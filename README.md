@@ -204,6 +204,22 @@ automatically" is off in Plex, the analyzes that follow need one idle check each
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.
 
+### Force a conversion
+
+The proof refuses a file that it cannot prove lossless, and the decision log holds the refusal. When you checked the
+refusal and accept it, name the file:
+
+```
+arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
+```
+
+The run then takes only the listed files. A file converts when the proof refuses it for the same reason as the last
+refusal in the decision log. Another refusal, or no logged refusal, is not forced, and the run says why. Every other
+step runs as normal. The original stays in `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, so one move puts it back. The
+decision line names the refusal in `repack.forced`, and the nightly audit says the conversion was forced. The option
+needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0. A path that is not in the run's work list is
+reported and skipped.
+
 ## The decision log
 
 `LOG` gets one JSON line per file that a run looks at: the hook, every backfill, the scans and the audit. A line holds

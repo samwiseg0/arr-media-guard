@@ -436,8 +436,8 @@ to run the undo of a file's last edit. A later import of the same item runs the 
 Every video file that is not Matroska becomes `<base>.mkv`, and so does a `.mkv` file that holds
 another container. `--backfill <app> --convert` converts the library. The hook converts an import
 only with `CONVERT=true`, except a `.mkv` file with another container, which always converts. The
-log calls a conversion a repack. A conversion keeps no original. It proves every stream first, and
-the app must list the new file before the original goes.
+log calls a conversion a repack. A conversion keeps no original, except a forced one. It proves every
+stream first, and the app must list the new file before the original goes.
 
 **Skips.** A skip writes nothing, and the file goes on `STATE_DIR/convert-<app>.txt`.
 
@@ -467,12 +467,54 @@ move 2 ms at most, because a stream whose times jump back can pass the digest an
 Lacing is off, because ffmpeg reads the frames of a lace a few ms off. MP4 timed text becomes
 SubRip, and its cues must match.
 
+Matroska stores no decode times, so ffmpeg guesses them during its read. A frame stored far ahead of
+the frames it displays after breaks the guess, and ffmpeg's muxer then moves a few packet times of
+the read. So when the time check fails on the new file, ffprobe reads that stream's stored times
+again. ffprobe only demuxes. The second check decides, and the proof entry names it in
+`times.reread`. The second read runs only after a failed check. Stored times that moved still fail.
+
 The proof allows a cut last frame and a cut first audio frame that mkvmerge drops, because a cut
 frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
-The proof also allows a last sample that an MP4 edit list hides. Any other lost packet fails, and
-the file keeps its original.
+The proof also allows a last sample that an MP4 edit list hides.
+
+A few packets more may go at the ends when every other packet matches in order. The video may lose
+up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose
+junk at its start, zero packets at its end, and one cut frame at each end, up to 16 packets
+(`JUNK_MAX`). Junk is a packet of zero bytes, or a stray RIFF header of at most 128 bytes. A read of
+the first packets shows a header, and it runs only when a lost packet before the first frame is not
+zeros. The kept audio must keep its start and its times, so audio that moved still fails. The proof
+entry names each lost packet in `dropped_start` or `dropped_end`, with its time, size and kind.
+
+Three more differences pass, each with its own check:
+
+- An HEVC codec header can hold units that mkvmerge copies into packet 0, such as an SEI. The proof
+  filter takes out only the parameter sets. When only packet 0 differs, one packet of each file is
+  read. It passes when the new packet 0 holds the original's and units of the header, byte for byte.
+  The entry names them in `header_units`.
+- An audio packet may share its time with a neighbour in the original, in any container. The
+  measured case is an MP4 whose first two AAC packets carry one time, which mkvmerge spaces one
+  frame apart. When the time check of an audio stream fails, each time is measured against the
+  video's start. A packet that shares its time may move one frame, the median step of the stream,
+  and every other packet 2 ms. Video never gets this rule. The entry names it in `times.shared`.
+- An MP4 timed-text cue can start and end at one time, beside another cue at that start. mkvmerge
+  gives it a length. It passes when it keeps its start and text and ends at or before the next
+  cue. The entry names it in `zero_length`.
+
+Any other lost packet fails, and the file keeps its original.
+
+**Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
+whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
+--convert --apply --force-convert PATH [PATH ...]` takes only the listed files. The force is bound
+to the refusal a person saw. A file converts when the proof refuses it with the same text as the
+last refusal the decision log holds for its path. Another refusal, or none in the log, is not
+forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
+import, the extras and the checks after them. The original is hard-linked into `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
+header repair keeps it, so one move undoes the conversion. The option needs `KEEP_ORIGINALS_DAYS`
+above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
+"forced". A listed path that is not in the run's work list is reported and skipped. The hook
+never forces a conversion.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
@@ -551,7 +593,7 @@ decision runs on the new file, and the app rescans the item. A backfill dry run 
 ## Kept originals
 
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for
-`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing. The original is
+`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
 hard-linked to `<mount>/<KEEP_DIR>/<UTC time>/<path from the mount>`, where the mount is the mount
 point that holds the file. With the app root folders and the Plex sections below the mount, nothing
 scans the folder. A hard link needs no space and never leaves the path missing. When a link is not

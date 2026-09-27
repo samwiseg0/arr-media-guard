@@ -21,6 +21,7 @@
   arr-media-guard --backfill <radarr|sonarr> --apply --plan-from FILE [--canary N]
   arr-media-guard --backfill <radarr|sonarr> --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
   arr-media-guard --backfill <radarr|sonarr> --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]
+  arr-media-guard --backfill <radarr|sonarr> --convert --apply --force-convert PATH [PATH ...] [--ids ID ...]
   arr-media-guard --plex-flush <radarr|sonarr>
   arr-media-guard --backfill <radarr|sonarr> --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --backfill <radarr|sonarr> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
@@ -109,7 +110,7 @@ Every file the hook, a backfill, the audio scan or an audit probe looks at gets 
 and a one-line logfmt summary goes to syslog with the tag arr-media-guard. See docs/design.md, "Logs".
 See docs/design.md, "How it runs", for the queue, the job processes and the locks.
 """
-import argparse, calendar, collections, concurrent.futures, contextlib, datetime, fcntl, hashlib, json, os, re, select, shutil, signal
+import argparse, array, calendar, collections, concurrent.futures, contextlib, datetime, fcntl, hashlib, json, os, re, select, shutil, signal
 import sqlite3, subprocess, sys, syslog, tempfile, threading, time, traceback, types, uuid
 import urllib.error, urllib.parse, urllib.request
 
@@ -2519,7 +2520,7 @@ def content_text(ev):
 
 
 def process(app, path, label, original, runtime, apply=True, post=True, source="hook", job=None, audio=True, kids=False, release="",
-            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None):
+            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=None):
     """Probe one file and decide its flags. Hear the audio language when the decision needs it, check the audio (hook
     only), edit the flags when the rules say so, and verify. Then run the metadata checks and alert.
 
@@ -2539,7 +2540,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     deletes anything. pool is the conversion pool of a backfill with several workers, see backfill_files(). lock is then
     held shared, and the conversion runs under it. convert_on says whether a file that is not .mkv converts: CONVERT for
     the hook, --convert for a backfill. A .mkv file that holds another container converts either way. A backfill with
-    --convert stops after the conversion: the language backfill decides the flags later, from its own cache.
+    --convert stops after the conversion: the language backfill decides the flags later, from its own cache. force
+    is the refusal a person accepts, see convert().
     Returns the decision log record, which the caller writes with decision().
     """
     ctx = ctx or {"listed": runtime}
@@ -2556,7 +2558,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if (mkv and container != "Matroska") or (not mkv and conv):   # mkvpropedit edits Matroska only, see convert()
         if shared and apply and not pool:
             raise Replan("the file needs a repack")
-        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool)
+        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force)
         if lock is not None and not pool and result.startswith(("repacked", "repack failed")):   # convert() let the lock go, see there
             gated(lock, fcntl.LOCK_EX)
         if job is not None and "warnings" in rec["repack"]:
@@ -3128,6 +3130,10 @@ RELINK_WAIT = 60          # seconds relink() reads the app's record again after 
 PROOF_RATE = 10e6         # bytes a second a proof read must reach at least, else it times out
 SYNC = 0.05               # seconds a stream's start may move against the first video stream's
 TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start: Matroska keeps milliseconds
+END_LOSS = 3              # video packets the new file may lack at its end, a loss of up to 3 frames that is accepted
+JUNK_MAX = 16             # audio packets the ends of a stream may lose as junk and cut frames, see ends_lost()
+JUNK_HEADERS = (b"RIFF",)  # a stray container header that an audio stream may hold as a packet of its own
+JUNK_HEADER_MAX = 128     # bytes such a header packet holds at most
 SIDECAR_FLAGS = {"forced": "--forced-display-flag", "hi": "--hearing-impaired-flag", "sdh": "--hearing-impaired-flag",
                  "cc": "--hearing-impaired-flag"}
 # Where mkvmerge changes packets on purpose, per ffprobe format and codec, "*" for any format: (the bitstream filter for
@@ -3200,6 +3206,26 @@ def srt_cues(text, shift=0):
     return sorted((a, b, clean(t)) for a, b, t in cues if clean(t))
 
 
+def zero_cues(a, b):
+    """(the cues b with each zero-length cue of a put back, the start in seconds of each one put back). a and b are
+    srt_cues() of the original and the new file. An MP4 timed-text sample may start and end at the same time, beside
+    another cue at that start. The MP4 never shows it, and mkvmerge gives it a length. It passes when the new cue has
+    the same start and text and ends at or before the next later start. Cues pair by start and text, because the sort
+    can put the two cues of one start the other way round. cue_fault() then checks every other cue."""
+    b, back = list(b), []
+    for s, e, text in a:
+        if s != e:
+            continue
+        later = next((c[0] for c in a if c[0] > s), None)
+        if later is None:
+            continue
+        k = next((i for i, c in enumerate(b) if abs(c[0] - s) <= 2 and c[2] == text and c[0] != c[1] and c[1] <= later + 2), None)
+        if k is not None:
+            b[k] = (s, e, text)
+            back.append(s / 1000)
+    return sorted(b), back
+
+
 def cue_fault(what, a, b, last_end=True):
     """Why the cue lists a and b of srt_cues() differ, or None. A time may move by 2 ms, the rounding of two timescales.
     last_end False lets the end of the last cue differ: mkvmerge ends the last MP4 timed-text sample early, where the
@@ -3238,8 +3264,8 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     maps lists ffprobe stream indexes. bsf maps a stream index to the bitstream filter its packets go through first.
     opts are input options, such as -ignore_editlist 1.
     Returns ({stream index: count (packets with data), empty (packets without), bytes, digest (sha256 over their md5s),
-    start and end in seconds, times (the time of each packet with data, in file order)}, {stream index in texts: its
-    SubRip text}). A timeout or an ffmpeg error raises."""
+    start and end in seconds, times (the time of each packet with data, in file order), md5s (their md5s, 16 bytes
+    each) and sizes}, {stream index in texts: its SubRip text}). A timeout or an ffmpeg error raises."""
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
     if maps:
@@ -3267,7 +3293,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
                 k, dts, pts, dur, size = int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4])
                 pts = pts if abs(pts) < 1 << 62 else dts   # AVI video has a decode time only
                 s = stats.setdefault(maps[k], {"count": 0, "empty": 0, "bytes": 0, "digest": hashlib.sha256(), "rest": hashlib.sha256(),
-                                               "start": None, "end": None, "times": []})
+                                               "start": None, "end": None, "times": [], "md5s": bytearray(), "sizes": array.array("L")})
                 if size:
                     s["but_last"], s["last"], s["last_pts"] = s["digest"].copy(), size, round(pts * tb[k], 3) if abs(pts) < 1 << 62 else None
                     if s["count"]:   # rest: every packet but the first, but_ends: every one but the first and the last
@@ -3276,6 +3302,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
                         s["first"], s["first_pts"] = size, s["last_pts"]
                     s["count"] += 1; s["bytes"] += size; s["digest"].update(p[5].encode())
                     s["times"].append(pts * tb[k] if abs(pts) < 1 << 62 else None)
+                    s["md5s"] += bytes.fromhex(p[5]); s["sizes"].append(size)
                 else:
                     s["empty"] += 1
                 if abs(pts) < 1 << 62:   # AV_NOPTS_VALUE has no time
@@ -3305,18 +3332,26 @@ def prove(src, tmp, subs, folder, captions=None):
     must end within 1 s of where they ended. Every packet must also keep its time against its stream's first packet,
     see times_fault(). Those checks run for every stream, whatever passed its data.
 
-    One difference passes. mkvmerge drops a cut last frame, the stream's last packet, when every
+    Some differences pass. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
     cut first frame, alone or with its cut last frame. The entry names it in
     dropped_first, and the stream's start is then its second packet. mkvmerge may instead trim that fragment. A
     smaller first MP3 or MP2 packet passes when every other packet matches and the second packet keeps its time.
     The entry names both sizes in trimmed_first. The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
-    edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. captions maps the stream index of
+    edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. When the time
+    check fails on a Matroska tmp, ffprobe reads the stored times of that stream again, see stored_times(), and only
+    that second check decides. The entry names it in times.reread.
+
+    A few more packets may go at the ends when every other packet matches in order, see ends_lost(): up to END_LOSS
+    video packets at the end, and junk and cut frames at the ends of an audio stream. The entry names them in
+    dropped_start and dropped_end. An HEVC packet 0 may also hold units of the codec header more, see header_units(),
+    named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length. An
+    audio packet that shares its time with a neighbour may move one frame, see times_fault(). captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
     ones, and its text must match."""
     fa, sa, _ = ff_streams(src)
-    _, sb, _ = ff_streams(tmp)
+    fb, sb, _ = ff_streams(tmp)
     a, b, fam = media_streams(sa), media_streams(sb), fa.split(",")[0]
     pairs, proof = [], []
     captions = captions or {}
@@ -3359,7 +3394,7 @@ def prove(src, tmp, subs, folder, captions=None):
                           + (f", new file through {f[1]}" if f[1] else ""),
                           count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), hash=x["digest"][:16],
                           match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
-        xt, yt, xs, why = x.get("times") or [], y.get("times") or [], x["start"], None
+        xt, yt, xs, why, ycut = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None)
         if x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame, and that passes
             proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[:-1]
@@ -3374,7 +3409,18 @@ def prove(src, tmp, subs, folder, captions=None):
         elif x["count"] + 1 == y["count"] and y.get("but_last") == x["digest"] and fam == "mov" and \
                 edit_list_sample(src, s["index"], f[0], y, folder, timeout):   # the sample the MP4's edit list cuts off
             proof[-1].update(count=y["count"], edit_list={"pts": y.get("last_pts"), "size": y["last"]})
-            yt = yt[:-1]
+            ycut = slice(None, -1)
+            yt = yt[ycut]
+        elif x["count"] > y["count"] and (lost := ends_lost(src, x, y, s, f[0], timeout)):   # a few packets at the ends
+            a, b, gone = lost
+            proof[-1].update(**({"dropped_start": gone[:a]} if a else {}), **({"dropped_end": gone[a:]} if b else {}))
+            xt = xt[a:len(xt) - b]
+            if a:   # the stream now starts at its first kept packet
+                xs = xt[0] if xt and xt[0] is not None else xs
+                proof[-1]["start"][0] = round(xs - va, 3)
+        elif s["codec_name"] == "hevc" and x["count"] == y["count"] and x["digest"] != y["digest"] and \
+                x.get("but_first") == y.get("but_first") and (units := header_units(src, tmp, s["index"], t["index"], f, timeout)):
+            proof[-1]["header_units"] = units   # mkvmerge copies units of the codec header into packet 0
         elif s["codec_name"] in ("mp3", "mp2") and x["count"] == y["count"] > 1 and x["digest"] != y["digest"] and \
                 x.get("but_first") == y.get("but_first") and (y.get("first") or 0) < (x.get("first") or 0):   # a trimmed cut first frame
             proof[-1].update(trimmed_first={"pts": x.get("first_pts"), "size": [x["first"], y["first"]]})
@@ -3394,13 +3440,18 @@ def prove(src, tmp, subs, folder, captions=None):
         if not why and fam == "avi" and s["codec_type"] == "audio":
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:
-            why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt)
+            video = (va, vb) if s["codec_type"] == "audio" else None   # packets that share a time, see times_fault()
+            why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video)
+            if why and fb.startswith("matroska"):   # ffmpeg's read may move a few stored times, see stored_times()
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored_times(tmp, t["index"], timeout)[ycut], video)
         proof[-1]["match"] = not why
         fault = fault or why
     for s, t in text:
         ca, cb = srt_cues(ta[s["index"]], -round(va * 1000)), srt_cues(tb[t["index"]], -round(vb * 1000))
+        cb, zero = zero_cues(ca, cb)
         why = cue_fault(f"the {s['codec_name']} stream {s['index']}", ca, cb, last_end=False)
-        proof.append(dict(stream=f"s{s['index']}", codec=s["codec_name"], method="text", count=len(ca), match=not why))
+        proof.append(dict(stream=f"s{s['index']}", codec=s["codec_name"], method="text", count=len(ca), match=not why,
+                          **({"zero_length": zero} if zero else {})))
         fault = fault or why
     for s, t, sc in pairs:
         if sc:
@@ -3420,7 +3471,7 @@ def prove(src, tmp, subs, folder, captions=None):
     return fault, proof
 
 
-def times_fault(name, codec, xt, yt):
+def times_fault(name, codec, xt, yt, video=None):
     """(why the packet times of a stream moved in the new file, or None; the check for the proof entry). xt and yt are
     the times of the packets with data in file order, the one packet an exception left out already gone. Each list is
     sorted and taken against its own first time, and each pair may differ by TIME_SLACK. Sorted, because an AVI video
@@ -3432,7 +3483,13 @@ def times_fault(name, codec, xt, yt):
     and the two drift apart over the length of a file. A player plays the audio on, as mkvmerge
     counts it, so prove() leaves AVI audio out of this check and keeps its start and its data. A TS
     whose audio times go back 0.3 s at 2 minutes plays 0.3 s late in the new file from there, because mkvmerge makes
-    the audio continuous. That fails here."""
+    the audio continuous. That fails here.
+
+    video is (the original's video start, the new file's) for an audio stream. When the check fails and packets of the
+    original share a time with a neighbour, a second check measures every time against the video's start, as the start
+    check does. A packet that shares a time may move one frame, the median step of the original, and TIME_SLACK more
+    for the rounding. Every other packet may move TIME_SLACK. An MP4 can give its first two AAC packets one time, and mkvmerge spaces them one frame apart.
+    The check then names the shared packets in shared."""
     if len(xt) != len(yt) or None in xt or None in yt:
         return (f"stream {name} ({codec}) has packets with no time", {"checked": False}) if None in xt + yt else \
             (f"stream {name} ({codec}) holds {len(yt)} timed packets in the new file, {len(xt)} in the original", {"checked": False})
@@ -3443,10 +3500,31 @@ def times_fault(name, codec, xt, yt):
         if d > worst:
             worst, at = d, p - a[0]
     check = {"worst_ms": round(worst * 1000, 1), **({"at": round(at, 3)} if at is not None and worst > TIME_SLACK else {})}
+    same = {j for i in range(1, len(a)) if a[i] == a[i - 1] for j in (i - 1, i)} if worst > TIME_SLACK and video else set()
+    if same and len(set(a)) > 1:
+        steps = sorted(q - p for p, q in zip(a, a[1:]) if q > p)
+        frame, moves = steps[len(steps) // 2], [abs((q - video[1]) - (p - video[0])) for p, q in zip(a, b)]
+        check["shared"] = {"packets": len(same), "frame_ms": round(frame * 1000, 1), "worst_ms": round(max(moves) * 1000, 1)}
+        if all(d <= (frame if i in same else 0) + TIME_SLACK for i, d in enumerate(moves)):
+            return None, check
     if worst > TIME_SLACK:
         return (f"a packet of stream {name} ({codec}) moved {worst * 1000:.0f} ms against its stream's start, {at:.3f} s into the "
                 "original"), check
     return None, check
+
+
+def stored_times(path, index, timeout):
+    """The time of each packet with data of stream index of the Matroska file path, in file order, as ffprobe reads it.
+    Matroska stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the
+    frames it displays after breaks that guess. ffmpeg's muxer then logs "Non-monotonic DTS", which -v error hides,
+    and moves a few packet times of its read. ffprobe only demuxes, so it reads the times the file stores. prove()
+    runs this only after a failed time check. A timeout or an ffprobe error raises."""
+    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
+                        "packet=pts_time,size", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
+    if r.returncode:   # a decoder message of the stream probe may show, as in packet_hashes(). A wrong read fails the check.
+        raise RuntimeError(f"ffprobe did not read the times of {os.path.basename(path)}: {mask(r.stderr.strip())[-200:]}")
+    rows = [line.split(",") for line in r.stdout.splitlines() if line.strip()]
+    return [None if t == "N/A" else float(t) for t, size in rows if size != "0"]
 
 
 def edit_list_sample(src, index, bsf, y, folder, timeout):
@@ -3456,6 +3534,101 @@ def edit_list_sample(src, index, bsf, y, folder, timeout):
     give the new file's count and digest. It reads the whole file again, in this case only."""
     z = packet_hashes(src, [index], {index: bsf} if bsf else {}, [], folder, timeout, opts=("-ignore_editlist", "1"))[0].get(index) or {}
     return (z.get("count"), z.get("digest")) == (y["count"], y["digest"])
+
+
+def packet_data(path, index, bsf, n, timeout):
+    """The data of the first n packets of stream index of path, read with -c copy through bsf, joined. The caller splits
+    it by the sizes of its own read. It reads only the start of the file. A timeout or an ffmpeg error raises."""
+    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
+                        *(["-bsf:0", bsf] if bsf else []), "-frames:0", str(n), "-f", "data", "pipe:1"], capture_output=True, timeout=timeout)
+    if r.returncode:
+        raise RuntimeError(f"ffmpeg did not read the first packets of {os.path.basename(path)}: "
+                           f"{mask(r.stderr.decode(errors='replace').strip())[-200:]}")
+    return r.stdout
+
+
+def ends_lost(src, x, y, s, bsf, timeout):
+    """(packets lost at the start, packets lost at the end, [{pts, size, kind}] of each) when the new file holds every
+    other packet of stream s of src in order, else None. x and y are the packet_hashes() of the stream, bsf the
+    original's filter. The one-packet cuts pass in prove() before this.
+
+    A video stream may lose up to END_LOSS packets at its end, kind "lost". An audio stream may lose up to JUNK_MAX
+    packets: junk at its start, zero packets at its end, and one cut frame next to the kept packets at each end. Junk
+    is a packet of zero bytes, kind "zero", or a stray container header of JUNK_HEADERS, kind "header", which a read of
+    those first packets shows. A cut frame is kind "cut". prove() then checks the start and the times of the kept
+    packets, so audio that moved still fails."""
+    xm, ym, sizes, times = x.get("md5s"), y.get("md5s"), x.get("sizes"), x.get("times") or []
+    video = s["codec_type"] == "video"
+    if xm is None or ym is None or s["codec_type"] not in ("video", "audio"):
+        return None
+    n, m = len(xm) // 16, len(ym) // 16
+    if not 0 < n - m <= (END_LOSS if video else JUNK_MAX):
+        return None
+    zero = lambda i: xm[16 * i:16 * i + 16] == hashlib.md5(bytes(sizes[i])).digest()
+    entry = lambda i, kind: {"pts": round(times[i], 3) if i < len(times) and times[i] is not None else None, "size": sizes[i], "kind": kind}
+    data = None
+    for a in range(1 if video else n - m + 1):
+        b = n - m - a
+        if memoryview(xm)[16 * a:16 * (a + m)] != ym:
+            continue
+        if video:
+            return 0, b, [entry(i, "lost") for i in range(n - b, n)]
+        lead, tail = list(range(a)), list(range(n - b, n))
+        if not all(zero(i) for i in tail[1:]):   # after the cut last frame, only zero packets
+            continue
+        heads = [i for i in lead[:-1] if not zero(i)]   # before the cut first frame, only junk
+        if any(sizes[i] > JUNK_HEADER_MAX for i in heads):
+            continue
+        if heads and data is None:   # one read of the most packets any split can lose at the start
+            data = packet_data(src, s["index"], bsf, n - m, timeout)
+        start = lambda i: sum(sizes[:i])
+        if not all(data[start(i):start(i) + sizes[i]].startswith(JUNK_HEADERS) for i in heads):
+            continue
+        kind = lambda i, cut: "zero" if zero(i) else "header" if i in heads else cut
+        return a, b, [entry(i, kind(i, "cut")) for i in lead] + [entry(i, kind(i, "cut")) for i in tail]
+    return None
+
+
+def annexb_units(data):
+    """The NAL units of an H.264 or HEVC packet in Annex B form, without their start codes."""
+    return [u.rstrip(b"\0") for u in re.split(b"\0\0\1", data)[1:]] if data.startswith((b"\0\0\1", b"\0\0\0\1")) else []
+
+
+def hvcc_units(path, index, timeout):
+    """The NAL units in the HEVC codec header (hvcC) of stream index of path, from ffprobe's dump of it."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries", "stream=extradata", "-show_data", "-of", "json",
+                        path], capture_output=True, text=True, errors="replace", timeout=timeout)
+    dump = ((json.loads(r.stdout or "{}").get("streams") or [{}])[0].get("extradata") or "") if r.returncode == 0 else ""
+    raw, units = bytes.fromhex("".join("".join(line[10:49].split()) for line in dump.splitlines() if line.strip())), []
+    if len(raw) < 23 or raw[0] != 1:   # configurationVersion 1, see ISO/IEC 14496-15
+        return units
+    pos = 23
+    for _ in range(raw[22]):   # numOfArrays: the NAL type, then numNalus units, each after its 2-byte length
+        count, pos = int.from_bytes(raw[pos + 1:pos + 3], "big"), pos + 3
+        for _ in range(count):
+            size = int.from_bytes(raw[pos:pos + 2], "big")
+            units.append(raw[pos + 2:pos + 2 + size])
+            pos += 2 + size
+    return units
+
+
+def header_units(src, tmp, i, k, bsf, timeout):
+    """The hex of each NAL unit that packet 0 of stream k of tmp holds more than packet 0 of stream i of src, when each
+    one is a unit of the original's HEVC codec header, byte for byte, and packet 0 of src is in the new packet 0 in
+    order. Else None. mkvmerge copies the header's units into packet 0, and bsf removes only the parameter sets.
+    prove() reads one packet of each file, and only when every other packet matches."""
+    old = annexb_units(packet_data(src, i, bsf[0], 1, timeout))
+    new = annexb_units(packet_data(tmp, k, bsf[1], 1, timeout))
+    header, left, more = hvcc_units(src, i, timeout), iter(old), []
+    want = next(left, None)
+    for u in new:
+        if u == want:
+            want = next(left, None)
+        elif u in header:
+            more.append(u.hex()[:64])
+        else:
+            return None
+    return more if old and want is None and more else None
 
 
 def convert_captions(path, streams, folder, size):
@@ -4018,7 +4191,7 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (result, info,
     the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not matroska, ...".
@@ -4037,7 +4210,12 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
     original's inode, size and mtime once more and renames. The app's import holds no lock, and an undo takes it
     exclusive again. The lock comes back free once the remux started. pool is the worker's pool, see backfill_files(): the
     import holds no worker slot, and pool.imports sends it with the other files of the item that wait. Only the main
-    thread sets a signal handler or the time limit."""
+    thread sets a signal handler or the time limit.
+
+    force is the last proof refusal of the file in the decision log, as its result text, see logged_refusals(). A person
+    checked it and accepts it. The file then converts when prove() refuses it for that same reason. info names the
+    refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it. Another
+    refusal is not forced, and info names the logged one in not_forced."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -4099,8 +4277,13 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
         if (new_j.get("container") or {}).get("type") != "Matroska":
             raise RuntimeError(f"the new file reads as {(new_j.get('container') or {}).get('type')}")
         fault, info["proof"] = prove(path, tmp, subs, folder, cc)
-        if fault:
+        seen = fault and mask(f"repack failed: {fault}")[:500]   # the refusal as the decision log holds it
+        if fault and force and seen != force:
+            info["not_forced"] = f"the last refusal in the decision log differs: {force.partition(': ')[2][:200]}"
+        if fault and seen != force:
             raise RuntimeError(fault)
+        if fault:
+            info["forced"] = fault
         try:
             os.chown(tmp, st.st_uid, st.st_gid)
         except PermissionError as ex:   # a NAS share may refuse chown, see repack()
@@ -4125,6 +4308,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
             now = os.stat(path)
         if not now or (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
             raise SourceChanged("the app replaced or renamed the original during the repack")
+        if info.get("forced"):   # a hard link: one move puts the original back
+            try:
+                info["kept"] = keep_original(path)
+            except OSError as ex:
+                raise RuntimeError(f"the original could not be kept, so it stays: {ex}") from None
         if main:
             signal.signal(signal.SIGTERM, term)   # from here a stop waits for the swap and the job's end, as for mkvpropedit
         with no_stop():
@@ -4199,6 +4387,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
             pending_edit(key, dict(entry, state="stranded", error=mask(str(ex))[:200]))
         elif entry is not None:
             pending_edit(key)
+        if info.get("kept") and undo != "completed":   # the original stays, at its name or the held name, so its kept link goes
+            with contextlib.suppress(OSError):
+                if st.st_ino in {os.stat(p).st_ino for p in (path, held) if os.path.lexists(p)}:
+                    os.remove(info["kept"])
+                    del info["kept"]
         if not isinstance(ex, Exception):
             raise
         if undo == "completed":
@@ -4210,6 +4403,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
         if main:
             signal.signal(signal.SIGTERM, term)
         shutil.rmtree(folder, ignore_errors=True)
+    if info.get("kept"):
+        prune_originals(originals_root(path))
     info.update(new_size=size, new_tracks=track_list(new_j))
     return "repacked", info, new
 
@@ -4810,7 +5005,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": want["guids"]}
     run = lambda lock, shared, pool: process(app, path, label, original, runtime, apply=a.apply, post=False, source="backfill", kids=kids,
                                              release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, ctx=ctx, lock=lock, shared=shared,
-                                             pool=pool, convert_on=a.convert)
+                                             pool=pool, convert_on=a.convert, force=a.force.get(path))
     try:
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
@@ -4827,6 +5022,22 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     return time.time() - started, rec
 
 
+def logged_refusals(paths):
+    """{path: the last refusal of its conversion in the decision log, as the result text of a failed repack, or None}
+    for paths. A forced conversion's line counts with the refusal it overrode. --force-convert forces a file only for
+    that refusal, so a file that now fails for another reason stays."""
+    out = dict.fromkeys(paths)
+    for r in read_jsonl(CFG["LOG"] + ".1", CFG["LOG"]):
+        rp = r.get("repack") or {}
+        if r.get("path") not in out or "outcome" not in r:
+            continue
+        if rp.get("forced"):
+            out[r["path"]] = mask(f"repack failed: {rp['forced']}")[:500]
+        elif r["outcome"] == "repack_failed":
+            out[r["path"]] = r["result"]
+    return out
+
+
 def backfill(argv):
     ap = argparse.ArgumentParser(prog="arr-media-guard --backfill")
     ap.add_argument("app", choices=sorted(APPS)); ap.add_argument("--apply", action="store_true")
@@ -4836,8 +5047,12 @@ def backfill(argv):
     ap.add_argument("--restart", action="store_true"); ap.add_argument("--workers", type=int)
     ap.add_argument("--plan-out"); ap.add_argument("--plan-from"); ap.add_argument("--canary", type=int, default=0)
     ap.add_argument("--only-undecided", action="store_true"); ap.add_argument("--convert", action="store_true")
-    ap.add_argument("--plex-later", action="store_true")
+    ap.add_argument("--plex-later", action="store_true"); ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH")
     a = ap.parse_args(argv); app, ids = a.app, set(a.ids)
+    if a.force_convert and not (a.convert and a.apply):
+        ap.error("--force-convert needs --convert --apply")
+    if a.force_convert and not KEEP_DAYS:
+        ap.error("--force-convert needs KEEP_ORIGINALS_DAYS above 0, so the original is kept")
     if a.plex_later and not (a.convert and a.apply):
         ap.error("--plex-later needs --convert --apply")
     if a.canary and not (a.plan_from and a.apply):
@@ -4878,6 +5093,15 @@ def backfill(argv):
                       or str(r.get("header_repair", "")).startswith("would repair header"))]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
+    a.force = {}   # path: the refusal a person checked, docs/design.md, "Conversion"
+    if a.force_convert:   # the run takes only the listed files
+        listed = {os.path.abspath(p) for p in a.force_convert}
+        for p in sorted(listed - {w[0]["path"] for w in work}):
+            print(f"not in this run's work list, skipped: {p}", flush=True)
+        work = [w for w in work if w[0]["path"] in listed]
+        a.force = logged_refusals({w[0]["path"] for w in work})
+        for p in sorted(p for p, why in a.force.items() if not why):
+            print(f"no proof refusal in the decision log, so it is not forced: {p}", flush=True)
     # A dry run reads SCAN_WORKERS files at a time, like a scan, and --workers wins. An apply edits one file at a time, so
     # --limit, --canary and the Plex pace stay exact. A conversion apply converts CONVERT_WORKERS files at a time through
     # the slots of a pool, see backfill_files().
@@ -4920,6 +5144,8 @@ def backfill(argv):
             print(f'{rec["result"][:60]:<12} {label} | {edit_text(pos, rec.get("edits", []))}'
                   f'{" | heard " + heard if heard else ""}'
                   f'{" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else ""}'
+                  f'{" | forced, the proof refused: " + rec["repack"]["forced"][:150] if (rec.get("repack") or {}).get("forced") else ""}'
+                  f'{" | not forced: " + rec["repack"]["not_forced"][:150] if (rec.get("repack") or {}).get("not_forced") else ""}'
                   f'{" | " + "; ".join(rec.get("notes", [])) if rec.get("notes") else ""}'
                   f'{" | ALERT " + "; ".join(rec["alerts"]) if rec.get("alerts") else ""}', flush=True)
         if a.apply and (rec["result"] == "edited" or {"repacked", *REPAIRED} & set(rec.get("reasons", []))) and want and CFG["PLEX_URL"]:
@@ -5094,7 +5320,8 @@ def audit(argv):
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
             if (r.get("repack") or {}).get("new_size"):
-                add(repacked, f'repacked from {r.get("container")}', r.get("label")); seen.append(("changed", r))
+                add(repacked, f'repacked from {r.get("container")}' + (", forced" if r["repack"].get("forced") else ""), r.get("label"))
+                seen.append(("changed", r))
             code = (r.get("header_repair") or {}).get("code")
             if code in REPAIRED:
                 add(headers, {"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "subtitles removed",
@@ -5172,7 +5399,8 @@ LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "Germa
 def change_phrases(r):
     """The changes one decision line records, as (phrase, role) in the plain words of layout B: "English audio first",
     "English subs on" with the role of the subtitle turned on, "English subs off", "foreign subs off", "fake forced
-    subs off", "audio default flag fixed", "converted to MKV from AVI", "header repaired". Each phrase once."""
+    subs off", "audio default flag fixed", "converted to MKV from AVI" (", forced" when a person forced it), "header
+    repaired". Each phrase once."""
     out, before = [], {t["sel"]: t for t in r.get("before") or []}
     words = {"audio default flag fixed": "audio default flag fixed", "English subtitle off": "English subs off",
              "foreign subtitle off": "foreign subs off", "forced flag cleared": "fake forced subs off"}
@@ -5185,7 +5413,7 @@ def change_phrases(r):
         elif rule in words:
             out.append((words[rule], None))
     if (r.get("repack") or {}).get("new_size"):
-        out.append((f"converted to MKV from {r.get('container')}", None))
+        out.append((f"converted to MKV from {r.get('container')}" + (", forced" if r["repack"].get("forced") else ""), None))
     code = (r.get("header_repair") or {}).get("code")
     if code in REPAIRED:
         out.append(({"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "a subtitle track removed"}[code],
