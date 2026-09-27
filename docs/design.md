@@ -455,7 +455,8 @@ language, forced and hearing-impaired flags from the name. A sidecar that ends p
 has cues out of order, is timed for another cut and stays beside the file. `mkvmerge
 --disable-lacing --track-order` writes a hidden temp file with no video extension, so the apps and
 Plex never import a partial file. Any mkvmerge warning fails the conversion. ASF and WMV go through
-`ffmpeg -c copy`, because mkvmerge cannot read them. A c608 caption track becomes an English SubRip
+`ffmpeg -c copy -copyinkf`, because mkvmerge cannot read them. `-copyinkf` keeps the frames before the
+first keyframe. A c608 caption track becomes an English SubRip
 track, because mkvmerge drops it.
 
 **The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyinkf

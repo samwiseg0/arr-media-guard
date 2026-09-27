@@ -6284,6 +6284,26 @@ def test_a_real_remux_proves_every_stream_at_packet_level(convertible, tmp_path,
         assert tracks == [("eng", True), ("eng", False), ("spa", False)]
 
 
+def test_a_wmv_that_starts_before_its_first_keyframe_converts_whole(tmp_path):
+    """ASF and WMV go through ffmpeg -c copy. With -copyinkf the new file keeps the frames before the first keyframe and
+    proves clean. The same remux without it loses them, and the proof refuses it."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, src, new, lost = (tmp_path / n for n in ("full.wmv", "Clip.wmv", "new.mkv", "lost.mkv"))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+              "-c:v", "wmv2", "-g", "48", "-c:a", "wmav2", str(full)], check=True)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-map", "0", "-c", "copy", "-copyinkf", str(src)], check=True)
+    remux(src, new)   # convert_cmd(), as convert() runs it for a container mkvmerge cannot read
+    fault, proof = hook.prove(str(src), str(new), [], str(tmp_path))
+    flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags", "-of", "csv=p=0", str(src)],
+                     capture_output=True, text=True).stdout.split()
+    assert fault is None and "K" not in flags[0] and proof[0]["count"] == len(flags), (fault, proof)
+    argv = hook.convert_cmd(str(src), str(lost), hook.mkvmerge(str(src)), [], hook.ff_streams(str(src))[1])[5:]
+    REAL_RUN([a for a in argv if a != "-copyinkf"], check=True)
+    fault, _ = hook.prove(str(src), str(lost), [], str(tmp_path))
+    assert fault and fault.startswith("stream video 0 (wmv2) holds "), fault
+
+
 def test_frames_before_the_first_keyframe_are_proven(tmp_path):
     """An MP4 can start with frames before its first keyframe. A plain -c copy drops them, so a proof that read both
     files that way passed a new file that lost them. With -copyinkf the proof reads them: mkvmerge keeps them and

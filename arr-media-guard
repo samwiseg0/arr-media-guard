@@ -3680,12 +3680,12 @@ def convert_captions(path, streams, folder, size):
 def convert_cmd(src, tmp, j, subs, streams=None, captions=()):
     """The remux of src, its captions and its sidecars subs into tmp. mkvmerge keeps the track order and every track it
     reads, then adds each caption SubRip of convert_captions() as "English (CC)", then the sidecars. A container
-    mkvmerge cannot read (ASF) goes through ffmpeg -c copy instead, with streams, its ffprobe streams, and never a new
-    encode. The ffmpeg path takes no sidecar and no caption."""
+    mkvmerge cannot read (ASF) goes through ffmpeg -c copy -copyinkf instead, with streams, its ffprobe streams, and never
+    a new encode. -copyinkf keeps the frames before the first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-v", "error", "-i", src] + [a for s in media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
-            + ["-c", "copy", "-f", "matroska", tmp]
+            + ["-c", "copy", "-copyinkf", "-f", "matroska", tmp]   # the frames before the first keyframe too
     ids = [t.get("id") for t in j.get("tracks") or []]
     extra = len(captions) + len(subs)
     order = ["--track-order", ",".join([f"0:{i}" for i in ids] + [f"{n}:0" for n in range(1, extra + 1)])] if ids and None not in ids else []
