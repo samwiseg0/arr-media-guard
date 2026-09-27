@@ -472,12 +472,18 @@ the frames it displays after breaks the guess, and ffmpeg's muxer then moves a f
 the read. So when the time check fails on the new file, ffprobe reads that stream's stored times
 again. ffprobe only demuxes. The second check decides, and the proof entry names it in
 `times.reread`. The second read runs only after a failed check. Stored times that moved still fail.
+For video it takes the stored times from the first keyframe on. An MP4 can start with frames before
+its first keyframe, and mkvmerge keeps them. ffmpeg's read skips them in both files, and ffprobe does
+not.
 
 The proof allows a cut last frame and a cut first audio frame that mkvmerge drops, because a cut
 frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
-The proof also allows a last sample that an MP4 edit list hides.
+An AVI can also hold junk inside its first MP3 packet, zeros or a RIFF header of at most 128 bytes,
+and end on a cut frame that mkvmerge drops. That passes when one read of packet 0 of each file shows
+the new packet 0 is the tail of the old one after the junk. The entry names the junk in
+`trimmed_first.junk` and the cut frame in `dropped`. The proof also allows a last sample that an MP4 edit list hides.
 
 A few packets more may go at the ends when every other packet matches in order. The video may lose
 up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose

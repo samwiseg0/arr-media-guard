@@ -3337,7 +3337,8 @@ def prove(src, tmp, subs, folder, captions=None):
     cut first frame, alone or with its cut last frame. The entry names it in
     dropped_first, and the stream's start is then its second packet. mkvmerge may instead trim that fragment. A
     smaller first MP3 or MP2 packet passes when every other packet matches and the second packet keeps its time.
-    The entry names both sizes in trimmed_first. The new file may also hold one
+    The entry names both sizes in trimmed_first. The stream may also lose its cut last frame then, when the new packet
+    0 is the tail of the old one after zeros or a stray header, see junk_head(). The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
     edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. When the time
     check fails on a Matroska tmp, ffprobe reads the stored times of that stream again, see stored_times(), and only
@@ -3421,9 +3422,15 @@ def prove(src, tmp, subs, folder, captions=None):
         elif s["codec_name"] == "hevc" and x["count"] == y["count"] and x["digest"] != y["digest"] and \
                 x.get("but_first") == y.get("but_first") and (units := header_units(src, tmp, s["index"], t["index"], f, timeout)):
             proof[-1]["header_units"] = units   # mkvmerge copies units of the codec header into packet 0
-        elif s["codec_name"] in ("mp3", "mp2") and x["count"] == y["count"] > 1 and x["digest"] != y["digest"] and \
-                x.get("but_first") == y.get("but_first") and (y.get("first") or 0) < (x.get("first") or 0):   # a trimmed cut first frame
+        elif s["codec_name"] in ("mp3", "mp2") and x["count"] - y["count"] in (0, 1) and y["count"] > 1 and x["digest"] != y["digest"] and \
+                x.get("but_first" if x["count"] == y["count"] else "but_ends") == y.get("but_first") and \
+                (y.get("first") or 0) < (x.get("first") or 0) and \
+                (x["count"] == y["count"] or (junk := junk_head(src, tmp, s["index"], t["index"], f, timeout))):   # a trimmed cut first frame
             proof[-1].update(trimmed_first={"pts": x.get("first_pts"), "size": [x["first"], y["first"]]})
+            if x["count"] > y["count"]:   # junk inside packet 0, and a cut last frame mkvmerge drops
+                proof[-1]["trimmed_first"]["junk"] = junk
+                proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
+                xt = xt[:-1]
             # mkvmerge re-times the stream from the first frame it keeps. Junk longer than one frame would shift every
             # later packet, and the first packets still start together, so the second packet must keep its time.
             if None in (xt[1:2] or [None]) + (yt[1:2] or [None]):
@@ -3443,7 +3450,8 @@ def prove(src, tmp, subs, folder, captions=None):
             video = (va, vb) if s["codec_type"] == "audio" else None   # packets that share a time, see times_fault()
             why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video)
             if why and fb.startswith("matroska"):   # ffmpeg's read may move a few stored times, see stored_times()
-                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored_times(tmp, t["index"], timeout)[ycut], video)
+                stored = stored_times(tmp, t["index"], timeout, s["codec_type"] == "video")
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored[ycut], video)
         proof[-1]["match"] = not why
         fault = fault or why
     for s, t in text:
@@ -3513,18 +3521,22 @@ def times_fault(name, codec, xt, yt, video=None):
     return None, check
 
 
-def stored_times(path, index, timeout):
+def stored_times(path, index, timeout, video=False):
     """The time of each packet with data of stream index of the Matroska file path, in file order, as ffprobe reads it.
+    For video, from the first keyframe on: ffmpeg's -c copy read in packet_hashes() skips the frames before it in both
+    files, and ffprobe does not. An MP4 can start with frames before its first keyframe, and mkvmerge keeps them.
     Matroska stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the
     frames it displays after breaks that guess. ffmpeg's muxer then logs "Non-monotonic DTS", which -v error hides,
     and moves a few packet times of its read. ffprobe only demuxes, so it reads the times the file stores. prove()
     runs this only after a failed time check. A timeout or an ffprobe error raises."""
     r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
-                        "packet=pts_time,size", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
+                        "packet=pts_time,size,flags", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
     if r.returncode:   # a decoder message of the stream probe may show, as in packet_hashes(). A wrong read fails the check.
         raise RuntimeError(f"ffprobe did not read the times of {os.path.basename(path)}: {mask(r.stderr.strip())[-200:]}")
     rows = [line.split(",") for line in r.stdout.splitlines() if line.strip()]
-    return [None if t == "N/A" else float(t) for t, size in rows if size != "0"]
+    if video:
+        rows = rows[next((i for i, row in enumerate(rows) if "K" in row[2]), len(rows)):]
+    return [None if t == "N/A" else float(t) for t, size, _ in rows if size != "0"]
 
 
 def edit_list_sample(src, index, bsf, y, folder, timeout):
@@ -3587,6 +3599,17 @@ def ends_lost(src, x, y, s, bsf, timeout):
         kind = lambda i, cut: "zero" if zero(i) else "header" if i in heads else cut
         return a, b, [entry(i, kind(i, "cut")) for i in lead] + [entry(i, kind(i, "cut")) for i in tail]
     return None
+
+
+def junk_head(src, tmp, i, k, bsf, timeout):
+    """"zero" or "header" when packet 0 of stream k of tmp is the tail of packet 0 of stream i of src, and the part
+    before it is zeros or a stray header of JUNK_HEADERS of at most JUNK_HEADER_MAX bytes, else None. An AVI can hold
+    such junk inside its first audio packet, and mkvmerge keeps only the frame after it. One packet of each file is read."""
+    old, new = packet_data(src, i, bsf[0], 1, timeout), packet_data(tmp, k, bsf[1], 1, timeout)
+    head = old[:len(old) - len(new)]
+    if not new or not head or not old.endswith(new):
+        return None
+    return "zero" if not head.strip(b"\0") else "header" if head.startswith(JUNK_HEADERS) and len(head) <= JUNK_HEADER_MAX else None
 
 
 def annexb_units(data):
