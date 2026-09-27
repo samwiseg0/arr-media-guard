@@ -197,6 +197,9 @@ arr-media-guard --subhunt radarr --ids 123                    # find a release w
 arr-media-guard --audit radarr --since 24h --post             # the hook's edits of the last day, to Discord
 ```
 
+An apply asks Plex to analyze each edited item, after the section is idle on two checks. When "Scan my library
+automatically" is off in Plex, the analyzes that follow need one idle check each. See docs/design.md, "The burst".
+
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.
 

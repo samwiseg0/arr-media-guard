@@ -574,6 +574,17 @@ def plex_activities(cache):
     return cache["acts"]
 
 
+def plex_watches():
+    """Whether Plex may scan a folder by itself when a file in it changes, its "Scan my library automatically"
+    setting. Then a backfill's edit can start a scan of the edited item, so each analyze keeps its own two idle checks.
+    A missing setting or a failed read counts as on."""
+    try:
+        prefs = {s.get("id"): s.get("value") for s in plex_get("/:/prefs").get("Setting", [])}
+    except Exception:
+        return True
+    return prefs.get("FSEventLibraryUpdatesEnabled") is not False
+
+
 def plex_scan(section, acts):
     """The title of a Plex activity that may cover this library section, or "" when none does. acts is the
     /activities list. Plex 1.43 lists a scan there as type library.update.section, with the section in
@@ -596,7 +607,7 @@ def plex_job(app, source, label, path, want, decision_id):
                 decision_id=decision_id, keys=None, section=None, since=None, quiet=None, scan="", deferrals=0, logged=None)
 
 
-def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None):
+def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None, burst=None):
     """One step of p, a plex_job(). First the lookup, again on the waits schedule until Plex lists the file. Then two
     checks of its library section PLEX_QUIET seconds apart, both idle, because the app's own Plex connection can start
     a scan just after the edit. Only then the analyze. Plex 1.43 crashes when an analyze races a scan of the same
@@ -604,8 +615,11 @@ def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None):
     PLEX_BUSY_CAP seconds of that the analyze is skipped. cache is plex_activities()'s dict, shared by one worker pass.
     The check right before the PUT never uses it. Returns (the final message or None, a reason code or None). A code
     without a message is a deferral. ready, from --plex-flush, gives the seconds the send must still wait for
-    another reason, checked right after the two idle checks. A wait restarts them."""
-    now = time.monotonic()
+    another reason, checked right after the two idle checks. A wait restarts them.
+
+    burst, from a backfill only, maps a section to the times of the first and the last idle check in a row. A check
+    at most PLEX_QUIET after the last one continues the row. Once the row spans PLEX_QUIET, each further analyze needs
+    only its own fresh idle check. A busy or failed check ends the row. See docs/design.md, "The burst"."""
     if not p["keys"]:
         try:
             p["keys"], p["other"], p["section"] = plex_folder_scan(p) if (p["want"] or {}).get("folder") else plex_find(p["path"], p["want"])
@@ -617,6 +631,10 @@ def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None):
                 return plex_gave_up(p["other"], sum(waits)), "plex_not_found"
             p["due"] = p["edited"] + sum(waits[:p["tries"] + 1])
             return None, None
+    now = time.monotonic()   # after the lookup, so the times below are those of the check
+    row = (burst or {}).get(p["section"])
+    if row and p["quiet"] is None and now - row[1] <= PLEX_QUIET:
+        p["quiet"] = row[0]
     # The check that can release the PUT reads /activities fresh. A shared read can be stale by then: another item's
     # lookup ran meanwhile, and a scan may have started. One GET per analyze sent.
     fresh = cache is None or (p["quiet"] is not None and now - p["quiet"] >= PLEX_QUIET)
@@ -627,12 +645,15 @@ def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None):
     p["since"] = p["since"] or now
     if p["scan"]:
         p["quiet"] = None
+        (burst or {}).pop(p["section"], None)
         if now - p["since"] >= PLEX_BUSY_CAP:
             return (f'section {p["section"]} was not idle for {PLEX_BUSY_CAP} seconds, last: {p["scan"]}. No analyze, '
                     "Plex's own scan reads the new flags."), "plex_analyze_skipped_busy"
         p["due"], p["deferrals"] = now + PLEX_BUSY_WAIT, p["deferrals"] + 1
         return None, code
     p["quiet"] = p["quiet"] or now
+    if burst is not None:
+        burst[p["section"]] = (p["quiet"], now)
     if now - p["quiet"] < PLEX_QUIET:
         p["due"] = p["quiet"] + PLEX_QUIET
         return None, None
@@ -668,13 +689,13 @@ def plex_gave_up(other, seconds):
     return ("Plex has the item but not this file" if other is True else "not in Plex") + f" after {seconds} seconds, no analyze." + extra
 
 
-def plex_analyze(p, skipped, ready=None):
+def plex_analyze(p, skipped, ready=None, burst=None):
     """The backfill's analyze: one lookup, then plex_step() with a sleep in between. The backfill waits while the
     section is busy, so the next file waits too. skipped holds the sections this run already gave up on. A file in
     one of them is skipped at its first busy check, so a section busy for hours costs one PLEX_BUSY_CAP per run, not
-    one per file. An analyze sent clears the section. Returns (message, reason code)."""
+    one per file. An analyze sent clears the section. burst goes to plex_step(). Returns (message, reason code)."""
     while True:
-        done, code = plex_step(p, waits=(0,), ready=ready)
+        done, code = plex_step(p, waits=(0,), ready=ready, burst=burst)
         if code in ("plex_section_busy", "plex_check_failed") and p["section"] in skipped:
             done = f'section {p["section"]} is still busy ({p["scan"]}) after an earlier skip in this run. No analyze.'
             code = "plex_analyze_skipped_busy"
@@ -4847,6 +4868,7 @@ def backfill(argv):
     print(f"{len(work)} {'files that are not .mkv' if a.convert else 'mkv files, each read for its own tracks'}, "
           f"{('APPLY' + (f', {workers} at a time' if workers > 1 else '')) if a.apply else f'dry run, {workers} at a time'}", flush=True)
     counts, out, skipped, needed = {}, open(a.plan_out, "w") if a.plan_out else None, set(), 0   # skipped: plex_analyze()'s sections
+    burst = {} if a.apply and not a.convert and CFG["PLEX_URL"] and not plex_watches() else None   # see plex_step()
     scans, rescans, settles, stop = {}, set(), {}, threading.Event()   # scans: folder -> plex_folder_job(), rescans and settles: per item, at the end
     if a.apply and a.convert:   # a stopped run left these
         pending_recover(app, True)
@@ -4887,7 +4909,7 @@ def backfill(argv):
             elif (p["want"] or {}).get("folder"):   # the episodes of a season share one folder, so it is scanned once
                 scans[p["path"]] = p
             else:
-                rec["plex"], rec["plex_reason"] = plex_analyze(p, skipped)
+                rec["plex"], rec["plex_reason"] = plex_analyze(p, skipped, burst=burst)
                 rec["plex_section"] = p["section"]   # --plex-flush reads it
                 time.sleep(PLEX_PACE)
         decision(rec, time.time() - took)   # every file, dry runs too, so a run can be reviewed later

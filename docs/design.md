@@ -137,6 +137,22 @@ section replaces the item's media. So the section must be idle on two checks of 
 section. A failed check counts as busy. A busy section defers the analyze by `PLEX_BUSY_WAIT`. After
 `PLEX_BUSY_CAP` the worker gives up, because Plex's own scan reads the changed file anyway.
 
+**The burst.** A backfill edits files in place, and the app does not import them. So an edit starts a scan only
+when Plex watches the library folders ("Scan my library automatically"). When Plex does not, a backfill confirms the
+section idle once, and each analyze after that needs one fresh idle check right before its request. The idle checks
+form a row. A check at most `PLEX_QUIET` after the last one continues the row, and the row must span `PLEX_QUIET`.
+A busy check, a failed check or a longer gap ends the row, and the next analyze waits for two checks again.
+
+Each request still follows a fresh check that finds no scan in its section. The checks come at least as close
+together as the two checks did. Plex's work after an analyze (loudness, credits, chapter thumbnails, ad detection)
+is no scan, so it never ends a row. Each analyze leaves the same work under both rules, and `PLEX_PACE` still
+separates two requests. A scan that starts after the last check can meet that work under either rule. A row belongs
+to one backfill process. The worker, another backfill and `--plex-flush` never use it.
+
+The worker keeps two checks for each item. An import makes the app ask Plex to scan the item's folder, and one check
+can come before that scan starts. The worker runs the checks of its waiting items side by side, so a season pack
+does not wait `PLEX_QUIET` for each file.
+
 **A folder scan.** A renamed file is not in Plex until Plex scans its folder. So a conversion or a
 restore under another name queues a partial scan of its one folder. Plex's work after an analyze
 shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section.

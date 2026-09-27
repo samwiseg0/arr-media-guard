@@ -177,6 +177,10 @@ def env(tmp_path, monkeypatch):
             act = calls["activities"].pop(0) if calls["activities"] else []
             if isinstance(act, Exception): raise act
             return {"MediaContainer": {"Activity": act}}
+        if u.path == "/:/prefs":   # calls["prefs"] is the watcher setting's value. None leaves it out. An exception is raised.
+            v = calls.get("prefs")
+            if isinstance(v, Exception): raise v
+            return {"MediaContainer": {"size": 177, "Setting": [] if v is None else [dict(WATCH_SETTING, value=v)]}}
         assert method == "PUT" and u.path.endswith("/analyze"), url   # never a section or folder scan
         return b""
 
@@ -801,6 +805,98 @@ def test_backfill_skips_a_section_it_gave_up_on_at_once(env, monkeypatch, tmp_pa
     assert "earlier skip" in done[1]["plex"]
     assert [(r["source"], r["plex_reason"]) for r in log_lines(env) if r["result"] == "plex_deferred"] == [("backfill", "plex_section_busy")]
     assert capsys.readouterr().out.count("waiting for Plex section 12 (Scanning Movies Film A)") == 1
+
+
+# --- a backfill's burst: one two-check confirmation, then one fresh idle check per analyze ---
+
+# Real shapes from Plex 1.43. An analyze makes Plex queue this work. It is no scan, so it never ends a burst.
+LOUDNESS = {"cancellable": False, "progress": 50, "subtitle": "Show E S01 E05", "title": "Generating loudness data",
+            "type": "media.generate.loudness", "userID": 1, "uuid": "00000000-0000-4000-8000-000000000002"}
+CREDITS = {"cancellable": False, "progress": -1, "subtitle": "Show E S01 E21", "title": "Detecting Credits",
+           "type": "media.generate.credits", "userID": 1, "uuid": "00000000-0000-4000-8000-000000000003"}
+WATCH_SETTING = {"advanced": False, "default": False, "group": "library", "hidden": False, "id": "FSEventLibraryUpdatesEnabled",
+                 "label": "Scan my library automatically", "type": "bool", "value": False,
+                 "summary": "Your library will be updated automatically when changes to library folders are detected."}
+
+
+def backfill_films(env, monkeypatch, tmp_path, n):
+    """n films in section 12, each in Plex, for a backfill apply that edits every one."""
+    paths = [env["path"]] + [str(tmp_path / "media" / "Film A (1979)" / f"Other{i}.mkv") for i in range(1, n)]
+    for i, p in enumerate(paths[1:], 1):
+        open(p, "wb").write(b"x")
+        env["plex_items"].append(plex_item(f"710{1 + i}", f"tmdb://{90001 + i}", p))
+    movies = [{"id": 7 + i, "title": "Film A", "year": 1979, "originalLanguage": {"name": "English"}, "runtime": 120,
+               "tmdbId": 90001 + i, "movieFile": {"path": p, "mediaInfo": {"audioStreamCount": 2}}} for i, p in enumerate(paths)]
+    monkeypatch.setattr(hook, "arr", lambda app, p: movies)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    real_run = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: None if argv[0] == "ionice" else real_run(argv, **k))
+
+
+@pytest.mark.parametrize("watch, checks", [
+    (False, [0, 15, 17, 19]),                                           # Plex does not watch the folders: one confirmation
+    (True, [0, 15, 17, 32, 34, 49]),                                    # an edit can start a scan: two checks per file
+    (None, [0, 15, 17, 32, 34, 49]),                                    # no such setting
+    (urllib.error.URLError("refused"), [0, 15, 17, 32, 34, 49])])       # the read failed
+def test_a_backfill_burst_confirms_the_section_once(env, monkeypatch, tmp_path, watch, checks):
+    backfill_films(env, monkeypatch, tmp_path, 3)
+    env["prefs"] = watch
+    env["activities"] = [[LOUDNESS, CREDITS]] * 6   # Plex's own work after each analyze
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert analyzes(env) == ["/library/metadata/7101/analyze", "/library/metadata/7102/analyze", "/library/metadata/7103/analyze"]
+    assert env["checks"] == checks
+    plex = [(m, urlparse(u).path) for m, u, b in env["http"] if "plex.invalid" in u]
+    assert all(plex[i - 1] == ("GET", "/activities") for i, c in enumerate(plex) if c[0] == "PUT")   # a fresh check before each PUT
+    assert [r["plex_reason"] for r in log_lines(env) if r.get("outcome") == "edited"] == ["plex_analyze_sent"] * 3
+
+
+def burst_job(env, label="Film A"):
+    return hook.plex_job("radarr", "backfill", label, env["path"], {"guids": ["tmdb://90001"], "title": "Film A"}, None)
+
+
+def burst_run(env, gaps, burst):
+    """plex_analyze() for one file after each gap in seconds, as a backfill sends them. Returns the reason codes."""
+    codes = []
+    for gap in gaps:
+        hook.time.sleep(gap)
+        codes.append(hook.plex_analyze(burst_job(env), set(), burst=burst)[1])
+    return codes
+
+
+def test_a_scan_mid_burst_ends_it(env):
+    env["activities"] = [[], [], [], [scan()]]   # the third file's check finds a scan that started after the second analyze
+    burst, start = {}, env["clock"][0]
+    assert burst_run(env, [0, hook.PLEX_PACE, hook.PLEX_PACE, hook.PLEX_PACE], burst) == ["plex_analyze_sent"] * 4
+    assert env["checks"] == [0, 15, 17, 19, 49, 64, 66]   # busy at 19: wait, then two new idle checks, then the burst again
+    assert len(analyzes(env)) == 4 and burst == {"12": (start + 49, start + 66)}   # the new row starts at 49
+    assert [r["plex_reason"] for r in log_lines(env) if r["result"] == "plex_deferred"] == ["plex_section_busy"]
+    env["activities"] = [[scan()]]   # a file in a section this run gave up on stops at its first busy check
+    assert hook.plex_analyze(burst_job(env), {"12"}, burst=burst)[1] == "plex_analyze_skipped_busy" and burst == {}
+    assert burst_run(env, [hook.PLEX_PACE], burst) == ["plex_analyze_sent"] and env["checks"][-3:] == [66, 68, 83]
+
+
+def test_an_idle_gap_ends_the_burst(env):
+    burst = {}
+    gaps = [0, hook.PLEX_QUIET + 1, hook.PLEX_QUIET]   # a slow file, then one that comes exactly PLEX_QUIET after a check
+    assert burst_run(env, gaps, burst) == ["plex_analyze_sent"] * 3
+    assert env["checks"] == [0, 15, 31, 46, 61]   # 16 s after the last check: two new checks. 15 s after: one.
+    env["activities"] = [urllib.error.URLError("refused")]
+    assert burst_run(env, [hook.PLEX_PACE], burst) == ["plex_analyze_sent"] and env["checks"][-3:] == [63, 93, 108]   # a failed check ends it too
+
+
+def test_each_process_confirms_the_section_itself(env):
+    """The hook's worker sends every analyze of its job processes itself, see coordinate(). It never uses a burst, because
+    the import made the app ask Plex for a scan of the item's folder. A second backfill has its own burst. So an idle
+    row that one backfill saw never releases an analyze of another sender."""
+    burst = {}
+    burst_run(env, [0], burst)
+    pending = [burst_job(env, "hook item")]
+    drain(pending)
+    assert env["checks"] == [0, 15, 15, 30]   # the worker: two checks, though the backfill's row is live
+    burst_run(env, [0], {})
+    assert env["checks"][-2:] == [30, 45]   # another backfill: its own two checks
+    burst_run(env, [0], burst)   # the other senders' checks never extended this row. Its last check was at 15, so it has expired.
+    assert env["checks"][-2:] == [45, 60] and len(analyzes(env)) == 4
 
 
 # --- the backfill ------------------------------------------------------------------------------
