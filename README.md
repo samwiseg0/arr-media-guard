@@ -34,6 +34,7 @@ Every file it looks at gets one JSON line in the decision log. Every edit logs i
 - Linux, with Sonarr and Radarr on the same host. It is tested with Sonarr 4 and Radarr 6.
 - Python 3.12 or later.
 - `mkvtoolnix` and `ffmpeg` (for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`).
+  Tested with mkvtoolnix 92 and ffmpeg 7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so every header repair refuses.
 - Optional: Plex, a Discord webhook, and a TMDB API read token.
 - Optional: the language detection venv, about 450 MB, and its model, 464 MB. The pinned wheels are for CPython 3.13
   on x86_64.
