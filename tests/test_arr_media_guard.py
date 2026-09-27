@@ -2651,7 +2651,7 @@ def test_an_mp4_named_mkv_is_repacked_rescanned_and_decided(env, monkeypatch):
     assert [r["result"] for r in log_lines(env)][:3] == ["repacked", "editing", "edited"]   # the repack record comes first
     assert rec["repack"]["old_size"] == 1000 and rec["repack"]["new_size"] == 1004 and rec["repack"]["rescan"] == "sent"
     assert [t[0] for t in rec["repack"]["tracks"]] == ["video", "audio", "subtitles"] and rec["repack"]["new_tracks"][1][2] == "eng"
-    tmp = os.path.join(folder, "." + os.path.basename(env["path"]) + ".repack-tmp")   # hidden, and no video extension
+    tmp = os.path.join(folder, hook.HIDE_DIR, "." + os.path.basename(env["path"]) + ".repack-tmp")   # a hidden folder the apps skip
     assert env["repacks"][0][:10] == ["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", "--disable-lacing", "-o", tmp]
     events = env["events"]
     assert events[events.index("repack") - 1] == "alarm 0" and f"alarm {hook.BUDGET}" in events[events.index("repack"):]
@@ -2730,21 +2730,26 @@ def test_a_long_name_keeps_its_repack_temp_under_255_bytes():
     name = "Ö" * 130 + ".mkv"   # 264 bytes
     tmp = os.path.basename(hook.repack_tmp(os.path.join("/m", name)))
     assert len(os.fsencode(tmp)) == 255 and tmp.startswith(".Ö") and tmp.endswith(".repack-tmp")
-    assert hook.repack_tmp("/m/a/b.mkv") == "/m/a/.b.mkv.repack-tmp"
+    assert hook.repack_tmp("/m/a/b.mkv") == f"/m/a/{hook.HIDE_DIR}/.b.mkv.repack-tmp"
 
 
 def test_the_worker_removes_a_stale_repack_temp_file(env):
     """A SIGKILL mid-remux leaves the temp file. The next job in its folder removes it after a day and logs it. A temp
-    file two hours old may be one a conversion worker of a backfill still proves, so it stays."""
+    file two hours old may be one a conversion worker of a backfill still proves, so it stays. Older versions wrote the
+    temp file beside the video, so the folder itself is swept too."""
     folder = os.path.dirname(env["path"])
-    old, new, proof = (os.path.join(folder, f".{n}.mkv.repack-tmp") for n in ("Old", "Busy", "Proof"))
-    for f, age in ((old, 86500), (new, 60), (proof, 7200)):
+    hidden = os.path.join(folder, hook.HIDE_DIR)
+    os.mkdir(hidden)
+    old, new, proof = (os.path.join(hidden, f".{n}.mkv.repack-tmp") for n in ("Old", "Busy", "Proof"))
+    older = os.path.join(folder, ".Older.mkv.repack-tmp")
+    for f, age in ((old, 86500), (older, 90000), (new, 60), (proof, 7200)):
         open(f, "wb").close()
         os.utime(f, (env["clock"][0] - age,) * 2)
     hook.main([])
-    assert sorted(os.listdir(folder)) == sorted([os.path.basename(env["path"]), os.path.basename(new), os.path.basename(proof)])
-    (w,) = [r for r in log_lines(env) if r.get("note", "").startswith("removed a repack temp")]
-    assert w["path"] == old and w["source"] == "hook" and w["result"] == "warning"
+    assert sorted(os.listdir(folder)) == sorted([os.path.basename(env["path"]), hook.HIDE_DIR])
+    assert sorted(os.listdir(hidden)) == sorted([os.path.basename(new), os.path.basename(proof)])
+    w = [r for r in log_lines(env) if r.get("note", "").startswith("removed a repack temp")]
+    assert sorted(r["path"] for r in w) == sorted([old, older]) and {(r["source"], r["result"]) for r in w} == {("hook", "warning")}
 
 
 INTERRUPT = """
@@ -4668,7 +4673,7 @@ def test_a_removal_that_does_not_match_the_plan_keeps_the_original(mkvs, tmp_pat
     result, _ = hook.repack(str(path), j, os.stat(path), True, h)
     assert result == ("header repair failed: subtitle track 3 has 8 of 24 lines starting after the end, so the plan to remove it "
                       "no longer holds"), result
-    assert path.read_bytes() == before and not [n for n in os.listdir(tmp_path) if n.endswith(".repack-tmp")]
+    assert path.read_bytes() == before and not os.path.exists(os.path.dirname(hook.repack_tmp(str(path))))
     other = copy.deepcopy(j); del other["tracks"][2]   # the English track went instead of the Italian one
     assert hook.header_fault(j, str(path), other, os.path.getsize(path), dict(h, remove=[3]), {}).startswith("the tracks changed")
     assert hook.header_fault(j, str(path), j, os.path.getsize(path), dict(h, remove=[3]), {}).startswith("the tracks changed")
@@ -4781,7 +4786,7 @@ def test_a_cut_episode_is_never_trimmed_or_stripped(env, cuts, tmp_path, monkeyp
     assert rec["header_repair"]["code"] == "subtitle_file_may_be_cut" and rec["alert_kinds"][-1] == "cut"
     after = hook.mkvmerge(str(path))
     assert [t["type"] for t in after["tracks"]] == ["video", "audio", "subtitles"] and hook.arr_decide.duration(after) > 660
-    assert not [n for n in os.listdir(path.parent) if n.endswith(".repack-tmp")]
+    assert not os.path.exists(os.path.dirname(hook.repack_tmp(str(path))))
 
 
 # --- restore after a bad upgrade ------------------------------------------------------------------
@@ -5258,6 +5263,45 @@ def test_an_mp4_import_is_converted_relinked_and_scanned_in_plex(env, monkeypatc
     assert not os.path.exists(root) and "kept" not in rec["repack"]
 
 
+def scanned_as_extras(env, folder, video):
+    """The app's disk scan while mkvmerge writes, as another job's rescan runs it: every file beside the video becomes
+    an extra of its record, file 11. A hidden file counts too. A hidden folder does not (ExcludedSubFoldersRegex)."""
+    rows = []
+    env["during_repack"] = lambda: rows.extend((n, 11, "ExtraFiles") for n in sorted(os.listdir(folder))
+                                               if os.path.isfile(os.path.join(folder, n)) and n != os.path.basename(video))
+    env["extra_rows"] = lambda: list(rows)
+    return rows
+
+
+def test_a_rescan_during_the_remux_never_takes_the_temp_file_as_an_extra(env, monkeypatch):
+    """A real import: a rescan of the series ran while mkvmerge wrote the temp file beside the video. The app took the
+    hidden temp file as an extra of the old record. The swap then hid it with the extras, and the link to the new name
+    failed with ENOENT. The temp file now sits in HIDE_DIR, which the scan skips."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    rows = scanned_as_extras(env, os.path.dirname(mkv), mp4)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["repack"]["extras_hidden"], rows) == ("edited", 0, []), rec["result"]
+    assert env["repacks"][0][env["repacks"][0].index("-o") + 1] == hook.repack_tmp(mp4) == os.path.join(
+        os.path.dirname(mp4), hook.HIDE_DIR, "." + os.path.basename(mp4) + ".repack-tmp")
+    assert sorted(os.listdir(os.path.dirname(mkv))) == [os.path.basename(mkv)]   # no temp file, no held name, no hidden folder
+
+
+def test_a_failed_swap_removes_its_own_temp_file_after_the_extras_are_back(env, monkeypatch):
+    """The failure path of the same import. The app listed the temp file as an extra, the swap hid it, and the link
+    failed. The failure path removed the temp file before the extras went back, so the temp file came back as a
+    second copy of the new file. It goes last now."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    folder = os.path.dirname(mkv)
+    env["extra_rows"] = lambda: [(os.path.relpath(hook.repack_tmp(mp4), folder), 11, "ExtraFiles"), (os.path.basename(mkv)[:-4] + ".nfo-orig", 11, "ExtraFiles")]
+    open(mkv[:-4] + ".nfo-orig", "w").close()
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "repack_failed" and "No such file or directory" in rec["result"] and rec["repack"]["extras_left"] == [], rec
+    assert sorted(os.listdir(folder)) == sorted([os.path.basename(mp4), os.path.basename(mkv)[:-4] + ".nfo-orig"])
+    assert env["writes"] == [] and open(mp4, "rb").read() == b"x" * 1000
+
+
 @pytest.mark.parametrize("status", ["completed", "failed"])
 def test_an_app_that_does_not_take_the_new_file_gets_the_original_back(env, monkeypatch, status):
     """The ManualImport fails, or completes and the movie still lists the MP4. The original goes back to its name. The
@@ -5721,6 +5765,7 @@ def test_a_taken_hidden_name_refuses_the_swap(env, monkeypatch):
     """A file under the original's hidden name would be replaced by the rename. The swap refuses before
     anything moves."""
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    os.mkdir(os.path.dirname(hook.held_name(mp4)))
     open(hook.held_name(mp4), "w").close()
     hook.main([])
     rec = decided(env)

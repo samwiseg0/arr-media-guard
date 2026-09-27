@@ -453,8 +453,11 @@ stream first, and the app must list the new file before the original goes.
 **The remux.** A `.srt` beside the video that starts with its base name is muxed in, with its
 language, forced and hearing-impaired flags from the name. A sidecar that ends past the video, or
 has cues out of order, is timed for another cut and stays beside the file. `mkvmerge
---disable-lacing --track-order` writes a hidden temp file with no video extension, so the apps and
-Plex never import a partial file. Any mkvmerge warning fails the conversion. ASF and WMV go through
+--disable-lacing --track-order` writes the temp file into `HIDE_DIR` beside the video. The apps' disk
+scan and Plex skip a hidden folder, so they never import a partial file. A hidden file beside the
+video is not enough. The app's scan takes it as an extra of the item and can rename it or send it to
+the recycle bin. A swap once hid it with the extras, and the link to the new name failed. Any mkvmerge
+warning fails the conversion. ASF and WMV go through
 `ffmpeg -c copy`, because mkvmerge cannot read them. A c608 caption track becomes an English SubRip
 track, because mkvmerge drops it.
 
@@ -518,9 +521,10 @@ never forces a conversion.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
-into `HIDE_DIR`, the new file is linked in as `<base>.mkv`, and the original becomes a hidden held
-name. The app then takes the new file. Only then are the original and the sidecars deleted. When a
-step fails after that, `convert_undo()` reads the app first and never deletes a file the app lists.
+into `HIDE_DIR`, the new file is linked in as `<base>.mkv`, and the original moves to a held name in
+`HIDE_DIR`. The app then takes the new file. Only then are the original and the sidecars deleted. When a
+step fails after that, `convert_undo()` reads the app first and never deletes a file the app lists. A
+failure removes the temp file last, after the extras are back, and then the empty `HIDE_DIR`.
 
 **The app takes the new file.** A `ManualImport` command names the item. It carries the old record's
 quality, languages, release group and indexer flags, so the app never parses the new name. The file

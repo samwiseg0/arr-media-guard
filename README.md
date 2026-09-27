@@ -94,7 +94,7 @@ the end of the line. Every key is optional. [examples/arr-media-guard.env](examp
 | `POLICY_FILE` | `/etc/arr-media-guard.policy.json` | The decision policy. Without it the hook edits nothing and alerts once. |
 | `LID_DIR` | `/opt/arr-media-guard-lid` | The language detection venv and model. |
 | `KEEP_DIR` | `.arr-media-guard-originals` | The folder at the top of each mount that holds kept originals. A name without a leading dot takes the default. |
-| `HIDE_DIR` | `.arr-media-guard-convert` | The folder beside an extra file where it waits during a conversion. A name without a leading dot takes the default. |
+| `HIDE_DIR` | `.arr-media-guard-convert` | The folder beside the video where a remux writes its temp file, and where the original and the extras wait during a conversion. A name without a leading dot takes the default. |
 | `NAME` | `arr-media-guard` | The syslog tag and the name in alert footers. |
 | `INSTANCE` | the host name | The name of this host in logs and alerts. |
 | `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989` | The app APIs. |

@@ -2980,28 +2980,50 @@ def stopped(signum, _):
 
 
 def repack_tmp(path):
-    """The temp file of a repack: hidden and with no video extension, like arr_subhunt's .subhunt-keep link, so the
-    apps' disk scan and Plex skip it. The name is cut to the share's 255-byte limit."""
+    """The temp file of a repack, in HIDE_DIR beside the file. The apps' disk scan and Plex skip a hidden folder. A hidden
+    file beside the video is not enough: the scan takes it as an extra of the item, and a conversion then hides it with
+    the extras. The name is cut to the share's 255-byte limit."""
     name = os.fsencode(os.path.basename(path))[:255 - len(b"." + REPACK_TMP)]
-    return os.path.join(os.path.dirname(path), os.fsdecode(b"." + name + REPACK_TMP))
+    return os.path.join(os.path.dirname(path), HIDE_DIR, os.fsdecode(b"." + name + REPACK_TMP))
+
+
+def new_tmp(tmp):
+    """Create the empty temp file tmp in its hidden folder, before the remux writes it. Another conversion in the same
+    folder removes that folder once it is empty, so the file holds it, and a create that finds no folder tries again."""
+    for n in range(3):
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        try:
+            return os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        except FileNotFoundError:
+            if n == 2:
+                raise
+
+
+def drop_tmp(tmp):
+    """Remove the temp file tmp, and its hidden folder when that is empty."""
+    with contextlib.suppress(OSError):
+        os.remove(tmp)
+    with contextlib.suppress(OSError):
+        os.rmdir(os.path.dirname(tmp))
 
 
 def sweep_repack_tmp(folder, source):
     """Remove the temp files of repacks that a kill left behind in folder, when older than a day. Logs each one. A
     conversion worker of a backfill runs beside the hook and other workers, and a proof of a file at the size cap
-    may take hours."""
-    try:
-        names = [n for n in os.listdir(folder) if n.startswith(".") and n.endswith(os.fsdecode(REPACK_TMP))]
-    except OSError:
-        return
-    for n in names:
-        f = os.path.join(folder, n)
+    may take hours. Older versions wrote the temp file beside the video, so the folder itself is swept too."""
+    for d in (folder, os.path.join(folder, HIDE_DIR)):
         try:
-            if time.time() - os.path.getmtime(f) > 86400:
-                os.remove(f)
-                log(dict(source=source, result="warning", path=f, note="removed a repack temp file older than a day"))
+            names = [n for n in os.listdir(d) if n.startswith(".") and n.endswith(os.fsdecode(REPACK_TMP))]
         except OSError:
-            pass
+            continue
+        for n in names:
+            f = os.path.join(d, n)
+            try:
+                if time.time() - os.path.getmtime(f) > 86400:
+                    os.remove(f)
+                    log(dict(source=source, result="warning", path=f, note="removed a repack temp file older than a day"))
+            except OSError:
+                pass
 
 
 def repack(path, j, st, apply, hp):
@@ -3015,14 +3037,14 @@ def repack(path, j, st, apply, hp):
     file with bytes past the Segment end, see header_probe(). header_fault() then compares with the Segment size. A file
     that is not Matroska goes to convert().
 
-    mkvmerge writes repack_tmp() beside the original at nice 19 and idle I/O, with no time limit, so a slow NAS never
-    stops a remux halfway. --track-order keeps the tracks in their order. By default mkvmerge puts video first, and
-    a file may hold subtitles, audio, video in that order. The track UIDs and the Segment UID stay. Any mkvmerge warning is a
+    mkvmerge writes repack_tmp() in HIDE_DIR beside the original at nice 19 and idle I/O, with no time limit, so a slow
+    NAS never stops a remux halfway. --track-order keeps the tracks in their order. By default mkvmerge puts video
+    first, and a file may hold subtitles, audio, video in that order. The track UIDs and the Segment UID stay. Any mkvmerge warning is a
     fault: it resyncs past a damaged cluster and drops it. The temp file is synced, and header_fault() compares it to
     the original. The original must still be the file st describes, else the app replaced it meanwhile
     (repack_source_changed). On any fault the temp file goes and the original stays. Otherwise the temp file takes the
     original's owner and mode. The original is hard-linked into originals_root() for KEEP_DAYS, then the temp file is
-    renamed over it. Any exception removes the temp file first: Ctrl+C, the time limit, and SIGTERM through stopped()."""
+    renamed over it. Any exception removes the temp file: Ctrl+C, the time limit, and SIGTERM through stopped()."""
     info = {"container": (j.get("container") or {}).get("type"), "old_size": st.st_size, "tracks": track_list(j)}
     trim, remove = list(hp.get("trim") or ()), list(hp.get("remove") or ())
     tracks = {t.get("id"): t for t in j.get("tracks") or []}
@@ -3051,6 +3073,7 @@ def repack(path, j, st, apply, hp):
     info["warnings"] = None   # process() re-arms the time limit on this key, even when trim_inputs() raises
     term = signal.signal(signal.SIGTERM, stopped) if main else None
     try:
+        new_tmp(tmp)
         extra = []
         if trim or remove:
             extra, info["trimmed"], info["removed"] = trim_inputs(path, j, hp, folder)
@@ -3087,8 +3110,6 @@ def repack(path, j, st, apply, hp):
         os.replace(tmp, path)
     except BaseException as ex:
         with contextlib.suppress(OSError):
-            os.remove(tmp)
-        with contextlib.suppress(OSError):
             if info.get("kept") and os.stat(path).st_ino == st.st_ino:   # the rename never ran, so the original is still at path
                 os.remove(info["kept"])
                 del info["kept"]
@@ -3100,6 +3121,7 @@ def repack(path, j, st, apply, hp):
             signal.signal(signal.SIGTERM, term)
         if folder:
             shutil.rmtree(folder, ignore_errors=True)
+        drop_tmp(tmp)   # after a rename it removes only the empty hidden folder
     if info.get("kept"):
         prune_originals(originals_root(path))
     info.update(new_size=size, new_tracks=track_list(new))
@@ -3663,7 +3685,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=()):
     encode. The ffmpeg path takes no sidecar and no caption."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
-        return nice + ["ffmpeg", "-nostdin", "-v", "error", "-i", src] + [a for s in media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
+        return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
             + ["-c", "copy", "-f", "matroska", tmp]
     ids = [t.get("id") for t in j.get("tracks") or []]
     extra = len(captions) + len(subs)
@@ -4186,9 +4208,9 @@ def proc_start(pid):
 
 
 def held_name(path):
-    """The hidden name the original holds while the app takes the new file: no video extension, so the apps and Plex skip it."""
+    """The name the original holds while the app takes the new file, in HIDE_DIR beside it, as repack_tmp() explains."""
     name = os.fsencode(os.path.basename(path))[:255 - len(b"." + HELD)]
-    return os.path.join(os.path.dirname(path), os.fsdecode(b"." + name + HELD))
+    return os.path.join(os.path.dirname(path), HIDE_DIR, os.fsdecode(b"." + name + HELD))
 
 
 def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None):
@@ -4263,6 +4285,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     info["warnings"] = None   # process() re-arms the time limit on this key
     term = signal.signal(signal.SIGTERM, stopped) if main else None
     try:
+        new_tmp(tmp)
         r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values())), capture_output=True, text=True,
                            errors="replace")
         info["warnings"] = mask((r.stdout + r.stderr).strip())[-500:] or None
@@ -4331,10 +4354,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
                 info["extras_hidden"] = len(hidden)
                 os.link(tmp, new)   # fails when the name is taken meanwhile
                 state = "placed"
-                os.remove(tmp)
-                os.rename(path, held)
+                os.rename(path, held)   # while the temp file still holds the hidden folder, see new_tmp()
                 state = "held"
                 pending_edit(key, dict(entry, state="held"))
+                os.remove(tmp)
                 if lock is not None:   # the app's import holds no lock
                     fcntl.flock(lock, fcntl.LOCK_UN)
                 if pool:   # and no worker slot, so another file's remux runs meanwhile
@@ -4360,8 +4383,6 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
                 except OSError as ex:
                     info.setdefault("left", []).append(mask(f"{f}: {ex}")[:200])
     except BaseException as ex:
-        with contextlib.suppress(OSError):
-            os.remove(tmp)
         if lock is not None:   # no app call holds the lock. convert_undo() takes it again for the rename.
             fcntl.flock(lock, fcntl.LOCK_UN)
         undo = None
@@ -4403,6 +4424,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         if main:
             signal.signal(signal.SIGTERM, term)
         shutil.rmtree(folder, ignore_errors=True)
+        drop_tmp(tmp)   # last, after the extras are back: a temp file hidden with them came back too
     if info.get("kept"):
         prune_originals(originals_root(path))
     info.update(new_size=size, new_tracks=track_list(new_j))
