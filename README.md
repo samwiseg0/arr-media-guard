@@ -202,16 +202,19 @@ line nightly with a systemd timer or cron to review the hook's own edits.
 
 ### Force a conversion
 
-The proof refuses a file that it cannot prove lossless. When you checked the refusal and accept it, name the file:
+The proof refuses a file that it cannot prove lossless, and the decision log holds the refusal. When you checked the
+refusal and accept it, name the file:
 
 ```
-arr-media-guard --backfill radarr --convert --apply --ids 123 --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
+arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
 ```
 
-The file converts although the proof refuses it, and every other step runs as normal. The original stays in `KEEP_DIR`
-for `KEEP_ORIGINALS_DAYS`, so one move puts it back. The decision line names the refusal in `repack.forced`, and the
-nightly audit says the conversion was forced. The option needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0.
-A path that is not in the run's work list is reported and skipped.
+The run then takes only the listed files. A file converts when the proof refuses it for the same reason as the last
+refusal in the decision log. Another refusal, or no logged refusal, is not forced, and the run says why. Every other
+step runs as normal. The original stays in `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, so one move puts it back. The
+decision line names the refusal in `repack.forced`, and the nightly audit says the conversion was forced. The option
+needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0. A path that is not in the run's work list is
+reported and skipped.
 
 ## The decision log
 

@@ -472,9 +472,11 @@ Three more differences pass, each with its own check:
   filter takes out only the parameter sets. When only packet 0 differs, one packet of each file is
   read. It passes when the new packet 0 holds the original's and units of the header, byte for byte.
   The entry names them in `header_units`.
-- An MP4 can give two AAC packets one time, and mkvmerge spaces them one frame apart. When the time
-  check fails, each time is measured against the video's start. A packet that shares its time may
-  move one frame, and every other packet 2 ms. The entry names it in `times.shared`.
+- An audio packet may share its time with a neighbour in the original, in any container. The
+  measured case is an MP4 whose first two AAC packets carry one time, which mkvmerge spaces one
+  frame apart. When the time check of an audio stream fails, each time is measured against the
+  video's start. A packet that shares its time may move one frame, the median step of the stream,
+  and every other packet 2 ms. Video never gets this rule. The entry names it in `times.shared`.
 - An MP4 timed-text cue can start and end at one time, beside another cue at that start. mkvmerge
   gives it a length. It passes when it keeps its start and text and ends at or before the next
   cue. The entry names it in `zero_length`.
@@ -483,13 +485,15 @@ Any other lost packet fails, and the file keeps its original.
 
 **Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
 whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
---convert --apply --force-convert PATH [PATH ...]` converts each listed file when the proof refuses
-it. Every other step runs as normal: the remux, the swap, the app's import, the extras and the
-checks after them. The original is hard-linked into `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
+--convert --apply --force-convert PATH [PATH ...]` takes only the listed files. The force is bound
+to the refusal a person saw. A file converts when the proof refuses it with the same text as the
+last refusal the decision log holds for its path. Another refusal, or none in the log, is not
+forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
+import, the extras and the checks after them. The original is hard-linked into `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
 header repair keeps it, so one move undoes the conversion. The option needs `KEEP_ORIGINALS_DAYS`
 above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
-"forced". A listed path that is not in the run's work list is reported and skipped. The hook never
-forces a conversion.
+"forced". A listed path that is not in the run's work list is reported and skipped. The hook
+never forces a conversion.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move

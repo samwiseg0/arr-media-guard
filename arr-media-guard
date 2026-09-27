@@ -2482,7 +2482,7 @@ def content_text(ev):
 
 
 def process(app, path, label, original, runtime, apply=True, post=True, source="hook", job=None, audio=True, kids=False, release="",
-            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=False):
+            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=None):
     """Probe one file and decide its flags. Hear the audio language when the decision needs it, check the audio (hook
     only), edit the flags when the rules say so, and verify. Then run the metadata checks and alert.
 
@@ -2503,7 +2503,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     held shared, and the conversion runs under it. convert_on says whether a file that is not .mkv converts: CONVERT for
     the hook, --convert for a backfill. A .mkv file that holds another container converts either way. A backfill with
     --convert stops after the conversion: the language backfill decides the flags later, from its own cache. force
-    converts the file when the proof refuses it, see convert().
+    is the refusal a person accepts, see convert().
     Returns the decision log record, which the caller writes with decision().
     """
     ctx = ctx or {"listed": runtime}
@@ -3176,8 +3176,10 @@ def zero_cues(a, b):
     can put the two cues of one start the other way round. cue_fault() then checks every other cue."""
     b, back = list(b), []
     for s, e, text in a:
+        if s != e:
+            continue
         later = next((c[0] for c in a if c[0] > s), None)
-        if s != e or later is None:
+        if later is None:
             continue
         k = next((i for i, c in enumerate(b) if abs(c[0] - s) <= 2 and c[2] == text and c[0] != c[1] and c[1] <= later + 2), None)
         if k is not None:
@@ -4151,7 +4153,7 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=False):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (result, info,
     the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not matroska, ...".
@@ -4172,8 +4174,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=False
     import holds no worker slot, and pool.imports sends it with the other files of the item that wait. Only the main
     thread sets a signal handler or the time limit.
 
-    force converts the file when prove() refuses it: a person checked the refusal and accepts it. info names the
-    refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it."""
+    force is the last proof refusal of the file in the decision log, as its result text, see logged_refusals(). A person
+    checked it and accepts it. The file then converts when prove() refuses it for that same reason. info names the
+    refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it. Another
+    refusal is not forced, and info names the logged one in not_forced."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -4235,7 +4239,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=False
         if (new_j.get("container") or {}).get("type") != "Matroska":
             raise RuntimeError(f"the new file reads as {(new_j.get('container') or {}).get('type')}")
         fault, info["proof"] = prove(path, tmp, subs, folder, cc)
-        if fault and not force:
+        seen = fault and mask(f"repack failed: {fault}")[:500]   # the refusal as the decision log holds it
+        if fault and force and seen != force:
+            info["not_forced"] = f"the last refusal in the decision log differs: {force.partition(': ')[2][:200]}"
+        if fault and seen != force:
             raise RuntimeError(fault)
         if fault:
             info["forced"] = fault
@@ -4957,7 +4964,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": want["guids"]}
     run = lambda lock, shared, pool: process(app, path, label, original, runtime, apply=a.apply, post=False, source="backfill", kids=kids,
                                              release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, ctx=ctx, lock=lock, shared=shared,
-                                             pool=pool, convert_on=a.convert, force=path in a.force)
+                                             pool=pool, convert_on=a.convert, force=a.force.get(path))
     try:
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
@@ -4972,6 +4979,22 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     except Exception as ex:
         rec = dict(app=app, source="backfill", apply=a.apply, ids=ids, label=label, path=path, result=mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, rec
+
+
+def logged_refusals(paths):
+    """{path: the last refusal of its conversion in the decision log, as the result text of a failed repack, or None}
+    for paths. A forced conversion's line counts with the refusal it overrode. --force-convert forces a file only for
+    that refusal, so a file that now fails for another reason stays."""
+    out = dict.fromkeys(paths)
+    for r in read_jsonl(CFG["LOG"] + ".1", CFG["LOG"]):
+        rp = r.get("repack") or {}
+        if r.get("path") not in out or "outcome" not in r:
+            continue
+        if rp.get("forced"):
+            out[r["path"]] = mask(f"repack failed: {rp['forced']}")[:500]
+        elif r["outcome"] == "repack_failed":
+            out[r["path"]] = r["result"]
+    return out
 
 
 def backfill(argv):
@@ -5029,9 +5052,15 @@ def backfill(argv):
                       or str(r.get("header_repair", "")).startswith("would repair header"))]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
-    a.force = {os.path.abspath(p) for p in a.force_convert}   # a person checked each refusal, docs/design.md, "Conversion"
-    for p in sorted(a.force - {w[0]["path"] for w in work}):
-        print(f"not in this run's work list, skipped: {p}", flush=True)
+    a.force = {}   # path: the refusal a person checked, docs/design.md, "Conversion"
+    if a.force_convert:   # the run takes only the listed files
+        listed = {os.path.abspath(p) for p in a.force_convert}
+        for p in sorted(listed - {w[0]["path"] for w in work}):
+            print(f"not in this run's work list, skipped: {p}", flush=True)
+        work = [w for w in work if w[0]["path"] in listed]
+        a.force = logged_refusals({w[0]["path"] for w in work})
+        for p in sorted(p for p, why in a.force.items() if not why):
+            print(f"no proof refusal in the decision log, so it is not forced: {p}", flush=True)
     # A dry run reads SCAN_WORKERS files at a time, like a scan, and --workers wins. An apply edits one file at a time, so
     # --limit, --canary and the Plex pace stay exact. A conversion apply converts CONVERT_WORKERS files at a time through
     # the slots of a pool, see backfill_files().
@@ -5074,6 +5103,7 @@ def backfill(argv):
                   f'{" | heard " + heard if heard else ""}'
                   f'{" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else ""}'
                   f'{" | forced, the proof refused: " + rec["repack"]["forced"][:150] if (rec.get("repack") or {}).get("forced") else ""}'
+                  f'{" | not forced: " + rec["repack"]["not_forced"][:150] if (rec.get("repack") or {}).get("not_forced") else ""}'
                   f'{" | " + "; ".join(rec.get("notes", [])) if rec.get("notes") else ""}'
                   f'{" | ALERT " + "; ".join(rec["alerts"]) if rec.get("alerts") else ""}', flush=True)
         if a.apply and (rec["result"] == "edited" or {"repacked", *REPAIRED} & set(rec.get("reasons", []))) and want and CFG["PLEX_URL"]:
