@@ -685,8 +685,9 @@ def test_the_check_before_a_put_is_a_fresh_read(env, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def plex_analyzed():
-    """The worker's record of the last analyze per section starts empty in each test."""
+    """The worker's record of the last analyze per section, and its read of the decision log, start empty in each test."""
     hook.PLEX_ANALYZED.clear()
+    hook.PLEX_LOGGED[:] = [0, collections.defaultdict(float), None]
 
 
 def drain(pending):
@@ -782,6 +783,23 @@ def test_a_scan_queued_after_an_analyze_waits_for_two_idle_checks(env, monkeypat
     pending = [c, a]
     hook.plex_pass(pending)
     assert pending == [a] and a["quiet"] == hook.time.monotonic() and plex_lines(env)[-1] == ("plex", "plex_scan_failed")   # its first new check
+
+
+def test_a_worker_folder_scan_waits_for_a_backfill_analyze_in_the_log(env, monkeypatch):
+    """A backfill is another process, so the worker's own record of its analyzes misses it. The decision log has it. The
+    scan waits PLEX_SCAN_AFTER after it, then takes two new idle checks, as --plex-flush does."""
+    sent = refreshes(env, monkeypatch)
+    at = []
+    real_http = hook.http
+    monkeypatch.setattr(hook, "http", lambda url, *a, **k: (at.append(hook.time.time()) if "/refresh" in url else None) or real_http(url, *a, **k))
+    start = hook.time.time()
+    log_at_clock(dict(app="radarr", source="backfill", result="edited", plex="analyze sent for 7101", plex_reason="plex_analyze_sent",
+                      plex_section="12"))
+    drain([hook.plex_folder_job("radarr", "hook", "Film A (1979)", os.path.dirname(env["path"]), "abc123")])
+    assert len(sent) == 1 and at[0] - start >= hook.PLEX_SCAN_AFTER
+    c = env["checks"]   # two idle checks, the wait for the logged analyze, two new checks. The log's time has whole seconds.
+    assert len(c) == 4 and c[:2] == [0, 15] and hook.PLEX_SCAN_AFTER - 1 < c[2] <= hook.PLEX_SCAN_AFTER and c[3] - c[2] == 15
+    assert plex_lines(env) == [("plex_deferred", "plex_scan_after_analyze"), ("plex", "plex_scan_sent")]
 
 
 def test_backfill_skips_a_section_it_gave_up_on_at_once(env, monkeypatch, tmp_path, capsys):

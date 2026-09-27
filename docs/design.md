@@ -155,7 +155,8 @@ does not wait `PLEX_QUIET` for each file.
 
 **A folder scan.** A renamed file is not in Plex until Plex scans its folder. So a conversion or a
 restore under another name queues a partial scan of its one folder. Plex's work after an analyze
-shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section.
+shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section. The worker reads
+the decision log for this, as `--plex-flush` does, so it also waits for a backfill's analyzes.
 An analyze waits while a folder scan of its section is pending.
 
 ## Alerts

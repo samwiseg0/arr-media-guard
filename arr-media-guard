@@ -749,27 +749,10 @@ def plex_flush(argv):
             if mine:
                 roots[(d["key"], loc["path"])] = mine
                 left = [x for x in left if x not in mine]
-    log_at, skipped = [0, collections.defaultdict(float)], set()   # the decision log's read offset, section -> last analyze
-
-    def after_analyze(section):   # seconds the scan must still wait, from every analyze the log records by now
-        with contextlib.suppress(OSError), open(CFG["LOG"], "rb") as fh:
-            if os.fstat(fh.fileno()).st_size < log_at[0]:   # turned by logrotate: read the new file from its start
-                log_at[0] = 0
-            fh.seek(log_at[0])
-            for line in fh:
-                if not line.endswith(b"\n"):
-                    break   # half a line: read it again next time
-                log_at[0] += len(line)
-                with contextlib.suppress(ValueError, KeyError, TypeError):
-                    r = json.loads(line)
-                    if r.get("plex_reason") in ("plex_analyze_sent", "plex_analyze_failed"):
-                        at, s = datetime.datetime.fromisoformat(r["time"]).timestamp(), r.get("section") or r.get("plex_section")
-                        for k in [str(s)] if s is not None else ["*"]:
-                            log_at[1][k] = max(log_at[1][k], at)
-        return max(0.0, PLEX_SCAN_AFTER - (time.time() - max(log_at[1][str(section)], log_at[1]["*"])))
+    seen, skipped = [0, collections.defaultdict(float), None], set()   # see after_analyze()
     for (section, root), mine in sorted(roots.items()):
         p = plex_folder_job(app, "backfill", f"section {section}", root, None)
-        done, code = plex_analyze(p, skipped, ready=lambda s=section: after_analyze(s))
+        done, code = plex_analyze(p, skipped, ready=lambda s=section: after_analyze(seen, s))
         log(dict(app=app, source="backfill", label=p["label"], path=root, result="plex", plex=done, plex_reason=code, section=section,
                  folders=len(mine)))
         print(f"section {section} at {root}, {len(mine)} folders: {done}", flush=True)
@@ -781,6 +764,31 @@ def plex_flush(argv):
         else:
             left += mine
     print(f"{len(folders) - len(left)} folders scanned, {len(left)} left on the list", flush=True)
+
+
+def after_analyze(seen, section):
+    """Seconds a folder scan of section must still wait, so that PLEX_SCAN_AFTER passes after every analyze the decision
+    log records by now. seen is [read offset, section -> time of the last analyze, inode], kept by the caller, so each
+    call reads only the new lines. A new inode or a shorter file is a log that logrotate turned. It is read from its
+    start."""
+    with contextlib.suppress(OSError), open(CFG["LOG"], "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if st.st_ino != seen[2] or st.st_size < seen[0]:
+            seen[0], seen[2] = 0, st.st_ino
+        fh.seek(seen[0])
+        for line in fh:
+            if not line.endswith(b"\n"):
+                break   # half a line: read it again next time
+            seen[0] += len(line)
+            if b'"plex_analyze_' not in line:   # most lines, and json.loads() is slow on a large log
+                continue
+            with contextlib.suppress(ValueError, KeyError, TypeError):
+                r = json.loads(line)
+                if r.get("plex_reason") in ("plex_analyze_sent", "plex_analyze_failed"):
+                    at, s = datetime.datetime.fromisoformat(r["time"]).timestamp(), r.get("section") or r.get("plex_section")
+                    for k in [str(s)] if s is not None else ["*"]:
+                        seen[1][k] = max(seen[1][k], at)
+    return max(0.0, PLEX_SCAN_AFTER - (time.time() - max(seen[1][str(section)], seen[1]["*"])))
 
 
 def plex_folder_scan(p, send=False):
@@ -4390,7 +4398,8 @@ def plex_pass(pending):
             continue
         if plex_scan_first(p, pending):   # not yet: its two idle checks start again after the scan
             p["quiet"] = None
-        done, code = plex_step(p, cache=cache)
+        # a folder scan also waits for the analyzes of every other sender on this host, a backfill's among them
+        done, code = plex_step(p, cache=cache, ready=(lambda p=p: after_analyze(PLEX_LOGGED, p["section"])) if (p["want"] or {}).get("folder") else None)
         if done or code:
             plex_note(p, done, code)
         if code in ("plex_analyze_sent", "plex_analyze_failed"):   # a failed request may still have reached Plex
@@ -4404,6 +4413,7 @@ def plex_pass(pending):
 
 PLEX_SCAN_AFTER = 300   # seconds a folder scan waits after the last analyze sent in its section, then its two idle checks
 PLEX_ANALYZED = {}      # library section -> time.monotonic() of the last analyze this worker sent there
+PLEX_LOGGED = [0, collections.defaultdict(float), None]   # after_analyze()'s read of the decision log, for the worker
 
 
 def plex_scan_first(p, pending):
@@ -4412,8 +4422,9 @@ def plex_scan_first(p, pending):
     goes out first, and the gate then holds each analyze until the scan ends. An analyze that went out before the scan
     was queued is no longer pending, so plex_pass() holds the scan PLEX_SCAN_AFTER seconds after the section's last
     analyze instead, then its two idle checks. That is a delay, so it never deadlocks. A request that failed may still
-    have reached Plex, so any end of an item restarts the other kind's checks."""
-    # ponytail: PLEX_ANALYZED lives in the worker, so a new worker does not know the analyzes of a stopped one
+    have reached Plex, so any end of an item restarts the other kind's checks. Right before the send, the scan also
+    waits PLEX_SCAN_AFTER after every analyze the decision log records, see after_analyze(). That covers a backfill, a
+    stopped worker and this worker."""
     return not (p["want"] or {}).get("folder") and p["section"] is not None and \
         any(q["section"] == p["section"] and (q["want"] or {}).get("folder") for q in pending if q is not p)
 
