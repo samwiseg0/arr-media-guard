@@ -456,8 +456,30 @@ The proof allows a cut last frame and a cut first audio frame that mkvmerge drop
 frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
-The proof also allows a last sample that an MP4 edit list hides. Any other lost packet fails, and
-the file keeps its original.
+The proof also allows a last sample that an MP4 edit list hides.
+
+A few packets more may go at the ends when every other packet matches in order. The video may lose
+up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose
+junk at its start, zero packets at its end, and one cut frame at each end, up to 16 packets
+(`JUNK_MAX`). Junk is a packet of zero bytes, or a stray RIFF header of at most 128 bytes. A read of
+the first packets shows a header, and it runs only when a lost packet before the first frame is not
+zeros. The kept audio must keep its start and its times, so audio that moved still fails. The proof
+entry names each lost packet in `dropped_start` or `dropped_end`, with its time, size and kind.
+
+Three more differences pass, each with its own check:
+
+- An HEVC codec header can hold units that mkvmerge copies into packet 0, such as an SEI. The proof
+  filter takes out only the parameter sets. When only packet 0 differs, one packet of each file is
+  read. It passes when the new packet 0 holds the original's and units of the header, byte for byte.
+  The entry names them in `header_units`.
+- An MP4 can give two AAC packets one time, and mkvmerge spaces them one frame apart. When the time
+  check fails, each time is measured against the video's start. A packet that shares its time may
+  move one frame, and every other packet 2 ms. The entry names it in `times.shared`.
+- An MP4 timed-text cue can start and end at one time, beside another cue at that start. mkvmerge
+  gives it a length. It passes when it keeps its start and text and ends at or before the next
+  cue. The entry names it in `zero_length`.
+
+Any other lost packet fails, and the file keeps its original.
 
 **Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
 whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>

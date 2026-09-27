@@ -6150,14 +6150,16 @@ def test_a_cut_last_frame_passes_and_is_logged(monkeypatch, tmp_path, lost, faul
 
 def test_packet_hashes_keep_the_digests_without_the_first_packet(monkeypatch, tmp_path):
     """A cut first audio frame is proved by the digest over every packet but the first, and a cut frame at both ends by
-    the digest without the first and the last."""
-    lines = ["#tb 0: 1/1000"] + [f"0, {i * 32}, {i * 32}, 32, {z}, m{i}" for i, z in enumerate((144, 768, 768, 412))]
+    the digest without the first and the last. The md5 and the size of each packet stay too."""
+    m = [hook.hashlib.md5(bytes([i])).hexdigest() for i in range(4)]
+    lines = ["#tb 0: 1/1000"] + [f"0, {i * 32}, {i * 32}, 32, {z}, {m[i]}" for i, z in enumerate((144, 768, 768, 412))]
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: open(argv[-1], "w").write("\n".join(lines) + "\n")
                         and types.SimpleNamespace(returncode=0, stderr=""))
     s = hook.packet_hashes("/m/x.avi", [1], {}, [], str(tmp_path), 60)[0][1]
-    sha = lambda *m: hook.hashlib.sha256("".join(m).encode()).hexdigest()
-    assert (s["digest"], s["but_last"], s["but_first"], s["but_ends"]) == (sha("m0", "m1", "m2", "m3"), sha("m0", "m1", "m2"), sha("m1", "m2", "m3"), sha("m1", "m2"))
+    sha = lambda *k: hook.hashlib.sha256("".join(m[i] for i in k).encode()).hexdigest()
+    assert (s["digest"], s["but_last"], s["but_first"], s["but_ends"]) == (sha(0, 1, 2, 3), sha(0, 1, 2), sha(1, 2, 3), sha(1, 2))
     assert (s["first"], s["first_pts"], s["last"], s["last_pts"]) == (144, 0.0, 412, 0.096)
+    assert s["md5s"] == bytes.fromhex("".join(m)) and list(s["sizes"]) == [144, 768, 768, 412]
 
 
 @pytest.mark.parametrize("case, fault", [
@@ -6315,6 +6317,185 @@ def test_a_failed_time_check_reads_the_stored_times_again(monkeypatch, tmp_path,
         assert fault is None and proof[0]["match"] and times["reread"]["worst_ms"] < 1, (fault, times)
     else:
         assert fault.startswith("a packet of stream video 0 (h264) moved 42 ms") and 41 < times["reread"]["worst_ms"] < 43, fault
+
+
+def packets_of(datas, times, step):
+    """packet_hashes() of one stream from the data and the time of each packet, with their md5s and sizes."""
+    md5s = b"".join(hook.hashlib.md5(d).digest() for d in datas)
+    return {"count": len(datas), "empty": 0, "digest": hook.hashlib.sha256(md5s).hexdigest(), "md5s": bytearray(md5s),
+            "sizes": hook.array.array("L", map(len, datas)), "times": list(times), "start": round(min(times), 3),
+            "end": round(max(times) + step, 3)}
+
+
+def fake_proof_reads(monkeypatch, fam, streams, old, new, packets=None):
+    """prove() of a.src against a.mkv in the current folder with fake reads: ff_streams() gives fam and streams,
+    packet_hashes() old or new, and packet_data() the first n packets of packets, joined. Returns the list of
+    packet_data() reads."""
+    open("a.src", "w").close(); open("a.mkv", "w").close()
+    monkeypatch.setattr(hook, "ff_streams", lambda p: (fam if p.endswith(".src") else "matroska,webm", streams, 20.0))
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
+                        (old if path.endswith(".src") else new, {}))
+    monkeypatch.setattr(hook, "stored_times", lambda path, index, timeout: new[index]["times"])   # as ffmpeg read them
+    reads = []
+    monkeypatch.setattr(hook, "packet_data", lambda path, index, bsf, n, timeout: reads.append((index, n)) or b"".join(packets[:n]))
+    return reads
+
+
+@pytest.mark.parametrize("lost, other, fault", [
+    (3, None, None),   # the last 3 frames
+    (4, None, "stream video 0 (h264) holds 196 packets in the new file, 200 in the original"),
+    (2, 50, "stream video 0 (h264) holds 198 packets in the new file, 200 in the original"),   # and a frame in the middle differs
+])
+def test_up_to_three_video_packets_may_go_at_the_end(monkeypatch, tmp_path, lost, other, fault):
+    monkeypatch.chdir(tmp_path)
+    """The new file may lack up to 3 video packets at its end when every other packet matches in order. The proof
+    names each lost packet with its time and size. A fourth lost packet, or another packet that differs, fails."""
+    frame = 1001 / 24000
+    datas, times = [bytes([i % 251]) * (100 + i) for i in range(200)], [i * frame for i in range(200)]
+    kept = datas[:200 - lost]
+    if other:
+        kept[other] = b"x" + kept[other][1:]
+    fake_proof_reads(monkeypatch, "mov,mp4,m4a,3gp,3g2,mj2", [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
+                     {0: packets_of(datas, times, frame)}, {0: packets_of(kept, [round(t, 3) for t in times[:200 - lost]], frame)})
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert got == fault, got
+    if not fault:
+        assert proof[0]["match"] and proof[0]["dropped_end"] == [{"pts": round(times[i], 3), "size": 100 + i, "kind": "lost"} for i in (197, 198, 199)]
+
+
+FRAME_AC3 = 0.032
+AUDIO_JUNK = {   # (the original's junk at the start, at the end, whether the new file keeps the cut last frame, its move)
+    "zero packets at the end": ([], [bytes(768)] * 6, True, None),
+    "header and zeros at the start, cut last frame": ([b"RIFF" + bytes(66), bytes(400)], [], False, None),
+    "zero bytes at the start, audio late": ([bytes(1599)], [], True, 0.1),
+    "two frames lost at the start": ([b"\x0b\x77" + bytes([1]) * 98, b"\x0b\x77" + bytes([2]) * 98], [], True, None),
+}
+
+
+@pytest.mark.parametrize("case, fault", [
+    ("zero packets at the end", None),
+    ("header and zeros at the start, cut last frame", None),
+    ("zero bytes at the start, audio late", "stream audio 1 starts +0.100 s from the video in the new file, +0.000 s in the original"),
+    ("two frames lost at the start", "stream audio 1 (ac3) holds 300 packets in the new file, 302 in the original"),
+])
+def test_audio_may_lose_junk_and_cut_frames_at_its_ends(monkeypatch, tmp_path, case, fault):
+    monkeypatch.chdir(tmp_path)
+    """Audio may lose packets of zero bytes and a stray RIFF header at its start, zero packets at its end, and a cut
+    frame at each end, when every other packet matches in order. The kept packets keep their start and their times:
+    audio that runs 100 ms late for its first 0.5 s after a lost run of 1,599 zero bytes fails. Two real frames lost
+    at the start fail, and a read of the first packets shows they are no header."""
+    head, tail, cut_kept, late = AUDIO_JUNK[case]
+    frames = [b"\x0b\x77" + bytes([i % 251]) * (766 - i % 7) for i in range(300)]
+    cut = [] if cut_kept else [b"\x0b\x77" + bytes(80)]
+    old_datas = head + frames + cut + tail
+    old_times = [0.0] * len(head) + [i * FRAME_AC3 for i in range(300 + len(cut) + len(tail))]
+    new_times = [round(i * FRAME_AC3 + (late if late and i * FRAME_AC3 < 0.5 else 0), 3) for i in range(300)]
+    video = packets_of([bytes([i % 251]) * 900 for i in range(240)], [i * 0.04 for i in range(240)], 0.04)
+    reads = fake_proof_reads(monkeypatch, "mpegts", [{"index": 0, "codec_type": "video", "codec_name": "mpeg2video"},
+                                                     {"index": 1, "codec_type": "audio", "codec_name": "ac3"}],
+                             {0: video, 1: packets_of(old_datas, old_times, FRAME_AC3)}, {0: video, 1: packets_of(frames, new_times, FRAME_AC3)},
+                             old_datas)
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert got == fault, got
+    # one read of the first packets, as many as the stream lost, and only for a non-zero packet before the first frame
+    assert reads == {"header and zeros at the start, cut last frame": [(1, 3)], "two frames lost at the start": [(1, 2)]}.get(case, []), reads
+    if case == "zero packets at the end":
+        assert [d["kind"] for d in proof[1]["dropped_end"]] == ["zero"] * 6 and "dropped_start" not in proof[1] and proof[1]["match"]
+    elif not fault:
+        assert [(d["kind"], d["size"]) for d in proof[1]["dropped_start"]] == [("header", 70), ("zero", 400)]
+        assert [(d["kind"], d["size"]) for d in proof[1]["dropped_end"]] == [("cut", 82)] and proof[1]["start"] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("move, other, fault", [
+    (1, 0, None),   # mkvmerge spaces the two packets of one time one frame apart
+    (2, 0, "a packet of stream audio 1 (aac) moved 43 ms against its stream's start"),
+    (1, 0.005, "a packet of stream audio 1 (aac) moved 26 ms against its stream's start"),   # and a later packet moves 5 ms
+])
+def test_audio_packets_that_share_a_time_may_move_one_frame(monkeypatch, tmp_path, move, other, fault):
+    monkeypatch.chdir(tmp_path)
+    """In an MP4 the first two AAC packets may carry one time. mkvmerge moves the first one a frame earlier. Against the
+    video's start, a packet that shares its time may move one frame, and every other packet 2 ms. Two frames, or
+    another packet that moves 5 ms, fail."""
+    frame = 1024 / 48000
+    datas = [bytes([i % 251]) * 300 for i in range(500)]
+    old = [0.0, 0.0] + [i * frame for i in range(1, 499)]
+    new = [round(-move * frame, 3), 0.0] + [round(i * frame + (other if i == 100 else 0), 3) for i in range(1, 499)]
+    video = packets_of([bytes([i % 251]) * 900 for i in range(250)], [i * 0.04 for i in range(250)], 0.04)
+    fake_proof_reads(monkeypatch, "mov,mp4,m4a,3gp,3g2,mj2", [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"},
+                                                              {"index": 1, "codec_type": "audio", "codec_name": "aac"}],
+                     {0: video, 1: packets_of(datas, old, frame)}, {0: video, 1: packets_of(datas, new, frame)})
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert (got or "").startswith(fault or "") and bool(got) == bool(fault), got
+    assert proof[1]["times"]["shared"]["packets"] == 2 and proof[1]["times"]["shared"]["frame_ms"] == 21.3
+
+
+SEI_UNIT = bytes.fromhex("4e0181010f80")   # a prefix SEI in the codec header
+SLICE_UNIT = bytes.fromhex("2601af") + bytes(range(1, 60))
+
+
+@pytest.mark.parametrize("case", ["header unit", "other unit", "clean"])
+def test_an_hevc_packet_0_may_hold_a_unit_of_the_codec_header(monkeypatch, tmp_path, case):
+    monkeypatch.chdir(tmp_path)
+    """mkvmerge copies the units of the HEVC codec header into packet 0, and the proof filter takes out only the
+    parameter sets. Packet 0 passes when it holds the original's packet 0 and units of the header, byte for byte, and
+    every other packet matches. A unit that is not in the header fails. A clean stream reads no packet."""
+    start = b"\0\0\0\1"
+    old = start + SLICE_UNIT
+    new = {"header unit": start + SEI_UNIT + start + SLICE_UNIT, "other unit": start + SEI_UNIT[:-2] + b"\x0e\x80" + start + SLICE_UNIT,
+           "clean": old}[case]
+    stats = lambda first, digest: {"count": 48, "empty": 0, "digest": digest, "but_first": "rest", "first": len(first), "start": 0.0,
+                                   "end": 2.0, "times": [i * 0.04 for i in range(48)]}
+    fake_proof_reads(monkeypatch, "mov,mp4,m4a,3gp,3g2,mj2", [{"index": 0, "codec_type": "video", "codec_name": "hevc"}],
+                     {0: stats(old, "d-old")}, {0: stats(new, "d-old" if case == "clean" else "d-new")})
+    reads = []
+    monkeypatch.setattr(hook, "packet_data", lambda path, index, bsf, n, timeout: reads.append((path[-3:], bsf, n)) or (old if path.endswith(".src") else new))
+    monkeypatch.setattr(hook, "hvcc_units", lambda path, index, timeout: [bytes.fromhex("4001"), bytes.fromhex("4201"), bytes.fromhex("4401"), SEI_UNIT])
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    if case == "clean":
+        assert got is None and reads == [] and "header_units" not in proof[0]
+    elif case == "other unit":
+        assert got == "the packet data of stream video 0 (hevc) differ", got
+    else:
+        assert got is None and proof[0]["header_units"] == ["4e0181010f80"], (got, proof)
+        assert reads == [("src", hook.NO_AUD["hevc"], 1), ("mkv", hook.NO_AUD["hevc"], 1)]
+
+
+def test_a_real_hevc_remux_passes_with_the_header_sei_in_packet_0(tmp_path):
+    """x265 writes an SEI into the HEVC codec header of an MP4, and mkvmerge copies it into packet 0 of the new file."""
+    if not (shutil.which("mkvmerge") and shutil.which("ffmpeg")) or "libx265" not in REAL_RUN(["ffmpeg", "-hide_banner", "-encoders"],
+                                                                                                capture_output=True, text=True).stdout:
+        pytest.skip("needs ffmpeg with libx265 and mkvmerge")
+    src, out = tmp_path / "Clip.mp4", tmp_path / "new.mkv"
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=2", "-c:v", "libx265", "-x265-params",
+              "log-level=none", "-tag:v", "hvc1", str(src)], check=True)
+    REAL_RUN(["mkvmerge", "-q", "--disable-lacing", "-o", str(out), str(src)], check=True)
+    fault, proof = hook.prove(str(src), str(out), [], str(tmp_path))
+    assert fault is None and proof[0]["header_units"][0].startswith("4e01"), (fault, proof)
+
+
+@pytest.mark.parametrize("case, fault", [
+    ("zero cue", None),
+    ("runs into the next cue", "the mov_text stream 1 "),
+    ("another cue moved", "the mov_text stream 1 "),
+])
+def test_a_zero_length_cue_may_get_a_length(monkeypatch, tmp_path, case, fault):
+    (tmp_path / "a.src").touch(); (tmp_path / "a.mkv").touch()
+    """An MP4 timed-text cue may start and end at one time, beside another cue at that start. mkvmerge gives it a
+    length, and the sort then puts the pair the other way round. It passes when it keeps its start and text and ends
+    before the next cue. One that runs into the next cue fails, and so does any other cue that moved."""
+    nxt = "00:01:01,800" if case == "runs into the next cue" else "00:01:04,000"
+    srt = lambda zero_end, open_end: (f"1\n00:01:00,000 --> {zero_end}\n- Who is it?\n\n2\n00:01:00,000 --> {open_end}\n- Open the door.\n\n"
+                                      f"3\n{nxt} --> 00:01:06,000\nThe next line\n")
+    old, new = srt("00:01:00,000", "00:01:01,500"), srt("00:01:02,000", "00:01:01,700" if case == "another cue moved" else "00:01:01,500")
+    monkeypatch.setattr(hook, "ff_streams", lambda p: ("mov,mp4" if p.endswith(".src") else "matroska,webm",
+                                                       [{"index": 0, "codec_type": "video", "codec_name": "h264"},
+                                                        {"index": 1, "codec_type": "subtitle", "codec_name": "mov_text" if p.endswith(".src") else "subrip"}], 90.0))
+    video = {"count": 10, "empty": 0, "digest": "v", "start": 0.0, "end": 90.0, "times": [i * 9.0 for i in range(10)]}
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
+                        ({0: video}, {i: old if path.endswith(".src") else new for i in texts}))
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert (got or "").startswith(fault or "") and bool(got) == bool(fault), got
+    assert proof[1].get("zero_length") == ([60.0] if case != "runs into the next cue" else None), proof[1]
 
 
 def test_the_extras_come_from_the_apps_own_database(tmp_path, monkeypatch):
