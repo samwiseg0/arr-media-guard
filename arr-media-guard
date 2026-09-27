@@ -21,6 +21,7 @@
   arr-media-guard --backfill <radarr|sonarr> --apply --plan-from FILE [--canary N]
   arr-media-guard --backfill <radarr|sonarr> --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
   arr-media-guard --backfill <radarr|sonarr> --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]
+  arr-media-guard --backfill <radarr|sonarr> --convert --apply --force-convert PATH [PATH ...] [--ids ID ...]
   arr-media-guard --plex-flush <radarr|sonarr>
   arr-media-guard --backfill <radarr|sonarr> --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --backfill <radarr|sonarr> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
@@ -2481,7 +2482,7 @@ def content_text(ev):
 
 
 def process(app, path, label, original, runtime, apply=True, post=True, source="hook", job=None, audio=True, kids=False, release="",
-            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None):
+            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=False):
     """Probe one file and decide its flags. Hear the audio language when the decision needs it, check the audio (hook
     only), edit the flags when the rules say so, and verify. Then run the metadata checks and alert.
 
@@ -2501,7 +2502,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     deletes anything. pool is the conversion pool of a backfill with several workers, see backfill_files(). lock is then
     held shared, and the conversion runs under it. convert_on says whether a file that is not .mkv converts: CONVERT for
     the hook, --convert for a backfill. A .mkv file that holds another container converts either way. A backfill with
-    --convert stops after the conversion: the language backfill decides the flags later, from its own cache.
+    --convert stops after the conversion: the language backfill decides the flags later, from its own cache. force
+    converts the file when the proof refuses it, see convert().
     Returns the decision log record, which the caller writes with decision().
     """
     ctx = ctx or {"listed": runtime}
@@ -2518,7 +2520,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if (mkv and container != "Matroska") or (not mkv and conv):   # mkvpropedit edits Matroska only, see convert()
         if shared and apply and not pool:
             raise Replan("the file needs a repack")
-        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool)
+        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force)
         if lock is not None and not pool and result.startswith(("repacked", "repack failed")):   # convert() let the lock go, see there
             gated(lock, fcntl.LOCK_EX)
         if job is not None and "warnings" in rec["repack"]:
@@ -3999,7 +4001,7 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=False):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (result, info,
     the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not matroska, ...".
@@ -4018,7 +4020,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
     original's inode, size and mtime once more and renames. The app's import holds no lock, and an undo takes it
     exclusive again. The lock comes back free once the remux started. pool is the worker's pool, see backfill_files(): the
     import holds no worker slot, and pool.imports sends it with the other files of the item that wait. Only the main
-    thread sets a signal handler or the time limit."""
+    thread sets a signal handler or the time limit.
+
+    force converts the file when prove() refuses it: a person checked the refusal and accepts it. info names the
+    refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -4080,8 +4085,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
         if (new_j.get("container") or {}).get("type") != "Matroska":
             raise RuntimeError(f"the new file reads as {(new_j.get('container') or {}).get('type')}")
         fault, info["proof"] = prove(path, tmp, subs, folder, cc)
-        if fault:
+        if fault and not force:
             raise RuntimeError(fault)
+        if fault:
+            info["forced"] = fault
         try:
             os.chown(tmp, st.st_uid, st.st_gid)
         except PermissionError as ex:   # a NAS share may refuse chown, see repack()
@@ -4106,6 +4113,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
             now = os.stat(path)
         if not now or (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
             raise SourceChanged("the app replaced or renamed the original during the repack")
+        if info.get("forced"):   # a hard link: one move puts the original back
+            try:
+                info["kept"] = keep_original(path)
+            except OSError as ex:
+                raise RuntimeError(f"the original could not be kept, so it stays: {ex}") from None
         if main:
             signal.signal(signal.SIGTERM, term)   # from here a stop waits for the swap and the job's end, as for mkvpropedit
         with no_stop():
@@ -4180,6 +4192,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
             pending_edit(key, dict(entry, state="stranded", error=mask(str(ex))[:200]))
         elif entry is not None:
             pending_edit(key)
+        if info.get("kept") and undo != "completed":   # the original stays, at its name or the held name, so its kept link goes
+            with contextlib.suppress(OSError):
+                if st.st_ino in {os.stat(p).st_ino for p in (path, held) if os.path.lexists(p)}:
+                    os.remove(info["kept"])
+                    del info["kept"]
         if not isinstance(ex, Exception):
             raise
         if undo == "completed":
@@ -4191,6 +4208,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None):
         if main:
             signal.signal(signal.SIGTERM, term)
         shutil.rmtree(folder, ignore_errors=True)
+    if info.get("kept"):
+        prune_originals(originals_root(path))
     info.update(new_size=size, new_tracks=track_list(new_j))
     return "repacked", info, new
 
@@ -4788,7 +4807,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": want["guids"]}
     run = lambda lock, shared, pool: process(app, path, label, original, runtime, apply=a.apply, post=False, source="backfill", kids=kids,
                                              release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, ctx=ctx, lock=lock, shared=shared,
-                                             pool=pool, convert_on=a.convert)
+                                             pool=pool, convert_on=a.convert, force=path in a.force)
     try:
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
@@ -4814,8 +4833,12 @@ def backfill(argv):
     ap.add_argument("--restart", action="store_true"); ap.add_argument("--workers", type=int)
     ap.add_argument("--plan-out"); ap.add_argument("--plan-from"); ap.add_argument("--canary", type=int, default=0)
     ap.add_argument("--only-undecided", action="store_true"); ap.add_argument("--convert", action="store_true")
-    ap.add_argument("--plex-later", action="store_true")
+    ap.add_argument("--plex-later", action="store_true"); ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH")
     a = ap.parse_args(argv); app, ids = a.app, set(a.ids)
+    if a.force_convert and not (a.convert and a.apply):
+        ap.error("--force-convert needs --convert --apply")
+    if a.force_convert and not KEEP_DAYS:
+        ap.error("--force-convert needs KEEP_ORIGINALS_DAYS above 0, so the original is kept")
     if a.plex_later and not (a.convert and a.apply):
         ap.error("--plex-later needs --convert --apply")
     if a.canary and not (a.plan_from and a.apply):
@@ -4856,6 +4879,9 @@ def backfill(argv):
                       or str(r.get("header_repair", "")).startswith("would repair header"))]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
+    a.force = {os.path.abspath(p) for p in a.force_convert}   # a person checked each refusal, docs/design.md, "Conversion"
+    for p in sorted(a.force - {w[0]["path"] for w in work}):
+        print(f"not in this run's work list, skipped: {p}", flush=True)
     # A dry run reads SCAN_WORKERS files at a time, like a scan, and --workers wins. An apply edits one file at a time, so
     # --limit, --canary and the Plex pace stay exact. A conversion apply converts CONVERT_WORKERS files at a time through
     # the slots of a pool, see backfill_files().
@@ -4897,6 +4923,7 @@ def backfill(argv):
             print(f'{rec["result"][:60]:<12} {label} | {edit_text(pos, rec.get("edits", []))}'
                   f'{" | heard " + heard if heard else ""}'
                   f'{" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else ""}'
+                  f'{" | forced, the proof refused: " + rec["repack"]["forced"][:150] if (rec.get("repack") or {}).get("forced") else ""}'
                   f'{" | " + "; ".join(rec.get("notes", [])) if rec.get("notes") else ""}'
                   f'{" | ALERT " + "; ".join(rec["alerts"]) if rec.get("alerts") else ""}', flush=True)
         if a.apply and (rec["result"] == "edited" or {"repacked", *REPAIRED} & set(rec.get("reasons", []))) and want and CFG["PLEX_URL"]:
@@ -5070,7 +5097,8 @@ def audit(argv):
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
             if (r.get("repack") or {}).get("new_size"):
-                add(repacked, f'repacked from {r.get("container")}', r.get("label")); seen.append(("changed", r))
+                add(repacked, f'repacked from {r.get("container")}' + (", forced" if r["repack"].get("forced") else ""), r.get("label"))
+                seen.append(("changed", r))
             code = (r.get("header_repair") or {}).get("code")
             if code in REPAIRED:
                 add(headers, {"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "subtitles removed",
@@ -5148,7 +5176,8 @@ LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "Germa
 def change_phrases(r):
     """The changes one decision line records, as (phrase, role) in the plain words of layout B: "English audio first",
     "English subs on" with the role of the subtitle turned on, "English subs off", "foreign subs off", "fake forced
-    subs off", "audio default flag fixed", "converted to MKV from AVI", "header repaired". Each phrase once."""
+    subs off", "audio default flag fixed", "converted to MKV from AVI" (", forced" when a person forced it), "header
+    repaired". Each phrase once."""
     out, before = [], {t["sel"]: t for t in r.get("before") or []}
     words = {"audio default flag fixed": "audio default flag fixed", "English subtitle off": "English subs off",
              "foreign subtitle off": "foreign subs off", "forced flag cleared": "fake forced subs off"}
@@ -5161,7 +5190,7 @@ def change_phrases(r):
         elif rule in words:
             out.append((words[rule], None))
     if (r.get("repack") or {}).get("new_size"):
-        out.append((f"converted to MKV from {r.get('container')}", None))
+        out.append((f"converted to MKV from {r.get('container')}" + (", forced" if r["repack"].get("forced") else ""), None))
     code = (r.get("header_repair") or {}).get("code")
     if code in REPAIRED:
         out.append(({"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "a subtitle track removed"}[code],

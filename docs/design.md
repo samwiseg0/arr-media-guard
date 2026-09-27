@@ -415,8 +415,8 @@ to run the undo of a file's last edit. A later import of the same item runs the 
 Every video file that is not Matroska becomes `<base>.mkv`, and so does a `.mkv` file that holds
 another container. `--backfill <app> --convert` converts the library. The hook converts an import
 only with `CONVERT=true`, except a `.mkv` file with another container, which always converts. The
-log calls a conversion a repack. A conversion keeps no original. It proves every stream first, and
-the app must list the new file before the original goes.
+log calls a conversion a repack. A conversion keeps no original, except a forced one. It proves every
+stream first, and the app must list the new file before the original goes.
 
 **Skips.** A skip writes nothing, and the file goes on `STATE_DIR/convert-<app>.txt`.
 
@@ -458,6 +458,16 @@ passes when every other packet matches and the second packet keeps its time. mkv
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
 The proof also allows a last sample that an MP4 edit list hides. Any other lost packet fails, and
 the file keeps its original.
+
+**Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
+whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
+--convert --apply --force-convert PATH [PATH ...]` converts each listed file when the proof refuses
+it. Every other step runs as normal: the remux, the swap, the app's import, the extras and the
+checks after them. The original is hard-linked into `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
+header repair keeps it, so one move undoes the conversion. The option needs `KEEP_ORIGINALS_DAYS`
+above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
+"forced". A listed path that is not in the run's work list is reported and skipped. The hook never
+forces a conversion.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
@@ -536,7 +546,7 @@ decision runs on the new file, and the app rescans the item. A backfill dry run 
 ## Kept originals
 
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for
-`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing. The original is
+`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
 hard-linked to `<mount>/<KEEP_DIR>/<UTC time>/<path from the mount>`, where the mount is the mount
 point that holds the file. With the app root folders and the Plex sections below the mount, nothing
 scans the folder. A hard link needs no space and never leaves the path missing. When a link is not

@@ -200,6 +200,19 @@ arr-media-guard --audit radarr --since 24h --post             # the hook's edits
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.
 
+### Force a conversion
+
+The proof refuses a file that it cannot prove lossless. When you checked the refusal and accept it, name the file:
+
+```
+arr-media-guard --backfill radarr --convert --apply --ids 123 --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
+```
+
+The file converts although the proof refuses it, and every other step runs as normal. The original stays in `KEEP_DIR`
+for `KEEP_ORIGINALS_DAYS`, so one move puts it back. The decision line names the refusal in `repack.forced`, and the
+nightly audit says the conversion was forced. The option needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0.
+A path that is not in the run's work list is reported and skipped.
+
 ## The decision log
 
 `LOG` gets one JSON line per file that a run looks at: the hook, every backfill, the scans and the audit. A line holds

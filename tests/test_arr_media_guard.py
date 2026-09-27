@@ -5646,6 +5646,43 @@ def test_a_backfill_converts_from_its_plan_with_a_canary_and_a_cap(env, monkeypa
     assert [q["path"] for m, u, q in sent] == [[os.path.dirname(p)] for p in (str(other), mkv)] and analyzes(env) == []
 
 
+@pytest.mark.parametrize("case", ["forced", "forced, not taken", "no option", "not in the work list"])
+def test_a_person_can_force_a_conversion_the_proof_refuses(env, monkeypatch, tmp_path, capsys, case):
+    """--force-convert converts a listed file that the proof refuses, because a person checked the refusal. The decision
+    line names the refusal in forced, the original stays in KEEP_DIR, so one move undoes it, and the nightly audit says
+    forced. When the app does not take the new file, the original goes back and its kept link goes. The same file
+    without the option keeps its original. A path outside the run's work list is reported and skipped."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    env["proof"] = ("stream video 0 (h264) holds 1006 packets in the new file, 1000 in the original", [])
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "movieId": 7, "path": mp4})]
+    root = tmp_path / hook.KEEP_DIR
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(root))
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    before = open(mp4, "rb").read()
+    force = {"no option": [], "not in the work list": ["--force-convert", "/m/Other.mp4"]}.get(case, ["--force-convert", mp4])
+    env["app_takes"] = case != "forced, not taken"
+    with pytest.raises(SystemExit):   # KEEP_ORIGINALS_DAYS 0 keeps no original
+        hook.main(["--backfill", "radarr", "--convert", "--apply", "--force-convert", mp4])
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    with pytest.raises(SystemExit):   # a dry run proves nothing
+        hook.main(["--backfill", "radarr", "--convert", "--force-convert", mp4])
+    hook.main(["--backfill", "radarr", "--convert", "--apply", *force])
+    out = capsys.readouterr().out
+    (rec,) = [r for r in log_lines(env) if r.get("outcome")]
+    if case != "forced":
+        assert rec["outcome"] == "repack_failed" and ("forced" in rec["repack"]) == case.startswith("forced") and "kept" not in rec["repack"], rec
+        assert os.listdir(os.path.dirname(mp4)) == [os.path.basename(mp4)] and os.stat(mp4).st_nlink == 1
+        assert not [f for _, _, fs in os.walk(root) for f in fs]
+        assert ("not in this run's work list, skipped: /m/Other.mp4" in out) == (case == "not in the work list"), out
+        return
+    kept = rec["repack"]["kept"]
+    assert rec["outcome"] == "repacked" and rec["repack"]["forced"] == env["proof"][0], rec
+    assert os.listdir(os.path.dirname(mp4)) == [os.path.basename(mkv)] and "forced, the proof refused: stream video 0" in out
+    assert kept.startswith(str(root) + "/") and kept.endswith(os.path.basename(mp4)) and open(kept, "rb").read() == before
+    assert os.stat(kept).st_nlink == 1   # the held name is gone
+    assert hook.change_phrases(rec) == [(f"converted to MKV from {rec['container']}, forced", None)]
+
+
 def test_backfill_conversions_run_side_by_side_and_swap_under_the_exclusive_lock(env, monkeypatch, tmp_path, capsys):
     """Two workers: both remuxes run at once under the shared file lock, a barrier proves it. Each swap and each flag
     edit holds the lock exclusive, and the app's import holds none. Every file gets its decision line."""
