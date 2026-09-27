@@ -3258,7 +3258,8 @@ def media_streams(streams):
 
 
 def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
-    """One read of path through ffmpeg with -c copy and -copyts. No stream is decoded, only timed text becomes SubRip.
+    """One read of path through ffmpeg with -c copy, -copyinkf and -copyts. No stream is decoded, only timed text becomes
+    SubRip. -copyinkf keeps the frames before the first keyframe, which a copy drops by default in both files.
     With raw the text streams are SubRip already and their packets are written as they are, because ffmpeg's SubRip
     decoder drops a cue whose text starts with a line break.
     maps lists ffprobe stream indexes. bsf maps a stream index to the bitstream filter its packets go through first.
@@ -3269,7 +3270,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
     if maps:
-        argv += [a for i in maps for a in ("-map", f"0:{i}")] + ["-c", "copy"]
+        argv += [a for i in maps for a in ("-map", f"0:{i}")] + ["-c", "copy", "-copyinkf"]   # frames before the first keyframe too
         argv += [a for k, i in enumerate(maps) if bsf.get(i) for a in (f"-bsf:{k}", bsf[i])] + ["-f", "framemd5", out]
     for i, f in srt.items():
         argv += ["-map", f"0:{i}", "-c:s", "copy" if raw else "srt", "-f", "srt", f]
@@ -3450,8 +3451,7 @@ def prove(src, tmp, subs, folder, captions=None):
             video = (va, vb) if s["codec_type"] == "audio" else None   # packets that share a time, see times_fault()
             why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video)
             if why and fb.startswith("matroska"):   # ffmpeg's read may move a few stored times, see stored_times()
-                stored = stored_times(tmp, t["index"], timeout, s["codec_type"] == "video")
-                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored[ycut], video)
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored_times(tmp, t["index"], timeout)[ycut], video)
         proof[-1]["match"] = not why
         fault = fault or why
     for s, t in text:
@@ -3521,22 +3521,18 @@ def times_fault(name, codec, xt, yt, video=None):
     return None, check
 
 
-def stored_times(path, index, timeout, video=False):
+def stored_times(path, index, timeout):
     """The time of each packet with data of stream index of the Matroska file path, in file order, as ffprobe reads it.
-    For video, from the first keyframe on: ffmpeg's -c copy read in packet_hashes() skips the frames before it in both
-    files, and ffprobe does not. An MP4 can start with frames before its first keyframe, and mkvmerge keeps them.
     Matroska stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the
     frames it displays after breaks that guess. ffmpeg's muxer then logs "Non-monotonic DTS", which -v error hides,
     and moves a few packet times of its read. ffprobe only demuxes, so it reads the times the file stores. prove()
     runs this only after a failed time check. A timeout or an ffprobe error raises."""
     r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
-                        "packet=pts_time,size,flags", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
+                        "packet=pts_time,size", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
     if r.returncode:   # a decoder message of the stream probe may show, as in packet_hashes(). A wrong read fails the check.
         raise RuntimeError(f"ffprobe did not read the times of {os.path.basename(path)}: {mask(r.stderr.strip())[-200:]}")
     rows = [line.split(",") for line in r.stdout.splitlines() if line.strip()]
-    if video:
-        rows = rows[next((i for i, row in enumerate(rows) if "K" in row[2]), len(rows)):]
-    return [None if t == "N/A" else float(t) for t, size, _ in rows if size != "0"]
+    return [None if t == "N/A" else float(t) for t, size in rows if size != "0"]
 
 
 def edit_list_sample(src, index, bsf, y, folder, timeout):
@@ -3552,7 +3548,8 @@ def packet_data(path, index, bsf, n, timeout):
     """The data of the first n packets of stream index of path, read with -c copy through bsf, joined. The caller splits
     it by the sizes of its own read. It reads only the start of the file. A timeout or an ffmpeg error raises."""
     r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
-                        *(["-bsf:0", bsf] if bsf else []), "-frames:0", str(n), "-f", "data", "pipe:1"], capture_output=True, timeout=timeout)
+                        "-copyinkf", *(["-bsf:0", bsf] if bsf else []), "-frames:0", str(n), "-f", "data", "pipe:1"], capture_output=True,
+                       timeout=timeout)
     if r.returncode:
         raise RuntimeError(f"ffmpeg did not read the first packets of {os.path.basename(path)}: "
                            f"{mask(r.stderr.decode(errors='replace').strip())[-200:]}")
@@ -3603,8 +3600,9 @@ def ends_lost(src, x, y, s, bsf, timeout):
 
 def junk_head(src, tmp, i, k, bsf, timeout):
     """"zero" or "header" when packet 0 of stream k of tmp is the tail of packet 0 of stream i of src, and the part
-    before it is zeros or a stray header of JUNK_HEADERS of at most JUNK_HEADER_MAX bytes, else None. An AVI can hold
-    such junk inside its first audio packet, and mkvmerge keeps only the frame after it. One packet of each file is read."""
+    before it is zeros or a stray header of JUNK_HEADERS of at most JUNK_HEADER_MAX bytes, else None. The first audio
+    packet can hold such junk in any container, and mkvmerge keeps only the frame after it. The measured files are AVIs.
+    One packet of each file is read."""
     old, new = packet_data(src, i, bsf[0], 1, timeout), packet_data(tmp, k, bsf[1], 1, timeout)
     head = old[:len(old) - len(new)]
     if not new or not head or not old.endswith(new):

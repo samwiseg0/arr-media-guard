@@ -6284,6 +6284,28 @@ def test_a_real_remux_proves_every_stream_at_packet_level(convertible, tmp_path,
         assert tracks == [("eng", True), ("eng", False), ("spa", False)]
 
 
+def test_frames_before_the_first_keyframe_are_proven(tmp_path):
+    """An MP4 can start with frames before its first keyframe. A plain -c copy drops them, so a proof that read both
+    files that way passed a new file that lost them. With -copyinkf the proof reads them: mkvmerge keeps them and
+    passes, and an ffmpeg copy that lost them fails. The one-packet read also starts at packet 0."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, src, kept, lost = (tmp_path / n for n in ("full.mp4", "Clip.mp4", "kept.mkv", "lost.mkv"))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+              "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", str(full)], check=True)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-c", "copy", "-copyinkf", str(src)], check=True)   # a cut mid-GOP
+    remux(src, kept)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(src), "-c", "copy", str(lost)], check=True)
+    fault, proof = hook.prove(str(src), str(kept), [], str(tmp_path))
+    flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags,size", "-of", "csv=p=0", str(src)],
+                     capture_output=True, text=True).stdout.split()
+    before = next(i for i, f in enumerate(flags) if "K" in f.split(",")[1])
+    assert fault is None and before > 10 and proof[0]["count"] == len(flags), (fault, proof, before)
+    assert len(hook.packet_data(str(src), 0, None, 1, 60)) == int(flags[0].split(",")[0])   # packet 0, no keyframe
+    fault, _ = hook.prove(str(src), str(lost), [], str(tmp_path))
+    assert fault == f"stream video 0 (h264) holds {len(flags) - before} packets in the new file, {len(flags)} in the original", fault
+
+
 @pytest.mark.parametrize("tamper, why", [
     (["-c:v", "copy", "-c:a", "aac", "-b:a", "64k", "-c:s", "srt"], "the packet data of stream audio 1 (aac) differ"),
     (["-c:v", "copy", "-c:a", "copy", "-c:s", "srt", "-t", "10"], "stream video 0 (h264) holds 242 packets in the new file, 480 in the original"),
@@ -6459,6 +6481,7 @@ LOST_ONE = "stream audio 1 (mp3) holds 999 packets in the new file, 1000 in the 
     ("header of 128 bytes", None),
     ("header of 129 bytes", LOST_ONE),
     ("other head", LOST_ONE),
+    ("short other head", LOST_ONE),   # 70 bytes of a frame, no RIFF header
     ("not the tail", LOST_ONE),
     ("second packet moved", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +60 ms"),
 ])
@@ -6466,9 +6489,9 @@ def test_a_trimmed_first_frame_may_come_with_a_cut_last_frame(monkeypatch, tmp_p
     """In an AVI, packet 0 of an MP3 stream can hold junk before a whole frame, and the last packet can be a cut frame.
     mkvmerge keeps only the frame after the junk and drops the cut frame. That passes when the new packet 0 is the tail
     of the old one after zeros or a RIFF header of at most 128 bytes, every other packet matches, and the second packet
-    keeps its time within 50 ms. A head of other bytes, or a new packet 0 that is not the tail, fails."""
+    keeps its time within 50 ms. A head of other bytes, short or long, or a new packet 0 that is not the tail, fails."""
     head = {"header": b"RIFF" + bytes(66), "header of 128 bytes": b"RIFF" + bytes(124), "header of 129 bytes": b"RIFF" + bytes(125),
-            "other head": b"\x01" * 626}.get(case, bytes(626))
+            "other head": b"\x01" * 626, "short other head": b"\xff\xfb" + b"\x01" * 68}.get(case, bytes(626))
     old0, new0 = head + MP3_FRAME, MP3_FRAME[:-1] + (b"\x01" if case == "not the tail" else b"\0")
     fam = "mov,mp4,m4a,3gp,3g2,mj2" if case.endswith("MP4") else "avi"
     delta = {"zeros, MP4": 0.0, "second packet moved": 0.06}.get(case, 0.026)
@@ -6523,7 +6546,7 @@ def test_every_stream_keeps_its_start_and_its_packet_times(monkeypatch, tmp_path
         new = dict(old, times=[t + (0.001 if i % 2 else 0) for i, t in enumerate(times)])
     monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
                         ({0: video, 1: old if path.endswith(".src") else new}, {}))
-    monkeypatch.setattr(hook, "stored_times", lambda path, index, timeout, video=False: new["times"])   # the times mkvmerge stored
+    monkeypatch.setattr(hook, "stored_times", lambda path, index, timeout: new["times"])   # the times mkvmerge stored
     src, tmp = tmp_path / "a.src", tmp_path / "a.tmp"
     src.touch(); tmp.touch()
     got, proof = hook.prove(str(src), str(tmp), [], str(tmp_path))
@@ -6535,16 +6558,13 @@ def test_every_stream_keeps_its_start_and_its_packet_times(monkeypatch, tmp_path
 FRAME = 1001 / 24000   # one frame at 23.976 fps
 
 
-@pytest.mark.parametrize("case", ["clean", "read moved", "stored moved", "edit list, read moved", "frames before the keyframe, read moved",
-                                  "frames before the keyframe, stored moved"])
+@pytest.mark.parametrize("case", ["clean", "read moved", "stored moved", "edit list, read moved"])
 def test_a_failed_time_check_reads_the_stored_times_again(monkeypatch, tmp_path, case):
     """Matroska stores no decode times. ffmpeg guesses them, and one frame stored far ahead of the frames it displays
     after breaks the guess. ffmpeg's muxer then moves a few packet times of its read by one frame near one point. ffprobe
     only demuxes, and its read of the same file is clean. So a failed time check reads the stored times of that stream
     again, and only that second check decides. Stored times that really moved still fail. A clean first check runs
-    no second read. When the new file holds the one sample an MP4 edit list hides, the second check leaves it out too.
-    An MP4 can start with 58 frames before its first keyframe, and mkvmerge keeps them. ffmpeg's read skips them in both
-    files, so the second check takes the stored times from the first keyframe on. A keyframe that moved still fails."""
+    no second read. When the new file holds the one sample an MP4 edit list hides, the second check leaves it out too."""
     order = [0, 3, 1, 2]   # an I or P frame, then the two B-frames it displays after, in file order
     src = [(4 * (i // 4) + order[i % 4]) * FRAME for i in range(400)]
     stored = [round(t, 3) for t in src]   # Matroska keeps milliseconds
@@ -6559,13 +6579,9 @@ def test_a_failed_time_check_reads_the_stored_times_again(monkeypatch, tmp_path,
                         ({0: stats(src) if path.endswith(".mp4") else new(stored if case == "clean" else read)}, {}))
     probes = []
 
-    lead = [f"{j * FRAME:.6f},{800 + j},___" for j in range(58)] if case.startswith("frames before") else []   # no keyframe
-    shift = 58 * FRAME if lead else 0
-
-    def run(argv, **kw):   # ffprobe's demux of the new file: pts_time,size,flags per packet, and one packet with no data
+    def run(argv, **kw):   # ffprobe's demux of the new file: pts_time,size per packet, and one packet with no data
         probes.append(argv)
-        kept = (read if case.endswith("stored moved") else stored) + extra
-        rows = lead + [f"{t + shift:.6f},{900 + i},{'K_' if i % 50 == 0 else '__'}_" for i, t in enumerate(kept)] + ["16.700000,0,___"]
+        rows = [f"{t:.6f},{900 + i}" for i, t in enumerate((read if case == "stored moved" else stored) + extra)] + ["16.700000,0"]
         return types.SimpleNamespace(returncode=0, stdout="\n".join(rows) + "\n", stderr="")
     monkeypatch.setattr(hook.subprocess, "run", run)
     (tmp_path / "Film.mp4").touch(); (tmp_path / "new.mkv").touch()
@@ -6578,7 +6594,7 @@ def test_a_failed_time_check_reads_the_stored_times_again(monkeypatch, tmp_path,
     if case.endswith("read moved"):
         assert fault is None and proof[0]["match"] and times["reread"]["worst_ms"] < 1, (fault, times)
         assert ("edit_list" in proof[0]) == bool(extra)
-    else:   # the moved packets include the keyframe of packet 200
+    else:
         assert fault.startswith("a packet of stream video 0 (h264) moved 42 ms") and 41 < times["reread"]["worst_ms"] < 43, fault
 
 
@@ -6598,7 +6614,7 @@ def fake_proof_reads(monkeypatch, fam, streams, old, new, packets=None):
     monkeypatch.setattr(hook, "ff_streams", lambda p: (fam if p.endswith(".src") else "matroska,webm", streams, 20.0))
     monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
                         (old if path.endswith(".src") else new, {}))
-    monkeypatch.setattr(hook, "stored_times", lambda path, index, timeout, video=False: new[index]["times"])   # as ffmpeg read them
+    monkeypatch.setattr(hook, "stored_times", lambda path, index, timeout: new[index]["times"])   # as ffmpeg read them
     reads = []
     monkeypatch.setattr(hook, "packet_data", lambda path, index, bsf, n, timeout: reads.append((index, n)) or b"".join(packets[:n]))
     return reads
