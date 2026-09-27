@@ -131,7 +131,8 @@ COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-g
 TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": "Broken duration header", "edit": "Flag edit failed",
           "policy": "Policy did not load", "content": "Wrong content", "repack": "Repack failed", "video": "Video check uncertain",
           "header": "Header repair failed", "subtitle": "Subtitle runs past the end", "cut": "File may be cut"}
-CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video"}   # the alert kinds that come with a re-grab action
+# the alert kinds that come with a re-grab action
+CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
 WOULD = "A re-grab would delete"   # the start of the action while WRONG_CONTENT_REGRAB is off
 UNCONFIRMED = "A second check did not find the same fault"   # the start of the action when the second check disagrees
 RESTORED = "The hook put back the old file"   # the start of the action when the job's own old file came back, see restore_text()
@@ -187,6 +188,7 @@ CFG = settings()
 REGRAB_CAP = int(CFG.get("REGRAB_CAP") or 30)   # re-grabs per app in 24 hours, a download counts once. Then alerts only.
 VIDEO_REGRAB_CAP = int(CFG.get("VIDEO_REGRAB_CAP") or 30)   # the same for corrupt video, counted apart from REGRAB_CAP
 WRONG_CONTENT_REGRAB = CFG.get("WRONG_CONTENT_REGRAB", "").lower() == "true"   # off: a wrong-content file only alerts
+DAMAGE_REGRAB = CFG.get("DAMAGE_REGRAB", "true").lower() != "false"   # off: a conversion that shows a damaged source only alerts
 REPACK_MAX = float(CFG.get("REPACK_MAX_GB") or 30) * 1e9   # a larger file that is not Matroska is logged and skipped. A header repair too.
 HEADER_REPAIR = CFG.get("HEADER_REPAIR", "true").lower() != "false"   # off: a header issue is logged and never remuxed
 try:   # days a repack keeps the original it replaced, see keep_original(). 0 drops it.
@@ -317,7 +319,8 @@ OUTCOMES = (("edited", "edited"), ("no change", "no_change"), ("dry run", "dry_r
             ("skipped, not matroska, the name", "repack_name_taken"), ("skipped, not matroska, the app", "repack_app_refused"),
             ("skipped, not matroska, the file sits outside", "repack_app_refused"), ("skipped, not matroska, the CEA-608", "repack_no_captions"),
             ("skipped, not matroska, ffprobe", "repack_unreadable"), ("skipped, not matroska, Sonarr reads", "repack_parse_refused"),
-            ("skipped, not matroska, the new name loses", "repack_score_refused"), ("extras still hidden", "extras_hidden"))
+            ("skipped, not matroska, the new name loses", "repack_score_refused"), ("extras still hidden", "extras_hidden"),
+            ("damaged source", "damaged_source"))
 
 
 def outcome(result):
@@ -1718,7 +1721,7 @@ def content_probe(app, owner, original, kids, release, ctx, heard=None):
 
 def units():
     """download id -> {"time", "failed", "deleted": [file ids], "clean": [file ids], "kind"} for the downloads a re-grab handled.
-    kind is audio, content or video, the fault the unit was checked for. A unit from before kinds existed is audio."""
+    kind is audio, content, video or damage, the fault the unit was checked for. A unit from before kinds existed is audio."""
     try:
         return json.load(open(os.path.join(CFG["STATE_DIR"], "units.json")))
     except (OSError, ValueError):
@@ -1787,7 +1790,7 @@ def unit_files(app, records, job):
 
 # Per fault kind: the result of a faulty file, the result of a clean one, and what the re-grab action calls the files it deleted.
 RESULTS = {"audio": ("broken audio", "audio checked", "broken files"), "content": ("wrong content", "content checked", "files with the wrong content"),
-           "video": ("corrupt video", "video checked", "corrupt files")}
+           "video": ("corrupt video", "video checked", "corrupt files"), "damage": ("damaged source", "source checked", "damaged files")}
 
 
 def regrab(app, job, fault, probe, kind="audio", dry=False):
@@ -1797,10 +1800,10 @@ def regrab(app, job, fault, probe, kind="audio", dry=False):
     code is regrabbed, would_regrab, unconfirmed, capped, no_grab or failed.
 
     fault is the certain fault found in the job's file. probe(path, f, fresh) checks a file from scratch and returns
-    (its certain fault or None, log fields), see audio_probe(), content_probe() and video_probe(). Every second check
-    passes fresh=True. kind is audio, content or video. Corrupt video counts against VIDEO_REGRAB_CAP, the other kinds
-    share REGRAB_CAP. dry stops after the second check of the job's file and deletes nothing: the wrong-content re-grab
-    while it is switched off.
+    (its certain fault or None, log fields), see audio_probe(), content_probe(), video_probe() and damage_probe(). Every
+    second check passes fresh=True. kind is audio, content, video or damage. Corrupt video counts against
+    VIDEO_REGRAB_CAP, the other kinds share REGRAB_CAP. dry stops after the second check of the job's file and deletes
+    nothing: the wrong-content re-grab while it is switched off.
     """
     name = "Radarr" if app == "radarr" else "Sonarr"
     records = []
@@ -2531,7 +2534,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     exclusive lock. The language hearing runs without the lock, and shared.reshare(st) takes it shared again after it,
     see reshared().
 
-    job is the queued hook job. With it, a certain audio or video fault skips the edit and re-grabs the file. The video
+    job is the queued hook job. With it, a certain audio or video fault skips the edit and re-grabs the file. So does a
+    conversion that shows the original damaged, while DAMAGE_REGRAB is on. The video
     check runs only when the audio is not certainly broken. audio or video False skips a check the file already had
     with its download. Wrong content re-grabs after the edit, or only says it would while WRONG_CONTENT_REGRAB is off.
     kids and release are the item context of the decision, ids the app's ids of the item, ctx the metadata context of
@@ -2554,7 +2558,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         sweep_repack_tmp(os.path.dirname(path), source)
     st = os.stat(path); size = st.st_size; j = mkvmerge(path)
     rec.update(size=size, mtime=int(st.st_mtime), file_duration=round(arr_decide.duration(j)))
-    container, unconverted = (j.get("container") or {}).get("type") or "Matroska", None   # a probe without a type reads as Matroska
+    container = (j.get("container") or {}).get("type") or "Matroska"   # a probe without a type reads as Matroska
+    unconverted = damaged = None
     if (mkv and container != "Matroska") or (not mkv and conv):   # mkvpropedit edits Matroska only, see convert()
         if shared and apply and not pool:
             raise Replan("the file needs a repack")
@@ -2577,13 +2582,24 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
                 text = f"The repack into Matroska failed, so the original {container} file stays. {why[:1].upper()}{why[1:]}."
             if not would:
                 convert_list(app, rec)
-            if mkv or job is None:
-                if text:
-                    rec.update(alerts=[f"repack: {text}"], alert_kinds=["repack"])
+            damage = rec["repack"].get("damage")
+            if damage and job is not None and apply and DAMAGE_REGRAB:   # the original is damaged: it re-grabs like broken audio
+                code, action = regrab(app, job, damage["fault"], damage_probe(damage, j), "damage")
+                rec.update(result=f"damaged source: {damage['fault']}", regrab=code)
+                refused = f" The proof refused the new file, because {damage['refusal']}." if damage.get("refusal") else ""
+                found = f"The conversion found a damaged source, because {damage['fault']}. {damage['line'].rstrip('.')}."
+                damaged, text = ("damage", found + refused, action), None
+            gone = damaged and (rec["regrab"] in ("regrabbed", "restored", "searched", "deleted") or not os.path.exists(path))
+            if mkv or job is None or gone:
+                problem = damaged or (("repack", text, None) if text else None)
+                if problem:
+                    rec.update(alerts=[f"{problem[0]}: {problem[1]}" + (f" {problem[2]}" if problem[2] else "")], alert_kinds=[problem[0]])
                     if post:
-                        rec["alert_result"] = [alert(app, label, path, size, "repack", text)]
+                        rec["alert_result"] = [alert(app, label, path, size, *problem)]
                 return rec
-            unconverted = (result, text)   # an import goes on with the original, so its audio and video checks still run
+            if damaged:
+                signal.alarm(BUDGET)   # regrab() turned the time limit off
+            unconverted = (rec["result"], text)   # an import goes on with the original, so its audio and video checks still run
         else:
             if path != rec["path"]:   # the app lists the new name now, with a new file id
                 rec["path"], mkv, fid = path, True, rec["repack"]["relink"]["file_id"]
@@ -2665,6 +2681,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     first, rest, certain, vcertain = [], [], None, None   # (kind, text[, action]): the re-grab kinds go first, the doubts and edit failures last
     if vpre:   # the check that ran before the header step. A repaired file is the same streams, so it holds for the new file.
         rec["video"] = video_summary(*vpre)
+    if damaged:
+        first.append(damaged)
     if unconverted and unconverted[1]:
         rest.append(("repack", unconverted[1]))
     if rec.get("header_repair", {}).get("code") == "header_repair_failed":
@@ -3390,7 +3408,7 @@ def prove(src, tmp, subs, folder, captions=None):
             return f"stream {s['index']} changed its codec from {s['codec_name']} to {t['codec_name']}", proof
     packets = [(s, t) for s, t, sc in pairs if s and not sc and s["codec_name"] not in TIMED_TEXT]
     text = [(s, t) for s, t, sc in pairs if s and not sc and s["codec_name"] in TIMED_TEXT]
-    rule = lambda c: PROOF_BSF.get((fam, c)) or PROOF_BSF.get(("*", c)) or PROOF_BSF.get(("*", c.split("_")[0] + "_*"))
+    rule = lambda c: proof_bsf(fam, c)
     bsf = {s["index"]: rule(s["codec_name"]) for s, _ in packets if rule(s["codec_name"])}
     timeout = max(600, os.path.getsize(src) / PROOF_RATE)
     pool = concurrent.futures.ThreadPoolExecutor(2)   # both reads at once: the proof then takes about as long as the remux
@@ -3491,6 +3509,95 @@ def prove(src, tmp, subs, folder, captions=None):
     if abs(eb - ea) > arr_decide.REPAIR_END:
         fault = fault or f"the video and the audio end at {eb:.3f} s in the new file, {ea:.3f} s in the original"
     return fault, proof
+
+
+def proof_bsf(fam, codec):
+    """The PROOF_BSF pair of a stream of codec in a file of the ffprobe format fam, or None."""
+    return PROOF_BSF.get((fam, codec)) or PROOF_BSF.get(("*", codec)) or PROOF_BSF.get(("*", codec.split("_")[0] + "_*"))
+
+
+# The messages that show a conversion's original damaged, by the read that logs them: the remux (mkvmerge), the
+# proof's read of the original (ffmpeg) and ffprobe's first read. Each gives one fault text, so that regrab()'s second
+# check can compare it. A proof refusal alone (an edit list, the times, the cues, a packet count) stays a refusal, and
+# the original stays. So does a warning alone, see invalid_audio(). ffprobe reads no stream in a file it cannot open
+# either, so its message must name a data error.
+DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes of invalid data which were skipped", "mkvmerge skipped invalid audio data"),
+          "ffmpeg": (r"NAL unit size|Invalid data found|partial file", "ffmpeg did not read the file cleanly"),
+          "ffprobe": (r"ffprobe read no stream: .*?(?:Invalid data found|moov atom not found|partial file)", "ffprobe read no stream in the file")}
+SKIP_EDGE = 5   # seconds from either end of the file where an mkvmerge skip is end junk, such as zero bytes after the last frame
+# the proof's refusals that name one audio stream's packet count or packet data, see prove()
+REFUSED_AUDIO = r"stream audio (\d+) \([^)]*\) holds \d+ packets in the new file|the packet data of stream audio (\d+) \([^)]*\) differ"
+
+
+def damage_of(read, text):
+    """{"read", "fault", "line"} when text, the output of that read of the original, holds its DAMAGE message, else
+    None. line is the message from its start, without the path before it."""
+    m = re.search(DAMAGE[read][0], text or "")
+    return {"read": read, "fault": DAMAGE[read][1], "line": mask(text[m.start():].splitlines()[0])[:200]} if m else None
+
+
+def invalid_audio(text, j, streams, dur):
+    """{ffprobe index of an audio stream: the warning} for each mkvmerge warning in text that skipped invalid data in
+    that audio track more than SKIP_EDGE seconds from either end of the file, dur seconds long. mkvmerge names the
+    track by its id in j. The k-th audio track of j is the k-th audio stream of streams, as prove() pairs them. An
+    unknown dur counts nothing."""
+    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "audio"]
+    ff = [s["index"] for s in media_streams(streams) if s.get("codec_type") == "audio"]
+    out = {}
+    for m in re.finditer(rf"track (\d+): ({DAMAGE['mkvmerge'][0]} before timestamp (\d+):(\d+):(\d+(?:\.\d+)?)[^\n]*)", text or ""):
+        at, k = int(m[3]) * 3600 + int(m[4]) * 60 + float(m[5]), ids.index(int(m[1])) if int(m[1]) in ids else len(ff)
+        if k < len(ff) and dur and SKIP_EDGE < at < dur - SKIP_EDGE:
+            out.setdefault(ff[k], mask(m[2])[:200])
+    return out
+
+
+def audio_damage(text, j, streams, dur, fault):
+    """damage_of() for mkvmerge: its warning of invalid audio data counts only when the proof then refused that same
+    audio stream for its packet count or its packet data, see invalid_audio(). The refusal is fault."""
+    m = re.fullmatch(REFUSED_AUDIO, fault or "")
+    index = m and int(m[1] or m[2])
+    line = invalid_audio(text, j, streams, dur).get(index)
+    return {"read": "mkvmerge", "fault": DAMAGE["mkvmerge"][1], "line": line, "stream": index, "refusal": fault[:200]} if line else None
+
+
+def source_read(damage, path, j):
+    """The read of a conversion's original that showed damage, run again from scratch on path, as damage_of() it. It
+    writes nothing: mkvmerge remuxes into /dev/null, and ffmpeg reads the streams the way prove() reads them. j is the
+    mkvmerge -J probe of path. mkvmerge must skip invalid data in the same audio stream away from the ends again. The
+    proof's refusal stands from the conversion. Any other failure of the read is no damage."""
+    read = damage["read"]
+    try:
+        fam, streams, _ = ff_streams(path)
+        if read == "mkvmerge":
+            r = subprocess.run(convert_cmd(path, os.devnull, j, []), capture_output=True, text=True, errors="replace")
+            dur = arr_decide.duration(j) or ffprobe_duration(path) or 0
+            line = invalid_audio(r.stdout + r.stderr, j, streams, dur).get(damage["stream"])
+            return dict(damage, line=line) if line else None
+        if read == "ffmpeg":
+            media = [s for s in media_streams(streams) if s.get("codec_name") not in CAPTIONS]
+            text = [s["index"] for s in media if s["codec_name"] in TIMED_TEXT]
+            maps = [s["index"] for s in media if s["index"] not in text]
+            bsf = {s["index"]: f[0] for s in media if s["index"] in maps and (f := proof_bsf(fam.split(",")[0], s["codec_name"])) and f[0]}
+            folder = tempfile.mkdtemp(prefix="arr-media-guard-damage-")
+            try:
+                packet_hashes(path, maps, bsf, text, folder, max(600, os.path.getsize(path) / PROOF_RATE))
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+    except Exception as ex:
+        return None if read == "mkvmerge" else damage_of(read, str(ex))
+    return None
+
+
+def damage_probe(damage, j):
+    """probe() of regrab() for a damaged source, see source_read(). It judges only the job's own file: another file of
+    the download shows its damage in its own conversion, and joins the unit then."""
+    def probe(path, f, fresh=False):
+        if f is not None:
+            return None, {"skipped": "only its own conversion reads it for damage"}
+        signal.alarm(0)   # a read of the whole file, as the remux, has no time limit
+        d = source_read(damage, path, j)
+        return d and d["fault"], {"damage": d}
+    return probe
 
 
 def times_fault(name, codec, xt, yt, video=None):
@@ -4219,13 +4326,13 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not matroska, ...".
 
     A CEA-608 caption track, which mkvmerge drops, becomes a SubRip track first, see convert_captions(). The remux goes
-    to repack_tmp() with no time limit and no new encode, and any warning fails it. prove() then checks every stream at
-    packet level, and the captions and the sidecars by their text. On a name change the new file goes in place, and the
-    original holds held_name() while relink() makes the app list the new file. Only then the original and the sidecars
-    go. The extras the app tracks for the original's record wait in HIDE_DIR from the swap until settle() runs, see
-    app_extras(). convert-pending.json holds the swap from its start. When anything fails after the new file is in
-    place, convert_undo() decides by what the app lists: a file the app lists is never deleted. Nothing is kept once the
-    new file is in place. SIGTERM waits for the swap to end.
+    to repack_tmp() with no time limit and no new encode. An error fails it, and an mkvmerge warning alone does not.
+    prove() then checks every stream at packet level, and the captions and the sidecars by their text. On a name change
+    the new file goes in place, and the original holds held_name() while relink() makes the app list the new file. Only
+    then the original and the sidecars go. The extras the app tracks for the original's record wait in HIDE_DIR from the
+    swap until settle() runs, see app_extras(). convert-pending.json holds the swap from its start. When anything fails
+    after the new file is in place, convert_undo() decides by what the app lists: a file the app lists is never
+    deleted. Nothing is kept once the new file is in place. SIGTERM waits for the swap to end.
 
     lock is the held file lock: shared in a backfill worker, so several files convert at once, exclusive in a hook job.
     The app's record is read again before the swap. The swap then takes the lock exclusive, see swap_lock(), checks the
@@ -4237,7 +4344,9 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     force is the last proof refusal of the file in the decision log, as its result text, see logged_refusals(). A person
     checked it and accepts it. The file then converts when prove() refuses it for that same reason. info names the
     refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it. Another
-    refusal is not forced, and info names the logged one in not_forced."""
+    refusal is not forced, and info names the logged one in not_forced.
+
+    info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -4254,6 +4363,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         streams = ff_streams(path)[1]
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as ex:
         streams, why = [], mask(f"ffprobe cannot read it: {ex}")[:200]
+        if damage := damage_of("ffprobe", str(ex)):
+            info["damage"] = damage
     else:
         why = None
     caps = [] if unreadable else [s for s in media_streams(streams) if s.get("codec_name") in CAPTIONS]
@@ -4289,8 +4400,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values())), capture_output=True, text=True,
                            errors="replace")
         info["warnings"] = mask((r.stdout + r.stderr).strip())[-500:] or None
-        if r.returncode or info["warnings"]:   # a warning keeps the original
+        # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so
+        # the proof decides. An error of mkvmerge, and any message of ffmpeg, keep the original.
+        if r.returncode not in (0, 1) or (unreadable and (r.returncode or info["warnings"])):
             raise RuntimeError(f"{'ffmpeg' if unreadable else 'mkvmerge'} exited {r.returncode}: {info['warnings']}")
+        out = "" if unreadable else r.stdout + r.stderr   # a warning of invalid audio data, see audio_damage()
         fd = os.open(tmp, os.O_RDONLY)
         try:
             os.fsync(fd)   # a write error the NAS still holds shows here, before the checks read the file
@@ -4304,6 +4418,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         if fault and force and seen != force:
             info["not_forced"] = f"the last refusal in the decision log differs: {force.partition(': ')[2][:200]}"
         if fault and seen != force:
+            if damage := audio_damage(out, j, streams, dur, fault):   # invalid data, and the same audio stream refused
+                info["damage"] = damage
             raise RuntimeError(fault)
         if fault:
             info["forced"] = fault
@@ -4383,6 +4499,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
                 except OSError as ex:
                     info.setdefault("left", []).append(mask(f"{f}: {ex}")[:200])
     except BaseException as ex:
+        if str(ex).startswith(f"ffmpeg did not read {os.path.basename(path)} cleanly") and (damage := damage_of("ffmpeg", str(ex))):
+            info["damage"] = damage   # the proof's read of the original, see packet_hashes(). The temp file has another name.
         if lock is not None:   # no app call holds the lock. convert_undo() takes it again for the rename.
             fcntl.flock(lock, fcntl.LOCK_UN)
         undo = None

@@ -166,8 +166,8 @@ An analyze waits while a folder scan of its section is pending.
 
 Every alert is a Discord embed to `DISCORD_WEBHOOK`, one per file and problem. The username names
 the app and `INSTANCE`. The embed says the problem and what the hook did, and the footer shows the
-TMDB state. Red is broken audio, corrupt video or wrong content. Amber is every other alert. Green
-is a clean scan summary. Mentions are off, and the secrets are masked. A marker in
+TMDB state. Red is broken audio, corrupt video, wrong content or a damaged source. Amber is every
+other alert. Green is a clean scan summary. Mentions are off, and the secrets are masked. A marker in
 `STATE_DIR/alerts/` stops a repeat, and an upgrade to a file of another size alerts again.
 
 | Kind | Fires when |
@@ -178,6 +178,7 @@ is a clean scan summary. Mentions are off, and the secrets are masked. A marker 
 | Content | The evidence adds up to a re-grab. The title says "would re-grab" while `WRONG_CONTENT_REGRAB` is off. |
 | Audio, Video | See "Broken audio" and "Corrupt video". |
 | Edit | mkvpropedit failed, or the second probe shows the old flags. |
+| Damaged source | The conversion of an import shows a damaged source, see "Damaged source". |
 | Repack, Header | A conversion or a header repair failed, and the original stays. |
 | Subtitle, Cut | A subtitle runs far past the end. It is not SubRip, or the file may be cut. |
 | Policy | The policy file is missing or does not load. |
@@ -456,10 +457,11 @@ has cues out of order, is timed for another cut and stays beside the file. `mkvm
 --disable-lacing --track-order` writes the temp file into `HIDE_DIR` beside the video. The apps' disk
 scan and Plex skip a hidden folder, so they never import a partial file. A hidden file beside the
 video is not enough. The app's scan takes it as an extra of the item and can rename it or send it to
-the recycle bin. A swap once hid it with the extras, and the link to the new name failed. Any mkvmerge
-warning fails the conversion. ASF and WMV go through
-`ffmpeg -c copy`, because mkvmerge cannot read them. A c608 caption track becomes an English SubRip
-track, because mkvmerge drops it.
+the recycle bin. A swap once hid it with the extras, and the link to the new name failed. An
+mkvmerge error fails the conversion. mkvmerge exits 1 on warnings alone, and then the proof decides,
+because a warning can be harmless, such as zero bytes it skips at an audio end. ASF and WMV go through
+`ffmpeg -c copy`, because mkvmerge cannot read them, and any ffmpeg message fails them. A c608
+caption track becomes an English SubRip track, because mkvmerge drops it.
 
 **The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyts -f
 framemd5` and pairs the streams of each kind. A stream must keep its codec, its count of packets
@@ -546,6 +548,41 @@ run. A conversion reads the file three times and writes it once, so the file ser
 Keep `CONVERT_WORKERS` (1) low. `CONVERT_MAX_FILES` (200) stops a run after that many
 conversions. A `--convert` run decides no flags, and the language backfill does that later. Convert
 a library like a backfill, with a dry run, an audit and a canary first.
+
+## Damaged source
+
+A conversion reads the whole original, so it can show that the download is damaged. The hook then
+re-grabs the import. Only these signs count:
+
+- mkvmerge warns "This audio track contains N bytes of invalid data which were skipped" for an audio
+  track, more than `SKIP_EDGE` (5) seconds from either end of the file. The proof then refuses that
+  same audio stream, for its packet count or its packet data. The k-th audio track of mkvmerge is the
+  k-th audio stream of ffprobe, as the proof pairs them.
+- ffmpeg does not read the original cleanly in the proof, with "NAL unit size", "Invalid data found" or
+  "partial file". A failed read of the temp file says nothing of the original.
+- ffprobe reads no stream in the original and names a data error, "Invalid data found", "moov atom not
+  found" or "partial file". An empty message or a read error of the file system is no damage.
+
+A proof refusal alone, over an edit list, the times, the cues or a packet count, is no damage. So is a
+warning alone, or a warning with a refusal of another stream. A skip near an end is often junk, such as
+zero bytes after the last audio frame, and a clean proof converts that file. Each of these stays a
+refusal with its "Repack failed" alert, and the original stays.
+
+The re-grab uses the steps and safeguards of "Broken audio". They are the grab record, `REGRAB_CAP`,
+the download as one unit, the second check and "Restore after a bad upgrade". The second check runs
+the read that showed the damage again, from scratch. mkvmerge remuxes into `/dev/null` and must skip
+invalid data in the same audio stream, away from the ends, again. ffmpeg reads the original through the
+proof's filters, and ffprobe probes it. The proof does not run again, and its refusal stands. The
+re-grab judges only the job's own file. Another file of the download shows its damage in its own
+conversion, and joins the unit then. A re-grab that deletes the file ends the job. Otherwise the
+original stays and gets the import's audio and video checks. The decision line has the outcome
+`damaged_source`, the `regrab` code and `repack.damage`. One red "Damaged source" embed says what the
+hook did.
+
+Only a hook job re-grabs. A library backfill with `--convert` lists a damaged file in
+`convert-<app>.txt`, and it never re-grabs. `DAMAGE_REGRAB=false` turns the re-grab off. A failed
+conversion then alerts "Repack failed". A file ffprobe cannot read is skipped and listed, with no
+"Repack failed" alert.
 
 ## Header repair
 

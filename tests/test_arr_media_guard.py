@@ -2684,8 +2684,7 @@ def test_a_sonarr_repack_rescans_the_series(env, monkeypatch):
 
 
 @pytest.mark.parametrize("fault, why", [
-    ("rc", "mkvmerge exited 2"),
-    ("warning", "mkvmerge exited 1: Warning: the timestamps of track 1 jump"),   # a warning keeps the original
+    ("rc", "mkvmerge exited 2"),   # an error, not a warning
     ("container", "the new file reads as MP4/QuickTime"),
     ("proof", "the packet data of stream audio 1 (aac) differ"),
 ])
@@ -2693,8 +2692,6 @@ def test_a_repack_that_fails_its_checks_keeps_the_original(env, fault, why):
     folder = mp4_named_mkv(env)
     if fault == "rc":
         env["repack_rc"], env["repack_out"] = 2, "Error: the file could not be read"
-    elif fault == "warning":
-        env["repack_rc"], env["repack_out"] = 1, "Warning: the timestamps of track 1 jump"
     elif fault == "container":
         env["mkv_probe"]["container"]["type"] = "MP4/QuickTime"
     else:
@@ -5302,6 +5299,219 @@ def test_a_failed_swap_removes_its_own_temp_file_after_the_extras_are_back(env, 
     assert env["writes"] == [] and open(mp4, "rb").read() == b"x" * 1000
 
 
+# The damage messages in the shape the remux, the proof and ffprobe log them. Every path and number is made up.
+def invalid_audio(at="00:04:21.517000000", at2="00:04:21.541000000"):
+    """mkvmerge's two warnings for invalid data it skipped in track 1, the audio, at those times of the 600 s file."""
+    return "\n".join(f"Warning: '/m/Show/Season 1/Show - s01e02 - Title - DVD.avi' track 1: This audio track contains {n} bytes of invalid "
+                     f"data which were skipped before timestamp {t}. The audio/video synchronization may have been lost."
+                     for n, t in ((173, at), (239, at2)))
+
+
+INVALID_AUDIO = invalid_audio()
+BAD_READ = ("NAL unit size (0 > 4817).\n[filter_units @ 0x55e3a1c07d40] Failed to read packet.\n[vost#0:0/copy @ 0x55e3a1c08e80] "
+            "Error applying bitstream filters to a packet: Invalid data found when processing input")
+NO_STREAM = "ffprobe read no stream: /m/Film A (1979)/Film A (1979).mp4: Invalid data found when processing input"
+PARTIAL = "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x55d0c1a2b3c0] stream 1, offset 0x1f4a2b3: partial file"   # a download cut short
+
+
+REFUSAL = "the packet data of stream audio 1 (mp3) differ"   # the proof after mkvmerge skipped invalid audio data
+
+
+def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ):
+    """An MP4 import of Film A with a grab record, whose conversion shows the damage signal. mkvmerge's invalid-data
+    warning comes with a proof refusal. The second check from scratch finds the signal again when repeat. Returns (mp4,
+    each read that showed it)."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    grabbed(env, monkeypatch)
+    reads = []
+    if signal == "mkvmerge":
+        outs = iter([INVALID_AUDIO, INVALID_AUDIO if repeat else ""])
+        env["during_repack"] = lambda: env.update(repack_out=next(outs)) or reads.append(env["repacks"][-1])
+        env["repack_rc"], env["proof"] = 1, (REFUSAL, [])
+    elif signal == "ffmpeg":
+        def bad_read(path, maps, bsf, *a, **k):
+            reads.append((path, bsf))
+            if len(reads) == 1 or repeat:
+                raise RuntimeError(f"ffmpeg did not read {os.path.basename(path)} cleanly: {message}")
+            return {}, {}
+        monkeypatch.setattr(hook, "prove", lambda src, *a, **k: bad_read(src, [0, 1], {0: "filter_units=remove_types=9"}))
+        monkeypatch.setattr(hook, "packet_hashes", bad_read)
+    else:
+        real, calls = hook.ff_streams, []
+        def no_stream(path):
+            calls.append(path)
+            if len(calls) == 1 or repeat:
+                raise RuntimeError(NO_STREAM)
+            return real(path)
+        monkeypatch.setattr(hook, "ff_streams", no_stream)
+        reads = calls
+    return mp4, reads
+
+
+@pytest.mark.parametrize("signal, line, message", [
+    ("mkvmerge", "This audio track contains 173 bytes of invalid data which were skipped before timestamp 00:04:21.517000000. The "
+                 "audio/video synchronization may have been lost.", None),
+    ("ffmpeg", "NAL unit size (0 > 4817).", BAD_READ),
+    ("ffmpeg", "partial file", PARTIAL),
+    ("ffprobe", NO_STREAM, None),
+])
+def test_a_damaged_source_re_grabs_the_import(env, monkeypatch, signal, line, message):
+    """Each damage signal of a conversion deletes the import, re-monitors it and marks the grab failed, after a second
+    read of the original from scratch finds the same signal. One red embed says so."""
+    mp4, reads = damaged_import(env, monkeypatch, signal, message=message)
+    hook.main([])
+    rec = decided(env)
+    fault = hook.DAMAGE[signal][1]
+    assert (rec["outcome"], rec["result"], rec["regrab"]) == ("damaged_source", f"damaged source: {fault}", "regrabbed"), rec
+    assert rec["repack"]["damage"] == dict({"read": signal, "fault": fault, "line": line},
+                                           **({"refusal": REFUSAL, "stream": 1} if signal == "mkvmerge" else {}))
+    assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+                             ("POST", "history/failed/2101", None)]
+    assert env["mkvpropedit"] == [] and "audio" not in rec and len(reads) == 2   # the read that showed it, then the second check
+    if signal == "mkvmerge":   # the same remux into /dev/null, which writes nothing
+        assert reads[1][reads[1].index("-o") + 1] == os.devnull and reads[1][-1] == mp4
+    if signal == "ffmpeg":   # the proof's read of the original, through the same bitstream filter
+        assert reads[1] == (mp4, {0: "filter_units=remove_types=9"})
+    (e,) = [b["embeds"][0] for m, u, b in env["http"] if m == "POST"]
+    assert (e["title"], e["color"]) == ("Damaged source, re-grabbed", hook.COLORS["red"])
+    refused = f" The proof refused the new file, because {REFUSAL}." if signal == "mkvmerge" else ""
+    assert e["description"] == (f"The conversion found a damaged source, because {fault}. {line.rstrip('.')}.{refused}\n"
+                                "The hook deleted the file, re-monitored it and marked the grab failed, so Radarr searches again.")
+    assert regrabs_counted("radarr") == 1
+
+
+@pytest.mark.parametrize("case", ["timestamps", "edit list", "cues", "end skip", "start skip", "temp file read", "switch off"])
+def test_a_format_refusal_or_the_switch_off_keeps_the_original(env, monkeypatch, case):
+    """mkvmerge skipped invalid audio data in each case. A refusal of another stream, or of the times, is no damage. A
+    skip near an end of the file is end junk, even when the proof refuses that audio stream. A failed read of the temp
+    file says nothing of the original. Each stays a refusal with its Repack failed embed, and the original stays. So
+    does a damaged source while DAMAGE_REGRAB is off."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    grabbed(env, monkeypatch)
+    env["repack_rc"], env["repack_out"] = 1, {"end skip": invalid_audio("00:09:58.806000000", "00:09:58.832000000"),
+                                              "start skip": invalid_audio("00:00:00.412000000", "00:00:00.438000000")}.get(case, INVALID_AUDIO)
+    env["proof"] = ({"timestamps": "a packet of stream video 0 (h264) moved 27 ms against its stream's start, 842.516 s into the original",
+                     "edit list": "stream video 0 (h264) holds 30918 packets in the new file, 30920 in the original",
+                     "cues": "the mov_text stream 2 holds 471 cues in the new file, 483 in the original"}.get(case, REFUSAL), [])
+    if case == "temp file read":
+        tmp = os.path.basename(hook.repack_tmp(mp4))
+        monkeypatch.setattr(hook, "prove", lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"ffmpeg did not read {tmp} cleanly: {BAD_READ}")))
+    if case == "switch off":
+        monkeypatch.setattr(hook, "DAMAGE_REGRAB", False)
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "repack_failed" and "regrab" not in rec and os.path.exists(mp4), rec
+    assert ("damage" in rec["repack"]) == (case == "switch off") and "history/failed/2101" not in str(env["writes"])
+    (e,) = [b["embeds"][0] for m, u, b in env["http"] if m == "POST"]
+    assert (e["title"], e["color"]) == ("Repack failed", hook.COLORS["amber"])
+
+
+def test_the_cap_stops_a_damaged_source_re_grab(env, monkeypatch):
+    mp4, reads = damaged_import(env, monkeypatch, "mkvmerge")
+    with open(os.path.join(hook.CFG["STATE_DIR"], "regrabs.json"), "w") as f:
+        json.dump({"radarr": [env["clock"][0] - 60] * hook.REGRAB_CAP}, f)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "capped") and env["writes"] == [] and os.path.exists(mp4), rec
+    assert rec["alerts"][0].endswith(f"The cap of {hook.REGRAB_CAP} re-grabs a day is reached, so the file stays.")
+    assert "audio" in rec and "video" in rec   # the original stays, so it gets the import's checks
+
+
+@pytest.mark.parametrize("stderr", ["", "/m/Film A (1979)/Film A (1979).mp4: Input/output error"])
+def test_ffprobe_without_a_data_error_is_no_damage(env, monkeypatch, stderr):
+    """ffprobe once failed with an empty message on a file it had read seconds before. A read error of the file system
+    names no damage either. The conversion is skipped and the file is listed, as before."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    grabbed(env, monkeypatch)
+    monkeypatch.setattr(hook, "ff_streams", lambda path: (_ for _ in ()).throw(RuntimeError(f"ffprobe read no stream: {stderr}")))
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "repack_unreadable" and "damage" not in rec["repack"] and "regrab" not in rec, rec
+    assert env["writes"] == [] and os.path.exists(mp4)
+
+
+def test_the_damage_re_grab_judges_only_the_jobs_own_file(env, monkeypatch):
+    """The download also imported file 12 of movie 8, which ffprobe cannot read either. Only the job's file goes. The
+    other file shows its damage in its own conversion, and a line says it was not judged here."""
+    mp4, reads = damaged_import(env, monkeypatch, "ffprobe")
+    other = os.path.join(os.path.dirname(mp4), "Film B (1983).mp4")
+    shutil.copy(mp4, other)
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = {"records": GRAB["records"] + [
+        {"id": 2103, "eventType": "downloadFolderImported", "movieId": 8, "data": {"fileId": "12"}}]}
+    env["movies"]["movie/8"] = {"title": "Film B", "movieFile": {"id": 12, "path": other}}
+    hook.main([])
+    assert [w for w in env["writes"] if w[0] == "DELETE"] == [("DELETE", "moviefile/11", None)] and os.path.exists(other)
+    (w,) = [r for r in log_lines(env) if r.get("path") == other]
+    assert w["note"] == "not judged for damaged source: only its own conversion reads it for damage" and other not in reads
+
+
+def test_an_asf_remux_that_logs_a_message_keeps_the_original(env, monkeypatch):
+    """mkvmerge cannot read ASF, so ffmpeg remuxes it. Only mkvmerge's warnings go to the proof. Any ffmpeg message fails
+    the conversion, even when ffmpeg exits 0."""
+    mp4_named_mkv(env)
+    env["probe"] = copy.deepcopy(WMV)
+    env["extra_streams"] = [{"index": 0, "codec_type": "video", "codec_name": "wmv2"}, {"index": 1, "codec_type": "audio", "codec_name": "wmav2"}]
+    real = hook.subprocess.run
+    def remux(argv, **kw):
+        r = real(argv, **kw)
+        if "matroska" in argv:
+            r.stderr = "[asf @ 0x5610b2e4c1a0] Packet 3 exceeds the packet size"
+        return r
+    monkeypatch.setattr(hook.subprocess, "run", remux)
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "repack_failed" and "ffmpeg exited 0: [asf @" in rec["result"] and "damage" not in rec["repack"], rec
+    assert open(env["path"], "rb").read() == b"x" * 1000
+
+
+def test_a_real_asf_conversion_overwrites_its_empty_temp_file(convertible, tmp_path, monkeypatch):
+    """new_tmp() creates the temp file before the remux, so ffmpeg must overwrite it. A .mkv name holding ASF converts in
+    place, with the real tools and the real proof."""
+    monkeypatch.setitem(hook.CFG, "LOG", str(tmp_path / "log.jsonl"))
+    monkeypatch.setattr(hook.signal, "alarm", lambda s: None)
+    path = tmp_path / "Clip (2020)" / "Clip (2020).mkv"
+    path.parent.mkdir()
+    shutil.copy(convertible / "Clip.wmv", path)
+    result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert (result, new) == ("repacked", str(path)), (result, info.get("warnings"))
+    assert hook.mkvmerge(str(path))["container"]["type"] == "Matroska" and os.listdir(path.parent) == [path.name]
+
+
+@pytest.mark.parametrize("out", [INVALID_AUDIO, "Warning: the timestamps of track 1 jump"])
+def test_a_mkvmerge_warning_with_a_passing_proof_converts(env, monkeypatch, out):
+    """mkvmerge exits 1 on warnings alone, as for zero bytes it skips at an audio end. The proof decides, and a clean
+    proof converts. The warning stays in the log."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    grabbed(env, monkeypatch)
+    env["repack_rc"], env["repack_out"] = 1, out
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["path"], rec["repack"]["warnings"]) == ("edited", mkv, out[-500:]), rec["result"]
+    assert "damage" not in rec["repack"] and "history/failed/2101" not in str(env["writes"])
+
+
+def test_a_backfill_lists_a_damaged_source_and_never_re_grabs(env, monkeypatch):
+    """The library conversion finds the same damage. It only lists the file, and the original stays."""
+    (mp4,) = mp4_films(env, monkeypatch, 1)
+    env["repack_rc"], env["repack_out"], env["proof"] = 1, INVALID_AUDIO, (REFUSAL, [])
+    hook.main(["--backfill", "radarr", "--convert", "--apply"])
+    (rec,) = [r for r in log_lines(env) if r.get("outcome")]
+    assert (rec["outcome"], rec["repack"]["damage"]["read"]) == ("repack_failed", "mkvmerge") and "regrab" not in rec, rec
+    assert os.path.exists(mp4) and env["writes"] == [] and [u for m, u, b in env["http"] if m == "POST"] == []
+    (line,) = open(os.path.join(hook.CFG["STATE_DIR"], "convert-radarr.txt")).read().splitlines()
+    assert line.split("\t")[1] == "repack_failed" and line.endswith(mp4)
+
+
+@pytest.mark.parametrize("signal", ["mkvmerge", "ffmpeg", "ffprobe"])
+def test_a_second_check_that_does_not_find_the_damage_again_keeps_the_file(env, monkeypatch, signal):
+    mp4, reads = damaged_import(env, monkeypatch, signal, repeat=False)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "unconfirmed") and env["writes"] == [] and os.path.exists(mp4), rec
+    (e,) = [b["embeds"][0] for m, u, b in env["http"] if m == "POST"]
+    assert (e["title"], e["color"]) == ("Damaged source, not confirmed", hook.COLORS["amber"])
+
+
 @pytest.mark.parametrize("status", ["completed", "failed"])
 def test_an_app_that_does_not_take_the_new_file_gets_the_original_back(env, monkeypatch, status):
     """The ManualImport fails, or completes and the movie still lists the MP4. The original goes back to its name. The
@@ -5328,7 +5538,7 @@ def test_a_sidecar_timed_for_another_cut_stays_beside_the_file(env, monkeypatch)
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=(".en.srt",))
     with open(mkv[:-4] + ".es.srt", "w") as f:
         f.write("1\n00:38:00,000 --> 00:38:27,000\nFin\n")
-    with open(mkv[:-4] + ".en.forced.srt", "w") as f:   # mkvmerge warns, and a warning fails the conversion
+    with open(mkv[:-4] + ".en.forced.srt", "w") as f:   # its cues are out of order, so it stays beside the file
         f.write("1\n00:02:00,000 --> 00:02:01,000\nB\n\n2\n00:01:00,000 --> 00:01:01,000\nA\n")
     hook.main([])
     rec = decided(env)

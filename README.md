@@ -22,7 +22,8 @@ re-encodes.
 - **Header repair.** A lossless `mkvmerge` remux repairs a Matroska header with a wrong duration or a subtitle that runs
   past the end. The original stays for a week.
 - **Conversion.** It can convert AVI, MP4, M4V, TS and WebM files into Matroska. It proves every stream of the new
-  file packet by packet before the original goes.
+  file packet by packet before the original goes. When the conversion of an import shows a damaged source, the hook
+  re-grabs it like broken audio.
 - **Backfill and scans.** The same script fixes the flags of your whole library, scans it for broken audio or corrupt
   video, and audits its own edits.
 
@@ -103,9 +104,10 @@ the end of the line. Every key is optional. [examples/arr-media-guard.env](examp
 | `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. Plex must see the files under the same paths as the apps. An empty `PLEX_URL` turns every Plex call off. |
 | `DISCORD_WEBHOOK` | empty | Alerts and scan summaries. Empty: nothing is posted. |
 | `TMDB_TOKEN` | empty | A TMDB API read token. Empty: Radarr's bundled key, read from `/opt/Radarr/Radarr.Common.dll`. |
-| `REGRAB_CAP` | `30` | Re-grabs per app in 24 hours for broken audio and wrong content. Then it alerts only. |
+| `REGRAB_CAP` | `30` | Re-grabs per app in 24 hours for broken audio, wrong content and a damaged source. Then it alerts only. |
 | `VIDEO_REGRAB_CAP` | `30` | The same for corrupt video, counted apart. |
 | `WRONG_CONTENT_REGRAB` | `false` | `false`: a wrong-content file only alerts "would re-grab". |
+| `DAMAGE_REGRAB` | `true` | Re-grab an import whose conversion shows a damaged source. `false`: no re-grab. A failed conversion alerts "Repack failed", and a file ffprobe cannot read is only listed. |
 | `RESTORE` | `true` | A re-grab of a broken upgrade puts back the old file from the recycle bin. |
 | `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
 | `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced, hard-linked into `KEEP_DIR`. `0` keeps nothing. |
