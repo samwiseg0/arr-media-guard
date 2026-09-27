@@ -446,6 +446,12 @@ move 2 ms at most, because a stream whose times jump back can pass the digest an
 Lacing is off, because ffmpeg reads the frames of a lace a few ms off. MP4 timed text becomes
 SubRip, and its cues must match.
 
+Matroska stores no decode times, so ffmpeg guesses them during its read. A frame stored far ahead of
+the frames it displays after breaks the guess, and ffmpeg's muxer then moves a few packet times of
+the read. So when the time check fails on the new file, ffprobe reads that stream's stored times
+again. ffprobe only demuxes. The second check decides, and the proof entry names it in
+`times.reread`. The second read runs only after a failed check. Stored times that moved still fail.
+
 The proof allows a cut last frame and a cut first audio frame that mkvmerge drops, because a cut
 frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the

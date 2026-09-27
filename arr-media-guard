@@ -3274,11 +3274,13 @@ def prove(src, tmp, subs, folder, captions=None):
     smaller first MP3 or MP2 packet passes when every other packet matches and the second packet keeps its time.
     The entry names both sizes in trimmed_first. The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
-    edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. captions maps the stream index of
+    edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. When the time
+    check fails on a Matroska tmp, ffprobe reads the stored times of that stream again, see stored_times(), and only
+    that second check decides. The entry names it in times.reread. captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
     ones, and its text must match."""
     fa, sa, _ = ff_streams(src)
-    _, sb, _ = ff_streams(tmp)
+    fb, sb, _ = ff_streams(tmp)
     a, b, fam = media_streams(sa), media_streams(sb), fa.split(",")[0]
     pairs, proof = [], []
     captions = captions or {}
@@ -3321,7 +3323,7 @@ def prove(src, tmp, subs, folder, captions=None):
                           + (f", new file through {f[1]}" if f[1] else ""),
                           count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), hash=x["digest"][:16],
                           match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
-        xt, yt, xs, why = x.get("times") or [], y.get("times") or [], x["start"], None
+        xt, yt, xs, why, ycut = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None)
         if x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame, and that passes
             proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[:-1]
@@ -3336,7 +3338,8 @@ def prove(src, tmp, subs, folder, captions=None):
         elif x["count"] + 1 == y["count"] and y.get("but_last") == x["digest"] and fam == "mov" and \
                 edit_list_sample(src, s["index"], f[0], y, folder, timeout):   # the sample the MP4's edit list cuts off
             proof[-1].update(count=y["count"], edit_list={"pts": y.get("last_pts"), "size": y["last"]})
-            yt = yt[:-1]
+            ycut = slice(None, -1)
+            yt = yt[ycut]
         elif s["codec_name"] in ("mp3", "mp2") and x["count"] == y["count"] > 1 and x["digest"] != y["digest"] and \
                 x.get("but_first") == y.get("but_first") and (y.get("first") or 0) < (x.get("first") or 0):   # a trimmed cut first frame
             proof[-1].update(trimmed_first={"pts": x.get("first_pts"), "size": [x["first"], y["first"]]})
@@ -3357,6 +3360,8 @@ def prove(src, tmp, subs, folder, captions=None):
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:
             why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt)
+            if why and fb.startswith("matroska"):   # ffmpeg's read may move a few stored times, see stored_times()
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, stored_times(tmp, t["index"], timeout)[ycut])
         proof[-1]["match"] = not why
         fault = fault or why
     for s, t in text:
@@ -3409,6 +3414,20 @@ def times_fault(name, codec, xt, yt):
         return (f"a packet of stream {name} ({codec}) moved {worst * 1000:.0f} ms against its stream's start, {at:.3f} s into the "
                 "original"), check
     return None, check
+
+
+def stored_times(path, index, timeout):
+    """The time of each packet with data of stream index of the Matroska file path, in file order, as ffprobe reads it.
+    Matroska stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the
+    frames it displays after breaks that guess. ffmpeg's muxer then logs "Non-monotonic DTS", which -v error hides,
+    and moves a few packet times of its read. ffprobe only demuxes, so it reads the times the file stores. prove()
+    runs this only after a failed time check. A timeout or an ffprobe error raises."""
+    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
+                        "packet=pts_time,size", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
+    if r.returncode:   # a decoder message of the stream probe may show, as in packet_hashes(). A wrong read fails the check.
+        raise RuntimeError(f"ffprobe did not read the times of {os.path.basename(path)}: {mask(r.stderr.strip())[-200:]}")
+    rows = [line.split(",") for line in r.stdout.splitlines() if line.strip()]
+    return [None if t == "N/A" else float(t) for t, size in rows if size != "0"]
 
 
 def edit_list_sample(src, index, bsf, y, folder, timeout):
