@@ -447,8 +447,11 @@ Lacing is off, because ffmpeg reads the frames of a lace a few ms off. MP4 timed
 SubRip, and its cues must match.
 
 The proof allows a cut last frame and a cut first audio frame that mkvmerge drops, because a cut
-frame cannot decode. It allows a last sample that an MP4 edit list hides. Any other lost packet
-fails, and the file keeps its original.
+frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
+passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
+stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
+The proof also allows a last sample that an MP4 edit list hides. Any other lost packet fails, and
+the file keeps its original.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move

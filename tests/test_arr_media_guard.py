@@ -6167,6 +6167,40 @@ def test_a_cut_first_audio_frame_passes_and_is_logged(monkeypatch, tmp_path, cas
 
 
 @pytest.mark.parametrize("case, fault", [
+    ("trimmed", None),      # a 480-byte fragment with no header opens the MP3 stream, mkvmerge keeps 96 bytes
+    ("same size", "the packet data of stream audio 1 (mp3) differ"),
+    ("second packet moved", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved -96 ms"),
+    ("pcm", "the packet data of stream audio 1 (pcm_s16le) differ"),
+    ("grew", "the packet data of stream audio 1 (mp3) differ"),
+    ("other packets differ", "the packet data of stream audio 1 (mp3) differ"),
+    ("video", "the packet data of stream video 0 (mpeg4) differ"),
+])
+def test_a_trimmed_first_audio_frame_passes_and_is_logged(monkeypatch, tmp_path, case, fault):
+    """An AVI whose first MP3 packet is a cut fragment: mkvmerge keeps only its tail. That passes. A first packet that
+    grew or kept its size, other packets that differ, a second packet that moved, PCM or video still fail."""
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"},
+               {"index": 1, "codec_type": "audio", "codec_name": "pcm_s16le" if case == "pcm" else "mp3"}]
+    monkeypatch.setattr(hook, "ff_streams", lambda p: ("avi" if p.endswith(".avi") else "matroska,webm", streams, 1800.0))
+    video = {"count": 45000, "empty": 0, "digest": "v", "but_first": "v-rest", "first": 9000, "first_pts": 0.0, "start": 0.0, "end": 1800.0}
+    audio = {"count": 52000, "empty": 0, "digest": "a", "but_first": "a-rest", "first": 480, "first_pts": 0.0, "start": 0.0, "end": 1800.0,
+             "times": [0.0, 0.026, 0.052]}
+    new_a = dict(audio, digest="a2", first={"grew": 600, "same size": 480}.get(case, 96),
+                 but_first="a-other" if case == "other packets differ" else "a-rest",
+                 times=[0.0, 0.026 - 0.096, 0.052 - 0.096] if case == "second packet moved" else [0.0, 0.026, 0.052])
+    new_v = dict(video, digest="v2", first=4000) if case == "video" else video
+
+    def hashes(path, maps, bsf, texts, folder, timeout, raw=False):
+        return ({0: video, 1: audio} if path.endswith(".avi") else {0: new_v, 1: new_a}), {}
+    monkeypatch.setattr(hook, "packet_hashes", hashes)
+    src, tmp = tmp_path / "Show.avi", tmp_path / ".Show.avi.repack-tmp"
+    src.touch(); tmp.touch()
+    got, proof = hook.prove(str(src), str(tmp), [], str(tmp_path))
+    assert got == fault, got
+    if not fault:
+        assert proof[1]["trimmed_first"] == {"pts": 0.0, "size": [480, 96]} and proof[1]["match"]
+
+
+@pytest.mark.parametrize("case, fault", [
     ("cut frame, start moved", "stream audio 1 starts +0.500 s from the video in the new file, +0.000 s in the original"),
     ("edit list, start moved", "stream audio 1 starts +0.500 s from the video in the new file, +0.000 s in the original"),
     ("times go back 0.3 s", "a packet of stream audio 1 (aac) moved 300 ms against its stream's start"),

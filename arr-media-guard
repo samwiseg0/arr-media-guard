@@ -3270,7 +3270,9 @@ def prove(src, tmp, subs, folder, captions=None):
     One difference passes. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
     cut first frame, alone or with its cut last frame. The entry names it in
-    dropped_first, and the stream's start is then its second packet. The new file may also hold one
+    dropped_first, and the stream's start is then its second packet. mkvmerge may instead trim that fragment. A
+    smaller first MP3 or MP2 packet passes when every other packet matches and the second packet keeps its time.
+    The entry names both sizes in trimmed_first. The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
     edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
@@ -3335,6 +3337,16 @@ def prove(src, tmp, subs, folder, captions=None):
                 edit_list_sample(src, s["index"], f[0], y, folder, timeout):   # the sample the MP4's edit list cuts off
             proof[-1].update(count=y["count"], edit_list={"pts": y.get("last_pts"), "size": y["last"]})
             yt = yt[:-1]
+        elif s["codec_name"] in ("mp3", "mp2") and x["count"] == y["count"] > 1 and x["digest"] != y["digest"] and \
+                x.get("but_first") == y.get("but_first") and (y.get("first") or 0) < (x.get("first") or 0):   # a trimmed cut first frame
+            proof[-1].update(trimmed_first={"pts": x.get("first_pts"), "size": [x["first"], y["first"]]})
+            # mkvmerge re-times the stream from the first frame it keeps. Junk longer than one frame would shift every
+            # later packet, and the first packets still start together, so the second packet must keep its time.
+            if None in (xt[1:2] or [None]) + (yt[1:2] or [None]):
+                why = f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet has no time"
+            elif abs((xt[1] - va) - (yt[1] - vb)) > SYNC:
+                why = (f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet moved "
+                       f"{((yt[1] - vb) - (xt[1] - va)) * 1000:+.0f} ms")
         elif x["count"] != y["count"]:
             why = f"stream {name} ({s['codec_name']}) holds {y['count']} packets in the new file, {x['count']} in the original"
         elif x["digest"] != y["digest"]:
