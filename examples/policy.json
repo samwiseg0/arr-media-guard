@@ -1,0 +1,25 @@
+{
+  "kids": {
+    "genres": {"radarr": ["Family"], "sonarr": ["Children", "Family"]},
+    "profiles": ["Kids"],
+    "studios": ["Studio A"]
+  },
+  "audio": {
+    "english": ["original"],
+    "foreign": ["original", "english"],
+    "foreign_kids": ["english", "original"]
+  },
+  "subtitles": {
+    "english": ["forced"],
+    "foreign": ["full", "sdh", "forced", "dub"]
+  },
+  "sparse_events": 1.5,
+  "forced_flag_events": 4.0,
+  "density_min_minutes": 15,
+  "min_confidence": 0.7,
+  "forced_clear": {
+    "events": 10.0,
+    "english_only_audio": true,
+    "reference_ratio": 0.8
+  }
+}

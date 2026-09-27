@@ -1,0 +1,47 @@
+{
+ "_comment": "Sonarr files that are MP4 under a .mkv name, which mkvpropedit refuses. probe is the trimmed mkvmerge -J of the first one. All of them read MP4/QuickTime.",
+ "paths": [
+  "/data/tv/Show A/Season 1/Show A - S01E01-E02 - Episode A + Episode B - WEBDL-1080p.mkv",
+  "/data/tv/Show A/Season 1/Show A - S01E03-E04 - Episode C + Episode D - WEBDL-1080p.mkv",
+  "/data/tv/Show A/Season 1/Show A - S01E05-E06 - Episode E + Episode F - WEBDL-1080p.mkv",
+  "/data/tv/Show A/Season 1/Show A - S01E07-E08 - Episode G + Episode H - WEBDL-1080p.mkv",
+  "/data/tv/Show A/Season 2/Show A - S02E01-E02 - Episode I - WEBDL-1080p.mkv"
+ ],
+ "container_type": "MP4/QuickTime",
+ "probe": {
+  "container": {
+   "properties": {
+    "container_type": 25,
+    "is_providing_timestamps": true,
+    "title": "Episode A / Episode B"
+   },
+   "recognized": true,
+   "supported": true,
+   "type": "MP4/QuickTime"
+  },
+  "tracks": [
+   {
+    "type": "video",
+    "codec": "AVC/H.264/MPEG-4p10",
+    "properties": {
+     "language": "und"
+    }
+   },
+   {
+    "type": "audio",
+    "codec": "E-AC-3",
+    "properties": {
+     "language": "eng",
+     "audio_channels": 6
+    }
+   },
+   {
+    "type": "subtitles",
+    "codec": "Timed Text",
+    "properties": {
+     "language": "eng"
+    }
+   }
+  ]
+ }
+}

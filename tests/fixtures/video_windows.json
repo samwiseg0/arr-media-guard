@@ -1,0 +1,136 @@
+[
+  {
+    "name": "UHD remux seek, Film A at 684 s",
+    "note": "HEVC logs PPS changed between slices before the first frame of a seek. An error before the first frame is seek noise, so the window is clean.",
+    "before": [
+      "[matroska,webm @ 0x603ba822e8c0] [warning] Could not find codec parameters for stream 3 (Subtitle: hdmv_pgs_subtitle (pgssub)): unspecified size",
+      "[matroska,webm @ 0x603ba822e8c0] [warning] Could not find codec parameters for stream 4 (Subtitle: hdmv_pgs_subtitle (pgssub)): unspecified size",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [warning] Skipping invalid undecodable NALU: 9",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices.",
+      "[hevc @ 0x63f4d2af83c0] [error] PPS changed between slices."
+    ],
+    "first": 0.042,
+    "frames": 120,
+    "fps": 23.976,
+    "after": [],
+    "bad": null
+  },
+  {
+    "name": "MPEG-TS seek, Film B in a .ts file at 1512 s",
+    "note": "A TS seek may land several seconds past the position. A first frame is late only past LATE, 30 s.",
+    "before": [
+      "[mpegts @ 0x6046edd41cc0] [warning] start time for stream 2 is not set in estimate_timings_from_pts",
+      "[h264 @ 0x59f7f8a27fc0] [error] co located POCs unavailable",
+      "[h264 @ 0x5bf6726e23c0] [error] co located POCs unavailable"
+    ],
+    "first": 6.912,
+    "frames": 120,
+    "fps": 23.976,
+    "after": [],
+    "bad": null
+  },
+  {
+    "name": "Seek into zeros, Film C at 731 s",
+    "note": "The demuxer scans from the zero-filled region to the next intact cluster, and video comes back 612 s after the window start.",
+    "before": [
+      "[matroska,webm @ 0x55d0] [error] 0x00 at pos 1048576 (0x100000) invalid as first byte of an EBML number"
+    ],
+    "first": 612.4,
+    "frames": 50,
+    "fps": 23.976,
+    "after": [],
+    "bad": "no video where the window starts"
+  },
+  {
+    "name": "Decode errors after the first frame, the shape of a glitch in a full decode",
+    "note": "A decoder error after the first output frame is damage.",
+    "before": [],
+    "first": 0.0,
+    "frames": 120,
+    "fps": 23.976,
+    "after": [
+      "[h264 @ 0x5602] [error] error while decoding MB 52 30, bytestream -7",
+      "[vist#0:0/h264 @ 0x5603] [dec:h264 @ 0x5604] [warning] corrupt decoded frame"
+    ],
+    "bad": "2 decode errors"
+  },
+  {
+    "name": "Malformed SEI, Film D in an MP4 at 796 s",
+    "note": "The h264 decoder logs this at every keyframe and skips the SEI. A full decode loses no frame, so the window is clean.",
+    "before": [],
+    "first": 0.0,
+    "frames": 120,
+    "fps": 23.976,
+    "after": [
+      "[h264 @ 0x5604b3c7e980] [error] SEI type 0 size 5 truncated at 4",
+      "[h264 @ 0x5f1f1e5145c0] [error] SEI type 0 size 5 truncated at 4"
+    ],
+    "bad": null
+  },
+  {
+    "name": "Scrambled slices, Film E at 578 s",
+    "note": "Few frames decode. SEI lines of random types come with the real faults, which keep the window bad.",
+    "before": [
+      "[h264 @ 0x5dcedce13480] [error] SEI type 187 size 142 truncated at 5",
+      "[h264 @ 0x5dcedce13480] [error] A non-intra slice in an IDR NAL unit.",
+      "[h264 @ 0x5dcedce13480] [error] decode_slice_header error",
+      "[h264 @ 0x5dcedce13480] [error] no frame!",
+      "[h264 @ 0x5dcedce13480] [error] non-existing PPS 11 referenced",
+      "[h264 @ 0x5dcedce13480] [error] SEI type 204 size 96 truncated at 2"
+    ],
+    "first": 0.0,
+    "frames": 0,
+    "fps": 23.976,
+    "after": [],
+    "bad": "no video where the window starts"
+  },
+  {
+    "name": "Seek into packed B-frames, Show A S01E01 in an AVI at 452 s",
+    "note": "The mpeg4 decoder logs one low_delay line after the seek. A full decode outputs every frame with no error.",
+    "before": [],
+    "first": 0.0,
+    "frames": 150,
+    "fps": 29.97,
+    "after": [
+      "[mpeg4 @ 0x5d8f259faf00] [info] Video uses a non-standard and wasteful way to store B-frames ('packed B-frames'). Consider using the mpeg4_unpack_bframes bitstream filter without encoding but stream copy to fix it.",
+      "[mpeg4 @ 0x5aa9568c8e40] [error] low_delay flag set incorrectly, clearing it",
+      "[out#0/null @ 0x5b1f86826940] [info] video:58KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown"
+    ],
+    "bad": null
+  },
+  {
+    "name": "Lost bytes in a cut mp4, Show B S01E02 at 305 s",
+    "note": "Bytes are lost early, so every later packet fails, with no frame and 'partial file'. A cut file with no video where the window starts is bad.",
+    "before": [
+      "[h264 @ 0x572d7a44b680] [error] Invalid NAL unit size (-518233407 > 31552).",
+      "[h264 @ 0x572d7a44b680] [error] missing picture in access unit with size 31556",
+      "[h264 @ 0x5cf0e54f66c0] [error] Invalid NAL unit size (-518233407 > 31552).",
+      "[h264 @ 0x5cf0e54f66c0] [error] Error splitting the input into NAL units.",
+      "[vist#0:0/h264 @ 0x5949b0dae200] [dec:h264 @ 0x572d7a44b680] [error] Error submitting packet to decoder: Invalid data found when processing input",
+      "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x57819b32d840] [error] stream 0, offset 0x0e2a41c3: partial file",
+      "[vist#0:0/h264 @ 0x55aa0a2f51c0] [dec:h264 @ 0x57ba7ee49740] [fatal] Decode error rate 1 exceeds maximum 0.666667",
+      "[vist#0:0/h264 @ 0x55aa0a2f51c0] [dec:h264 @ 0x57ba7ee49740] [error] Task finished with error code: -1145393733 (Error number -1145393733 occurred)",
+      "[vist#0:0/h264 @ 0x55aa0a2f51c0] [dec:h264 @ 0x57ba7ee49740] [error] Terminating thread with return code -1145393733 (Error number -1145393733 occurred)",
+      "[vf#0:0 @ 0x6167f2e79040] [warning] No filtered frames for output stream, trying to initialize anyway.",
+      "[out#0/null @ 0x56a4fb6b7e00] [info] video:0KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown",
+      "[out#0/null @ 0x56a4fb6b7e00] [warning] Output file is empty, nothing was encoded(check -ss / -t / -frames parameters if used)"
+    ],
+    "first": 0.0,
+    "frames": 0,
+    "fps": 29.97,
+    "after": [],
+    "bad": "no video where the window starts"
+  }
+]
