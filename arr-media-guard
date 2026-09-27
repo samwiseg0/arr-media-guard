@@ -576,7 +576,7 @@ def plex_activities(cache):
 
 def plex_watches():
     """Whether Plex may scan a folder by itself when a file in it changes, its "Scan my library automatically"
-    setting. Then a backfill's edit can start a scan of the edited item, so each analyze keeps its own two idle checks.
+    setting. Then a backfill's edit can start a scan of the edited item, so the analyze takes its own two idle checks.
     A missing setting or a failed read counts as on."""
     try:
         prefs = {s.get("id"): s.get("value") for s in plex_get("/:/prefs").get("Setting", [])}
@@ -614,12 +614,13 @@ def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None, burst=None):
     section. A busy section or a failed check waits PLEX_BUSY_WAIT and starts the two checks over. After
     PLEX_BUSY_CAP seconds of that the analyze is skipped. cache is plex_activities()'s dict, shared by one worker pass.
     The check right before the PUT never uses it. Returns (the final message or None, a reason code or None). A code
-    without a message is a deferral. ready, from --plex-flush, gives the seconds the send must still wait for
-    another reason, checked right after the two idle checks. A wait restarts them.
+    without a message is a deferral. ready, from a folder scan of --plex-flush or the worker, gives the seconds the
+    send must still wait for another reason, checked right after the two idle checks. A wait restarts them.
 
     burst, from a backfill only, maps a section to the times of the first and the last idle check in a row. A check
     at most PLEX_QUIET after the last one continues the row. Once the row spans PLEX_QUIET, each further analyze needs
-    only its own fresh idle check. A busy or failed check ends the row. See docs/design.md, "The burst"."""
+    only its own fresh idle check. A busy or failed check ends the row, and so does "Scan my library automatically"
+    when it is on, missing or does not read, see plex_watches(). See docs/design.md, "The burst"."""
     if not p["keys"]:
         try:
             p["keys"], p["other"], p["section"] = plex_folder_scan(p) if (p["want"] or {}).get("folder") else plex_find(p["path"], p["want"])
@@ -631,9 +632,12 @@ def plex_step(p, waits=PLEX_WAITS, cache=None, ready=None, burst=None):
                 return plex_gave_up(p["other"], sum(waits)), "plex_not_found"
             p["due"] = p["edited"] + sum(waits[:p["tries"] + 1])
             return None, None
-    now = time.monotonic()   # after the lookup, so the times below are those of the check
-    row = (burst or {}).get(p["section"])
-    if row and p["quiet"] is None and now - row[1] <= PLEX_QUIET:
+    row = (burst or {}).get(p["section"]) if p["quiet"] is None else None
+    if row and plex_watches():   # read before each file, so a change in the middle of a run counts
+        del burst[p["section"]]
+        row = None
+    now = time.monotonic()   # after the lookup and the setting, so the times below are those of the check
+    if row and now - row[1] <= PLEX_QUIET:
         p["quiet"] = row[0]
     # The check that can release the PUT reads /activities fresh. A shared read can be stale by then: another item's
     # lookup ran meanwhile, and a scan may have started. One GET per analyze sent.
@@ -769,25 +773,30 @@ def plex_flush(argv):
 def after_analyze(seen, section):
     """Seconds a folder scan of section must still wait, so that PLEX_SCAN_AFTER passes after every analyze the decision
     log records by now. seen is [read offset, section -> time of the last analyze, inode], kept by the caller, so each
-    call reads only the new lines. A new inode or a shorter file is a log that logrotate turned. It is read from its
-    start."""
-    with contextlib.suppress(OSError), open(CFG["LOG"], "rb") as fh:
-        st = os.fstat(fh.fileno())
-        if st.st_ino != seen[2] or st.st_size < seen[0]:
-            seen[0], seen[2] = 0, st.st_ino
-        fh.seek(seen[0])
-        for line in fh:
-            if not line.endswith(b"\n"):
-                break   # half a line: read it again next time
-            seen[0] += len(line)
-            if b'"plex_analyze_' not in line:   # most lines, and json.loads() is slow on a large log
-                continue
-            with contextlib.suppress(ValueError, KeyError, TypeError):
-                r = json.loads(line)
-                if r.get("plex_reason") in ("plex_analyze_sent", "plex_analyze_failed"):
-                    at, s = datetime.datetime.fromisoformat(r["time"]).timestamp(), r.get("section") or r.get("plex_section")
-                    for k in [str(s)] if s is not None else ["*"]:
-                        seen[1][k] = max(seen[1][k], at)
+    call reads only the new lines. After logrotate renamed the log to LOG.1, the rest of that file is read first, then
+    the new log from its start. A log that got shorter, as copytruncate leaves it, is read from its start."""
+    for path in (CFG["LOG"] + ".1", CFG["LOG"]):
+        with contextlib.suppress(OSError), open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if st.st_ino != seen[2]:
+                if path != CFG["LOG"]:
+                    continue   # LOG.1 is read only as the rest of the file this reader had
+                seen[0], seen[2] = 0, st.st_ino
+            elif st.st_size < seen[0]:
+                seen[0] = 0
+            fh.seek(seen[0])
+            for line in fh:
+                if not line.endswith(b"\n"):
+                    break   # half a line: read it again next time
+                seen[0] += len(line)
+                if b'"plex_analyze_' not in line:   # most lines, and json.loads() is slow on a large log
+                    continue
+                with contextlib.suppress(ValueError, KeyError, TypeError):
+                    r = json.loads(line)
+                    if r.get("plex_reason") in ("plex_analyze_sent", "plex_analyze_failed"):
+                        at, s = datetime.datetime.fromisoformat(r["time"]).timestamp(), r.get("section") or r.get("plex_section")
+                        for k in [str(s)] if s is not None else ["*"]:
+                            seen[1][k] = max(seen[1][k], at)
     return max(0.0, PLEX_SCAN_AFTER - (time.time() - max(seen[1][str(section)], seen[1]["*"])))
 
 
@@ -4879,7 +4888,7 @@ def backfill(argv):
     print(f"{len(work)} {'files that are not .mkv' if a.convert else 'mkv files, each read for its own tracks'}, "
           f"{('APPLY' + (f', {workers} at a time' if workers > 1 else '')) if a.apply else f'dry run, {workers} at a time'}", flush=True)
     counts, out, skipped, needed = {}, open(a.plan_out, "w") if a.plan_out else None, set(), 0   # skipped: plex_analyze()'s sections
-    burst = {} if a.apply and not a.convert and CFG["PLEX_URL"] and not plex_watches() else None   # see plex_step()
+    burst = {}   # plex_analyze()'s rows of idle checks, see plex_step()
     scans, rescans, settles, stop = {}, set(), {}, threading.Event()   # scans: folder -> plex_folder_job(), rescans and settles: per item, at the end
     if a.apply and a.convert:   # a stopped run left these
         pending_recover(app, True)
@@ -4921,9 +4930,10 @@ def backfill(argv):
                 scans[p["path"]] = p
             else:
                 rec["plex"], rec["plex_reason"] = plex_analyze(p, skipped, burst=burst)
-                rec["plex_section"] = p["section"]   # --plex-flush reads it
-                time.sleep(PLEX_PACE)
+                rec["plex_section"] = p["section"]   # --plex-flush and the worker read it, see after_analyze()
         decision(rec, time.time() - took)   # every file, dry runs too, so a run can be reviewed later
+        if "plex_section" in rec:   # after the decision line, so a folder scan elsewhere sees this analyze at once
+            time.sleep(PLEX_PACE)
         if "after the run" in ((rec.get("repack") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan")):
             rescans.add(rec["ids"]["app_id"])
         if (rec.get("repack") or {}).get("pending"):

@@ -141,7 +141,9 @@ section. A failed check counts as busy. A busy section defers the analyze by `PL
 when Plex watches the library folders ("Scan my library automatically"). When Plex does not, a backfill confirms the
 section idle once, and each analyze after that needs one fresh idle check right before its request. The idle checks
 form a row. A check at most `PLEX_QUIET` after the last one continues the row, and the row must span `PLEX_QUIET`.
-A busy check, a failed check or a longer gap ends the row, and the next analyze waits for two checks again.
+A busy check, a failed check or a longer gap ends the row, and the next analyze waits for two checks again. The
+backfill reads the setting before each analyze that would use a row. When it is on, missing or does not read, the
+row ends for that file.
 
 Each request still follows a fresh check that finds no scan in its section. The checks come at least as close
 together as the two checks did. Plex's work after an analyze (loudness, credits, chapter thumbnails, ad detection)
@@ -156,7 +158,8 @@ does not wait `PLEX_QUIET` for each file.
 **A folder scan.** A renamed file is not in Plex until Plex scans its folder. So a conversion or a
 restore under another name queues a partial scan of its one folder. Plex's work after an analyze
 shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section. The worker reads
-the decision log for this, as `--plex-flush` does, so it also waits for a backfill's analyzes.
+the decision log for this, as `--plex-flush` does, so it also waits for a backfill's analyzes. A backfill writes the
+decision line of an analyzed file before its `PLEX_PACE` pause. After logrotate, the reader finishes `LOG.1` first.
 An analyze waits while a folder scan of its section is pending.
 
 ## Alerts

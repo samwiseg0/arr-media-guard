@@ -178,8 +178,9 @@ def env(tmp_path, monkeypatch):
             act = calls["activities"].pop(0) if calls["activities"] else []
             if isinstance(act, Exception): raise act
             return {"MediaContainer": {"Activity": act}}
-        if u.path == "/:/prefs":   # calls["prefs"] is the watcher setting's value. None leaves it out. An exception is raised.
-            v = calls.get("prefs")
+        if u.path == "/:/prefs":   # calls["prefs"] is the watcher setting's value, or a list of one per read. None leaves it
+            v = calls.get("prefs")   # out. An exception is raised.
+            if isinstance(v, list): v = v.pop(0)
             if isinstance(v, Exception): raise v
             return {"MediaContainer": {"size": 177, "Setting": [] if v is None else [dict(WATCH_SETTING, value=v)]}}
         assert method == "PUT" and u.path.endswith("/analyze"), url   # never a section or folder scan
@@ -803,6 +804,72 @@ def test_a_worker_folder_scan_waits_for_a_backfill_analyze_in_the_log(env, monke
     assert plex_lines(env) == [("plex_deferred", "plex_scan_after_analyze"), ("plex", "plex_scan_sent")]
 
 
+ANALYZE_LINE = dict(app="radarr", source="hook", result="plex", plex="analyze sent for 7101", plex_reason="plex_analyze_sent",
+                    section="12")
+
+
+def pad_log(n):
+    """n decision lines with no analyze, so the log is longer than a reader's offset."""
+    with open(hook.CFG["LOG"], "a") as f:
+        f.write("".join(json.dumps(dict(result="no change", path=f"/m/{i}.mkv", note="x" * 200)) + "\n" for i in range(n)))
+
+
+def reader():
+    return [0, collections.defaultdict(float), None]
+
+
+def holds(seen, section="12"):
+    """Whether the reader holds a scan for the whole PLEX_SCAN_AFTER. The log's time has whole seconds."""
+    return hook.after_analyze(seen, section) > hook.PLEX_SCAN_AFTER - 1
+
+
+def test_the_log_reader_finishes_the_rotated_log_first(env):
+    seen = reader()
+    pad_log(5)
+    assert hook.after_analyze(seen, "12") == 0
+    log_at_clock(ANALYZE_LINE)   # the last line before logrotate renames the log
+    os.rename(hook.CFG["LOG"], hook.CFG["LOG"] + ".1")
+    pad_log(1)
+    assert holds(seen)
+
+
+def test_the_log_reader_starts_a_new_log_at_its_top(env):
+    seen = reader()
+    pad_log(5)
+    hook.after_analyze(seen, "12")
+    os.rename(hook.CFG["LOG"], hook.CFG["LOG"] + ".1")
+    log_at_clock(ANALYZE_LINE)   # the first line of the new log, which then grows past the old offset
+    pad_log(10)
+    assert holds(seen)
+
+
+def test_the_log_reader_starts_a_shorter_log_at_its_top(env):
+    seen = reader()
+    pad_log(5)
+    hook.after_analyze(seen, "12")
+    open(hook.CFG["LOG"], "w").close()   # copytruncate keeps the inode
+    log_at_clock(ANALYZE_LINE)
+    assert holds(seen)
+
+
+@pytest.mark.parametrize("line, section", [
+    (dict(ANALYZE_LINE, plex_reason="plex_analyze_failed"), "12"),   # a failed request may still have reached Plex
+    ({k: v for k, v in ANALYZE_LINE.items() if k != "section"}, "7")])   # a line with no section counts for every section
+def test_the_log_reader_counts_every_analyze_that_may_have_reached_plex(env, line, section):
+    log_at_clock(line)
+    assert holds(reader(), section)
+
+
+def test_the_log_reader_reads_half_a_line_again(env):
+    seen, line = reader(), json.dumps(dict(ANALYZE_LINE, time=datetime.datetime.fromtimestamp(hook.time.time()).astimezone().isoformat()))
+    with open(hook.CFG["LOG"], "a") as f:   # a writer in the middle of its line
+        f.write(line[:60])
+    assert hook.after_analyze(seen, "12") == 0
+    with open(hook.CFG["LOG"], "a") as f:
+        f.write(line[60:] + "\n")
+    assert holds(seen)
+
+
 def test_backfill_skips_a_section_it_gave_up_on_at_once(env, monkeypatch, tmp_path, capsys):
     paths = [env["path"]] + [str(tmp_path / "media" / "Film A (1979)" / f"Other{n}.mkv") for n in (1, 2)]
     for n, p in enumerate(paths[1:], 1):
@@ -854,6 +921,7 @@ def backfill_films(env, monkeypatch, tmp_path, n):
 
 @pytest.mark.parametrize("watch, checks", [
     (False, [0, 15, 17, 19]),                                           # Plex does not watch the folders: one confirmation
+    ([False, True], [0, 15, 17, 19, 34]),                               # the owner turns it on before the third file
     (True, [0, 15, 17, 32, 34, 49]),                                    # an edit can start a scan: two checks per file
     (None, [0, 15, 17, 32, 34, 49]),                                    # no such setting
     (urllib.error.URLError("refused"), [0, 15, 17, 32, 34, 49])])       # the read failed
@@ -861,7 +929,14 @@ def test_a_backfill_burst_confirms_the_section_once(env, monkeypatch, tmp_path, 
     backfill_films(env, monkeypatch, tmp_path, 3)
     env["prefs"] = watch
     env["activities"] = [[LOUDNESS, CREDITS]] * 6   # Plex's own work after each analyze
+    real_sleep, logged = hook.time.sleep, []
+    def sleep(sec):   # the decision line with the analyze is in the log before the pause, so a folder scan elsewhere sees it
+        if sec == hook.PLEX_PACE:
+            logged.append((len(analyzes(env)), len([r for r in log_lines(env) if r.get("plex_section")])))
+        real_sleep(sec)
+    monkeypatch.setattr(hook.time, "sleep", sleep)
     hook.main(["--backfill", "radarr", "--apply"])
+    assert logged == [(1, 1), (2, 2), (3, 3)]
     assert analyzes(env) == ["/library/metadata/7101/analyze", "/library/metadata/7102/analyze", "/library/metadata/7103/analyze"]
     assert env["checks"] == checks
     plex = [(m, urlparse(u).path) for m, u, b in env["http"] if "plex.invalid" in u]
@@ -883,6 +958,7 @@ def burst_run(env, gaps, burst):
 
 
 def test_a_scan_mid_burst_ends_it(env):
+    env["prefs"] = False
     env["activities"] = [[], [], [], [scan()]]   # the third file's check finds a scan that started after the second analyze
     burst, start = {}, env["clock"][0]
     assert burst_run(env, [0, hook.PLEX_PACE, hook.PLEX_PACE, hook.PLEX_PACE], burst) == ["plex_analyze_sent"] * 4
@@ -895,7 +971,7 @@ def test_a_scan_mid_burst_ends_it(env):
 
 
 def test_an_idle_gap_ends_the_burst(env):
-    burst = {}
+    env["prefs"], burst = False, {}
     gaps = [0, hook.PLEX_QUIET + 1, hook.PLEX_QUIET]   # a slow file, then one that comes exactly PLEX_QUIET after a check
     assert burst_run(env, gaps, burst) == ["plex_analyze_sent"] * 3
     assert env["checks"] == [0, 15, 31, 46, 61]   # 16 s after the last check: two new checks. 15 s after: one.
@@ -907,7 +983,7 @@ def test_each_process_confirms_the_section_itself(env):
     """The hook's worker sends every analyze of its job processes itself, see coordinate(). It never uses a burst, because
     the import made the app ask Plex for a scan of the item's folder. A second backfill has its own burst. So an idle
     row that one backfill saw never releases an analyze of another sender."""
-    burst = {}
+    env["prefs"], burst = False, {}
     burst_run(env, [0], burst)
     pending = [burst_job(env, "hook item")]
     drain(pending)
