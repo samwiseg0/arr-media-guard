@@ -61,8 +61,9 @@ It reads `/etc/arr-media-guard.env`. Set `ARR_MEDIA_GUARD_ENV` to use another fi
 Sonarr and Radarr run the script as their own user. That user must be able to write `STATE_DIR`, `LOG` and your media
 files. Both apps share the state folder and its locks, so give them a shared group, or run both as the same user.
 
-The decision log grows by one line per file. Rotate it weekly with logrotate. Leave out `copytruncate`, because the
-script opens the log for each line.
+The decision log grows by one line per file. Rotate it weekly with logrotate. Keep `delaycompress` next to `compress`,
+because a Plex folder scan reads the rest of `LOG.1` after a rotation. Leave out `copytruncate`, because the script
+opens the log for each line.
 
 The hook's children run in the app's cgroup. Add `OOMPolicy=continue` to the `[Service]` section of both app units,
 so an OOM kill of a child never restarts the app. See "Memory" in the design notes.

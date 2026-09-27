@@ -369,7 +369,8 @@ codes come from `OUTCOMES` in the script. The reason codes come from the `reason
 `arr_decide.py` and from the script's header and restore steps. An `editing` line with the undo goes
 out before each edit, so a crashed edit still has a record. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
-the log weekly with compression.
+the log weekly with compression, and keep `delaycompress`. A folder scan reads the rest of `LOG.1` after a rotation,
+and plain `compress` has already made it `LOG.1.gz`.
 
 Each decision also goes to syslog as one logfmt line with the tag `NAME`. It holds no path, no track
 list and no secret. The app key is `arr`, because a log store such as Loki often puts the syslog tag
