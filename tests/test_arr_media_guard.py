@@ -34,6 +34,7 @@ import importlib.util
 import io
 import json
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -2975,10 +2976,10 @@ def test_the_zero_probe_reads_only_the_matroska_clusters(tmp_path):
     """Rule A. A file may hold a zero run in a font of its Attachments, before the first Cluster. Another may hold
     zeros from its Segment end on, then the Clusters of an older copy. The episode in each Segment decodes clean, so
     neither zero run is damage."""
-    D = hook.arr_decide
-    head = el(0x1549A966, os.urandom(200)) + el(0x1941A469, bytes(4 << 20))   # Info, then Attachments with a zero-filled font
-    segment = head + b"".join(el(D.CLUSTER, os.urandom(1 << 20)) for _ in range(24)) + el(D.CUES, os.urandom(4096))
-    old = b"".join(el(D.CLUSTER, os.urandom(1 << 20)) for _ in range(8))
+    D, rnd = hook.arr_decide, random.Random(20260927)   # the same bytes on every run
+    head = el(0x1549A966, rnd.randbytes(200)) + el(0x1941A469, bytes(4 << 20))   # Info, then Attachments with a zero-filled font
+    segment = head + b"".join(el(D.CLUSTER, rnd.randbytes(1 << 20)) for _ in range(24)) + el(D.CUES, rnd.randbytes(4096))
+    old = b"".join(el(D.CLUSTER, rnd.randbytes(1 << 20)) for _ in range(8))
     f = tmp_path / "Show K - s01e04 - Bluray-1080p.mkv"
     f.write_bytes(ebml(len(segment), segment) + bytes(16 << 20) + old)
     ds, size = len(ebml(0, b"")), os.path.getsize(f)
