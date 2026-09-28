@@ -5844,6 +5844,28 @@ def test_a_name_that_loses_a_scoring_custom_format_refuses_the_conversion(env, m
         assert rec["outcome"] == "edited" and os.path.exists(mkv), rec["result"]
 
 
+def test_a_listed_file_still_refuses_at_the_score_check(env, monkeypatch, tmp_path, capsys):
+    """--force-convert overrides only a logged proof refusal and Sonarr's name check. A listed file whose new name would
+    lose a custom format that scores still refuses before the remux, as Film H does without the option."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    record = env["movies"]["moviefile/11"]
+    record.update(sceneName=None, customFormatScore=7, customFormats=[{"id": 1, "name": "Format A"}, {"id": 2, "name": "Format B"}])
+    download = "Film.H.2007.Extended.Cut.BluRay.H264.AC3.DD5"
+    env["original_paths"] = {11: f"{download}/{download}.mp4"}
+    env["movies"]["movie/7"]["qualityProfileId"] = 4
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "movieId": 7, "path": mp4})]
+    env["profile"] = {"formatItems": [{"format": 1, "name": "Format A", "score": 5}, {"format": 2, "name": "Format B", "score": 2}]}
+    env["parse_cf"] = lambda title: {"customFormats": [{"id": 2, "name": "Format B"}] if title.endswith(".mkv") else [{"id": 1, "name": "Format A"}],
+                                     "parsedMovieInfo": {"releaseGroup": None, "quality": {"quality": {"name": "Bluray-720p"}}}}
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--convert", "--apply", "--force-convert", mp4])
+    (rec,) = [r for r in log_lines(env) if r.get("outcome")]
+    assert rec["outcome"] == "repack_score_refused" and "lost Format A (+5)" in rec["result"], rec["result"]
+    assert env["repacks"] == [] and env["writes"] == [] and os.path.exists(mp4) and not os.path.exists(mkv)
+    assert "name check" not in capsys.readouterr().out
+
+
 def test_a_record_with_no_scene_name_keeps_its_download_name(monkeypatch):
     """Film H has no scene name, and the app scored "Format A" on its original download path. The new
     record has no such path, so the hook sends that path's name as the scene name. The app keeps it when it reads as a
@@ -6226,7 +6248,8 @@ def test_a_person_can_force_a_conversion_the_proof_refuses(env, monkeypatch, tmp
         assert rec["outcome"] == "repack_failed" and ("forced" in rec["repack"]) == (case == "forced, not taken") and "kept" not in rec["repack"], rec
         assert os.path.exists(first) and not os.path.exists(mkv) and os.stat(first).st_nlink == 1
         assert not [f for _, _, fs in os.walk(root) for f in fs]
-        assert ("no proof refusal in the decision log, so only its name check is forced: " + first in out) == (case == "no refusal logged"), out
+        assert ("no proof refusal in the decision log, so it is not forced: " + first in out) == (case == "no refusal logged"), out
+        assert "name check" not in out   # Radarr has no name check
         assert ("not forced: the last refusal in the decision log differs: " + refusal in out) == (case == "other refusal"), out
         if case != "forced, not taken":
             return

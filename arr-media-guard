@@ -5270,7 +5270,8 @@ def backfill(argv):
         work = [w for w in work if w[0]["path"] in listed]
         a.force = logged_refusals({w[0]["path"] for w in work})
         for p in sorted(p for p, why in a.force.items() if not why):
-            print(f"no proof refusal in the decision log, so only its name check is forced: {p}", flush=True)
+            print(f"no proof refusal in the decision log, so {'only its name check is' if app == 'sonarr' else 'it is not'} forced: {p}",
+                  flush=True)
     # A dry run reads SCAN_WORKERS files at a time, like a scan, and --workers wins. An apply edits one file at a time, so
     # --limit, --canary and the Plex pace stay exact. A conversion apply converts CONVERT_WORKERS files at a time through
     # the slots of a pool, see backfill_files().
