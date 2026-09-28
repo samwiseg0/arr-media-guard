@@ -4446,12 +4446,13 @@ def test_the_wrong_content_regrab_waits_its_turn(env, monkeypatch):
 @pytest.fixture(scope="module")
 def damaged(tmp_path_factory):
     """80 s of noisy video at 2 Mbit/s with no Cues, then three copies damaged the ways real files were. Every window
-    reads the file from its start, because nothing says where a cluster is."""
+    reads the file from its start, because nothing says where a cluster is. One encoder thread and a fixed noise seed
+    give the same file on every machine, since x264's output changes with the thread count."""
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     d = tmp_path_factory.mktemp("damaged")
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=80,noise=alls=40:allf=t", "-f", "lavfi",
-                    "-i", "sine=frequency=440:duration=80", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M", "-g", "48", "-c:a", "aac",
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=80,noise=alls=40:allf=t:all_seed=1", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=80", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M", "-g", "48", "-threads", "1", "-c:a", "aac",
                     str(d / "src.mkv")], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), "--cues", "0:none", "--cues", "1:none", str(d / "src.mkv")], check=True)
     size = os.path.getsize(d / "nocues.mkv")
