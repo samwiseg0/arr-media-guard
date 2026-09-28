@@ -527,6 +527,14 @@ above 0. The decision line names the refusal in `repack.forced`, and the nightly
 "forced". A listed path that is not in the run's work list is reported and skipped. The hook
 never forces a conversion.
 
+A listed Sonarr file also skips `parse_refuses()`. Scene numbering can put specials at the start of
+a season, and an alias can match another show, so the parse can read a right name as other
+episodes. The ManualImport names the item's own episodes by id, so the link stays right. The parse
+result is fixed, so this needs no logged refusal. Every other check still runs, and the proof must
+still pass unless its refusal is logged. The decision line names the parse result in
+`repack.forced_name`, the original is kept as for a forced proof, and the audit says "name
+forced". The extras still go back by a rescan, which links them by their parsed names.
+
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
 into `HIDE_DIR`, the new file is linked in as `<base>.mkv`, and the original moves to a held name in

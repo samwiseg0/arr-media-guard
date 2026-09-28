@@ -4363,10 +4363,13 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     import holds no worker slot, and pool.imports sends it with the other files of the item that wait. Only the main
     thread sets a signal handler or the time limit.
 
-    force is the last proof refusal of the file in the decision log, as its result text, see logged_refusals(). A person
+    force is None for a file no person listed with --force-convert. For a listed file it is the last proof refusal of
+    the file in the decision log, as its result text, or "" when the log holds none, see logged_refusals(). A person
     checked it and accepts it. The file then converts when prove() refuses it for that same reason. info names the
     refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it. Another
-    refusal is not forced, and info names the logged one in not_forced.
+    refusal is not forced, and info names the logged one in not_forced. A listed Sonarr file also skips
+    parse_refuses(), because the ManualImport names its episodes by id. info names the parse result in forced_name, and
+    the original is kept too. Every other check still runs.
 
     info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import."""
     c = j.get("container") or {}
@@ -4399,6 +4402,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         if not why and app == "sonarr":   # the new name and the extras that go back must parse as this file's episodes
             muxed = {s["path"] for s in subs}
             why = parse_refuses(new, items, [x for x in app_extras(app, ids["app_id"], old.get("id"), home) if x not in muxed])
+            if why and force is not None:   # a person listed the file, and the relink names its episodes by id
+                info["forced_name"], why = why, None
         why = why or score_refuses(app, ids["app_id"], old, new)
     folder = tempfile.mkdtemp(prefix="arr-media-guard-convert-")
     if not why and caps:   # a read of the whole file, in a dry run too, so the dry run lists a caption track with no text
@@ -4469,7 +4474,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
             now = os.stat(path)
         if not now or (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
             raise SourceChanged("the app replaced or renamed the original during the repack")
-        if info.get("forced"):   # a hard link: one move puts the original back
+        if info.get("forced") or info.get("forced_name"):   # a hard link: one move puts the original back
             try:
                 info["kept"] = keep_original(path)
             except OSError as ex:
@@ -5185,10 +5190,10 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
 
 
 def logged_refusals(paths):
-    """{path: the last refusal of its conversion in the decision log, as the result text of a failed repack, or None}
+    """{path: the last refusal of its conversion in the decision log, as the result text of a failed repack, or ""}
     for paths. A forced conversion's line counts with the refusal it overrode. --force-convert forces a file only for
     that refusal, so a file that now fails for another reason stays."""
-    out = dict.fromkeys(paths)
+    out = dict.fromkeys(paths, "")
     for r in read_jsonl(CFG["LOG"] + ".1", CFG["LOG"]):
         rp = r.get("repack") or {}
         if r.get("path") not in out or "outcome" not in r:
@@ -5263,7 +5268,7 @@ def backfill(argv):
         work = [w for w in work if w[0]["path"] in listed]
         a.force = logged_refusals({w[0]["path"] for w in work})
         for p in sorted(p for p, why in a.force.items() if not why):
-            print(f"no proof refusal in the decision log, so it is not forced: {p}", flush=True)
+            print(f"no proof refusal in the decision log, so only its name check is forced: {p}", flush=True)
     # A dry run reads SCAN_WORKERS files at a time, like a scan, and --workers wins. An apply edits one file at a time, so
     # --limit, --canary and the Plex pace stay exact. A conversion apply converts CONVERT_WORKERS files at a time through
     # the slots of a pool, see backfill_files().
@@ -5308,6 +5313,7 @@ def backfill(argv):
                   f'{" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else ""}'
                   f'{" | forced, the proof refused: " + rec["repack"]["forced"][:150] if (rec.get("repack") or {}).get("forced") else ""}'
                   f'{" | not forced: " + rec["repack"]["not_forced"][:150] if (rec.get("repack") or {}).get("not_forced") else ""}'
+                  f'{" | name forced: " + rec["repack"]["forced_name"][:150] if (rec.get("repack") or {}).get("forced_name") else ""}'
                   f'{" | " + "; ".join(rec.get("notes", [])) if rec.get("notes") else ""}'
                   f'{" | ALERT " + "; ".join(rec["alerts"]) if rec.get("alerts") else ""}', flush=True)
         if a.apply and (rec["result"] == "edited" or {"repacked", *REPAIRED} & set(rec.get("reasons", []))) and want and CFG["PLEX_URL"]:
@@ -5482,7 +5488,7 @@ def audit(argv):
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
             if (r.get("repack") or {}).get("new_size"):
-                add(repacked, f'repacked from {r.get("container")}' + (", forced" if r["repack"].get("forced") else ""), r.get("label"))
+                add(repacked, f'repacked from {r.get("container")}' + forced_note(r["repack"]), r.get("label"))
                 seen.append(("changed", r))
             code = (r.get("header_repair") or {}).get("code")
             if code in REPAIRED:
@@ -5558,10 +5564,15 @@ LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "Germa
               "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "und": "untagged"}
 
 
+def forced_note(repack):
+    """What a person forced in a conversion: ", forced" for a proof refusal, ", name forced" for Sonarr's name check."""
+    return (", forced" if repack.get("forced") else "") + (", name forced" if repack.get("forced_name") else "")
+
+
 def change_phrases(r):
     """The changes one decision line records, as (phrase, role) in the plain words of layout B: "English audio first",
     "English subs on" with the role of the subtitle turned on, "English subs off", "foreign subs off", "fake forced
-    subs off", "audio default flag fixed", "converted to MKV from AVI" (", forced" when a person forced it), "header
+    subs off", "audio default flag fixed", "converted to MKV from AVI" (with forced_note()), "header
     repaired". Each phrase once."""
     out, before = [], {t["sel"]: t for t in r.get("before") or []}
     words = {"audio default flag fixed": "audio default flag fixed", "English subtitle off": "English subs off",
@@ -5575,7 +5586,7 @@ def change_phrases(r):
         elif rule in words:
             out.append((words[rule], None))
     if (r.get("repack") or {}).get("new_size"):
-        out.append((f"converted to MKV from {r.get('container')}" + (", forced" if r["repack"].get("forced") else ""), None))
+        out.append((f"converted to MKV from {r.get('container')}" + forced_note(r["repack"]), None))
     code = (r.get("header_repair") or {}).get("code")
     if code in REPAIRED:
         out.append(({"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "a subtitle track removed"}[code],
