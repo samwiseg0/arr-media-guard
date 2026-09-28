@@ -10,7 +10,7 @@ jobs:
     # Debian 13 ships the tested tool versions. mkvtoolnix 82 on Ubuntu 24.04 does not report frame counts.
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Python, ffmpeg and mkvtoolnix
         run: apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ffmpeg mkvtoolnix
       - name: Install pytest
