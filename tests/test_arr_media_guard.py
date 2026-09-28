@@ -5711,26 +5711,35 @@ def test_a_name_sonarr_reads_as_other_episodes_refuses_the_conversion(env, monke
     assert line.split("\t")[1] == "repack_parse_refused"
 
 
-@pytest.mark.parametrize("case", ["listed", "not listed", "proof refused", "proof refused, then logged"])
+@pytest.mark.parametrize("case", ["listed", "not listed", "proof refused", "proof refused, then logged", "listed, clean extra",
+                                  "listed, extra mis-links"])
 def test_a_listed_file_skips_the_sonarr_name_check(env, monkeypatch, tmp_path, capsys, case):
     """Scene numbering can make Sonarr's parse read a right name as other episodes. A file a person lists with
     --force-convert skips that check, because the ManualImport names the item's own episodes by id. The decision line
     names the parse result in forced_name, the original stays in KEEP_DIR, and the audit says "name forced". An unlisted
     file still skips the conversion. The proof still runs: a listed file it refuses keeps its original, unless the
-    decision log holds that refusal, as for any force."""
+    decision log holds that refusal, as for any force. An extra keeps the check, because a rescan links it by its name:
+    a listed file with a clean extra converts, and one whose extra maps to other episodes refuses and names the extra."""
     def link(eps, ids, fid):
         for e in eps:
             if e["id"] in ids: e["episodeFileId"] = fid
     mp4, mkv, eps, files = sonarr_mp4(env, monkeypatch, link)
     series_app = hook.arr   # sonarr_mp4()'s app, and the lists a backfill reads
-    lists = {"series": [{"id": 5, "title": "Show", "statistics": {"episodeFileCount": 1}}], "episode?seriesId=5": eps,
-             "episodefile?seriesId=5": [dict(files[9], seriesId=5)]}
-    monkeypatch.setattr(hook, "arr", lambda a, p: lists[p] if p in lists else series_app(a, p))
+    linked = lambda: sorted({e["episodeFileId"] for e in eps})   # the file the episodes link, 9 and then the new one
+    lists = {"series": lambda: [{"id": 5, "title": "Show", "statistics": {"episodeFileCount": 1}}], "episode?seriesId=5": lambda: eps,
+             "episodefile?seriesId=5": lambda: [dict(files[i], seriesId=5) for i in linked()]}
+    monkeypatch.setattr(hook, "arr", lambda a, p: lists[p]() if p in lists else series_app(a, p))
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     monkeypatch.setattr(hook, "KEEP_DAYS", 7)
     root = tmp_path / hook.KEEP_DIR
     monkeypatch.setattr(hook, "originals_root", lambda p: str(root))
     env["parse"] = {os.path.basename(mkv): [7201]}   # two episodes early
+    extra = mp4[:-4] + ".pdf"
+    if "extra" in case:   # an extra that goes back after the settle
+        with open(extra, "w") as f:
+            f.write("notes")
+        env["extra_rows"] = lambda: [(os.path.basename(extra), linked()[0], "ExtraFiles")]   # the rescans link it to the new file
+        env["parse"][os.path.basename(extra)] = [7201] if case.endswith("mis-links") else [31, 32]
     refusal = "stream video 0 (h264) holds 1006 packets in the new file, 1000 in the original"
     if case.startswith("proof refused"):
         env["proof"] = (refusal, [])
@@ -5741,6 +5750,10 @@ def test_a_listed_file_skips_the_sonarr_name_check(env, monkeypatch, tmp_path, c
         hook.main(["--backfill", "sonarr", "--convert", "--apply", *force])
     rec = [r for r in log_lines(env) if r.get("outcome")][-1]
     imports = [w[2] for w in env["writes"] if w[1] == "command" and w[2]["name"] == "ManualImport"]
+    if case == "listed, extra mis-links":
+        assert rec["outcome"] == "repack_parse_refused" and f"maps {os.path.basename(extra)} to other episodes" in rec["result"], rec
+        assert imports == [] and os.path.exists(mp4) and os.path.exists(extra) and env["repacks"] == [] and "forced_name" not in rec["repack"]
+        return
     if case in ("not listed", "proof refused"):
         assert rec["outcome"] == ("repack_parse_refused" if case == "not listed" else "repack_failed") and os.path.exists(mp4), rec
         assert imports == [] and not os.path.exists(mkv) and not [f for _, _, fs in os.walk(root) for f in fs]
@@ -5753,6 +5766,8 @@ def test_a_listed_file_skips_the_sonarr_name_check(env, monkeypatch, tmp_path, c
     note = ", forced, name forced" if case == "proof refused, then logged" else ", name forced"
     assert hook.change_phrases(rec) == [(f"converted to MKV from {rec['container']}{note}", None)]
     assert "name forced: Sonarr reads a name as other episodes" in capsys.readouterr().out
+    assert os.path.basename(mkv) in rec["repack"]["forced_name"] and os.path.basename(extra) not in rec["repack"]["forced_name"]
+    assert os.path.exists(extra) == (case == "listed, clean extra")   # the extra goes back beside the new file
 
 
 def test_a_sonarr_import_that_links_one_episode_of_two_is_undone(env, monkeypatch):

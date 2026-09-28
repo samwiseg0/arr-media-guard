@@ -222,9 +222,11 @@ decision line names the refusal in `repack.forced`, and the nightly audit says t
 needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0. A path that is not in the run's work list is
 reported and skipped.
 
-A listed Sonarr file also skips the check that Sonarr reads its new name as its own episodes. Scene numbering or an
+A listed Sonarr file also skips the check that Sonarr reads its new video name as its own episodes. Scene numbering or an
 alias can make that check wrong while the names are right. The conversion names the episodes by id, so the link stays
-right. This needs no logged refusal. The proof still runs, and a proof refusal is forced only as above. The decision
+right. This needs no logged refusal. The extras beside the video keep the check, and an extra whose name maps to other
+episodes still refuses the file and is named, so you can fix or remove it. The proof still runs, and a proof refusal is
+forced only as above. The decision
 line names the parse result in `repack.forced_name`, the original stays in `KEEP_DIR`, and the audit says "name
 forced".
 

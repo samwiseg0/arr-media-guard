@@ -4056,14 +4056,14 @@ def original_path(app, fid):
     return rows[0][0] if rows else None
 
 
-def parse_refuses(new, items, extras):
-    """Why Sonarr would link the new file's name, or one of its extras, to other episodes, or None.
+def parse_refuses(items, names):
+    """Why Sonarr would link one of names, the new file's name or an extra, to other episodes, or None.
     The second rescan of settle_extras() links each extra to the episodes its name parses as, and a later rescan reads
     the video's name the same way. So the new name and every extra that goes back must parse as the file's own
     episodes, or some of them, see other_episodes(). A name that does not parse, or parses as other episodes, refuses
     the conversion before anything is written, as scene or absolute numbering can. Radarr
     keeps one movie a folder, so it needs no parse."""
-    for p in [new, *extras]:
+    for p in names:
         why = other_episodes(p, items, os.path.basename(p))
         if why:
             return mask(f"Sonarr reads a name as other episodes: {why}")[:300]
@@ -4368,8 +4368,9 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     checked it and accepts it. The file then converts when prove() refuses it for that same reason. info names the
     refusal in forced, and the original is kept in originals_root() for KEEP_DAYS, as a header repair keeps it. Another
     refusal is not forced, and info names the logged one in not_forced. A listed Sonarr file also skips
-    parse_refuses(), because the ManualImport names its episodes by id. info names the parse result in forced_name, and
-    the original is kept too. Every other check still runs.
+    parse_refuses() for its own new name, because the ManualImport names its episodes by id. info names the parse result
+    in forced_name, and the original is kept too. Its extras still go back by a rescan, which links them by their parsed
+    names, so each extra must still parse as the file's episodes. Every other check still runs.
 
     info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import."""
     c = j.get("container") or {}
@@ -4401,9 +4402,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         why = app_refuses(path, old, items, home)
         if not why and app == "sonarr":   # the new name and the extras that go back must parse as this file's episodes
             muxed = {s["path"] for s in subs}
-            why = parse_refuses(new, items, [x for x in app_extras(app, ids["app_id"], old.get("id"), home) if x not in muxed])
-            if why and force is not None:   # a person listed the file, and the relink names its episodes by id
-                info["forced_name"], why = why, None
+            extras = [x for x in app_extras(app, ids["app_id"], old.get("id"), home) if x not in muxed]
+            why = parse_refuses(items, extras if force is not None else [new, *extras])
+            if not why and force is not None and (name := parse_refuses(items, [new])):   # the relink names the episodes by id
+                info["forced_name"] = name
         why = why or score_refuses(app, ids["app_id"], old, new)
     folder = tempfile.mkdtemp(prefix="arr-media-guard-convert-")
     if not why and caps:   # a read of the whole file, in a dry run too, so the dry run lists a caption track with no text
