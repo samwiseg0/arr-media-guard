@@ -460,11 +460,13 @@ video is not enough. The app's scan takes it as an extra of the item and can ren
 the recycle bin. A swap once hid it with the extras, and the link to the new name failed. An
 mkvmerge error fails the conversion. mkvmerge exits 1 on warnings alone, and then the proof decides,
 because a warning can be harmless, such as zero bytes it skips at an audio end. ASF and WMV go through
-`ffmpeg -c copy`, because mkvmerge cannot read them, and any ffmpeg message fails them. A c608
-caption track becomes an English SubRip track, because mkvmerge drops it.
+`ffmpeg -c copy -copyinkf`, because mkvmerge cannot read them, and any ffmpeg message fails them.
+`-copyinkf` keeps the frames before the first keyframe. A c608 caption track becomes an English
+SubRip track, because mkvmerge drops it.
 
-**The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyts -f
-framemd5` and pairs the streams of each kind. A stream must keep its codec, its count of packets
+**The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyinkf
+-copyts -f framemd5` and pairs the streams of each kind. `-copyinkf` keeps the frames before the
+first keyframe, which a copy drops by default. Without it, a new file that lost them would pass. A stream must keep its codec, its count of packets
 with data, and a digest over every packet. Where mkvmerge changes packets on purpose, a bitstream
 filter brings both sides to the same bytes (`PROOF_BSF`). Each stream must start within 0.05
 seconds of where it started, and the video and audio must end within 1 second. Each packet time may
@@ -482,7 +484,11 @@ The proof allows a cut last frame and a cut first audio frame that mkvmerge drop
 frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
-The proof also allows a last sample that an MP4 edit list hides.
+The first MP3 or MP2 packet can also hold junk before a whole frame, zeros or a RIFF header of at
+most 128 bytes, and the stream can end on a cut frame that mkvmerge drops. The rule runs in any
+container, and the measured files are AVIs. It passes when one read of packet 0 of each file shows
+the new packet 0 is the tail of the old one after the junk. The entry names the junk in
+`trimmed_first.junk` and the cut frame in `dropped`. The proof also allows a last sample that an MP4 edit list hides.
 
 A few packets more may go at the ends when every other packet matches in order. The video may lose
 up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose

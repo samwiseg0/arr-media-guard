@@ -6575,6 +6575,48 @@ def test_a_real_remux_proves_every_stream_at_packet_level(convertible, tmp_path,
         assert tracks == [("eng", True), ("eng", False), ("spa", False)]
 
 
+def test_a_wmv_that_starts_before_its_first_keyframe_converts_whole(tmp_path):
+    """ASF and WMV go through ffmpeg -c copy. With -copyinkf the new file keeps the frames before the first keyframe and
+    proves clean. The same remux without it loses them, and the proof refuses it."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, src, new, lost = (tmp_path / n for n in ("full.wmv", "Clip.wmv", "new.mkv", "lost.mkv"))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+              "-c:v", "wmv2", "-g", "48", "-c:a", "wmav2", str(full)], check=True)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-map", "0", "-c", "copy", "-copyinkf", str(src)], check=True)
+    remux(src, new)   # convert_cmd(), as convert() runs it for a container mkvmerge cannot read
+    fault, proof = hook.prove(str(src), str(new), [], str(tmp_path))
+    flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags", "-of", "csv=p=0", str(src)],
+                     capture_output=True, text=True).stdout.split()
+    assert fault is None and "K" not in flags[0] and proof[0]["count"] == len(flags), (fault, proof)
+    argv = hook.convert_cmd(str(src), str(lost), hook.mkvmerge(str(src)), [], hook.ff_streams(str(src))[1])[5:]
+    REAL_RUN([a for a in argv if a != "-copyinkf"], check=True)
+    fault, _ = hook.prove(str(src), str(lost), [], str(tmp_path))
+    assert fault and fault.startswith("stream video 0 (wmv2) holds "), fault
+
+
+def test_frames_before_the_first_keyframe_are_proven(tmp_path):
+    """An MP4 can start with frames before its first keyframe. A plain -c copy drops them, so a proof that read both
+    files that way passed a new file that lost them. With -copyinkf the proof reads them: mkvmerge keeps them and
+    passes, and an ffmpeg copy that lost them fails. The one-packet read also starts at packet 0."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, src, kept, lost = (tmp_path / n for n in ("full.mp4", "Clip.mp4", "kept.mkv", "lost.mkv"))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+              "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", str(full)], check=True)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-c", "copy", "-copyinkf", str(src)], check=True)   # a cut mid-GOP
+    remux(src, kept)
+    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(src), "-c", "copy", str(lost)], check=True)
+    fault, proof = hook.prove(str(src), str(kept), [], str(tmp_path))
+    flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags,size", "-of", "csv=p=0", str(src)],
+                     capture_output=True, text=True).stdout.split()
+    before = next(i for i, f in enumerate(flags) if "K" in f.split(",")[1])
+    assert fault is None and before > 10 and proof[0]["count"] == len(flags), (fault, proof, before)
+    assert len(hook.packet_data(str(src), 0, None, 1, 60)) == int(flags[0].split(",")[0])   # packet 0, no keyframe
+    fault, _ = hook.prove(str(src), str(lost), [], str(tmp_path))
+    assert fault == f"stream video 0 (h264) holds {len(flags) - before} packets in the new file, {len(flags)} in the original", fault
+
+
 @pytest.mark.parametrize("tamper, why", [
     (["-c:v", "copy", "-c:a", "aac", "-b:a", "64k", "-c:s", "srt"], "the packet data of stream audio 1 (aac) differ"),
     (["-c:v", "copy", "-c:a", "copy", "-c:s", "srt", "-t", "10"], "stream video 0 (h264) holds 242 packets in the new file, 480 in the original"),
@@ -6737,6 +6779,50 @@ def test_a_trimmed_first_audio_frame_passes_and_is_logged(monkeypatch, tmp_path,
     assert got == fault, got
     if not fault:
         assert proof[1]["trimmed_first"] == {"pts": 0.0, "size": [480, 96]} and proof[1]["match"]
+
+
+MP3_FRAME = b"\xff\xfb\x90\x64" + bytes(range(1, 256)) + bytes(158)   # one 417-byte MPEG audio frame
+LOST_ONE = "stream audio 1 (mp3) holds 999 packets in the new file, 1000 in the original"
+
+
+@pytest.mark.parametrize("case, fault", [
+    ("zeros", None),        # 626 zero bytes before the frame, and the second packet +26 ms, as ffmpeg counts AVI bytes
+    ("header", None),       # a 70-byte RIFF header before the frame
+    ("zeros, MP4", None),   # a container with audio times: the cut last frame leaves the time check too
+    ("header of 128 bytes", None),
+    ("header of 129 bytes", LOST_ONE),
+    ("other head", LOST_ONE),
+    ("short other head", LOST_ONE),   # 70 bytes of a frame, no RIFF header
+    ("not the tail", LOST_ONE),
+    ("second packet moved", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +60 ms"),
+])
+def test_a_trimmed_first_frame_may_come_with_a_cut_last_frame(monkeypatch, tmp_path, case, fault):
+    """In an AVI, packet 0 of an MP3 stream can hold junk before a whole frame, and the last packet can be a cut frame.
+    mkvmerge keeps only the frame after the junk and drops the cut frame. That passes when the new packet 0 is the tail
+    of the old one after zeros or a RIFF header of at most 128 bytes, every other packet matches, and the second packet
+    keeps its time within 50 ms. A head of other bytes, short or long, or a new packet 0 that is not the tail, fails."""
+    head = {"header": b"RIFF" + bytes(66), "header of 128 bytes": b"RIFF" + bytes(124), "header of 129 bytes": b"RIFF" + bytes(125),
+            "other head": b"\x01" * 626, "short other head": b"\xff\xfb" + b"\x01" * 68}.get(case, bytes(626))
+    old0, new0 = head + MP3_FRAME, MP3_FRAME[:-1] + (b"\x01" if case == "not the tail" else b"\0")
+    fam = "mov,mp4,m4a,3gp,3g2,mj2" if case.endswith("MP4") else "avi"
+    delta = {"zeros, MP4": 0.0, "second packet moved": 0.06}.get(case, 0.026)
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"}, {"index": 1, "codec_type": "audio", "codec_name": "mp3"}]
+    monkeypatch.setattr(hook, "ff_streams", lambda p: (fam if p.endswith(".src") else "matroska,webm", streams, 26.0))
+    video = {"count": 650, "empty": 0, "digest": "v", "start": 0.0, "end": 26.0, "times": [i * 0.04 for i in range(650)]}
+    old = {"count": 1000, "empty": 0, "digest": "a", "but_first": "a-first", "but_ends": "a-ends", "first": len(old0), "first_pts": 0.0,
+           "last": 200, "last_pts": 25.974, "start": 0.0, "end": 26.0, "times": [i * 0.026 for i in range(1000)]}
+    new = {"count": 999, "empty": 0, "digest": "b", "but_first": "a-ends", "first": len(new0), "start": 0.0, "end": 25.974,
+           "times": [0.0] + [round(i * 0.026 + delta, 3) for i in range(1, 999)]}
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
+                        ({0: video, 1: old if path.endswith(".src") else new}, {}))
+    monkeypatch.setattr(hook, "packet_data", lambda path, index, bsf, n, timeout: old0 if path.endswith(".src") else new0)
+    (tmp_path / "a.src").touch(); (tmp_path / "a.mkv").touch()
+    got, proof = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert got == fault, got
+    if not fault:
+        junk = "header" if case.startswith("header") else "zero"
+        assert proof[1]["trimmed_first"] == {"pts": 0.0, "size": [len(old0), len(new0)], "junk": junk} and proof[1]["match"], proof[1]
+        assert proof[1]["dropped"] == {"pts": 25.974, "size": 200}
 
 
 @pytest.mark.parametrize("case, fault", [
