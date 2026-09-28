@@ -3526,7 +3526,8 @@ DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes of invalid data whi
           "ffprobe": (r"ffprobe read no stream: .*?(?:Invalid data found|moov atom not found|partial file)", "ffprobe read no stream in the file")}
 SKIP_EDGE = 5   # seconds from either end of the file where an mkvmerge skip is end junk, such as zero bytes after the last frame
 # the proof's refusals that name one audio stream's packet count or packet data, see prove()
-REFUSED_AUDIO = r"stream audio (\d+) \([^)]*\) holds \d+ packets in the new file|the packet data of stream audio (\d+) \([^)]*\) differ"
+REFUSED_AUDIO = (r"stream audio (\d+) \([^)]*\) holds \d+ packets in the new file, \d+ in the original"
+                 r"|the packet data of stream audio (\d+) \([^)]*\) differ")
 
 
 def damage_of(read, text):
@@ -3546,7 +3547,7 @@ def invalid_audio(text, j, streams, dur):
     out = {}
     for m in re.finditer(rf"track (\d+): ({DAMAGE['mkvmerge'][0]} before timestamp (\d+):(\d+):(\d+(?:\.\d+)?)[^\n]*)", text or ""):
         at, k = int(m[3]) * 3600 + int(m[4]) * 60 + float(m[5]), ids.index(int(m[1])) if int(m[1]) in ids else len(ff)
-        if k < len(ff) and dur and SKIP_EDGE < at < dur - SKIP_EDGE:
+        if k < len(ff) and dur and SKIP_EDGE < at < dur - SKIP_EDGE:   # no known dur: no skip is away from the ends
             out.setdefault(ff[k], mask(m[2])[:200])
     return out
 

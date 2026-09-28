@@ -5300,9 +5300,9 @@ def test_a_failed_swap_removes_its_own_temp_file_after_the_extras_are_back(env, 
 
 
 # The damage messages in the shape the remux, the proof and ffprobe log them. Every path and number is made up.
-def invalid_audio(at="00:04:21.517000000", at2="00:04:21.541000000"):
-    """mkvmerge's two warnings for invalid data it skipped in track 1, the audio, at those times of the 600 s file."""
-    return "\n".join(f"Warning: '/m/Show/Season 1/Show - s01e02 - Title - DVD.avi' track 1: This audio track contains {n} bytes of invalid "
+def invalid_audio(at="00:04:21.517000000", at2="00:04:21.541000000", track=1):
+    """mkvmerge's two warnings for invalid data it skipped in an audio track, 1 by default, at those times of the 600 s file."""
+    return "\n".join(f"Warning: '/m/Show/Season 1/Show - s01e02 - Title - DVD.avi' track {track}: This audio track contains {n} bytes of invalid "
                      f"data which were skipped before timestamp {t}. The audio/video synchronization may have been lost."
                      for n, t in ((173, at), (239, at2)))
 
@@ -5317,17 +5317,17 @@ PARTIAL = "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x55d0c1a2b3c0] stream 1, offset 0x1f4a2b3
 REFUSAL = "the packet data of stream audio 1 (mp3) differ"   # the proof after mkvmerge skipped invalid audio data
 
 
-def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ):
+def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ, refusal=REFUSAL, second=None):
     """An MP4 import of Film A with a grab record, whose conversion shows the damage signal. mkvmerge's invalid-data
-    warning comes with a proof refusal. The second check from scratch finds the signal again when repeat. Returns (mp4,
-    each read that showed it)."""
+    warning comes with the proof's refusal. The second check from scratch finds the signal again when repeat. For
+    mkvmerge, second is what its second run says instead. Returns (mp4, each read that showed it)."""
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
     grabbed(env, monkeypatch)
     reads = []
     if signal == "mkvmerge":
-        outs = iter([INVALID_AUDIO, INVALID_AUDIO if repeat else ""])
+        outs = iter([INVALID_AUDIO, second if second is not None else INVALID_AUDIO if repeat else ""])
         env["during_repack"] = lambda: env.update(repack_out=next(outs)) or reads.append(env["repacks"][-1])
-        env["repack_rc"], env["proof"] = 1, (REFUSAL, [])
+        env["repack_rc"], env["proof"] = 1, (refusal, [])
     elif signal == "ffmpeg":
         def bad_read(path, maps, bsf, *a, **k):
             reads.append((path, bsf))
@@ -5415,6 +5415,42 @@ def test_the_cap_stops_a_damaged_source_re_grab(env, monkeypatch):
     assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "capped") and env["writes"] == [] and os.path.exists(mp4), rec
     assert rec["alerts"][0].endswith(f"The cap of {hook.REGRAB_CAP} re-grabs a day is reached, so the file stays.")
     assert "audio" in rec and "video" in rec   # the original stays, so it gets the import's checks
+
+
+def test_a_packet_count_refusal_of_the_warned_stream_re_grabs(env, monkeypatch):
+    """The proof's refusal as it reads in full, after mkvmerge skipped invalid data in that same audio stream."""
+    mp4, reads = damaged_import(env, monkeypatch, "mkvmerge", refusal="stream audio 1 (mp3) holds 1000 packets in the new file, 1003 in the original")
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["regrab"], rec["repack"]["damage"]["stream"]) == ("damaged_source", "regrabbed", 1), rec
+    assert ("DELETE", "moviefile/11", None) in env["writes"]
+
+
+@pytest.mark.parametrize("case, refusal, second, regrab", [
+    ("another stream refused", "the packet data of stream audio 3 (aac) differ", None, None),
+    ("second check on another stream", REFUSAL, invalid_audio(track=3), "unconfirmed"),
+    ("second check at an end", REFUSAL, invalid_audio("00:09:58.806000000", "00:09:58.832000000"), "unconfirmed"),
+])
+def test_invalid_audio_counts_only_for_the_refused_stream_away_from_the_ends(env, monkeypatch, case, refusal, second, regrab):
+    """A file with two audio streams, 1 and 3. mkvmerge skipped invalid data in stream 1 at 4:21. A refusal of stream 3
+    is no damage. The second check must find a skip in stream 1 away from the ends again."""
+    mp4, reads = damaged_import(env, monkeypatch, "mkvmerge", refusal=refusal, second=second)
+    dub = copy.deepcopy(env["probe"]["tracks"][1])
+    dub["id"], dub["properties"]["uid"] = 3, 99
+    env["probe"]["tracks"].append(dub)
+    hook.main([])
+    rec = decided(env)
+    assert rec.get("regrab") == regrab and env["writes"] == [] and os.path.exists(mp4), rec
+    assert rec["outcome"] == ("damaged_source" if regrab else "repack_failed")
+
+
+def test_a_skip_in_a_file_of_unknown_length_is_no_damage(env, monkeypatch):
+    """With no duration, no skip can be shown to lie away from the ends. The file stays."""
+    mp4, reads = damaged_import(env, monkeypatch, "mkvmerge")
+    monkeypatch.setattr(hook, "ffprobe_duration", lambda path: None)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], "damage" in rec["repack"], env["writes"]) == ("repack_failed", False, []) and os.path.exists(mp4), rec
 
 
 @pytest.mark.parametrize("stderr", ["", "/m/Film A (1979)/Film A (1979).mp4: Input/output error"])
