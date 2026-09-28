@@ -97,8 +97,9 @@ A Matroska track has a legacy ISO 639-2 tag (`eng`) and a newer BCP 47 tag (`en`
 47 tag wins when both are there. `mkvpropedit --set language=<tag>` writes both, in the same call as
 the flag edits.
 
-A tag changes only when two signals agree and one of them is the heard language. The signals are the
-legacy tag, a BCP 47 tag that names another language, the heard language and the title's language.
+A tag changes only when two signals agree and one of them is the heard or the read language. The
+signals are the legacy tag, a BCP 47 tag that names another language, the heard language of an audio
+track, the read language of a subtitle, and the title's language, see "Subtitle text".
 A main audio track also has the item's original language. TMDB's spoken languages count only for an
 `und` track, because TMDB lists English as spoken for many foreign films. The language with the most
 signals wins when it has two or more and no other language has as many.
@@ -108,7 +109,7 @@ signals wins when it has two or more and no other language has as many.
 - A Spanish track tagged `eng` in a Spanish film gets `es`, because the heard and the original
   language beat the tag. A title a muxer copied onto an English dub changes nothing, because the
   heard English keeps the tag.
-- A subtitle keeps its language, because no language detection reads text.
+- A subtitle changes its language only with its text and one more signal, such as its title.
 - A new language keeps a BCP 47 tag that names it or a language inside it, so `yue` and `cmn-Hant`
   stay. A kept language keeps its BCP 47 language, script and region. The script stays, because Plex
   shows Traditional and Simplified Chinese both as 中文 without it.
@@ -181,6 +182,7 @@ other alert. Green is a clean scan summary. Mentions are off, and the secrets ar
 | Damaged source | The conversion of an import shows a damaged source, see "Damaged source". |
 | Repack, Header | A conversion or a header repair failed, and the original stays. |
 | Subtitle, Cut | A subtitle runs far past the end. It is not SubRip, or the file may be cut. |
+| Subtitle language | A subtitle's text reads as another language than its tag, and nothing else backs a new tag. |
 | Policy | The policy file is missing or does not load. |
 
 A fault that the second check did not find again is amber, "not confirmed". A missing or rejected
@@ -452,7 +454,8 @@ stream first, and the app must list the new file before the original goes.
   caption track
 
 **The remux.** A `.srt` beside the video that starts with its base name is muxed in, with its
-language, forced and hearing-impaired flags from the name. A sidecar that ends past the video, or
+language, forced and hearing-impaired flags from the name. Its text can overrule the name's language,
+see "Subtitle text". A sidecar that ends past the video, or
 has cues out of order, is timed for another cut and stays beside the file. `mkvmerge
 --disable-lacing --track-order` writes the temp file into `HIDE_DIR` beside the video. The apps' disk
 scan and Plex skip a hidden folder, so they never import a partial file. A hidden file beside the
@@ -779,6 +782,45 @@ python3 -m venv /opt/arr-media-guard-lid/venv
 /opt/arr-media-guard-lid/venv/bin/python arr_lid.py --fetch --model-dir /opt/arr-media-guard-lid/models
 touch /opt/arr-media-guard-lid/ready        # last
 ```
+
+## Subtitle text
+
+`text_language()` in `arr_decide.py` names the language of a subtitle text. It needs no model and no
+dependency. Each of 17 languages has a list of common dialogue words: English, Spanish, Portuguese,
+French, German, Italian, Romanian, Dutch, Swedish, Danish, Norwegian, Polish, Czech, Slovak, Turkish,
+Russian and Ukrainian. A word in one list only is a *telling* word. Its answer is the *read* language.
+
+- The letters give the script first. Greek, Hebrew, Arabic, Persian, Thai, Korean, Japanese, Chinese,
+  Hindi, Tamil, Telugu, Georgian and Armenian text gets the language of its script. Latin and Cyrillic
+  text goes to the lists.
+- The top language needs 90 percent of the telling words and 25 telling words at least. Its whole list
+  must also hold 20 percent of all words. A language with no list stays under that share.
+- The count runs every 300 letters. It stops at the first verdict, or at 3,000 letters, about 600
+  words, so clear text stops early. Text under 300 letters is short. Short text, mixed text and a
+  language with no list get no answer. Text whose top language holds under 75 percent is mixed at
+  once. Between 75 and 90 percent the count reads on, because a few early words weigh most.
+
+The read language is a signal, never an authority.
+
+- **Sidecars.** A conversion already reads each sidecar. When the text reads as a language other than
+  the one its name gives, the sidecar is muxed with the text's language. The forced flag of the name
+  then stays only when the text's language is a main audio language, because a player shows a forced
+  track in the audio's language by itself. The name wins when the lists cannot name its language.
+  `repack.sidecars` logs `read` and the `mismatch`.
+- **Tracks in a Matroska file.** The read language is one signal of the rule in "Language tags". Only
+  the text tracks a decision depends on are read. These are a track that is default or forced after
+  the plan, and a track whose tag the text can change: two signals disagree, or an `und` track has a
+  title that names a language. The text alone never changes a tag. A tagged track whose text reads as
+  another language, with nothing else to back it, gets a "Subtitle language" alert and the reason
+  `subtitle_text_mismatch`.
+- PGS and VobSub tracks are pictures, so they have no read language.
+
+**The read.** mkvmerge and ffmpeg write a cue entry for every subtitle block. `subtitle_read()` reads
+the Cues, which the header check has read just before. It finds the entries of the wanted tracks by
+their bytes, so it never walks the other cue points. It then reads each block by its entry, with one
+small unbuffered read, and stops at the verdict or after 200 blocks. It never reads a Cluster in full,
+so the cost does not grow with the file size. A track with no cue entries, or with a content encoding
+other than zlib, gets no answer. The decision log holds each answer in `read`.
 
 ## Status file
 

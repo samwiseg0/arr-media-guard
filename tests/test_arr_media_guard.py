@@ -7366,3 +7366,218 @@ def test_keep_dir_and_hide_dir_fall_back_to_their_defaults(tmp_path, monkeypatch
     (tmp_path / "env").write_text("KEEP_DIR='.kept'\nHIDE_DIR='.hidden'\n")
     loader.exec_module(m)
     assert (m.KEEP_DIR, m.HIDE_DIR) == (".kept", ".hidden")
+
+
+# --- subtitle text language (docs/design.md, "Subtitle text") -----------------------------------------------
+
+SUBS = os.path.join(os.path.dirname(__file__), "fixtures", "subtitles")
+
+
+def cue_texts(name, times=3):
+    """The cue texts of a SubRip file of the corpus, parsed as sidecar_subs() parses a sidecar. A scene holds about a
+    third of the TEXT_STOP letters a real track gives, so it plays three times by default."""
+    with open(os.path.join(SUBS, f"{name}.srt"), "rb") as f:
+        return [c[2] for c in hook.srt_cues(f.read().decode("utf-8-sig"))] * times
+
+
+# One scene of original dialogue in each language, as real-shape SubRip. A name that ends in _plain drops the accents,
+# as some fansubs type. English with some Spanish words stays English. Catalan and Croatian have no list, and they and
+# mixed text get no answer.
+CORPUS = {"eng": "eng", "spa": "spa", "spa_plain": "spa", "por": "por", "por_plain": "por", "fre": "fre", "ger": "ger", "ita": "ita",
+          "rum": "rum", "rum_plain": "rum", "dut": "dut", "swe": "swe", "dan": "dan", "nor": "nor", "pol": "pol", "cze": "cze", "slo": "slo",
+          "tur": "tur", "rus": "rus",
+          "ukr": "ukr", "gre": "gre", "ara": "ara", "per": "per", "chi": "chi", "jpn": "jpn", "kor": "kor",
+          "eng_spanish_words": "eng", "cat": None, "hrv": None, "mixed_eng_spa": None, "mixed_chi_eng": None}
+
+
+def test_the_corpus_table_lists_every_corpus_file():
+    assert sorted(CORPUS) == sorted(n[:-4] for n in os.listdir(SUBS))
+
+
+@pytest.mark.parametrize("name, lang", CORPUS.items())
+def test_the_text_language_of_each_corpus_file(name, lang):
+    got = hook.arr_decide.text_language(cue_texts(name))
+    assert got[0] == lang, got
+    assert got[1] >= hook.arr_decide.TEXT_SHARE if lang else got[1] < hook.arr_decide.TEXT_SHARE, got
+
+
+@pytest.mark.parametrize("name, why", [("mixed_eng_spa", "mixed, eng holds"), ("mixed_chi_eng", "mixed scripts"), ("cat", "telling words"),
+                                       ("hrv", "telling words")])
+def test_mixed_text_and_a_language_with_no_list_say_why_they_get_no_answer(name, why):
+    assert why in hook.arr_decide.text_language(cue_texts(name))[2]
+
+
+def test_short_text_gets_no_answer():
+    """Four cues, or a signs track, hold too few letters to judge."""
+    assert hook.arr_decide.text_language(cue_texts("eng", 1)[:4])[:2] == (None, 0.0)
+    assert hook.arr_decide.text_language(["[DOOR SLAMS]", "EXIT", "Sign: Main Street"])[2].startswith("short")
+
+
+def test_the_count_stops_at_its_first_verdict():
+    """The cues are read only as far as the verdict needs, so a Matroska read stops early too. Clear English stops at
+    the first count. Mixed text stops at TEXT_STOP."""
+    d = hook.arr_decide
+    for name, most in (("eng", d.TEXT_STEP), ("mixed_eng_spa", d.TEXT_STOP)):
+        seen = []
+        def cues():
+            for t in cue_texts(name, 20):
+                seen.append(t)
+                yield t
+        d.text_language(cues())
+        assert sum(c.isalpha() for t in seen[:-1] for c in t) < most, name
+
+
+def test_a_few_early_words_of_another_language_do_not_decide():
+    """Two English cues before Romanian text give a share between TEXT_MIXED and TEXT_SHARE at the first counts. The
+    count reads on, and the Romanian text decides."""
+    early = ["Or maybe the other one, or this one?", "What about the one with the red door?"]
+    assert hook.arr_decide.text_language(early + cue_texts("rum"))[0] == "rum"
+
+
+def test_romanian_cedillas_read_as_romanian():
+    """Old Romanian subtitles write ş and ţ with a cedilla. The lists spell them with a comma below."""
+    texts = [t.replace("ș", "ş").replace("ț", "ţ") for t in cue_texts("rum")]
+    assert hook.arr_decide.text_language(texts)[0] == "rum"
+
+
+def test_a_near_miss_never_takes_the_other_language():
+    """English with some Spanish words, Portuguese against Spanish, and the close Nordic and West Slavic languages keep
+    their language or get no answer."""
+    assert hook.arr_decide.text_language(cue_texts("eng_spanish_words"))[0] in (None, "eng")
+    for name, other in (("por", "spa"), ("por_plain", "spa"), ("spa", "por"), ("spa_plain", "por"), ("dan", "nor"), ("nor", "dan"), ("swe", "dan"),
+                        ("cze", "pol"), ("slo", "pol"), ("cze", "slo")):
+        assert hook.arr_decide.text_language(cue_texts(name))[0] != other, name
+
+
+def test_the_read_language_is_one_signal_of_the_retag_rule():
+    """A lone mismatch keeps the tag and alerts. With the title it makes two signals and the tag changes. A tag
+    text_language() cannot name never alerts."""
+    d, table = hook.arr_decide, hook.langs()
+    sub = lambda lang, **kw: tracks(("audio", "eng", None, 1, True, {"audio_channels": 2}), ("subtitles", lang, None, 2, True, kw))
+    r = d.retag(sub("eng"), read={"s1": "rum"}, table=table)
+    assert (r["edits"], r["set"], r["mismatch"]) == ([], {}, ["s1 is tagged eng, but its text reads as rum"]), r
+    assert "subtitle_text_mismatch" in r["reasons"] and "s1 keeps eng: eng (tagged eng); rum (the text reads rum)" in r["notes"]
+    titled = sub("eng", track_name="French")
+    assert d.retag(titled, table=table)["to_read"] == {"s1"} and not d.retag(sub("eng"), table=table)["to_read"]
+    r = d.retag(titled, read={"s1": "fre"}, table=table)
+    assert (r["edits"], r["set"], r["mismatch"]) == ([["track:=2", "fr", "eng", "language"], ["track:=2", "fr", None, "language-ietf"]],
+                                                     {"s1": "fre"}, []), r
+    assert d.retag(titled, read={"s1": "eng"}, table=table)["edits"] == []   # the tag and the text beat the title
+    r = d.retag(sub("und", track_name="English"), read={"s1": "eng"}, table=table)
+    assert r["edits"][0] == ["track:=2", "en", "und", "language"] and r["set"] == {"s1": "eng"}
+    assert d.retag(sub("und"), table=table)["to_read"] == set() and d.retag(sub("und"), read={"s1": "eng"}, table=table)["edits"] == []
+    assert d.retag(sub("hrv"), read={"s1": "pol"}, table=table)["mismatch"] == []
+    assert d.retag(sub("eng"), read={"s1": "eng"}, table=table)["mismatch"] == []
+    assert [t["lang"] for t in d.decide(sub("eng"), "English", heard={"s1": "fre"})["tracks"]] == ["eng", "fre"]   # retag's set reaches decide()
+
+
+def test_the_sidecar_rule():
+    d = hook.arr_decide
+    rum, eng, none = ("rum", 1.0, "100% rum"), ("eng", 1.0, "100% eng"), (None, 0.0, "short")
+    assert d.sidecar_language("eng", rum, {"eng"}) == ("rum", False, "named eng, but the text reads as rum: 100% rum")
+    assert d.sidecar_language("eng", rum, {"eng", "rum"})[:2] == ("rum", True)   # Romanian audio: a forced Romanian track is right
+    assert d.sidecar_language("eng", eng, {"eng"}) is None and d.sidecar_language("eng", none, {"eng"}) is None
+    assert d.sidecar_language(None, rum, {"eng"}) is None   # no language in the name
+    assert d.sidecar_language("hrv", ("pol", 0.95, ""), {"eng"}) is None   # the lists cannot name Croatian, so the name stays
+
+
+def test_a_sidecar_whose_text_reads_another_language_is_muxed_with_it(env, monkeypatch):
+    """Romanian text named .en.forced.srt must never become an English forced track. It goes in as Romanian, with no
+    forced flag, because the audio is English. The English sidecar keeps its name's language."""
+    mp4, mkv = mp4_import(env, monkeypatch)
+    for ext, name in ((".en.srt", "eng"), (".en.forced.srt", "rum")):
+        shutil.copy(os.path.join(SUBS, f"{name}.srt"), mkv[:-4] + ext)
+    hook.main([])
+    rec = decided(env)
+    remux = env["repacks"][0]
+    forced = remux.index(mkv[:-4] + ".en.forced.srt")
+    assert remux[forced - 6:forced] == ["--language", "0:rum", "--sub-charset", "0:UTF-8", "--default-track-flag", "0:0"], remux
+    assert [(s["lang"], s["flags"], s["read"]) for s in rec["repack"]["sidecars"]] == [("rum", [], "rum"), ("en", [], "eng")], rec["repack"]
+    assert rec["repack"]["sidecars"][0]["mismatch"].startswith("named eng, but the text reads as rum: ") and "mismatch" not in rec["repack"]["sidecars"][1]
+
+
+def test_near_miss_sidecars_keep_their_names(env, monkeypatch):
+    """Portuguese named pt, Spanish named es, and English with Spanish words named en all keep their language."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=(".pt.srt", ".es.srt", ".en.srt"))
+    for ext, name in ((".pt.srt", "por"), (".es.srt", "spa"), (".en.srt", "eng_spanish_words")):
+        shutil.copy(os.path.join(SUBS, f"{name}.srt"), mkv[:-4] + ext)
+    hook.main([])
+    assert [(s["lang"], s.get("mismatch")) for s in decided(env)["repack"]["sidecars"]] == [("en", None), ("es", None), ("pt", None)]
+
+
+SHOWN_SUBS = tracks(("video", "und", None, 1, True, {}), ("audio", "eng", None, 2, True, {"audio_channels": 6}),
+                    ("subtitles", "eng", None, 3, True, {"codec_id": "S_TEXT/UTF8"}),     # forced below: it shows by itself
+                    ("subtitles", "eng", None, 4, False, {"codec_id": "S_TEXT/UTF8"}),    # shows only when a viewer picks it
+                    ("subtitles", "eng", None, 5, False, {"track_name": "French", "codec_id": "S_TEXT/UTF8"}))   # tag and title disagree
+SHOWN_SUBS["tracks"][2]["properties"]["forced_track"] = True
+
+
+def test_the_hook_reads_the_subtitles_a_decision_depends_on(env, monkeypatch):
+    """The forced default track and the track whose title questions its tag are read. The third track is not. The
+    Romanian text of the forced track has no second signal, so it only alerts. The French text agrees with the title,
+    so that tag changes in the flag edit, and the check after the edit plans nothing more."""
+    env["probe"] = copy.deepcopy(SHOWN_SUBS)
+    asked = []
+    monkeypatch.setattr(hook, "subtitle_read", lambda path, j, want: asked.append(set(want)) or
+                        {"s1": ("rum", 1.0, "100% rum"), "s3": ("fre", 0.96, "96% fre")})
+    hook.main([])
+    rec = decided(env)
+    assert asked == [{"s1", "s3"}] and rec["read"]["s1"] == {"lang": "rum", "conf": 1.0, "why": "100% rum"}
+    assert rec["edits"] == [["track:=5", "fr", "eng", "language"], ["track:=5", "fr", None, "language-ietf"]], rec
+    assert rec["recheck"]["edits"] == 0 and rec["tracks"][3]["lang"] == "fre", rec
+    assert "subtitle_text_mismatch" in rec["reasons"] and "sublang" in rec["alert_kinds"]
+    assert "S1 is tagged eng, but its text reads as rum. Nothing else backs a new tag" in rec["alerts"][rec["alert_kinds"].index("sublang")]
+
+
+def test_a_read_subtitle_language_is_never_heard_again_on_the_second_check(env, monkeypatch):
+    """retag()'s set carries a retagged subtitle into heard, and heard goes to the second check before a re-grab. That
+    check hears only audio, so the subtitle must not count as "not heard again" and take out the language point."""
+    wrong_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "WRONG_CONTENT_REGRAB", True)
+    real = hook.arr_decide.retag
+    monkeypatch.setattr(hook.arr_decide, "retag", lambda j, *a, **k: dict(real(j, *a, **k), set={"s1": "fre"}))
+    hook.main([])
+    assert decided(env)["outcome"] == "wrong_content"
+
+
+@pytest.fixture(scope="module")
+def text_mkv(tmp_path_factory):
+    """Matroska files with five text subtitle tracks: Romanian text tagged eng and forced, French titled "French",
+    English, Spanish with zlib compression, and Japanese ASS. mkvmerge writes one, ffmpeg copies it into the other.
+    A third has no cue entries for its subtitle."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    d = tmp_path_factory.mktemp("text")
+    sub = lambda n: os.path.join(SUBS, f"{n}.srt")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=600:size=320x180:rate=25", "-c:v", "libx264",
+                    "-preset", "ultrafast", "-threads", "1", str(d / "v.mp4")], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", sub("jpn"), str(d / "jpn.ass")], check=True)
+    subprocess.run(["mkvmerge", "-q", "-o", str(d / "mkvmerge.mkv"), str(d / "v.mp4"), "--language", "0:eng", "--forced-display-flag", "0:1", sub("rum"),
+                    "--language", "0:eng", "--track-name", "0:French", sub("fre"), "--language", "0:eng", sub("eng"),
+                    "--language", "0:spa", "--compression", "0:zlib", sub("spa"), "--language", "0:jpn", str(d / "jpn.ass")], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(d / "mkvmerge.mkv"), "-map", "0", "-c", "copy", str(d / "ffmpeg.mkv")], check=True)
+    subprocess.run(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), str(d / "v.mp4"), "--cues", "0:none", sub("eng")], check=True)
+    return d
+
+
+@pytest.mark.parametrize("name", ["mkvmerge.mkv", "ffmpeg.mkv"])
+def test_subtitle_read_takes_each_text_by_its_cue_entry(text_mkv, name):
+    """Each track reads right, zlib and ASS included, and the read takes a small part of the file."""
+    path = str(text_mkv / name)
+    j = REAL_MKVMERGE(path)
+    before = hook.rchar()
+    got = hook.subtitle_read(path, j, {"s1", "s2", "s3", "s4", "s5"})
+    read = hook.rchar() - before
+    assert {p: g[0] for p, g in got.items()} == {"s1": "rum", "s2": "fre", "s3": "eng", "s4": "spa", "s5": "jpn"}, got
+    assert read < os.path.getsize(path) / 10, (read, os.path.getsize(path))
+    assert hook.subtitle_read(path, j, {"s3"}).keys() == {"s3"}   # a track no decision depends on is never read
+
+
+def test_subtitle_read_skips_what_it_cannot_read(text_mkv):
+    """A track the Cues do not index gets no answer, a picture track is never read, and a file that is not Matroska
+    gives nothing."""
+    path = str(text_mkv / "nocues.mkv")
+    assert hook.subtitle_read(path, REAL_MKVMERGE(path), {"s1"}) == {"s1": (None, 0.0, "the Cues index none of its blocks")}
+    pgs = {"tracks": [{"type": "subtitles", "properties": {"codec_id": "S_HDMV/PGS", "number": 2}}]}
+    assert hook.subtitle_read("/nonexistent.mkv", pgs, {"s1"}) == {}
+    assert hook.subtitle_read(str(text_mkv / "v.mp4"), REAL_MKVMERGE(path), {"s1"}) == {}

@@ -112,7 +112,7 @@ See docs/design.md, "How it runs", for the queue, the job processes and the lock
 """
 import argparse, array, calendar, collections, concurrent.futures, contextlib, datetime, fcntl, hashlib, json, os, re, select, shutil, signal
 import sqlite3, subprocess, sys, syslog, tempfile, threading, time, traceback, types, uuid
-import urllib.error, urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request, zlib
 
 # The modules sit beside the script, symlinks resolved. ARR_MEDIA_GUARD_LIB names another folder.
 sys.path.insert(0, os.environ.get("ARR_MEDIA_GUARD_LIB") or os.path.dirname(os.path.realpath(__file__)))
@@ -130,7 +130,8 @@ LIB = ("arr_decide.py", "arr_meta.py", "arr_status.py", "arr_subhunt.py", "arr_l
 COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-grab fault. amber: other alerts. green: a clean scan.
 TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": "Broken duration header", "edit": "Flag edit failed",
           "policy": "Policy did not load", "content": "Wrong content", "repack": "Repack failed", "video": "Video check uncertain",
-          "header": "Header repair failed", "subtitle": "Subtitle runs past the end", "cut": "File may be cut"}
+          "header": "Header repair failed", "subtitle": "Subtitle runs past the end", "cut": "File may be cut",
+          "sublang": "Subtitle language"}
 # the alert kinds that come with a re-grab action
 CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
 WOULD = "A re-grab would delete"   # the start of the action while WRONG_CONTENT_REGRAB is off
@@ -163,6 +164,10 @@ HEADER_TAIL = (16 << 20, 128 << 20)   # bytes it reads at the end for the stream
 TAIL_MIN = 1 << 20                    # bytes past the Segment end that make a header issue. A few stray bytes there are
                                       # common and harmless. Over 1 MiB is a header issue.
 CUES_MAX = 16 << 20                   # a larger Cues element is not read. A film's Cues are far smaller.
+TEXT_CODECS = ("S_TEXT/UTF8", "S_TEXT/ASS", "S_TEXT/SSA")   # subtitle codecs whose text subtitle_read() reads. PGS and VobSub are pictures.
+TEXT_CUES = 200                       # blocks subtitle_read() reads at most per track
+TEXT_BLOCK = 64 << 10                 # bytes of one subtitle block it reads at most
+TEXT_AHEAD = 16                       # blocks whose reads it starts at once
 SUB_MAX = 1800                        # seconds subtitle_ends() may take with no time limit, as in a scan or a backfill
 SUB_RESERVE = 150                     # seconds of the job's time limit it leaves for the zero probe and the windows
 LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_language", "audio_untagged_or_missing"}   # reason codes
@@ -1335,6 +1340,66 @@ def subtitle_ends(path, j, timeout, limit=None, lines=None):
     return {i: round(e, 3) for i, e in ends.items()}
 
 
+def subtitle_read(path, j, want):
+    """{track position: text_language() of its text} for the text subtitle tracks of a Matroska file at the positions in
+    want (docs/design.md, "Subtitle text"). j is its mkvmerge -J probe. mkvmerge and ffmpeg index every subtitle block
+    in the Cues, so the read takes the Cues and then each block by its index entry, one small read each. It stops at
+    text_language()'s verdict or after TEXT_CUES blocks, and it never reads a Cluster in full. A picture track, a track
+    with a content encoding other than zlib, and a track the Cues do not index get no entry. A failure keeps what was
+    read. The job's time limit passes."""
+    tracks, n, out = {}, 0, {}
+    for t in j.get("tracks") or []:
+        p = t.get("properties") or {}
+        if t.get("type") != "subtitles":
+            continue
+        n += 1
+        if f"s{n}" in want and p.get("codec_id") in TEXT_CODECS and p.get("content_encoding_algorithms") in (None, "0") and p.get("number"):
+            tracks[p["number"]] = (f"s{n}", p["codec_id"] != "S_TEXT/UTF8", p.get("content_encoding_algorithms") == "0")
+    if not tracks:
+        return out
+    try:
+        with open(path, "rb", buffering=0) as f:   # unbuffered, so each read takes only the bytes it asks for
+            b = f.read(HEADER_READ); seg = arr_decide.segment_start(b)
+            if not seg:
+                return out
+            ds, cues, clusters = seg[0], {}, {}
+            seek = arr_decide.front_seeks(b, ds)
+            for pos in [] if arr_decide.CUES in seek else seek.get(arr_decide.SEEKHEAD, []):   # a second SeekHead may list the Cues
+                f.seek(ds + pos); c = f.read(HEADER_READ); e = arr_decide.element(c, 0)
+                if e and e[0] == arr_decide.SEEKHEAD and e[2] is not None:
+                    arr_decide.seek_entries(c, e[1], e[1] + e[2], seek)
+            for pos in seek.get(arr_decide.CUES, [])[:1]:
+                f.seek(ds + pos); e = arr_decide.element(f.read(12), 0)
+                if e and e[0] == arr_decide.CUES and e[2] is not None and e[2] <= CUES_MAX:
+                    f.seek(ds + pos + e[1]); cues = arr_decide.cue_blocks(f.read(e[2]), set(tracks), TEXT_CUES)
+
+            def texts(number, ass, packed):   # the cue texts of one track, read one block at a time while text_language() asks
+                for i, (cp, rp) in enumerate(cues[number]):
+                    if i % TEXT_AHEAD == 0:   # start the reads of the next blocks at once, so a cold NFS read waits about once a batch
+                        for c, r in cues[number][i:i + TEXT_AHEAD]:   # the Cluster header, then the block after a header of 5 to 12 bytes
+                            os.posix_fadvise(f.fileno(), ds + c, 12, os.POSIX_FADV_WILLNEED)
+                            os.posix_fadvise(f.fileno(), ds + c + 5 + r, 1031, os.POSIX_FADV_WILLNEED)
+                    if cp not in clusters:
+                        f.seek(ds + cp); e = arr_decide.element(f.read(12), 0)
+                        clusters[cp] = e[1] if e and e[0] == arr_decide.CLUSTER else None
+                    if clusters[cp] is None:
+                        continue
+                    f.seek(ds + cp + clusters[cp] + rp); blk = f.read(1024); e = arr_decide.element(blk, 0)
+                    if e and e[2] is not None and len(blk) < e[1] + e[2] <= TEXT_BLOCK:
+                        blk += f.read(e[1] + e[2] - len(blk))
+                    frame = arr_decide.block_frame(blk, number)
+                    if frame is not None:
+                        text = (zlib.decompress(frame) if packed else frame).decode("utf-8", "replace")
+                        yield text.split(",", 8)[-1] if ass else text   # an ASS event holds 8 fields before its text
+            for number, (pos, ass, packed) in tracks.items():
+                out[pos] = arr_decide.text_language(texts(number, ass, packed)) if number in cues else (None, 0.0, "the Cues index none of its blocks")
+    except arr_meta.OutOfTime:
+        raise
+    except Exception as ex:   # the text is one signal among others, so a failed read never stops a job
+        out.update({p: (None, 0.0, mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, _, _ in tracks.values() if p not in out})
+    return out
+
+
 def header_of(path, j=None):
     """header_probe() of a .mkv file, None for another file or when the probe fails. A failure never costs the video
     check. The job's time limit passes."""
@@ -1697,7 +1762,9 @@ def content_probe(app, owner, original, kids, release, ctx, heard=None):
     file of the download is another film and is never judged. A file it does not judge returns (None, {"skipped"}).
     regrab() calls it for the job's own file (f None) only as the second check. That check hears the audio again
     past the cache, and asks TMDB past its cache. When it cannot hear what the first check heard, the language
-    points do not count. fresh asks TMDB past its cache for another file of the unit."""
+    points do not count. fresh asks TMDB past its cache for another file of the unit. A subtitle position in heard got
+    its language from its text, and no hearing repeats that."""
+    heard = {p: x for p, x in (heard or {}).items() if p.startswith("a")}
     def probe(path, f, fresh=False):
         signal.alarm(BUDGET)
         if f is not None and (app == "radarr" or any(e.get("seriesId") != int(owner) for e in f["eps"])):
@@ -1713,7 +1780,7 @@ def content_probe(app, owner, original, kids, release, ctx, heard=None):
                 d = arr_decide.decide(j, original, kids, release, again)
         m = metadata(app, path, j, os.path.getsize(path), d, original, release, c, fresh=fresh or f is None)
         ev = m["evidence"]
-        if f is None and any(pos not in again for pos in heard or {}):
+        if f is None and any(pos not in again for pos in heard):
             ev = without_language(ev, "not heard again on the second check")
         return ("wrong content" if ev["regrab"] else None), {"evidence": ev, "trusted": m["trusted"], "heard_again": again}
     return probe
@@ -2647,7 +2714,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
                                                                                    "wrong_language": False, "tracks": arr_decide.classify(j)}
     heard, got, tags = {}, {}, None
     lid_when = LID_WHEN & set(d["reasons"])
-    ask = arr_decide.retag(j, table=langs())["ask"] if mkv else set()   # the tracks whose tag only a heard language can change
+    pre = arr_decide.retag(j, table=langs()) if mkv else {"ask": set(), "to_read": set()}
+    ask = pre["ask"]   # the tracks whose tag only a heard language can change
     doubt = {t["pos"] for t in d["tracks"] if t["kind"] == "a" and t["role"] == "main" and t["conf"] < arr_decide.AGREE} if lid_when else set()
     if (lid_when or ask) and arr_decide.duration(j) >= LID_MIN_SECONDS:
         if shared:   # a hearing waits for the host's one model, so it runs without the file lock and an edit never queues behind it
@@ -2656,8 +2724,15 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         if shared:
             shared.reshare(st)
     known, said = item_languages(original, asked[0])
-    if mkv:
-        tags = arr_decide.retag(j, got, known, langs(), said)
+    read = {}
+    if mkv:   # the subtitles a player shows by itself, and those whose tag the text can change
+        shown = arr_decide.defaults(d["edits"])
+        want = pre["to_read"] | {t["pos"] for t in d["tracks"] if t["kind"] == "s" and (shown.get(t["sel"], t["default"]) or t["forced_flag"])}
+        got_text = subtitle_read(path, j, want) if want else {}
+        if got_text:
+            rec["read"] = {p: {"lang": x[0], "conf": x[1], "why": x[2]} for p, x in got_text.items()}
+        read = {p: x[0] for p, x in got_text.items() if x[0]}
+        tags = arr_decide.retag(j, got, known, langs(), said, read)
     lang = {t["pos"]: t["lang"] for t in d["tracks"]}
     fix = {p: x for p, x in (tags or {}).get("set", {}).items() if x != lang.get(p)}   # a new tag the decision does not read yet
     heard = {**fix, **got} if lid_when else fix   # outside those reasons a heard language counts only when the tag changes
@@ -2685,6 +2760,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         first.append(damaged)
     if unconverted and unconverted[1]:
         rest.append(("repack", unconverted[1]))
+    if tags and tags["mismatch"]:
+        rest.append(("sublang", f'{sentences(tags["mismatch"])} Nothing else backs a new tag, so the tag stays. Check the track and fix its tag.'))
     if rec.get("header_repair", {}).get("code") == "header_repair_failed":
         why = rec["header_repair"]["result"].partition(": ")[2][:200]
         rest.append(("header", f"The header repair failed, so the file stays as it was. {why[:1].upper()}{why[1:]}."))
@@ -2723,7 +2800,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         rec["result"] = unconverted[0] if unconverted else "skipped, not mkv"
     else:
         rec = edit(rec, j, d["edits"], apply, replan=lambda after: arr_decide.with_tags(arr_decide.decide(after, original, kids, release, heard, spoken),
-                                                                                      arr_decide.retag(after, got, known, langs(), said)))
+                                                                                      arr_decide.retag(after, got, known, langs(), said, read)))
         if d.get("undecided"):   # the decision abstained, so edits is empty
             rec["result"] = "undecided: " + d["undecided"]
         elif d.get("dropped"):
@@ -3196,10 +3273,10 @@ PY_CHARSET = {"UTF-16": "utf-16", "UTF-8": "utf-8-sig", "cp1252": "cp1252"}   # 
 
 def sidecar_subs(path):
     """The .srt files beside path whose name starts with its base name, as {path, name, lang, flags, charset, end,
-    ordered}. The first part after the base name is the language when it reads as a code (Movie.en.srt, Movie.eng.srt),
+    ordered, read}. The first part after the base name is the language when it reads as a code (Movie.en.srt, Movie.eng.srt),
     else und. forced, hi, sdh and cc set a flag (Movie.en.forced.srt, Movie.en.hi.srt). The charset is UTF-16 by its
     BOM, UTF-8 when the bytes decode as UTF-8, else cp1252. end is where its last cue ends, in seconds. ordered says
-    each cue starts no earlier than the one before, else mkvmerge warns."""
+    each cue starts no earlier than the one before, else mkvmerge warns. read is text_language() of its first cues."""
     folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
     try:
         names = sorted(n for n in os.listdir(folder) if n.startswith(base + ".") and n.lower().endswith(".srt"))
@@ -3221,7 +3298,8 @@ def sidecar_subs(path):
         cues, starts = srt_cues(text), [m.groups()[:4] for m in map(arr_decide.SRT_TIME.match, text.splitlines()) if m]
         starts = [(int(h), int(m), int(s), int(f.ljust(3, "0")[:3])) for h, m, s, f in starts]
         out.append(dict(path=os.path.join(folder, n), name=n, lang=lang, flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
-                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts)))
+                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts),
+                        read=arr_decide.text_language(c[2] for c in cues)))
     return out
 
 
@@ -4380,8 +4458,15 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     dur = arr_decide.duration(j) or ffprobe_duration(path) or 0
     late = [s for s in subs if s["end"] > dur + max(arr_decide.HEADER_OFF, arr_decide.HEADER_SHARE * dur) or not s["ordered"]]
     subs = [s for s in subs if s not in late]
+    audio = {t["lang"] for t in arr_decide.classify(j) if t["kind"] == "a" and t["role"] == "main"}
+    for s in subs:   # a sidecar whose text reads as another language than its name is muxed with the text's language
+        base = s["lang"].split("-")[0]
+        got = arr_decide.sidecar_language(langs()[0].get(base) or (base if len(base) == 3 else None), s["read"], audio)
+        if got:
+            s.update(lang=got[0], mismatch=got[2], flags=s["flags"] if got[1] else [f for f in s["flags"] if f != SIDECAR_FLAGS["forced"]])
     info = {"container": container, "old_size": st.st_size, "tracks": track_list(j),
-            "sidecars": [{k: s[k] for k in ("name", "lang", "flags")} for s in subs], **({"old_path": path, "new_path": new} if new != path else {})}
+            "sidecars": [{**{k: s[k] for k in ("name", "lang", "flags")}, "read": s["read"][0], **({"mismatch": s["mismatch"]} if "mismatch" in s else {})}
+                         for s in subs], **({"old_path": path, "new_path": new} if new != path else {})}
     if late:   # it stays beside the file, where it keeps the base name the player looks for
         info["sidecars_left"] = [f"{s['name']}: its cues are out of order" if not s["ordered"] else
                                  f"{s['name']}: its last cue ends at {arr_meta.hms(s['end'])}, the file at {arr_meta.hms(dur)}" for s in late]

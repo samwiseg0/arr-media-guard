@@ -36,6 +36,7 @@ docs/design.md explains the rules behind it.
 """
 import re
 import statistics
+import unicodedata
 
 ALIAS = [{"jpn", "jap", "japanese"}, {"ger", "deu", "german"}, {"fre", "fra", "french"}, {"chi", "zho", "cmn", "yue", "chinese", "mandarin", "cantonese"},
          {"dut", "nld", "dutch", "flemish"}, {"cze", "ces", "czech"}, {"gre", "ell", "greek"}, {"rum", "ron", "romanian"}, {"per", "fas", "persian"},
@@ -136,7 +137,8 @@ def classify(j, heard=None):
     dub) and commentary. A subtitle is forced by a "forced" or signs title, by density under POLICY["sparse_events"],
     or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. "conflict" is (kind, sentence)
     when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
-    heard maps an audio track's position ("a2") to the language arr_lid.py heard on it, see language().
+    heard maps an audio track's position ("a2") to the language arr_lid.py heard on it, see language(). It may also map a
+    subtitle position to the language retag() gives it from its text.
     """
     out, n = [], {"a": 0, "s": 0}
     for t in j.get("tracks") or j.get("streams") or []:
@@ -154,7 +156,7 @@ def classify(j, heard=None):
         n[kind] += 1; title = f["title"] or ""; ev = f["events"]
         sel = f"track:={f['uid']}" if f["uid"] else f"track:{kind}{n[kind]}"   # a UID survives any track order
         tag = (f["lang"] or "und").lower()
-        h = (heard or {}).get(f"{kind}{n[kind]}") if kind == "a" else None
+        h = (heard or {}).get(f"{kind}{n[kind]}")
         lang, conf, why = language(tag, title_language(title, kind), h)
         comment = bool(f["comment"] or COMMENT_TITLE.search(title))
         described = bool(f["described"] or re.search(r"descri", title, re.I) or re.search(r"\bAD\b|DVS", title))
@@ -443,27 +445,37 @@ def language_tags(j):
     return out
 
 
-def retag(j, heard=None, known=(), table=({}, {}), spoken=()):
+def lang_key(x):
+    """One key for the aliases of a language: nob, nno and nor are one, chi holds yue."""
+    return min(codes(x) or {x})
+
+
+def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
     """The language tag edits of one mkvmerge -J probe (docs/design.md, "Language tags"), as {"edits", "rules", "notes",
-    "reasons", "set", "ask"}. heard maps an audio track's position to the language arr_lid.py heard. known holds the
+    "reasons", "set", "ask", "to_read", "mismatch"}. heard maps an audio track's position to the language arr_lid.py
+    heard, and read a subtitle track's position to the language text_language() read in its text. known holds the
     item's original languages, the app's and TMDB's, and spoken TMDB's spoken languages, all as 639-2 codes. table is
     language_table().
 
-    A language changes only when two signals agree, and one of them is the heard language. The
-    track signals are the legacy tag, a BCP 47 tag that names another language, the heard language and the language
-    the title names. The item's original language is one more signal for a main audio track. A spoken language is one
+    A language changes only when two signals agree, and one of them is the heard or the read language. The
+    track signals are the legacy tag, a BCP 47 tag that names another language, the heard or read language and the
+    language the title names. The item's original language is one more signal for a main audio track. A spoken language is one
     only for an und track, because TMDB lists English dialogue as spoken in many foreign films, so it would back
     every lying eng tag. A language wins with two signals or more when no other language has as many. The track
-    signals break a tie. Only a main audio track is heard, so no other track changes its language. mul and zxx stay. A
-    track that keeps its language gets the form of ietf_form(). A new language keeps the BCP 47 tag when that names it
-    or a language inside it: und/yue heard as chi stays yue.
-    set maps each main audio track whose language changes to its new 639-2 code, for decide(). ask holds the main audio
-    tracks not heard yet whose tag a heard language may change: und, two tags that disagree, or a title that names
-    another language."""
+    signals break a tie. Only a main audio track is heard and only a subtitle is read, so no other track changes its
+    language. mul and zxx stay. A track that keeps its language gets the form of ietf_form(). A new language keeps the
+    BCP 47 tag when that names it or a language inside it: und/yue heard as chi stays yue.
+    set maps each main audio or subtitle track whose language changes to its new 639-2 code, for decide(). ask holds the
+    main audio tracks not heard yet whose tag a heard language may change: und, two tags that disagree, or a title that
+    names another language. to_read holds the subtitle tracks not read yet whose tag a read language may change: two
+    signals that disagree, or an und tag with a title that names a language. mismatch holds a sentence for each read
+    subtitle whose text reads another language than its tag while the tag stays. It counts only when text_language()
+    can name the tagged language."""
     legacy_of, ietf_of = table
-    key = lambda x: min(codes(x) or {x})   # one key for the aliases of a language: nob, nno and nor are one, chi holds yue
+    key = lang_key
     known, spoken, tags = {key(x) for x in known if x}, {key(x) for x in spoken if x}, language_tags(j)
-    out = {"edits": [], "rules": [], "notes": [], "reasons": [], "set": {}, "ask": set()}
+    readable = {key(x) for x in TEXT_LANGS}
+    out = {"edits": [], "rules": [], "notes": [], "reasons": [], "set": {}, "ask": set(), "to_read": set(), "mismatch": []}
     for t in classify(j):
         if t["pos"] not in tags:   # an ffprobe probe has no BCP 47 tag
             continue
@@ -472,18 +484,21 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=()):
         bcp = legacy_of.get(m[1].lower()) if m else None   # the 639-2 language of the BCP 47 tag, None when mkvmerge has none
         split = bool(bcp) and key(bcp) != key(tag)          # the two tags name different languages
         main = t["kind"] == "a" and t["role"] == "main"
-        h = (heard or {}).get(pos) if main else None
+        h = (heard or {}).get(pos) if main else (read or {}).get(pos) if t["kind"] == "s" else None
+        said = f"heard {h}" if main else f"the text reads {h}"
         votes = {}   # language key: [its code, [the signals that name it]]
-        for x, why in ((tag, f"tagged {tag}"), (bcp if split else None, f"BCP 47 tag {ietf}"), (h, f"heard {h}"),
+        for x, why in ((tag, f"tagged {tag}"), (bcp if split else None, f"BCP 47 tag {ietf}"), (h, said),
                        (title_language(t["title"], t["kind"]), f'the title "{t["title"]}"')):
             if x and x not in UNTAGGED:
                 votes.setdefault(key(x), [x, []])[1].append(why)
         if main and h is None and tag not in KEEP_TAGS and (tag == "und" or split or len(votes) > 1):
             out["ask"].add(pos)
+        if t["kind"] == "s" and h is None and tag not in KEEP_TAGS and len(votes) + (tag == "und") > 1:
+            out["to_read"].add(pos)
         item = lambda k: "the item's original language" if k in known else "TMDB's spoken languages" if tag == "und" and not split and k in spoken else None
         score = sorted(((len(s) + bool(main and item(k)), len(s), k) for k, (_, s) in votes.items()), reverse=True)
         win = score[0][2] if score and score[0][0] >= 2 and (len(score) == 1 or score[1][:2] < score[0][:2]) else None
-        heard_it = win is not None and f"heard {h}" in votes[win][1]
+        heard_it = win is not None and said in votes[win][1]
         why = "; ".join(votes[win][1]) + (f", and {item(win)}" if main and item(win) else "") if win else ""
         value = rule = None
         if win and (split or win != key(tag)) and tag not in KEEP_TAGS and heard_it:
@@ -496,7 +511,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=()):
             value, rule, why = ietf_form(ietf), "language tag form", "the form keeps the language, a script and a region"
         elif len(votes) > 1 or split or (tag == "und" and h):   # a tag that looks wrong, or an und track, keeps its language
             out["notes"].append(f"{pos} keeps {tag}{'/' + ietf if ietf else ''}: " + "; ".join(f'{c} ({", ".join(s)})' for c, s in votes.values())
-                                + ("" if h else ", no heard language"))
+                                + ("" if h else ", no heard language" if t["kind"] == "a" else ", no text read"))
             out["reasons"] += [] if "language_tag_kept" in out["reasons"] else ["language_tag_kept"]
         if value:
             out["edits"].append([t["sel"], value, tag, LANG_EDIT])
@@ -507,6 +522,9 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=()):
             out["notes"].append(f'{pos} {tag}{"/" + ietf if ietf else ""} -> {value}: {why}')
             code = rule.replace(" ", "_")
             out["reasons"] += [] if code in out["reasons"] else [code]
+        if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in readable and key(out["set"].get(pos, tag)) != key(h):
+            out["mismatch"].append(f"{pos} is tagged {tag}, but its text reads as {h}")
+            out["reasons"] += [] if "subtitle_text_mismatch" in out["reasons"] else ["subtitle_text_mismatch"]
     return out
 
 
@@ -526,6 +544,157 @@ def unapplied(after, edits):
         if prop(e) in (LANG_EDIT, LANG_IETF): return e[1] in tags[t["pos"]]
         return (t["default"] if prop(e) == "flag-default" else int(t["forced_flag"])) == e[1]
     return [e for e in edits if e[0] not in ts or not shows(e, ts[e[0]])]
+
+
+# Subtitle text language (docs/design.md, "Subtitle text"). A count of common words names the language of a subtitle
+# text, with no model and no dependency. Each list holds frequent dialogue words of one language. A word in one list
+# only is a telling word. A word in several lists counts only for the cover of each.
+TEXT_STEP = 300      # letters between two counts. A text with fewer letters is short and gets no answer.
+TEXT_STOP = 3000     # letters after which the count stops, about 600 words
+TEXT_TELL = 25       # telling words the top language needs for an answer
+TEXT_COVER = 0.2     # the share of all words the top language's whole list must hold. A language with no list holds less.
+TEXT_SHARE = 0.9     # the share of the telling words, or of the letters for a script, the top language must hold
+TEXT_MIXED = 0.75    # a text whose top language holds less than this share is mixed at once. More stays open until TEXT_STOP.
+STOPWORDS = {k: frozenset(v.split()) for k, v in {
+    "eng": "the you to and it of that what this have your my for not be do are don know just can with all get but there they she him "
+           "her his like right well if go out up how about want now come think why who did will would been were had could should going one "
+           "got let from when because here me no we is was on in so i a at or an care even ten face",
+    "spa": "que de no a la el y es en lo un por me se una te los con para mi qué eso esto está esta pero yo muy bien sí si ya su tu aquí aqui "
+           "ahora hay nada estoy tengo puedo quiero sé cuando donde dónde algo todo más mas cómo como también tambien usted ella él eres soy "
+           "gracias señor senor porque del al le les nos ha va son las solo este ser ti ve dar pelo cosa van",
+    "por": "que de não nao o a e é um uma eu você voce isso com se me do da em na no os as mas ele ela muito bem também tambem então entao "
+           "obrigado obrigada sim está esta estou tenho aqui agora nós meu minha seu sua onde quando porque nada tudo foi vai vou já só ao "
+           "pelo pela das lá senhor para por coisa ser fazer pode como te este todo à sei nos mais dar algo",
+    "fre": "je de pas le la vous est que tu à et les un ne il ce qui on une en c j pour des mais qu me elle a moi bien du non plus au avec "
+           "lui sais suis oui ai fait tout rien ça va si nous sont êtes était cette comme où quoi alors ici peut veux dans sur mon ton son "
+           "très te ta ma as dit mal",
+    "ger": "ich du die der und nicht das ist sie es zu ein wir was mir ja in den mit sich auf mich dich hier eine so wie aber sein hat habe "
+           "haben kann noch nur schon wenn wo warum gut jetzt nein danke bitte bin bist war von dem für auch alles doch mal weiß um an er "
+           "ihn ihm uns euch dir als am will des",
+    "ita": "che non di il è la un per mi ma a in si ti lo le cosa sono come questo bene sei ho hai ha qui io tu lui lei noi voi mio tuo "
+           "suo sua con del della da gli una perché fatto solo ci anche sta niente adesso molto grazie signore allora dove quando tutto chi "
+           "più così essere fare vai va o e c",
+    "rum": "și si să sa că ca nu este e în in pe ce mai eu tu el ea am ai o un cu se te mă ma ne asta acum aici dar da bine știu stiu "
+           "vreau poți poti avem sunt ești esti fost face ceva nimic doar tot unde cum când cand pentru despre din lui fi va voi dacă daca "
+           "care la de a are iar îmi imi meu noi au al hai or",
+    "dut": "ik je het de een niet dat is en wat van in ze hij we zijn er op te maar met me die voor dit hebt heb heeft kan wel nog naar "
+           "ben bent was jij mijn hier zo goed weet waar waarom nee ja ook alles niks niets dan als om moet wil zal hoe wie nu toch even "
+           "gaan komen had sta",
+    "swe": "jag du det att inte är en och som på har vi vad med för han hon den mig dig sig ska kan så om var här nu men till av ett bara "
+           "nej ja hur vill kommer vet inget ingenting allt där också eller min din honom henne detta gör måste oss er då blev mer alltid "
+           "dem sa igen kanske säga blir bli nog",
+    "dan": "jeg du det at ikke er en og i på har vi hvad med for han hun den mig dig sig skal kan så om var her nu men til af et bare "
+           "nej ja hvordan vil kommer ved noget intet alt der også eller min din ham hende dette sige gør være meget havde blev os hvorfor "
+           "da lige nogen sådan mere altid som dem kun selv hvis hvor godt nok skulle ingen fordi tror undskyld "
+           "måske tale sagde gik lad bliver blive fik sidste lidt hvornår skete jer øjeblik hjælpe igen tak have op mit",
+    "nor": "jeg du det at ikke er en og i på har vi hva med for han hun den meg deg seg skal kan så om var her nå men til av et bare "
+           "nei ja hvordan vil kommer vet noe ingenting alt der også eller min din ham henne dette si gjør være mye hadde ble oss hvorfor "
+           "da sånn noen mer alltid som dem kun selv hvis hvor godt nok skulle ingen fordi tror sa kanskje "
+           "snakke igjen blir bli gikk fikk litt siste skjedde unnskyld dere øyeblikk hjelpe ett",
+    "pol": "nie to się w i na jest że z co jak ale tak do ja ty mi go mnie już tu czy o jestem jesteś być był była może wiem mam masz "
+           "nic tylko teraz dobrze dlaczego gdzie kiedy proszę dziękuję dla po od za przez ten ta te bardzo wszystko jeszcze tego my wy "
+           "on ona ci cię mu ze a żeby jeśli będzie sobie jej nas tam tutaj coś ktoś nigdy zawsze też więc bo no chcę "
+           "możesz musisz musimy trzeba wiesz chodź jego mój moja twój naprawdę dobra tej tym nawet gdy pan pani",
+    "cze": "je se to na že v a s ne jsem jsi jsme jste jsou co jak ale tak už ještě taky tady teď proč kde když můžu mám máš vím víš chci "
+           "nevím protože jo jen být byl bylo něco nic nikdo všechno dobře děkuju prosím pane tě mě ti mi tebe mně jeho její můj tvůj tohle "
+           "takže tam pak opravdu musím musíme chceš jestli dneska zítra já ho ty z dnes",
+    "slo": "je sa to na že v a s nie som si sme ste sú čo ako ale tak už ešte tiež tu teraz prečo kde keď môžem mám máš viem vieš chcem "
+           "neviem pretože áno len byť bol bolo niečo nič nikto všetko dobre ďakujem prosím pane ťa ma ti mi teba mne jeho jej môj tvoj toto "
+           "takže tam potom naozaj musím musíme chceš ak dnes zajtra ho z ich",
+    "tur": "bir bu ne ve için de da mı mi mu mü ben sen o çok var yok değil ama ile gibi daha şey evet hayır tamam şimdi burada nasıl "
+           "neden kim bunu beni seni onu bana sana ona benim senin sadece lazım zaman iyi bak hadi gel git en her kadar şu biliyorum "
+           "ya ki bey hep ise yani işte peki niye biz siz onlar hiç bile sonra önce zaten belki hemen lütfen diye çünkü artık olsun oldu "
+           "olur misin musun mısın değilim istiyorum gerek tabii orada nerede bunlar şunu bunun onun bizim sizin seninle benimle efendim",
+    "rus": "и в не на я что он с это как а то все она так его но да ты к у же вы за бы по только ее мне было вот от меня еще нет о из "
+           "ему теперь когда ну если уже или быть был него до вас опять вам ведь там потом себя ничего ей может они тут где есть надо "
+           "ней для мы тебя их чем была сам без тоже себе под будет тогда кто этот хорошо почему здесь тебе",
+    "ukr": "і в не на я що він з це як а то все вона так його але та ти до у же ви за б по тільки її мені було ось від мене ще ні о "
+           "із йому тепер коли ну якщо вже або бути був нього вас знову вам там потім себе нічого їй може вони тут де є треба ній для "
+           "ми тебе їх чим була сам без теж собі під буде тоді хто цей добре чому",
+}.items()}
+TELLING = {k: s - frozenset().union(*(o for j, o in STOPWORDS.items() if j != k)) for k, s in STOPWORDS.items()}
+# A script that names one language. Latin and Cyrillic go to the word lists. Han with kana is Japanese. Arabic script
+# with Persian letters is Persian. Another script names no language.
+SCRIPTS = {"GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara", "THAI": "tha", "HANGUL": "kor", "HIRAGANA": "jpn", "KATAKANA": "jpn",
+           "CJK": "chi", "DEVANAGARI": "hin", "TAMIL": "tam", "TELUGU": "tel", "GEORGIAN": "geo", "ARMENIAN": "arm"}
+PERSIAN = frozenset("پچژگکی")   # letters Persian writes and Arabic does not
+TEXT_LANGS = frozenset(STOPWORDS) | frozenset(SCRIPTS.values()) | {"per"}   # every language text_language() can name
+TEXT_NOISE = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # SubRip tags, ASS override blocks and ASS line breaks
+TEXT_FOLD = str.maketrans("şţё", "șțе")   # Romanian cedillas to commas below, and Russian ё to е, as the lists spell them
+WORD = re.compile(r"[^\W\d_]+")
+
+
+def script_of(c):
+    """The script of one letter, as the first word of its Unicode name: LATIN, CYRILLIC, CJK."""
+    if c < "\u0250":
+        return "LATIN"
+    return unicodedata.name(c, "OTHER").split(" ")[0].split("-")[0]
+
+
+def text_judge(words, scripts, letters):
+    """(language or None, confidence, why, final) from the counts text_language() keeps. final is False when the top
+    language has too few telling words yet, or holds between TEXT_MIXED and TEXT_SHARE of them, so more text may decide."""
+    if scripts.get("HIRAGANA", 0) + scripts.get("KATAKANA", 0) > 0.1 * scripts.get("CJK", 0):
+        scripts = dict(scripts, KATAKANA=scripts.get("KATAKANA", 0) + scripts.get("CJK", 0), CJK=0)   # kanji in Japanese
+    top = max(scripts, key=scripts.get)
+    n = sum(v for k, v in scripts.items() if SCRIPTS.get(k, k) == SCRIPTS.get(top, top))
+    if n < TEXT_SHARE * letters:
+        return None, round(n / letters, 2), f"mixed scripts, {n / letters:.0%} {top.lower()}", True
+    if top not in ("LATIN", "CYRILLIC"):
+        lang = SCRIPTS.get(top)
+        if lang == "ara" and sum(k * sum(c in PERSIAN for c in w) for w, k in words.items()) > 0.05 * n:
+            lang = "per"
+        return lang, round(n / letters, 2), f"{n / letters:.0%} of the letters are {top.lower()}" + ("" if lang else ", which names no one language"), True
+    tell = {k: sum(words.get(w, 0) for w in s) for k, s in TELLING.items()}
+    lang = max(tell, key=tell.get)
+    if tell[lang] < TEXT_TELL:
+        return None, 0.0, f"{tell[lang]} telling words", False
+    share, cover = tell[lang] / sum(tell.values()), sum(words.get(w, 0) for w in STOPWORDS[lang]) / sum(words.values())
+    if cover < TEXT_COVER:
+        return None, round(share, 2), f"no list fits, {lang} words are {cover:.0%} of the text", True
+    if share < TEXT_SHARE:
+        second = sorted(tell.values())[-2]
+        return None, round(share, 2), f"mixed, {lang} holds {share:.0%} of the telling words, the next {second / sum(tell.values()):.0%}", share < TEXT_MIXED
+    return lang, round(share, 2), f"{share:.0%} of the telling words are {lang}, its words are {cover:.0%} of the text", True
+
+
+def text_language(cues):
+    """(ISO 639-2 language or None, confidence, why) of the text of subtitle cues. cues is an iterable of cue texts, read
+    only as far as the answer needs. Tags and ASS override blocks drop out. The letters decide the script first. A
+    script of one language names it, and Latin or Cyrillic text goes to the word lists. There the language with the
+    most telling words wins when it holds TEXT_SHARE of all telling words, has TEXT_TELL of them, and its whole list
+    holds TEXT_COVER of the text. The count runs every TEXT_STEP letters. It stops at the first verdict or at TEXT_STOP
+    letters. A text under TEXT_STEP letters is short. Mixed text and a language with no list get None. A share under
+    TEXT_MIXED is mixed at once, and a share just under TEXT_SHARE reads on, because a few early words weigh most."""
+    words, scripts, letters, check = {}, {}, 0, TEXT_STEP
+    for text in cues:
+        text = TEXT_NOISE.sub(" ", text).replace("İ", "i").lower().translate(TEXT_FOLD)
+        for c in text:
+            if c.isalpha():
+                s = script_of(c); scripts[s] = scripts.get(s, 0) + 1; letters += 1
+        for w in WORD.findall(text):
+            words[w] = words.get(w, 0) + 1
+        if letters >= check:
+            got = text_judge(words, scripts, letters)
+            if got[3] or letters >= TEXT_STOP:
+                return got[:3]
+            check = min(letters + TEXT_STEP, TEXT_STOP)
+    if letters < TEXT_STEP:
+        return None, 0.0, f"short, {letters} letters"
+    return text_judge(words, scripts, letters)[:3]
+
+
+def sidecar_language(named, read, audio):
+    """What the text of a sidecar subtitle changes before a conversion muxes it, or None (docs/design.md, "Subtitle
+    text"). named is the ISO 639-2 language its file name gives, None for none. read is text_language() of its text,
+    and audio holds the languages of the file's main audio tracks. The text overrules the name only when
+    text_language() is sure, and only when it can name the language of the name too. Returns (the language to mux the
+    sidecar with, True when its name may still set the forced flag, a note for the log). A player shows a forced track
+    in the audio's language by itself, so the forced flag of the name stays only when the text is in an audio language."""
+    lang = read[0]
+    if not (lang and named) or lang_key(named) not in {lang_key(x) for x in TEXT_LANGS} or lang_key(named) == lang_key(lang):
+        return None
+    return lang, lang_key(lang) in {lang_key(a) for a in audio}, f"named {named}, but the text reads as {lang}: {read[2]}"
 
 
 def duration(j):
@@ -993,6 +1162,40 @@ def last_cues(b):
     return out
 
 
+def cue_blocks(b, tracks, cap):
+    """{track number: [(Cluster position, position inside the Cluster data)]} of the first cap cue entries of each track
+    in tracks, from the data of a whole Cues element. A film's Cues hold tens of thousands of cue points, and a walk over
+    each one in Python is slow. So this search finds the CueTrackPositions of the wanted tracks by their bytes: a
+    one-byte CueTrack, then the CueClusterPosition and the CueRelativePosition, in the order mkvmerge and ffmpeg write
+    them. An entry in another shape is left out."""
+    # ponytail: a byte search. A muxer that writes the elements in another order or size gives no entries, so no answer.
+    out = {n: [] for n in tracks if 0 < n < 128}
+    if not out:
+        return {}
+    for m in re.finditer(rb"\xf7\x81([" + re.escape(bytes(sorted(out))) + rb"])\xf1([\x81-\x88])", b):
+        n, p = m[1][0], m.end() + (m[2][0] & 0x7F)
+        r = len(out[n]) < cap and b[p:p + 1] == b"\xf0" and element(b, p)
+        if r and r[2] and r[1] + r[2] <= len(b):
+            out[n].append((int.from_bytes(b[m.end():p], "big"), int.from_bytes(b[r[1]:r[1] + r[2]], "big")))
+            if all(len(v) >= cap for v in out.values()):
+                break
+    return {n: v for n, v in out.items() if v}
+
+
+def block_frame(b, number):
+    """The frame of the SimpleBlock or BlockGroup at the start of b, or None when b holds no whole block of track number
+    there. A laced block holds several frames, and it gets None too."""
+    e = element(b, 0)
+    if e and e[2] is not None and e[1] + e[2] <= len(b) and e[0] == BLOCKGROUP:
+        e = next((c for c in children(b, e[1], e[1] + e[2]) if c[0] == BLOCK), None)
+    if not e or e[2] is None or e[1] + e[2] > len(b) or e[0] not in (SIMPLEBLOCK, BLOCK) or not e[2]:
+        return None
+    d = e[1]; k = 9 - b[d].bit_length()   # the track number is an EBML variable-size integer
+    if not 0 < k <= 4 or e[2] < k + 3 or int.from_bytes(b[d:d + k], "big") & ((1 << 7 * k) - 1) != number or b[d + k + 2] & 0x06:
+        return None
+    return b[d + k + 3:d + e[2]]
+
+
 def cluster_blocks(b, start, end, durations, ends):
     """Add the end tick of each block of one Cluster, b[start:end], to ends {track number: tick}. A block ends at its
     timestamp plus its BlockDuration, else its frames times the track's default duration. False when the bytes are no
@@ -1431,6 +1634,13 @@ def _selftest():
     r = retag(subs, {}, {"eng"}, table)   # a subtitle is never heard, so it keeps its language, even when its two tags disagree
     assert r["edits"] == [["track:=2", "en-US", "eng", LANG_EDIT], ["track:=2", "en-US", "en-us", LANG_IETF]] and r["set"] == {} and not r["ask"], r
     assert r["rules"] == ["language tag form"] * 2 and r["notes"][-1].startswith("s4 keeps eng/fr-CA"), r
+    # subtitle text: the read language is one more signal, and a read language with no second signal keeps the tag
+    en = ["Where have you been? I called you three times."] * 10
+    assert text_language(en)[0] == "eng" and text_language(en[:2])[0] is None
+    st = tagged(("audio", "eng", None, "", True, 1), ("subtitles", "eng", None, "", True, 2), ("subtitles", "eng", None, "French", False, 3))
+    r = retag(st, table=table, read={"s1": "rum", "s2": "fre"})
+    assert r["mismatch"] == ["s1 is tagged eng, but its text reads as rum"] and r["set"] == {"s2": "fre"} and retag(st, table=table)["to_read"] == {"s2"}, r
+    assert sidecar_language("eng", ("rum", 1.0, ""), {"eng"})[:2] == ("rum", False) and sidecar_language("eng", ("eng", 1.0, ""), {"eng"}) is None
     und = tagged(("audio", "und", None, "English", True, 1))
     assert retag(und, {"a1": "spa"}, {"eng"}, table, spoken={"spa"})["edits"] == []   # a tie: the title and the original against heard and spoken
     assert retag(tagged(("audio", "und", None, "", True, 1)), {"a1": "cze"}, {"eng"}, table, spoken={"cze"})["edits"][0][1] == "cze"   # spoken, und only
