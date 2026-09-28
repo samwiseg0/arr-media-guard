@@ -69,6 +69,11 @@ LANGUAGES = ("English | eng | eng | en\nSpanish | spa | spa | es\nFrench | fre |
 hook.LANGS[:] = [hook.arr_decide.language_table(LANGUAGES)]
 
 
+def noise(n, seed=20260928):
+    """n bytes that look random but are the same on every run, so a damaged test file breaks the same way each time."""
+    return random.Random(seed + n).randbytes(n)
+
+
 def test_decision_selftest():
     hook.arr_decide.selftest()
 
@@ -2916,7 +2921,7 @@ def ebml(segment_size, data):
 def test_segment_size_and_zero_probe_on_made_up_bytes(tmp_path, monkeypatch):
     monkeypatch.setitem(hook.CFG, "LOG", str(tmp_path / "log.jsonl"))
     f = tmp_path / "v.mkv"
-    f.write_bytes(os.urandom(64 << 20))
+    f.write_bytes(noise(64 << 20))
     assert hook.zero_probe(str(f)) == ([], 256 * 65536, False) and hook.segment_short(str(f)) is None
     step = (64 << 20) * 0.98 / 256   # 257 KiB between two reads
     at = int((64 << 20) * (0.01 + 100.5 * step / (64 << 20))) // 4096 * 4096   # read 100
@@ -2939,13 +2944,13 @@ def test_segment_size_and_zero_probe_on_made_up_bytes(tmp_path, monkeypatch):
     assert fields["header"] == {"skipped": "not Matroska, or no Segment size"}
     assert fields["zeros"]["read"] - 256 * 65536 in range(1, 20 * (256 << 10))   # the runs were measured, up to 256 KiB a hit
     small = tmp_path / "small.mkv"   # under 18 MB the reads overlap. Padding still never counts, and a long run counts per 64 KiB.
-    small.write_bytes(os.urandom(512 << 10) + bytes(40 << 10) + os.urandom(512 << 10))
+    small.write_bytes(noise(512 << 10) + bytes(40 << 10) + noise(512 << 10))
     assert hook.zero_probe(str(small))[0] == []
-    small.write_bytes(os.urandom(512 << 10) + bytes(300 << 10) + os.urandom(512 << 10))
+    small.write_bytes(noise(512 << 10) + bytes(300 << 10) + noise(512 << 10))
     assert len(hook.zero_probe(str(small))[0]) in range(2, 7)
     f.write_bytes(ebml(1000, bytes(900)))
     assert hook.segment_short(str(f)) == 100   # the Segment promises 1000 bytes of data, 900 are there
-    f.write_bytes(ebml(200000, os.urandom(100000)))
+    f.write_bytes(ebml(200000, noise(100000)))
     certain, doubts, fields = hook.check_video(str(f), 0)
     assert (certain, fields["fault"], fields["header"]["short"]) == ("the file is 100000 bytes shorter than its Matroska header says", "truncated", 100000)
     assert "zeros" not in fields
@@ -2956,7 +2961,7 @@ def test_segment_size_and_zero_probe_on_made_up_bytes(tmp_path, monkeypatch):
     hook.log(dict(path=str(f), result="editing", undo=[]))
     hook.log(dict(path=str(f), result="wrong content: x", edit_result="edited"))   # the edit finished
     assert hook.check_video(str(f), 0)[2]["fault"] == "truncated"
-    f.write_bytes(ebml(1000, os.urandom(1000 - 67)))   # 67 bytes short, every cluster intact
+    f.write_bytes(ebml(1000, noise(1000 - 67)))   # 67 bytes short, every cluster intact
     certain, doubts, fields = hook.check_video(str(f), 0)
     assert certain is None and doubts == ["the Matroska header promises 67 bytes past the end of the file"]
     assert fields["windows"] == {"list": [], "took": fields["windows"]["took"], "read": 0, "skipped": "the duration is under 60 s"}
@@ -2974,7 +2979,7 @@ def fake_ffmpeg(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setattr(hook, "WINDOW_POLL", 0.05)
     f = tmp_path / "v.mkv"
-    f.write_bytes(os.urandom(4 << 20))
+    f.write_bytes(noise(4 << 20))
     return str(f)
 
 
@@ -3027,7 +3032,7 @@ def clips(tmp_path_factory):
     shutil.copy(good, d / "damaged.mkv")
     with open(d / "damaged.mkv", "r+b") as f:
         for k in range(1, 60):   # 59 spots of 16 KiB random bytes, so each window meets one
-            f.seek(size * k // 60); f.write(os.urandom(16 << 10))
+            f.seek(size * k // 60); f.write(noise(16 << 10))
     return d
 
 
@@ -3125,7 +3130,7 @@ def test_the_bytes_show_an_encrypted_track_when_ffmpeg_names_none(tmp_path, monk
     enc = el(D.CONTENTENCODINGS, el(D.CONTENTENCODING, el(0x5033, b"\x01") + el(D.CONTENTENCRYPTION, el(0x47E1, b"\x05") + el(0x47E2, bytes(16)))))
     entry = lambda kind, extra: el(D.TRACKENTRY, el(0xD7, b"\x01") + el(D.TRACKTYPE, bytes([kind])) + el(0x86, b"V_MPEG4/ISO/AVC") + extra)
     for name, tracks, want in (("enc.mkv", entry(1, enc), True), ("plain.mkv", entry(1, b""), False), ("audio.mkv", entry(1, b"") + entry(2, enc), False)):
-        segment = el(0x1549A966, os.urandom(40)) + el(D.TRACKS, tracks) + el(D.CLUSTER, os.urandom(4096))
+        segment = el(0x1549A966, noise(40)) + el(D.TRACKS, tracks) + el(D.CLUSTER, noise(4096))
         (tmp_path / name).write_bytes(ebml(len(segment), segment))
         assert hook.encrypted_video(str(tmp_path / name)) is want, name
     nodecoder = dict(CLEAN_WINDOW, frames=0, empty=True, ran=False, nodecoder=True, encrypted=False, read=0, took=1.0)
@@ -4370,7 +4375,7 @@ def test_windows_follow_the_video_track_duration_never_the_segment_duration(env,
     assert hook.video_seconds(tagged, {"video": 6736.0}) == 6736.0   # the stream end read from the file wins
     stale = copy.deepcopy(tagged); stale["tracks"][0]["properties"]["tag__statistics_writing_app"] = "mkvmerge v40.0"
     assert hook.video_seconds(stale) is None   # a tag another muxer copied says nothing about this file
-    f = tmp_path / "Film F.mkv"; f.write_bytes(os.urandom(1 << 20))
+    f = tmp_path / "Film F.mkv"; f.write_bytes(noise(1 << 20))
     env["files"][str(f)] = tagged
     monkeypatch.setattr(hook, "ffprobe_duration", lambda p: 10033.2)
     hook.video_check(str(f))
@@ -4450,7 +4455,7 @@ def damaged(tmp_path_factory):
                     str(d / "src.mkv")], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), "--cues", "0:none", "--cues", "1:none", str(d / "src.mkv")], check=True)
     size = os.path.getsize(d / "nocues.mkv")
-    for name, at, data in (("garbage.mkv", 0.4, os.urandom(2 << 20)), ("hole.mkv", 0.4, bytes(160 << 10))):
+    for name, at, data in (("garbage.mkv", 0.4, noise(2 << 20)), ("hole.mkv", 0.4, bytes(160 << 10))):
         shutil.copy(d / "nocues.mkv", d / name)
         with open(d / name, "r+b") as f:
             f.seek(int(size * at)); f.write(data)
@@ -4466,7 +4471,7 @@ def damaged(tmp_path_factory):
             b[pos:pos + n] = (int.from_bytes(b[pos:pos + n], "big") // 2).to_bytes(n, "big")   # now inside a cluster
     with open(d / "badcues.mkv", "r+b") as f:
         f.write(b)
-        f.seek(int(os.path.getsize(d / "badcues.mkv") * 0.4)); f.write(os.urandom(2 << 20))
+        f.seek(int(os.path.getsize(d / "badcues.mkv") * 0.4)); f.write(noise(2 << 20))
     os.remove(d / "src.mkv")
     return d
 
