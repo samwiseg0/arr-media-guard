@@ -282,9 +282,12 @@ def audio_target(main, orig, cls):
     return [], None
 
 
-def decide(j, original, kids=False, release="", heard=None, spoken=None):
+def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=None):
     """The planned default-flag changes for one file. kids is kids_title() for the movie or series, release its release name,
     heard the languages arr_lid.py heard (see classify()), spoken TMDB's spoken languages or None (see forced_to_clear()).
+    wrong is retag()'s wrong: a subtitle whose text reads as another language than its tag. When no main audio track
+    speaks that language, the decision treats the track as that language, and the track loses its default and forced
+    flags. Rather no subtitle than a wrong one. Its tag stays.
 
     Returns {"edits": [[selector, new flag, current flag], ...], "notes", "reasons": stable codes, "wrong_language",
     "undecided": reason or None, "abstain": its code, "dropped": [broken invariants], "invariants": their codes,
@@ -297,6 +300,10 @@ def decide(j, original, kids=False, release="", heard=None, spoken=None):
     cls = "english" if "eng" in orig else "foreign_kids" if kids and orig else "foreign"
     plan = {"edits": [], "notes": [], "reasons": [], "wrong_language": False, "undecided": None, "abstain": None, "dropped": [], "invariants": [],
             "path": CLASS_NAMES[cls], "rules": [], "edit_rules": [], "cls": cls, "orig": sorted(orig), "tracks": ts}
+    spoken_here = {lang_key(t["lang"]) for t in main}
+    mute = [t for t in su if t["pos"] in (wrong or {}) and lang_key(wrong[t["pos"]]) not in spoken_here]
+    for t in mute:
+        t.update(lang=wrong[t["pos"]], lang_why=f'{t["lang_why"]}, the text reads {wrong[t["pos"]]}')
     if any(t["conf"] == TITLE_WINS for t in main): say(plan, "title_language_wins")
     if any(t["conf"] == HEARD for t in main): say(plan, "heard_language")
     elif any(t["heard"] for t in main): say(plan, "heard_confirms")
@@ -330,13 +337,18 @@ def decide(j, original, kids=False, release="", heard=None, spoken=None):
     want = {t["sel"]: int(t is a) for t in au} if a is not cur or flagged != 1 else {}
     if a is cur and flagged != 1: say(plan, "audio_flags_normalized", f'{flagged} default audio flags, {a["pos"]} keeps the only one')
     doubt = (english_subtitles if a["lang"] == "eng" else original_subtitles)(su, want, plan)
+    for t in mute:
+        want[t["sel"]] = 0
+        if t["default"] or t["forced_flag"]:
+            say(plan, "subtitle_text_muted", f'{t["pos"]} loses its default and forced flags, because its text reads as {t["lang"]}, '
+                'and no main audio track speaks it')
     if doubt:
         say(plan, "sparse_full_title", doubt)
         return dict(plan, undecided=doubt, abstain="sparse_full_title")
     # A forced English track with the full dialogue loses its forced flag, so Plex never shows it on its own under English audio.
     clear, kept = forced_to_clear(su, main, plan, cls, spoken) if a["lang"] == "eng" else ([], None)
     edits = [[t["sel"], want[t["sel"]], t["default"]] for t in ts if want.get(t["sel"], t["default"]) != t["default"]]
-    edits += [[t["sel"], 0, 1, FORCED_FLAG] for t in clear]
+    edits += [[t["sel"], 0, 1, FORCED_FLAG] for t in clear + [t for t in mute if t["forced_flag"]]]
     if not edits:
         return plan
     final = {t["sel"]: want.get(t["sel"], t["default"]) for t in ts}
@@ -452,12 +464,13 @@ def lang_key(x):
 
 def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
     """The language tag edits of one mkvmerge -J probe (docs/design.md, "Language tags"), as {"edits", "rules", "notes",
-    "reasons", "set", "ask", "to_read", "mismatch"}. heard maps an audio track's position to the language arr_lid.py
+    "reasons", "set", "ask", "to_read", "mismatch", "wrong"}. heard maps an audio track's position to the language arr_lid.py
     heard, and read a subtitle track's position to the language text_language() read in its text. known holds the
     item's original languages, the app's and TMDB's, and spoken TMDB's spoken languages, all as 639-2 codes. table is
     language_table().
 
-    A language changes only when two signals agree, and one of them is the heard or the read language. The
+    A language changes only when two signals agree, and one of them is the heard or the read language. An und subtitle
+    takes its read language alone, because its tag makes no claim, unless a title or a BCP 47 tag names a language. The
     track signals are the legacy tag, a BCP 47 tag that names another language, the heard or read language and the
     language the title names. The item's original language is one more signal for a main audio track. A spoken language is one
     only for an und track, because TMDB lists English dialogue as spoken in many foreign films, so it would back
@@ -467,15 +480,15 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
     BCP 47 tag when that names it or a language inside it: und/yue heard as chi stays yue.
     set maps each main audio or subtitle track whose language changes to its new 639-2 code, for decide(). ask holds the
     main audio tracks not heard yet whose tag a heard language may change: und, two tags that disagree, or a title that
-    names another language. to_read holds the subtitle tracks not read yet whose tag a read language may change: two
-    signals that disagree, or an und tag with a title that names a language. mismatch holds a sentence for each read
-    subtitle whose text reads another language than its tag while the tag stays. It counts only when text_language()
-    can name the tagged language."""
+    names another language. to_read holds the subtitle tracks not read yet whose tag a read language may change: an und
+    tag, or two signals that disagree. mismatch holds a sentence for each read subtitle whose text reads another
+    language than its tag while the tag stays, and wrong maps its position to the read language, for decide(). It counts
+    only when text_language() can name the tagged language."""
     legacy_of, ietf_of = table
     key = lang_key
     known, spoken, tags = {key(x) for x in known if x}, {key(x) for x in spoken if x}, language_tags(j)
     readable = {key(x) for x in TEXT_LANGS}
-    out = {"edits": [], "rules": [], "notes": [], "reasons": [], "set": {}, "ask": set(), "to_read": set(), "mismatch": []}
+    out = {"edits": [], "rules": [], "notes": [], "reasons": [], "set": {}, "ask": set(), "to_read": set(), "mismatch": [], "wrong": {}}
     for t in classify(j):
         if t["pos"] not in tags:   # an ffprobe probe has no BCP 47 tag
             continue
@@ -493,13 +506,15 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
                 votes.setdefault(key(x), [x, []])[1].append(why)
         if main and h is None and tag not in KEEP_TAGS and (tag == "und" or split or len(votes) > 1):
             out["ask"].add(pos)
-        if t["kind"] == "s" and h is None and tag not in KEEP_TAGS and len(votes) + (tag == "und") > 1:
+        if t["kind"] == "s" and h is None and tag not in KEEP_TAGS and (tag == "und" or len(votes) > 1):
             out["to_read"].add(pos)
         item = lambda k: "the item's original language" if k in known else "TMDB's spoken languages" if tag == "und" and not split and k in spoken else None
         score = sorted(((len(s) + bool(main and item(k)), len(s), k) for k, (_, s) in votes.items()), reverse=True)
         win = score[0][2] if score and score[0][0] >= 2 and (len(score) == 1 or score[1][:2] < score[0][:2]) else None
+        alone = win is None and t["kind"] == "s" and h and tag == "und" and not split and len(votes) == 1   # an und subtitle claims no language
+        win = key(h) if alone else win
         heard_it = win is not None and said in votes[win][1]
-        why = "; ".join(votes[win][1]) + (f", and {item(win)}" if main and item(win) else "") if win else ""
+        why = "; ".join(votes[win][1]) + (f", and {item(win)}" if main and item(win) else "") + (", and the und tag names no language" if alone else "") if win else ""
         value = rule = None
         if win and (split or win != key(tag)) and tag not in KEEP_TAGS and heard_it:
             named = key(bcp or m[1].lower()) if m else None   # the language of the BCP 47 tag, a macrolanguage for yue or cmn
@@ -524,6 +539,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
             out["reasons"] += [] if code in out["reasons"] else [code]
         if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in readable and key(out["set"].get(pos, tag)) != key(h):
             out["mismatch"].append(f"{pos} is tagged {tag}, but its text reads as {h}")
+            out["wrong"][pos] = h
             out["reasons"] += [] if "subtitle_text_mismatch" in out["reasons"] else ["subtitle_text_mismatch"]
     return out
 
@@ -1641,6 +1657,11 @@ def _selftest():
     r = retag(st, table=table, read={"s1": "rum", "s2": "fre"})
     assert r["mismatch"] == ["s1 is tagged eng, but its text reads as rum"] and r["set"] == {"s2": "fre"} and retag(st, table=table)["to_read"] == {"s2"}, r
     assert sidecar_language("eng", ("rum", 1.0, ""), {"eng"})[:2] == ("rum", False) and sidecar_language("eng", ("eng", 1.0, ""), {"eng"}) is None
+    assert retag(st, table=table, read={"s1": "rum"})["wrong"] == {"s1": "rum"}   # a lone wrong language loses the default it has
+    signs = tagged(("audio", "eng", None, "", True, 1), ("subtitles", "eng", None, "Forced", True, 2))   # a forced English track stays on
+    assert decide(signs, "English", wrong={"s1": "rum"})["edits"] == [["track:=2", 0, 1]] and decide(signs, "English")["edits"] == []
+    und_sub = tagged(("audio", "eng", None, "", True, 1), ("subtitles", "und", None, "", False, 2))
+    assert retag(und_sub, table=table, read={"s1": "fre"})["set"] == {"s1": "fre"}   # an und tag claims nothing, so the read language sets it
     und = tagged(("audio", "und", None, "English", True, 1))
     assert retag(und, {"a1": "spa"}, {"eng"}, table, spoken={"spa"})["edits"] == []   # a tie: the title and the original against heard and spoken
     assert retag(tagged(("audio", "und", None, "", True, 1)), {"a1": "cze"}, {"eng"}, table, spoken={"cze"})["edits"][0][1] == "cze"   # spoken, und only

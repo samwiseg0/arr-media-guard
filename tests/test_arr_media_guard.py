@@ -7465,10 +7465,58 @@ def test_the_read_language_is_one_signal_of_the_retag_rule():
     assert d.retag(titled, read={"s1": "eng"}, table=table)["edits"] == []   # the tag and the text beat the title
     r = d.retag(sub("und", track_name="English"), read={"s1": "eng"}, table=table)
     assert r["edits"][0] == ["track:=2", "en", "und", "language"] and r["set"] == {"s1": "eng"}
-    assert d.retag(sub("und"), table=table)["to_read"] == set() and d.retag(sub("und"), read={"s1": "eng"}, table=table)["edits"] == []
     assert d.retag(sub("hrv"), read={"s1": "pol"}, table=table)["mismatch"] == []
     assert d.retag(sub("eng"), read={"s1": "eng"}, table=table)["mismatch"] == []
+    assert d.retag(sub("eng"), read={"s1": "rum"}, table=table)["wrong"] == {"s1": "rum"}
     assert [t["lang"] for t in d.decide(sub("eng"), "English", heard={"s1": "fre"})["tracks"]] == ["eng", "fre"]   # retag's set reaches decide()
+
+
+def test_an_und_subtitle_takes_its_read_language_alone():
+    """An und tag claims no language, so a sure read sets it, and the flag rules then use the new language. A title or
+    a BCP 47 tag that names another language is a claim, and the tag stays und. Short text sets nothing."""
+    d, table = hook.arr_decide, hook.langs()
+    und = lambda **kw: tracks(("audio", "eng", None, 1, True, {"audio_channels": 2}), ("subtitles", "und", None, 2, True, kw))
+    assert d.retag(und(), table=table)["to_read"] == {"s1"}
+    r = d.retag(und(), read={"s1": "rum"}, table=table)
+    assert (r["edits"][0], r["set"], r["mismatch"]) == (["track:=2", "rum", "und", "language"], {"s1": "rum"}, []), r
+    assert r["notes"] == ["s1 und -> rum: the text reads rum, and the und tag names no language"] and "language_tag_set" in r["reasons"]
+    assert d.decide(und(), "English", heard=r["set"])["edits"] == [["track:=2", 0, 1]]   # a Romanian default under English audio goes off
+    assert d.retag(und(track_name="French"), read={"s1": "eng"}, table=table)["edits"] == []   # the title is a claim: a tie
+    assert d.retag(und(language_ietf="fr"), read={"s1": "eng"}, table=table)["edits"] == []   # so is a BCP 47 tag
+    assert d.retag(und(), read={}, table=table)["edits"] == []   # short or mixed text reads as nothing
+
+
+def last_forced(j, forced=True):
+    """j with the forced flag of its last track set, which mk() writes as False."""
+    j["tracks"][-1]["properties"]["forced_track"] = forced
+    return j
+
+
+def test_a_wrong_language_no_audio_speaks_loses_its_flags():
+    """Rather no subtitle than a wrong one. A read language that contradicts the tag, with nothing to back a new tag,
+    takes the default and forced flags when no main audio track speaks it. The tag stays."""
+    d = hook.arr_decide
+    subs = lambda *audio, forced=True: last_forced(tracks(*[("audio", a, None, i + 1, i == 0, {"audio_channels": 2}) for i, a in enumerate(audio)],
+                                                         ("subtitles", "eng", None, 9, True, {})), forced)
+    p = d.decide(subs("eng"), "English", wrong={"s1": "rum"})
+    assert p["edits"] == [["track:=9", 0, 1], ["track:=9", 0, 1, d.FORCED_FLAG]] and not p["dropped"], p
+    assert "subtitle_text_muted" in p["reasons"] and p["tracks"][1]["tag"] == "eng" and p["tracks"][1]["lang"] == "rum"
+    # a foreign film with no other English subtitle: without the rule the Romanian text would stay on as the English subtitle
+    p = d.decide(subs("jpn", forced=False), "Japanese", wrong={"s1": "rum"})
+    assert p["edits"] == [["track:=9", 0, 1]] and not p["dropped"], p
+    assert d.decide(subs("jpn", forced=False), "Japanese")["edits"] == []
+
+
+def test_a_wrong_language_that_an_audio_track_speaks_keeps_its_flags():
+    """Near misses: forced English text tagged French on English audio, and Romanian text beside a Romanian audio track.
+    The new rule changes nothing there."""
+    d = hook.arr_decide
+    fre = last_forced(tracks(("audio", "eng", None, 1, True, {"audio_channels": 2}), ("subtitles", "fre", None, 9, True, {})))
+    assert d.decide(fre, "English", wrong={"s1": "eng"})["edits"] == d.decide(fre, "English")["edits"]
+    two = last_forced(tracks(("audio", "eng", None, 1, True, {"audio_channels": 2}), ("audio", "rum", None, 2, False, {"audio_channels": 2}),
+                             ("subtitles", "eng", None, 9, True, {})))
+    p = d.decide(two, "English", wrong={"s1": "rum"})
+    assert p["edits"] == d.decide(two, "English")["edits"] and "subtitle_text_muted" not in p["reasons"], p
 
 
 def test_the_sidecar_rule():
@@ -7523,10 +7571,25 @@ def test_the_hook_reads_the_subtitles_a_decision_depends_on(env, monkeypatch):
     hook.main([])
     rec = decided(env)
     assert asked == [{"s1", "s3"}] and rec["read"]["s1"] == {"lang": "rum", "conf": 1.0, "why": "100% rum"}
-    assert rec["edits"] == [["track:=5", "fr", "eng", "language"], ["track:=5", "fr", None, "language-ietf"]], rec
+    assert rec["edits"] == [["track:=3", 0, 1], ["track:=3", 0, 1, "flag-forced"],   # Romanian text no audio speaks goes off, tag and all
+                            ["track:=5", "fr", "eng", "language"], ["track:=5", "fr", None, "language-ietf"]], rec
     assert rec["recheck"]["edits"] == 0 and rec["tracks"][3]["lang"] == "fre", rec
-    assert "subtitle_text_mismatch" in rec["reasons"] and "sublang" in rec["alert_kinds"]
-    assert "S1 is tagged eng, but its text reads as rum. Nothing else backs a new tag" in rec["alerts"][rec["alert_kinds"].index("sublang")]
+    assert "subtitle_text_mismatch" in rec["reasons"] and "subtitle_text_muted" in rec["reasons"] and "sublang" in rec["alert_kinds"]
+    text = rec["alerts"][rec["alert_kinds"].index("sublang")]
+    assert "S1 is tagged eng, but its text reads as rum. Nothing else backs a new tag, so the tag stays. S1 loses its default" in text, text
+    p = env["files"][env["path"]]["tracks"][2]["properties"]
+    assert (p["language"], p["default_track"], p["forced_track"]) == ("eng", 0, 0), p
+
+
+def test_the_hook_tags_an_und_subtitle_by_its_text(env, monkeypatch):
+    """An und default subtitle reads as Romanian. The tag changes, and the default goes off under English audio."""
+    env["probe"] = tracks(("video", "und", None, 1, True, {}), ("audio", "eng", None, 2, True, {"audio_channels": 6}),
+                          ("subtitles", "und", None, 3, True, {"codec_id": "S_TEXT/UTF8"}))
+    monkeypatch.setattr(hook, "subtitle_read", lambda path, j, want: {"s1": ("rum", 0.97, "97% rum")} if "s1" in want else {})
+    hook.main([])
+    rec = decided(env)
+    assert rec["edits"][:2] == [["track:=3", 0, 1], ["track:=3", "rum", "und", "language"]] and rec["recheck"]["edits"] == 0, rec
+    assert "s1 und -> rum: the text reads rum, and the und tag names no language" in rec["notes"] and "sublang" not in rec.get("alert_kinds", [])
 
 
 def test_a_read_subtitle_language_is_never_heard_again_on_the_second_check(env, monkeypatch):

@@ -2736,8 +2736,9 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     lang = {t["pos"]: t["lang"] for t in d["tracks"]}
     fix = {p: x for p, x in (tags or {}).get("set", {}).items() if x != lang.get(p)}   # a new tag the decision does not read yet
     heard = {**fix, **got} if lid_when else fix   # outside those reasons a heard language counts only when the tag changes
-    if heard:
-        d = arr_decide.decide(j, original, kids, release, heard, spoken)
+    wrong = (tags or {}).get("wrong") or {}   # a subtitle whose text contradicts its tag, with nothing else to back a new tag
+    if heard or wrong:
+        d = arr_decide.decide(j, original, kids, release, heard, spoken, wrong)
     if tags:
         d = arr_decide.with_tags(d, tags)
     file_checks = arr_decide.checks(j, size, runtime, shorter_only=app == "sonarr")
@@ -2761,7 +2762,9 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if unconverted and unconverted[1]:
         rest.append(("repack", unconverted[1]))
     if tags and tags["mismatch"]:
-        rest.append(("sublang", f'{sentences(tags["mismatch"])} Nothing else backs a new tag, so the tag stays. Check the track and fix its tag.'))
+        muted = [n for n in d["notes"] if " loses its default and forced flags, " in n]
+        rest.append(("sublang", f'{sentences(tags["mismatch"])} Nothing else backs a new tag, so the tag stays. {sentences(muted)}'.rstrip()
+                                + " Check the track and fix its tag."))
     if rec.get("header_repair", {}).get("code") == "header_repair_failed":
         why = rec["header_repair"]["result"].partition(": ")[2][:200]
         rest.append(("header", f"The header repair failed, so the file stays as it was. {why[:1].upper()}{why[1:]}."))
@@ -2799,7 +2802,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     elif not mkv:
         rec["result"] = unconverted[0] if unconverted else "skipped, not mkv"
     else:
-        rec = edit(rec, j, d["edits"], apply, replan=lambda after: arr_decide.with_tags(arr_decide.decide(after, original, kids, release, heard, spoken),
+        rec = edit(rec, j, d["edits"], apply, replan=lambda after: arr_decide.with_tags(arr_decide.decide(after, original, kids, release, heard, spoken, wrong),
                                                                                       arr_decide.retag(after, got, known, langs(), said, read)))
         if d.get("undecided"):   # the decision abstained, so edits is empty
             rec["result"] = "undecided: " + d["undecided"]

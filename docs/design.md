@@ -109,7 +109,9 @@ signals wins when it has two or more and no other language has as many.
 - A Spanish track tagged `eng` in a Spanish film gets `es`, because the heard and the original
   language beat the tag. A title a muxer copied onto an English dub changes nothing, because the
   heard English keeps the tag.
-- A subtitle changes its language only with its text and one more signal, such as its title.
+- A subtitle changes its language only with its text and one more signal, such as its title. An
+  `und` subtitle takes its read language alone, because its tag makes no claim. A title or a BCP 47
+  tag that names a language is a claim, and the tag then stays.
 - A new language keeps a BCP 47 tag that names it or a language inside it, so `yue` and `cmn-Hant`
   stay. A kept language keeps its BCP 47 language, script and region. The script stays, because Plex
   shows Traditional and Simplified Chinese both as 中文 without it.
@@ -810,9 +812,13 @@ The read language is a signal, never an authority.
 - **Tracks in a Matroska file.** The read language is one signal of the rule in "Language tags". Only
   the text tracks a decision depends on are read. These are a track that is default or forced after
   the plan, and a track whose tag the text can change: two signals disagree, or an `und` track has a
-  title that names a language. The text alone never changes a tag. A tagged track whose text reads as
-  another language, with nothing else to back it, gets a "Subtitle language" alert and the reason
-  `subtitle_text_mismatch`.
+  title that names a language. The text alone never changes a tag, except on an `und` track, see
+  "Language tags". The flag rules then use the new tag.
+- **A wrong tag with nothing to back a new one.** The track keeps its tag and gets a "Subtitle
+  language" alert and the reason `subtitle_text_mismatch`. When no main audio track speaks the read
+  language, the track also loses its default and forced flags (`subtitle_text_muted`), because a
+  wrong subtitle is worse than none. Text in a main audio language keeps its flags, such as forced
+  English text tagged French under English audio.
 - PGS and VobSub tracks are pictures, so they have no read language.
 
 **The read.** mkvmerge and ffmpeg write a cue entry for every subtitle block. `subtitle_read()` reads
@@ -820,7 +826,8 @@ the Cues, which the header check has read just before. It finds the entries of t
 their bytes, so it never walks the other cue points. It then reads each block by its entry, with one
 small unbuffered read, and stops at the verdict or after 200 blocks. It never reads a Cluster in full,
 so the cost does not grow with the file size. A track with no cue entries, or with a content encoding
-other than zlib, gets no answer. The decision log holds each answer in `read`.
+other than zlib, gets no answer. So does a file from a muxer that writes its cue entries in another
+order or size than mkvmerge and ffmpeg. The decision log holds each answer in `read`.
 
 ## Status file
 
