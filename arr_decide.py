@@ -497,7 +497,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
         bcp = legacy_of.get(m[1].lower()) if m else None   # the 639-2 language of the BCP 47 tag, None when mkvmerge has none
         split = bool(bcp) and key(bcp) != key(tag)          # the two tags name different languages
         main = t["kind"] == "a" and t["role"] == "main"
-        h = (heard or {}).get(pos) if main else (read or {}).get(pos) if t["kind"] == "s" else None
+        h = (heard or {}).get(pos) if main else (read or {}).get(pos)   # read holds subtitle positions only
         said = f"heard {h}" if main else f"the text reads {h}"
         votes = {}   # language key: [its code, [the signals that name it]]
         for x, why in ((tag, f"tagged {tag}"), (bcp if split else None, f"BCP 47 tag {ietf}"), (h, said),
@@ -511,7 +511,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
         item = lambda k: "the item's original language" if k in known else "TMDB's spoken languages" if tag == "und" and not split and k in spoken else None
         score = sorted(((len(s) + bool(main and item(k)), len(s), k) for k, (_, s) in votes.items()), reverse=True)
         win = score[0][2] if score and score[0][0] >= 2 and (len(score) == 1 or score[1][:2] < score[0][:2]) else None
-        alone = win is None and t["kind"] == "s" and h and tag == "und" and not split and len(votes) == 1   # an und subtitle claims no language
+        alone = win is None and t["kind"] == "s" and h and len(votes) == 1   # only the read names a language: an und tag, no title, no BCP 47
         win = key(h) if alone else win
         heard_it = win is not None and said in votes[win][1]
         why = "; ".join(votes[win][1]) + (f", and {item(win)}" if main and item(win) else "") + (", and the und tag names no language" if alone else "") if win else ""
@@ -595,7 +595,10 @@ STOPWORDS = {k: frozenset(v.split()) for k, v in {
            "care la de a are iar îmi imi meu noi au al hai or",
     "dut": "ik je het de een niet dat is en wat van in ze hij we zijn er op te maar met me die voor dit hebt heb heeft kan wel nog naar "
            "ben bent was jij mijn hier zo goed weet waar waarom nee ja ook alles niks niets dan als om moet wil zal hoe wie nu toch even "
-           "gaan komen had sta",
+           "gaan komen had sta nou ons iets",
+    "afr": "ek jy hy sy ons julle hulle nie vir sal sê baie dis hom hoekom asseblief dankie kry gesê mense iemand niemand altyd miskien "
+           "regtig môre vandag lyk moenie die het was en van in op te dat wat dit is maar ook om met moet wil gaan kan weet hier daar waar "
+           "waarom hoe wie nee ja goed alles niks een voor nog dan my jou haar iets nou",
     "swe": "jag du det att inte är en och som på har vi vad med för han hon den mig dig sig ska kan så om var här nu men till av ett bara "
            "nej ja hur vill kommer vet inget ingenting allt där också eller min din honom henne detta gör måste oss er då blev mer alltid "
            "dem sa igen kanske säga blir bli nog",
@@ -634,6 +637,7 @@ TELLING = {k: s - frozenset().union(*(o for j, o in STOPWORDS.items() if j != k)
 SCRIPTS = {"GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara", "THAI": "tha", "HANGUL": "kor", "HIRAGANA": "jpn", "KATAKANA": "jpn",
            "CJK": "chi", "DEVANAGARI": "hin", "TAMIL": "tam", "TELUGU": "tel", "GEORGIAN": "geo", "ARMENIAN": "arm"}
 PERSIAN = frozenset("پچژگکی")   # letters Persian writes and Arabic does not
+SOUTH_CYRILLIC = frozenset("јљњћђџѓќѕ")   # Serbian and Macedonian letters. Russian and Ukrainian never write them.
 TEXT_LANGS = frozenset(STOPWORDS) | frozenset(SCRIPTS.values()) | {"per"}   # every language text_language() can name
 TEXT_NOISE = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # SubRip tags, ASS override blocks and ASS line breaks
 TEXT_FOLD = str.maketrans("şţё", "șțе")   # Romanian cedillas to commas below, and Russian ё to е, as the lists spell them
@@ -663,6 +667,8 @@ def text_judge(words, scripts, letters):
         return lang, round(n / letters, 2), f"{n / letters:.0%} of the letters are {top.lower()}" + ("" if lang else ", which names no one language"), True
     tell = {k: sum(words.get(w, 0) for w in s) for k, s in TELLING.items()}
     lang = max(tell, key=tell.get)
+    if lang in ("rus", "ukr") and any(c in SOUTH_CYRILLIC for w in words for c in w):   # Serbian shares most Russian stopwords
+        return None, 0.0, f"Serbian or Macedonian letters rule out {lang}", True
     if tell[lang] < TEXT_TELL:
         return None, 0.0, f"{tell[lang]} telling words", False
     share, cover = tell[lang] / sum(tell.values()), sum(words.get(w, 0) for w in STOPWORDS[lang]) / sum(words.values())

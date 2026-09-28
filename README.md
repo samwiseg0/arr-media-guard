@@ -15,7 +15,7 @@ re-encodes.
 - **Language detection.** When a track's language is in doubt, an optional Whisper model hears the audio. A count
   of common words reads the language of subtitle text. A sidecar whose text is in another language than its name
   goes in with the text's language. A text track with a wrong tag gets a fixed tag, or an alert. When no audio track
-  speaks its language, it also stops showing by itself.
+  speaks its language, it also stops showing by itself. An `und` track takes the language its text reads.
 - **Broken audio and corrupt video.** It samples the audio that will play and decodes three short video windows.
   A certain fault deletes the file, marks the grab failed and lets the app search again. A daily cap limits this.
 - **Restore after a bad upgrade.** When the broken file was an upgrade, the old file comes back from the app's

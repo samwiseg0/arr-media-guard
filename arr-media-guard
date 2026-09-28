@@ -354,13 +354,14 @@ def logfmt(pairs):
 
 def decision(rec, started):
     """Write one decision line for a file the hook, a backfill or an audit looked at, then its one-line summary to syslog.
-    The line carries the schema, the script and policy versions, the outcome code and the seconds it took."""
+    The line carries the schema, the script and policy versions, the outcome code and the seconds it took. The summary
+    says tmdb=not_asked when the run asked TMDB nothing, as in a conversion backfill."""
     rec = dict(rec, schema=SCHEMA, version=VERSION, policy=policy_hash(), host=HOST, outcome=outcome(rec.get("result", "")),
                took=round(time.time() - started, 2))
     log(rec)
     to_syslog(mask(logfmt([("arr", rec.get("app")), ("source", rec.get("source")), ("outcome", rec["outcome"]), ("class", rec.get("class")),
                            ("edits", len(rec.get("edits") or [])), ("reasons", ",".join(rec.get("reasons") or [])),
-                           ("alerts", ",".join(rec.get("alert_kinds") or [])), ("tmdb", rec.get("tmdb")), ("label", rec.get("label")),
+                           ("alerts", ",".join(rec.get("alert_kinds") or [])), ("tmdb", rec.get("tmdb") or "not_asked"), ("label", rec.get("label")),
                            ("id", rec.get("id"))])))
     return rec
 
@@ -869,7 +870,7 @@ def post(app, emb):
 def footer_b(tmdb=None):
     """The footer of layout B: "TMDB ok · arr-media-guard on <INSTANCE>". tmdb is a decision line's TMDB
     code or arr_meta.tmdb_day_status(). Without it the footer names the host only."""
-    words = {"no_record": "has no record", "tmdb_unavailable": "unavailable", "tmdb_token_missing": "key missing",
+    words = {"found": "found the item", "no_record": "has no record", "tmdb_unavailable": "unavailable", "tmdb_token_missing": "key missing",
              "tmdb_token_rejected": "key rejected", "no checks": "not asked"}
     return " · ".join(([f"TMDB {words.get(tmdb, tmdb)}"] if tmdb else []) + [f"{CFG['NAME']} on {CFG['INSTANCE']}"])
 
@@ -2564,7 +2565,7 @@ def metadata(app, path, j, size, d, original, release, ctx, fresh=False, asked=N
     cache = os.path.join(CFG["STATE_DIR"], "tmdb-recheck.json" if fresh else "tmdb.json")
     expected, t0 = asked or tmdb_ask(app, ctx, fresh)
     code, why = arr_meta.tmdb_state(expected)
-    if code not in ("ok", "no_record") or arr_meta.DOWN.get("answered", 0) >= t0:
+    if code not in ("found", "no_record") or arr_meta.DOWN.get("answered", 0) >= t0:
         status("tmdb", code, why)
     kind = "episode" if app == "sonarr" else "special" if (expected or {}).get("special") else "movie"
     name = release or os.path.basename(path)

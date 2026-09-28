@@ -382,7 +382,7 @@ list and no secret. The app key is `arr`, because a log store such as Loki often
 in its `app` label.
 
 ```
-arr=radarr source=hook outcome=edited class="English original: audio switched" edits=2 reasons=kids_dub alerts="" tmdb=ok label="Film A" id=65ab6056ca69
+arr=radarr source=hook outcome=edited class="English original: audio switched" edits=2 reasons=kids_dub alerts="" tmdb=found label="Film A" id=65ab6056ca69
 ```
 
 ## Backfill
@@ -714,8 +714,11 @@ checks after the flag edit.
 - **TMDB.** Each answer is cached for 30 days. A failed call pauses TMDB for 10 minutes, so an
   outage costs one timeout per run, and a failure reads as unknown. By default the module reads
   Radarr's bundled TMDB key from `/opt/Radarr/Radarr.Common.dll`. `TMDB_TOKEN` overrides it. The
-  `tmdb` code of a record is `ok`, `no_record`, `tmdb_unavailable`, `tmdb_token_missing` or
-  `tmdb_token_rejected`. A cached answer never counts as live, so it never hides a dead key.
+  `tmdb` code of a record is `found` (TMDB returned the item's record), `no_record`,
+  `tmdb_unavailable`, `tmdb_token_missing` or `tmdb_token_rejected`. Records from before 1.3.0 say
+  `ok` for `found`, and every reader takes both. The syslog line says `not_asked` when the run asked
+  TMDB nothing, as in a conversion backfill. `status.json` and the nightly audit keep `ok` for a day
+  or a check where TMDB works. A cached answer never counts as live, so it never hides a dead key.
 - **Duration.** A duration is trusted when two sources agree within 30 seconds or 2 percent. The
   sources are the header, the stream durations, the size over the bitrate, and the last video
   packet. A header that no other source confirms gets a duration alert only.
@@ -788,13 +791,14 @@ touch /opt/arr-media-guard-lid/ready        # last
 ## Subtitle text
 
 `text_language()` in `arr_decide.py` names the language of a subtitle text. It needs no model and no
-dependency. Each of 17 languages has a list of common dialogue words: English, Spanish, Portuguese,
-French, German, Italian, Romanian, Dutch, Swedish, Danish, Norwegian, Polish, Czech, Slovak, Turkish,
-Russian and Ukrainian. A word in one list only is a *telling* word. Its answer is the *read* language.
+dependency. Each of 18 languages has a list of common dialogue words: English, Spanish, Portuguese,
+French, German, Italian, Romanian, Dutch, Afrikaans, Swedish, Danish, Norwegian, Polish, Czech,
+Slovak, Turkish, Russian and Ukrainian. A word in one list only is a *telling* word. Its answer is the *read* language.
 
 - The letters give the script first. Greek, Hebrew, Arabic, Persian, Thai, Korean, Japanese, Chinese,
   Hindi, Tamil, Telugu, Georgian and Armenian text gets the language of its script. Latin and Cyrillic
-  text goes to the lists.
+  text goes to the lists. Serbian and Macedonian share most Russian stopwords, so one of their own
+  letters (ј, љ, њ, ћ, ђ, џ, ѓ, ќ, ѕ) rules out Russian and Ukrainian.
 - The top language needs 90 percent of the telling words and 25 telling words at least. Its whole list
   must also hold 20 percent of all words. A language with no list stays under that share.
 - The count runs every 300 letters. It stops at the first verdict, or at 3,000 letters, about 600
@@ -811,14 +815,15 @@ The read language is a signal, never an authority.
   `repack.sidecars` logs `read` and the `mismatch`.
 - **Tracks in a Matroska file.** The read language is one signal of the rule in "Language tags". Only
   the text tracks a decision depends on are read. These are a track that is default or forced after
-  the plan, and a track whose tag the text can change: two signals disagree, or an `und` track has a
-  title that names a language. The text alone never changes a tag, except on an `und` track, see
-  "Language tags". The flag rules then use the new tag.
+  the plan, and a track whose tag the text can change: every `und` track, and a track whose two
+  signals disagree. The text alone never changes a tag, except on an `und` track, see "Language
+  tags". The flag rules then use the new tag.
 - **A wrong tag with nothing to back a new one.** The track keeps its tag and gets a "Subtitle
   language" alert and the reason `subtitle_text_mismatch`. When no main audio track speaks the read
   language, the track also loses its default and forced flags (`subtitle_text_muted`), because a
-  wrong subtitle is worse than none. Text in a main audio language keeps its flags, such as forced
-  English text tagged French under English audio.
+  wrong subtitle is worse than none. The decision then counts the track as its read language, so the
+  normal rules can give the default to the real English track instead. Text in a main audio language
+  keeps its flags, such as forced English text tagged French under English audio.
 - PGS and VobSub tracks are pictures, so they have no read language.
 
 **The read.** mkvmerge and ffmpeg write a cue entry for every subtitle block. `subtitle_read()` reads
@@ -842,7 +847,8 @@ with JSONPath preprocessing is one way. `arr_status.py` writes the file.
             "policy": {"status": "ok", "since": 1789000000, "checked": 1790000000, "...": "..."}}}
 ```
 
-The tmdb status is `ok`, `unavailable`, `token_missing` or `token_rejected`. The policy status is
+The tmdb status is `ok`, `unavailable`, `token_missing` or `token_rejected`. A file's `found` and
+`no_record` both record `ok`, because TMDB answered. The policy status is
 `ok` or `failed`. A check never recorded reads `unknown`. `since` is when the status last changed,
 and `checked` is the last check. `error` keeps the last error text after a recovery, cut to 200
 characters with anything that looks like a token replaced. `last_24h` counts each status over the

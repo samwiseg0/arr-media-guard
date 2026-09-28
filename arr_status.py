@@ -30,8 +30,9 @@ import fcntl, json, os, re, tempfile, time
 FILE = "status.json"
 VERSION = 1
 STATUSES = {"tmdb": ("ok", "unavailable", "token_missing", "token_rejected"), "policy": ("ok", "failed")}
-# arr_meta.tmdb_state() codes. no_record means TMDB answered without the item, or there was no id to ask about.
-ALIASES = {"no_record": "ok", "tmdb_unavailable": "unavailable", "tmdb_token_missing": "token_missing",
+# arr_meta.tmdb_state() codes. found means TMDB returned the item's record. no_record means TMDB answered without the
+# item, or there was no id to ask about. Both mean TMDB works, so status.json says ok.
+ALIASES = {"found": "ok", "no_record": "ok", "tmdb_unavailable": "unavailable", "tmdb_token_missing": "token_missing",
            "tmdb_token_rejected": "token_rejected"}
 UNKNOWN = {"tmdb": "unavailable", "policy": "failed"}   # an unknown code still reads as a failure to a trigger
 DAY = 86400

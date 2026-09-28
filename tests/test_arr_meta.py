@@ -434,7 +434,7 @@ def test_tmdb_failure_is_remembered(tmp_path, monkeypatch, status, code):
 def test_tmdb_404_is_an_answer(tmp_path, monkeypatch):
     monkeypatch.setattr(M.urllib.request, "urlopen", Urlopen(404))
     assert M.expected_languages("radarr", {"tmdb": 1}, "t", str(tmp_path / "c.json")) is None
-    assert M.tmdb_state(None)[0] == "no_record" and M.tmdb_state(tmdb("eng", ["eng"], 90))[0] == "ok"
+    assert M.tmdb_state(None)[0] == "no_record" and M.tmdb_state(tmdb("eng", ["eng"], 90))[0] == "found"
 
 
 def test_tmdb_token_missing_and_unsendable(tmp_path, monkeypatch):
@@ -506,7 +506,8 @@ def test_key_alert_once_a_day(tmp_path):
 
 def test_tmdb_day_status():
     rec = lambda code: {"tmdb": code}
-    assert M.tmdb_day_status([rec("ok"), rec("no_record"), {}]) == "ok"
+    assert M.tmdb_day_status([rec("found"), rec("no_record"), {}]) == "ok"
+    assert M.tmdb_day_status([rec("ok")]) == "ok" and M.tmdb_day_status([rec("ok"), rec("tmdb_token_missing")]) == "key broken"   # a line from before 1.3.0
     assert M.tmdb_day_status([rec("ok"), rec("tmdb_unavailable"), rec("tmdb_unavailable")]) == "unavailable 2 times"
     assert M.tmdb_day_status([rec("tmdb_unavailable"), rec("tmdb_token_rejected")]) == "key broken"
     assert M.tmdb_day_status([{}, {"outcome": "edited"}]) == "no checks"

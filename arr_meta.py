@@ -127,9 +127,10 @@ def _down(code, why):
 
 
 def tmdb_state(expected):
-    """(code, why) for the decision log and the Loki line. The code is ok, no_record, tmdb_unavailable (network,
-    timeout, 5xx), tmdb_token_missing (no token) or tmdb_token_rejected (TMDB answered 401 or 403)."""
-    if expected: return "ok", ""
+    """(code, why) for the decision log and the Loki line. The code is found (TMDB returned the item's record),
+    no_record, tmdb_unavailable (network, timeout, 5xx), tmdb_token_missing (no token) or tmdb_token_rejected (TMDB
+    answered 401 or 403). Decision lines from before 1.3.0 say ok for found."""
+    if expected: return "found", ""
     if time.time() < DOWN["until"]: return DOWN["code"], DOWN["why"]
     return "no_record", "TMDB has no record for the item"
 
@@ -155,7 +156,8 @@ def key_alert(code, state_dir, now=None):
 
 def tmdb_day_status(records):
     """The nightly audit's TMDB status from a day of decision records: "key broken", "unavailable n times", "ok", or
-    "no checks" when no record carries a tmdb code."""
+    "no checks" when no record carries a tmdb code. "ok" is the day's health: found, the old ok and no_record all count
+    as TMDB working."""
     codes = [r["tmdb"] for r in records if r.get("tmdb")]
     if any(c in KEY_BROKEN for c in codes): return "key broken"
     n = codes.count("tmdb_unavailable")

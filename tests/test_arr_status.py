@@ -74,7 +74,7 @@ def test_since_moves_only_on_a_change_and_checked_on_every_write(tmp_path):
 
 def test_arr_meta_codes_map_to_statuses(tmp_path):
     d = str(tmp_path)
-    for code, want in [("no_record", "ok"), ("tmdb_unavailable", "unavailable"),
+    for code, want in [("found", "ok"), ("no_record", "ok"), ("ok", "ok"), ("tmdb_unavailable", "unavailable"),
                        ("tmdb_token_missing", "token_missing"), ("tmdb_token_rejected", "token_rejected")]:
         S.record(d, "tmdb", code, now=T0)
         assert read(d)["checks"]["tmdb"]["status"] == want
@@ -87,7 +87,7 @@ def test_every_arr_meta_code_maps_to_a_status():
         pytest.skip("arr_meta.py is not in this tree")
     with open(src) as f:
         lines = [line for line in f if "_down(" in line or line.startswith("KEY_BROKEN")]
-    codes = set(re.findall(r'"(tmdb_[a-z_]+)"', "".join(lines))) | {"ok", "no_record"}
+    codes = set(re.findall(r'"(tmdb_[a-z_]+)"', "".join(lines))) | {"found", "no_record"}
     assert {"tmdb_unavailable", "tmdb_token_missing", "tmdb_token_rejected"} <= codes
     for code in codes:
         assert S.ALIASES.get(code, code) in S.STATUSES["tmdb"], code

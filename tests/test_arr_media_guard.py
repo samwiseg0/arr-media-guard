@@ -2403,7 +2403,7 @@ def test_tmdb_languages_decide_the_language_alert(env):
     env["tmdb"] = dict(TMDB, original="por", spoken=["por"])   # Radarr's original language is wrong, the file is right
     hook.main([])
     rec = decided(env)
-    assert rec["alerts"] == [] and rec["tmdb"] == "ok" and rec["evidence"]["signals"][0]["verdict"] == "ok"
+    assert rec["alerts"] == [] and rec["tmdb"] == "found" and rec["evidence"]["signals"][0]["verdict"] == "ok"
 
 
 def test_a_header_no_second_source_confirms_still_alerts(env):
@@ -7381,11 +7381,11 @@ def cue_texts(name, times=3):
 
 
 # One scene of original dialogue in each language, as real-shape SubRip. A name that ends in _plain drops the accents,
-# as some fansubs type. English with some Spanish words stays English. Catalan and Croatian have no list, and they and
-# mixed text get no answer.
+# as some fansubs type. English with some Spanish words stays English. Catalan, Croatian and Serbian have no list, and
+# they and mixed text get no answer.
 CORPUS = {"eng": "eng", "spa": "spa", "spa_plain": "spa", "por": "por", "por_plain": "por", "fre": "fre", "ger": "ger", "ita": "ita",
-          "rum": "rum", "rum_plain": "rum", "dut": "dut", "swe": "swe", "dan": "dan", "nor": "nor", "pol": "pol", "cze": "cze", "slo": "slo",
-          "tur": "tur", "rus": "rus",
+          "rum": "rum", "rum_plain": "rum", "dut": "dut", "afr": "afr", "swe": "swe", "dan": "dan", "nor": "nor", "pol": "pol", "cze": "cze",
+          "slo": "slo", "tur": "tur", "rus": "rus", "srp": None,
           "ukr": "ukr", "gre": "gre", "ara": "ara", "per": "per", "chi": "chi", "jpn": "jpn", "kor": "kor",
           "eng_spanish_words": "eng", "cat": None, "hrv": None, "mixed_eng_spa": None, "mixed_chi_eng": None}
 
@@ -7434,6 +7434,50 @@ def test_a_few_early_words_of_another_language_do_not_decide():
     assert hook.arr_decide.text_language(early + cue_texts("rum"))[0] == "rum"
 
 
+def test_serbian_letters_rule_out_russian_and_ukrainian():
+    """Serbian and Macedonian share most Russian stopwords. One of their own letters is enough to refuse rus and ukr."""
+    d = hook.arr_decide
+    assert d.text_language(cue_texts("srp"))[2] == "Serbian or Macedonian letters rule out rus"
+    assert d.text_language(cue_texts("rus"))[0] == "rus"
+    assert d.text_language(["Његош је рекао."] + cue_texts("rus"))[0] is None
+    assert d.text_language(["Сѕвезда."] + cue_texts("ukr"))[2] == "Serbian or Macedonian letters rule out ukr"
+
+
+def test_an_answer_needs_enough_telling_words():
+    """Twenty Spanish cues hold 17 telling words, under TEXT_TELL."""
+    assert hook.arr_decide.text_language(cue_texts("spa", 1)[:20]) == (None, 0.0, "17 telling words")
+
+
+def test_a_text_mostly_outside_every_list_gets_no_answer():
+    """A text whose list words are under TEXT_COVER gets no answer, even when every telling word is English. A language
+    with no list can hit one list's words now and then, and this check stops that. Here "the" is one word in six."""
+    nouns = "harbor lantern midnight velvet copper orchard falcon meadow thunder canyon silver prairie".split()
+    cues = [" ".join(["The"] + [nouns[(i + k) % 12] for k in (0, 3, 5, 7, 9)]) for i in range(60)]
+    assert hook.arr_decide.text_language(cues) == (None, 1.0, "no list fits, eng words are 17% of the text")
+
+
+def test_clearly_mixed_text_stops_at_once():
+    """Two Spanish cues to each English one give a share under TEXT_MIXED, so the count stops there. English cues
+    that follow are never read."""
+    eng, spa = cue_texts("eng", 1), cue_texts("spa", 1)
+    mixed = [x for i in range(12) for x in (spa[2 * i], spa[2 * i + 1], eng[i])]
+    got = hook.arr_decide.text_language(mixed + eng * 6)
+    assert got[0] is None and got[2].startswith("mixed, eng holds 60%"), got
+
+
+def test_the_lists_read_cedillas_and_yo_as_they_spell_them():
+    """Old Romanian subtitles write ş and ţ with a cedilla, and Russian ones often write ё. Each word here matches a
+    list only after the fold."""
+    d = hook.arr_decide
+    assert d.text_language(["Ştiu. Şi eşti? Poţi."] * 30)[0] == "rum"
+    assert d.text_language(["Её? Ещё её."] * 60)[0] == "rus"
+
+
+def test_tags_and_ass_override_blocks_are_no_words():
+    """{\be1} would read as the English word "be" in every cue and make Spanish text look mixed."""
+    assert hook.arr_decide.text_language(["{\\be1}<i>" + t + "</i>" for t in cue_texts("spa")])[0] == "spa"
+
+
 def test_romanian_cedillas_read_as_romanian():
     """Old Romanian subtitles write ş and ţ with a cedilla. The lists spell them with a comma below."""
     texts = [t.replace("ș", "ş").replace("ț", "ţ") for t in cue_texts("rum")]
@@ -7445,7 +7489,7 @@ def test_a_near_miss_never_takes_the_other_language():
     their language or get no answer."""
     assert hook.arr_decide.text_language(cue_texts("eng_spanish_words"))[0] in (None, "eng")
     for name, other in (("por", "spa"), ("por_plain", "spa"), ("spa", "por"), ("spa_plain", "por"), ("dan", "nor"), ("nor", "dan"), ("swe", "dan"),
-                        ("cze", "pol"), ("slo", "pol"), ("cze", "slo")):
+                        ("cze", "pol"), ("slo", "pol"), ("cze", "slo"), ("afr", "dut"), ("dut", "afr"), ("srp", "rus")):
         assert hook.arr_decide.text_language(cue_texts(name))[0] != other, name
 
 
@@ -7505,6 +7549,17 @@ def test_a_wrong_language_no_audio_speaks_loses_its_flags():
     p = d.decide(subs("jpn", forced=False), "Japanese", wrong={"s1": "rum"})
     assert p["edits"] == [["track:=9", 0, 1]] and not p["dropped"], p
     assert d.decide(subs("jpn", forced=False), "Japanese")["edits"] == []
+
+
+def test_a_muted_track_counts_as_its_read_language():
+    """A French film: the default English subtitle holds Romanian text, and an English SDH track is off. The muted
+    track counts as Romanian, so the normal rules give the default to the real English track."""
+    d = hook.arr_decide
+    j = tracks(("audio", "fre", None, 1, True, {"audio_channels": 6}), ("subtitles", "eng", None, 2, True, {}),
+               ("subtitles", "eng", None, 3, False, {"track_name": "SDH"}))
+    assert d.decide(j, "French")["edits"] == []
+    p = d.decide(j, "French", wrong={"s1": "rum"})
+    assert p["edits"] == [["track:=2", 0, 1], ["track:=3", 1, 0]] and p["rules"] == ["foreign subtitle off", "sdh English subtitle on"], p
 
 
 def test_a_wrong_language_that_an_audio_track_speaks_keeps_its_flags():
@@ -7592,6 +7647,13 @@ def test_the_hook_tags_an_und_subtitle_by_its_text(env, monkeypatch):
     assert "s1 und -> rum: the text reads rum, and the und tag names no language" in rec["notes"] and "sublang" not in rec.get("alert_kinds", [])
 
 
+def test_the_syslog_line_says_which_tmdb_answer_a_file_got(env):
+    """found, no_record or a failure code, and not_asked when the run asked TMDB nothing, as in a conversion backfill."""
+    hook.decision({"app": "radarr", "source": "backfill", "result": "repacked", "label": "Film A"}, time.time())
+    hook.decision({"app": "radarr", "source": "hook", "result": "edited", "label": "Film A", "tmdb": "found"}, time.time())
+    assert " tmdb=not_asked " in env["syslog"][-2] and " tmdb=found " in env["syslog"][-1], env["syslog"]
+
+
 def test_a_read_subtitle_language_is_never_heard_again_on_the_second_check(env, monkeypatch):
     """retag()'s set carries a retagged subtitle into heard, and heard goes to the second check before a re-grab. That
     check hears only audio, so the subtitle must not count as "not heard again" and take out the language point."""
@@ -7634,6 +7696,55 @@ def test_subtitle_read_takes_each_text_by_its_cue_entry(text_mkv, name):
     assert {p: g[0] for p, g in got.items()} == {"s1": "rum", "s2": "fre", "s3": "eng", "s4": "spa", "s5": "jpn"}, got
     assert read < os.path.getsize(path) / 10, (read, os.path.getsize(path))
     assert hook.subtitle_read(path, j, {"s3"}).keys() == {"s3"}   # a track no decision depends on is never read
+
+
+def test_subtitle_read_skips_a_content_encoding_it_cannot_undo(text_mkv):
+    """Only zlib is undone. Another content encoding, such as header removal, leaves the track unread."""
+    path = str(text_mkv / "mkvmerge.mkv")
+    j = REAL_MKVMERGE(path)
+    j["tracks"][3]["properties"]["content_encoding_algorithms"] = "3"   # s3, the English text
+    assert hook.subtitle_read(path, j, {"s3"}) == {}
+
+
+def test_a_failed_read_keeps_what_it_read_and_never_stops_the_job(text_mkv):
+    """The probe says s3 is zlib-compressed, but its blocks are plain text, so zlib fails. s2 keeps its answer, and s3
+    gets no answer with the error."""
+    path = str(text_mkv / "mkvmerge.mkv")
+    j = REAL_MKVMERGE(path)
+    j["tracks"][3]["properties"]["content_encoding_algorithms"] = "0"
+    got = hook.subtitle_read(path, j, {"s2", "s3"})
+    assert got["s2"][0] == "fre" and got["s3"][:2] == (None, 0.0) and got["s3"][2].startswith("the read failed: error: "), got
+
+
+def test_a_cue_entry_that_points_at_another_track_reads_nothing(text_mkv, monkeypatch):
+    """Every cue entry of s3 points at a video block. block_frame() checks the track number, so no video bytes read as
+    text."""
+    path = str(text_mkv / "mkvmerge.mkv")
+    real = hook.arr_decide.cue_blocks
+    monkeypatch.setattr(hook.arr_decide, "cue_blocks", lambda b, tracks, cap: {n: real(b, {1}, cap)[1] for n in tracks})
+    assert hook.subtitle_read(path, REAL_MKVMERGE(path), {"s3"}) == {"s3": (None, 0.0, "short, 0 letters")}
+
+
+def cue_el(i, data):
+    """One EBML element with a one-byte size."""
+    return i.to_bytes((i.bit_length() + 7) // 8, "big") + bytes([0x80 | len(data)]) + data
+
+
+def test_cue_blocks_takes_only_entries_with_a_relative_position():
+    """The byte search needs a CueRelativePosition right after the CueClusterPosition. An entry where another element
+    comes there, a CueDuration here, is left out, so its value never reads as a position."""
+    d = hook.arr_decide
+    point = lambda rest: cue_el(d.CUEPOINT, cue_el(d.CUETIME, b"\x00") + cue_el(d.CUETRACKPOS, cue_el(d.CUETRACK, b"\x02") + cue_el(0xF1, b"\x05") + rest))
+    b = point(cue_el(0xF0, b"\x03")) + point(cue_el(0xB2, b"\x07")) + point(cue_el(0xF0, b"\x09"))
+    assert d.cue_blocks(b, {2}, 10) == {2: [(5, 3), (5, 9)]} and d.cue_blocks(b, {2}, 1) == {2: [(5, 3)]} and d.cue_blocks(b, {3}, 10) == {}
+
+
+def test_block_frame_checks_the_track_and_the_lacing():
+    d = hook.arr_decide
+    block = lambda track, flags: cue_el(d.SIMPLEBLOCK, bytes([0x80 | track]) + b"\x00\x10" + bytes([flags]) + b"Hello")
+    assert d.block_frame(block(2, 0x80), 2) == b"Hello" and d.block_frame(cue_el(d.BLOCKGROUP, cue_el(d.BLOCK, block(2, 0)[2:])), 2) == b"Hello"
+    assert d.block_frame(block(3, 0x80), 2) is None   # another track
+    assert d.block_frame(block(2, 0x82), 2) is None   # a laced block holds several frames
 
 
 def test_subtitle_read_skips_what_it_cannot_read(text_mkv):
