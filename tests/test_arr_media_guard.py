@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 import types
+from fractions import Fraction
 import urllib.error
 from urllib.parse import parse_qs, urlparse
 
@@ -235,7 +236,7 @@ def env(tmp_path, monkeypatch):
         calls.get("on_write", lambda *a: None)(app, p, method, body)
         return {"id": 1, "status": "completed"} if p == "command" else None
     monkeypatch.setattr(hook, "arr_write", fake_arr_write)
-    monkeypatch.setattr(hook, "prove", lambda src, tmp, subs, folder, captions=None: copy.deepcopy(calls["proof"]))   # tests with real files call it
+    monkeypatch.setattr(hook, "prove", lambda src, tmp, subs, folder, captions=None, **kw: copy.deepcopy(calls["proof"]))   # tests with real files call it
     def fake_mkvmerge(p):   # a file a repack wrote starts with MKV! and reads as calls["mkv_probe"], even after the rename
         mkv = os.path.exists(p) and open(p, "rb").read(4) == b"MKV!"
         if mkv and (calls["files"].get(p, {}).get("container") or {}).get("type") != "Matroska":
@@ -7755,3 +7756,986 @@ def test_subtitle_read_skips_what_it_cannot_read(text_mkv):
     pgs = {"tracks": [{"type": "subtitles", "properties": {"codec_id": "S_HDMV/PGS", "number": 2}}]}
     assert hook.subtitle_read("/nonexistent.mkv", pgs, {"s1"}) == {}
     assert hook.subtitle_read(str(text_mkv / "v.mp4"), REAL_MKVMERGE(path), {"s1"}) == {}
+
+
+# --- the subtitle match check (docs/design.md, "Subtitle match") ------------------------------------------------------
+
+import test_arr_subsync as talk  # noqa: E402  the dialogue written for the tests, and the fake hearing
+
+
+def sub_probe(*subs, audio=(("jpn", True), ("eng", False))):
+    """A film of talk.DURATION with the audio tracks audio, (tag, default), and the subtitles subs, (tag, default, more
+    properties). A subtitle is SubRip unless it names another codec_id."""
+    ts = [("video", "und", None, 1, True, {})] + [("audio", a, None, 2 + i, d, {"audio_channels": 2}) for i, (a, d) in enumerate(audio)]
+    ts += [("subtitles", lang, None, 10 + i, d, {"codec_id": "S_TEXT/UTF8", **{k: v for k, v in kw.items() if k != "forced_track"}})
+           for i, (lang, d, kw) in enumerate(subs)]
+    j = tracks(*ts)
+    for t, (_, _, kw) in zip(j["tracks"][len(audio) + 1:], subs):
+        t["properties"]["forced_track"] = kw.get("forced_track", False)
+    j["container"]["properties"]["duration"] = int(talk.DURATION * 1e9)
+    for i, t in enumerate(j["tracks"]):
+        t["id"] = i
+    return j
+
+
+def hearing(env, monkeypatch, cues, lines=talk.RIGHT, answer=None, spoken=lambda i: True):
+    """The check through its real code, with the model faked: subtitle_cues() reads cues {position: cues}, and a hearing
+    hears lines in the windows asked, or gives answer. spoken(i) False drops line i, for a window with little speech.
+    env["words"] records (audio index, language, windows) per hearing."""
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want: {p: c for p, c in cues.items() if p in want})
+
+    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None):
+        if not words:
+            return {"why": "no language hearing in these tests"}
+        env.setdefault("words", []).append((index, words[0], list(words[1])))
+        if answer:
+            return answer
+        got = [dict(w, secs=words[2]) for w in talk.heard(words[1], lines, secs=words[2], keep=spoken)]
+        few = hook.arr_subsync.short(got, words[0]) if len(words) > 3 and words[3] else []
+        extra = [words[3][k] for k in few if words[3][k] is not None] if len(few) < len(got) or len(got) == 1 else []
+        env.setdefault("more", []).append(extra)
+        return {"windows": got + [dict(w, secs=hook.arr_subsync.THIRD) for w in talk.heard(extra, lines, secs=hook.arr_subsync.THIRD, keep=spoken)],
+                "cached": False, "reused": 0, "cpu": 12.5,
+                "took": 12.0}
+    monkeypatch.setattr(hook, "lid_run", fake_lid_run)
+
+
+def japanese_film(env, *subs):
+    """A Japanese film with Japanese and English audio. A mismatch there is only unknown, see sub_hold()."""
+    env["movies"]["movie/7"].update(originalLanguage={"name": "Japanese"}, runtime=round(talk.DURATION / 60))
+    env["probe"] = sub_probe(*subs)
+
+
+def english_film(env, *subs):
+    """An English film with English audio only, where a mismatch counts."""
+    env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
+    env["probe"] = sub_probe(*subs, audio=(("eng", True),))
+
+
+def test_sub_targets_take_the_text_tracks_a_viewer_would_use():
+    """Full, SDH and dub text tracks in an audio language. A forced or commentary track, a picture track and a track in
+    no audio language are never checked."""
+    j = sub_probe(("eng", False, {}), ("eng", True, {"forced_track": True, "track_name": "Forced"}), ("fre", False, {}),
+                  ("eng", False, {"codec_id": "S_HDMV/PGS"}), ("eng", False, {"codec_id": "S_TEXT/ASS", "track_name": "SDH"}),
+                  ("eng", False, {"codec_id": "S_TEXT/WEBVTT"}), ("eng", False, {"track_name": "Commentary"}),
+                  audio=(("eng", True),))
+    d = hook.arr_decide.decide(j, "English")
+    assert hook.sub_targets(j, d) == {"s1": ("eng", 0), "s5": ("eng", 0), "s6": ("eng", 0)}
+    # Japanese text has no spaces, so a Japanese track under Japanese audio is never heard
+    j = sub_probe(("jpn", False, {}), ("eng", False, {}), audio=(("jpn", True), ("eng", False)))
+    assert hook.sub_targets(j, hook.arr_decide.decide(j, "Japanese")) == {"s2": ("eng", 1)}
+    # the audio that plays is the one heard when two main tracks speak the language
+    j = sub_probe(("eng", False, {}), audio=(("eng", False), ("eng", True)))
+    assert hook.sub_targets(j, hook.arr_decide.decide(j, "English")) == {"s1": ("eng", 1)}
+
+
+def test_a_subtitle_of_another_episode_loses_its_flags_and_alerts(env, monkeypatch):
+    """An English film with the English subtitle on. That subtitle holds another episode's lines. With no original
+    kept (KEEP_ORIGINALS_DAYS 0) it stays in the file and loses its flags. One hearing serves both tracks."""
+    english_film(env, ("eng", True, {}), ("eng", False, {"track_name": "SDH"}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER), "s2": talk.cues(talk.RIGHT)})
+    hook.main([])
+    rec = decided(env)
+    assert [rec["subcheck"][p]["verdict"] for p in ("s1", "s2")] == ["mismatch", "match"], rec["subcheck"]
+    assert rec["edits"] == [["track:=10", 0, 1]] and rec["outcome"] == "edited", rec["edits"]
+    assert "subtitle_audio_mismatch" in rec["reasons"] and rec["alert_kinds"] == ["submatch"], rec
+    assert rec["alerts"][0].startswith("submatch: Subtitle track s1 does not match the audio, the heard words match the cues at ")
+    assert [(i, lang) for i, lang, _ in env["words"]] == [(0, "eng")]   # the English audio, heard once for both tracks
+    assert rec["recheck"]["edits"] == 0   # the re-plan after the edit keeps the track off
+
+
+def test_a_matching_subtitle_keeps_its_flags(env, monkeypatch):
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    hook.main([])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "match" and rec["subcheck"]["s1"]["timing"]["why"] == "in time"
+    assert rec["outcome"] == "no_change" and env["mkvpropedit"] == [] and "alert_kinds" in rec and rec["alert_kinds"] == []
+
+
+def test_a_file_with_no_track_to_check_is_never_heard(env, monkeypatch):
+    """Cost: a forced track, a picture track and a French track under English and Japanese audio need no hearing."""
+    japanese_film(env, ("eng", True, {"forced_track": True, "track_name": "Signs"}), ("eng", False, {"codec_id": "S_HDMV/PGS"}), ("fre", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER), "s3": talk.cues(talk.OTHER)})
+    hook.main([])
+    assert "words" not in env and "subcheck" not in decided(env)
+
+
+def test_the_check_is_off_with_sub_check_false(env, monkeypatch):
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "SUB_CHECK", False)
+    hook.main([])
+    assert "words" not in env and decided(env)["outcome"] == "no_change"
+
+
+def test_a_hearing_that_fails_gives_unknown_and_the_import_goes_on(env, monkeypatch):
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)}, answer={"why": "no answer in 90 seconds"})
+    hook.main([])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "unknown" and rec["subcheck"]["s1"]["why"] == "no answer in 90 seconds"
+    assert rec["outcome"] == "no_change" and env["mkvpropedit"] == []
+
+
+def test_the_check_asks_the_hearing_for_its_time_left(env, monkeypatch):
+    """The check shares the job's time limit: with under 10 seconds left it hears nothing and says why."""
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook.signal, "getitimer", lambda which: (hook.LID_RESERVE + 5, 0))
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    assert "words" not in env and r["verdict"] == "unknown" and r["why"].startswith("no time left"), r
+
+
+def late_english_film(env, monkeypatch, lines=talk.RIGHT, **kw):
+    """An English film whose SubRip track shows every line 2 seconds late, or as kw moves it."""
+    env["probe"] = sub_probe(("eng", False, {}), audio=(("eng", True),))
+    env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
+    hearing(env, monkeypatch, {"s1": talk.cues(lines, **(kw or {"offset": 2.0}))})
+    got = []
+    def fake_resub(path, j, st, apply, fixes, drop=()):
+        got.append((apply, fixes, list(drop)))
+        if env.get("resub_fails"):
+            return "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
+        return ("subtitles remuxed", {"warnings": None, "new_size": 1000, "kept": "/kept/f.mkv"}) if apply else ("would remux subtitles: track 2", {})
+    monkeypatch.setattr(hook, "resub", fake_resub)
+    return got
+
+
+def test_a_late_subtitle_gets_new_times_in_a_remux(env, monkeypatch):
+    got = late_english_film(env, monkeypatch)
+    hook.main([])
+    rec = [r for r in log_lines(env) if r.get("outcome")][-1]
+    (apply, fixes, drop), = got
+    assert apply and list(fixes) == [2] and fixes[2]["rate"] == "1/1" and abs(fixes[2]["offset"] - 2) < 0.05 and drop == [], fixes
+    assert rec["subremux"]["codes"] == ["subtitle_retimed"] and rec["reasons"][0] == "subtitle_retimed" and rec["subremux"]["rescan"] == "sent"
+    assert [r["result"] for r in log_lines(env)][0] == "subtitles remuxed"   # the record is on disk before anything else runs
+    assert ("POST", "command", {"name": "RescanMovie", "movieId": 7}) in env["writes"]
+
+
+def test_a_retime_in_a_job_process_takes_the_exclusive_lock_first(env, monkeypatch, tmp_path):
+    """A job process holds the file lock shared. A remux must not run under it, so the job plans again with the lock
+    exclusive, and the second run reads the cached words."""
+    got = late_english_film(env, monkeypatch)
+    shared = types.SimpleNamespace(exclusive=lambda st: None, reshare=lambda st: None, settle=lambda: None, turn=lambda: None)
+    with open(tmp_path / "lock", "w") as lock, pytest.raises(hook.Replan, match="a subtitle needs a remux"):
+        hook.process("radarr", env["path"], "Film A (1979)", "English", 120, lock=lock, shared=shared)
+    assert got == []
+
+
+def test_a_dry_run_only_says_it_would_retime(env, monkeypatch):
+    got = late_english_film(env, monkeypatch)
+    rec = hook.process("radarr", env["path"], "Film A (1979)", "English", 120, apply=False, post=False)
+    assert got[0][0] is False and rec["subremux"]["codes"] == ["would_remux_subtitles"] and env["mkvpropedit"] == []
+
+
+def test_sub_timing_off_keeps_the_times_and_alerts(env, monkeypatch):
+    got = late_english_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "SUB_TIMING", False)
+    hook.main([])
+    rec = decided(env)
+    assert got == [] and "subremux" not in rec and rec["alert_kinds"] == ["subtiming"] and "SUB_TIMING is off" in rec["alerts"][0], rec
+
+
+def test_a_cut_with_two_offsets_alerts_and_keeps_the_times(env, monkeypatch):
+    got = late_english_film(env, monkeypatch, where=lambda i: 8.0 if talk.FIRST + talk.GAP * i > talk.DURATION / 2 else 0.0)
+    hook.main([])
+    rec = decided(env)
+    assert got == [] and rec["subcheck"]["s1"]["timing"]["piecewise"] and rec["alert_kinds"] == ["subtiming"], rec
+
+
+def test_a_backfill_checks_subtitles_only_with_sub_check(env, monkeypatch, capsys):
+    """Cost: a backfill never hears by default. With --sub-check a dry run reports the verdicts, the fix it would make
+    and the summary, and changes nothing. Its verdict asks for an action, so a second dry run checks the file again."""
+    got = late_english_film(env, monkeypatch, lines=talk.RIGHT)
+    env["probe"] = sub_probe(("eng", False, {}), ("eng", True, {"track_name": "SDH"}), audio=(("eng", True),))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=2.0), "s2": talk.cues(talk.OTHER)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr"])
+    assert "words" not in env and got == []
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    out = capsys.readouterr().out
+    assert len(env["words"]) == 1 and got == [(False, got[0][1], [])] and env["mkvpropedit"] == [] and env["repacks"] == []
+    assert "s1 match" in out and "fix +2.00 s 1/1" in out and "s2 mismatch" in out and "would remux subtitles" in out, out
+    assert "subtitle check: 1 files checked, 1 tracks match, 1 do not, 0 unknown, 1 timing fixes, 12 CPU seconds" in out, out
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 2
+
+
+def test_a_backfill_with_sub_check_skips_a_file_it_checked(env, monkeypatch, capsys):
+    """A cached verdict that asks for nothing more skips the file, so a stopped run goes on where it stopped. A file that
+    changed since is checked again."""
+    japanese_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 1 and hook.sub_cached(env["path"])
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 1 and '"subtitles checked before": 1' in capsys.readouterr().out
+    os.utime(env["path"], ns=(time.time_ns(), os.stat(env["path"]).st_mtime_ns + 10**9))
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 2
+
+
+def test_sub_check_runs_with_the_flag_backfill_only(env, monkeypatch):
+    for extra in (["--convert"], ["--check-audio"]):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--backfill", "radarr", "--sub-check", *extra])
+        assert ex.value.code == 2
+
+
+def test_a_backfill_takes_only_the_listed_paths(env, monkeypatch, tmp_path, capsys):
+    other = tmp_path / "media" / "Other.mkv"
+    other.write_bytes(b"x")
+    movies = [dict(env["movies"]["movie/7"], id=i, title=f"Film {i}", movieFile={"id": i, "path": p}) for i, p in ((7, env["path"]), (8, str(other)))]
+    monkeypatch.setattr(hook, "arr", lambda app, p: movies)
+    seen = []
+    monkeypatch.setattr(hook, "process", lambda app, path, label, *a, **k: seen.append(path) or {"result": "no change"})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--paths", str(other), "/nowhere.mkv"])
+    assert seen == [str(other)] and "not in this run's work list, skipped: /nowhere.mkv" in capsys.readouterr().out
+
+
+def removal_film(env, monkeypatch, tmp_path, fails=False):
+    """An English film whose default English subtitle holds another episode, beside a matching SDH track. Originals are
+    kept, and the fake remux removes the tracks it drops from the file's probe."""
+    english_film(env, ("eng", True, {}), ("eng", False, {"track_name": "SDH"}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER), "s2": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    got, env["resub_fails"] = [], fails
+
+    def fake_resub(path, j, st, apply, fixes, drop=()):
+        got.append((apply, fixes, list(drop)))
+        if fails:
+            return "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
+        if not apply:
+            return "would remux subtitles: remove track 2", {}
+        p = env["files"][path]
+        p["tracks"] = [t for t in p["tracks"] if t.get("id") not in drop]
+        return "subtitles remuxed", {"warnings": None, "new_size": 1000, "kept": "/kept/f.mkv"}
+    monkeypatch.setattr(hook, "resub", fake_resub)
+    return got
+
+
+def test_a_track_of_another_episode_is_removed_in_a_remux(env, monkeypatch, tmp_path):
+    """Rather no subtitle than a wrong one: the track leaves the file and the original is kept. The SDH track, now s1,
+    stays off under the English audio, so no flag changes."""
+    got = removal_film(env, monkeypatch, tmp_path)
+    hook.main([])
+    rec = decided(env)
+    assert got == [(True, {}, [2])] and rec["subremux"]["removed"] == ["s1"] and rec["subremux"]["codes"] == ["subtitle_mismatch_removed"], rec
+    assert not rec.get("edits") and rec["outcome"] == "no_change" and "subtitle_audio_mismatch" not in rec["reasons"], rec
+    assert rec["alert_kinds"] == ["submatch"] and "The hook removed it, and the original file is kept at /kept/f.mkv." in rec["alerts"][0]
+    assert rec["subremux"]["rescan"] == "sent"
+
+
+def test_a_failed_removal_turns_the_flags_off_instead(env, monkeypatch, tmp_path):
+    got = removal_film(env, monkeypatch, tmp_path, fails=True)
+    hook.main([])
+    rec = decided(env)
+    assert got == [(True, {}, [2])] and rec["subremux"]["codes"] == ["subtitle_remux_failed"] and rec["subremux"]["removed"] == []
+    assert rec["edits"] == [["track:=10", 0, 1]] and "subtitle_audio_mismatch" in rec["reasons"], rec
+    assert "It stays in the file, because subtitle remux failed: the packet data" in rec["alerts"][0], rec["alerts"]
+
+
+def test_no_kept_original_means_no_removal(env, monkeypatch, tmp_path):
+    """A removal cannot be undone without the kept original, so KEEP_ORIGINALS_DAYS 0 keeps the track and turns it off."""
+    got = removal_film(env, monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    hook.main([])
+    rec = decided(env)
+    assert got == [] and rec["edits"] == [["track:=10", 0, 1]] and "subtitle_audio_mismatch" in rec["reasons"], rec
+    assert "because KEEP_ORIGINALS_DAYS is 0, so the original could not be kept" in rec["alerts"][0], rec["alerts"]
+
+
+def test_a_retime_and_a_removal_share_one_remux(env, monkeypatch, tmp_path):
+    got = late_english_film(env, monkeypatch)
+    env["probe"] = sub_probe(("eng", False, {}), ("eng", False, {"track_name": "SDH"}), audio=(("eng", True),))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=2.0), "s2": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    hook.main([])
+    rec = decided(env)
+    (apply, fixes, drop), = got
+    assert apply and list(fixes) == [2] and drop == [3] and rec["subremux"]["codes"] == ["subtitle_retimed", "subtitle_mismatch_removed"], got
+
+
+def test_a_dry_run_backfill_with_sub_check_plans_the_removal(env, monkeypatch, tmp_path, capsys):
+    got = removal_film(env, monkeypatch, tmp_path)
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert got == [(False, {}, [2])] and env["mkvpropedit"] == []
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert got[1:] == [(True, {}, [2])], got
+
+
+def sidecar_film(env, monkeypatch, tmp_path, **names):
+    """An English film with no subtitle track and sidecars {name suffix: cues} beside it. Originals are kept under
+    tmp_path/.kept."""
+    env["probe"] = sub_probe(audio=(("eng", True),))
+    env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
+    for ext, cs in names.items():
+        with open(env["path"][:-4] + ext.replace("_", "."), "w") as f:
+            f.write(srt_text(cs))
+    hearing(env, monkeypatch, {})
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+
+
+def srt_text(cs):
+    t = lambda x: f"{int(x // 3600):02d}:{int(x // 60 % 60):02d}:{int(x % 60):02d},{round(x % 1 * 1000):03d}"
+    return "".join(f"{i}\n{t(a)} --> {t(b)}\n{text}\n\n" for i, (a, b, text) in enumerate(cs, 1))
+
+
+def test_a_sidecar_beside_an_mkv_that_does_not_match_moves_to_the_kept_originals(env, monkeypatch, tmp_path):
+    sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.OTHER), _en_forced_srt=talk.cues(talk.OTHER))
+    hook.main([])
+    rec = decided(env)
+    side = env["path"][:-4] + ".en.srt"
+    assert set(rec["subcheck"]) == {os.path.basename(side)}   # a forced sidecar is never checked
+    assert not os.path.exists(side) and os.path.exists(env["path"][:-4] + ".en.forced.srt")
+    (e,), = [rec["sidecars"]]
+    assert e["result"] == "moved" and e["kept"].startswith(str(tmp_path / ".kept")) and open(e["kept"]).read() == srt_text(talk.cues(talk.OTHER))
+    assert [r["result"] for r in log_lines(env) if r.get("path") == side] == ["sidecar moved"]
+    assert rec["alert_kinds"] == ["submatch"] and "Bazarr can download it again" in rec["alerts"][0]
+
+
+def test_a_late_sidecar_beside_an_mkv_is_written_again_and_its_original_kept(env, monkeypatch, tmp_path):
+    sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.RIGHT, offset=2.0))
+    side = env["path"][:-4] + ".en.srt"
+    os.chmod(side, 0o640)
+    hook.main([])
+    rec = decided(env)
+    (e,), = [rec["sidecars"]]
+    assert e["result"] == "retimed" and rec["alert_kinds"] == [], rec
+    assert open(e["kept"]).read() == srt_text(talk.cues(talk.RIGHT, offset=2.0))   # the kept link holds the old text
+    got = hook.srt_cues(open(side).read())
+    assert all(abs(a / 1000 - c[0]) <= 0.3 for (a, _, _), c in zip(got, talk.cues(talk.RIGHT))) and os.stat(side).st_mode & 0o777 == 0o640
+    assert not os.path.exists(os.path.join(os.path.dirname(side), hook.HIDE_DIR))   # the temp file and its folder are gone
+
+
+def test_a_sidecar_with_no_place_to_keep_its_original_stays(env, monkeypatch, tmp_path):
+    sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.OTHER))
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    hook.main([])
+    rec = decided(env)
+    assert rec["sidecars"][0]["result"] == "left" and os.path.exists(env["path"][:-4] + ".en.srt")
+    assert "It stays beside the file: KEEP_ORIGINALS_DAYS is 0" in rec["alerts"][0], rec["alerts"]
+
+
+def test_a_new_sidecar_undoes_the_backfill_skip(env, monkeypatch, tmp_path, capsys):
+    """A file with only a sidecar is taken by --sub-check. A sidecar Bazarr writes later makes the file new again."""
+    sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.RIGHT))
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr"])
+    assert "words" not in env   # one audio track and no subtitle track: the flag backfill leaves it out
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 1
+    with open(env["path"][:-4] + ".en.sdh.srt", "w") as f:
+        f.write(srt_text(talk.cues(talk.RIGHT)))
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 2
+
+
+def test_a_window_that_hears_too_little_gets_a_third_in_its_part(env, monkeypatch):
+    """Cost: a window that heard too little gets a longer window in the same part of the file, heard by arr_lid in the
+    same process, so the model loads once. A file whose windows hear enough pays nothing for it."""
+    track = talk.cues(talk.OTHER)
+    first = hook.arr_subsync.windows(track, talk.DURATION, hook.arr_decide.STOPWORDS["eng"])
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": track}, spoken=lambda i: not first[0] - 1 <= talk.FIRST + talk.GAP * i < first[0] + hook.arr_subsync.WINDOW)
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    (_, _, a), = env["words"]
+    (b,), = env["more"]
+    assert a == first and b + hook.arr_subsync.THIRD <= 0.25 * talk.DURATION, (a, b)
+    assert b + hook.arr_subsync.THIRD <= first[0] or b >= first[0] + hook.arr_subsync.WINDOW   # no overlap with the first
+    assert r["verdict"] == "mismatch" and len(r["windows"]) == 3 and r["starts"] == [[a, hook.arr_subsync.WINDOW]], r
+
+
+def test_no_third_window_when_both_windows_hear_too_little(env, monkeypatch):
+    """Two short windows and a third could never make two good ones, so the first hearing hears no third. The drift
+    hearing then tries where a far ratio would put the speech, and with too little speech there too, it stays unknown."""
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)}, spoken=lambda i: i % 5 == 0)
+    hook.main([])
+    assert env["more"][0] == [] and len(env["words"]) == 2 and decided(env)["subcheck"]["s1"]["verdict"] == "unknown"
+
+
+def test_the_windows_of_an_earlier_check_are_heard_again_as_they_were(env, monkeypatch):
+    """After a conversion the new file's check hears the same windows, so each hearing reads the words carried over."""
+    hearing(env, monkeypatch, {})
+    j = sub_probe(audio=(("eng", True),))
+    items = {"x": ("eng", 0, talk.cues(talk.OTHER))}
+    hook.sub_verdicts(env["path"], j, items, {0: [[[100.0, 1000.0], 10.0], [[150.0], 24.0]]})
+    assert [w for _, _, w in env["words"]] == [[100.0, 1000.0], [150.0]]
+
+
+def test_renumber_moves_the_later_tracks_up():
+    assert hook.renumber({"s1": "rum", "s3": "fre", "a1": "eng", "s4": "x"}, {"s2", "s4"}) == {"s1": "rum", "s2": "fre", "a1": "eng"}
+
+
+def test_the_verdict_cache_keeps_a_pending_action(tmp_path, monkeypatch):
+    """A verdict whose action no apply made yet does not skip the file, so an apply after a dry run still acts."""
+    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path))
+    path = str(tmp_path / "f.mkv")
+    open(path, "w").close()
+    assert not hook.sub_cached(path)
+    hook.sub_cache(path, {"s1": "mismatch"}, True)
+    assert not hook.sub_cached(path)
+    hook.sub_cache(path, {"s1": "mismatch"}, False)
+    assert hook.sub_cached(path)
+
+
+def test_decide_never_gives_the_default_to_an_unmatched_track():
+    """The unmatched role is in no policy list. An unmatched forced-flagged track loses the forced flag too."""
+    d = hook.arr_decide
+    j = sub_probe(("eng", True, {"forced_track": True}), ("eng", False, {"track_name": "SDH"}))
+    for t in j["tracks"]:
+        if t["type"] == "subtitles":
+            t["properties"]["tag_number_of_frames"] = "900"   # dense, so the forced flag reads as a full track
+    p = d.decide(j, "Japanese", unmatched={"s1"})
+    assert ["track:=10", 0, 1, d.FORCED_FLAG] in p["edits"] and ["track:=10", 0, 1] in p["edits"] and ["track:=11", 1, 0] in p["edits"], p
+    assert p["tracks"][2]["role"] == "unmatched" and not p["dropped"]
+
+
+@pytest.mark.parametrize("seconds, heard", [(hook.SUB_MIN_SECONDS - 1, False), (hook.SUB_MIN_SECONDS, True)])
+def test_a_short_file_is_never_heard(env, monkeypatch, seconds, heard):
+    """Two windows of a file under SUB_MIN_SECONDS sit too close for a timing fit. A file of SUB_MIN_SECONDS is heard."""
+    english_film(env, ("eng", False, {}))
+    env["probe"]["container"]["properties"]["duration"] = seconds * 10**9
+    env["movies"]["movie/7"]["runtime"] = 5
+    hearing(env, monkeypatch, {"s1": [(10.0 + 2 * i, 11.0 + 2 * i, talk.OTHER[i]) for i in range(140)]})
+    hook.main([])
+    assert ("words" in env) == heard, decided(env).get("subcheck")
+
+
+def test_props_fault_names_what_a_remux_lost():
+    j = sub_probe(("eng", False, {"language_ietf": "en-US"}))
+    j["attachments"] = [{"id": 1}]
+    assert hook.props_fault(j, copy.deepcopy(j)) is None
+    for change, why in ((lambda n: n["tracks"][3]["properties"].update(uid=99), "track 3 changed its uid"),
+                        (lambda n: n["tracks"][3]["properties"].pop("language_ietf"), "track 3 changed its language_ietf"),
+                        (lambda n: n["tracks"][3]["properties"].update(flag_hearing_impaired=True), "track 3 changed its flag_hearing_impaired"),
+                        (lambda n: n.update(attachments=[]), "the attachments changed from 1 to 0")):
+        new = copy.deepcopy(j)
+        change(new)
+        assert hook.props_fault(j, new) == why
+
+
+def test_srt_moved_moves_only_the_times():
+    text = "1\n00:00:01,000 --> 00:00:03,500\n<i>Mira</i>, open it.\n\n2\n00:01:00,250 --> 00:01:02,000\nNot yet.\n"
+    got = hook.srt_moved(text, {"rate": "1/1", "offset": 2.0})
+    assert got == "1\n00:00:00,000 --> 00:00:01,500\n<i>Mira</i>, open it.\n\n2\n00:00:58,250 --> 00:01:00,000\nNot yet.\n"
+
+
+def test_convert_subs_leaves_out_what_does_not_match(monkeypatch, tmp_path):
+    """A conversion: the sidecar that does not match moves into the kept originals and is not muxed, the late sidecar is
+    muxed from a copy with new times while its original is kept, and the built-in track that does not match is left
+    out of the remux."""
+    video = tmp_path / "media" / "Film A (1979).mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x")
+    srt = lambda cs: "".join(f"{i}\n{hook.arr_meta.hms(a).replace('.', ',')},000 --> {hook.arr_meta.hms(b).replace('.', ',')},000\n{t}\n\n"
+                             for i, (a, b, t) in enumerate(cs, 1))
+    for name, cs in (("Film A (1979).en.srt", talk.cues(talk.OTHER)), ("Film A (1979).en.sdh.srt", talk.cues(talk.RIGHT, offset=2.0)),
+                     ("Film A (1979).en.forced.srt", talk.cues(talk.OTHER))):   # a forced sidecar is never checked
+        (video.parent / name).write_text(srt([(round(a), round(b), t) for a, b, t in cs]))
+    subs = hook.sidecar_subs(str(video))
+    j = sub_probe(("eng", False, {}), audio=(("eng", True),))
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+               {"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"}]
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=srt([(1, 2, "Hello")] * 30), stderr=""))
+    verdicts = {"Film A (1979).en.srt": {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best", "timing": None},
+                "Film A (1979).en.sdh.srt": {"verdict": "match", "why": "", "timing": {"fix": {"rate": "1/1", "offset": 2.0}}},
+                "s1": {"verdict": "mismatch", "why": "the heard words match the cues at 0%, 3% at best", "timing": None}}
+    asked = []
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: asked.append(sorted(items)) or verdicts)
+    info = {}
+    keep, drop = hook.convert_subs(str(video), j, streams, subs, talk.DURATION, True, str(tmp_path), info)
+    assert asked == [sorted(verdicts)] and drop == [(2, 2)] and info["tracks_unmatched"] == ["s1"]
+    assert [s["name"] for s in keep] == ["Film A (1979).en.forced.srt", "Film A (1979).en.sdh.srt"] and keep[0].get("mux") is None
+    keep = keep[1:]
+    assert keep[0]["mux"].startswith(str(tmp_path)) and keep[0]["charset"] == "UTF-8"
+    assert not (video.parent / "Film A (1979).en.srt").exists() and info["sidecars_unmatched"][0]["moved"].startswith(str(tmp_path / ".kept"))
+    assert info["sidecars_kept"][0].endswith("Film A (1979).en.sdh.srt") and (video.parent / "Film A (1979).en.sdh.srt").exists()
+    assert open(keep[0]["mux"]).read().startswith("1\n00:01:00,000 --> 00:01:02,000\n")   # the first cue, at 62 s, moved 2 s earlier
+    argv = hook.convert_cmd(str(video), "/t.mkv", {"tracks": [{"id": 0}, {"id": 1}, {"id": 2}]}, keep, drop=[2])
+    assert argv[argv.index("--track-order") + 1] == "0:0,0:1,1:0" and argv[argv.index("-s") + 1] == "!2" and argv[-1] == keep[0]["mux"]
+    (video.parent / "Film A (1979).en.forced.srt").unlink()
+    # with no place to keep it, the unmatched sidecar stays beside the file and says why
+    (video.parent / "Film A (1979).en.srt").write_text(srt([(round(a), round(b), t) for a, b, t in talk.cues(talk.OTHER)]))
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    info = {}
+    hook.convert_subs(str(video), j, streams, hook.sidecar_subs(str(video)), talk.DURATION, True, str(tmp_path), info)
+    assert (video.parent / "Film A (1979).en.srt").exists() and info["sidecars_unmatched"][0]["left"] == "KEEP_ORIGINALS_DAYS is 0"
+
+
+@pytest.fixture(scope="module")
+def sync_mkv(tmp_path_factory):
+    """A Matroska file of 40 seconds with video, audio and one SubRip track of 18 cues, one every 2 seconds."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    d = tmp_path_factory.mktemp("sync")
+    with open(d / "s.srt", "w") as f:
+        f.write("".join(f"{i}\n00:00:{2 * i:02d},000 --> 00:00:{2 * i + 1:02d},500\n{talk.RIGHT[i]}\n\n" for i in range(1, 19)))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
+              "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "f.mkv"), str(d / "av.mp4"), "--language", "0:eng", str(d / "s.srt")], check=True)
+    return d
+
+
+def test_subtitle_cues_read_the_times_of_each_cue(sync_mkv):
+    path = str(sync_mkv / "f.mkv")
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert [(a, b) for a, b, _ in got] == [(2.0 * i, 2.0 * i + 1.5) for i in range(1, 19)] and got[0][2] == talk.RIGHT[1]
+
+
+@pytest.mark.parametrize("fix", [{"rate": "1/1", "offset": 1.0}, {"rate": "25025/24000", "offset": 0.0}])
+def test_resub_moves_the_track_and_proves_every_other_packet(sync_mkv, tmp_path, fix):
+    """A real remux: ffmpeg moves the cues by the fix, and the proof shows every video and audio packet the same. The
+    tracks keep their UIDs, so the flag edits of the plan still find them."""
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    j = REAL_MKVMERGE(path)
+    result, info = hook.resub(path, j, os.stat(path), True, {2: fix})
+    assert result == "subtitles remuxed", (result, info)
+    assert all(e["match"] for e in info["proof"]) and [e["stream"] for e in info["proof"]] == ["video 0", "audio 1", "subtitle 2"]
+    new = REAL_MKVMERGE(path)
+    assert [t["properties"]["uid"] for t in new["tracks"]] == [t["properties"]["uid"] for t in j["tracks"]]
+    got = hook.subtitle_cues(path, new, {"s1"})["s1"]
+    want = [hook.arr_subsync.moved(2000 * i, fix) / 1000 for i in range(1, 19)]
+    assert len(got) == len(want) and all(abs(a - max(0, w)) <= 0.002 for (a, _, _), w in zip(got, want)), (got[:3], want[:3])
+
+
+def test_the_proof_refuses_times_the_fix_does_not_explain(sync_mkv, tmp_path):
+    """The guard of the retime: the proof reads the moved track as moved only with the fix, and refuses a wrong fix."""
+    src, tmp = str(sync_mkv / "f.mkv"), str(tmp_path / "t.mkv")
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", src, "-itsoffset", "-1", "-i", src, "-map", "0:0", "-map", "0:1", "-map", "1:2", "-c", "copy", "-copyinkf",
+              tmp], check=True)
+    fix = {"rate": "1/1", "offset": 1.0}
+    assert hook.prove(src, tmp, [], str(tmp_path), retimed={0: fix})[0] is None
+    assert "subtitle 2" in hook.prove(src, tmp, [], str(tmp_path))[0]
+    assert "subtitle 2" in hook.prove(src, tmp, [], str(tmp_path), retimed={0: {"rate": "1/1", "offset": 0.5}})[0]
+
+
+def test_the_proof_leaves_out_a_dropped_track_only_when_asked(sync_mkv, tmp_path):
+    src, tmp = str(sync_mkv / "f.mkv"), str(tmp_path / "t.mkv")
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", src, "-map", "0:0", "-map", "0:1", "-c", "copy", "-copyinkf", tmp], check=True)
+    assert hook.prove(src, tmp, [], str(tmp_path), dropped={2})[0] is None
+    assert hook.prove(src, tmp, [], str(tmp_path))[0] == "the new file holds 0 subtitle streams, not 1"
+
+
+def test_resub_removes_one_track_and_retimes_another_in_one_remux(sync_mkv, tmp_path):
+    """A real remux of a file with two SubRip tracks: the first moves 1 s earlier, the second leaves the file. The
+    tracks that stay keep their UIDs and flags, the proof passes, and a removal keeps the original."""
+    src, path = str(sync_mkv / "f.mkv"), str(tmp_path / "two.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", path, src, "--language", "0:eng", "--track-name", "0:Other", str(sync_mkv / "s.srt")], check=True)
+    j = REAL_MKVMERGE(path)
+    fix = {"rate": "1/1", "offset": 1.0}
+    old = hook.KEEP_DAYS, hook.originals_root
+    hook.KEEP_DAYS, hook.originals_root = 7, lambda p: str(tmp_path / ".kept")
+    try:
+        result, info = hook.resub(path, j, os.stat(path), True, {2: fix}, [3])
+    finally:
+        hook.KEEP_DAYS, hook.originals_root = old
+    assert result == "subtitles remuxed", (result, info)
+    assert [e["stream"] for e in info["proof"]] == ["video 0", "audio 1", "subtitle 2"] and all(e["match"] for e in info["proof"])
+    new = REAL_MKVMERGE(path)
+    assert [t["properties"]["uid"] for t in new["tracks"]] == [t["properties"]["uid"] for t in j["tracks"][:3]]
+    assert info["kept"].startswith(str(tmp_path / ".kept")) and REAL_MKVMERGE(info["kept"])["tracks"][3]["properties"]["track_name"] == "Other"
+    got = hook.subtitle_cues(path, new, {"s1"})["s1"]
+    assert [round(a, 2) for a, _, _ in got[:2]] == [1.0, 3.0]
+
+
+def test_a_translated_subtitle_beside_a_dub_is_never_removed(env, monkeypatch, tmp_path):
+    """A Japanese series with Japanese audio and an English dub. The English subtitle translates the Japanese, so its
+    words differ from the dub's. A mismatch there is only unknown: no removal, no flag change, no alert. The same
+    holds for a sidecar beside it. A match still counts."""
+    japanese_film(env, ("eng", True, {}), ("eng", False, {"track_name": "SDH"}))
+    with open(env["path"][:-4] + ".en.srt", "w") as f:
+        f.write(srt_text(talk.cues(talk.OTHER)))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER), "s2": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: pytest.fail("a translated subtitle must never be removed"))
+    hook.main([])
+    rec = decided(env)
+    side = os.path.basename(env["path"][:-4] + ".en.srt")
+    assert [rec["subcheck"][k]["verdict"] for k in ("s1", "s2", side)] == ["unknown", "match", "unknown"], rec["subcheck"]
+    assert rec["subcheck"]["s1"]["why"].endswith(", but the original language is jpn, and the subtitle may translate it")
+    assert rec["subcheck"]["s1"]["held"] and "sidecars" not in rec and os.path.exists(env["path"][:-4] + ".en.srt")
+    assert "submatch" not in rec["alert_kinds"] and "subtitle_audio_mismatch" not in rec["reasons"]
+
+
+def test_a_dub_only_file_of_a_foreign_original_never_loses_a_subtitle(env, monkeypatch):
+    """A Japanese film that carries only its English dub. The English subtitle may translate the Japanese original,
+    so a mismatch is only unknown. Near miss: the same file as an English original keeps its mismatch."""
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Japanese"}
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    assert r["verdict"] == "unknown" and r["why"].endswith(", but the original language is jpn, and the subtitle may translate it"), r
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "English"}
+    os.utime(env["path"], ns=(time.time_ns(), os.stat(env["path"]).st_mtime_ns + 10**9))
+    hook.main([])
+    assert [r for r in log_lines(env) if r.get("outcome")][-1]["subcheck"]["s1"]["verdict"] == "mismatch"
+
+
+def test_sub_hold_takes_the_original_first_and_the_other_audio_only_without_one():
+    ts = lambda *audio: hook.arr_decide.classify(sub_probe(audio=[(a, i == 0) for i, a in enumerate(audio)]))
+    assert hook.sub_hold(ts("eng", "spa"), {"eng"}, "eng") is None   # an English original with a Spanish dub
+    assert hook.sub_hold(ts("jpn", "eng"), {"jpn", "jap"}, "eng").startswith("the original language is jpn")
+    assert hook.sub_hold(ts("eng"), {"jpn", "jap"}, "eng").startswith("the original language is jpn")   # a dub-only file
+    assert hook.sub_hold(ts("jpn", "eng"), set(), "eng").startswith("no original language is known, and the file also carries jpn audio")
+    assert hook.sub_hold(ts("eng"), set(), "eng") is None and hook.sub_hold(ts("eng", "und"), set(), "eng") is None
+
+
+def guarded_film(env, monkeypatch, original, audio):
+    """A film of original language original with the audio tracks audio and one English subtitle of another episode."""
+    env["movies"]["movie/7"].update(originalLanguage={"name": original}, runtime=round(talk.DURATION / 60))
+    env["probe"] = sub_probe(("eng", False, {}), audio=[(a, i == 0) for i, a in enumerate(audio)])
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    hook.main([])
+    return decided(env)["subcheck"]["s1"]
+
+
+def test_an_english_original_with_a_spanish_dub_keeps_its_mismatch(env, monkeypatch):
+    r = guarded_film(env, monkeypatch, "English", ("eng", "spa"))
+    assert r["verdict"] == "mismatch" and "held" not in r, r
+
+
+def test_an_unknown_original_with_two_audio_languages_holds_the_mismatch(env, monkeypatch):
+    r = guarded_film(env, monkeypatch, "Unknown", ("jpn", "eng"))
+    assert r["verdict"] == "unknown" and r["held"] and "no original language is known" in r["why"], r
+
+
+def test_an_unknown_original_with_one_audio_language_keeps_its_mismatch(env, monkeypatch):
+    r = guarded_film(env, monkeypatch, "Unknown", ("eng",))
+    assert r["verdict"] == "mismatch", r
+
+
+def test_a_conversion_keeps_a_translated_sidecar(monkeypatch, tmp_path):
+    """The guard holds in a conversion too: a mismatch of a dub-only foreign original is unknown, so the sidecar is
+    muxed and stays."""
+    video = tmp_path / "Film A (1979).mp4"
+    video.write_bytes(b"x")
+    (tmp_path / "Film A (1979).en.srt").write_text(srt_text(talk.cues(talk.OTHER)))
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: {k: {"verdict": "mismatch", "why": "5%", "timing": None} for k in items})
+    subs, info = hook.sidecar_subs(str(video)), {}
+    keep, drop = hook.convert_subs(str(video), sub_probe(audio=(("eng", True),)), [], subs, talk.DURATION, True, str(tmp_path), info, {"jpn", "jap"})
+    assert [s["name"] for s in keep] == ["Film A (1979).en.srt"] and drop == [] and "sidecars_unmatched" not in info
+    assert info["subcheck"]["Film A (1979).en.srt"]["verdict"] == "unknown"
+
+
+def test_a_conversion_that_leaves_a_track_out_keeps_the_original(env, monkeypatch):
+    """A track that leaves the file comes back only from the kept original, so the conversion keeps it, as a forced
+    one does. The alert names where it is."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    folder = os.path.dirname(mkv)
+    root = os.path.join(os.path.dirname(os.path.dirname(folder)), hook.KEEP_DIR)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: root)
+
+    def left_out(path, j, streams, subs, dur, apply, folder, info, known=()):
+        info.update(subcheck={"s1": {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best"}}, tracks_unmatched=["s1"])
+        return subs, [(2, 2)]
+    monkeypatch.setattr(hook, "convert_subs", left_out)
+    monkeypatch.setattr(hook, "sub_on", lambda source, sub_check=False: True)
+    hook.main([])
+    rec = decided(env)
+    remux = env["repacks"][0]
+    assert remux[remux.index("-s") + 1] == "!2" and rec["repack"]["kept"].startswith(root + "/") and os.path.exists(rec["repack"]["kept"])
+    assert "The conversion left it out, and the original file is kept at " + rec["repack"]["kept"] in " ".join(rec["alerts"]), rec["alerts"]
+
+
+def test_a_conversion_with_no_place_to_keep_the_original_keeps_the_track(monkeypatch, tmp_path):
+    """With KEEP_ORIGINALS_DAYS 0 the track stays in, and the new file's check turns its flags off."""
+    video = tmp_path / "Film A (1979).mp4"
+    video.write_bytes(b"x")
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+               {"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"}, {"index": 3, "codec_type": "subtitle", "codec_name": "mov_text"}]
+    j = sub_probe(("eng", False, {}), ("eng", False, {"track_name": "Commentary"}), audio=(("eng", True),))
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=srt_text([(1, 2, "Hello")] * 30), stderr=""))
+    asked = []
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: asked.append(sorted(items)) or
+                        {k: {"verdict": "mismatch", "why": "5%", "timing": None} for k in items})
+    for days, drop in ((0, []), (7, [(2, 2)])):
+        monkeypatch.setattr(hook, "KEEP_DAYS", days)
+        info = {}
+        assert hook.convert_subs(str(video), j, streams, [], talk.DURATION, True, str(tmp_path), info)[1] == drop, info
+        assert info["tracks_unmatched"] == ["s1"] and ("tracks_kept_back" in info) == (days == 0)
+    assert asked == [["s1"], ["s1"]]   # the commentary track is never checked
+
+
+def test_a_conversion_asks_with_the_original_language(env, monkeypatch):
+    """convert() passes the item's original language to the check, so a Japanese original holds a mismatch that its
+    English dub gives, see sub_hold()."""
+    mp4_import(env, monkeypatch, sidecars=())
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Japanese"}
+    seen = []
+    monkeypatch.setattr(hook, "convert_subs", lambda *a: seen.append(set(a[8])) or (a[3], []))
+    monkeypatch.setattr(hook, "sub_on", lambda source, sub_check=False: True)
+    hook.main([])
+    assert seen == [hook.arr_decide.codes("Japanese")], seen
+
+
+def test_sub_audio_takes_main_tagged_tracks_and_the_one_that_plays():
+    ts = hook.arr_decide.classify(sub_probe(audio=(("eng", False), ("eng", True), ("spa", False), ("und", False))))
+    assert hook.sub_audio(ts) == {"eng": 1, "spa": 2}   # the default English track, and no und track
+    j = sub_probe(audio=(("eng", True), ("eng", False)))
+    j["tracks"][2]["properties"]["track_name"] = "Commentary"
+    assert hook.sub_audio(hook.arr_decide.classify(j)) == {"eng": 0}
+    j = sub_probe(audio=(("eng", False), ("fre", True)))
+    j["tracks"][1]["properties"]["track_name"] = "Commentary"   # the only English track is commentary
+    assert hook.sub_audio(hook.arr_decide.classify(j)) == {"fra": 1}
+
+
+def test_a_retime_keeps_the_mismatch_of_a_track_that_stays(env, monkeypatch):
+    """KEEP_ORIGINALS_DAYS 0: the remux retimes s1, and s2 does not match. s2 stays in the file, loses its flags and
+    keeps its alert, and the verdict cache marks nothing done that is not."""
+    got = late_english_film(env, monkeypatch)
+    env["probe"] = sub_probe(("eng", False, {}), ("eng", True, {"track_name": "SDH"}), audio=(("eng", True),))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=2.0), "s2": talk.cues(talk.OTHER)})
+    hook.main([])
+    rec = decided(env)
+    (apply, fixes, drop), = got
+    assert apply and list(fixes) == [2] and drop == [] and rec["subremux"]["codes"] == ["subtitle_retimed"], got
+    assert "subtitle_audio_mismatch" in rec["reasons"] and rec["alert_kinds"] == ["submatch"], rec
+    assert "Subtitle track s2 does not match the audio" in rec["alerts"][0] and "KEEP_ORIGINALS_DAYS is 0" in rec["alerts"][0]
+
+
+def test_a_removal_moves_the_read_language_of_a_later_track(env, monkeypatch, tmp_path):
+    """After s1 leaves the file, s2 is s1. Its read language moves with it, so the Romanian text tagged English still
+    loses its flags."""
+    got = removal_film(env, monkeypatch, tmp_path)
+    env["probe"] = sub_probe(("eng", False, {}), ("eng", True, {"forced_track": True, "track_name": "Forced"}), audio=(("eng", True),))
+    monkeypatch.setattr(hook, "subtitle_read", lambda path, j, want: {"s2": ("rum", 0.97, "97% rum")} if "s2" in want else {})
+    hook.main([])
+    rec = decided(env)
+    assert got == [(True, {}, [2])] and rec["edits"] == [["track:=11", 0, 1], ["track:=11", 0, 1, hook.arr_decide.FORCED_FLAG]], rec
+    assert "subtitle_text_muted" in rec["reasons"]
+
+
+def test_a_flags_off_fallback_counts_as_pending_until_applied(env, monkeypatch, capsys):
+    """KEEP_ORIGINALS_DAYS 0: a dry run plans the flags off, so its verdict asks for an action and the next run checks
+    again. After the apply the file is done, and the next run skips it."""
+    english_film(env, ("eng", True, {}), ("eng", False, {"track_name": "SDH"}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER), "s2": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert not hook.sub_cached(env["path"])
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert [r for r in log_lines(env) if r.get("outcome")][-1]["outcome"] == "edited" and hook.sub_cached(env["path"])
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert len(env["words"]) == 2 and '"subtitles checked before": 1' in capsys.readouterr().out
+
+
+def test_a_cue_moved_before_0_starts_at_0_and_no_stream_moves(sync_mkv, tmp_path):
+    """A fix of 3 s moves the first cue, at 2 s, to -1 s. It starts at 0, as srt_moved() does, and the video and the
+    audio keep their start times. A negative time would make ffmpeg move every stream."""
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    j = REAL_MKVMERGE(path)
+    starts = {x["index"]: float(x.get("start_time") or 0) for x in hook.ff_streams(path)[1]}
+    result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": 3.0}})
+    assert result == "subtitles remuxed", (result, info)
+    assert {x["index"]: float(x.get("start_time") or 0) for x in hook.ff_streams(path)[1] if x["codec_type"] != "subtitle"} == \
+        {i: t for i, t in starts.items() if i != 2}
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert [(round(a, 2), round(b, 2)) for a, b, _ in got[:3]] == [(0.0, 0.5), (1.0, 2.5), (3.0, 4.5)], got[:3]
+
+
+def test_the_proof_refuses_a_remux_that_moved_every_stream(sync_mkv, tmp_path):
+    """Every stream 4 s later keeps each start against the video's. Only the absolute check sees it."""
+    src, tmp = str(sync_mkv / "f.mkv"), str(tmp_path / "t.mkv")
+    REAL_RUN(["ffmpeg", "-v", "error", "-itsoffset", "4", "-i", src, "-map", "0", "-c", "copy", "-copyinkf", tmp], check=True)
+    assert hook.prove(src, tmp, [], str(tmp_path))[0] is None
+    assert "starts at 4." in hook.prove(src, tmp, [], str(tmp_path), absolute=True)[0]
+
+
+def test_resub_keeps_the_owner_and_mode_and_refuses_a_changed_original(sync_mkv, tmp_path, monkeypatch):
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    os.chmod(path, 0o640)
+    owned = []
+    monkeypatch.setattr(hook.os, "chown", lambda p, uid, gid: owned.append((uid, gid)))
+    st = os.stat(path)
+    assert hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})[0] == "subtitles remuxed"
+    assert owned == [(st.st_uid, st.st_gid)] and os.stat(path).st_mode & 0o7777 == 0o640
+    # the app replaces the original while the remux runs: the original stays and the temp file goes
+    st, real = os.stat(path), hook.mkvmerge
+    monkeypatch.setattr(hook, "mkvmerge", lambda p: (os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9)), real(p))[1])
+    result, _ = hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert result.startswith("subtitle remux failed, the original changed: ") and os.stat(path).st_ino == st.st_ino
+    assert not os.path.exists(os.path.join(tmp_path, hook.HIDE_DIR))
+
+
+def test_limit_counts_a_remux_that_would_run(env, monkeypatch, tmp_path):
+    """--limit stops after N files that need a change. A subtitle remux that a dry run would make is one."""
+    got = late_english_film(env, monkeypatch)
+    other = tmp_path / "media" / "Other.mkv"
+    shutil.copy(env["path"], other)
+    env["files"][str(other)] = copy.deepcopy(env["probe"])
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=i, title=f"Film {i}", movieFile={"id": i, "path": p})
+                              for i, p in ((7, env["path"]), (8, str(other)))]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--sub-check", "--limit", "1"])
+    assert len(got) == 1 and got[0][0] is False, got
+
+
+def test_paths_refuses_a_scan(env, monkeypatch):
+    for scan in ("--check-audio", "--check-video"):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--backfill", "radarr", scan, "--paths", env["path"]])
+        assert ex.value.code == 2
+
+
+def test_a_language_check_runs_the_subtitle_hearings_with_its_model(env, monkeypatch, tmp_path):
+    """The file's audio tag is in doubt, so the language check runs. It gets a file of the subtitle check's hearings,
+    with the cues of the English track, so the model loads once. The file is gone afterwards."""
+    env["movies"]["movie/7"].update(originalLanguage={"name": "Spanish"}, runtime=round(talk.DURATION / 60))
+    env["probe"] = sub_probe(("eng", False, {}), audio=(("eng", True),))
+    env["probe"]["tracks"][1]["properties"]["language_ietf"] = "es"   # the two tags disagree, so the language check runs
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want: {"s1": talk.cues(talk.RIGHT)} if "s1" in want else {})
+    seen = []
+
+    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None):
+        if then:
+            with open(then) as f:
+                seen.append((keep, json.load(f)))
+        return {"why": "no answer in these tests"}
+    monkeypatch.setattr(hook, "lid_run", fake_lid_run)
+    hook.main([])
+    (keep, jobs), = seen
+    assert keep and [(x["index"], x["lang"], len(x["cues"]), x["duration"]) for x in jobs] == [(0, "eng", talk.LINES, talk.DURATION)], jobs
+    assert not [n for n in os.listdir(hook.CFG["STATE_DIR"]) if n.startswith("subjobs-")]
+
+
+@pytest.mark.parametrize("rate", [Fraction(25025, 24000), Fraction(24000, 25025)])
+@pytest.mark.parametrize("chant", [False, True])
+def test_a_ratio_hears_a_middle_window_where_its_speech_is(env, monkeypatch, rate, chant):
+    """A subtitle timed for another frame rate: its cues drift 4 percent from the audio. The first hearing asks for a
+    middle window near the centre between its windows. The densest cues there lie at cue times, and the fix to confirm
+    puts their speech many seconds away in the audio, where the check hears it. When Whisper hears nothing there, as
+    on a chant it drops, a window of THIRD seconds elsewhere in that part is heard in the same hearing. The windows
+    then carry the fix."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    english_film(env, ("eng", False, {}))
+    track = talk.cues(talk.RIGHT, rate=rate)
+    confirm = S.check(talk.heard(S.windows(track, talk.DURATION, stop)), track, "eng", talk.DURATION)["timing"]["confirm"]
+    audio_mid = S.moved(S.windows(track, talk.DURATION, stop, parts=S.middle(confirm, talk.DURATION))[0] * 1000, confirm) / 1000
+    quiet = lambda i: not (chant and audio_mid - 1 <= talk.FIRST + talk.GAP * i < audio_mid + S.WINDOW)
+    hearing(env, monkeypatch, {"s1": track}, spoken=quiet)
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    (_, _, first), (_, _, mid) = env["words"]
+    assert len(first) == 2 and mid == [pytest.approx(audio_mid, abs=0.1)], (first, mid, audio_mid)
+    assert 0.4 <= (mid[0] - first[0]) / (first[1] - first[0]) <= 0.6, (first, mid)
+    assert bool(env["more"][1]) == chant, env["more"]   # the window of THIRD seconds, heard only when the first hears too little
+    assert Fraction(r["timing"]["fix"]["rate"]) == rate and len(r["starts"]) == 2 and list(got[0].values())[0]["rate"] == r["timing"]["fix"]["rate"], r
+
+
+def test_resub_holds_every_stream_to_its_own_start(sync_mkv, tmp_path, monkeypatch):
+    """The remux must move no stream, so resub() asks the proof for the absolute start check."""
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    asked, real = [], hook.prove
+    monkeypatch.setattr(hook, "prove", lambda *a, **k: asked.append(k) or real(*a, **k))
+    assert hook.resub(path, REAL_MKVMERGE(path), os.stat(path), True, {2: {"rate": "1/1", "offset": 1.0}})[0] == "subtitles remuxed"
+    assert asked[0]["absolute"] is True and asked[0]["retimed"] == {0: {"rate": "1/1", "offset": 1.0}}
+
+
+def test_a_retime_before_0_fails_the_proof_when_the_audio_has_a_codec_delay(sync_mkv, tmp_path):
+    """ffmpeg writes AAC into Matroska with a codec delay. A fix that moves the first cue before 0 starts it at 0, and
+    the later cues then move by that delay. The proof refuses the remux, and the file stays as it was. A fix that moves
+    no cue before 0 passes."""
+    av, path = tmp_path / "av.mkv", str(tmp_path / "f.mkv")
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(sync_mkv / "av.mp4"), "-c:v", "copy", "-c:a", "aac", str(av)], check=True)
+    REAL_RUN(["mkvmerge", "-q", "-o", path, str(av), "--language", "0:eng", str(sync_mkv / "s.srt")], check=True)
+    j, st = REAL_MKVMERGE(path), os.stat(path)
+    assert j["tracks"][1]["properties"].get("codec_delay"), j["tracks"][1]
+    result = hook.resub(path, j, st, True, {2: {"rate": "1/1", "offset": 3.0}})[0]
+    assert result.startswith("subtitle remux failed") and "moved" in result and os.stat(path).st_ino == st.st_ino, result
+    assert hook.resub(path, j, st, True, {2: {"rate": "1/1", "offset": 1.0}})[0] == "subtitles remuxed"
+
+
+def silent_late_windows(track):
+    """spoken() for hearing(): no speech in the audio where the first hearing's late window and its third window lie,
+    as a far drift can leave it."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    first = S.windows(sorted(track), talk.DURATION, stop)
+    late = (first[1], S.windows(sorted(track), talk.DURATION, stop, secs=S.THIRD, taken=first)[1])
+    return lambda i: not any(a - 3 <= talk.FIRST + talk.GAP * i < a + S.THIRD for a in late)
+
+
+def test_a_far_drift_hears_where_the_ratio_puts_the_speech(env, monkeypatch):
+    """A 25 fps subtitle on a 23.976 video, and no speech where the late windows of the first hearing lie. The drift
+    hearing hears where each far ratio puts the speech of the densest late cues. Those windows match, a middle window
+    confirms the ratio, and the track gets its fix."""
+    rate = Fraction(24000, 25025)
+    english_film(env, ("eng", False, {}))
+    track = talk.cues(talk.RIGHT, rate=rate)
+    hearing(env, monkeypatch, {"s1": track}, spoken=silent_late_windows(track))
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    assert [len(ws) for _, _, ws in env["words"]] == [2, 2, 1], env["words"]   # the first hearing, the drift hearing, the middle
+    assert r["verdict"] == "match" and Fraction(r["timing"]["fix"]["rate"]) == rate and got, r
+
+
+def test_only_the_first_hearing_names_a_mismatch(env, monkeypatch):
+    """Near miss: a track with none of the audio's words, and no speech where the late windows of the first
+    hearing lie. The drift windows read a mismatch, but a window away from the densest cues is no proof, so the verdict stays
+    unknown and the track stays."""
+    english_film(env, ("eng", False, {}))
+    track = talk.cues([f"zz{i}a zz{i}b zz{i}c zz{i}d" for i in range(talk.LINES)])
+    hearing(env, monkeypatch, {"s1": track}, spoken=silent_late_windows(track))
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: got.append(a) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    assert len(env["words"]) == 2 and r["verdict"] == "unknown" and "only in windows heard after the first" in r["why"] and not got, r
+
+
+def test_a_window_with_too_few_matched_cues_hears_a_longer_window(env, monkeypatch):
+    """A track 2 s late, and only two whole lines in the early window: two anchors, under MIN_CUES. A window of THIRD
+    seconds around it holds more lines, and the track gets its fix."""
+    english_film(env, ("eng", False, {}))
+    track = talk.cues(talk.RIGHT, offset=2.0)
+    early = hook.arr_subsync.windows(sorted(track), talk.DURATION, hook.arr_decide.STOPWORDS["eng"])[0]
+    inside = [i for i in range(talk.LINES) if early <= talk.FIRST + talk.GAP * i < early + hook.arr_subsync.WINDOW]
+    hearing(env, monkeypatch, {"s1": track}, spoken=lambda i: i not in inside[2:])
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    r = decided(env)["subcheck"]["s1"]
+    assert [ws for _, _, ws in env["words"]][1] == [round(early - (hook.arr_subsync.THIRD - hook.arr_subsync.WINDOW) / 2, 1)], env["words"]
+    assert r["timing"]["fix"] and r["timing"]["fix"]["rate"] == "1/1" and abs(r["timing"]["fix"]["offset"] - 2.0) < 0.1, r
+
+
+@pytest.mark.parametrize("step, alerts", [(0.99, False), (1.0, True)])
+def test_a_piecewise_step_under_a_second_goes_to_the_report_only(step, alerts, monkeypatch):
+    """The windows of a right track can differ by most of a second. A piecewise result alerts only from STEP_ALERT, 1 s,
+    on. Below that the backfill report still names it, and it never gets a fix."""
+    t = {"fix": None, "piecewise": True, "offsets": [0.23, round(0.23 + step, 2)], "why": "the cues are off, which no frame-rate ratio explains"}
+    sync = {"s1": {"verdict": "match", "why": "the heard words match", "windows": [], "timing": t}}
+    assert [k for k, _ in hook.sub_alerts({}, sync, [])] == (["subtiming"] if alerts else [])
+    assert "times stay: the cues are off" in hook.sub_text({"subcheck": sync})

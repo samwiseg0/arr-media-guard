@@ -17,7 +17,8 @@
 """arr-media-guard: set the default audio and subtitle tracks of an imported mkv, and flag broken files.
 
   arr-media-guard                     run by Sonarr or Radarr as a CustomScript connection
-  arr-media-guard --backfill <radarr|sonarr> [--apply] [--ids ID ...] [--limit N] [--plan-out FILE] [--workers N]
+  arr-media-guard --backfill <radarr|sonarr> [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--plan-out FILE] [--workers N]
+  arr-media-guard --backfill <radarr|sonarr> --sub-check [--apply] [--ids ID ...] [--paths PATH ...]
   arr-media-guard --backfill <radarr|sonarr> --apply --plan-from FILE [--canary N]
   arr-media-guard --backfill <radarr|sonarr> --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
   arr-media-guard --backfill <radarr|sonarr> --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]
@@ -60,6 +61,12 @@ a re-grab, the worker re-grabs the download the way it does for broken audio. It
 asks TMDB again, past both caches. That needs WRONG_CONTENT_REGRAB in the env file. Until then it logs and posts
 "would re-grab" and deletes nothing. The outcome names what happened: would_regrab only when every guard passed.
 status.json records the TMDB and policy checks for Zabbix.
+
+Each text subtitle and .srt sidecar in the language of a main audio track is checked against the audio, see
+docs/design.md, "Subtitle match". arr_lid.py hears two short windows, and arr_subsync.py compares the words with the
+cues. A track that does not match leaves the file in a remux that the packet proof checks, or loses its flags when the
+remux fails. A sidecar that does not match moves to KEEP_DIR, or stays out of a conversion. A subtitle off by an offset
+or a frame-rate ratio gets new times. The check runs on imports, and a backfill runs it only with --sub-check.
 
 The worker also checks the audio track that will play, in three 20-second samples. A certain fault
 (no audio track, silence or decode errors in all three samples, or no audio in the late sample)
@@ -110,7 +117,7 @@ Every file the hook, a backfill, the audio scan or an audit probe looks at gets 
 and a one-line logfmt summary goes to syslog with the tag arr-media-guard. See docs/design.md, "Logs".
 See docs/design.md, "How it runs", for the queue, the job processes and the locks.
 """
-import argparse, array, calendar, collections, concurrent.futures, contextlib, datetime, fcntl, hashlib, json, os, re, select, shutil, signal
+import argparse, array, calendar, collections, concurrent.futures, contextlib, datetime, fcntl, fractions, hashlib, json, os, re, select, shutil, signal
 import sqlite3, subprocess, sys, syslog, tempfile, threading, time, traceback, types, uuid
 import urllib.error, urllib.parse, urllib.request, zlib
 
@@ -120,18 +127,19 @@ sys.path.insert(0, os.environ.get("ARR_MEDIA_GUARD_LIB") or os.path.dirname(os.p
 import arr_decide  # noqa: E402
 import arr_meta  # noqa: E402
 import arr_status  # noqa: E402
+import arr_subsync  # noqa: E402
 
 ENV_FILE = os.environ.get("ARR_MEDIA_GUARD_ENV", "/etc/arr-media-guard.env")
 BUDGET = 300          # seconds a hook run may take from the lock to mkvpropedit
 LOCK_WAIT = 3600      # seconds a hook waits for the lock, so a holder stuck on the NAS never blocks later imports forever
 APPS = {"radarr": (7878, "/var/lib/radarr/config.xml"), "sonarr": (8989, "/var/lib/sonarr/config.xml")}
 SECRETS = ("PLEX_TOKEN", "DISCORD_WEBHOOK", "TMDB_TOKEN")
-LIB = ("arr_decide.py", "arr_meta.py", "arr_status.py", "arr_subhunt.py", "arr_lid.py")   # the modules beside arr_decide.py
+LIB = ("arr_decide.py", "arr_meta.py", "arr_status.py", "arr_subhunt.py", "arr_lid.py", "arr_subsync.py")   # the modules beside arr_decide.py
 COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-grab fault. amber: other alerts. green: a clean scan.
 TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": "Broken duration header", "edit": "Flag edit failed",
           "policy": "Policy did not load", "content": "Wrong content", "repack": "Repack failed", "video": "Video check uncertain",
           "header": "Header repair failed", "subtitle": "Subtitle runs past the end", "cut": "File may be cut",
-          "sublang": "Subtitle language"}
+          "sublang": "Subtitle language", "submatch": "Wrong subtitle", "subtiming": "Subtitle timing"}
 # the alert kinds that come with a re-grab action
 CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
 WOULD = "A re-grab would delete"   # the start of the action while WRONG_CONTENT_REGRAB is off
@@ -168,6 +176,8 @@ TEXT_CODECS = ("S_TEXT/UTF8", "S_TEXT/ASS", "S_TEXT/SSA")   # subtitle codecs wh
 TEXT_CUES = 200                       # blocks subtitle_read() reads at most per track
 TEXT_BLOCK = 64 << 10                 # bytes of one subtitle block it reads at most
 TEXT_AHEAD = 16                       # blocks whose reads it starts at once
+SUB_CODECS = TEXT_CODECS + ("S_TEXT/WEBVTT",)   # the text subtitle codecs the subtitle match check reads
+CUE_MAX = 5000                        # blocks subtitle_cues() reads at most per track. A film holds about 1,500.
 SUB_MAX = 1800                        # seconds subtitle_ends() may take with no time limit, as in a scan or a backfill
 SUB_RESERVE = 150                     # seconds of the job's time limit it leaves for the zero probe and the windows
 LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_language", "audio_untagged_or_missing"}   # reason codes
@@ -196,11 +206,20 @@ WRONG_CONTENT_REGRAB = CFG.get("WRONG_CONTENT_REGRAB", "").lower() == "true"   #
 DAMAGE_REGRAB = CFG.get("DAMAGE_REGRAB", "true").lower() != "false"   # off: a conversion that shows a damaged source only alerts
 REPACK_MAX = float(CFG.get("REPACK_MAX_GB") or 30) * 1e9   # a larger file that is not Matroska is logged and skipped. A header repair too.
 HEADER_REPAIR = CFG.get("HEADER_REPAIR", "true").lower() != "false"   # off: a header issue is logged and never remuxed
+SUB_CHECK = CFG.get("SUB_CHECK", "true").lower() != "false"     # the subtitle match check of an import, docs/design.md, "Subtitle match"
+SUB_TIMING = CFG.get("SUB_TIMING", "true").lower() != "false"   # off: a subtitle whose times need a fix only alerts
+SUB_TIMEOUT = 90       # seconds the subtitle check may hear one file, the model load included
+SUB_MIN_SECONDS = 300  # a shorter file is never checked: its two windows would sit too close for a timing fit
+STEP_ALERT = 1.0       # seconds the windows of a piecewise result must differ by to alert. A smaller step goes to the log only.
+SUB_ROLES = ("full", "sdh", "dub")   # the subtitle roles the check takes. A forced or commentary track is never checked.
+# Languages written with no spaces between words. Their cue text reads as one long word, so the check can give no
+# verdict and never hears them.
+NO_SPACES = frozenset({"jpn", "chi", "tha"})
 try:   # days a repack keeps the original it replaced, see keep_original(). 0 drops it.
     KEEP_DAYS = max(0, int(CFG.get("KEEP_ORIGINALS_DAYS", "7") or 0))
 except ValueError:
     KEEP_DAYS = 7
-REPAIRED = ("header_repaired", "subtitle_trimmed", "subtitle_removed", "tail_removed")   # the reason codes of a remux that replaced the file
+REPAIRED = ("header_repaired", "subtitle_trimmed", "subtitle_removed", "tail_removed", "subtitle_retimed", "subtitle_mismatch_removed")   # the reason codes of a remux that replaced the file
 # The reason code of each header step result, longest prefix first
 HEADER_CODES = (("header repair skipped", "header_repair_skipped"), ("header repair failed", "header_repair_failed"),
                 ("would repair header", "would_repair_header"), ("header repaired", "header_repaired"), ("subtitles trimmed", "subtitle_trimmed"),
@@ -1343,21 +1362,42 @@ def subtitle_ends(path, j, timeout, limit=None, lines=None):
 
 def subtitle_read(path, j, want):
     """{track position: text_language() of its text} for the text subtitle tracks of a Matroska file at the positions in
-    want (docs/design.md, "Subtitle text"). j is its mkvmerge -J probe. mkvmerge and ffmpeg index every subtitle block
-    in the Cues, so the read takes the Cues and then each block by its index entry, one small read each. It stops at
-    text_language()'s verdict or after TEXT_CUES blocks, and it never reads a Cluster in full. A picture track, a track
-    with a content encoding other than zlib, and a track the Cues do not index get no entry. A failure keeps what was
-    read. The job's time limit passes."""
+    want (docs/design.md, "Subtitle text"). j is its mkvmerge -J probe. It stops at text_language()'s verdict or after
+    TEXT_CUES blocks, see subtitle_blocks(). A track the read cannot take gets no entry, or a reason. A failure keeps
+    what was read. The job's time limit passes."""
+    return subtitle_blocks(path, j, want, TEXT_CODECS, TEXT_CUES, lambda blocks: arr_decide.text_language(t for _, _, t in blocks),
+                           lambda why: (None, 0.0, why))
+
+
+def subtitle_cues(path, j, want):
+    """{track position: [(start, end, text)] in seconds} of every cue of the text subtitle tracks at the positions in
+    want, for the subtitle match check (docs/design.md, "Subtitle match"). SubRip, ASS, SSA and WebVTT tracks. A cue
+    with no BlockDuration ends at the next cue, 5 seconds at most. A track the read cannot take gets no entry."""
+    def timed(blocks):
+        got = [b for b in blocks if b[0] is not None]
+        return [(s, s + d if d is not None else min(s + 5, got[k + 1][0] if k + 1 < len(got) else s + 5), text)
+                for k, (s, d, text) in enumerate(got)]
+    return {p: c for p, c in subtitle_blocks(path, j, want, SUB_CODECS, CUE_MAX, timed, lambda why: None).items() if c}
+
+
+def subtitle_blocks(path, j, want, codecs, cap, use, failed):
+    """{track position: use(its blocks)} for the tracks of codecs at the positions in want. mkvmerge and ffmpeg index
+    every subtitle block in the Cues, so the read takes the Cues and then each block by its index entry, one small read
+    each. It never reads a Cluster in full, so the cost does not grow with the file size. use gets an iterator of
+    (start seconds, duration seconds or None, text) over at most cap blocks, read one at a time while use asks. A
+    picture track, a track with a content encoding other than zlib, and a track the Cues do not index get no entry, or
+    failed(why). A failure keeps what was read. The job's time limit passes."""
     tracks, n, out = {}, 0, {}
     for t in j.get("tracks") or []:
         p = t.get("properties") or {}
         if t.get("type") != "subtitles":
             continue
         n += 1
-        if f"s{n}" in want and p.get("codec_id") in TEXT_CODECS and p.get("content_encoding_algorithms") in (None, "0") and p.get("number"):
-            tracks[p["number"]] = (f"s{n}", p["codec_id"] != "S_TEXT/UTF8", p.get("content_encoding_algorithms") == "0")
+        if f"s{n}" in want and p.get("codec_id") in codecs and p.get("content_encoding_algorithms") in (None, "0") and p.get("number"):
+            tracks[p["number"]] = (f"s{n}", p["codec_id"] in ("S_TEXT/ASS", "S_TEXT/SSA"), p.get("content_encoding_algorithms") == "0")
     if not tracks:
         return out
+    scale = ((j.get("container") or {}).get("properties") or {}).get("timestamp_scale") or 1000000   # ns a tick
     try:
         with open(path, "rb", buffering=0) as f:   # unbuffered, so each read takes only the bytes it asks for
             b = f.read(HEADER_READ); seg = arr_decide.segment_start(b)
@@ -1372,32 +1412,373 @@ def subtitle_read(path, j, want):
             for pos in seek.get(arr_decide.CUES, [])[:1]:
                 f.seek(ds + pos); e = arr_decide.element(f.read(12), 0)
                 if e and e[0] == arr_decide.CUES and e[2] is not None and e[2] <= CUES_MAX:
-                    f.seek(ds + pos + e[1]); cues = arr_decide.cue_blocks(f.read(e[2]), set(tracks), TEXT_CUES)
+                    f.seek(ds + pos + e[1]); cues = arr_decide.cue_blocks(f.read(e[2]), set(tracks), cap)
 
-            def texts(number, ass, packed):   # the cue texts of one track, read one block at a time while text_language() asks
+            def blocks(number, ass, packed):   # the cues of one track, read one block at a time while use() asks
                 for i, (cp, rp) in enumerate(cues[number]):
                     if i % TEXT_AHEAD == 0:   # start the reads of the next blocks at once, so a cold NFS read waits about once a batch
-                        for c, r in cues[number][i:i + TEXT_AHEAD]:   # the Cluster header, then the block after a header of 5 to 12 bytes
-                            os.posix_fadvise(f.fileno(), ds + c, 12, os.POSIX_FADV_WILLNEED)
+                        for c, r in cues[number][i:i + TEXT_AHEAD]:   # the Cluster header and its Timestamp, then the block
+                            os.posix_fadvise(f.fileno(), ds + c, 48, os.POSIX_FADV_WILLNEED)
                             os.posix_fadvise(f.fileno(), ds + c + 5 + r, 1031, os.POSIX_FADV_WILLNEED)
-                    if cp not in clusters:
-                        f.seek(ds + cp); e = arr_decide.element(f.read(12), 0)
-                        clusters[cp] = e[1] if e and e[0] == arr_decide.CLUSTER else None
+                    if cp not in clusters:   # (data start, Timestamp). The Timestamp comes first, after ffmpeg's CRC-32.
+                        f.seek(ds + cp); h = f.read(48); e = arr_decide.element(h, 0)
+                        kids = arr_decide.children(h, e[1], len(h)) if e and e[0] == arr_decide.CLUSTER else ()
+                        ts = next((int.from_bytes(h[d:d + n], "big") for i, d, n in kids if i == arr_decide.TIMESTAMP), None)
+                        clusters[cp] = (e[1], ts) if e and e[0] == arr_decide.CLUSTER else None
                     if clusters[cp] is None:
                         continue
-                    f.seek(ds + cp + clusters[cp] + rp); blk = f.read(1024); e = arr_decide.element(blk, 0)
+                    f.seek(ds + cp + clusters[cp][0] + rp); blk = f.read(1024); e = arr_decide.element(blk, 0)
                     if e and e[2] is not None and len(blk) < e[1] + e[2] <= TEXT_BLOCK:
                         blk += f.read(e[1] + e[2] - len(blk))
-                    frame = arr_decide.block_frame(blk, number)
+                    frame, times = arr_decide.block_frame(blk, number), arr_decide.block_times(blk)
                     if frame is not None:
                         text = (zlib.decompress(frame) if packed else frame).decode("utf-8", "replace")
-                        yield text.split(",", 8)[-1] if ass else text   # an ASS event holds 8 fields before its text
+                        start = (clusters[cp][1] + times[0]) * scale / 1e9 if times and clusters[cp][1] is not None else None
+                        yield start, times[1] * scale / 1e9 if times and times[1] is not None else None, \
+                            text.split(",", 8)[-1] if ass else text   # an ASS event holds 8 fields before its text
             for number, (pos, ass, packed) in tracks.items():
-                out[pos] = arr_decide.text_language(texts(number, ass, packed)) if number in cues else (None, 0.0, "the Cues index none of its blocks")
+                out[pos] = use(blocks(number, ass, packed)) if number in cues else failed("the Cues index none of its blocks")
     except arr_meta.OutOfTime:
         raise
     except Exception as ex:   # the text is one signal among others, so a failed read never stops a job
-        out.update({p: (None, 0.0, mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, _, _ in tracks.values() if p not in out})
+        out.update({p: failed(mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, _, _ in tracks.values() if p not in out})
+    return out
+
+
+def lid_kept(path, index):
+    """[(start, seconds)] of the audio the language check kept for path, see arr_lid.kept_pcm(). [] without arr_lid."""
+    try:
+        import arr_lid
+    except ImportError:
+        return []
+    return arr_lid.kept_pcm(os.path.join(CFG["STATE_DIR"], "lid.sqlite"), path, index)
+
+
+def sub_on(source, sub_check=False):
+    """The subtitle match check runs: on an import, and in a backfill only with --sub-check."""
+    return SUB_CHECK and (source == "hook" or sub_check)
+
+
+def sub_audio(ts, edits=()):
+    """{language key: the ffmpeg audio index of the main track the subtitle check hears for that language}. The track
+    that plays wins when it speaks the language, else the first main track that does. ts is arr_decide.classify()."""
+    play, out = arr_decide.default_audio(ts, edits), {}
+    for i, t in enumerate(t for t in ts if t["kind"] == "a"):
+        k = arr_decide.lang_key(t["lang"])
+        if t["role"] == "main" and t["lang"] not in arr_decide.UNTAGGED and (k not in out or t is play):
+            out[k] = i
+    return out
+
+
+def spaced(lang):
+    """The language writes spaces between its words, so the check can compare them, see NO_SPACES."""
+    return arr_decide.lang_key(lang) not in {arr_decide.lang_key(x) for x in NO_SPACES}
+
+
+def sub_targets(j, d):
+    """{subtitle position: (its language, the ffmpeg audio index it is compared with)} of the text tracks a viewer
+    would use: SubRip, ASS, SSA or WebVTT, in a SUB_ROLES role, in the language of a main audio track. j is the mkvmerge
+    -J probe of a Matroska file and d its decision."""
+    codec, n = {}, 0
+    for t in j.get("tracks") or []:
+        if t.get("type") == "subtitles":
+            n += 1
+            codec[f"s{n}"] = (t.get("properties") or {}).get("codec_id")
+    audio = sub_audio(d["tracks"], d["edits"])
+    return {t["pos"]: (t["lang"], audio[arr_decide.lang_key(t["lang"])]) for t in d["tracks"] if t["kind"] == "s"
+            and codec.get(t["pos"]) in SUB_CODECS and t["role"] in SUB_ROLES and arr_decide.lang_key(t["lang"]) in audio and spaced(t["lang"])}
+
+
+def sub_groups(items):
+    """{ffmpeg audio index: (language, the cues of all its items, sorted)} of sub_verdicts() items. The items of one
+    audio track share its windows, picked from all their cues, and one hearing."""
+    out = {}
+    for k, (lang, idx, cues) in items.items():
+        out.setdefault(idx, (lang, []))[1].extend(cues)
+    return {idx: (lang, sorted(cues)) for idx, (lang, cues) in out.items()}
+
+
+def sub_verdicts(path, j, items, starts=None):
+    """{key: result} of the subtitle match check (docs/design.md, "Subtitle match") for items {key: (language, ffmpeg
+    audio index, [(start, end, text)] in seconds)}. The items of one audio track share its windows, picked from all
+    their cues by arr_subsync.windows(), and one hearing. When a window hears under arr_subsync.MIN_WORDS words and
+    the other does not, arr_lid hears a longer window in the same part of the file, in the same process. Later
+    hearings follow what the check asks for: windows where a far drift puts the speech when too few windows heard
+    enough, a longer window around a window with too few matched cues for a fix, and a middle window to confirm a
+    ratio. Only the first hearing names a mismatch. A file whose windows hear enough pays for one hearing. result is arr_subsync.check() with "audio", "starts" ([window starts, seconds] of each hearing) and the
+    hearings' facts: "cached", "reused", "cpu", "took", "profile". starts {audio index: that list} forces the hearings
+    of an earlier check, so a check after a conversion reads the words carried over. A missing install, too little
+    time, a timeout or an error gives unknown and never fails the job. The job's time limit passes."""
+    dur, out = arr_decide.duration(j), {}
+    alarm = signal.getitimer(signal.ITIMER_REAL)[0]   # 0 when no time limit runs, as in a backfill
+    budget, spent = (min(SUB_TIMEOUT, alarm - LID_RESERVE) if alarm else SUB_TIMEOUT), [0.0]
+    for idx, (lang, cues) in sub_groups(items).items():
+        keys, heard, runs = [k for k, x in items.items() if x[1] == idx], [], []
+        stop, plan = arr_decide.STOPWORDS.get(lang, frozenset()), (starts or {}).get(idx)
+
+        def listen(ws, secs=arr_subsync.WINDOW, more=None):   # one hearing, or why none
+            if budget - spent[0] < 10:
+                return f"no time left of the {max(budget, 0):.0f} seconds the check may take"
+            t0 = time.monotonic()
+            got = lid_run(path, idx, j, (), budget - spent[0], words=(lang, ws, secs, more))
+            spent[0] += time.monotonic() - t0 - got.get("waited", 0)
+            if not got.get("windows"):
+                return mask(str(got.get("why") or "no words"))[:200]
+            heard.extend(got["windows"]); runs.append(dict(got, starts=[ws, secs]))
+            return None
+        first = plan[0][0] if plan else arr_subsync.windows(cues, dur, stop, lid_kept(path, idx))
+        more = None if plan else arr_subsync.windows(cues, dur, stop, secs=arr_subsync.THIRD, taken=first) if first else None
+        why = listen(first, more=more) if first else "a part of the file holds no cue"
+        check = lambda: {k: arr_subsync.check(heard, items[k][2], lang, dur) for k in keys}
+        res = {} if why else check()
+        before, done = res, set()   # the verdicts of the first hearing, and the later hearings and windows made
+        for p in (plan or [])[1:] if not why else ():
+            listen(*p)
+            res = check()
+        for _ in range(4) if not (why or plan) else ():
+            ts = [r.get("timing") or {} for r in res.values()]
+            poor = {a for t in ts for a in t.get("few", ())}   # windows with too few cues whose first words matched
+            seen = max((r["windows"] for r in res.values()), key=len, default=[])   # the windows the check took
+            halves = {w["at"] < dur / 2 for w in seen if w["words"] >= arr_subsync.MIN_WORDS and w["at"] not in poor}
+            ext = sorted(a for a in poor - done if any(w["at"] == a and w.get("secs", arr_subsync.WINDOW) < arr_subsync.THIRD for w in heard))
+            if ext:
+                # A window with too few cues whose first words matched: hear a window of THIRD seconds around it.
+                done.update(ext)
+                step = ([round(max(0.0, a - (arr_subsync.THIRD - arr_subsync.WINDOW) / 2), 1) for a in ext], arr_subsync.THIRD, None)
+            elif len(halves) < 2 and "drift" not in done:
+                # A half of the file with no window that heard enough. A drift far from 1 moves the speech of the
+                # densest cues away from a window at cue time, so hear where each far ratio puts it. A window whose
+                # words matched says where the cues sit, see arr_subsync.drift().
+                done.add("drift")
+                hint = max(((w["overlap"] * w["words"], w["at"] + arr_subsync.WINDOW / 2, w["offset"]) for w in seen
+                            if w["offset"] is not None), default=(0,))
+                ws = [a for a in arr_subsync.drift([s for s in first if (s < dur / 2) not in halves], hint[1:] if hint[0] >= 3 else None)
+                      if all(abs(a - w["at"]) >= arr_subsync.WINDOW / 2 for w in heard)]
+                step = (ws, arr_subsync.WINDOW, None)
+            elif (fix := next((t["confirm"] for t in ts if t.get("confirm")), None)) and "middle" not in done:
+                # A ratio waits for a middle window near the centre between the others, see arr_subsync.middle(). Its
+                # densest cues lie at cue times, and the fix to confirm says where their speech is in the audio, many
+                # seconds away for a 25 fps track. When it hears too little, as on a chant that Whisper drops, a window
+                # of THIRD seconds elsewhere in that part is heard in the same process.
+                done.add("middle")
+                part = arr_subsync.middle(fix, dur)
+                mid = arr_subsync.windows(cues, dur, stop, parts=part)
+                alt = arr_subsync.windows(cues, dur, stop, secs=arr_subsync.THIRD, taken=mid, parts=part) if mid else []
+                at, alt = ([round(max(0.0, arr_subsync.moved(s * 1000, fix) / 1000), 1) for s in ws if s is not None] for ws in (mid, alt))
+                step = (at, arr_subsync.WINDOW, alt or None)
+            else:
+                break
+            if not step[0] or listen(*step):
+                break
+            res = check()
+        for k, r in res.items():   # only the first hearing's windows sit where the cues are dense, so only they name a mismatch
+            if r["verdict"] == "mismatch" and before[k]["verdict"] != "mismatch":
+                res[k] = dict(r, verdict="unknown", why=f'{r["why"]}, but only in windows heard after the first, which can sit where no cue is')
+        facts = {"audio": idx, "starts": [r["starts"] for r in runs] or ([[first, arr_subsync.WINDOW]] if first else []),
+                 "cached": all(r.get("cached") for r in runs), "reused": sum(r.get("reused") or 0 for r in runs),
+                 **{k: round(sum(r.get(k) or 0 for r in runs), 2) for k in ("cpu", "took", "waited") if any(k in r for r in runs)},
+                 **({"profile": [r["profile"] for r in runs if r.get("profile")]} if any(r.get("profile") for r in runs) else {})}
+        for k in keys:
+            out[k] = dict(verdict="unknown", why=why, windows=[], timing=None, **facts) if why else dict(res[k], **facts)
+    return out
+
+
+def sub_hold(ts, known, lang):
+    """Why a mismatch of a subtitle in lang cannot count, or None (docs/design.md, "Subtitle match"). A right subtitle
+    can translate other speech than the audio it is compared with, such as the Japanese original beside an English
+    dub. A dub script and a translation use other words, so such a track can read as a mismatch. known holds the
+    item's original languages as 639-2 codes, from the app or TMDB. When it names one, the mismatch counts unless the
+    original is another language than the subtitle, so an English original with a Spanish dub keeps the check. When
+    no original is known, another main audio language in the file stands in for it. ts is arr_decide.classify()."""
+    key = arr_decide.lang_key(lang)
+    orig = {arr_decide.lang_key(x): x for x in sorted(known or ()) if x and x not in arr_decide.UNTAGGED}
+    if orig:
+        return None if key in orig else f"the original language is {', '.join(sorted(orig.values()))}, and the subtitle may translate it"
+    other = sorted({t["lang"] for t in ts if t["kind"] == "a" and t["role"] == "main" and t["lang"] not in arr_decide.UNTAGGED
+                    and arr_decide.lang_key(t["lang"]) != key})
+    return f"no original language is known, and the file also carries {', '.join(other)} audio, which the subtitle may translate" \
+        if other else None
+
+
+def sub_held(res, items, ts, known):
+    """res of sub_verdicts() with each mismatch that sub_hold() rules out turned into unknown, its why extended."""
+    for k, r in res.items():
+        why = r["verdict"] == "mismatch" and sub_hold(ts, known, items[k][0])
+        if why:
+            r.update(verdict="unknown", why=f'{r["why"]}, but {why}', held=True)
+    return res
+
+
+def side_code(s):
+    """The 639-2 code of a sidecar's language: its name may give en, and the tracks give eng."""
+    base = s["lang"].split("-")[0]
+    return langs()[0].get(base) or base
+
+
+def mkv_sidecars(path, d):
+    """{name: sidecar_subs() entry} of the .srt files beside a Matroska file that the check takes: in the language of a
+    main audio track and not forced. Bazarr writes its downloads there."""
+    audio = sub_audio(d["tracks"], d["edits"])
+    return {s["name"]: s for s in sidecar_subs(path) if arr_decide.lang_key(side_code(s)) in audio and SIDECAR_FLAGS["forced"] not in s["flags"]
+            and spaced(side_code(s))}
+
+
+def sub_items(path, j, d, sides):
+    """The sub_verdicts() items of a Matroska file: the tracks of sub_targets() with their cues read by
+    subtitle_cues(), and the sidecars sides of mkv_sidecars()."""
+    targets, audio = sub_targets(j, d), sub_audio(d["tracks"], d["edits"])
+    cues = subtitle_cues(path, j, set(targets)) if targets else {}
+    items = {p: (lang, idx, cues.get(p) or []) for p, (lang, idx) in targets.items()}
+    items.update({n: (side_code(s), audio[arr_decide.lang_key(side_code(s))], [(a / 1000, b / 1000, t) for a, b, t in s["cues"]])
+                  for n, s in sides.items()})
+    return items
+
+
+def sub_jobs(path, j, d, sides):
+    """A file of the subtitle check's hearings for arr_lid.jobs(), written into STATE_DIR, or None when nothing would be
+    heard. A language check runs them with the model it loaded, see hear(). The caller removes the file."""
+    items = sub_items(path, j, d, sides) if arr_decide.duration(j) >= SUB_MIN_SECONDS else {}
+    if not items:
+        return None
+    fd, name = tempfile.mkstemp(prefix="subjobs-", suffix=".json", dir=CFG["STATE_DIR"])
+    with os.fdopen(fd, "w") as f:
+        json.dump([{"index": idx, "lang": lang, "cues": cues, "duration": arr_decide.duration(j)} for idx, (lang, cues) in sub_groups(items).items()], f)
+    return name
+
+
+def sub_match(path, j, d, starts=None, sides=None, known=()):
+    """{subtitle position or sidecar name: sub_verdicts() result} for the tracks of sub_targets(), with their cues read
+    by subtitle_cues(), and the sidecars sides of mkv_sidecars(). {} when nothing qualifies or the file runs under
+    SUB_MIN_SECONDS. So a file with no such track or sidecar costs nothing. known holds the item's original languages,
+    and a mismatch that sub_hold() rules out is unknown."""
+    sides = sides or {}
+    if not (sub_targets(j, d) or sides) or arr_decide.duration(j) < SUB_MIN_SECONDS or not lid_ready():
+        return {}
+    items = sub_items(path, j, d, sides)
+    return sub_held(sub_verdicts(path, j, items, starts), items, d["tracks"], known)
+
+
+def side_stats(path):
+    """{name: [size, mtime_ns]} of the .srt files beside path that start with its base name."""
+    folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
+    out = {}
+    with contextlib.suppress(OSError):
+        for n in os.listdir(folder):
+            if n.startswith(base + ".") and n.lower().endswith(".srt"):
+                with contextlib.suppress(OSError):
+                    st = os.stat(os.path.join(folder, n))
+                    out[n] = [st.st_size, st.st_mtime_ns]
+    return out
+
+
+def sub_cache(path, verdicts, pending):
+    """Cache the subtitle check's verdicts for path as it is now, with its sidecars, see arr_lid.verdict_put()."""
+    with contextlib.suppress(ImportError):
+        import arr_lid
+        arr_lid.verdict_put(os.path.join(CFG["STATE_DIR"], "lid.sqlite"), path, {"verdicts": verdicts, "sidecars": side_stats(path)}, pending)
+
+
+def sub_cached(path):
+    """The subtitle check of path as it is now is cached and asks for nothing more, so a backfill with --sub-check
+    skips the file. A dry run's verdict that asks for an action does not count, so an apply after it still acts. A
+    sidecar that came, went or changed since counts as a change, so a new download from Bazarr is checked."""
+    try:
+        import arr_lid
+    except ImportError:
+        return False
+    got = arr_lid.verdict_get(os.path.join(CFG["STATE_DIR"], "lid.sqlite"), path)
+    return bool(got) and not got[1] and isinstance(got[0], dict) and got[0].get("sidecars") == side_stats(path)
+
+
+def sidecar_fix(sides, sync, apply, app, source):
+    """Act on the sidecars beside a Matroska file (docs/design.md, "Subtitle match"). A sidecar that does not match the
+    audio moves into originals_root() as a kept original. A sidecar whose times need a fix is written again with new
+    times, and its original is kept the same way. Both need a place to keep the original, so with
+    KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. Each move and rewrite gets a log line. Returns one entry per
+    sidecar with an action: {name, action, why, result: "moved", "retimed", "left" or "dry run", kept or left}."""
+    out = []
+    for n, s in sorted(sides.items()):
+        r = sync.get(n) or {}
+        fix = SUB_TIMING and (r.get("timing") or {}).get("fix")
+        if r.get("verdict") != "mismatch" and not fix:
+            continue
+        e = {"name": n, "action": "move" if r.get("verdict") == "mismatch" else "retime", "why": r["why"] if not fix else r["timing"]["why"]}
+        out.append(e)
+        if not apply:
+            e["result"] = "dry run"
+            continue
+        tmp = repack_tmp(s["path"])
+        try:
+            st = os.stat(s["path"])
+            why = keepable(s["path"], st) if KEEP_DAYS else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"
+            if why: raise OSError(why)
+            if e["action"] == "retime":   # a new file over the name, so the kept hard link holds the old text
+                with open(s["path"], "rb") as f:
+                    text = srt_moved(f.read().decode(PY_CHARSET[s["charset"]], errors="replace"), fix)
+                new_tmp(tmp)
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(text)
+                with contextlib.suppress(PermissionError):   # a NAS share may refuse chown. The mode stays.
+                    os.chown(tmp, st.st_uid, st.st_gid)
+                os.chmod(tmp, st.st_mode & 0o7777)
+            e["kept"] = keep_original(s["path"])
+            os.replace(tmp, s["path"]) if e["action"] == "retime" else os.remove(s["path"])
+            e["result"] = "moved" if e["action"] == "move" else "retimed"
+            log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", kept=e["kept"], why=e["why"]))
+        except OSError as ex:
+            e.update(result="left", left=mask(str(ex))[:200])
+        finally:
+            drop_tmp(tmp)
+    if any(e.get("kept") for e in out):
+        prune_originals(originals_root(out[0]["kept"]))
+    return out
+
+
+def sub_alerts(rec, sync, unmatched):
+    """The alerts of the subtitle match check, as [(kind, text)]: one "submatch" alert for the tracks and sidecars that
+    do not match the audio, and one "subtiming" alert for the tracks whose times are off and stay. unmatched holds the
+    tracks, by their place before any remux, that stayed in the file and lost their flags instead."""
+    rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
+    for p in rm.get("removed") or []:
+        wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. The hook removed it, and the original file is kept at "
+                     f"{rm.get('kept')}.")
+    for p in unmatched:
+        why = rm["result"] if p in (rm.get("remove") or []) and not rm.get("removed") else rm.get("kept_back") or "the file was not remuxed"
+        wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. It stays in the file, because {why}. "
+                     "It loses its default and forced flags.")
+    for e in rec.get("sidecars") or []:
+        if e["action"] == "move":
+            where = f"It moved to {e['kept']}." if e.get("kept") else f"It stays beside the file: {e.get('left') or 'a dry run'}."
+            wrong.append(f"The sidecar {e['name']} does not match the audio, {e['why']}. {where} Bazarr can download it again.")
+        elif e["result"] == "left":
+            late.append(f"The sidecar {e['name']} needs new times, {e['why']}, but it stays as it was: {e['left']}.")
+    for e in rp.get("sidecars_unmatched", []):
+        where = f"It moved to {e['moved']}." if e.get("moved") else f"It stays beside the file: {e.get('left') or 'a dry run'}."
+        wrong.append(f"The sidecar {e['name']} does not match the audio, {e['why']}. The conversion left it out. {where}")
+    for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
+        wrong.append(f"Subtitle track {p} does not match the audio, {rp['subcheck'][p]['why']}. The conversion left it out, and the "
+                     f"original file is kept at {rp.get('kept')}.")
+    for p, r in sorted(sync.items()):
+        t = r.get("timing") or {}
+        if (t.get("piecewise") and round(max(t["offsets"]) - min(t["offsets"]), 2) >= STEP_ALERT) or "unfixed" in t:
+            late.append(f"Subtitle {'track ' if p.startswith('s') and p[1:].isdigit() else ''}{p} is off the audio: {t['why']}. Its times stay.")
+    if rm.get("fixed") and not rm.get("done"):
+        late.append(f"Subtitle track {', '.join(rm['fixed'])} needs new times, but {rm['result']}. The file stays as it was.")
+    if not SUB_TIMING:
+        late += [f"Subtitle {p} needs new times: {r['timing']['why']}. SUB_TIMING is off, so its times stay."
+                 for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
+    return ([("submatch", " ".join(wrong))] if wrong else []) + ([("subtiming", " ".join(late))] if late else [])
+
+
+def renumber(m, gone):
+    """m with each subtitle position key moved down past the removed positions gone, and the removed keys dropped.
+    Other keys stay."""
+    out = {}
+    for k, v in (m or {}).items():
+        if k.startswith("s") and k[1:].isdigit():
+            if k in gone: continue
+            k = f"s{int(k[1:]) - sum(int(g[1:]) < int(k[1:]) for g in gone)}"
+        out[k] = v
     return out
 
 
@@ -2421,25 +2802,32 @@ def lid_turn(deadline):
         gate.close()
 
 
-def lid_cached(path, index, j):
-    """arr_lid.py has an answer cached for this stream of this file, so the run needs no turn at the model."""
+def lid_cached(path, index, j, words=None):
+    """arr_lid.py has an answer cached for this stream of this file, so the run needs no turn at the model. words is
+    (language, window starts) of the subtitle check, see arr_lid.listen()."""
     try:
         import arr_lid
-        return arr_lid.cache_get(os.path.join(CFG["STATE_DIR"], "lid.sqlite"), path, index, arr_lid.tag(arr_lid.MODEL),
-                                 arr_decide.duration(j)) is not None
+        cache = os.path.join(CFG["STATE_DIR"], "lid.sqlite")
+        if words:
+            return arr_lid.words_get(cache, path, index, arr_lid.tag(arr_lid.MODEL), *words[:3]) is not None
+        return arr_lid.cache_get(cache, path, index, arr_lid.tag(arr_lid.MODEL), arr_decide.duration(j)) is not None
     except Exception:   # no module, no file, no cache: take the turn
         return False
 
 
-def lid_run(path, index, j, expect, timeout, fresh=False):
+def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None):
     """One arr_lid.py run on ffmpeg audio stream index. Returns its JSON answer, or {"why": the reason there is none}.
     It runs in its own process group. A timeout or the job's time limit kills the whole group, so no ffmpeg cut
-    outlives it. fresh hears past the cache. The hook and the subtitle hunter both call it.
+    outlives it. fresh hears past the cache. The hook and the subtitle hunter both call it. keep keeps the samples'
+    audio for the subtitle check. words is (language, window starts, seconds of each window, a second window per start
+    or None): the run then gives the words of those windows for the subtitle check instead, see arr_lid.listen(). then
+    is a file of the subtitle check's hearings that a language check runs after its own, with the model loaded, see
+    arr_lid.jobs().
     A run that must hear first waits for the host's turn at the model, see lid_turn(). timeout starts after that wait,
     and a job's time limit caps it then. A wait of a second or more comes back as "waited"."""
     if not lid_ready():
         return {"why": "language detection is not installed"}
-    start, cached = time.monotonic(), not fresh and lid_cached(path, index, j)
+    start, cached = time.monotonic(), not fresh and lid_cached(path, index, j, words)
     with contextlib.nullcontext() if cached else LID_ONE:
         alarm = signal.getitimer(signal.ITIMER_REAL)[0]   # a hook job waits only while its time limit leaves room to hear
         turn = None if cached else lid_turn(start + (alarm - LID_RESERVE - 10 if alarm else float("inf")))
@@ -2448,18 +2836,23 @@ def lid_run(path, index, j, expect, timeout, fresh=False):
             return {"why": f"another hearing held the model for {waited:.0f} seconds", "waited": waited}
         try:
             alarm = signal.getitimer(signal.ITIMER_REAL)[0]
-            got = lid_cli(path, index, j, expect, min(timeout, alarm - LID_RESERVE) if alarm else timeout, fresh)
+            got = lid_cli(path, index, j, expect, min(timeout, alarm - LID_RESERVE) if alarm else timeout, fresh, keep, words, then)
             return dict(got, waited=waited) if waited >= 1 else got
         finally:
             if turn:
                 turn.close()
 
 
-def lid_cli(path, index, j, expect, timeout, fresh):
+def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None):
     """The arr_lid.py process of lid_run(), killed with its process group after timeout seconds."""
     argv = [os.path.join(CFG["LID_DIR"], "venv", "bin", "python"), os.path.join(os.path.dirname(arr_decide.__file__), "arr_lid.py"), path,
             str(index), str(arr_decide.duration(j)), "--cache", os.path.join(CFG["STATE_DIR"], "lid.sqlite"),
-            "--model-dir", os.path.join(CFG["LID_DIR"], "models")] + (["--fresh"] if fresh else []) + ["--expect", *expect]
+            "--model-dir", os.path.join(CFG["LID_DIR"], "models")]
+    if words:
+        argv += ["--words", words[0], *map(str, words[1]), "--secs", str(words[2] if len(words) > 2 else arr_subsync.WINDOW)]
+        argv += ["--more", *("-" if x is None else str(x) for x in words[3])] if len(words) > 3 and words[3] else []
+    else:
+        argv += (["--fresh"] if fresh else []) + (["--keep-pcm"] if keep else []) + ["--expect", *expect] + (["--then-words", then] if then else [])
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
     except OSError as ex:
@@ -2480,13 +2873,14 @@ def lid_cli(path, index, j, expect, timeout, fresh):
             p.wait()
 
 
-def hear(path, j, d, original, fresh=False, only=None):
+def hear(path, j, d, original, fresh=False, only=None, keep=False, then=None):
     """arr_lid.py on each main audio track whose language is below AGREE, or on the main tracks at the positions in only.
     Returns ({track position: the language heard}, {track position: arr_lid.py's answer}) for the decision and the log.
     All tracks of a file share LID_TIMEOUT of hearing, cut to the job's time left minus LID_RESERVE for the audio samples.
     A wait for the host's model does not count, see lid_run(). With too little left, detection is
     skipped and the plan goes on without it. A missing install, a timeout or an error is no answer and never fails the
-    job. The time limit passes. fresh hears past the cache."""
+    job. The time limit passes. fresh hears past the cache. keep keeps the samples' audio for the subtitle check, and
+    then is the file of the subtitle check's hearings that the first hearing runs too, see lid_run()."""
     alarm = signal.getitimer(signal.ITIMER_REAL)[0]   # 0 when no time limit runs, as in a backfill
     budget = min(LID_TIMEOUT, alarm - LID_RESERVE) if alarm else LID_TIMEOUT
     heard, out, spent = {}, {}, 0.0   # spent counts the hearing, never a wait for the model, see lid_run()
@@ -2500,7 +2894,8 @@ def hear(path, j, d, original, fresh=False, only=None):
             got = {"why": f"no time left of the {max(budget, 0):.0f} seconds detection may take"}
         else:
             t0 = time.monotonic()
-            got = lid_run(path, i, j, [t["tag"], *sorted(arr_decide.codes(original))], left, fresh)
+            got = lid_run(path, i, j, [t["tag"], *sorted(arr_decide.codes(original))], left, fresh, keep, then=then)
+            then = None   # once: its words are cached then
             spent += time.monotonic() - t0 - got.get("waited", 0)
         out[t["pos"]] = {"lang": got.get("lang"), "prob": got.get("prob"), "why": mask(str(got.get("why") or ""))[:200] or None,
                          "cached": got.get("cached"), "took": got.get("took"), **({"waited": round(got["waited"])} if got.get("waited") else {})}
@@ -2528,14 +2923,15 @@ def item_languages(original, expected):
     return arr_decide.codes(original) | {e.get("original")} - {None}, set(e.get("spoken") or [])
 
 
-def lid_carry(path, before):
+def lid_carry(path, before, was=None):
     """Move arr_lid.py's cached answers for path from its stat before an edit to its stat now. mkvpropedit changes the
-    mtime but never the audio. arr_lid is optional, and carry() never raises."""
+    mtime but never the audio. was is the original's path of a conversion, whose words move too. arr_lid is optional,
+    and carry() never raises."""
     try:
         import arr_lid
     except ImportError:
         return
-    arr_lid.carry(path, before, os.path.join(CFG["STATE_DIR"], "lid.sqlite"))
+    arr_lid.carry(path, before, os.path.join(CFG["STATE_DIR"], "lid.sqlite"), was)
 
 
 def tmdb_ask(app, ctx, fresh=False):
@@ -2591,7 +2987,7 @@ def content_text(ev):
 
 
 def process(app, path, label, original, runtime, apply=True, post=True, source="hook", job=None, audio=True, kids=False, release="",
-            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=None):
+            keep_plan=False, ids=None, ctx=None, lock=None, video=True, shared=False, pool=None, convert_on=None, force=None, sub_check=False):
     """Probe one file and decide its flags. Hear the audio language when the decision needs it, check the audio (hook
     only), edit the flags when the rules say so, and verify. Then run the metadata checks and alert.
 
@@ -2613,13 +3009,16 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     held shared, and the conversion runs under it. convert_on says whether a file that is not .mkv converts: CONVERT for
     the hook, --convert for a backfill. A .mkv file that holds another container converts either way. A backfill with
     --convert stops after the conversion: the language backfill decides the flags later, from its own cache. force
-    is the refusal a person accepts, see convert().
+    is the refusal a person accepts, see convert(). sub_check runs the subtitle match check in a backfill, see sub_on().
+    A track that does not match leaves the file, and a track whose times need a fix gets them, in one remux, see
+    resub(). When the remux fails, a track that does not match loses its flags instead. Sidecars beside the file are
+    checked too, see sidecar_fix().
     Returns the decision log record, which the caller writes with decision().
     """
     ctx = ctx or {"listed": runtime}
     rec = dict(id=uuid.uuid4().hex[:12], app=app, source=source, apply=apply, ids=ids or {}, label=label, path=path, original=original,
                kids=kids, release=release)
-    mkv, conv = path.lower().endswith(".mkv"), CONVERT if convert_on is None else convert_on
+    mkv, conv, subs_on = path.lower().endswith(".mkv"), CONVERT if convert_on is None else convert_on, sub_on(source, sub_check)
     if not mkv and job is None and not conv:
         return dict(rec, result="skipped, not mkv")
     if apply and (mkv or conv):   # a SIGKILL during a repack leaves its temp file
@@ -2631,7 +3030,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if (mkv and container != "Matroska") or (not mkv and conv):   # mkvpropedit edits Matroska only, see convert()
         if shared and apply and not pool:
             raise Replan("the file needs a repack")
-        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force)
+        was = path
+        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force, subs_on, arr_decide.codes(original))
         if lock is not None and not pool and result.startswith(("repacked", "repack failed")):   # convert() let the lock go, see there
             gated(lock, fcntl.LOCK_EX)
         if job is not None and "warnings" in rec["repack"]:
@@ -2675,6 +3075,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
                 if job is not None:
                     job.update(path=path, file_id=str(fid))
             log(dict(rec, result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
+            lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
             if source == "backfill" and convert_on:   # the language backfill decides the flags later, from its own cache
                 rec["repack"]["rescan"] = "after the run"
                 return dict(rec, result="repacked", reasons=["repacked"], **{"class": "repacked"})
@@ -2721,7 +3122,15 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if (lid_when or ask) and arr_decide.duration(j) >= LID_MIN_SECONDS:
         if shared:   # a hearing waits for the host's one model, so it runs without the file lock and an edit never queues behind it
             fcntl.flock(lock, fcntl.LOCK_UN)
-        got, rec["heard"] = hear(path, j, d, original, only=doubt | ask)
+        keep = subs_on and mkv and lid_ready() and bool(any((t.get("properties") or {}).get("codec_id") in SUB_CODECS for t in j.get("tracks") or [])
+                                                        or side_stats(path))
+        then = sub_jobs(path, j, d, mkv_sidecars(path, d)) if keep else None   # the subtitle check shares the loaded model
+        try:
+            got, rec["heard"] = hear(path, j, d, original, only=doubt | ask, keep=keep, then=then)
+        finally:
+            if then:
+                with contextlib.suppress(OSError):
+                    os.remove(then)
         if shared:
             shared.reshare(st)
     known, said = item_languages(original, asked[0])
@@ -2742,6 +3151,51 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         d = arr_decide.decide(j, original, kids, release, heard, spoken, wrong)
     if tags:
         d = arr_decide.with_tags(d, tags)
+    sync, unmatched, fixes, sides = {}, set(), {}, {}   # the subtitle match check, docs/design.md, "Subtitle match"
+    if mkv and subs_on and lid_ready():
+        sides = mkv_sidecars(path, d)
+        if sub_targets(j, d) or sides:
+            if shared:   # a hearing waits for the host's one model, so it runs without the file lock, as above
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            before = (rec.get("repack") or {}).get("subcheck") or {}   # a conversion checked the tracks already: the same windows
+            sync = sub_match(path, j, d, {r["audio"]: r["starts"] for r in before.values() if r.get("starts")} or None, sides, known)
+            if shared:
+                shared.reshare(st)
+        if sync:
+            rec["subcheck"] = sync
+        tracks = {p: r for p, r in sync.items() if p not in sides}
+        unmatched = {p for p, r in tracks.items() if r["verdict"] == "mismatch"}
+        fixes = {p: r["timing"]["fix"] for p, r in tracks.items() if (r.get("timing") or {}).get("fix")} if SUB_TIMING else {}
+    remove = sorted(unmatched) if KEEP_DAYS else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
+    if fixes or remove:
+        if shared and apply:
+            raise Replan("a subtitle needs a remux")
+        ids_of = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
+        by_id = lambda ps: [ids_of[int(p[1:]) - 1] for p in ps]
+        result, info = resub(path, j, st, apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove))
+        if job is not None and "warnings" in info:
+            signal.alarm(BUDGET)   # resub() ran its remux with the time limit off, whatever came of it
+        done = result == "subtitles remuxed"
+        code = "would_remux_subtitles" if result.startswith("would") else "subtitle_remux_skipped" if result.startswith("subtitle remux skipped") \
+            else None if done else "subtitle_remux_failed"
+        rec["subremux"] = dict(info, result=result, done=done, fixed=sorted(fixes), remove=remove, removed=remove if done else [],
+                               codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_mismatch_removed", remove)) if x] if done else [code])
+        if done:
+            log(dict(rec, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+            lid_carry(path, st)   # the proof shows the same audio
+            st = os.stat(path); size = st.st_size; j = mkvmerge(path)
+            rec.update(size=size, mtime=int(st.st_mtime))
+            gone = set(remove)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
+            read, wrong, heard = renumber(read, gone), renumber(wrong, gone), renumber(heard, gone)
+            unmatched = set(renumber(dict.fromkeys(unmatched), gone))
+            tags = arr_decide.retag(j, got, known, langs(), said, read)
+    stay = sorted({p for p, r in sync.items() if p not in sides and r["verdict"] == "mismatch"} - set((rec.get("subremux") or {}).get("removed") or []))
+    if stay and not KEEP_DAYS:   # the tracks that stay, by their place before any remux, for the alert
+        rec.setdefault("subremux", {}).update(kept_back="KEEP_ORIGINALS_DAYS is 0, so the original could not be kept")
+    if unmatched or (rec.get("subremux") or {}).get("done"):
+        d = arr_decide.decide(j, original, kids, release, heard, spoken, wrong, unmatched)
+        if tags:
+            d = arr_decide.with_tags(d, tags)
     file_checks = arr_decide.checks(j, size, runtime, shorter_only=app == "sonarr")
     rec.update(notes=d["notes"], reasons=d.get("reasons", []), item_class=d.get("cls"), tracks=track_log(d["tracks"]),
                undecided=d.get("undecided"), abstain=d.get("abstain"), dropped=d.get("dropped", []), invariants=d.get("invariants", []),
@@ -2750,6 +3204,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         rec["reasons"] = ["not_matroska" if unconverted else "repacked"] + rec["reasons"]
     if "header_repair" in rec:
         rec["reasons"] = [rec["header_repair"]["code"]] + rec["reasons"]
+    if (rec.get("subremux") or {}).get("codes"):
+        rec["reasons"] = rec["subremux"]["codes"] + rec["reasons"]
     rec["class"] = arr_decide.plan_class(d)
     if keep_plan:
         rec["plan"] = plan_record(app, label, path, d)
@@ -2790,7 +3246,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
             rest.append(("video", sentences(doubts)))
     if shared and not (certain or vcertain or WRONG_CONTENT_REGRAB):   # the checks found nothing to re-grab
         shared.settle()
-    if shared and apply and (certain or vcertain or (mkv and d["edits"])):
+    acts = [n for n in sides if (sync.get(n) or {}).get("verdict") == "mismatch" or (SUB_TIMING and ((sync.get(n) or {}).get("timing") or {}).get("fix"))]
+    if shared and apply and (certain or vcertain or (mkv and (d["edits"] or acts))):
         shared.exclusive(st)
     if certain:
         rec["result"] = f"broken audio: {certain}"
@@ -2803,7 +3260,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     elif not mkv:
         rec["result"] = unconverted[0] if unconverted else "skipped, not mkv"
     else:
-        rec = edit(rec, j, d["edits"], apply, replan=lambda after: arr_decide.with_tags(arr_decide.decide(after, original, kids, release, heard, spoken, wrong),
+        rec = edit(rec, j, d["edits"], apply, replan=lambda after: arr_decide.with_tags(arr_decide.decide(after, original, kids, release, heard, spoken, wrong,
+                                                                                                            unmatched),
                                                                                       arr_decide.retag(after, got, known, langs(), said, read)))
         if d.get("undecided"):   # the decision abstained, so edits is empty
             rec["result"] = "undecided: " + d["undecided"]
@@ -2816,6 +3274,16 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         rec["repack"]["rescan"] = rescan_now()
     if rec.get("header_repair", {}).get("code") in REPAIRED:
         rec["header_repair"]["rescan"] = rescan_now()
+    if (rec.get("subremux") or {}).get("done"):
+        rec["subremux"]["rescan"] = rescan_now()
+    if acts and mkv and not (certain or vcertain):   # the sidecars beside the file, under the lock of the edit
+        rec["sidecars"] = sidecar_fix({n: sides[n] for n in acts}, sync, apply, app, source)
+    rest += sub_alerts(rec, sync, stay)
+    if mkv and subs_on and lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
+        muted = {t["sel"] for t in d["tracks"] if t["pos"] in unmatched}
+        done = apply and rec["result"] in ("edited", "no change") and (rec.get("subremux") or {}).get("done", not (fixes or remove)) \
+            and all(e["result"] in ("moved", "retimed") for e in rec.get("sidecars") or [])
+        sub_cache(path, {p: r["verdict"] for p, r in sync.items()}, (bool(fixes or remove or acts) or any(e[0] in muted for e in d["edits"])) and not done)
     if rec["result"].startswith(("VERIFY", "mkvpropedit")):
         rest.append(("edit", f'The flag edit failed. {rec["result"][:150]} {after_state(rec)}'))
     if lock is not None:   # the edit is done, and the checks below only read the file
@@ -3227,6 +3695,148 @@ def repack(path, j, st, apply, hp):
     return done, info
 
 
+# The properties a retime puts back with mkvpropedit after ffmpeg's remux, as (mkvmerge -J name, mkvpropedit name).
+# ffmpeg writes new UIDs and no BCP 47 tag, and the plan's flag edits name the tracks by UID.
+PROP_EDITS = (("uid", "track-uid"), ("language_ietf", "language-ietf"), ("track_name", "name"), ("default_track", "flag-default"),
+              ("forced_track", "flag-forced"), ("enabled_track", "flag-enabled"), ("flag_original", "flag-original"),
+              ("flag_commentary", "flag-commentary"), ("flag_hearing_impaired", "flag-hearing-impaired"),
+              ("flag_visual_impaired", "flag-visual-impaired"), ("flag_text_descriptions", "flag-text-descriptions"))
+
+
+def props_fault(j, new, drop=()):
+    """Why the tracks of the remuxed probe new differ from those of j less the track ids in drop, or None: the type,
+    codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, and the count of attachments
+    and chapters."""
+    j = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop])
+    if track_list(j) != track_list(new): return f"the tracks changed from {track_list(j)} to {track_list(new)}"
+    for a, b in zip(j.get("tracks") or [], new.get("tracks") or []):
+        pa, pb = a.get("properties") or {}, b.get("properties") or {}
+        diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)]
+        if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"
+    for k in ("attachments", "chapters"):
+        if len(j.get(k) or []) != len(new.get(k) or []): return f"the {k} changed from {len(j.get(k) or [])} to {len(new.get(k) or [])}"
+    return None
+
+
+def srt_moved(text, fix):
+    """SubRip text with each time line moved by fix, see arr_subsync.moved(). A time before 0 becomes 0. The rest of the
+    text stays as it is."""
+    ms = lambda h, m, sec, f: int(h) * 3600000 + int(m) * 60000 + int(sec) * 1000 + int(f.ljust(3, "0")[:3])
+    at = lambda x: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(max(0, arr_subsync.moved(x, fix)))
+    def line(m):
+        g = m.groups()
+        return f"{at(ms(*g[:4]))} --> {at(ms(*g[4:8]))}{g[8]}"
+    return "\n".join(arr_decide.SRT_TIME.sub(line, x) for x in text.replace("\r\n", "\n").split("\n"))
+
+
+def resub(path, j, st, apply, fixes, drop=()):
+    """Remux a Matroska file in place with new times for the subtitle tracks in fixes, {mkvmerge track id: fix of
+    arr_subsync.timing()}, and without the subtitle track ids in drop, in one remux under the caller's exclusive file
+    lock (docs/design.md, "Subtitle match"). Returns (result, info). result is "subtitles remuxed", "would remux
+    subtitles: ...", "subtitle remux failed: ..." or "subtitle remux skipped, ...".
+
+    ffmpeg copies every other stream with -copyinkf, and reads each retimed track from a second input of the same file
+    with -itsoffset and -itsscale, so its cues move to (time - offset) / rate. mkvmerge moves the times of laced AAC
+    frames by up to 2 ms in a Matroska to Matroska remux, and the proof refuses that. ffmpeg keeps the times it reads,
+    and the proof passes. mkvpropedit then puts back each kept track's UID, BCP 47 tag, name and flags, and the Segment
+    UID, which ffmpeg does not keep. The new file must keep every other track and its properties (props_fault()), and
+    prove() must show every packet of every kept stream the same, the retimed tracks' times as the fix moves them.
+
+    It runs like repack(): the temp file in HIDE_DIR, no time limit during the remux, and SIGTERM removes the temp file.
+    The original must still be the file st describes. The temp file takes its owner and mode, the original is kept in
+    originals_root() for KEEP_DAYS, and the temp file is renamed over it. A removal needs that kept original, so with
+    KEEP_ORIGINALS_DAYS 0 the caller never asks for one."""
+    info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop)}
+    what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
+                     + [f"remove track {i}" for i in drop])
+    why = repack_skip(path, st)
+    if why:
+        return f"subtitle remux skipped, {why}: {what}", info
+    if not apply:
+        return f"would remux subtitles: {what}", info
+    tmp, folder = repack_tmp(path), tempfile.mkdtemp(prefix="arr-media-guard-resub-")
+    subs = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]   # the k-th of them is ffprobe's k-th
+    main = threading.current_thread() is threading.main_thread()
+    if main:
+        signal.alarm(0)   # never kill the remux mid-write
+    info["warnings"] = None   # process() re-arms the time limit on this key
+    term = signal.signal(signal.SIGTERM, stopped) if main else None
+    try:
+        streams = ff_streams(path)[1]
+        text = [x["index"] for x in streams if x.get("codec_type") == "subtitle"]
+        if len(text) != len(subs):
+            raise RuntimeError(f"ffprobe reads {len(text)} subtitle streams and mkvmerge {len(subs)}")
+        moved, gone = {text[subs.index(i)]: f for i, f in fixes.items()}, {text[subs.index(i)] for i in drop}
+        argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
+        for x, f in moved.items():   # one input per track: -itsoffset holds for a whole input
+            argv += ["-itsoffset", f"{-f['offset']:.3f}", f"-itsscale:{x}", repr(1 / float(fractions.Fraction(f["rate"]))), "-i", path]
+        source, kept = {x: n for n, x in enumerate(moved, 1)}, [x["index"] for x in streams if x["index"] not in gone]
+        argv += [a for x in kept for a in ("-map", f"{source.get(x, 0)}:{x}")]
+        # A cue the fix moves before 0 starts at 0, as srt_moved() does. A negative time would make ffmpeg move every stream.
+        clamp = "setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(0\\,PTS+DURATION)\\,DURATION)"
+        argv += [a for n, x in enumerate(kept) if x in moved for a in (f"-bsf:{n}", clamp)]
+        argv += ["-c", "copy", "-copyinkf", "-default_mode", "passthrough", "-f", "matroska", tmp]
+        new_tmp(tmp)
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+        info["warnings"] = mask((r.stdout + r.stderr).strip())[-500:] or None
+        if r.returncode or info["warnings"]:
+            raise RuntimeError(f"ffmpeg exited {r.returncode}: {info['warnings']}")
+        uid = ((j.get("container") or {}).get("properties") or {}).get("segment_uid")
+        edits = ["--edit", "info", "--set", f"segment-uid=0x{uid}"] if uid else []
+        for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("id") not in drop), 1):   # the n-th track of the new file
+            p = t.get("properties") or {}
+            sets = [f"{name}={int(v) if isinstance(v, bool) else v}" for k, name in PROP_EDITS if (v := p.get(k)) is not None]
+            edits += ["--edit", f"track:{n}"] + [a for x in sets for a in ("--set", x)] if sets else []
+        e = subprocess.run(["mkvpropedit", tmp, *edits], capture_output=True, text=True, errors="replace")
+        if e.returncode > 1:
+            raise RuntimeError(f"mkvpropedit exited {e.returncode}: {mask((e.stdout + e.stderr).strip())[-300:]}")
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)   # a write error the NAS still holds shows here, before the checks read the file
+        finally:
+            os.close(fd)
+        new = mkvmerge(tmp)
+        fault = props_fault(j, new, drop)
+        if not fault:
+            kept = [i for i in subs if i not in drop]
+            fault, info["proof"] = prove(path, tmp, [], folder, dropped=gone, retimed={kept.index(i): f for i, f in fixes.items()}, absolute=True)
+        if fault: raise RuntimeError(fault)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError as ex:   # a NAS share may refuse chown. The mode stays.
+            new_st = os.stat(tmp)
+            info["owner"] = {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{new_st.st_uid}:{new_st.st_gid}", "why": f"chown refused: {ex}"}
+        os.chmod(tmp, st.st_mode & 0o7777)
+        size, now = os.path.getsize(tmp), None
+        with contextlib.suppress(FileNotFoundError):
+            now = os.stat(path)
+        if not now or (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
+            raise SourceChanged("the app replaced or renamed the original during the subtitle remux")
+        if KEEP_DAYS:
+            try:
+                info["kept"] = keep_original(path)
+            except OSError as ex:
+                raise RuntimeError(f"the original could not be kept, so it stays: {ex}") from None
+        os.replace(tmp, path)
+    except BaseException as ex:
+        with contextlib.suppress(OSError):
+            if info.get("kept") and os.stat(path).st_ino == st.st_ino:   # the rename never ran, so the original is still at path
+                os.remove(info["kept"])
+                del info["kept"]
+        if not isinstance(ex, Exception):
+            raise
+        return mask(f"subtitle remux failed{', the original changed' if isinstance(ex, SourceChanged) else ''}: {ex}")[:500], info
+    finally:
+        if main:
+            signal.signal(signal.SIGTERM, term)
+        shutil.rmtree(folder, ignore_errors=True)
+        drop_tmp(tmp)
+    if info.get("kept"):
+        prune_originals(originals_root(path))
+    info["new_size"] = size
+    return "subtitles remuxed", info
+
+
 def rescan(app, owner):
     """Ask the app to rescan one movie or series, so its size and media info follow a repack. Returns "sent" or why not."""
     if not owner: return "no item id"
@@ -3280,7 +3890,8 @@ def sidecar_subs(path):
     ordered, read}. The first part after the base name is the language when it reads as a code (Movie.en.srt, Movie.eng.srt),
     else und. forced, hi, sdh and cc set a flag (Movie.en.forced.srt, Movie.en.hi.srt). The charset is UTF-16 by its
     BOM, UTF-8 when the bytes decode as UTF-8, else cp1252. end is where its last cue ends, in seconds. ordered says
-    each cue starts no earlier than the one before, else mkvmerge warns. read is text_language() of its first cues."""
+    each cue starts no earlier than the one before, else mkvmerge warns. read is text_language() of its first cues, and
+    cues is srt_cues() of its text."""
     folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
     try:
         names = sorted(n for n in os.listdir(folder) if n.startswith(base + ".") and n.lower().endswith(".srt"))
@@ -3303,7 +3914,7 @@ def sidecar_subs(path):
         starts = [(int(h), int(m), int(s), int(f.ljust(3, "0")[:3])) for h, m, s, f in starts]
         out.append(dict(path=os.path.join(folder, n), name=n, lang=lang, flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
                         charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts),
-                        read=arr_decide.text_language(c[2] for c in cues)))
+                        read=arr_decide.text_language(c[2] for c in cues), cues=cues))
     return out
 
 
@@ -3442,7 +4053,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     return stats, texts
 
 
-def prove(src, tmp, subs, folder, captions=None):
+def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False):
     """(why the new file tmp is not a lossless copy of src with the sidecars subs, or None; the proof per stream). No
     stream is ever decoded.
 
@@ -3473,10 +4084,17 @@ def prove(src, tmp, subs, folder, captions=None):
     named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length. An
     audio packet that shares its time with a neighbour may move one frame, see times_fault(). captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
-    ones, and its text must match."""
+    ones, and its text must match.
+
+    dropped holds the stream indexes of src that the remux left out on purpose, a subtitle that does not match the
+    audio. retimed maps the k-th subtitle stream of src, from 0, to the fix of arr_subsync.timing() that the remux
+    applied: its packets must match, and its times are compared as the fix moves them, a time before 0 at 0. absolute
+    holds each stream to its own start time too, within SYNC, for a remux that must move no stream. The other checks
+    compare each start with the video's, so a remux that moved every stream would pass them."""
     fa, sa, _ = ff_streams(src)
     fb, sb, _ = ff_streams(tmp)
-    a, b, fam = media_streams(sa), media_streams(sb), fa.split(",")[0]
+    a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped], media_streams(sb), fa.split(",")[0]
+    moved = {s["index"]: (retimed or {})[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in (retimed or {})}
     pairs, proof = [], []
     captions = captions or {}
     for kind in ("video", "audio", "subtitle"):
@@ -3519,6 +4137,11 @@ def prove(src, tmp, subs, folder, captions=None):
                           count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), hash=x["digest"][:16],
                           match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
         xt, yt, xs, why, ycut = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None)
+        if s["index"] in moved:   # the times the fix gives, as mkvmerge --sync wrote them
+            fx = moved[s["index"]]
+            to = lambda t: max(0, arr_subsync.moved(t * 1000, fx)) / 1000
+            xt, xs = [None if t is None else to(t) for t in xt], to(xs)
+            proof[-1].update(retimed=fx, start=[round(xs - va, 3), proof[-1]["start"][1]])
         if x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame, and that passes
             proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[:-1]
@@ -3567,6 +4190,8 @@ def prove(src, tmp, subs, folder, captions=None):
             why = f"the packet data of stream {name} ({s['codec_name']}) differ"
         if not why and abs((xs - va) - (y["start"] - vb)) > SYNC:   # every stream, the exceptions included
             why = f"stream {name} starts {y['start'] - vb:+.3f} s from the video in the new file, {xs - va:+.3f} s in the original"
+        if not why and absolute and abs(xs - y["start"]) > SYNC:
+            why = f"stream {name} starts at {y['start']:.3f} s in the new file, {xs:.3f} s in the original"
         if not why and fam == "avi" and s["codec_type"] == "audio":
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:
@@ -3585,7 +4210,7 @@ def prove(src, tmp, subs, folder, captions=None):
         fault = fault or why
     for s, t, sc in pairs:
         if sc:
-            with open(sc["path"], "rb") as f:
+            with open(sc.get("mux") or sc["path"], "rb") as f:
                 ca = srt_cues(f.read().decode(PY_CHARSET[sc["charset"]], errors="replace"))
             what = f"the captions of stream {s['index']}" if s else f"the sidecar {sc['name']}"
             why = cue_fault(what, ca, srt_cues(tb[t["index"]]))
@@ -3889,26 +4514,105 @@ def convert_captions(path, streams, folder, size):
     return out, None
 
 
-def convert_cmd(src, tmp, j, subs, streams=None, captions=()):
+def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=()):
     """The remux of src, its captions and its sidecars subs into tmp. mkvmerge keeps the track order and every track it
-    reads, then adds each caption SubRip of convert_captions() as "English (CC)", then the sidecars. A container
+    reads but the subtitle track ids in drop, then adds each caption SubRip of convert_captions() as "English (CC)",
+    then the sidecars. A sidecar with new times goes in from its "mux" file. A container
     mkvmerge cannot read (ASF) goes through ffmpeg -c copy -copyinkf instead, with streams, its ffprobe streams, and never
     a new encode. -copyinkf keeps the frames before the first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
             + ["-c", "copy", "-copyinkf", "-f", "matroska", tmp]   # the frames before the first keyframe too
-    ids = [t.get("id") for t in j.get("tracks") or []]
+    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in drop]
     extra = len(captions) + len(subs)
     order = ["--track-order", ",".join([f"0:{i}" for i in ids] + [f"{n}:0" for n in range(1, extra + 1)])] if ids and None not in ids else []
-    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order, src]   # each frame its own block, see times_fault()
+    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order, *(["-s", "!" + ",".join(map(str, drop))] if drop else []),
+                   src]   # each frame its own block, see times_fault()
     for c in captions:
         argv += ["--language", "0:en", "--track-name", f"0:{CC_NAME}", "--sub-charset", "0:UTF-8", "--default-track-flag", "0:0",
                  "--forced-display-flag", "0:0", c["path"]]
     for s in subs:
         argv += ["--language", f"0:{s['lang']}", "--sub-charset", f"0:{s['charset']}", "--default-track-flag", "0:0"]
-        argv += [a for f in s["flags"] for a in (f, "0:1")] + [s["path"]]
+        argv += [a for f in s["flags"] for a in (f, "0:1")] + [s.get("mux") or s["path"]]
     return argv
+
+
+def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=()):
+    """The subtitle match check of a conversion (docs/design.md, "Subtitle match"). It checks each sidecar in subs and
+    each built-in text track, in a SUB_ROLES role and in the language of a main audio track, against the audio. A
+    forced sidecar is never checked. Returns (the sidecars to mux, [(mkvmerge track id, ffprobe stream index)] of the
+    tracks to leave out). info gets the results in subcheck and what changed.
+
+    A sidecar that does not match is not muxed. On apply it moves into originals_root() as a kept original. With
+    KEEP_ORIGINALS_DAYS 0, or no place to keep it, it stays beside the file. A built-in track that does not match is
+    left out of the remux, and convert() keeps the original. With no place to keep it the track stays in. A sidecar whose times need a fix is kept the same way, and its text with new times goes in
+    the remux. A built-in track whose times need a fix gets them after the conversion, from the check of the new
+    Matroska file, which reads the same windows and the words carried over, see process(). known holds the item's
+    original languages for sub_hold()."""
+    if dur < SUB_MIN_SECONDS or not lid_ready():
+        return subs, []
+    ts = arr_decide.classify(j)
+    audio = sub_audio(ts)
+    items, text = {}, [x for x in media_streams(streams) if x.get("codec_type") == "subtitle"]
+    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
+    for s in subs:
+        lang = side_code(s)
+        k = arr_decide.lang_key(lang)
+        if k in audio and SIDECAR_FLAGS["forced"] not in s["flags"] and spaced(lang):
+            items[s["name"]] = (lang, audio[k], [(a / 1000, b / 1000, t) for a, b, t in s["cues"]])
+    for n, t in enumerate(t for t in ts if t["kind"] == "s"):
+        x = text[n] if len(text) == len(ids) else None   # the k-th ffprobe subtitle is mkvmerge's k-th
+        k = arr_decide.lang_key(t["lang"])
+        if x and x.get("codec_name") in ("subrip", "ass", "ssa", "webvtt", "mov_text") and t["role"] in SUB_ROLES and k in audio and spaced(t["lang"]):
+            r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{x['index']}", "-c:s", "srt", "-f", "srt", "-"],
+                               capture_output=True, text=True, errors="replace", timeout=600)
+            items[t["pos"]] = (t["lang"], audio[k], [(a / 1000, b / 1000, c) for a, b, c in (srt_cues(r.stdout) if r.returncode == 0 else [])])
+    if not items:
+        return subs, []
+    got = info["subcheck"] = sub_held(sub_verdicts(path, j, items), items, ts, known)
+    keep = []
+    for s in subs:
+        r = got.get(s["name"]) or {}
+        fix = SUB_TIMING and (r.get("timing") or {}).get("fix")
+        if r.get("verdict") == "mismatch" or (fix and apply):
+            why = (keepable(s["path"], os.stat(s["path"])) or None) if KEEP_DAYS else "KEEP_ORIGINALS_DAYS is 0"
+        if r.get("verdict") == "mismatch":   # rather no subtitle than a wrong one
+            entry = {"name": s["name"], "why": r["why"]}
+            info.setdefault("sidecars_unmatched", []).append(entry)
+            try:
+                if apply and why: raise OSError(why)
+                if apply:
+                    entry["moved"] = keep_original(s["path"])
+                    os.remove(s["path"])
+            except OSError as ex:
+                entry["left"] = mask(str(ex))[:200]
+            continue
+        if fix and apply:
+            try:
+                if why: raise OSError(why)
+                with open(s["path"], "rb") as f:
+                    text_now = f.read().decode(PY_CHARSET[s["charset"]], errors="replace")
+                mux = os.path.join(folder, f"retimed-{len(keep)}.srt")
+                with open(mux, "w", encoding="utf-8") as f:
+                    f.write(srt_moved(text_now, fix))
+                info.setdefault("sidecars_kept", []).append(keep_original(s["path"]))
+                s = dict(s, mux=mux, charset="UTF-8", retimed=fix)
+                info.setdefault("sidecars_retimed", []).append(s["name"])
+            except OSError as ex:
+                info.setdefault("sidecars_not_retimed", []).append(mask(f"{s['name']}: {ex}")[:200])
+        elif fix:
+            info.setdefault("sidecars_would_retime", []).append(s["name"])
+        keep.append(s)
+    wrong = [(n, t["pos"]) for n, t in enumerate(t for t in ts if t["kind"] == "s") if (got.get(t["pos"]) or {}).get("verdict") == "mismatch"]
+    # A track that leaves the file comes back only from the kept original, see convert(). Without one it stays, and
+    # the check of the new Matroska file turns its flags off.
+    why = wrong and ((keepable(path, os.stat(path)) or None) if KEEP_DAYS else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept")
+    if wrong:
+        info["tracks_unmatched"] = [p for _, p in wrong]
+        if why:
+            info["tracks_kept_back"] = why
+    return keep, [] if why else [(ids[n], text[n]["index"]) for n, _ in wrong]
 
 
 def convert_skip(app, path, new, st, ids):
@@ -4424,7 +5128,7 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), HIDE_DIR, os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=()):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (result, info,
     the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not matroska, ...".
@@ -4454,7 +5158,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     in forced_name, and the original is kept too. Its extras still go back by a rescan, which links them by their parsed
     names, so each extra must still parse as the file's episodes. Every other check still runs.
 
-    info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import."""
+    info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import.
+
+    sub runs the subtitle match check first, see convert_subs(): a sidecar that does not match the audio is moved aside,
+    a built-in text track that does not match is left out of the remux, and a sidecar whose times need a fix is muxed
+    with new times. A conversion that leaves a track out keeps the original, as a forced one does. known holds the item's original languages, see sub_hold()."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -4485,7 +5193,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     caps = [] if unreadable else [s for s in media_streams(streams) if s.get("codec_name") in CAPTIONS]
     what = f"the container is {container}" + (", renamed to .mkv" if new != path else "") + (f", {len(subs)} sidecar subtitles" if subs else "") \
         + (f", {len(caps)} CEA-608 caption tracks as SubRip" if caps else "")
-    why, old, items, cc = why or convert_skip(app, path, new, st, ids), {}, {}, {}
+    why, old, items, cc, drop = why or convert_skip(app, path, new, st, ids), {}, {}, {}, []
     if not why and new != path:   # read-only: the app's record of the original, which the ManualImport copies
         old, items, home = app_file(app, ids)
         why = app_refuses(path, old, items, home)
@@ -4497,6 +5205,12 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
                 info["forced_name"] = name
         why = why or score_refuses(app, ids["app_id"], old, new)
     folder = tempfile.mkdtemp(prefix="arr-media-guard-convert-")
+    if not why and sub and not unreadable:
+        try:
+            subs, drop = convert_subs(path, j, streams, subs, dur, apply, folder, info, known)
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
     if not why and caps:   # a read of the whole file, in a dry run too, so the dry run lists a caption track with no text
         try:
             cc, why = convert_captions(path, caps, folder, st.st_size)
@@ -4515,8 +5229,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
     term = signal.signal(signal.SIGTERM, stopped) if main else None
     try:
         new_tmp(tmp)
-        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values())), capture_output=True, text=True,
-                           errors="replace")
+        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), [t for t, _ in drop]),
+                           capture_output=True, text=True, errors="replace")
         info["warnings"] = mask((r.stdout + r.stderr).strip())[-500:] or None
         # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so
         # the proof decides. An error of mkvmerge, and any message of ffmpeg, keep the original.
@@ -4531,7 +5245,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
         new_j = mkvmerge(tmp)
         if (new_j.get("container") or {}).get("type") != "Matroska":
             raise RuntimeError(f"the new file reads as {(new_j.get('container') or {}).get('type')}")
-        fault, info["proof"] = prove(path, tmp, subs, folder, cc)
+        fault, info["proof"] = prove(path, tmp, subs, folder, cc, **({"dropped": {i for _, i in drop}} if drop else {}))
         seen = fault and mask(f"repack failed: {fault}")[:500]   # the refusal as the decision log holds it
         if fault and force and seen != force:
             info["not_forced"] = f"the last refusal in the decision log differs: {force.partition(': ')[2][:200]}"
@@ -4565,7 +5279,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None)
             now = os.stat(path)
         if not now or (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
             raise SourceChanged("the app replaced or renamed the original during the repack")
-        if info.get("forced") or info.get("forced_name"):   # a hard link: one move puts the original back
+        if info.get("forced") or info.get("forced_name") or drop:   # a hard link: one move puts the original back
             try:
                 info["kept"] = keep_original(path)
             except OSError as ex:
@@ -5257,18 +5971,22 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     changed meanwhile, or needs a repack, runs again with the lock exclusive from the start, as a job process does.
     pool is the conversion pool of a --convert apply. The file then holds a slot of it throughout, taken before the
     lock, and its conversion runs under the shared lock, see convert(). A re-run converts under the exclusive lock.
-    --convert takes every file that is not .mkv, so selected() does not apply."""
+    --convert takes every file that is not .mkv, so selected() does not apply. With --sub-check a file whose subtitle
+    check is cached and asks for nothing more is skipped, and the result is "checked". A file with a sidecar is taken
+    then, whatever its tracks."""
     label, original, runtime, want, kids, ctx = info
     started, path = time.time(), f["path"]
     ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": want["guids"]}
     run = lambda lock, shared, pool: process(app, path, label, original, runtime, apply=a.apply, post=False, source="backfill", kids=kids,
                                              release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, ctx=ctx, lock=lock, shared=shared,
-                                             pool=pool, convert_on=a.convert, force=a.force.get(path))
+                                             pool=pool, convert_on=a.convert, force=a.force.get(path), sub_check=a.sub_check)
     try:
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
                 with locked(shared=True) as lock:
-                    if not a.plan_from and not a.convert and not selected(path):
+                    if a.sub_check and sub_cached(path):
+                        return "checked"
+                    if not a.plan_from and not a.convert and not selected(path) and not (a.sub_check and side_stats(path)):
                         return None
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: reshared(lock, path, st)), pool)
@@ -5306,7 +6024,13 @@ def backfill(argv):
     ap.add_argument("--plan-out"); ap.add_argument("--plan-from"); ap.add_argument("--canary", type=int, default=0)
     ap.add_argument("--only-undecided", action="store_true"); ap.add_argument("--convert", action="store_true")
     ap.add_argument("--plex-later", action="store_true"); ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH")
+    ap.add_argument("--sub-check", action="store_true", help="run the subtitle match and timing check too")
+    ap.add_argument("--paths", nargs="+", default=[], metavar="PATH", help="only these files")
     a = ap.parse_args(argv); app, ids = a.app, set(a.ids)
+    if a.sub_check and (a.convert or a.check_audio or a.check_video):
+        ap.error("--sub-check runs with the flag backfill, not with --convert or a scan")
+    if a.paths and (a.check_audio or a.check_video):
+        ap.error("--paths limits the flag backfill, --convert and --sub-check, not a scan")
     if a.force_convert and not (a.convert and a.apply):
         ap.error("--force-convert needs --convert --apply")
     if a.force_convert and not KEEP_DAYS:
@@ -5324,14 +6048,16 @@ def backfill(argv):
     if a.check_audio or a.check_video:
         a.workers = a.workers or max(1, int(CFG.get("SCAN_WORKERS") or 1))   # an explicit --workers wins over SCAN_WORKERS
         return scan(app, a, "audio" if a.check_audio else "video")
-    work = []   # (file, (label, original, runtime, Plex lookup, kids, metadata context))
+    work, library = [], 0   # (file, (label, original, runtime, Plex lookup, kids, metadata context)), and all files for an estimate
     if app == "radarr":
         for m in arr(app, "movie"):
             f = movie_file(m)
+            library += bool(f)
             if f and (not ids or m["id"] in ids):
                 work.append((f, movie_item(m, kids_profiles())))
     else:
         for s in arr(app, "series"):
+            library += (s.get("statistics") or {}).get("episodeFileCount") or 0
             if (ids and s["id"] not in ids) or not (s.get("statistics") or {}).get("episodeFileCount"): continue
             eps = arr(app, f"episode?seriesId={s['id']}")
             for f in arr(app, f"episodefile?seriesId={s['id']}"):
@@ -5351,6 +6077,11 @@ def backfill(argv):
                       or str(r.get("header_repair", "")).startswith("would repair header"))]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
+    if a.paths:   # the run takes only the listed files
+        listed = {os.path.abspath(p) for p in a.paths}
+        for p in sorted(listed - {w[0]["path"] for w in work}):
+            print(f"not in this run's work list, skipped: {p}", flush=True)
+        work = [w for w in work if w[0]["path"] in listed]
     a.force = {}   # path: the refusal a person checked, docs/design.md, "Conversion"
     if a.force_convert:   # the run takes only the listed files
         listed = {os.path.abspath(p) for p in a.force_convert}
@@ -5384,9 +6115,11 @@ def backfill(argv):
     # flight end first and write their decision lines. A dry run keeps the file order.
     results = backfill_files(work, lambda *w: one(w), 2 * workers if pool else 1, stop, converted) if a.apply else \
         zip(work, ex.map(one, work) if ex else map(one, work))
+    subs = collections.Counter()   # the --sub-check summary
     for (f, (label, original, runtime, want, kids, ctx)), got in results:
-        if got is None:
-            counts["not selected"] = counts.get("not selected", 0) + 1
+        if got is None or got == "checked":
+            key = "not selected" if got is None else "subtitles checked before"
+            counts[key] = counts.get(key, 0) + 1
             continue
         took, rec = got
         if out and "plan" in rec:
@@ -5397,12 +6130,13 @@ def backfill(argv):
         for code in {"repacked", *REPAIRED, "would_repair_header"} & set(rec.get("reasons", [])):
             counts[code] = counts.get(code, 0) + 1
         if rec.get("edits") or rec.get("alerts") or rec.get("heard") or key != rec["result"] or "repack" in rec or "header_repair" in rec \
-                or rec["result"].startswith(("error", "VERIFY", "mkvpropedit", "read-only", "hardlinked")):
+                or rec.get("subcheck") or rec["result"].startswith(("error", "VERIFY", "mkvpropedit", "read-only", "hardlinked")):
             pos = {t["sel"]: t["pos"] for t in rec.get("before", [])}
             heard = ", ".join(f'{k} {v["lang"] or "no answer"}' for k, v in (rec.get("heard") or {}).items())
             print(f'{rec["result"][:60]:<12} {label} | {edit_text(pos, rec.get("edits", []))}'
                   f'{" | heard " + heard if heard else ""}'
                   f'{" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else ""}'
+                  f'{" | subtitles " + sub_text(rec) if rec.get("subcheck") else ""}'
                   f'{" | forced, the proof refused: " + rec["repack"]["forced"][:150] if (rec.get("repack") or {}).get("forced") else ""}'
                   f'{" | not forced: " + rec["repack"]["not_forced"][:150] if (rec.get("repack") or {}).get("not_forced") else ""}'
                   f'{" | name forced: " + rec["repack"]["forced_name"][:150] if (rec.get("repack") or {}).get("forced_name") else ""}'
@@ -5420,8 +6154,11 @@ def backfill(argv):
         decision(rec, time.time() - took)   # every file, dry runs too, so a run can be reviewed later
         if "plex_section" in rec:   # after the decision line, so a folder scan elsewhere sees this analyze at once
             time.sleep(PLEX_PACE)
-        if "after the run" in ((rec.get("repack") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan")):
+        if "after the run" in ((rec.get("repack") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan"),
+                               (rec.get("subremux") or {}).get("rescan")):
             rescans.add(rec["ids"]["app_id"])
+        if a.sub_check:
+            sub_count(subs, rec, took)
         if (rec.get("repack") or {}).get("pending"):
             settles.setdefault(rec["ids"]["app_id"], []).append(rec["repack"]["pending"])
         owner = (rec.get("ids") or {}).get("app_id")
@@ -5433,7 +6170,7 @@ def backfill(argv):
             print(f"stopped after {converted[0]} conversions, the cap of one run (CONVERT_MAX_FILES)", flush=True)
             stop.set()
         needed += rec["result"] in ("edited", "dry run") or rec["result"].startswith("would repack") \
-            or bool({*REPAIRED, "would_repair_header"} & set(rec.get("reasons", [])))
+            or bool({*REPAIRED, "would_repair_header", "would_remux_subtitles"} & set(rec.get("reasons", [])))
         if a.limit and needed >= a.limit: stop.set()
         if stop.is_set() and not pool: break   # a pool lets its files in flight end, see backfill_files()
     if ex: ex.shutdown(cancel_futures=True)
@@ -5448,6 +6185,45 @@ def backfill(argv):
         log(dict(app=app, source="backfill", label=p["label"], path=p["path"], result="plex", plex=done, plex_reason=code, decision_id=p["decision_id"]))
         time.sleep(PLEX_PACE)
     print("summary:", json.dumps(counts))
+    if a.sub_check:
+        print(sub_summary(subs, library), flush=True)
+
+
+def sub_text(rec):
+    """One line of a backfill's report: each checked track's verdict, overlaps and timing."""
+    out = []
+    for p, r in sorted(rec["subcheck"].items()):
+        laps = "/".join(f'{w["overlap"]:.0%}' for w in r.get("windows") or [])
+        fix = (r.get("timing") or {}).get("fix")
+        out.append(f'{p} {r["verdict"]}{" " + laps if laps else ""}' + (f' fix {fix["offset"]:+.2f} s {fix["rate"]}' if fix else "")
+                   + ("" if r["verdict"] == "match" else f' ({r["why"]})')
+                   + (f' (times stay: {t["why"]})' if (t := r.get("timing") or {}).get("piecewise") or "unfixed" in t else ""))
+    out += [f'{e["name"]}: {e["action"]} {e["result"]}' for e in rec.get("sidecars") or []]
+    return "; ".join(out) + (f' | {rec["subremux"]["result"][:150]}' if (rec.get("subremux") or {}).get("result") else "")
+
+
+def sub_count(c, rec, took):
+    """Add one file's subtitle check to the counts of a --sub-check backfill."""
+    rs = rec.get("subcheck") or {}
+    c["all"] += 1
+    c["all_seconds"] += took
+    if not rs:
+        return
+    c["files"] += 1
+    c["cpu"] += sum({r["audio"]: r.get("cpu") or 0 for r in rs.values() if not r.get("cached")}.values())
+    for r in rs.values():
+        c[r["verdict"]] += 1
+        c["fixes"] += bool((r.get("timing") or {}).get("fix"))
+
+
+def sub_summary(c, library):
+    """The last line of a --sub-check backfill: what it checked, what it found, the CPU time, and an estimate for the
+    whole library at this run's pace."""
+    each = c["all_seconds"] / c["all"] if c["all"] else 0
+    return (f'subtitle check: {c["files"]} files checked, {c["match"]} tracks match, {c["mismatch"]} do not, {c["unknown"]} unknown, '
+            f'{c["fixes"]} timing fixes, {c["cpu"]:.0f} CPU seconds for the hearing. '
+            + (f'At {each:.1f} seconds a file, all {library} files of the library take about {each * library / 3600:.1f} hours.'
+               if c["all"] else "No file ran, so there is no estimate."))
 
 
 def rescan_item(app, owner, keys):

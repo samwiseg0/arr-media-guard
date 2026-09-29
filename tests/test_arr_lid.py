@@ -222,3 +222,150 @@ def test_real_model_on_a_generated_clip(tmp_path):
     import numpy as np
     _, _, probs = arr_lid.load(model_dir=MODEL_DIR).detect_language(np.zeros(16000 * 5, np.float32))
     assert {w for w, _ in probs} <= set(arr_lid.WHISPER) and len(probs) >= 99
+
+
+# --- the subtitle check's words (docs/design.md, "Subtitle match") -------------------------------------------------
+
+@pytest.fixture
+def ears(monkeypatch, tmp_path):
+    """listen() with ffmpeg and the model mocked. Each second of the audio is one byte that names the second, and the
+    model hears one word in each second of the clip, the byte it holds. Returns the call log, a media file and the cache."""
+    calls = {"load": 0, "extract": [], "clips": []}
+
+    def extract(path, index, start, secs=30):
+        calls["extract"].append((index, start, secs))
+        return b"".join(bytes([(int(start) + k) % 250 + 1]) * 32000 for k in range(int(secs)))
+
+    def transcribe(whisper, pcm, lang):
+        calls["clips"].append((len(pcm), lang))
+        return [[k + 0.25, f"w{pcm[k * 32000]}"] for k in range(len(pcm) // 32000)]
+
+    monkeypatch.setattr(arr_lid, "load", lambda *a: calls.__setitem__("load", calls["load"] + 1) or "model")
+    monkeypatch.setattr(arr_lid, "extract", extract)
+    monkeypatch.setattr(arr_lid, "transcribe", transcribe)
+    media = tmp_path / "Show A S01E01.mkv"
+    media.write_bytes(b"x" * 100)
+    return calls, str(media), str(tmp_path / "state" / "lid.sqlite")
+
+
+def test_listen_hears_both_windows_as_one_clip_and_caches_the_words(ears):
+    calls, media, cache = ears
+    r = arr_lid.listen(media, 1, [200.0, 1000.0], "eng", cache=cache)
+    n = arr_lid.WORD_SECS
+    assert calls["clips"] == [(2 * n * 32000, "eng")] and calls["extract"] == [(1, 200.0, n), (1, 1000.0, n)]   # one model run
+    assert [w["at"] for w in r["windows"]] == [200.0, 1000.0] and not r["cached"]
+    assert r["windows"][0]["words"][0] == [0.25, "w201"] and r["windows"][1]["words"][0] == [0.25, f"w{1000 % 250 + 1}"]
+    assert all(0 <= t < n for w in r["windows"] for t, _ in w["words"]) and len(r["windows"][1]["words"]) == n
+    again = arr_lid.listen(media, 1, [200.0, 1000.0], "eng", cache=cache)
+    assert again["cached"] and again["windows"] == r["windows"] and calls["load"] == 1
+    assert not arr_lid.listen(media, 1, [200.0, 1001.0], "eng", cache=cache)["cached"]   # other windows are another key
+
+
+def test_listen_cuts_its_windows_from_the_samples_the_language_check_kept(ears, monkeypatch):
+    """No audio is decoded twice: a window inside a kept sample is cut from it."""
+    calls, media, cache = ears
+    monkeypatch.setattr(arr_lid, "detect", lambda whisper, pcm: {"speech": 20.0, "lang": "eng", "prob": 0.97, "top": []})
+    arr_lid.identify(media, 1, 1200, cache=cache, keep=True)
+    kept = sorted(arr_lid.kept_pcm(cache, media, 1))
+    assert kept == [(300, 30), (600, 30), (900, 30)] and arr_lid.kept_pcm(cache, media, 0) == []
+    calls["extract"].clear()
+    r = arr_lid.listen(media, 1, [305.0, 1000.0], "eng", cache=cache)
+    # the window at 305 s is cut 5 s into the sample at 300 s: its first second is second 305, byte 305 % 250 + 1
+    assert calls["extract"] == [(1, 1000.0, arr_lid.WORD_SECS)] and r["reused"] == 1 and r["windows"][0]["words"][0] == [0.25, "w56"]
+    with monkeypatch.context() as mp:   # after PCM_KEEP the samples are gone
+        mp.setattr(arr_lid, "PCM_KEEP", -1)
+        assert arr_lid.kept_pcm(cache, media, 1) == []
+
+
+def test_listen_refuses_a_language_whisper_cannot_write(ears):
+    calls, media, cache = ears
+    with pytest.raises(ValueError, match="whisper cannot transcribe gle"):
+        arr_lid.listen(media, 1, [200.0, 1000.0], "gle", cache=cache)
+    assert calls["load"] == 0
+
+
+def test_the_words_follow_an_edit_and_a_conversion(ears, tmp_path):
+    calls, media, cache = ears
+    arr_lid.listen(media, 1, [200.0, 1000.0], "eng", cache=cache)
+    new = str(tmp_path / "Show A S01E01 new.mkv")
+    before = os.stat(media)
+    os.rename(media, new)
+    arr_lid.carry(new, before, cache, was=media)   # a conversion: the proof shows the same audio
+    assert arr_lid.listen(new, 1, [200.0, 1000.0], "eng", cache=cache)["cached"]
+
+
+def test_the_verdict_cache_holds_the_pending_mark(tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"x")
+    cache = str(tmp_path / "lid.sqlite")
+    assert arr_lid.verdict_get(cache, str(media)) is None and not os.path.exists(cache)   # a read never creates the cache
+    arr_lid.verdict_put(cache, str(media), {"s1": "match"}, False)
+    assert arr_lid.verdict_get(cache, str(media)) == ({"s1": "match"}, False)
+    arr_lid.verdict_put(cache, str(media), {"s1": "mismatch"}, True)
+    assert arr_lid.verdict_get(cache, str(media)) == ({"s1": "mismatch"}, True)
+    before = os.stat(media)
+    os.utime(media, ns=(before.st_atime_ns, before.st_mtime_ns + 10**9))
+    arr_lid.carry(str(media), before, cache)   # an edit changes the file, so the verdict must be made again
+    assert arr_lid.verdict_get(cache, str(media)) is None
+
+
+def test_transcribe_drops_a_looping_segment(monkeypatch):
+    """A segment whose text compresses past MAX_COMPRESSION is Whisper saying one phrase again and again."""
+    import types
+    w = lambda t, x: types.SimpleNamespace(start=t, word=x)
+    segs = [types.SimpleNamespace(compression_ratio=1.4, words=[w(0.5, " Mira"), w(0.9, " runs.")]),
+            types.SimpleNamespace(compression_ratio=9.0, words=[w(2.0 + k / 10, " hey") for k in range(108)])]
+    asked = {}
+    model = types.SimpleNamespace(transcribe=lambda audio, **kw: asked.update(kw) or (iter(segs), None))
+    fake = types.ModuleType("numpy")   # the tests run without numpy
+    fake.int16 = fake.float32 = None
+    fake.frombuffer = lambda b, t: types.SimpleNamespace(astype=lambda t: 1.0)
+    monkeypatch.setitem(sys.modules, "numpy", fake)
+    assert arr_lid.transcribe(model, b"\0\0" * 16000, "eng") == [[0.5, "Mira"], [0.9, "runs."]]
+    assert not asked["condition_on_previous_text"] and asked["beam_size"] == 1 and asked["compression_ratio_threshold"] == arr_lid.MAX_COMPRESSION
+
+
+def test_the_model_loads_once_per_process(monkeypatch):
+    import types
+    made = []
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = lambda *a, **k: made.append(k["cpu_threads"]) or object()
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    monkeypatch.setattr(arr_lid, "LOADED", {})
+    first = arr_lid.load("small", "/models", 4)
+    assert arr_lid.load("small", "/models", 1) is first and made == [4]   # the subtitle check reuses the language check's model
+
+
+def test_listen_hears_a_third_window_in_the_same_process(ears, monkeypatch):
+    """The early window hears two words. The window of its part in more is heard in the same process, with the model
+    loaded once. The late window heard enough, so its entry in more is never heard."""
+    calls, media, cache = ears
+    def transcribe(whisper, pcm, lang):
+        calls["clips"].append((len(pcm), lang))
+        n = len(pcm) // 32000
+        return [[k + 0.25, f"word{pcm[k * 32000]}x{k}"] for k in range(n) if not 201 <= pcm[k * 32000] <= 210 or k < 2]   # the window at 200 s
+    monkeypatch.setattr(arr_lid, "transcribe", transcribe)
+    r = arr_lid.listen(media, 1, [200.0, 1000.0], "eng", cache=cache, more=[150.0, 1100.0])
+    assert [(w["at"], w["secs"]) for w in r["windows"]] == [(200.0, arr_lid.WORD_SECS), (1000.0, arr_lid.WORD_SECS), (150.0, arr_lid.THIRD_SECS)]
+    assert calls["load"] == 1 and len(calls["clips"]) == 2 and set(r["profile"]) == {"decode", "whisper", "load"}
+    again = arr_lid.listen(media, 1, [200.0, 1000.0], "eng", cache=cache)
+    assert again["cached"] and again["windows"] == r["windows"]   # the third window is cached with the first two
+    # a lone window, the middle one, that hears too little gets its window in more
+    r = arr_lid.listen(media, 1, [200.0], "eng", cache=cache, more=[600.0])
+    assert [(w["at"], w["secs"]) for w in r["windows"]] == [(200.0, arr_lid.WORD_SECS), (600.0, arr_lid.THIRD_SECS)]
+    # two windows that both hear too little get none: one more window cannot give two good ones
+    r = arr_lid.listen(media, 1, [200.0, 450.0], "eng", cache=cache, more=[150.0, 1100.0])
+    assert [w["at"] for w in r["windows"]] == [200.0, 450.0]
+
+
+def test_jobs_hear_the_windows_the_hook_would_pick(ears, tmp_path):
+    """After a language check, the subtitle check's hearing runs in the same process. The hook's own check then finds
+    the words in the cache."""
+    import arr_subsync
+    calls, media, cache = ears
+    cues = [[60.0 + 3 * i, 62.0 + 3 * i, f"garden window lantern number{i}"] for i in range(400)]
+    spec = tmp_path / "jobs.json"
+    spec.write_text(json.dumps([{"index": 1, "lang": "eng", "cues": cues, "duration": 1320.0}]))
+    (got,) = arr_lid.jobs(media, str(spec), cache)
+    first = arr_subsync.windows(cues, 1320.0, arr_decide.STOPWORDS["eng"])
+    assert got == {"index": 1, "starts": first} and arr_lid.words_get(cache, media, 1, arr_lid.tag(arr_lid.MODEL), "eng", first) is not None

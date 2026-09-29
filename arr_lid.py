@@ -34,10 +34,17 @@ venv Python in its own process group, with at most 120 seconds, so a slow NAS ne
     /opt/arr-media-guard-lid/venv/bin/python arr_lid.py PATH INDEX DURATION --cache FILE --model-dir DIR [--fresh] --expect TAG ORIGINAL...
 
 INDEX is the ffmpeg audio index (0:a:INDEX), the same index the hook's sample() uses. The CLI prints one JSON line.
+--keep-pcm keeps the audio of each sample in the cache for an hour, so the subtitle check can cut its windows from it.
+
+The subtitle check (docs/design.md, "Subtitle match") asks for the words of short windows instead:
+
+    /opt/arr-media-guard-lid/venv/bin/python arr_lid.py PATH INDEX DURATION --cache FILE --model-dir DIR --words LANG START...
+
+listen() transcribes every window in one Whisper run and caches the words by the same file identity.
 At install, "arr_lid.py --fetch" downloads the pinned model once and checks its sha256. docs/design.md, section
 "Audio language detection", has the rules and the install.
 """
-import argparse, fcntl, hashlib, json, os, sqlite3, subprocess, sys, time
+import argparse, fcntl, hashlib, json, os, resource, sqlite3, subprocess, sys, time
 from contextlib import closing
 
 ENGINE = "faster-whisper"
@@ -58,6 +65,13 @@ MIN_SPEECH = 8.0                         # seconds of speech a sample needs befo
 SAMPLE_MIN_PROB = 0.60                   # a sample under this names no language, it neither votes nor vetoes
 MIN_VOTES = 2
 MIN_PROB = 0.80                          # the mean probability of the agreed language over the votes
+# The subtitle check. Its two windows go through Whisper as one clip, so the encoder runs once. More threads cost more
+# CPU time than they save in wall time, so the check runs one thread.
+WORD_SECS = 10                           # seconds of each window, arr_subsync.WINDOW
+THIRD_SECS = 24                          # seconds of a third window, arr_subsync.THIRD
+MAX_COMPRESSION = 2.4                    # a segment whose text compresses more is a loop, faster-whisper's own threshold
+WORD_THREADS = 1
+PCM_KEEP = 3600                          # seconds a kept language sample stays in the cache for the subtitle check
 
 # Whisper's 99 languages plus yue (large-v3 only), as the ISO 639-2/B codes the classifier uses. no and nn are both
 # Norwegian, zh and yue Chinese.
@@ -86,6 +100,9 @@ WEAK = {"bel"}
 KIN = [{"srp", "hrv", "bos"}, {"hin", "urd"}, {"glg", "spa"}, {"glg", "por"}, {"cat", "spa"}, {"bul", "mac"}, {"rus", "ukr"},
        {"cze", "slo"}, {"nor", "dan", "swe"}, {"ind", "may"}, {"dut", "afr"}]
 UNTAGGED = {"und", "mul", "zxx", ""}
+
+
+WHISPER_CODE = {v: k for k, v in WHISPER.items() if k not in ("nn", "yue")}   # 639-2/B -> the code Whisper takes
 
 
 def code(lang):
@@ -128,6 +145,13 @@ def _db(path):
     # dur is the duration the caller passed, rounded. The cut positions follow from it, so it is part of the key.
     db.execute("CREATE TABLE IF NOT EXISTS lid (path TEXT, size INTEGER, mtime_ns INTEGER, idx INTEGER, model TEXT, dur INTEGER,"
                " samples TEXT, at REAL, PRIMARY KEY (path, size, mtime_ns, idx, model, dur))")
+    # The subtitle check: the words of its windows, the audio the language check kept, and each file's verdicts.
+    db.execute("CREATE TABLE IF NOT EXISTS words (path TEXT, size INTEGER, mtime_ns INTEGER, idx INTEGER, model TEXT, lang TEXT,"
+               " win TEXT, words TEXT, at REAL, PRIMARY KEY (path, size, mtime_ns, idx, model, lang, win))")
+    db.execute("CREATE TABLE IF NOT EXISTS pcm (path TEXT, size INTEGER, mtime_ns INTEGER, idx INTEGER, start INTEGER, secs INTEGER,"
+               " pcm BLOB, at REAL, PRIMARY KEY (path, size, mtime_ns, idx, start, secs))")
+    db.execute("CREATE TABLE IF NOT EXISTS subcheck (path TEXT, size INTEGER, mtime_ns INTEGER, result TEXT, pending INTEGER,"
+               " at REAL, PRIMARY KEY (path, size, mtime_ns))")
     return db
 
 
@@ -151,18 +175,56 @@ def cache_put(cache, path, index, model, duration_s, samples, st):
                    (path, st.st_size, st.st_mtime_ns, index, model, round(duration_s), json.dumps(samples), time.time()))
 
 
-def carry(path, before, cache=CACHE):
+def carry(path, before, cache=CACHE, was=None):
     """Move the cached results of path from its os.stat() before an in-place edit to its stat now.
     mkvpropedit changes the mtime but never the audio, so the hook calls this in-process after each edit. It never
-    raises and never creates the cache, because a cache problem must not fail an edit that already happened."""
+    raises and never creates the cache, because a cache problem must not fail an edit that already happened.
+    was is the old path of a conversion, whose proof shows the same audio. Only the subtitle check's words move then."""
     if not os.path.exists(cache): return
     try:
         st = os.stat(path)
         with closing(_db(cache)) as db, db:
-            db.execute("UPDATE OR REPLACE lid SET size=?, mtime_ns=? WHERE path=? AND size=? AND mtime_ns=?",
-                       (st.st_size, st.st_mtime_ns, path, before.st_size, before.st_mtime_ns))
+            for table in ("words",) if was else ("lid", "words", "pcm"):   # never subcheck: a changed file needs a new verdict
+                db.execute(f"UPDATE OR REPLACE {table} SET path=?, size=?, mtime_ns=? WHERE path=? AND size=? AND mtime_ns=?",
+                           (path, st.st_size, st.st_mtime_ns, was or path, before.st_size, before.st_mtime_ns))
     except (sqlite3.Error, OSError):
         pass
+
+
+def verdict_get(cache, path):
+    """(the subtitle check's cached result, pending) for path as it is now, or None. pending is True when the result
+    asked for an action that no apply made yet. It never raises and never creates the cache."""
+    try:
+        st = os.stat(path)
+        if not os.path.exists(cache): return None
+        with closing(_db(cache)) as db, db:
+            row = db.execute("SELECT result, pending FROM subcheck WHERE path=? AND size=? AND mtime_ns=?", (path, st.st_size, st.st_mtime_ns)).fetchone()
+        return (json.loads(row[0]), bool(row[1])) if row else None
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+
+
+def verdict_put(cache, path, result, pending):
+    """Cache the subtitle check's result for path as it is now. It never raises, because the check is done."""
+    try:
+        st = os.stat(path)
+        with closing(_db(cache)) as db, db:
+            db.execute("INSERT OR REPLACE INTO subcheck VALUES (?, ?, ?, ?, ?, ?)",
+                       (path, st.st_size, st.st_mtime_ns, json.dumps(result), int(pending), time.time()))
+    except (sqlite3.Error, OSError):
+        pass
+
+
+def kept_pcm(cache, path, index):
+    """[(start, seconds)] of the audio of stream index that the language check kept for path as it is now. It never raises."""
+    try:
+        st = os.stat(path)
+        if not os.path.exists(cache): return []
+        with closing(_db(cache)) as db, db:
+            return db.execute("SELECT start, secs FROM pcm WHERE path=? AND size=? AND mtime_ns=? AND idx=? AND at>?",
+                              (path, st.st_size, st.st_mtime_ns, index, time.time() - PCM_KEEP)).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
 
 
 def extract(path, index, start, secs=SAMPLE_SECS):
@@ -192,10 +254,17 @@ def fetch(model_dir=MODEL_DIR):
     return "downloaded"
 
 
+LOADED = {}   # (model, model_dir) -> the model this process loaded, so the language check and the subtitle check share it
+
+
 def load(model=MODEL, model_dir=MODEL_DIR, threads=THREADS):
-    """The Whisper model from its local directory. int8 on CPU. Never downloads."""
-    from faster_whisper import WhisperModel
-    return WhisperModel(os.path.join(model_dir, model), device="cpu", compute_type="int8", cpu_threads=threads, local_files_only=True)
+    """The Whisper model from its local directory. int8 on CPU. Never downloads. A process loads it once: a later call
+    gets the model loaded before, whatever its thread count, because a load costs a few CPU seconds."""
+    if (model, model_dir) not in LOADED:
+        from faster_whisper import WhisperModel
+        LOADED[model, model_dir] = WhisperModel(os.path.join(model_dir, model), device="cpu", compute_type="int8", cpu_threads=threads,
+                                                local_files_only=True)
+    return LOADED[model, model_dir]
 
 
 def detect(whisper, pcm):
@@ -214,8 +283,9 @@ def detect(whisper, pcm):
     return {"speech": speech, "lang": lang, "prob": round(by[lang], 3), "top": [[w, round(p, 3)] for w, p in probs[:3]]}
 
 
-def identify(path, audio_index, duration_s, expect=(), model=MODEL, model_dir=MODEL_DIR, cache=CACHE, threads=THREADS, fresh=False):
+def identify(path, audio_index, duration_s, expect=(), model=MODEL, model_dir=MODEL_DIR, cache=CACHE, threads=THREADS, fresh=False, keep=False):
     """The spoken language of ffmpeg audio stream audio_index of path. fresh skips the cached samples and hears again.
+    keep puts the audio of each new sample in the cache for PCM_KEEP, for the subtitle check, see listen().
 
     Returns {"lang": 639-2/B code or None, "prob", "why": the reason when lang is None, "samples": per sample
     {"at", "speech", "lang", "prob", "top"}, "engine", "model", "cached", "took": wall seconds}.
@@ -241,22 +311,161 @@ def identify(path, audio_index, duration_s, expect=(), model=MODEL, model_dir=MO
             samples = None if fresh else cache_get(cache, path, audio_index, key, duration_s)   # the other caller may have just heard it
             cached = samples is not None
             if not cached:
-                samples = hear(path, audio_index, duration_s, load(model, model_dir, threads))
+                kept = {}
+                samples = hear(path, audio_index, duration_s, load(model, model_dir, threads), kept if keep else None)
                 cache_put(cache, path, audio_index, key, duration_s, samples, st)
+                with closing(_db(cache)) as db, db:
+                    db.execute("DELETE FROM pcm WHERE at<?", (time.time() - PCM_KEEP,))
+                    db.executemany("INSERT OR REPLACE INTO pcm VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                   [(path, st.st_size, st.st_mtime_ns, audio_index, at, SAMPLE_SECS, pcm, time.time()) for at, pcm in kept.items()])
     lang, prob, why = combine(samples, expect)
     return dict(out, lang=lang, prob=prob, why=why, samples=samples, cached=cached, took=round(time.time() - t0, 2))
 
 
-def hear(path, audio_index, duration_s, whisper):
+def hear(path, audio_index, duration_s, whisper, kept=None):
     """Cut and hear samples in SAMPLE_AT order until SPEECH_SAMPLES hold speech. A position whose window overlaps
-    an earlier cut is skipped, so a short file or a probe with no duration gets one cut and never votes twice."""
+    an earlier cut is skipped, so a short file or a probe with no duration gets one cut and never votes twice.
+    kept, a dict, gets {start: the audio} of each sample."""
     samples = []
     for f in SAMPLE_AT:
         if sum(x["speech"] >= MIN_SPEECH for x in samples) >= SPEECH_SAMPLES: break
         at = round(max(0.0, min(duration_s * f, duration_s - SAMPLE_SECS)))
         if any(abs(at - x["at"]) < SAMPLE_SECS for x in samples): continue
-        samples.append(dict(at=at, **detect(whisper, extract(path, audio_index, at))))
+        pcm = extract(path, audio_index, at)
+        if kept is not None:
+            kept[at] = pcm
+        samples.append(dict(at=at, **detect(whisper, pcm)))
     return samples
+
+
+def transcribe(whisper, pcm, lang):
+    """[[seconds from the clip start, word]] of one clip, in the language lang (639-2/B). Silero VAD drops the silence,
+    and faster-whisper maps the times back. Greedy decoding with no temperature fallback keeps the cost down, and so
+    does a chunk as long as the clip: Whisper pads to 30 seconds by default, and the padding cost decode time. Each
+    segment decodes on its own, not on the text before it, so a loop cannot carry over. A segment whose text
+    compresses more than MAX_COMPRESSION is a loop, one phrase said again and again, and it drops."""
+    import numpy as np
+    audio = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
+    segs, _ = whisper.transcribe(audio, language=WHISPER_CODE.get(code(lang)), beam_size=1, temperature=0.0, word_timestamps=True,
+                                 vad_filter=True, condition_on_previous_text=False, compression_ratio_threshold=MAX_COMPRESSION,
+                                 chunk_length=max(1, -(-len(pcm) // 32000)))
+    return kept_words(segs)
+
+
+def kept_words(segs):
+    """[[start, word]] of faster-whisper segments, with each segment that compresses past MAX_COMPRESSION left out."""
+    return [[round(w.start, 2), w.word.strip()] for s in segs if s.compression_ratio <= MAX_COMPRESSION for w in s.words or [] if w.word.strip()]
+
+
+def clip_of(path, audio_index, starts, secs, kept):
+    """(the audio of the windows of secs from each start as one clip, the windows cut from a kept sample). A short cut
+    at the end pads with silence, so the times stay."""
+    clips, reused, n = [], 0, int(secs * 16000) * 2
+    for s in starts:
+        k = next(((a, p) for a, w, p in kept if a <= s and s + secs <= a + w), None)
+        if k:
+            b = int((s - k[0]) * 16000) * 2
+            clips.append(k[1][b:b + n])
+            reused += 1
+        else:
+            clips.append(extract(path, audio_index, s, secs))
+    return b"".join(c[:n].ljust(n, b"\0") for c in clips), reused
+
+
+def cpu_now():
+    """CPU seconds of this process and its children so far: the model, and ffmpeg."""
+    use = [resource.getrusage(w) for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
+    return sum(u.ru_utime + u.ru_stime for u in use)
+
+
+def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_dir=MODEL_DIR, cache=CACHE, threads=WORD_THREADS,
+           more=None, more_secs=THIRD_SECS):
+    """The words Whisper hears in the windows of secs from each start, on ffmpeg audio stream audio_index of path, in
+    the language lang (639-2/B). The windows go through Whisper as one clip, so the encoder runs once. A window inside
+    a sample the language check kept is cut from that sample, so no audio is decoded twice. more holds a second window
+    per start, or None: when a window hears under arr_subsync.MIN_WORDS words and another does not, or it is the only
+    window, its window in more, of more_secs, is heard too, in this process with the model loaded.
+    Returns {"windows": [{"at", "secs", "words": [[seconds from at, word], ...]}], "cached", "reused": windows cut from a
+    kept sample, "model", "took": wall seconds, "profile": CPU and wall seconds of the model load, the audio decode and
+    Whisper}. The words are cached by path, size, mtime, stream, model, language and the first windows. Raises when
+    ffmpeg or the model fails, and nothing is cached then."""
+    t0, key, win = time.time(), tag(model), json.dumps([[round(s, 1), secs] for s in starts])
+    if code(lang) not in WHISPER_CODE:
+        raise ValueError(f"whisper cannot transcribe {lang}")
+    st = os.stat(path)
+    row = words_get(cache, path, audio_index, key, lang, starts, secs)
+    if row is not None:
+        return {"windows": row, "cached": True, "reused": 0, "model": key, "took": round(time.time() - t0, 2)}
+    os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
+    with open(cache + ".lock", "w") as lock:   # the one model per host, as identify() takes it
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        row = words_get(cache, path, audio_index, key, lang, starts, secs)   # the other caller may have just heard it
+        if row is not None:
+            return {"windows": row, "cached": True, "reused": 0, "model": key, "took": round(time.time() - t0, 2)}
+        with closing(_db(cache)) as db, db:
+            kept = db.execute("SELECT start, secs, pcm FROM pcm WHERE path=? AND size=? AND mtime_ns=? AND idx=? AND at>?",
+                              (path, st.st_size, st.st_mtime_ns, audio_index, time.time() - PCM_KEEP)).fetchall()
+        prof = {}
+
+        def step(name, f, *a):   # CPU and wall seconds of one step, summed per name
+            c, w = cpu_now(), time.time()
+            got = f(*a)
+            prof[name] = [round(prof.get(name, [0, 0])[0] + cpu_now() - c, 2), round(prof.get(name, [0, 0])[1] + time.time() - w, 2)]
+            return got
+
+        whisper = []
+
+        def hear_all(ws, n):   # the windows ws of n seconds as one clip -> [{"at", "secs", "words"}]
+            clip, used = step("decode", clip_of, path, audio_index, ws, n, kept)
+            if not whisper:
+                whisper.append(step("load", load, model, model_dir, threads))
+            heard = step("whisper", transcribe, whisper[0], clip, lang)
+            return [{"at": s, "secs": n, "words": [[round(t - k * n, 2), w] for t, w in heard if k * n <= t < (k + 1) * n]}
+                    for k, s in enumerate(ws)], used
+        windows, reused = hear_all(starts, secs)
+        if more:
+            import arr_subsync
+            few = arr_subsync.short(windows, code(lang))
+            extra = [more[k] for k in few if k < len(more) and more[k] is not None] if len(few) < len(windows) or len(windows) == 1 else []
+            if extra:
+                got, used = hear_all(extra, more_secs)
+                windows, reused = windows + got, reused + used
+        with closing(_db(cache)) as db, db:
+            db.execute("INSERT OR REPLACE INTO words VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (path, st.st_size, st.st_mtime_ns, audio_index, key, code(lang), win, json.dumps(windows), time.time()))
+    return {"windows": windows, "cached": False, "reused": reused, "model": key, "took": round(time.time() - t0, 2), "profile": prof}
+
+
+def words_get(cache, path, audio_index, model, lang, starts, secs=WORD_SECS):
+    """The cached windows of listen() for path as it is now, or None."""
+    st = os.stat(path)
+    with closing(_db(cache)) as db, db:
+        row = db.execute("SELECT words FROM words WHERE path=? AND size=? AND mtime_ns=? AND idx=? AND model=? AND lang=? AND win=?",
+                         (path, st.st_size, st.st_mtime_ns, audio_index, model, code(lang),
+                          json.dumps([[round(s, 1), secs] for s in starts]))).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def jobs(path, spec, cache, model=MODEL, model_dir=MODEL_DIR):
+    """The subtitle check's hearings in the process of a language check, so the model loads once. spec is a JSON file
+    of [{"index", "lang", "cues": [[start, end, text], ...], "duration"}], one per audio stream. The windows come from
+    arr_subsync.windows() with the samples the language check kept, as the hook picks them, so the hook's own check
+    later finds the words in the cache. Returns [{"index", "starts"} or {"index", "error"}]."""
+    import arr_subsync
+    out = []
+    with open(spec) as f:
+        todo = json.load(f)
+    for j in todo:
+        try:
+            stop = arr_subsync.arr_decide.STOPWORDS.get(code(j["lang"]), frozenset())
+            first = arr_subsync.windows(j["cues"], j["duration"], stop, kept_pcm(cache, path, j["index"]))
+            if first:
+                more = arr_subsync.windows(j["cues"], j["duration"], stop, secs=THIRD_SECS, taken=first)
+                listen(path, j["index"], first, j["lang"], cache=cache, model=model, model_dir=model_dir, more=more)
+            out.append({"index": j["index"], "starts": first})
+        except Exception as e:   # the hook's own check tries again
+            out.append({"index": j.get("index"), "error": str(e)[:200]})
+    return out
 
 
 def lower_priority(threads):
@@ -278,19 +487,33 @@ def main(argv=None):
     ap.add_argument("--model", default=MODEL); ap.add_argument("--model-dir", default=MODEL_DIR)
     ap.add_argument("--cache", default=CACHE); ap.add_argument("--threads", type=int, default=THREADS)
     ap.add_argument("--fresh", action="store_true", help="hear the stream again, past the cache")
+    ap.add_argument("--keep-pcm", action="store_true", help="keep the samples' audio for the subtitle check")
+    ap.add_argument("--words", nargs="+", metavar="LANG START", help="the subtitle check: the words of a window from each START")
+    ap.add_argument("--secs", type=float, default=WORD_SECS, help="the seconds of each --words window")
+    ap.add_argument("--more", nargs="+", help="a second window per --words START, - for none, heard when its window hears too little")
+    ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
     a = ap.parse_args(argv)
     if a.fetch:
         print(fetch(a.model_dir))
         return 0
     if a.duration is None: ap.error("PATH, INDEX and DURATION are required")
     try:
-        r = identify(a.path, a.index, a.duration, a.expect, a.model, a.model_dir, a.cache, a.threads, a.fresh)
+        if a.words:
+            more = [None if x == "-" else float(x) for x in a.more] if a.more else None
+            r = listen(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.secs, model=a.model, model_dir=a.model_dir, cache=a.cache,
+                       more=more)
+        else:
+            threads = min(a.threads, WORD_THREADS) if a.then_words else a.threads   # the shared model runs the subtitle check's thread count
+            r = identify(a.path, a.index, a.duration, a.expect, a.model, a.model_dir, a.cache, threads, a.fresh, a.keep_pcm or bool(a.then_words))
+            if a.then_words:
+                r["words"] = jobs(a.path, a.then_words, a.cache, a.model, a.model_dir)
     except Exception as e:   # the hook reads one JSON line either way
         r = {"lang": None, "prob": 0.0, "why": f"error: {e}", "samples": [], "engine": ENGINE, "model": a.model, "error": str(e)}
+    r["cpu"] = round(cpu_now(), 2)   # the model load and ffmpeg too
     print(json.dumps(r))
     return 0 if "error" not in r else 1
 
 
 if __name__ == "__main__":
-    lower_priority(THREADS)
+    lower_priority(WORD_THREADS if "--words" in sys.argv or "--then-words" in sys.argv else THREADS)
     sys.exit(main())

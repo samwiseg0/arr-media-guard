@@ -282,12 +282,15 @@ def audio_target(main, orig, cls):
     return [], None
 
 
-def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=None):
+def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=None, unmatched=()):
     """The planned default-flag changes for one file. kids is kids_title() for the movie or series, release its release name,
     heard the languages arr_lid.py heard (see classify()), spoken TMDB's spoken languages or None (see forced_to_clear()).
     wrong is retag()'s wrong: a subtitle whose text reads as another language than its tag. When no main audio track
     speaks that language, the decision treats the track as that language, and the track loses its default and forced
     flags. Rather no subtitle than a wrong one. Its tag stays.
+    unmatched holds the positions of subtitles whose words do not match the audio (docs/design.md, "Subtitle match").
+    Such a track gets the role "unmatched", which no policy lists, so it never becomes a default. It loses its default
+    and forced flags.
 
     Returns {"edits": [[selector, new flag, current flag], ...], "notes", "reasons": stable codes, "wrong_language",
     "undecided": reason or None, "abstain": its code, "dropped": [broken invariants], "invariants": their codes,
@@ -304,6 +307,10 @@ def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=N
     mute = [t for t in su if t["pos"] in (wrong or {}) and lang_key(wrong[t["pos"]]) not in spoken_here]
     for t in mute:
         t.update(lang=wrong[t["pos"]], lang_why=f'{t["lang_why"]}, the text reads {wrong[t["pos"]]}')
+    for t in su:
+        if t["pos"] in unmatched:
+            t.update(role="unmatched", extra=True)   # extra: never a default, see invariants()
+            mute += [] if t in mute else [t]
     if any(t["conf"] == TITLE_WINS for t in main): say(plan, "title_language_wins")
     if any(t["conf"] == HEARD for t in main): say(plan, "heard_language")
     elif any(t["heard"] for t in main): say(plan, "heard_confirms")
@@ -339,7 +346,9 @@ def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=N
     doubt = (english_subtitles if a["lang"] == "eng" else original_subtitles)(su, want, plan)
     for t in mute:
         want[t["sel"]] = 0
-        if t["default"] or t["forced_flag"]:
+        if (t["default"] or t["forced_flag"]) and t["role"] == "unmatched":
+            say(plan, "subtitle_audio_mismatch", f'{t["pos"]} loses its default and forced flags: its words do not match the audio')
+        elif t["default"] or t["forced_flag"]:
             say(plan, "subtitle_text_muted", f'{t["pos"]} loses its default and forced flags, because its text reads as {t["lang"]}, '
                 'and no main audio track speaks it')
     if doubt:
@@ -1216,6 +1225,25 @@ def block_frame(b, number):
     if not 0 < k <= 4 or e[2] < k + 3 or int.from_bytes(b[d:d + k], "big") & ((1 << 7 * k) - 1) != number or b[d + k + 2] & 0x06:
         return None
     return b[d + k + 3:d + e[2]]
+
+
+def block_times(b):
+    """(the timestamp relative to its Cluster, the BlockDuration or None) of the SimpleBlock or BlockGroup at the start
+    of b, or None when b holds no whole block there. Both are in ticks of the file's timestamp scale."""
+    e = element(b, 0)
+    if not e or e[2] is None or e[1] + e[2] > len(b) or e[0] not in (SIMPLEBLOCK, BLOCKGROUP):
+        return None
+    dur = None
+    if e[0] == BLOCKGROUP:
+        kids = list(children(b, e[1], e[1] + e[2]))
+        dur = next((int.from_bytes(b[d:d + s], "big") for i, d, s in kids if i == BLOCKDURATION), None)
+        e = next((c for c in kids if c[0] == BLOCK), None)
+    if not e or not e[2]:
+        return None
+    k = 9 - b[e[1]].bit_length()   # the track number is an EBML variable-size integer
+    if not 0 < k <= 4 or e[2] < k + 3:
+        return None
+    return int.from_bytes(b[e[1] + k:e[1] + k + 2], "big", signed=True), dur
 
 
 def cluster_blocks(b, start, end, durations, ends):

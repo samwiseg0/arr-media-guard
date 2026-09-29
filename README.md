@@ -16,6 +16,10 @@ re-encodes.
   of common words reads the language of subtitle text. A sidecar whose text is in another language than its name
   goes in with the text's language. A text track with a wrong tag gets a fixed tag, or an alert. When no audio track
   speaks its language, it also stops showing by itself. An `und` track takes the language its text reads.
+- **Subtitle match.** Whisper hears two short windows of the audio, and the hook compares the words with each text
+  subtitle and `.srt` sidecar in the audio's language. A subtitle of another episode leaves the file in a proven
+  remux, or stays out of a conversion. A sidecar of another episode moves to the kept originals, and Bazarr can
+  download it again. A subtitle that runs late by an offset or a frame-rate ratio gets new times.
 - **Broken audio and corrupt video.** It samples the audio that will play and decodes three short video windows.
   A certain fault deletes the file, marks the grab failed and lets the app search again. A daily cap limits this.
 - **Restore after a bad upgrade.** When the broken file was an upgrade, the old file comes back from the app's
@@ -113,6 +117,8 @@ the end of the line. Every key is optional. [examples/arr-media-guard.env](examp
 | `DAMAGE_REGRAB` | `true` | Re-grab an import whose conversion shows a damaged source. `false`: no re-grab. A failed conversion alerts "Repack failed", and a file ffprobe cannot read is only listed. |
 | `RESTORE` | `true` | A re-grab of a broken upgrade puts back the old file from the recycle bin. |
 | `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
+| `SUB_CHECK` | `true` | Compare each text subtitle and sidecar of an import with the audio. Needs language detection. `false`: no check. |
+| `SUB_TIMING` | `true` | Give a matching subtitle new times when its times are off. `false`: it alerts only. |
 | `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced, hard-linked into `KEEP_DIR`. `0` keeps nothing. |
 | `REPACK_MAX_GB` | `30` | A larger file is never remuxed or converted. |
 | `CONVERT` | `false` | Convert every imported file that is not Matroska. A backfill converts only with `--convert`. |
@@ -199,12 +205,23 @@ arr-media-guard --backfill sonarr --check-audio --limit 2000  # scan for broken 
 arr-media-guard --backfill sonarr --check-video --restart     # scan for corrupt video, a new pass
 arr-media-guard --backfill sonarr --convert                   # the files that are not .mkv, dry
 arr-media-guard --backfill sonarr --convert --apply           # convert them, CONVERT_MAX_FILES a run
+arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
+arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
 arr-media-guard --subhunt radarr --ids 123                    # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
 arr-media-guard --audit radarr --since 24h --post             # the hook's edits of the last day, to Discord
 ```
 
 An apply asks Plex to analyze each edited item, after the section is idle on two checks. When "Scan my library
 automatically" is off in Plex, the analyzes that follow need one idle check each. See docs/design.md, "The burst".
+
+`--sub-check` adds the subtitle match check to a backfill, which never runs it by default. It also takes a file with
+a `.srt` sidecar beside it. A dry run prints each verdict and the removal or timing fix it would make, and an apply
+acts as an import does. `--paths` limits the flag backfill, `--convert` and `--sub-check` to the listed files, and
+a scan refuses it. The check caches its verdicts, so a later
+run skips a file that stays as it was, with the same sidecars, and needs nothing more. A stopped run goes on where it
+stopped. It hears at the backfill's priority with one Whisper thread. The last line
+counts the files checked, the verdicts, the timing fixes and the CPU time, and estimates the time for the whole
+library.
 
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.

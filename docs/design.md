@@ -834,6 +834,168 @@ so the cost does not grow with the file size. A track with no cue entries, or wi
 other than zlib, gets no answer. So does a file from a muxer that writes its cue entries in another
 order or size than mkvmerge and ffmpeg. The decision log holds each answer in `read`.
 
+## Subtitle match
+
+A text subtitle can hold the lines of another episode or another cut, and so can a sidecar. `arr_subsync.py` checks a
+text subtitle against the audio. The owner's rule is "rather no subtitle than a wrong one".
+
+**What it checks.** A SubRip, ASS, SSA, WebVTT or MP4 timed-text track in a full, SDH or dub role, a `.srt` sidecar in a
+conversion, and a `.srt` sidecar beside a Matroska file. Bazarr writes its downloads there. Its language must be the
+language of a main audio track. The check hears the track that plays when it speaks that language, else the first main
+track that does. A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
+5 minutes are never checked. Nor is Japanese, Chinese or Thai text, which has no spaces between its words, so the
+check could never give a verdict. So a file with no such track or sidecar costs nothing. The check runs on imports, and a
+backfill runs it only with `--sub-check`. `SUB_CHECK=false` turns it off. It needs language detection, see "Audio
+language detection".
+
+**The read.** `subtitle_cues()` reads every cue with its start and end, by the Cues, as `subtitle_read()` does. A cue
+ends at its BlockDuration. A sidecar and an MP4 track are read as SubRip text.
+
+**The hearing.** The check picks two windows of 10 seconds, one between 5 and 25 percent of the file and one between
+75 and 95 percent. So the line through them covers most of the file, and a drift shows. Each window is the place with
+the most cue words, because dense cues mean speech. Song lyrics (♪) do not count, and the test for them runs after the
+tags are gone, because a font colour holds a #. `arr_lid.listen()` hears both windows as one clip, with the pinned
+model, greedy decoding, word times and one thread. One clip runs the encoder once, and its chunk is as long as the
+clip, because Whisper's padding to 30 seconds cost decode time. Two windows of 12 seconds cost more to decode on dense
+dialogue, and two of 15 made the encoder run twice. The words are cached by path, size, mtime, stream, model, language and
+windows, and an edit or a proven remux carries them to the new file.
+
+When one window hears under 8 content words and the other does not, `listen()` hears a window of 24 seconds in the same
+part of the file, where it does not overlap the first, in the same process. The two windows with enough words then
+decide. A file whose windows both hear enough pays nothing for this. Two windows that both hear too little get no
+third, because one more window cannot give two good ones.
+
+A subtitle timed for another frame rate drifts. At 25/23.976 the speech of a cue at 20 minutes is 50 seconds earlier
+in the audio, so a window at the time of dense cues can hear silence. When fewer than two windows hear 8 words, a drift
+hearing follows. For each part with no window that heard enough, it hears one window of 10 seconds where the faster
+ratios, 25/23.976 and 25/24, put the speech of that part's densest cues, and one where the slower ratios put it. A
+window whose words matched says where the cues sit, and the drift windows go through that point. Else the cues start
+with the audio. A drift window closer than 5 seconds to a window heard already is not heard.
+
+Only the first hearing names a mismatch. Its windows sit where the cues are dense, so a wrong track shows there. A
+later window can sit where the track holds no cue, as in a song or a scene the subtitle leaves out. A mismatch that
+only later windows show is unknown, and the track stays.
+
+The language check and the subtitle check share their work. The language check keeps its samples for an hour when the
+file has a text subtitle, and a window inside a kept sample is cut from it, so no audio is decoded twice. When the
+language check runs on a file, it runs the subtitle check's hearings after its own, in the same process, with the model
+it loaded. The hook's own check then finds those words in the cache.
+
+Whisper can loop and write one word or phrase again and again. Each segment decodes on its own, not on the text before
+it. A segment whose text compresses more than 2.4, faster-whisper's own threshold, is a loop and drops. A phrase of up
+to 4 content words said again right after itself counts once. "I'm sorry." said four times compresses too little to
+drop, and it counts as two words. So a loop never reads as a mismatch. A real chant counts once too. That only makes
+the heard side shorter, and each word of it still matches the cues.
+
+**The verdict.** A window's overlap is the share of its heard content words that match the cue words in order at one
+offset. Stopwords, one-letter words, tags and sounds in brackets drop out. The search tries the offsets that the shared
+words point to over the whole cue list, so a shifted or drifting track still matches. A window with under 8 heard
+content words names nothing. Two windows at 50 percent or more is a match, and two at 30 percent or less is a
+mismatch. Anything else is unknown. So is a track under 20 cues, text with no spaces, a failed hearing and a timeout.
+The compare holds to one time window. Over a whole file, common words and names give a wrong track too many matches.
+
+**A translation is not a mismatch.** A right subtitle can translate other speech than the audio it is compared with.
+In a series with Japanese audio and an English dub, the full English subtitle translates the Japanese, and the dub
+script uses other words. Such a track can read as a mismatch, and on real files some did. So a mismatch can count as
+unknown:
+
+- When the item's original language is known, from the app or TMDB, a mismatch counts unless the original is another
+  language than the subtitle. So an English original with a Spanish dub keeps the check, and a Japanese series or a
+  dubbed film whose original the file does not carry gets unknown.
+- When no original language is known, another main audio language in the file stands in for it. A mismatch then
+  counts as unknown when the file carries one.
+
+A mismatch held this way stays in the decision record as unknown, with the reason. It gets no alert, no flag change
+and no removal, because no one can act on it. A match and a timing fix still count, and the dub's own transcript, the
+"Dubtitle" track, still matches. The same rule holds for sidecars and in a conversion.
+
+**Timing.** For a match, the check compares each cue start with the first heard word of the cue. Each window's median
+gives a point, and the line through the first and the last point says where the cues sit at the file's start and end.
+Only a cue whose first content word matched counts, because a later word would add the time of the words before it.
+A window needs 3 such cues. A window with fewer gets a window of 24 seconds around it, heard in one more hearing, and
+the longer window stands for it. The windows that decide the fix must lie in both halves of the file, because a cut
+in a half with no window goes unseen.
+Right tracks start their cues close to the first heard word, some a little before and some a little after. A fix keeps
+the median lead of right tracks, so a fixed copy lands within the spread of those leads, a few tenths of a second.
+
+- The track is in time when the cues at the file's start and end, and at every window, sit under 0.75 seconds off. So
+  the drift is judged by the error it causes at the file's ends, where it is largest. Right tracks sat closer, and a
+  24/23.976 drift of an 18-minute episode sat farther.
+- A ratio of 1, 25/23.976, 25/24 or 24/23.976, or the inverse of one, fits when every window, a middle one too, lies
+  within 0.3 seconds of one offset at that ratio. The middle window must also lie within 0.3 seconds of the line through
+  the early and the late window, and that line must stay under 0.75 seconds from the offset at the file's ends. The
+  windows of a right track differ a little, and a line through them would move that noise out to the ends. The ratio
+  with the least error at the file's ends wins, and a plain offset wins a near tie.
+- A ratio other than 1 needs a middle window, heard only then. Two windows cannot tell a drift from a cut between
+  them. A cut of 30 seconds can look like 25/24, and a cut of a second can look like 24/23.976 in an episode. The
+  middle window lies from 40 to 60 percent of the way from the early to the late window. So a cut anywhere between
+  them puts it at least 0.4 of the cut off their line. A cut of a second then puts it 0.4 to 0.6 seconds off, over the
+  0.3 seconds a fix allows. At a third of the way it sits only a third of a second off, and the spread of a right
+  track can hide that. Only a window in that part counts as the middle one, so windows that a drift hearing adds near
+  the ends never confirm a ratio. The window takes the densest cues there, and the fix to confirm says where their
+  speech is in the audio, many seconds away for a 25 fps track. When it hears under 8 words, as on a chant that
+  Whisper drops, a window of 24 seconds elsewhere in that part is heard in the same process. When both hear too
+  little, the track keeps its times with no alert.
+- No ratio that fits is two offsets, a different cut, and the times stay. It alerts when the windows differ by 1
+  second or more. A smaller step, as a right track can show, goes only to the decision log and the backfill report.
+  Two ratios that fit and move the cues apart by more than 0.3 seconds at the file's ends give no fix and alert, a
+  plain offset among them. Two windows cannot tell a plain offset from 24/23.976 when their offsets differ by half a
+  second.
+- After the fix, 80 percent of the matched cues must fall inside their spans.
+
+A rule that every matched cue agrees within 0.3 seconds fails on right tracks. Right tracks start their cues 0.9
+seconds early to 1.5 seconds late against the speech, so the rule takes the window medians and 80 percent of the cues.
+
+**Actions.**
+
+- A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitle"
+  alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
+  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `HIDE_DIR`. ffmpeg copies every
+  kept stream with `-copyinkf`, and reads a retimed track from a second input of the same file with `-itsoffset` and
+  `-itsscale`. A cue that the fix moves before 0 starts at 0, through the `setts` filter. A negative time would make
+  ffmpeg move every stream. When the audio has a codec delay, as AAC, Opus, AC-3 or MP3 that ffmpeg wrote into Matroska
+  has, that start at 0 moves the later cues of the track by the delay. The proof then refuses the remux, the file stays
+  as it was, and the "subtiming" alert says the remux failed. A fix that moves no cue before 0 passes. mkvmerge moved
+  AAC lace times by 2 ms in a Matroska to Matroska remux, and the proof refused it, while ffmpeg keeps the times it
+  reads.
+- mkvpropedit then puts back the Segment UID, and each kept track's UID, BCP 47 tag, name and flags. The new file must
+  keep the type, codec and language of each kept track in order, its UID, its BCP 47 tag, the properties in
+  `KEEP_PROPS` (its name, flags and codec private data), and the count of attachments and chapters. The proof of
+  "Conversion" must pass with the retimed tracks' times as the fix moves them. It also holds each stream to its own
+  start time, so a remux that moved every stream fails. The file keeps its owner and mode, and the original is kept as
+  in "Kept originals".
+- A removal cannot be undone without the kept original. So with `KEEP_ORIGINALS_DAYS` 0, or when the remux or the
+  proof fails, the track stays in the file. It gets the role `unmatched` instead, which no policy lists, so it never
+  becomes a default. It loses its default and forced flags with mkvpropedit (`subtitle_audio_mismatch`), and the alert
+  says why it stayed. A retime of another track in the same file keeps that. `SUB_TIMING=false` keeps the times and
+  alerts.
+- A sidecar beside a Matroska file that does not match moves into `KEEP_DIR` as a kept original, with a log line and
+  the alert. A sidecar whose times need a fix is written again with new times, as UTF-8, and its original is kept the
+  same way. With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. Bazarr can download the same wrong file
+  again, and the hook does not tell Bazarr. A later check moves it again.
+- In a conversion, a sidecar that does not match is not muxed. It moves into `KEEP_DIR`, and with
+  `KEEP_ORIGINALS_DAYS` 0 it stays beside the file. A built-in track that does not match is left out of the remux, and
+  the proof leaves it out too. The conversion then keeps the original in `KEEP_DIR`, as a forced conversion does, and
+  the alert names it. With `KEEP_ORIGINALS_DAYS` 0, or no place to keep it, the track stays in, and the check of the new
+  file turns its flags off. A sidecar whose times need a fix is muxed with new times, and its original is kept. A
+  built-in track whose times need a fix gets them after the conversion. The check of the new file reads the same
+  windows and the words carried over, so it hears nothing again.
+
+**Cost.** The target is 15 CPU seconds per file with a track to check, the model load included, and nothing for a
+file without one. A third window costs one more Whisper run in the same process, only for a file whose window heard
+too little. A middle window costs one more hearing, only for a track that needs a ratio fix, and its window of 24
+seconds one more Whisper run in that hearing. A drift hearing and a longer window at too few cues cost one more
+hearing each, only when the check asks for them. A check makes at most four hearings after the first. More threads cost more CPU time than they save in wall time, so the
+check runs one thread. A failure or a timeout gives unknown and never stops the import. The check shares the job's
+time limit, 90 seconds at most.
+
+**Cache and backfill.** `lid.sqlite` also holds each file's verdicts and the size and mtime of its sidecars, with a mark
+when they ask for an action that no apply made yet. A backfill with `--sub-check` skips a file whose verdicts are cached
+for its size and mtime and its sidecars, and ask for nothing more. So a stopped run goes on where it stopped, an apply
+after a dry run still acts, and a new sidecar from Bazarr is checked. `--sub-check` also takes a file with a sidecar
+that the flag backfill leaves out. The decision log holds each result in `subcheck`, the remux in `subremux` and the
+sidecar actions in `sidecars`.
+
 ## Status file
 
 The hook records two checks in `STATE_DIR/status.json`, the TMDB key and the policy file. A
