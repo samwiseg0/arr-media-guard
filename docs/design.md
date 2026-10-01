@@ -130,7 +130,7 @@ section. With `PLEX_URL` empty, the hook and the backfill make no Plex call at a
 
 Plex has no lookup by external id. So the hook searches by title in the section that holds the
 path, and the app's ids pick the item. For a show it reads every episode, because the numbering can
-differ between Sonarr and Plex. Plex and the apps must see the media at the same paths. A new import
+differ between Sonarr and Plex. `PLEX_PATH_MAP` maps the local path to the path Plex lists. A new import
 is often not in Plex yet. The worker looks again 15, 45, 105, 225, 405 and 600 seconds after the
 edit. After that the app's own Plex connection adds the item, with its flags already fixed.
 
@@ -297,6 +297,8 @@ only when all of these hold:
   old s01e01-e02 file never comes back for a broken s01e01.
 - The bin is on the file system of the old path, so the move is a rename. Keep the recycle bin on
   the media's file system, or no old file comes back.
+- The bin exists where the hook runs. `--selftest` and Test warn when it does not, as in a container
+  that does not mount it.
 - The old file passes the import's audio and video checks. A certain fault, an audio sample that
   did not run, or a stopped video check keeps it out. Other doubts do not, because it played before.
 - The bin file still has the inode, size and mtime the plan checked, because the app may give a
@@ -313,6 +315,50 @@ A manual import has no grab to mark failed, so the app does not search. With no 
 stays and alerts. When no old file came back after the delete, the hook searches for the items that
 were monitored. An API search grabs an unmonitored item too, so with none monitored nothing is
 searched.
+
+**The hook's own copy.** Without a recycle bin, with a bin on another file system, or with a bin
+this host does not see, no old file comes back. `KEEP_REPLACED=true` covers these cases. The app
+deletes the old file before the import calls the hook, so the hook keeps it at the Grab event, which
+the app sends when it picks a release. For each item of the grab that has a file, the hook
+hard-links the video and its extras into `<mount>/.<NAME>-recycle/<UTC time>/<path from the mount>`,
+the layout of the kept originals. `replaced_root()` picks the folder. A Sonarr grab can cover a
+season, and a file of several episodes is linked once. An anime batch can cross a season, so for an
+anime series the hook matches the absolute episode numbers. A link needs no space at the grab, and
+the file keeps its space until the prune. A copy could lose the race to the import, so where the
+file system refuses a link, the hook keeps nothing of that file and logs one line. A file the app
+lists and that is not on disk gets a line too. An error after the first link removes the links of
+the grab, so no link stays without its record. The Grab answer is always ok, and an error only logs.
+The hook keeps the links in `.<NAME>-recycle`, in the folder that "Kept originals" describes.
+
+`STATE_DIR/kept-replaced.json` holds one record per link. A record names the old path, the kept
+path, the grab's download id, the time and the inode. The import that replaces the old path claims
+the records of its own grab, or of a grab with no download id. A restore takes the copy only when
+the app's bin has none it can use, and only for the import that claimed it. A usable bin copy wins.
+A copy within an hour of `KEEP_ORIGINALS_DAYS` stays out, because the prune may remove it during the
+restore. The copy then gets the same checks as a bin copy, and its extras come back with it.
+
+A copy goes stale when the old path changes after the grab. A repair, a tail cut, a subtitle fix and
+a conversion under the same name rename a new file over the path. A restore renames an old file back
+over it, and another import replaces it. Each marks the records of the path stale, so a restore
+never brings back an older version. A later import also makes a claimed record stale. A change by
+the hook leaves a claimed record, because it holds the file its import replaced. The plan names why
+the old file stayed out. A flag edit changes the file in place, so the copy shares it and stays
+valid. The hook's own link does not count as a download client's hard link, so it never blocks an
+edit or a repair. A record matches the file by its inode, so a file the app renamed after the grab
+still finds its link. A record stays while its link exists.
+
+`KEEP_ORIGINALS_DAYS` caps the copies. The nightly audit removes the time folders older than that,
+in the folders of the app's root folders and in each folder a record names. The record covers a
+mount below a root folder, such as a dataset per show. The worker also prunes the folders the
+records name once a day, so a host with no nightly audit prunes too. A grab never prunes, so the app
+never waits for it. With `0`, the hook keeps nothing, and a prune removes every grab link.
+`--selftest` and Test warn when the app's saved connection to the hook does not send Grab, and when
+the hook cannot hard-link a file on a mount. They probe each mount with a small temp file that they
+remove. With the copies working, a bin warning says that the copies stand in.
+
+Two bind mounts of one file system share `st_dev`, but a rename between them fails. So the restore
+and the bin warning compare the mount tops too. A bin under another mount top counts as another
+volume.
 
 ## How it runs
 
@@ -674,9 +720,25 @@ decision runs on the new file, and the app rescans the item. A backfill dry run 
 
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for
 `KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
-hard-linked to `<mount>/.<NAME>-originals/<UTC time>/<path from the mount>`, where the mount is the mount
-point that holds the file. With the app root folders and the Plex sections below the mount, nothing
-scans the folder. A hard link needs no space and never leaves the path missing.
+hard-linked to `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. A hard link needs no space and never
+leaves the path missing. `keep_root()` picks the folder, the same way for `.<NAME>-recycle`:
+
+1. The top of the mount that holds the file, when `.<NAME>-originals` exists there and is writable. Every install
+   before 1.7.0 keeps its folder there.
+2. The mount top, when it is writable. With the app root folders and the Plex sections below the mount, nothing
+   scans the folder.
+3. A writable `.<NAME>-originals` that exists on the path from the mount top down to the file's folder, the highest
+   first. So the place stays the same from run to run.
+4. The highest writable folder on that path. A Docker volume whose root only root may write needs this.
+5. The mount top. No folder on the path is writable, so the fix is skipped, and the reason names the mount top, the
+   uid and the gid.
+
+Each folder sits on the file's mount, so the hard link works. A folder whose real path is on another mount, as one
+above a symlink to a share, never comes in. The dot hides it from the apps' disk scans and Plex. When the app renames
+an item folder that holds such a folder, the folder moves with it, and the prune and the restore no longer find it.
+Sonarr's Library Import lists a hidden folder at a root folder's top level as unmapped. `STATE_DIR/kept-folders.json`
+records each folder the hook keeps a file in. The nightly audit and the worker's daily prune clear those folders too,
+and a folder of another name never.
 
 Some file systems refuse a hard link. A keep folder on another file system does, and so do a file with too many links
 and some container or Windows mounts. The original is then copied, with its mode and times. The copy needs the file's size
@@ -684,7 +746,7 @@ plus 1 GB free, else the fix is skipped and says why. It is written under a hidd
 by size and hash, and only then renamed to the kept name. So the swap waits for a whole copy, and a crash leaves no
 file that looks kept. The log and the report of `--sub-time` say "copied" instead of "hard-linked". Any other link
 error skips the fix, as before. To undo a repair, move the kept file back and rescan the item.
-`NAME` names both hidden folders, `.<NAME>-originals` and `.<NAME>-convert`. A `NAME` with other
+`NAME` names the hidden folders, `.<NAME>-originals`, `.<NAME>-recycle` and `.<NAME>-convert`. A `NAME` with other
 characters than letters, digits, `.`, `_` and `-` fails `--selftest`, and the script uses `arr-media-guard`.
 Each keep and the nightly audit remove the time folders older than the setting.
 
@@ -698,7 +760,8 @@ Radarr, checks the file, and keeps a hard link of the old file until the new one
 `--subhunt radarr --ids 101` lists the ranked candidates, and `--apply` downloads, checks and
 imports. The hunter needs a Newznab indexer, such as NZBHydra2, and a SABnzbd download client in
 Radarr. It reads their keys from Radarr's database, because the API masks them. SABnzbd's download
-path must be the same path on the Radarr machine.
+path must be the path this script sees. Radarr gets that path through Radarr's path map, unchanged
+when no pair covers it.
 
 **Search and rank.** Each movie gets one indexer query by IMDb id. A result must carry this movie's
 IMDb tag, else Radarr must map its name to this movie. The tag comes first, because Radarr can map a
@@ -752,6 +815,36 @@ checks after the flag edit.
   with a listing of 20 minutes or more.
 - **Year.** The check reads the years before SxxEyy or the first quality word. It skips a year that
   belongs to a title and a daily show's air date. A year within one of an item year is ok.
+- **Episode title.** A release can follow another episode order than Sonarr, so a file can hold
+  another episode with the right language and runtime. The title comes from the scene NFO beside
+  the file Sonarr imported from, else from the release name between the episode tag and the first
+  quality word or release flag, such as REPACK or a language in capitals. A flag in title case is a
+  title word, as in "Internal Affairs". In a name all in capitals, only the flags right before the
+  quality word are cut, so "FRENCH WEEK" stays. A tag may name one segment
+  of a DVD order, as S04E15a. In a name with no quality word, a last "-GROUP" is the group. The hook reads the NFO at the event and keeps the title in the job, because a usenet
+  download folder can be gone when the worker runs. The Webhook gives the folder as
+  `episodeFile.sourcePath`, and Sonarr's path map maps it. With a map set, the listener reads only
+  under the map's local folders. An NFO counts only when it is a plain file whose name is the
+  video's, or the one NFO in a folder named like the video or the release. A file with no scene name
+  gives the title of Sonarr's own file name, and the alert says "the file name's title", because
+  Sonarr wrote that name in the order it had at the import. The check then reads the series'
+  episodes, one call per file, and one per series in a backfill. A file that no episode points to
+  gets no verdict.
+
+  A title matches an episode when their keys are the same: lower case, no accents, no apostrophes,
+  `&` as "and". Each segment that `/` or `+` joins matches on its own. A release name joins two titles
+  with no mark, so the titles that cover it from end to end, with only "and" between them, match
+  too. The verdict is "other" only
+  when the title matches another episode and none of the file's own. A key that two episodes share
+  names neither. A special counts only for a special, because a special often repeats a regular
+  title. A title within 0.8 of the file's own, by difflib's ratio, names the file's own, such as a
+  title that leaves out "Part Two". So does a title that holds the words of the file's own in a row,
+  or whose words the file's own holds. Neither rule joins two parts of one story, such as "Versus the
+  Ring" and "Versus the Ring Part 2", so a swap of two parts shows. A title that drops its part
+  number then alerts, and the alert asks to check the order. When Sonarr imported the release to other numbers than its tag,
+  its scene numbering already maps the release's order, and the title says nothing. The alert names
+  the episode in Sonarr's order, and its absolute number for anime. It asks to check the episode
+  order, or to import the file to the episodes it names by hand.
 
 **The re-grab rule.** A re-grab needs two points. The wrong language scores one. So does a release
 name that names that language, for movies only. A short or long runtime scores one, and so does a
@@ -759,7 +852,9 @@ year mismatch. Another TMDB film that the release's title and year find, whose r
 file, scores one. A release with an edition word never searches, because TMDB lists some cuts as
 films of their own. A movie under half its listing scores two on runtime, when a second source and
 TMDB agree. A special never does, because its listing may count the broadcast slot. A series never
-gets the release-language point, because a docuseries changes language per episode.
+gets the release-language point, because a docuseries changes language per episode. The episode
+title scores `EPISODE_TITLE_POINTS`, 0, so it alerts "Wrong episode" and never re-grabs. A re-grab on
+it would raise that constant.
 
 **The switch.** `REGRAB` leaves out `content` by default. Then the hook still checks the grab
 record, the cap and a second check. It then logs `would_regrab`, posts "Wrong content, would
@@ -1127,9 +1222,19 @@ and writes the cache. It acts as a backfill does, with the file lock, `.<NAME>-c
 analyze after an edit. Its alerts print and never post. An app names the item only for the original language and the
 inputs of the check: one list call per app, and the episode files of the one series that holds the path. A path no app
 lists, such as a copy, runs with no original language, so the decision cannot be trusted. It keeps every flag then, as
-the deep analysis does, and only a subtitle verdict changes a flag. An app that does not run on the host lists nothing.
-A lookup that fails, by an error, a timeout or an app restart, is not the same: `--apply` then stops before any
-change, and a dry run says why it knows no original language.
+the deep analysis does, and only a subtitle verdict changes a flag. A user who never set up an app gets no line for
+it. Such an app has no API key, no `config.xml`, and no URL or the URL that the env files ship. The image writes both
+env files into a new `/config`, so a one-off container has both shipped URLs. When neither app is set up, one line says
+so for every path. A lookup that fails, by an error, a timeout or an app restart, is not the same: `--apply` then stops
+before any change, and a dry run says why it knows no original language. An app with a URL of the user's own and no
+API key that reads is set up in part, and it fails the same way. A backfill or a scan of an app that is not set up
+stops with one line that names the settings. So do the audit's pruning and the subtitle hunter.
+
+A dry run prints each subtitle alert as `--apply` would act on it. `sub_alerts()` builds the dry texts from the
+remux's codes, and `repack_block()` gives the reason of a skip again. A file with another hard link stays as it is,
+flags included. A keep folder that is not writable names the folder, the uid and the gid of the run, which `PUID` and
+`PGID` set in Docker. When the folder does not exist, creating it is enough. The decision log, an import and `--apply`
+keep the texts of `sub_alerts()`.
 
 A research prototype of lapse's peak sigma scored another episode's track almost as high as a right one, so the fit
 keeps the lift.
@@ -1197,7 +1302,12 @@ variables give, and the listener still asks the API for the path.
 | `deleted` | `<app>_deletedpaths` | `deletedFiles[].path` | the body, each path in the item's folder from the API |
 | `recycled` | `<app>_deletedrecyclebinpaths` | `deletedFiles[].recycleBinPath` | the body, each path in `recycleBin` of `config/mediamanagement` |
 
-`eventType` is `Download` for an import and an upgrade, and `Test` for Test. A live test used
+`eventType` is `Download` for an import and an upgrade, and `Test` for Test. With `KEEP_REPLACED`
+on, a `Grab` body names the item in `movie.id` or `series.id`, the episodes in `episodes[].id`, and
+the download in `downloadId`. The Custom Script variables of a Grab name the movie in
+`radarr_movie_id`, and the series in `sonarr_series_id`. Sonarr names the episodes only by
+`sonarr_release_seasonnumber` and `sonarr_release_episodenumbers`, so the hook asks the API for
+their ids. Both apps name the download in `<app>_download_id`. The API gives the files. A live test used
 Sonarr 4.0 and Radarr 6.4. Both send `deletedFiles[].recycleBinPath` on an upgrade. Sonarr's On
 Import Complete trigger also sends `Download`, but with `episodeFiles` and no `episodeFile`. The
 listener refuses it and says which triggers to use.
@@ -1210,11 +1320,32 @@ and its recycle bin copy in the app's recycle bin, because a restore renames the
 old path. A refusal answers 4xx or 5xx, and the decision log gets a line with source `webhook`. The
 app shows the answer in its Test and in its log.
 
-**Paths.** The image must see the media at the apps' paths, or `PATH_MAP` pairs the two. `arr()` and
-`arr_write()` map every path in an API answer to the local path, and every path in a query or a
-body back to the app's path. Plex gets the apps' paths. The script reads `config.xml` and the app's
-database in `RADARR_DIR` or `SONARR_DIR`, `/var/lib/<app>` by default, so the compose file mounts
-the app's config folder there, read-only. SQLite reads a live WAL database through that mount from another container. On a
+**Paths.** The image must see the media at the apps' paths, or a path map pairs the two. Each
+program has its own map, `SONARR_PATH_MAP`, `RADARR_PATH_MAP` or `PLEX_PATH_MAP`. An empty one
+takes `PATH_MAP`, so a setup from before the three maps works unchanged. A tester's setup showed
+the need. Sonarr saw TV at `/mnt/TV`, Radarr saw films at `/movies`, and Plex saw them at
+`/mnt/TV Shows` and `/mnt/Movies`. One map cannot pair those with the container's paths.
+
+Each path that crosses to a program uses that program's map, and every Radarr or Sonarr instance
+counts as its app. `arr()` and `arr_write()` map every path in an API answer to the local path, and
+every path in a query or a body back to the app's path. The subtitle hunter and the conversion
+reach the app through them too. The listener maps the posted file path and the old files of an
+upgrade with the app's map. The Plex lookup, the folder scan and `--plex-flush` map the local path
+to Plex's path. The lists `--plex-flush` reads hold local paths. The app database reads give
+names and relative paths only. The script joins a relative path to a folder from the API, so the
+reads need no map. The hook's Custom Script variables need none either, because a Custom Script
+runs where the app runs. The subtitle hunter takes SABnzbd's download path as a local path. A pair
+matches whole folder names, so `/mnt/TV` never matches `/mnt/TV Shows`, and the longest pair wins.
+
+`--selftest` and the listener start check each map against the app root folders. A root folder
+the script does not see warns, with the app's map setting. A root folder that no Plex library
+folder holds or sits in warns, with `PLEX_PATH_MAP`. The check starts from the root folders, so a
+Plex library that holds none of them, such as music or another host's library, never warns. Both
+are warnings only. A deploy may run `--selftest` while a mount or an app is down. The listener must
+start before the apps answer, so it runs the check in a thread.
+
+The script reads `config.xml` and the app's database in `RADARR_DIR` or `SONARR_DIR`,
+`/var/lib/<app>` by default, so the compose file mounts the app's config folder there, read-only. SQLite reads a live WAL database through that mount from another container. On a
 test Radarr, the image read a movie file row that sat only in the WAL.
 
 **Requests.** The listener serves 32 requests at once on a pool of threads. Each request has 10
@@ -1236,9 +1367,9 @@ waits for it. A job that has not written goes back to the queue, and a flag edit
 first, see "Crashes and stops".
 
 **Daily jobs.** A native install runs the nightly audit from a systemd timer, and the audit removes
-kept originals older than `KEEP_ORIGINALS_DAYS`. logrotate rotates the decision log. In the image,
-the listener runs both once a day at `AUDIT_TIME`, the audit for each app whose API key reads. A day
-the container was down at that time runs at the next start.
+kept originals and grab links older than `KEEP_ORIGINALS_DAYS`. logrotate rotates the decision log.
+In the image, the listener runs both once a day at `AUDIT_TIME`, the audit for each app whose API
+key reads. A day the container was down at that time runs at the next start.
 
 **One-off containers.** Every other mode runs in a one-off container of the same image, or with
 `docker exec` in the service. A one-off container mounts the same `/config`, so its file lock, its

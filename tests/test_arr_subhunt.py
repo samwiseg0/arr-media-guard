@@ -434,6 +434,14 @@ def test_creds_come_from_the_apps_database(env, tmp_path, monkeypatch):
     assert REAL_CREDS(hook, "radarr") == {"sab": "https://sab.x:443/api", "sab_key": "S", "hydra": "https://search.x/api", "hydra_key": "H"}
 
 
+def test_a_missing_app_database_stops_with_one_line(env, tmp_path, monkeypatch):
+    """With no Radarr folder the hunter stops before SQLite, whose error names no file."""
+    monkeypatch.setitem(hook.CFG, "RADARR_DIR", str(tmp_path / "none"))
+    with pytest.raises(SystemExit) as ex:
+        REAL_CREDS(hook, "radarr")
+    assert str(ex.value) == f"{tmp_path / 'none' / 'radarr.db'} does not read. Set RADARR_DIR to Radarr's folder."
+
+
 # --- failure paths -------------------------------------------------------------------------------
 
 def test_a_sabnzbd_outage_marks_nothing_and_cleans_up(env, monkeypatch):

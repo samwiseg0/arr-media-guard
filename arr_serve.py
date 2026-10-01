@@ -23,6 +23,7 @@ It listens on port PORT. Radarr posts to /radarr and Sonarr to /sonarr, with HTT
 are WEBHOOK_USER and WEBHOOK_PASSWORD in the env file. Without both, the listener does not start. A Download event (an
 import or an upgrade) becomes the job file that hook() writes from the Custom Script variables, through queue_job().
 So the worker and the queue stay one code path. A Test event checks the policy, the API key and the root folders.
+With KEEP_REPLACED on, a Grab event hard-links the files the grab may replace, see grab().
 
 The body names the file by its id, and the app's API gives its path. The file record must belong to the item the body
 names. The path in the body is never used. The old files of an upgrade must sit in the item's folder, and their copies
@@ -84,7 +85,8 @@ def inside(path, folder):
 
 def job_of(h, app, body):
     """The job hook() writes for the same import, from the body of a Webhook Download event. The file id and the item
-    id come from the body. The path, the scene name and the episode ids come from the app's API by the file id. Raises
+    id come from the body. The path, the scene name and the episode ids come from the app's API by the file id. Sonarr's
+    episodeFile.sourcePath, mapped like any app path, names the folder whose NFO gives the episode title. Raises
     Refused when the record does not belong to the item, or when this container cannot see the file."""
     radarr, name = app == "radarr", NAMES[app]
     item, f = body.get("movie" if radarr else "series"), body.get("movieFile" if radarr else "episodeFile")
@@ -109,7 +111,7 @@ def job_of(h, app, body):
         raise Refused(400, f"{name} lists file {fid} at {path!r}, which is no plain absolute path")
     if not os.path.isfile(path):
         raise Refused(500, f"{name} lists file {fid} at {path}, and this container does not see it there. Mount the media at "
-                           "the app's paths, or set PATH_MAP")
+                           f"the app's paths, or {h.map_fix(app)}")
     eps = None
     if not radarr:
         eps = ",".join(str(i) for i in sorted(e["id"] for e in h.arr(app, f"episode?episodeFileId={fid}")))
@@ -117,11 +119,16 @@ def job_of(h, app, body):
     if not isinstance(down, str) or len(down) > MAX_ID:
         raise Refused(400, f"the downloadId is no text of at most {MAX_ID} characters")
     deleted, recycled = old_files(h, app, body.get("deletedFiles"), owner)
-    posted = h.mapped(f.get("path"))
+    posted = h.mapped(f.get("path"), app)
     if posted and posted != path:   # the app may have renamed it since. The API wins.
         note(h, app, "warning", f"the body names {posted!r}, and {name} lists file {fid} at {path}. The job takes the path of the API")
-    return {"app": app, "event": "Download", "time": time.time(), "path": path, "owner": str(owner), "file_id": str(fid),
-            "episode_ids": eps, "download_id": down, "release": rec.get("sceneName") or "", "deleted": deleted, "recycled": recycled}
+    job = {"app": app, "event": "Download", "time": time.time(), "path": path, "owner": str(owner), "file_id": str(fid),
+           "episode_ids": eps, "download_id": down, "release": rec.get("sceneName") or "", "deleted": deleted, "recycled": recycled}
+    if not radarr:   # the NFO beside the file Sonarr imported from, read now, see release_nfo_title()
+        source, pairs = h.mapped(f.get("sourcePath"), app), h.MAPS.get(app, h.PATH_MAP)
+        mapped = not pairs or any(inside(source, local) or source == local for _, local in pairs)   # with a map, only its folders
+        job["nfo_title"] = h.release_nfo_title(source, job["release"]) if plain(source) and mapped else None
+    return job
 
 
 def old_files(h, app, files, owner):
@@ -136,7 +143,7 @@ def old_files(h, app, files, owner):
     rbin = h.arr(app, "config/mediamanagement").get("recycleBin") or ""
     old, rb = [], []
     for d in files:
-        o, r = h.mapped(d.get("path")), h.mapped(d.get("recycleBinPath") or "")
+        o, r = h.mapped(d.get("path"), app), h.mapped(d.get("recycleBinPath") or "", app)
         if not inside(o, home):
             raise Refused(400, f"the old file {o!r} is not in the folder {home!r} of {NAMES[app]}'s item {owner}")
         if r and not inside(r, rbin):
@@ -144,6 +151,25 @@ def old_files(h, app, files, owner):
         old.append(o)
         rb.append(r)
     return "|".join(old), "|".join(rb)
+
+
+def grab(h, app, body):
+    """Keep the files a Grab event may replace, see keep_grab() in the host script. The body names the item and the
+    episodes by id, and the app's API gives the files. An error logs a line, and the answer is still ok, so the app's
+    grab never fails on the hook."""
+    try:
+        radarr = app == "radarr"
+        item, eps, down = body.get("movie" if radarr else "series"), body.get("episodes") or [], body.get("downloadId") or ""
+        owner = item.get("id") if isinstance(item, dict) else None
+        ids = [] if radarr or not isinstance(eps, list) else [e.get("id") if isinstance(e, dict) else None for e in eps]
+        if not (type(owner) is int and owner > 0 and all(type(i) is int and i > 0 for i in ids) and isinstance(down, str) and len(down) <= MAX_ID):
+            raise Refused(400, f"the Grab body has no {'movie' if radarr else 'series'} id, episode ids or downloadId that the hook can read")
+        rec = h.keep_grab(app, owner, down, ids) or {}
+        n = len(rec.get("kept") or [])
+        note(h, app, "grab", f"kept {n} file{'' if n == 1 else 's'}." + (f" {rec['note'][:1].upper()}{rec['note'][1:]}" if rec.get("note") else ""), logged=False)
+    except Exception as ex:
+        note(h, app, "error", f"the grab kept nothing: {type(ex).__name__}: {ex}")
+    return "arr-media-guard: Grab ok"
 
 
 def test_event(h, app):
@@ -157,7 +183,7 @@ def test_event(h, app):
         return h.mask(f"the {NAMES[app]} API did not answer: {type(ex).__name__}: {ex}")[:300]
     missing = [r for r in roots if not os.path.isdir(r)]
     if missing:
-        return f"this container does not see the root folders {', '.join(missing)}. Mount the media at the app's paths, or set PATH_MAP"
+        return f"this container does not see the root folders {', '.join(missing)}. Mount the media at the app's paths, or {h.map_fix(app)}"
     return None
 
 
@@ -333,6 +359,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.queued = True   # main() starts a worker once the answer went out
                 note(h, app, "queued", f"{job['path']} as {name}", logged=False)
                 self.answer(200, f"arr-media-guard: queued {job['path']}")
+            elif event == "Grab" and h.KEEP_REPLACED:
+                self.answer(200, grab(h, app, body))
             else:   # a trigger the connection was not meant to send, as hook() treats it
                 self.answer(200, f"arr-media-guard: {str(event)[:50]} ignored")
         except Refused as ex:
@@ -422,6 +450,13 @@ def daily(h):
         print("arr-media-guard: logrotate is not installed, so the decision log is not rotated", flush=True)
 
 
+def path_check(h):
+    """Print the warnings of h.path_warnings(), for docker logs. The listener runs it in a thread at its start, so a
+    slow app or Plex never delays the listener."""
+    for w in h.path_warnings():
+        print(f"arr-media-guard: warning: {w}", flush=True)
+
+
 def config(h):
     """(Authorization header value, AUDIT_TIME) from the env file, or exit with what to fix."""
     user, pw = h.CFG.get("WEBHOOK_USER", ""), h.CFG.get("WEBHOOK_PASSWORD", "")
@@ -456,10 +491,12 @@ def main(h, argv):
     stop, kids, last = [], {}, 0.0   # kids: Popen -> "worker" or "daily"
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.append(True))
-    print(f"arr-media-guard {h.VERSION}: listening on port {PORT}. PATH_MAP: {h.PATH_MAP or 'none'}. Nightly audit: {at or 'off'}. "
+    maps = ", ".join(f"{who} {'|'.join(':'.join(p) for p in h.MAPS.get(who, h.PATH_MAP)) or 'none'}" for who in h.MAP_KEYS)
+    print(f"arr-media-guard {h.VERSION}: listening on port {PORT}. Path maps: {maps}. Nightly audit: {at or 'off'}. "
           f"Apps with an API key: {', '.join(apps_on(h)) or 'none'}.", flush=True)
     for why in h.CONFIG_ERRORS:
         print(f"arr-media-guard: {why}", flush=True)
+    threading.Thread(target=path_check, args=(h,), daemon=True).start()   # the apps and Plex may still be starting
     while not stop:
         server.handle_request()
         for p in [p for p in kids if p.poll() is not None]:   # a child that ended

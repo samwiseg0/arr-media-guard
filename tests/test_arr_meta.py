@@ -555,3 +555,182 @@ def test_answered_counts_live_answers_only(tmp_path, monkeypatch):
     M.DOWN.update(until=0.0, answered=0.0)
     M.expected_languages("radarr", {"tmdb": 7}, "t", cache, now=4)
     assert M.DOWN["answered"] == 0.0 and M.tmdb_state(None)[0] == "tmdb_unavailable"
+
+
+# --- the episode title of a release ----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name, title", [
+    ("Show.A.S04E15.Ship.Voyage.1080p.WEB.H264-GRP", "Ship Voyage"),
+    ("Show.A.S04E15.1080p.WEB.H264-GRP", None),
+    ("Show.A.S21.E13.480p.WEBRIP.AAC2.0.x264-GRP", None),
+    ("Show.A.S01E01E02.Day.One.720p.HDTV.x264-GRP", "Day One"),
+    ("Show A - S02E41 - Night Shift [1080p.WEB-DL] [GRP]", "Night Shift"),
+    ("Show.A.E172.Night.Shift.720p.WEBRip.x264-GRP", "Night Shift"),
+    ("Show.A.2026.07.17.Slow.Fire.720p.WEB.H264-GRP", "Slow Fire"),
+    ("Show.A.S01E01.Night.Shift-GRP", "Night Shift"),   # no quality word: a last "-GRP" is the group
+    ("Show.A.S01E01.Night.Shift.REPACK.720p.WEB.H264-GRP", "Night Shift"),   # a release flag ends the title
+    ("Show.A.S01E01.Chinese.New.Year.GERMAN.720p.WEB.H264-GRP", "Chinese New Year"),   # a language word ends it in capitals only
+    ("Show.A.S02E05.Internal.Affairs.720p.WEB.H264-GRP", "Internal Affairs"),   # a flag in title case is a title word
+    ("Show.A.S02E05.Proper.Trouble.720p.WEB.H264-GRP", "Proper Trouble"),
+    ("show.a.s02e05.night.shift.internal.720p.web.h264-grp", "night shift"),
+    ("SHOW.A.S02E05.FRENCH.WEEK.720P.HDTV.X264-GRP", "FRENCH WEEK"),   # all in capitals: only the tags at the end are cut
+    ("SHOW.A.S02E05.NIGHT.SHIFT.FRENCH.REPACK.720P.HDTV.X264-GRP", "NIGHT SHIFT"),
+    ("Show.A.S04E15b.Night.Shift.DVDRip.x264-GRP", "Night Shift"),   # one segment of a DVD order
+    ("Show.A.2018.S04E12.The.Crossing.1080p.AMZN.WEB-DL", "The Crossing"),   # the year before the tag is no date
+])
+def test_the_release_name_gives_the_title_between_the_tag_and_the_quality(name, title):
+    assert M.release_episode_title(name) == title
+
+
+def test_the_nfo_gives_the_episode_title_line_first():
+    assert M.nfo_episode_title("Title.........: Ship Voyage/No Lady Here\nSize : 1 GB\n") == "Ship Voyage/No Lady Here"
+    assert M.nfo_episode_title(" Title    : Show A\n Episode Title : Night Shift\n") == "Night Shift"
+    assert M.nfo_episode_title("Title: Show A S04E15 Night Shift\n") == "Night Shift"
+    assert M.nfo_episode_title("Release: Show.A.S04E15\nRuntime: 11 min\n") is None
+
+
+def test_title_keys_ignore_case_marks_and_the_series_name():
+    assert M.title_key("That's No Lady & Co.!") == "thats no lady and co" and M.title_key("Café Noël") == "cafe noel"
+    assert M.title_keys("Ship Voyage / No Lady Here", {"show a"}) == {"ship voyage no lady here", "ship voyage", "no lady here"}
+    assert M.title_keys("Show A Night Shift", {"show a"}) == {"night shift"} and M.title_keys("Show A", {"show a"}) == set()
+
+
+def ep(i, season, number, title, absolute=None):
+    return {"id": i, "seasonNumber": season, "episodeNumber": number, "title": title, "absoluteEpisodeNumber": absolute}
+
+
+SERIES = [ep(1, 4, 15, "A Rainy Day"), ep(2, 4, 21, "Ship Voyage"), ep(3, 4, 22, "No Lady Here"), ep(4, 1, 1, "Reunion Part 2"),
+          ep(5, 2, 1, "The Reunion Part 2"), ep(6, 3, 1, "Homecoming"), ep(7, 3, 2, "Homecoming"), ep(8, 0, 4, "Behind the Scenes"),
+          ep(9, 3, 25, "Robot Rescue"), ep(10, 3, 45, "Two Pups"), ep(11, 3, 46, "Three Pups")]
+
+
+@pytest.mark.parametrize("title, imported, release, verdict, found", [
+    ("Ship Voyage/No Lady Here", [1], "Show.A.S04E15.1080p", "other", [2, 3]),   # each segment matches on its own
+    ("Ship Voyage", [1], "Show.A.S04E15.Ship.Voyage.1080p", "other", [2]),
+    ("A Rainy Day", [1], "Show.A.S04E15.A.Rainy.Day.1080p", "imported", []),
+    ("Ship Voyage/A Rainy Day", [1], "Show.A.S04E15.1080p", "imported", []),   # one segment is the file's own
+    ("The Reunion Part 2", [4], "Show.A.S01E01.The.Reunion.Part.2.1080p", "imported", []),   # near the file's own title
+    ("Homecoming", [1], "Show.A.S04E15.Homecoming.1080p", "none", []),   # two episodes share it, so it names neither
+    ("Behind the Scenes", [1], "Show.A.S04E15.Behind.the.Scenes.1080p", "none", []),   # a special counts for a special only
+    ("A Rainy Day", [8], "Show.A.S00E04.A.Rainy.Day.1080p", "other", [1]),
+    ("Robot Rescue", [10, 11], "Show.A.S03E25.Robot.Rescue.1080p", "mapped", []),   # Sonarr mapped S03E25 to E45-E46
+    ("Robot Rescue", [10, 11], "Show.A.S03E45E46.Robot.Rescue.1080p", "other", [9]),   # a two-episode file
+    ("Nothing Like It", [1], "Show.A.S04E15.Nothing.Like.It.1080p", "none", []),
+    ("Ship Voyage and No Lady Here", [1], "Show.A.S04E15.Ship.Voyage.and.No.Lady.Here.1080p", "other", [2, 3]),   # two titles, no "/"
+    ("Ship Voyage No Lady Here", [1], "Show.A.S04E15.Ship.Voyage.No.Lady.Here.1080p", "other", [2, 3]),
+    ("And Ship Voyage", [1], "Show.A.S04E15.And.Ship.Voyage.1080p", "none", []),   # a connector never starts a title
+    ("Ship Voyage and", [1], "Show.A.S04E15.Ship.Voyage.and.1080p", "none", []),
+    ("Rainy", [1], "Show.A.S04E15.Rainy.1080p", "imported", []),   # words of the file's own title in a row, far under TITLE_NEAR
+])
+def test_an_episode_title_names_another_episode_only_when_no_imported_one_matches(title, imported, release, verdict, found):
+    v = M.episode_title_verdict(title, SERIES, imported, release, ["Show A"])
+    assert (v["verdict"], v["episodes"], v["points"]) == (verdict, found, 0), v
+
+
+@pytest.mark.parametrize("title, own", [("Versus the Ring", "Versus the Ring Part 2"), ("The Claw (1)", "The Claw (2)")])
+def test_two_parts_of_one_story_never_name_each_other(title, own):
+    """A swap of part 1 and part 2 shows, though the titles are near and one holds the other's words."""
+    eps = [ep(1, 2, 22, title), ep(2, 2, 23, own)]
+    v = M.episode_title_verdict(title, eps, [2], "Show.A.S02E23.Title.720p")
+    assert (v["verdict"], v["names"]) == ("other", "S02E22"), v
+
+
+def test_the_verdict_names_both_orders_and_the_absolute_number():
+    v = M.episode_title_verdict("Ship Voyage", SERIES, [1], "Show.A.S04E15.1080p", said="the release's NFO")
+    assert v["why"] == "the release's NFO says Ship Voyage, which Sonarr lists as S04E21. It was imported as S04E15", v
+    v = M.episode_title_verdict("Ship Voyage/No Lady Here", SERIES, [1], "Show.A.S04E15.1080p")
+    assert v["names"] == "S04E21 and S04E22" and v["why"].startswith("the release's title says"), v   # the advice names both
+    v = M.episode_title_verdict("Ship Voyage/No Lady Here/Robot Rescue", SERIES, [1], "Show.A.S04E15.1080p")
+    assert v["names"] == "S03E25, S04E21 and S04E22", v
+    assert M.episode_title_verdict("Ship Voyage", SERIES, [], "Show.A.S04E15.1080p") is None   # no episode points to the file
+    anime = [ep(1, 5, 10, "First Light", 120), ep(2, 5, 20, "Last Light", 130)]
+    v = M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p", anime=True)   # an absolute number
+    assert v["verdict"] == "other" and v["why"].endswith("lists as S05E20 (absolute 130). It was imported as S05E10 (absolute 120)"), v
+    assert M.episode_title_verdict("Last Light", anime, [1], "Show.B.E125.Last.Light.720p")["verdict"] == "mapped"
+    assert "absolute" not in M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p")["why"]   # a standard series
+
+
+def test_an_episode_title_never_adds_a_point():
+    """The title alerts only. With a short runtime, its signal still leaves the evidence at one point, no re-grab."""
+    tracks = [{"kind": "a", "role": "main", "lang": "eng", "conf": 1.0}]
+    sig = M.episode_title_verdict("Ship Voyage", SERIES, [1], "Show.A.S04E15.Ship.Voyage.1080p")
+    ev = M.wrong_content_evidence(tracks, "English", tmdb("eng", ["eng"], 0), {"seconds": 600, "trust": "agree"}, [50],
+                                  "Show.A.S04E15.Ship.Voyage.1080p", "episode", 2012, [("Show A", 2012)], episode=sig)
+    assert ev["signals"][-1] is sig and ev["points"] == 1 and not ev["regrab"] and "Ship Voyage" not in ev["why"], ev
+
+
+
+# --- the tester's case: one interactive search for S04E15 of a cartoon in three episode orders ---------------------------
+
+SPONGE = json.load(open(os.path.join(os.path.dirname(__file__), "fixtures", "episode_title", "spongebob-s00-s04-episodes.json")))
+GHOST_HOST = 133   # S04E15 in Sonarr's order. The releases below were found for it.
+
+
+@pytest.mark.parametrize("name, want", [
+    ('SpongeBob.S04E15.PDTV.HebSub.XviD.D00oo00M', None),
+    ('spongebob.schwammkopf.s04e15.die.fanthaddaeustische.reise.patricia.german.dl.fs.1080p.web.h264-cnhd', 'none'),
+    ('SpongeBob.Schwammkopf.S04E15.Die.fanthaddaeustische.Reise.-.Patricia.GERMAN.DL.FS.1080p.WEB.H264-CNHD', 'none'),   # a German title names no episode
+    ('Spongebob.Schwammkopf.S04E15.German.AC3.DL.1080p.WebRip.x265-FuN', 'none'),
+    ('SpongeBob.SquarePants.1999.S04E15.FRENCH.1080p.WEB.H264-FTMVHD', None),
+    ('SpongeBob.SquarePants.1999.S04E15.Ghost.Host.REPACK.1080p.AMZN.Webrip.x265.10bit.EAC3.2.0-Frys-TAoE', 'imported'),
+    ("SpongeBob.SquarePants.2005.S04E15.Squidtastic.Voyage.That's.No.Lady.1080p.PMTP.WEB-DL.AAC.SDR.H.264-LioN", ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DD2.0.H.264.1-AME', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DD2.0.H.264-AME', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DD2.0.H264-AME', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DD2.0.H264-BTN', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DD2.0.H.264-PlayWEB', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune', None),
+    ('Spongebob.Squarepants.S04E15.1080p.AMZN.WEB-DL.DDP2.0.H.264-SiGLA', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.AV1.10bit-MeGusta', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.HEVC.x265-MeGusta', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.SKST.WEB-DL.DD2.0.H.264-PlayWEB', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.WEB-DL.HebSub.x264-D00oo00M', None),
+    ('SpongeBob.SquarePants.S04E15.1080p.WEB.H264-OUTPOST31', None),
+    ('SpongeBob.SquarePants.S04E15.720p.AMZN.WEB-DL.DDP2.0.H.264-VARYG', None),
+    ('SpongeBob.SquarePants.S04E15.720p.HEVC.x265-MeGusta', None),
+    ('SpongeBob.SquarePants.S04E15a-All.that.Glitters', ('other', 'S04E19')),   # a DVD segment, and no quality word
+    ('SpongeBob.SquarePants.S04E15a.DVDRip.iNTERNAL.XviD-iND', None),
+    ('SpongeBob.SquarePants.S04E15a.Squidtastic.Voyage.DVDRip.x264-TiMEGOD', ('other', 'S04E23')),
+    ('SpongeBob.SquarePants.S04E15b.DVDRip.iNTERNAL.XviD-iND', None),
+    ("SpongeBob.SquarePants.S04E15b.That's.No.Lady.DVDRip.x264-TiMEGOD", ('other', 'S04E27')),
+    ('SpongeBob.SquarePants.S04E15b.Thats.No.Lady.DVDRip.x264-TiMEGOD', ('other', 'S04E27')),
+    ('Spongebob.Squarepants.S04E15.Bummer.Vacation.Wigstuck.1080p.JHS.WEB-DL.English.AAC.2.0.H264-Rv', 'none'),   # "Wigstuck" is a typo, so no title covers it
+    ('SpongeBob.SquarePants.S04E15b-Wishing.You.Well', ('other', 'S04E20')),
+    ('SpongeBob.SquarePants.S04E15.DUTCH.1080p.WEB.h264-NLKIDS', None),
+    ('SpongeBob.SquarePants.S04E15-E16.Ghost.Host..Chimps.Ahoy.1080p.PMTP.WEB-DL.AAC2.0.x264-AndreMor', 'imported'),
+    ('SpongeBob.SquarePants.S04E15E16.Ghost.Host..Chimps.Ahoy.MULTI.1080p.MAX.WEB-DL.DDP2.0.H.264-AndreMor', 'imported'),   # one segment is the file's own
+    ('SpongeBob.SquarePants.S04E15E16.Ghost.Host..Chimps.Ahoy.MULTI.1080p.SKST.WEB-DL.DDP2.0.x264-AndreMor', 'imported'),
+    ('SpongeBob.SquarePants.S04E15-E16.Krusty.Towers.and.Mrs.Puff.Youre.Fired.1080p.AMZN.WEB-DL.AAC2.0.h.264-CHX', ('other', 'S04E13 and S04E14')),   # a third order
+    ('SpongeBob.SquarePants.S04E15.FRENCH.1080p.WEB.H264-HEADER', None),
+    ('SpongeBob.SquarePants-S04E15-Ghost.Host', 'imported'),   # dashes, and no quality word
+    ('SpongeBob.SquarePants.S04E15.Ghost.Host.1080p.AMZN.WEBRip.DDP.2.0.H.265-iVy', 'imported'),
+    ('SpongeBob.SquarePants.S04E15.Ghost.Host.1080p.AMZN.WEBRip.DDP2.0.x264', 'imported'),
+    ('Spongebob.Squarepants-S04e15-Ghost.Host-19', 'imported'),
+    ('SpongeBob SquarePants - S04E15 - Ghost Host - DVD', 'imported'),
+    ('SpongeBob.SquarePants.S04E15.Ghost.Host.REPACK.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune', 'imported'),
+    ('SpongeBob.SquarePants.S04E15.Ghost.Host.REPACK.1080p.AMZN.Webrip.x265.10bit.EAC3.2.0.-.Frys.TAoE', 'imported'),
+    ('SpongeBob.SquarePants.S04E15.NORDiC.ENG.1080p.SKST.WEB-DL.H.264-NORViNE', None),
+    ('SpongeBob.SquarePants.S04E15.REPACK.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune', None),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.amp;amp;amp;amp;.Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.amp;amp;amp;.Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.amp;amp;.Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.amp;.Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),   # an escaped "&" leaves "amp;"
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.and.Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.-.Thats.No.Lady.1080p.HMAX.WEB-DL.DDP2.0.H.265.DUAL-Potatin', ('other', 'S04E23 and S04E27')),   # "Thats" matches "That's"
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.-.Thats.No.Lady.1080p.PMTP.WEB-DL.AAC2.0.H.264.DUAL-OLYMPUS', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage..Thats.No.Lady.1080p.SKST.WEB-DL.DD+2.0.H.264-playWEB', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.Thats.No.Lady.1080p.SKST.WEB-DL.DDP2.0.H.264-OldT', ('other', 'S04E23 and S04E27')),
+    ('SpongeBob.SquarePants.S04E15.Squidtastic.Voyage.Thats.No.Lady.720p.SKST.WEB-DL.DDP2.0.H.264-OldT', ('other', 'S04E23 and S04E27')),
+    ('Spongebob Squarepants S04E15 TVRip HebDub XviD', None),
+    ('Spongebob.Squarepants.S04E15.TVRip.HebDub.XviD', None),
+    ('Spongebob.Squarepants.S04E15.TVRip.HebDub.XviD-P2P', None),
+    ('Spongebob.Squarepants.S04E15.TVRip.HebDub.XviD-P2P-Rakuv01', None),
+    ('Spongebob.Squarepants.S04E15.TVRip.HebDub.XviD-Rakuvfinhel', None),
+    ('SpongeBob.SquarePants.S04E15.XviD-AFG', None),
+    ('SpongeBob.Squarepants.SD.S04E15', None),
+])
+def test_each_release_of_one_search_gets_its_verdict(name, want):
+    """None: the name gives no title. Otherwise the verdict, with the episodes it names when it is "other"."""
+    title = M.release_episode_title(name)
+    v = title and M.episode_title_verdict(title, SPONGE, [GHOST_HOST], name, ["SpongeBob SquarePants"])
+    assert (None if not v else (v["verdict"], v["names"]) if v["verdict"] == "other" else v["verdict"]) == want, (title, v)

@@ -20,13 +20,14 @@ whether the file is wrong enough to re-grab. The rule is that a correct file is 
   never reads as a wrong file.
 - trusted_duration() trusts a duration only when two sources in the file agree. A header may be off by hours.
 - runtime_verdict() and year_verdict() judge the file against the item.
+- episode_title_verdict() finds a release whose episode title names another episode of the series. It alerts only.
 - wrong_content_evidence() adds the signals up. A re-grab needs REGRAB_POINTS.
 
 Network failure is "unknown", never "wrong". The only I/O is TMDB, the cache file and ffprobe in last_packet().
 No handler here catches OutOfTime, the exception the hook's time limit must raise.
 docs/design.md, "Metadata checks", has the rules and the reasons behind them.
 """
-import contextlib, fcntl, functools, http.client, json, os, re, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
+import contextlib, difflib, fcntl, functools, http.client, json, os, re, subprocess, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
 import arr_decide
 
@@ -398,16 +399,178 @@ def release_languages(release_name):
     return {c for w, c in arr_decide.LANGWORDS.items() if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", rest)}
 
 
+# The episode tag of a release name: S04E15, S04E15a (one segment of a DVD order), S21.E13, S01E01E02, S01E01-02,
+# E172 (an absolute number), a daily show's date, or Part04.
+EPISODE_TAG = re.compile(r"(?<![a-z0-9])(?:s\d{1,4}[ ._-]?e\d{1,4}[ab]?(?:[ ._-]?e\d{1,4}|-\d{1,4}(?![0-9pi]))*|e\d{1,4}"
+                         r"|(?:19|20)\d\d[ ._-]\d\d[ ._-]\d\d|part[ ._-]?\d{1,3})(?![a-z0-9])", re.I)
+EPISODE_TITLE_POINTS = 0   # points of a release title that names another episode. 0: it alerts, and never re-grabs.
+TITLE_NEAR = 0.8           # difflib's ratio of two title keys that name one episode, as "Reunion Part 2" and "The Reunion Part 2"
+# Words that end the episode title of a release name, beside the QUALITY words: release flags and sources. A flag in
+# title case is a title word ("Internal Affairs"), because a release writes REPACK, iNTERNAL or repack. A language word
+# ends the title only in capitals ("GERMAN"), because a title may hold one ("Chinese New Year").
+TITLE_END = {"repack", "proper", "rerip", "internal", "readnfo", "dirfix", "nfofix", "multi", "dual", "nordic", "eng", "hebsub", "hebdub",
+             "pdtv", "tvrip", "sdtv", "dvd", "ac3", "subbed", "dubbed", "vostfr"}
+CONNECTORS = {"and", "amp"}   # words between two episode titles in one release name. "amp" is what an escaped "&" leaves.
+
+
+def release_episode_title(name):
+    """The episode title in a release name, between the episode tag and the first QUALITY or tag word, or None. A tag
+    word is a TITLE_END flag, or a language word in capitals. In a name all in capitals the words cannot tell a tag from a
+    title ("FRENCH WEEK"), so only the tag words right before the QUALITY word or the end are cut. In a name with no
+    QUALITY word, a last "-GROUP" with no dot is the release group."""
+    tag = EPISODE_TAG.search(name or "")
+    if not tag:
+        return None
+    rest = name[tag.end():].split("[")[0]
+    end = QUALITY.search(rest)
+    words = [w for w in re.split(r"[ ._]+", rest[:end.start()] if end else re.sub(r"-[^-.\s]*$", "", rest)) if w]
+    flag = lambda w: (w.lower().strip("-") in TITLE_END and not w.istitle()) or (w.isupper() and w.lower() in arr_decide.LANGWORDS)
+    if "".join(words).isupper():
+        while words and flag(words[-1]):
+            words.pop()
+    else:
+        words = words[:next((i for i, w in enumerate(words) if flag(w)), len(words))]
+    return " ".join(words).strip(" -") or None
+
+
+def nfo_episode_title(text):
+    """The episode title of a scene NFO, from its "Episode Title" line, else its "Title" line, or None. A value that
+    holds an episode tag gives the words after the tag."""
+    found = {}
+    for line in (text or "").splitlines():
+        label, sep, value = line.partition(":")
+        key = re.sub(r"[^a-z]", "", label.lower())
+        if sep and key in ("title", "episodetitle", "episodename", "eptitle") and value.strip(" .:"):
+            found.setdefault(key != "title", value.strip(" .:\t"))
+    value = found.get(True) or found.get(False)
+    tag = value and EPISODE_TAG.search(value)
+    return (value[tag.end():].strip(" .-_") if tag else value) or None
+
+
+def title_key(text):
+    """text for a title match: lower case, no accents, no apostrophes, '&' as "and", every other mark a space."""
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower().replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", re.sub(r"['`]", "", text)).split())
+
+
+def title_keys(title, series=()):
+    """The keys of title and of each of its segments, which "/" or "+" join. A key that only names the series is left
+    out, and a series title in front of the episode title is dropped."""
+    out = set()
+    for part in [title] + re.split(r"\s*[/+]\s*", title or ""):
+        k = title_key(part)
+        for s in series:
+            if s and k.startswith(s + " "):
+                k = k[len(s) + 1:]
+        if k and k not in series:
+            out.add(k)
+    return out
+
+
+def tag_numbers(name):
+    """The numbers of the release name's episode tag: ("season", season, {episodes}), ("absolute", None, {numbers}) for a
+    bare E172 or a Part04, or None for a date or no tag."""
+    tag = EPISODE_TAG.search(name or "")
+    t = tag.group().lower() if tag else ""
+    if t.startswith("s"):
+        season, rest = re.match(r"s(\d+)(.*)", t).groups()
+        return "season", int(season), {int(n) for n in re.findall(r"\d+", rest)}
+    if t.startswith(("e", "part")):
+        return "absolute", None, {int(re.search(r"\d+", t).group())}
+    return None
+
+
+def covered(key, owners):
+    """The episode keys of owners that cover key from end to end, with only CONNECTORS between them, or []. A release
+    name joins two titles with no "/", as in "Show.S04E15.First.Title.Second.Title.1080p". A connector never starts or
+    ends the key, so "And Then" never reads as the title "Then"."""
+    words, starts, found = key.split(), {}, {0: []}   # found: the end of a covered start of words, and its keys
+    for k in owners:
+        starts.setdefault(k.split()[0], []).append(k.split())
+    for i, w in enumerate(words):
+        if i in found:
+            if w in CONNECTORS and found[i] and i + 1 < len(words):
+                found.setdefault(i + 1, found[i])
+            for kw in starts.get(w, ()):
+                if words[i:i + len(kw)] == kw:
+                    found.setdefault(i + len(kw), found[i] + [" ".join(kw)])
+    return found.get(len(words), [])
+
+
+PART = re.compile(r"(.*?)(?: (?:part |pt )?(\d{1,2}|one|two|three|four|five|six|i{1,3}|iv|v|vi))?")   # a key and its part number
+
+
+def parts(a, b):
+    """Whether two keys name two parts of one story: the same words with another part number, or none on one side, as
+    "versus the ring" and "versus the ring part 2". Neither names the other then, so a swap of two parts shows."""
+    (base_a, part_a), (base_b, part_b) = PART.fullmatch(a).groups(), PART.fullmatch(b).groups()
+    return base_a == base_b and part_a != part_b
+
+
+def episode_title_verdict(title, episodes, imported, release_name="", series_titles=(), said="the release's title", anime=False):
+    """Whether the episode title of a release names another episode of the series than the file was imported as.
+
+    title: release_episode_title() or nfo_episode_title(). episodes: Sonarr's episodes of the series. imported: the
+    ids of the file's episodes. release_name: the release, whose tag_numbers() Sonarr imported by. A title, or one of
+    its segments, matches an episode whose title has the same key. So do the titles that cover it, see covered(). The
+    verdict is one of these:
+    - "imported": a key is within TITLE_NEAR of an imported episode's title, or one holds the other's words in a row,
+      such as a title that leaves out "Part Two", or "Inferno (4)" for "The Romans: Inferno (4)".
+    - "mapped": Sonarr imported the release to other numbers than its tag, through its scene numbering, which already
+      maps the release's own order. The title then follows the release's order, so it says nothing.
+    - "other": the title matches another episode, one that no other episode shares the title with. A special counts
+      only for a special, because a special often repeats the title of a regular episode.
+    - "none": no episode matches.
+    said names where the title comes from, such as "the release's NFO". anime adds each episode's absolute number.
+    Returns a signal of wrong_content_evidence(): {"kind", "verdict", "points", "why", "episodes", "names"}. names holds
+    the matched episodes as the alert names them. None when no episode points to the file, because the check then has
+    nothing to compare.
+    """
+    series = {title_key(t) for t in series_titles if t}
+    mine, wanted, owners = [e for e in episodes if e["id"] in set(imported)], title_keys(title, series), {}
+    if not mine:
+        return None
+    for e in episodes:
+        for k in title_keys(e.get("title"), series):
+            owners.setdefault(k, set()).add(e["id"])
+    wanted |= {k for w in list(wanted) for k in covered(w, owners)}
+    near = lambda a, b: not parts(a, b) and (difflib.SequenceMatcher(None, a, b).ratio() >= TITLE_NEAR or f" {a} " in f" {b} " or f" {b} " in f" {a} ")
+    tag, found = tag_numbers(release_name), []
+    if any(near(k, o) for e in mine for o in title_keys(e.get("title"), series) for k in wanted):
+        verdict = "imported"
+    elif tag and mine and not tag[2] & ({e.get("episodeNumber") for e in mine if tag[0] == "absolute" or e.get("seasonNumber") == tag[1]}
+                                          | {e.get("absoluteEpisodeNumber") for e in mine if tag[0] == "absolute"}):
+        verdict = "mapped"
+    else:
+        ids = {i for k in wanted for i in owners.get(k, ()) if len(owners[k]) == 1}
+        special = any(e.get("seasonNumber") == 0 for e in mine)
+        found = sorted((e for e in episodes if e["id"] in ids and (e.get("seasonNumber") or special)),
+                       key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
+        verdict = "other" if found else "none"
+    name, listed = lambda es: ", ".join(episode_name(e, anime) for e in es), [episode_name(e, anime) for e in found]
+    why = f"{said} says {title}" + (f", which Sonarr lists as {name(found)}. It was imported as {name(mine)}" if found else "")
+    return {"kind": "episode_title", "verdict": verdict, "points": EPISODE_TITLE_POINTS if found else 0, "episodes": [e["id"] for e in found],
+            "names": f"{', '.join(listed[:-1])} and {listed[-1]}" if len(listed) > 1 else "".join(listed), "why": why}
+
+
+def episode_name(e, anime=False):
+    """S04E21 of a Sonarr episode. anime adds its absolute number, by which anime releases count."""
+    return f'S{e.get("seasonNumber") or 0:02d}E{e.get("episodeNumber") or 0:02d}' + \
+        (f' (absolute {e["absoluteEpisodeNumber"]})' if anime and e.get("absoluteEpisodeNumber") else "")
+
+
 def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, release_name, item_type, item_year,
-                           alt_titles_years=(), other=None):
+                           alt_titles_years=(), other=None, episode=None):
     """Each signal that the file holds the wrong content, its points, and whether they justify a re-grab.
 
     tracks: arr_decide.classify() of the file. original: the app's original language. expected: expected_languages().
     trusted: trusted_duration(). listed_minutes, release_name, item_type: see runtime_verdict(). item_year and
-    alt_titles_years: see year_verdict(). other: other_film() for a movie.
+    alt_titles_years: see year_verdict(). other: other_film() for a movie. episode: episode_title_verdict() for an
+    episode whose release names a title.
 
     One point each: the wrong language, the release name naming that language (movies), a short or long runtime, a
-    year mismatch, and the runtime of another film the release name names. Two points: a movie (never a special)
+    year mismatch, and the runtime of another film the release name names. An episode title that names another
+    episode scores EPISODE_TITLE_POINTS, 0, so it alerts and never re-grabs. Two points: a movie (never a special)
     under VERY_SHORT of a feature-length listing, with the header confirmed and a TMDB runtime known. A re-grab needs
     REGRAB_POINTS, so one signal alone never deletes a file, except a very short movie.
     Returns {"signals": [{"kind", "verdict", "points", "why"}], "points", "regrab", "why", "tmdb", "tmdb_why"}.
@@ -437,6 +600,7 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
     own = [m for m in ((listed_minutes, tmdb_rt) if movie else ()) if m]
     if other and movie and secs and own and not any(matches(m, secs) for m in own):
         add("other_film", "match", 1, f'the file runs like {other["title"]} ({other["year"]}), {other["source"]}, {other["runtime"]} minutes')
+    sig += [episode] if episode else []
     total, (code, reason) = sum(s["points"] for s in sig), tmdb_state(expected)
     return {"signals": sig, "points": total, "regrab": total >= REGRAB_POINTS, "why": "; ".join(s["why"] for s in sig if s["points"]),
             "tmdb": code, "tmdb_why": reason}

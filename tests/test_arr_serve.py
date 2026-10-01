@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 
 import pytest
 
@@ -88,7 +89,7 @@ def app(tmp_path, monkeypatch):
         v = s["api"][p]
         if isinstance(v, Exception):
             raise v
-        return h.mapped(v)   # the real arr() maps every answer
+        return h.mapped(v, a)   # the real arr() maps every answer with the app's map
     monkeypatch.setattr(h, "arr", fake_arr)
     return s
 
@@ -149,6 +150,20 @@ def test_a_sonarr_body_gives_the_job_hook_writes_with_the_apis_episode_ids(app, 
     got = arr_serve.job_of(h, "sonarr", sonarr_body(app, episodes=[{"id": 1}]))   # the posted episodes are never used
     assert {k: v for k, v in got.items() if k != "time"} == {k: v for k, v in want.items() if k != "time"}
     assert got["episode_ids"] == "901,902" and got["deleted"] is None and got["recycled"] is None
+
+
+def test_a_sonarr_body_reads_the_nfo_beside_its_source_as_the_hook_does(app, monkeypatch, tmp_path):
+    """Both read the scene NFO of the folder Sonarr imported from, at the event."""
+    rel = tmp_path / "downloads" / "Show.A.S01E02.1080p.WEB.H264-GRP"
+    rel.mkdir(parents=True)
+    (rel / "show.a.s01e02.1080p.web.h264-grp.nfo").write_text("Title : Night Shift\n")
+    src = str(rel / "show.a.s01e02.1080p.web.h264-grp.mkv")
+    want = hook_job(monkeypatch, {"sonarr_eventtype": "Download", "sonarr_series_id": "5", "sonarr_episodefile_id": "41",
+                                  "sonarr_episodefile_path": app["ep"], "sonarr_episodefile_episodeids": "901,902",
+                                  "sonarr_episodefile_scenename": "", "sonarr_download_id": "", "sonarr_episodefile_sourcepath": src})
+    got = arr_serve.job_of(h, "sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": src}))
+    assert got["nfo_title"] == want["nfo_title"] == "Night Shift"
+    assert arr_serve.job_of(h, "sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": "../x.mkv"}))["nfo_title"] is None
 
 
 def test_the_job_takes_the_apis_path_and_scene_name_and_logs_the_posted_path(app):
@@ -228,22 +243,22 @@ def test_an_api_error_other_than_404_passes_up(app):
 
 def test_path_map_maps_both_ways_by_the_longest_whole_prefix(monkeypatch):
     monkeypatch.setattr(h, "PATH_MAP", [("/tv", "/media/tv"), ("/tv/kids", "/kids"), ("/", "/host")])
-    assert h.mapped("/tv/Show/a.mkv") == "/media/tv/Show/a.mkv"
-    assert h.mapped("/tv/kids/Show/a.mkv") == "/kids/Show/a.mkv"
-    assert h.mapped("/tvshows/a.mkv") == "/host/tvshows/a.mkv"   # /tv matches whole folder names only
-    assert h.mapped("/tv") == "/media/tv"
-    assert h.mapped("/kids/Show/a.mkv", back=True) == "/tv/kids/Show/a.mkv"
-    assert h.mapped("/media/tv/a.mkv", back=True) == "/tv/a.mkv"
-    assert h.mapped({"a": ["/tv/x", 3, None, "Film /tv"], "b": {"c": "/tv/y"}}) == {"a": ["/media/tv/x", 3, None, "Film /tv"], "b": {"c": "/media/tv/y"}}
+    assert h.mapped("/tv/Show/a.mkv", "sonarr") == "/media/tv/Show/a.mkv"
+    assert h.mapped("/tv/kids/Show/a.mkv", "sonarr") == "/kids/Show/a.mkv"
+    assert h.mapped("/tvshows/a.mkv", "sonarr") == "/host/tvshows/a.mkv"   # /tv matches whole folder names only
+    assert h.mapped("/tv", "sonarr") == "/media/tv"
+    assert h.mapped("/kids/Show/a.mkv", "sonarr", back=True) == "/tv/kids/Show/a.mkv"
+    assert h.mapped("/media/tv/a.mkv", "sonarr", back=True) == "/tv/a.mkv"
+    assert h.mapped({"a": ["/tv/x", 3, None, "Film /tv"], "b": {"c": "/tv/y"}}, "sonarr") == {"a": ["/media/tv/x", 3, None, "Film /tv"], "b": {"c": "/media/tv/y"}}
     monkeypatch.setattr(h, "PATH_MAP", [])
-    assert h.mapped("/tv/a.mkv") == "/tv/a.mkv"
+    assert h.mapped("/tv/a.mkv", "sonarr") == "/tv/a.mkv"
 
 
 def test_a_map_to_the_root_and_a_blank_query_value_keep_their_shape(monkeypatch):
     monkeypatch.setattr(h, "PATH_MAP", [("/tv", "/")])
-    assert (h.mapped("/tv"), h.mapped("/tv/a/b.mkv"), h.mapped("/a/b.mkv", back=True)) == ("/", "/a/b.mkv", "/tv/a/b.mkv")
+    assert (h.mapped("/tv", "sonarr"), h.mapped("/tv/a/b.mkv", "sonarr"), h.mapped("/a/b.mkv", "sonarr", back=True)) == ("/", "/a/b.mkv", "/tv/a/b.mkv")
     monkeypatch.setattr(h, "PATH_MAP", [("/app", "/local")])
-    assert h.app_query("manualimport?q=&folder=%2Flocal%2Fa") == "manualimport?q=&folder=%2Fapp%2Fa"
+    assert h.app_query("manualimport?q=&folder=%2Flocal%2Fa", "radarr") == "manualimport?q=&folder=%2Fapp%2Fa"
 
 
 def test_arr_maps_the_answer_the_query_and_the_body(monkeypatch, tmp_path):
@@ -289,7 +304,7 @@ def test_config_refuses_to_start_without_credentials_or_with_a_bad_setting(monke
         arr_serve.config(h)
 
 
-def test_plex_gets_the_apps_path(monkeypatch):
+def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch):
     monkeypatch.setattr(h, "PATH_MAP", [("/data", "/mnt/data")])
     item = {"ratingKey": "7101", "Guid": [{"id": "tmdb://1"}], "Media": [{"Part": [{"file": "/data/movies/A/a.mkv"}]}]}
     def fake_plex_get(path, **q):
@@ -304,6 +319,177 @@ def test_plex_gets_the_apps_path(monkeypatch):
     monkeypatch.setattr(h, "http", lambda url, *a, **k: sent.append(url))
     h.plex_folder_scan(dict(p, section="12"), send=True)
     assert "path=%2Fdata%2Fmovies%2FA&" in sent[0]
+
+
+def test_each_program_maps_by_its_own_map_and_by_whole_folder_names(monkeypatch):
+    """"/mnt/TV" is a string prefix of "/mnt/TV Shows". A map takes whole folder names, and the longest prefix wins
+    within each map, in both directions. A program without its own map takes PATH_MAP."""
+    monkeypatch.setattr(h, "PATH_MAP", [("/data", "/media")])
+    monkeypatch.setattr(h, "MAPS", {"sonarr": [("/mnt/TV", "/media/TV")], "plex": [("/mnt/TV Shows", "/media/TV"), ("/mnt/TV", "/media/old")]})
+    assert h.mapped("/mnt/TV Shows/A/a.mkv", "sonarr") == "/mnt/TV Shows/A/a.mkv"   # no whole-name match
+    assert h.mapped("/mnt/TV/A/a.mkv", "sonarr") == "/media/TV/A/a.mkv"
+    assert h.mapped("/media/TV/A/a.mkv", "sonarr", back=True) == "/mnt/TV/A/a.mkv"
+    assert h.mapped("/media/TV/A/a.mkv", "plex", back=True) == "/mnt/TV Shows/A/a.mkv"
+    assert h.mapped("/mnt/TV Shows/A/a.mkv", "plex") == "/media/TV/A/a.mkv"
+    assert h.mapped("/mnt/TV/A/a.mkv", "plex") == "/media/old/A/a.mkv"
+    assert h.mapped("/media/TV Shows/a.mkv", "plex", back=True) == "/media/TV Shows/a.mkv"
+    assert h.mapped("/data/a.mkv", "radarr") == "/media/a.mkv" and h.mapped("/data/a.mkv", "sonarr") == "/data/a.mkv"
+    assert h.app_query("parse?path=%2Fmedia%2FTV%2Fa.mkv", "sonarr") == "parse?path=%2Fmnt%2FTV%2Fa.mkv"
+    assert h.app_query("parse?path=%2Fmedia%2Fa.mkv", "radarr") == "parse?path=%2Fdata%2Fa.mkv"
+
+
+TESTER = {"SONARR_PATH_MAP": "/mnt/TV:{m}/TV|/mnt/Anime:{m}/Anime", "RADARR_PATH_MAP": "/movies:{m}/Movies",
+          "PLEX_PATH_MAP": "/mnt/TV Shows:{m}/TV|/mnt/Anime:{m}/Anime|/mnt/Movies:{m}/Movies"}
+
+
+@pytest.fixture
+def tester(tmp_path, monkeypatch):
+    """A setup with a path map per program: Sonarr sees TV at /mnt/TV, Radarr sees films at /movies, Plex sees them at
+    /mnt/TV Shows and /mnt/Movies, and this container sees all three under its own media folder. Anime has one path in
+    Sonarr and Plex. The real arr() runs against a fake HTTP of both apps and Plex. Returns the fake's state."""
+    m = tmp_path / "media"
+    ep, film = m / "TV" / "Show A" / "Season 1" / "Show A - S01E02.mkv", m / "Movies" / "Film A (1979)" / "Film A (1979).mkv"
+    for f in (ep, film):
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"x")
+    (m / "Anime").mkdir()
+    for k, v in TESTER.items():
+        monkeypatch.setitem(h.CFG, k, v.format(m=m))
+    monkeypatch.setattr(h, "MAPS", {who: h.path_map(k)[0] for who, k in h.MAP_KEYS.items()})
+    monkeypatch.setattr(h, "PATH_MAP", [])
+    for k, v in (("SONARR_URL", "http://sonarr.invalid"), ("RADARR_URL", "http://radarr.invalid"), ("SONARR_API_KEY", "ks"),
+                 ("RADARR_API_KEY", "kr"), ("PLEX_URL", "http://plex.invalid"), ("PLEX_TOKEN", "t0ken"), ("LOG", str(tmp_path / "log.jsonl"))):
+        monkeypatch.setitem(h.CFG, k, v)
+    s = {"ep": str(ep), "film": str(film), "media": str(m), "calls": [], "api": {
+        "sonarr/episodefile/41": {"id": 41, "seriesId": 5, "path": "/mnt/TV/Show A/Season 1/Show A - S01E02.mkv"},
+        "sonarr/episode": [{"id": 901}],
+        "sonarr/series/5": {"id": 5, "path": "/mnt/TV/Show A"},
+        "sonarr/config/mediamanagement": {"recycleBin": ""},
+        "sonarr/rootfolder": [{"path": "/mnt/TV"}, {"path": "/mnt/Anime"}],
+        "radarr/moviefile/31": {"id": 31, "movieId": 7, "path": "/movies/Film A (1979)/Film A (1979).mkv"},
+        "radarr/rootfolder": [{"path": "/movies"}],
+        "sonarr/command": {"id": 1}, "radarr/parse": {},
+        "plex/library/sections": {"MediaContainer": {"Directory": [
+            {"key": "1", "Location": [{"path": "/mnt/TV Shows"}]}, {"key": "2", "Location": [{"path": "/mnt/Anime"}]},
+            {"key": "3", "Location": [{"path": "/mnt/Movies"}]}, {"key": "4", "Location": [{"path": "/mnt/Music"}]}]}},
+        "plex/library/sections/1/all": {"MediaContainer": {"Metadata": [{"ratingKey": "100", "Guid": [{"id": "tvdb://5"}]}]}},
+        "plex/library/metadata/100/allLeaves": {"MediaContainer": {"Metadata": [
+            {"ratingKey": "101", "Media": [{"Part": [{"file": "/mnt/TV Shows/Show A/Season 1/Show A - S01E02.mkv"}]}]}]}},
+        "plex/library/sections/3/all": {"MediaContainer": {"Metadata": [
+            {"ratingKey": "300", "Guid": [{"id": "tmdb://7"}], "Media": [{"Part": [{"file": "/mnt/Movies/Film A (1979)/Film A (1979).mkv"}]}]}]}},
+    }}
+
+    def fake_http(url, method="GET", body=None, headers=None, timeout=15):
+        u = urllib.parse.urlsplit(url)
+        who, path = u.netloc.split(".")[0], u.path.removeprefix("/api/v3")
+        s["calls"].append((who, method, path, dict(urllib.parse.parse_qsl(u.query)), body))
+        v = s["api"].get(f"{who}{path}")
+        if isinstance(v, Exception) or v is None:
+            raise v or http_error(404)
+        return json.loads(json.dumps(v))
+    monkeypatch.setattr(h, "http", fake_http)
+    return s
+
+
+def test_the_tester_setup_maps_each_import_by_its_app_and_finds_it_in_plex(tester):
+    """A Sonarr import under /mnt/TV and a Radarr import under /movies reach the job as local paths. Plex lists each
+    under its own path, and the lookup finds it there."""
+    body = {"eventType": "Download", "series": {"id": 5}, "episodeFile": {"id": 41, "path": "/mnt/TV/Show A/Season 1/Show A - S01E02.mkv"},
+            "deletedFiles": [{"path": "/mnt/TV/Show A/Season 1/old.mkv", "recycleBinPath": ""}]}
+    job = arr_serve.job_of(h, "sonarr", body)
+    assert (job["path"], job["deleted"]) == (tester["ep"], os.path.join(os.path.dirname(tester["ep"]), "old.mkv"))
+    assert not os.path.exists(h.CFG["LOG"])   # the posted path maps to the API's: no warning
+    film = arr_serve.job_of(h, "radarr", {"eventType": "Download", "movie": {"id": 7}, "movieFile": {"id": 31, "path": "/movies/Film A (1979)/Film A (1979).mkv"}})
+    assert film["path"] == tester["film"]
+    rel = os.path.join(tester["media"], "TV", "downloads", "Show.A.S01E02.WEB-GRP")   # Sonarr sees it under /mnt/TV
+    os.makedirs(rel)
+    open(os.path.join(rel, "show.a.s01e02.web-grp.nfo"), "w").write("Title : Night Shift\n")
+    sourced = arr_serve.job_of(h, "sonarr", dict(body, episodeFile=dict(body["episodeFile"], sourcePath="/mnt/TV/downloads/Show.A.S01E02.WEB-GRP/show.a.s01e02.web-grp.mkv")))
+    assert sourced["nfo_title"] == "Night Shift"   # the source path maps with Sonarr's map
+    outside = os.path.join(os.path.dirname(tester["media"]), "outside", "Show.A.S01E02.WEB-GRP")   # under no folder of the map
+    os.makedirs(outside)
+    open(os.path.join(outside, "show.a.s01e02.web-grp.nfo"), "w").write("Title : Night Shift\n")
+    posted = dict(body, episodeFile=dict(body["episodeFile"], sourcePath=os.path.join(outside, "show.a.s01e02.web-grp.mkv")))
+    assert arr_serve.job_of(h, "sonarr", posted)["nfo_title"] is None
+    assert h.plex_find(job["path"], {"guids": ["tvdb://5"], "title": "Show A", "show": True}) == (["101"], False, "1")
+    assert h.plex_find(film["path"], {"guids": ["tmdb://7"], "title": "Film A"}) == (["300"], False, "3")
+    p = h.plex_folder_job("sonarr", "hook", "Show A", os.path.dirname(job["path"]), None)
+    assert h.plex_folder_scan(p) == (["folder"], False, "1")
+    h.plex_folder_scan(dict(p, section="1"), send=True)
+    assert tester["calls"][-1][2:4] == ("/library/sections/1/refresh", {"path": "/mnt/TV Shows/Show A/Season 1", "X-Plex-Token": "t0ken"})
+    h.arr_write("sonarr", "command", "POST", {"name": "RescanSeries", "path": os.path.dirname(job["path"])})
+    h.arr("radarr", "parse?" + urllib.parse.urlencode({"path": film["path"]}))
+    assert [c[3:] for c in tester["calls"][-2:]] == [({}, {"name": "RescanSeries", "path": "/mnt/TV/Show A/Season 1"}),
+                                                    ({"path": "/movies/Film A (1979)/Film A (1979).mkv"}, None)]
+    assert h.path_warnings() == []   # the Music library holds no root folder, so it never warns
+
+
+def test_one_path_map_for_every_program_misses_plex_and_the_check_names_it(tester, monkeypatch, capsys):
+    """The tester's first setup: PATH_MAP alone. Plex lists TV under /mnt/TV Shows and films under /mnt/Movies, so the
+    lookup finds neither, and the path check names each root folder and PLEX_PATH_MAP. --selftest and the listener
+    start print the warnings and fail on none."""
+    m = tester["media"]
+    monkeypatch.setattr(h, "MAPS", {})
+    monkeypatch.setattr(h, "PATH_MAP", [("/mnt/TV", f"{m}/TV"), ("/mnt/Anime", f"{m}/Anime"), ("/movies", f"{m}/Movies")])
+    assert h.plex_find(tester["ep"], {"guids": ["tvdb://5"], "title": "Show A", "show": True}) == ([], False, None)
+    want = [f"no Plex library folder holds Sonarr's root folder {m}/TV, which PATH_MAP puts at /mnt/TV in Plex. "
+            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits.",
+            f"no Plex library folder holds Radarr's root folder {m}/Movies, which PATH_MAP puts at /movies in Plex. "
+            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits."]
+    assert sorted(h.path_warnings()) == sorted(want)
+    arr_serve.path_check(h)
+    assert sorted(capsys.readouterr().out.splitlines()) == sorted(f"arr-media-guard: warning: {w}" for w in want)
+    h.main(["--selftest"])
+    out = capsys.readouterr().out
+    assert all(f"warning: {w}" in out for w in want) and out.rstrip().endswith("selftest ok")
+
+
+def test_the_path_check_names_a_root_folder_this_script_does_not_see_and_its_setting(tester, monkeypatch):
+    tester["api"]["sonarr/rootfolder"].append({"path": "/mnt/TV/Kids"})   # mapped, and not there
+    tester["api"]["radarr/rootfolder"].append({"path": "/films4k"})       # no pair maps it
+    assert sorted(h.path_warnings()) == sorted([
+        f"this script does not see {tester['media']}/TV/Kids, where SONARR_PATH_MAP puts Sonarr's root folder /mnt/TV/Kids. "
+        "Mount the media there, or fix SONARR_PATH_MAP.",
+        "this script does not see Radarr's root folder /films4k. Mount the media there, or fix RADARR_PATH_MAP.",
+        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files the hook edits."])
+    # A Plex library inside a root folder, or one that holds it, counts. Without PLEX_URL there is no Plex check.
+    tester["api"]["plex/library/sections"]["MediaContainer"]["Directory"].append({"key": "5", "Location": [{"path": "/films4k/uhd"}]})
+    assert all(w.startswith("this script does not see") for w in h.path_warnings())
+    monkeypatch.setitem(h.CFG, "PLEX_URL", "")
+    tester["calls"].clear()
+    assert len(h.path_warnings()) == 2 and not any(c[0] == "plex" for c in tester["calls"])
+
+
+def test_with_no_map_set_the_path_check_says_to_set_one(tester, monkeypatch):
+    """No map moves the root folders, so the warnings name no map that puts them anywhere, and they say to set one."""
+    monkeypatch.setattr(h, "MAPS", {})
+    for k, v in (("RADARR_API_KEY", ""), ("RADARR_DIR", "/nonexistent")):   # Sonarr alone
+        monkeypatch.setitem(h.CFG, k, v)
+    tester["api"]["sonarr/rootfolder"] = [{"path": "/mnt/TV"}]
+    assert h.path_warnings() == [
+        "this script does not see Sonarr's root folder /mnt/TV. Mount the media there, or set SONARR_PATH_MAP or PATH_MAP.",
+        "no Plex library folder holds Sonarr's root folder /mnt/TV. Set PLEX_PATH_MAP or PATH_MAP, so Plex finds the files the hook edits."]
+
+
+def test_a_pair_with_trailing_slashes_maps_the_root_folder_itself(tester, monkeypatch):
+    """SONARR_PATH_MAP='/mnt/TV/:/media/TV/' maps /mnt/TV, so the Test event finds each root folder and passes."""
+    monkeypatch.setitem(h.CFG, "SONARR_PATH_MAP", "/mnt/TV/:{m}/TV/|/mnt/Anime//:{m}/Anime/".format(m=tester["media"]))
+    monkeypatch.setitem(h.MAPS, "sonarr", h.path_map("SONARR_PATH_MAP")[0])
+    assert h.mapped("/mnt/TV", "sonarr") == f"{tester['media']}/TV" and h.mapped(f"{tester['media']}/Anime", "sonarr", True) == "/mnt/Anime"
+    assert arr_serve.test_event(h, "sonarr") is None and h.path_warnings() == []
+
+
+def test_the_path_check_says_when_an_app_or_plex_does_not_answer(tester, monkeypatch):
+    tester["api"]["sonarr/rootfolder"] = urllib.error.URLError("refused")
+    tester["api"]["plex/library/sections"] = urllib.error.URLError("http://plex.invalid/library/sections?X-Plex-Token=t0ken refused")
+    assert h.path_warnings() == ["Sonarr did not answer, so its root folders are not checked: URLError: <urlopen error refused>",
+                                 "Plex did not answer, so its library folders are not checked: URLError: "
+                                 "<urlopen error http://plex.invalid/library/sections?X-Plex-Token=<PLEX_TOKEN> refused>"]
+    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "")
+    monkeypatch.setitem(h.CFG, "RADARR_DIR", "/nonexistent")   # an app this host does not run is never asked
+    tester["calls"].clear()
+    h.path_warnings()
+    assert not any(c[0] == "radarr" for c in tester["calls"])
 
 
 # --- the HTTP handler --------------------------------------------------------------------------------------------------
@@ -408,7 +594,7 @@ def test_the_test_event_checks_the_policy_the_api_and_the_root_folders(server, a
     assert code == 200 and "Test ok" in text and h.queued() == []
     app["api"]["rootfolder"].append({"path": "/nonexistent/anime"})
     code, text, _ = server("POST", "/sonarr", {"eventType": "Test"})
-    assert code == 500 and "/nonexistent/anime" in text and "PATH_MAP" in text
+    assert code == 500 and "/nonexistent/anime" in text and "Mount the media at the app's paths, or set SONARR_PATH_MAP or PATH_MAP" in text
     roots, app["api"]["rootfolder"] = app["api"]["rootfolder"][:2], urllib.error.URLError("refused")
     code, text, _ = server("POST", "/sonarr", {"eventType": "Test"})
     assert code == 500 and "API did not answer" in text
@@ -928,6 +1114,34 @@ def test_a_stop_ends_the_listener_at_once_and_prints_the_last_count(tmp_path):
             p.wait()
 
 
+def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path):
+    """The start line names the map of each program. The path check runs beside the listener, so an app that does not
+    answer gives a warning and never holds up the start. A bad pair in any map stops the start."""
+    port, env, out = free_port(), tmp_path / "env", tmp_path / "out"
+    base = (f"WEBHOOK_USER='guard'\nWEBHOOK_PASSWORD='s3cret-pass'\nAUDIT_TIME=''\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\n"
+            f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\nRADARR_DIR='/nonexistent'\n"
+            f"SONARR_API_KEY='0123abcd'\nSONARR_URL='http://127.0.0.1:{free_port()}'\nPATH_MAP='/data:/media'\n")
+    env.write_text(base + "PLEX_PATH_MAP='/mnt/TV Shows:/media/TV'\n")
+    with open(out, "w") as f:
+        p = subprocess.Popen([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], stdout=f, stderr=subprocess.STDOUT,
+                             env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
+    try:
+        for _ in range(100):
+            if "warning: Sonarr did not answer" in out.read_text():
+                break
+            time.sleep(0.1)
+        text = out.read_text()
+        assert "Path maps: sonarr /data:/media, radarr /data:/media, plex /mnt/TV Shows:/media/TV." in text, text
+        assert "arr-media-guard: warning: Sonarr did not answer, so its root folders are not checked: URLError" in text, text
+    finally:
+        p.send_signal(signal.SIGTERM)
+        p.wait(timeout=20)
+    env.write_text(base + "RADARR_PATH_MAP='/movies:/media/movies|movies:/m'\n")
+    r = subprocess.run([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
+    assert r.returncode == 1 and "--serve: RADARR_PATH_MAP takes pairs APP_PATH:LOCAL_PATH" in r.stderr, r.stderr
+
+
 def test_a_missing_recycle_bin_warns_in_the_test_and_the_selftest_and_fails_neither(server, app, monkeypatch, capsys):
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}
     code, text, _ = server("POST", "/radarr", {"eventType": "Test"})
@@ -980,5 +1194,160 @@ def test_a_recycle_bin_on_another_file_system_warns(app, monkeypatch):
     assert w.startswith(f"Radarr's recycle bin {app['rbin']} is on another file system than ") and "needs a rename" in w
 
 
+def test_a_recycle_bin_on_its_own_bind_mount_of_the_same_file_system_warns(app, monkeypatch):
+    """The bin and the root folders share st_dev, but the bin is its own mount, so a rename from it fails with EXDEV."""
+    real = os.path.ismount
+    monkeypatch.setattr(h.os.path, "ismount", lambda p: p == app["rbin"] or real(p))
+    (w,) = h.bin_warnings("radarr")
+    assert w.startswith(f"Radarr's recycle bin {app['rbin']} is on another file system than ") and "needs a rename" in w
+
+
 def test_a_recycle_bin_beside_the_media_gives_no_warning(app):
     assert h.bin_warnings("sonarr") == [] and h.bin_warnings("radarr") == []
+
+
+# --- KEEP_REPLACED: the Grab event and its warnings ---------------------------------------------------------------
+
+def keep_on(monkeypatch, tmp_path):
+    """KEEP_REPLACED on, with the top of the mount at tmp_path. Returns replaced_root()."""
+    monkeypatch.setattr(h, "KEEP_REPLACED", True)
+    monkeypatch.setattr(h, "mount_top", lambda f: str(tmp_path))
+    return str(tmp_path / h.RECYCLE_DIR)
+
+
+def test_a_grab_post_links_the_files_the_grab_may_replace(server, app, monkeypatch, tmp_path, capsys):
+    """Radarr names the movie, Sonarr the episodes, and the API gives their files. A two-episode file is linked once. The
+    line on stdout names a file that the API lists and that is not on disk."""
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["movie/7"]["movieFile"] = {"id": 31, "path": app["film"]}
+    app["api"]["episode?episodeIds=901&episodeIds=902"] = [{"id": 901, "episodeFileId": 41, "seriesId": 5}, {"id": 902, "episodeFileId": 41, "seriesId": 5}]
+    code, text, _ = server("POST", "/radarr", {"eventType": "Grab", "movie": {"id": 7}, "downloadId": "SABnzbd_nzo_abc123"})
+    assert (code, text) == (200, "arr-media-guard: Grab ok\n")
+    code, text, _ = server("POST", "/sonarr", {"eventType": "Grab", "series": {"id": 5}, "episodes": [{"id": 901}, {"id": 902}], "downloadId": "D1"})
+    assert (code, text) == (200, "arr-media-guard: Grab ok\n")
+    recs = h.kept_read()
+    assert sorted((r["app"], r["old"], r["download_id"]) for r in recs) == [("radarr", app["film"], "SABnzbd_nzo_abc123"), ("sonarr", app["ep"], "D1")]
+    assert all(os.stat(r["kept"]).st_ino == os.stat(r["old"]).st_ino for r in recs) and h.queued() == []
+    assert "arr-media-guard: radarr grab: kept 1 file.\n" in capsys.readouterr().out
+    app["api"]["movie/7"]["movieFile"] = {"id": 31, "path": app["film"] + ".gone"}
+    server("POST", "/radarr", {"eventType": "Grab", "movie": {"id": 7}, "downloadId": "D2"})
+    assert f"arr-media-guard: radarr grab: kept 0 files. Not kept: {app['film']}.gone: the file is not on disk\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("path, body", [("/radarr", {"eventType": "Grab"}), ("/radarr", {"eventType": "Grab", "movie": {"id": 7}, "downloadId": 5}),
+                                        ("/sonarr", {"eventType": "Grab", "series": {"id": 5}, "episodes": [{"id": "901"}]}),
+                                        ("/radarr", {"eventType": "Grab", "movie": {"id": 7}, "downloadId": "x" * 201}),
+                                        ("/radarr", {"eventType": "Grab", "movie": {"id": 8}})])
+def test_a_grab_that_fails_answers_ok_and_logs_why(server, app, monkeypatch, tmp_path, path, body):
+    """A body the hook cannot read never reaches the API. An API that fails logs too. The app's grab never fails on the
+    hook."""
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["movie/8"] = urllib.error.URLError("refused")
+    code, text, _ = server("POST", path, body)
+    assert (code, text) == (200, "arr-media-guard: Grab ok\n") and h.kept_read() == []
+    assert app["calls"] == ([("radarr", "movie/8")] if body.get("movie") == {"id": 8} else [])
+    (line,) = log_lines()
+    assert (line["source"], line["result"]) == ("webhook", "error") and line["note"].startswith("the grab kept nothing: ")
+
+
+def test_keep_replaced_warns_when_the_connection_to_the_hook_sends_no_grab(app, monkeypatch, tmp_path):
+    """The connection to this hook is a Custom Script with this script's path, or a Webhook to /radarr. Before the first
+    Save the API lists none, and nothing warns."""
+    keep_on(monkeypatch, tmp_path)
+    script = {"name": "guard", "implementation": "CustomScript", "onGrab": False, "fields": [{"name": "path", "value": h.__file__}]}
+    web = {"name": "guard-web", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://arr-media-guard:8484/radarr/"}]}
+    other = {"name": "Discord", "implementation": "Discord", "onGrab": False, "fields": [{"name": "webHookUrl", "value": "https://x.invalid/radarr"}]}
+    app["api"]["notification"] = [script, other]
+    assert h.bin_warnings("radarr") == ["KEEP_REPLACED is on, but Radarr's connection guard does not send Grab, so the hook keeps nothing. "
+                                        "Turn on On Grab in that connection."]
+    script["onGrab"] = True
+    assert h.bin_warnings("radarr") == []
+    app["api"]["notification"] = [web, other]
+    assert "Radarr's connection guard-web does not send Grab" in h.bin_warnings("radarr")[0]
+    app["api"]["notification"] = [other]
+    assert h.bin_warnings("radarr") == [] and not [n for n in os.listdir(tmp_path) if n.startswith(".link-probe-")]   # the probe left nothing
+
+
+def test_keep_replaced_warns_on_a_mount_that_takes_no_hard_link(app, monkeypatch, tmp_path):
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["notification"] = []
+    monkeypatch.setattr(h.os, "link", lambda a, b: (_ for _ in ()).throw(OSError(h.errno.EPERM, "Operation not permitted")))
+    assert h.bin_warnings("radarr") == [f"KEEP_REPLACED is on, but {tmp_path} takes no hard link (Operation not permitted), so the hook keeps "
+                                        "nothing on that mount. Keep the media on a file system that takes hard links."]
+    assert not [n for n in os.listdir(tmp_path) if n.startswith(".link-probe-")]
+
+
+def test_keep_replaced_says_where_the_grab_links_go_when_the_mount_top_is_not_writable(app, monkeypatch, tmp_path):
+    """The hook keeps them in a folder below the mount top. One at a root folder's top level shows in Library Import."""
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["notification"] = []
+    real = os.access
+    monkeypatch.setattr(h.os, "access", lambda p, mode, **k: False if str(p) == str(tmp_path) and mode & os.W_OK else real(p, mode, **k))
+    movies, tv = os.path.join(str(tmp_path), "movies"), os.path.join(str(tmp_path), "tv")
+    assert h.bin_warnings("sonarr") == [
+        f"uid {os.getuid()} and gid {os.getgid()} cannot write in {tmp_path}, so the hook keeps the grab links of {r} in {r}/{h.RECYCLE_DIR}. "
+        "Sonarr's Library Import lists that folder as unmapped. Do not import it." for r in (movies, tv)]
+    assert not [n for r in (movies, tv) for n in os.listdir(r) if n.startswith(".link-probe-")]
+
+
+@pytest.mark.parametrize("made", [False, True])
+def test_keep_replaced_names_the_folder_and_the_user_that_cannot_write_it(app, monkeypatch, tmp_path, made):
+    """The probe writes in the folder, or in the mount top while the folder does not exist. The warning names the folder
+    it probed, the uid and the gid, and what to do."""
+    root = keep_on(monkeypatch, tmp_path)
+    if made:
+        os.mkdir(root)
+    app["api"]["notification"] = []
+    monkeypatch.setattr(h.tempfile, "mkstemp", lambda **k: (_ for _ in ()).throw(PermissionError(13, "Permission denied")))
+    where, fix = (root, f"Give {root} to them.") if made else (tmp_path, f"Create {root} and give it to them.")
+    assert h.bin_warnings("radarr") == [f"KEEP_REPLACED is on, but uid {os.getuid()} and gid {os.getgid()} cannot write in {where} (Permission "
+                                        f"denied), so the hook keeps nothing on that mount. {fix} In Docker, PUID and PGID set them."]
+
+
+def test_the_link_probe_removes_both_files_when_it_stops_between_them(tmp_path, monkeypatch):
+    """A time limit can stop the probe after the link and before its removal. Neither file stays."""
+    real = os.link
+    def link(a, b):
+        real(a, b)
+        raise SystemExit(142)
+    monkeypatch.setattr(h.os, "link", link)
+    with pytest.raises(SystemExit):
+        h.link_probe(str(tmp_path / "recycle"))
+    assert os.listdir(tmp_path) == []
+
+
+def test_a_recycle_bin_the_hook_does_not_see_warns(app):
+    app["api"]["config/mediamanagement"] = {"recycleBin": "/nonexistent/recycle"}
+    assert h.bin_warnings("radarr") == ["Radarr's recycle bin /nonexistent/recycle does not exist where the hook runs, so the restore after "
+                                        "a bad upgrade cannot use it. Mount it at that path, or set RADARR_PATH_MAP or PATH_MAP."]
+
+
+@pytest.mark.parametrize("case", ["no bin", "not here", "other file system"])
+def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in(app, monkeypatch, tmp_path, case):
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
+    if case == "other file system":
+        real = h.volume
+        monkeypatch.setattr(h, "volume", lambda p: -1 if p.startswith(app["rbin"]) else real(p))
+    else:
+        app["api"]["config/mediamanagement"] = {"recycleBin": "" if case == "no bin" else "/nonexistent/recycle"}
+    (w,) = h.bin_warnings("radarr")
+    assert w.endswith(" The hook keeps its own copy of each file an upgrade replaces, so the restore after a bad upgrade still works.")
+    assert "cannot" not in w and "needs a rename" not in w
+    monkeypatch.setattr(h, "KEEP_DAYS", 0)   # keeping nothing, the bin warning says so again
+    w0, w1 = h.bin_warnings("radarr")
+    assert w0 == "KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so the hook keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0."
+    assert "still works" not in w1
+
+
+def test_the_test_event_and_the_selftest_print_the_keep_warnings(server, app, monkeypatch, tmp_path, capsys):
+    keep_on(monkeypatch, tmp_path)
+    app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
+    code, text, _ = server("POST", "/radarr", {"eventType": "Test"})
+    assert code == 200 and "Warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab" in text
+    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k")
+    monkeypatch.setitem(h.CFG, "SONARR_DIR", "/nonexistent")
+    capsys.readouterr()
+    h.main(["--selftest"])
+    out = capsys.readouterr().out
+    assert "warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab" in out and out.rstrip().endswith("selftest ok")

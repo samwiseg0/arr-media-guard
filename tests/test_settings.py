@@ -93,11 +93,13 @@ def test_an_unknown_regrab_kind_is_left_out_and_fails_the_selftest(tmp_path, cap
     assert "unused key WRONG_CONTENT_REGRAB in " in out and "unused key DAMAGE_REGRAB in " in out   # the old switches do nothing
 
 
-def test_name_names_the_two_hidden_folders(tmp_path, capsys):
+def test_name_names_the_hidden_folders(tmp_path, capsys):
     m = load(tmp_path)
-    assert (m.KEEP_DIR, m.HIDE_DIR) == (".arr-media-guard-originals", ".arr-media-guard-convert") and m.CONFIG_ERRORS == []
+    assert (m.KEEP_DIR, m.HIDE_DIR, m.RECYCLE_DIR) == (".arr-media-guard-originals", ".arr-media-guard-convert", ".arr-media-guard-recycle")
+    assert m.CONFIG_ERRORS == []
     m = load(tmp_path, "NAME='site-guard.2'\nKEEP_DIR='.kept'\nHIDE_DIR='.hidden'\n")
-    assert (m.KEEP_DIR, m.HIDE_DIR, m.CFG["NAME"]) == (".site-guard.2-originals", ".site-guard.2-convert", "site-guard.2")
+    assert (m.KEEP_DIR, m.HIDE_DIR, m.RECYCLE_DIR, m.CFG["NAME"]) == (".site-guard.2-originals", ".site-guard.2-convert", ".site-guard.2-recycle",
+                                                                     "site-guard.2")
     m.main(["--selftest"])   # the old keys change nothing, and the selftest names them
     out = capsys.readouterr().out
     assert "unused key KEEP_DIR in " in out and "unused key HIDE_DIR in " in out and "NAME replaced it" in out
@@ -106,7 +108,8 @@ def test_name_names_the_two_hidden_folders(tmp_path, capsys):
 @pytest.mark.parametrize("name", ["", "a/b", "has space", "../x"])
 def test_a_name_that_is_no_plain_folder_name_takes_the_default_and_fails_the_selftest(tmp_path, name):
     m = load(tmp_path, f"NAME='{name}'\n")
-    assert (m.KEEP_DIR, m.HIDE_DIR, m.CFG["NAME"]) == (".arr-media-guard-originals", ".arr-media-guard-convert", "arr-media-guard")
+    assert (m.KEEP_DIR, m.HIDE_DIR, m.RECYCLE_DIR, m.CFG["NAME"]) == (".arr-media-guard-originals", ".arr-media-guard-convert",
+                                                                     ".arr-media-guard-recycle", "arr-media-guard")
     assert len(m.CONFIG_ERRORS) == 1 and m.CONFIG_ERRORS[0].startswith(f"NAME {name!r} holds other characters")
     with pytest.raises(SystemExit, match="NAME"):
         m.main(["--selftest"])
@@ -149,3 +152,65 @@ def test_a_path_map_pair_that_is_not_two_absolute_paths_is_left_out_and_fails_th
     if bad:
         with pytest.raises(SystemExit, match="PATH_MAP takes pairs"):
             m.main(["--selftest"])
+
+
+@pytest.mark.parametrize("quote", ["'", '"', ""])
+def test_each_program_map_reads_paths_with_spaces_and_an_empty_one_takes_path_map(tmp_path, quote):
+    m = load(tmp_path, f"PATH_MAP={quote}/data:/media{quote}\nSONARR_PATH_MAP={quote}/mnt/TV:/media/TV|/mnt/Anime:/media/Anime{quote}\n"
+                       f"RADARR_PATH_MAP={quote}{quote}\nPLEX_PATH_MAP={quote}/mnt/TV Shows:/media/TV{quote}\n")
+    assert m.MAPS == {"sonarr": [("/mnt/TV", "/media/TV"), ("/mnt/Anime", "/media/Anime")], "plex": [("/mnt/TV Shows", "/media/TV")]}
+    assert m.PATH_MAP == [("/data", "/media")] and m.CONFIG_ERRORS == [] and m.PATH_MAP_ERROR is None
+    assert m.mapped("/media/TV/A/a.mkv", "plex", True) == "/mnt/TV Shows/A/a.mkv" and m.mapped("/data/a.mkv", "radarr") == "/media/a.mkv"
+    assert (m.map_key("sonarr"), m.map_key("radarr")) == ("SONARR_PATH_MAP", "PATH_MAP")
+
+
+def test_the_docker_env_file_keeps_every_map_on_path_map_until_one_is_set(tmp_path):
+    """The image writes the example env file, then the Docker section. A line added after them wins."""
+    text = "".join(open(os.path.join(FILES, *f)).read() for f in (("examples", "arr-media-guard.env"), ("docker", "arr-media-guard.env")))
+    m = load(tmp_path, text)
+    assert (m.MAPS, m.PATH_MAP, m.CONFIG_ERRORS, m.KEEP_REPLACED) == ({}, [], [], False)
+    m = load(tmp_path, text + "PATH_MAP='/tv:/media/TV'\nRADARR_PATH_MAP='/movies:/media/Movies'\nPLEX_PATH_MAP='/mnt/Movies:/media/Movies'\n")
+    assert m.MAPS == {"radarr": [("/movies", "/media/Movies")], "plex": [("/mnt/Movies", "/media/Movies")]} and m.CONFIG_ERRORS == []
+
+
+@pytest.mark.parametrize("key", ["SONARR_PATH_MAP", "RADARR_PATH_MAP", "PLEX_PATH_MAP"])
+def test_a_bad_pair_in_a_program_map_fails_the_selftest_and_stops_the_listener(tmp_path, key):
+    m = load(tmp_path, f"PATH_MAP='/tv=/media/tv'\n{key}='/a:/b|/c:d'\n")
+    assert m.MAPS[key.split("_")[0].lower()] == [("/a", "/b")]
+    assert m.CONFIG_ERRORS == ["PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths, joined by '|'. A pair that is not one is left out.",
+                               f"{key} takes pairs {'PLEX' if key == 'PLEX_PATH_MAP' else 'APP'}_PATH:LOCAL_PATH of absolute paths, joined by '|'. "
+                               "A pair that is not one is left out."]
+    assert m.PATH_MAP_ERROR == " ".join(m.CONFIG_ERRORS)   # arr_serve.config() refuses to start on it
+    with pytest.raises(SystemExit, match=key):
+        m.main(["--selftest"])
+
+
+@pytest.mark.parametrize("text, on", [("", False), ("KEEP_REPLACED=''\n", False), ("KEEP_REPLACED='true'\n", True),
+                                      ("KEEP_REPLACED=' True '\n", True), ("KEEP_REPLACED='false'\n", False)])
+def test_keep_replaced_is_off_unless_it_is_true(tmp_path, text, on):
+    m = load(tmp_path, text)
+    assert m.KEEP_REPLACED is on and m.CONFIG_ERRORS == []
+
+
+def test_a_trailing_slash_leaves_each_pair_and_a_value_with_no_pair_takes_path_map(tmp_path):
+    m = load(tmp_path, "PATH_MAP='/data/:/media/'\nSONARR_PATH_MAP='|'\nRADARR_PATH_MAP='/movies//:/media/Movies/|/:/host/'\nPLEX_PATH_MAP='/:/'\n")
+    assert m.PATH_MAP == [("/data", "/media")] and m.CONFIG_ERRORS == []
+    assert m.MAPS == {"radarr": [("/movies", "/media/Movies"), ("/", "/host")], "plex": [("/", "/")]}   # no sonarr map: '|' has no pair
+    assert (m.mapped("/data", "sonarr"), m.mapped("/movies", "radarr"), m.mapped("/media/Movies", "radarr", True)) == ("/media", "/media/Movies", "/movies")
+    assert (m.mapped("/tv/a.mkv", "radarr"), m.mapped("/media/a.mkv", "plex", True)) == ("/host/tv/a.mkv", "/media/a.mkv")
+
+
+def test_map_fix_says_fix_for_a_map_that_is_set_and_set_for_one_that_is_not(tmp_path):
+    m = load(tmp_path)
+    assert [m.map_key(w) for w in ("sonarr", "radarr", "plex")] == [None, None, None]
+    assert m.map_fix("sonarr") == "set SONARR_PATH_MAP or PATH_MAP"
+    m = load(tmp_path, "PATH_MAP='/data:/media'\nPLEX_PATH_MAP='/mnt:/media'\n")
+    assert [m.map_fix(w) for w in ("sonarr", "plex")] == ["fix PATH_MAP, or set SONARR_PATH_MAP", "fix PLEX_PATH_MAP"]
+
+
+def test_a_keep_replaced_value_other_than_true_or_false_keeps_nothing_and_fails_the_selftest(tmp_path):
+    m = load(tmp_path, "KEEP_REPLACED='yes'\n")
+    assert m.KEEP_REPLACED is False and m.CONFIG_ERRORS == [
+        "KEEP_REPLACED 'yes' is no switch value, so the hook keeps nothing at a grab. The values are true and false."]
+    with pytest.raises(SystemExit, match="KEEP_REPLACED 'yes' is no switch value"):
+        m.main(["--selftest"])

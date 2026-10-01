@@ -94,8 +94,9 @@ the same REGRAB_CAP. Its second check samples other parts of the file. A stage t
 limit cannot hold is skipped and logged, and an error in the check is no verdict. See docs/design.md, "Corrupt video".
 
 An upgrade's old file waits in the app's recycle bin. When it passes the same audio and video checks, a re-grab of the
-upgrade puts it back before the grab is marked failed, and the app rescans the item. See docs/design.md, "Restore after a
-bad upgrade".
+upgrade puts it back before the grab is marked failed, and the app rescans the item. With KEEP_REPLACED on, the Grab
+event hard-links each file the grab may replace, and that copy stands in for a bin copy the restore cannot use. See
+docs/design.md, "Restore after a bad upgrade".
 
 --backfill --check-audio scans the whole library for broken audio, and --check-video for corrupt video, with --workers N
 files at a time and a pause before each. Without --workers it takes SCAN_WORKERS from the env file, else 1. Each records
@@ -154,7 +155,7 @@ COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-g
 TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": "Broken duration header", "edit": "Flag edit failed",
           "policy": "Policy did not load", "content": "Wrong content", "repack": "Repack failed", "video": "Video check uncertain",
           "header": "Header repair failed", "subtitle": "Subtitle runs past the end", "cut": "File may be cut",
-          "sublang": "Subtitle language", "submatch": "Wrong subtitle", "subtiming": "Subtitle timing"}
+          "sublang": "Subtitle language", "submatch": "Wrong subtitle", "subtiming": "Subtitle timing", "episode": "Wrong episode"}
 # the alert kinds that come with a re-grab action
 CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
 WOULD = "A re-grab would delete"   # the start of the action for a kind REGRAB does not list
@@ -334,51 +335,144 @@ def api_key(app):
         re.search(r"<ApiKey>([^<]+)</ApiKey>", open(os.path.join(app_dir(app), "config.xml")).read()).group(1)
 
 
+# The app URLs that examples/arr-media-guard.env and docker/arr-media-guard.env hold. A URL the user left as shipped
+# sets up no app by itself, see no_key(). The image writes both files into a new env file, so a one-off container with
+# no app has both URLs.
+SHIPPED_URLS = {"radarr": ("http://127.0.0.1:7878", "http://radarr:7878"), "sonarr": ("http://127.0.0.1:8989", "http://sonarr:8989")}
+
+
+def no_key(app, ex):
+    """The line for an app that the user set up in part, from ex, the FileNotFoundError of api_key(). Its <APP>_URL is
+    the user's own, but no API key reads. None for an app that the user did not set up: no <APP>_API_KEY, no
+    config.xml in app_dir(), and no URL or one of SHIPPED_URLS. A one-shot run says nothing of such an app."""
+    key, url = app.upper(), (CFG.get(f"{app.upper()}_URL") or "").rstrip("/")
+    return f"{key}_URL is set, but the {app.capitalize()} API key does not read: {mask(str(ex))[:150]}. Set {key}_API_KEY." \
+        if url and url not in SHIPPED_URLS[app] else None
+
+
+def app_list(app):
+    """The first list call of a backfill or a scan, Radarr's movies or Sonarr's series. A run for an app that is not set
+    stops here with one line that names the settings."""
+    try:
+        return arr(app, "movie" if app == "radarr" else "series")
+    except FileNotFoundError as ex:   # api_key() found no key and no config.xml
+        sys.exit(no_key(app, ex) or f"{app.capitalize()} is not set up. Set {app.upper()}_URL and {app.upper()}_API_KEY.")
+
+
 # PATH_MAP='/tv:/media/tv|/movies:/media/movies' pairs the path an app uses with the path this script sees, as in Docker.
-_pairs = [pair.split(":") for pair in CFG.get("PATH_MAP", "").split("|") if pair]
-PATH_MAP = [tuple(p) for p in _pairs if len(p) == 2 and p[0].startswith("/") and p[1].startswith("/")]
-PATH_MAP_ERROR = None if len(PATH_MAP) == len(_pairs) else \
-    "PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths, joined by '|'. A pair that is not one is left out."
-if PATH_MAP_ERROR:   # --serve refuses to start on it
-    CONFIG_ERRORS.append(PATH_MAP_ERROR)
+# SONARR_PATH_MAP, RADARR_PATH_MAP and PLEX_PATH_MAP pair the paths of one program the same way. Each one that is empty
+# or missing takes PATH_MAP, see mapped().
+MAP_KEYS = {"sonarr": "SONARR_PATH_MAP", "radarr": "RADARR_PATH_MAP", "plex": "PLEX_PATH_MAP"}
 
 
-def mapped(x, back=False):
-    """x with each path under an app prefix of PATH_MAP moved to its local prefix, in every string of a list or dict.
-    back maps a local path to the app's path. The longest prefix wins, and a prefix matches whole folder names only."""
-    if not PATH_MAP:
+def path_map(key):
+    """(pairs, error) of the map setting key. error is None when every pair is two absolute paths. Each path loses its
+    trailing slashes, so a folder written as "/mnt/TV/" still maps itself. "/" stays "/"."""
+    pairs = [pair.split(":") for pair in CFG.get(key, "").split("|") if pair]
+    good = [tuple(x.rstrip("/") or "/" for x in p) for p in pairs if len(p) == 2 and p[0].startswith("/") and p[1].startswith("/")]
+    side = "PLEX_PATH" if key == "PLEX_PATH_MAP" else "APP_PATH"
+    return good, None if len(good) == len(pairs) else \
+        f"{key} takes pairs {side}:LOCAL_PATH of absolute paths, joined by '|'. A pair that is not one is left out."
+
+
+PATH_MAP, _error = path_map("PATH_MAP")
+MAPS, _errors = {}, [_error] if _error else []   # MAPS holds the map of each program whose own setting has a pair
+for _who, _key in MAP_KEYS.items():
+    _pairs, _error = path_map(_key)
+    _errors += [_error] if _error else []
+    if _pairs:   # a value with no pair, such as '|', leaves the program on PATH_MAP
+        MAPS[_who] = _pairs
+PATH_MAP_ERROR = " ".join(_errors) or None   # every map's error. --serve refuses to start on it.
+CONFIG_ERRORS += _errors
+
+
+def map_key(who):
+    """The setting whose map who takes, "sonarr", "radarr" or "plex": its own, else PATH_MAP. None when neither has a pair."""
+    return MAP_KEYS[who] if who in MAPS else "PATH_MAP" if PATH_MAP else None
+
+
+def map_fix(who):
+    """What a message tells the user to change when the map of who does not fit: fix a map that is set, else set one."""
+    key = map_key(who)
+    return f"fix {key}" if key == MAP_KEYS[who] else f"fix PATH_MAP, or set {MAP_KEYS[who]}" if key else f"set {MAP_KEYS[who]} or PATH_MAP"
+
+
+def mapped(x, who, back=False):
+    """x with each path under a program prefix of who's map moved to its local prefix, in every string of a list or dict.
+    who is "sonarr", "radarr" or "plex". back maps a local path to the program's path. The longest prefix wins, and a
+    prefix matches whole folder names only."""
+    pairs = MAPS.get(who, PATH_MAP)
+    if not pairs:
         return x
     if isinstance(x, dict):
-        return {k: mapped(v, back) for k, v in x.items()}
+        return {k: mapped(v, who, back) for k, v in x.items()}
     if isinstance(x, list):
-        return [mapped(v, back) for v in x]
-    for a, b in sorted(PATH_MAP, key=lambda m: -len(m[back])) if isinstance(x, str) else ():
+        return [mapped(v, who, back) for v in x]
+    for a, b in sorted(pairs, key=lambda m: -len(m[back])) if isinstance(x, str) else ():
         src, dst = (b, a) if back else (a, b)
         if x == src or x.startswith(src.rstrip("/") + "/"):
             return dst.rstrip("/") + x[len(src.rstrip("/")):] or "/"
     return x
 
 
-def app_query(path):
+def app_query(path, app):
     """An API path whose query values are local paths, with those values mapped to the app's paths."""
-    if not PATH_MAP or "?" not in path:
+    if not MAPS.get(app, PATH_MAP) or "?" not in path:
         return path
     base, q = path.split("?", 1)
-    return base + "?" + urllib.parse.urlencode([(k, mapped(v, True)) for k, v in urllib.parse.parse_qsl(q, keep_blank_values=True)])
+    return base + "?" + urllib.parse.urlencode([(k, mapped(v, app, True)) for k, v in urllib.parse.parse_qsl(q, keep_blank_values=True)])
 
 
 def arr(app, path):
     """GET from the local Sonarr or Radarr. The paths in the answer are the ones this script sees, see mapped()."""
     port = APPS[app]
-    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path)}", headers={"X-Api-Key": api_key(app)},
-                       timeout=60))
+    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path, app)}", headers={"X-Api-Key": api_key(app)},
+                       timeout=60), app)
 
 
 def arr_write(app, path, method, body=None):
     """A write to the local Sonarr or Radarr. The re-grabs and the rescan after a repack use it."""
     port = APPS[app]
-    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path)}", method, mapped(body, True),
-                       {"X-Api-Key": api_key(app)}, timeout=60))
+    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path, app)}", method, mapped(body, app, True),
+                       {"X-Api-Key": api_key(app)}, timeout=60), app)
+
+
+def path_warnings():
+    """Why a path map does not fit, as warnings. Each app whose API key reads names its root folders. A root folder
+    this script does not see warns, and so does one that no Plex library folder holds or sits in. --selftest and the
+    listener start print them, and neither fails on them. Plex libraries that hold no root folder never warn, so a
+    music library or another host's library stays quiet."""
+    out, roots = [], []
+    for app in APPS:
+        name = "Radarr" if app == "radarr" else "Sonarr"
+        try:
+            api_key(app)
+        except (OSError, AttributeError):   # an app this host does not run has no key here
+            continue
+        try:
+            local = [r["path"] for r in arr(app, "rootfolder")]
+        except Exception as ex:
+            out.append(mask(f"{name} did not answer, so its root folders are not checked: {type(ex).__name__}: {ex}")[:300])
+            continue
+        for r in local:
+            roots.append((name, r))
+            if not os.path.isdir(r):
+                where = f"{name}'s root folder {r}" if mapped(r, app, True) == r else \
+                    f"{r}, where {map_key(app)} puts {name}'s root folder {mapped(r, app, True)}"
+                out.append(f"this script does not see {where}. Mount the media there, or {map_fix(app)}.")
+    if not CFG["PLEX_URL"] or not roots:
+        return out
+    try:
+        locs = [loc["path"].rstrip("/") for d in plex_get("/library/sections").get("Directory", []) for loc in d.get("Location", [])]
+    except Exception as ex:
+        return out + [mask(f"Plex did not answer, so its library folders are not checked: {type(ex).__name__}: {ex}")[:300]]
+    for name, r in roots:
+        p = mapped(r, "plex", True).rstrip("/")
+        if not any(p == x or p.startswith(x + "/") or x.startswith(p + "/") for x in locs):
+            where, fix = "" if p == r.rstrip("/") else f", which {map_key('plex')} puts at {p} in Plex", map_fix("plex")
+            out.append(f"no Plex library folder holds {name}'s root folder {r}{where}. {fix[0].upper()}{fix[1:]}, so Plex finds the "
+                       "files the hook edits.")
+    return out
 
 
 def mkvmerge(path):
@@ -650,11 +744,11 @@ def plex_find(path, want):
     by external id, so the search goes by title in the section that holds the path. Any of the app's ids picks the
     item. When none matches, the first few title hits are checked by path alone. Plex can match a series folder to a
     same-name title that shares no id with Sonarr's series. For a show every episode is read, because the numbering
-    can differ. Sonarr's S02E10 can be Plex's S05E03. The file path is the final gate,
-    so Plex and the apps must see the files under the same paths. The third value is the key of the library section
+    can differ. Sonarr's S02E10 can be Plex's S05E03. The file path is the final gate. path is a local path, and
+    PLEX_PATH_MAP gives the path Plex lists it at, see mapped(). The third value is the key of the library section
     that lists the item.
     """
-    path = mapped(path, True)   # Plex sees the files under the apps' paths
+    path = mapped(path, "plex", True)
     parts = lambda v: [p.get("file") for m in v.get("Media", []) for p in m.get("Part", [])]
     leaves = lambda v: plex_get(f'/library/metadata/{v["ratingKey"]}/allLeaves').get("Metadata", []) if want.get("show") else [v]
     t = want["title"]
@@ -860,7 +954,7 @@ def plex_flush(argv):
     f, folders = os.path.join(CFG["STATE_DIR"], f"plex-later-{app}.txt"), []
     with contextlib.suppress(FileNotFoundError), open(f) as fh:
         fcntl.flock(fh, fcntl.LOCK_SH)
-        folders = sorted({mapped(line.strip(), True).rstrip("/") + "/" for line in fh if line.strip()})
+        folders = sorted({mapped(line.strip(), "plex", True).rstrip("/") + "/" for line in fh if line.strip()})
     roots, left = {}, list(folders)   # (section, location) -> its folders
     for d in plex_get("/library/sections").get("Directory", []) if folders else []:
         for loc in d.get("Location", []):
@@ -870,7 +964,7 @@ def plex_flush(argv):
                 left = [x for x in left if x not in mine]
     seen, skipped = [0, collections.defaultdict(float), None], set()   # see after_analyze()
     for (section, root), mine in sorted(roots.items()):
-        p = plex_folder_job(app, "backfill", f"section {section}", mapped(root), None)   # a local path, as every folder job holds
+        p = plex_folder_job(app, "backfill", f"section {section}", mapped(root, "plex"), None)   # a local path, as every folder job holds
         done, code = plex_analyze(p, skipped, ready=lambda s=section: after_analyze(seen, s))
         log(dict(app=app, source="backfill", label=p["label"], path=root, result="plex", plex=done, plex_reason=code, section=section,
                  folders=len(mine)))
@@ -878,7 +972,7 @@ def plex_flush(argv):
         if code == "plex_scan_sent":   # only now these folders leave the list, so a stop before keeps them listed
             with open(f, "r+") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
-                keep = [line for line in fh if line.strip() and mapped(line.strip(), True).rstrip("/") + "/" not in mine]
+                keep = [line for line in fh if line.strip() and mapped(line.strip(), "plex", True).rstrip("/") + "/" not in mine]
                 fh.seek(0); fh.truncate(); fh.writelines(keep)
         else:
             left += mine
@@ -920,13 +1014,13 @@ def plex_folder_scan(p, send=False):
     location holds the folder, as (keys, other, section) like plex_find(), ([], False, None) when none does. After them,
     with send: GET /library/sections/<section>/refresh?path=<folder>, Plex's partial scan, as (message, reason code).
     It scans that one folder, never the section."""
-    folder = mapped(p["path"], True).rstrip("/") + "/"   # Plex sees the files under the apps' paths
+    folder = mapped(p["path"], "plex", True).rstrip("/") + "/"
     if not send:
         for d in plex_get("/library/sections").get("Directory", []):
             if any(folder.startswith(loc["path"].rstrip("/") + "/") for loc in d.get("Location", [])):
                 return ["folder"], False, d["key"]
         return [], False, None
-    q = urllib.parse.urlencode({"path": mapped(p["path"], True), "X-Plex-Token": CFG["PLEX_TOKEN"]})
+    q = urllib.parse.urlencode({"path": mapped(p["path"], "plex", True), "X-Plex-Token": CFG["PLEX_TOKEN"]})
     try:
         http(f'{CFG["PLEX_URL"]}/library/sections/{p["section"]}/refresh?{q}')
     except Exception as ex:
@@ -2222,19 +2316,32 @@ def flash_why(plan):
             f"{len(plan)} cues get new ends")
 
 
-def sub_alerts(rec, sync, unmatched):
+def sub_alerts(rec, sync, unmatched, dry=False):
     """The alerts of the subtitle match check, as [(kind, text)]: one "submatch" alert for the tracks and sidecars that
     do not match the audio, and one "subtiming" alert for the tracks whose times are off and stay. unmatched holds the
-    tracks, by their place before any remux, that stayed in the file and lost their flags instead."""
+    tracks, by their place before any remux, that stayed in the file and lost their flags instead. With dry, the
+    sentences on the remux and on the flags say what --apply would do, as a one-shot dry run prints them, see
+    dry_alerts()."""
     rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
+    said, hard = (dry_remux(rec), links(rec["path"], os.stat(rec["path"])) > 1) if dry else (None, False)
+    flags = ("--apply would turn its default and forced flags off." if dry else "It loses its default and forced flags.") \
+        if sub_fixes(rec.get("source")) else "Its flags stay."
     for p in rm.get("removed") or []:
         wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. "
                      f"{'The hook' if rec.get('source') in ('hook', 'deep_analysis') else 'This run'} removed it, and the original file is kept at "
                      f"{rm.get('kept')}.")
     for p in unmatched:
-        why = rm["result"] if p in (rm.get("remove") or []) and not rm.get("removed") else rm.get("kept_back") or "the file was not remuxed"
-        wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. It stays in the file, because {why}. "
-                     + ("It loses its default and forced flags." if sub_fixes(rec.get("source")) else "Its flags stay."))
+        gone = p in (rm.get("remove") or []) and not rm.get("removed")   # the remux was to remove it
+        why = rm["result"] if gone else rm.get("kept_back") or "the file was not remuxed"
+        stays = f"It stays in the file, because {why}. {flags}"
+        if hard:   # edit() and the remux both leave a hardlinked file as it is
+            stays = HARDLINKED
+        elif dry and not gone and why.startswith("KEEP_ORIGINALS_DAYS is 0"):
+            stays = ("The track would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set "
+                     f"KEEP_ORIGINALS_DAYS above 0 to remove it. {flags}")
+        elif dry and gone and said:
+            stays = "--apply would remove it." if said == WOULD_REMUX else f"{said} The track would stay in the file. {flags}"
+        wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. {stays}")
     for e in rec.get("sidecars") or []:
         if e["action"] == "move":
             where = f"It moved to {e['kept']}." if e.get("kept") else f"It stays beside the file: {e.get('left') or 'a dry run'}."
@@ -2255,8 +2362,8 @@ def sub_alerts(rec, sync, unmatched):
             late.append(f"Subtitle {name(p)} " + (f"disagrees with the reference {name(ref) if ref[1:].isdigit() else 'sidecar ' + ref}" if ref else "is off the audio")
                         + f": {t['why']}. Its times stay.")
     if (rm.get("fixed") or rm.get("ended")) and not rm.get("done"):
-        late.append(f"Subtitle track {', '.join(sorted({*(rm.get('fixed') or []), *(rm.get('ended') or [])}))} needs new times, but "
-                    f"{rm['result']}. The file stays as it was.")
+        late.append(f"Subtitle track {', '.join(sorted({*(rm.get('fixed') or []), *(rm.get('ended') or [])}))} needs new times"
+                    + (f". {said}" if dry else f", but {rm['result']}. The file stays as it was."))
     if not sub_fixes(rec.get("source")):
         late += [f"Subtitle {p} needs new times: {r['timing']['why']}. SUBTITLES is check, so its times stay."
                  for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
@@ -2837,6 +2944,13 @@ def regrab(app, job, fault, probe, kind="audio"):
 
 
 RESTORE = CFG.get("RESTORE", "true").lower() != "false"   # off: the plain re-grab, and a manual import only alerts
+# on: a Grab event hard-links the files an upgrade may replace, so a restore needs no recycle bin, see keep_grab()
+KEEP_REPLACED = (CFG.get("KEEP_REPLACED") or "false").strip().lower()
+if KEEP_REPLACED not in ("true", "false"):   # the safest reading: keep nothing
+    CONFIG_ERRORS.append(f"KEEP_REPLACED {KEEP_REPLACED!r} is no switch value, so the hook keeps nothing at a grab. The values are true "
+                         "and false.")
+KEEP_REPLACED = KEEP_REPLACED == "true"
+KEEP_MARGIN = 3600   # seconds before KEEP_DAYS ends that a kept copy stays out of a restore, so the prune never takes it then
 RESTORE_WAIT = 120   # seconds a restore waits for the app's rescan before it reads the file record back
 DONE = ("completed", "failed", "aborted", "cancelled", "orphaned")   # the end states of an app command
 EXTRA_SLACK = 300    # seconds between the recycle of an old video file and of its extras. The app moves them in one upgrade.
@@ -2873,31 +2987,260 @@ def upgrade_jobs(download_id):
 
 
 def volume(path):
-    """st_dev of path, or of its nearest folder that exists. The app may remove an empty folder after a delete."""
+    """(st_dev, mount_top()) of path, or of its nearest folder that exists. The app may remove an empty folder after a
+    delete. Two bind mounts of one file system share st_dev, but a rename between them fails with EXDEV, so the mount
+    top counts too. The mount top comes from the real path, so a root folder named through a symlink finds the mount
+    that holds it."""
     while path not in ("", "/") and not os.path.exists(path):
         path = os.path.dirname(path)
-    return os.stat(path).st_dev
+    return os.stat(path).st_dev, mount_top(os.path.realpath(path))
 
 
 def bin_warnings(app):
-    """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, or its bin sits
-    on another file system than a root folder, and a restore only renames. [] when all is well or the app does not
-    answer. --selftest and the Test event print them, and neither fails on them."""
+    """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, its bin does not
+    exist where the hook runs, or it sits on another file system than a root folder, and a restore only renames. With
+    KEEP_REPLACED on, keep_warnings() come first. When they find nothing, a bin warning says that the hook's own copies
+    stand in. [] when all is well or the app does not answer. --selftest and the Test event print them, and neither
+    fails on them."""
     name = "Radarr" if app == "radarr" else "Sonarr"
     try:
         rbin = (arr(app, "config/mediamanagement") or {}).get("recycleBin") or ""
         roots = [r["path"] for r in arr(app, "rootfolder")]
+        out = keep_warnings(app, roots) if KEEP_REPLACED else []
     except Exception:
         return []
+    own = " The hook keeps its own copy of each file an upgrade replaces, so the restore after a bad upgrade still works." \
+        if KEEP_REPLACED and not out else ""
     if not rbin:
-        return [f"{name} has no recycle bin, so the restore after a bad upgrade cannot work. Set one in Media Management, "
-                "on the media's file system."]
+        return out + [f"{name} has no recycle bin." + own if own else f"{name} has no recycle bin, so the restore after a bad upgrade "
+                      "cannot work. Set one in Media Management, on the media's file system."]
+    if not os.path.isdir(rbin):   # a Docker mount or a path map that leaves it out
+        return out + [f"{name}'s recycle bin {rbin} does not exist where the hook runs." + own if own else f"{name}'s recycle bin {rbin} "
+                      "does not exist where the hook runs, so the restore after a bad upgrade cannot use it. Mount it at that path, or "
+                      f"{map_fix(app)}."]
     with contextlib.suppress(OSError):
         other = [r for r in roots if volume(r) != volume(rbin)]
         if other:
-            return [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
-                    "bad upgrade needs a rename. Move the bin onto the media's file system."]
-    return []
+            return out + [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}." + own if own else
+                          f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
+                          "bad upgrade needs a rename. Move the bin onto the media's file system."]
+    return out
+
+
+def keep_warnings(app, roots):
+    """Why KEEP_REPLACED keeps nothing for app, as warnings: KEEP_ORIGINALS_DAYS is 0, the app's connection to this hook
+    does not send Grab, or the hook cannot hard-link a file on the mount of a root folder in roots. The connection to
+    this hook is a Custom Script with this script's path, or a Webhook whose URL path is /radarr or /sonarr. The API
+    lists the saved connections, so a Test before a Save sees the old triggers. When keep_root() takes a folder below
+    the mount top, a warning says where the grab links go."""
+    name, out = "Radarr" if app == "radarr" else "Sonarr", []
+    if not KEEP_DAYS:
+        out.append("KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so the hook keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0.")
+    ours = []
+    for n in arr(app, "notification") or []:
+        f = {x.get("name"): x.get("value") for x in n.get("fields") or []}
+        if (n.get("implementation") == "CustomScript" and os.path.realpath(f.get("path") or "/") == os.path.realpath(__file__)) or \
+                (n.get("implementation") == "Webhook" and urllib.parse.urlparse(f.get("url") or "").path.rstrip("/") == f"/{app}"):
+            ours.append(n)
+    if ours and not any(n.get("onGrab") for n in ours):
+        out.append(f"KEEP_REPLACED is on, but {name}'s connection {', '.join(str(n.get('name')) for n in ours)} does not send Grab, so the "
+                   "hook keeps nothing. Turn on On Grab in that connection.")
+    seen = set()
+    for r in sorted(roots):
+        root = replaced_root(os.path.join(r, "x"))
+        if root in seen:
+            continue
+        seen.add(root)
+        why, top = link_probe(root), mount_top(r)
+        if why:
+            out.append(f"KEEP_REPLACED is on, but {why}")
+        elif os.path.dirname(root) != top:   # keep_root() took a folder below the mount top
+            blocked = os.path.join(top, RECYCLE_DIR) if os.path.lexists(os.path.join(top, RECYCLE_DIR)) else top
+            out.append(f"uid {os.getuid()} and gid {os.getgid()} cannot write in {blocked}, so the hook keeps the grab links of {r} in {root}."
+                       + (f" {name}'s Library Import lists that folder as unmapped. Do not import it." if os.path.dirname(root) == r.rstrip("/") else ""))
+    return out
+
+
+def link_probe(root):
+    """Why the hook cannot keep a file in root, as the end of a warning, or None. It links a small temp file in root,
+    or in the folder above it while root does not exist, and removes both. A folder it cannot write names the uid and
+    gid of this run, which PUID and PGID set in Docker."""
+    where = root if os.path.isdir(root) else os.path.dirname(root)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".link-probe-", dir=where)
+        os.close(fd)
+    except OSError as ex:
+        give = f"Give {root} to them." if where == root else f"Create {root} and give it to them."
+        return (f"uid {os.getuid()} and gid {os.getgid()} cannot write in {where} ({ex.strerror or ex}), so the hook keeps nothing on that mount. "
+                f"{give} In Docker, PUID and PGID set them.")
+    try:
+        os.link(tmp, tmp + ".link")
+    except OSError as ex:
+        return (f"{where} takes no hard link ({ex.strerror or ex}), so the hook keeps nothing on that mount. Keep the media on a file system "
+                "that takes hard links.")
+    finally:   # also after a time limit between the link and its removal
+        for f in (tmp + ".link", tmp):
+            with contextlib.suppress(OSError):
+                os.remove(f)
+    return None
+
+
+KEPT = "kept-replaced.json"   # the file in STATE_DIR with one record per link keep_grab() made, see kept_records()
+
+
+def kept_read():
+    """The records of KEPT, [] when the file does not read. write_json() replaces the file whole, so a read needs no lock."""
+    try:
+        with open(os.path.join(CFG["STATE_DIR"], KEPT)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+@contextlib.contextmanager
+def kept_records():
+    """The records of KEPT as a list to change in place, under KEPT.lock, written back after the block. A record stays
+    while it is younger than KEEP_DAYS or its link exists, so links() knows every link of the hook's own until the
+    nightly prune removes it. Each record holds the app, the old path, the kept path, the grab's download id, the time
+    and the inode of the link. An extra also holds "of", its video's old path.
+    "import" names the download id of the import that replaced the old path, and "stale" says why the link may never
+    come back, see kept_replaced()."""
+    path = os.path.join(CFG["STATE_DIR"], KEPT)
+    with open(path + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        recs = [r for r in kept_read() if time.time() - r["time"] <= KEEP_DAYS * 86400 or os.path.lexists(r["kept"])]
+        yield recs
+        write_json(path, recs)
+
+
+def kept_replaced(path, download_id=None):
+    """The file at path changed after the grabs that kept it. download_id is the import's when an import replaced path,
+    None when the hook replaced, moved or restored it. An import claims each unclaimed record of its own grab, and of a
+    grab with no download id, so its restore may use that link. Every other record of path goes stale, a claimed one
+    too, because the import replaced the file its claim kept. A change by the hook leaves a claimed record, which holds
+    the file its import replaced. So a restore never brings back an older version. An extra follows its video. Never
+    raises. An error logs a line."""
+    if not KEEP_REPLACED:
+        return
+    try:
+        with kept_records() as recs:
+            for r in recs:
+                if path not in (r["old"], r.get("of")) or "stale" in r or (download_id is None and "import" in r):
+                    continue
+                if download_id is not None and "import" not in r and r["download_id"] in ("", download_id):
+                    r["import"] = download_id
+                else:
+                    r["stale"] = "the hook changed the file after the grab" if download_id is None else "another import replaced the file after the grab"
+    except Exception as ex:
+        with contextlib.suppress(OSError):
+            log(dict(source="hook", path=path, result="warning", note=mask(f"the hook could not mark the kept copies of the file: {type(ex).__name__}: {ex}")[:300]))
+
+
+def kept_copy(app, old, download_id):
+    """(the record of the hook's own copy of old that the import download_id may bring back, or None, why the copy may
+    not come back or None). The import must have claimed it, see kept_replaced(). The link must still be the file the
+    grab linked. A copy within KEEP_MARGIN of KEEP_DAYS stays out, because the nightly prune may remove it."""
+    recs = [r for r in kept_read() if r["app"] == app and r["old"] == old and "of" not in r]
+    mine = [r for r in recs if r.get("import") == (download_id or "") and "stale" not in r]
+    if mine:
+        r = max(mine, key=lambda r: r["time"])
+        if time.time() - r["time"] > KEEP_DAYS * 86400 - KEEP_MARGIN:
+            return None, "The hook's own copy is too close to its prune at KEEP_ORIGINALS_DAYS"
+        try:
+            same = os.stat(r["kept"]).st_ino == r["ino"]
+        except OSError:
+            return None, "The hook's own copy is gone"
+        return (r, None) if same else (None, "The hook's own copy is no longer the file the grab linked")
+    stale = [r["stale"] for r in recs if "stale" in r and r["download_id"] in ("", download_id or "")]
+    return None, f"The hook's own copy is older, because {stale[-1]}" if stale else None
+
+
+def links(path, st):
+    """The hard links of the file st describes, less the ones keep_grab() made. edit(), repack_skip() and convert_skip()
+    refuse a file with more than one, the download client's copy. They leave out a link of the hook's own. An edit
+    reaches the kept copy too, and a rename over path makes the kept copy stale, see kept_replaced(). A record matches
+    by inode, so a file the app renamed or moved after the grab still finds its link."""
+    n = st.st_nlink
+    for r in kept_read() if n > 1 else ():
+        if r.get("ino") == st.st_ino:
+            with contextlib.suppress(OSError):
+                k = os.stat(r["kept"])
+                n -= (k.st_ino, k.st_dev) == (st.st_ino, st.st_dev)
+    return n
+
+
+def kept_extras(rec):
+    """[(kept extra, its old path, its signature)] for the extras the grab of rec kept with its video. A stale one stays."""
+    return sorted((r["kept"], r["old"], bin_sig(r["kept"])) for r in kept_read()
+                  if r.get("of") == rec["old"] and r["time"] == rec["time"] and "stale" not in r)
+
+
+def extra_of(stem, name):
+    """Whether name is an extra of the video stem: the app names it <stem>.en.srt, <stem>.nfo or <stem>-thumb.jpg."""
+    return name.startswith(stem) and name[len(stem):len(stem) + 1] in (".", "-") and os.path.splitext(name)[1].lower() not in VIDEO_EXT
+
+
+def keep_grab(app, owner, download_id, eps=()):
+    """Hard-link each library file a grab may replace into replaced_root(), with its extras, the kinds old_extras()
+    restores. The app deletes the old file before the import calls the hook, so the Grab event is the last moment the
+    file is there. eps are the episode ids of a Sonarr grab. A file that holds several of them is linked once. A file
+    the app does not list gives nothing. A file the app lists and that is not on disk gives a note, because the import
+    won the race. The links of one grab share one UTC stamp folder, with the path from the mount below, as
+    keep_original() lays them out. When a link fails, the hook keeps nothing of that file, because a copy of a large
+    file can lose the race to the import. An error after the first link removes every link of the grab, so no link
+    stays without its record. The nightly audit prunes the folder, so the app never waits for it here. Returns the
+    decision log line it wrote, or None when it kept and noted nothing. With KEEP_ORIGINALS_DAYS 0 it keeps nothing."""
+    if not (KEEP_REPLACED and KEEP_DAYS):
+        return None
+    if app == "radarr":
+        paths = [movie_file(arr(app, f"movie/{owner}")).get("path")]
+    else:
+        recs = arr(app, "episode?" + urllib.parse.urlencode([("episodeIds", i) for i in eps])) if eps else []
+        paths = [arr(app, f"episodefile/{fid}").get("path")
+                 for fid in sorted({e["episodeFileId"] for e in recs if e.get("episodeFileId") and e.get("seriesId") == int(owner)})]
+    now, kept, made, roots, stamps = time.time(), [], [], set(), set()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    missed = [f"{p}: the file is not on disk" for p in sorted({p for p in paths if p and not os.path.isfile(p)})]
+    try:
+        for p in sorted({p for p in paths if p and os.path.isfile(p)}):
+            root, (stem, folder) = replaced_root(p), (os.path.splitext(os.path.basename(p))[0], os.path.dirname(p))
+            extras = [os.path.join(folder, n) for n in sorted(os.listdir(folder)) if extra_of(stem, n) and os.path.isfile(os.path.join(folder, n))]
+            for x in [p] + extras:
+                k = os.path.join(root, stamp, os.path.relpath(x, os.path.dirname(root)))
+                if not os.path.lexists(os.path.join(root, stamp)):
+                    stamps.add(os.path.join(root, stamp))
+                try:
+                    os.makedirs(os.path.dirname(k), exist_ok=True)
+                    os.link(x, k)
+                except OSError as ex:   # the folder or the link
+                    missed.append(f"{x}: {ex.strerror or ex}")
+                    if x == p:   # no extra without its video
+                        break
+                    continue
+                made.append(k)
+                roots.add(root)
+                kept.append(dict(app=app, old=x, kept=k, download_id=download_id or "", time=now, ino=os.stat(k).st_ino, **({"of": p} if x != p else {})))
+        if kept:
+            with kept_records() as recs:
+                recs += kept
+    except BaseException:
+        for k in made:
+            with contextlib.suppress(OSError):
+                os.remove(k)
+        raise
+    finally:   # a stamp folder this call made and left empty, after a failed link or the removal above
+        for d in stamps:
+            for sub, _, _ in os.walk(d, topdown=False):
+                with contextlib.suppress(OSError):
+                    os.rmdir(sub)
+    for root in sorted(roots):
+        remember_folder(root)
+    if not kept and not missed:
+        return None
+    rec = dict(source="hook", app=app, result="kept_replaced" if kept else "not_kept_replaced", download_id=download_id or "", kept=[r["kept"] for r in kept],
+               **({"note": mask("not kept: " + "; ".join(missed))[:500]} if missed else {}))
+    log(rec)
+    return rec
 
 
 def old_file_check(path, original, kids, runtime):
@@ -2952,8 +3295,10 @@ def restore_plans(app, job, files, broken):
     """The old files of the broken files of a re-grab unit that may come back, read-only, before regrab() changes
     anything. The job's own old files come from its job, the others from the queued and claimed jobs of the download.
     An old file may come back when the recycle bin still holds it on the volume of its old path, no other file took
-    that path, and old_file_check() finds no certain fault. Returns {file id: {"back": [(old path, recycle bin path)],
-    "not": [(old path, why)], "owner", "label", "want", "checks"}} for each broken file an upgrade put in the library."""
+    that path, and old_file_check() finds no certain fault. With KEEP_REPLACED on, the hook's own copy from the grab
+    stands in for a bin copy it cannot use, see kept_copy(). A usable bin copy wins. Returns {file id: {"back": [(old
+    path, recycle bin path)], "not": [(old path, why)], "owner", "label", "want", "checks", "kept": {old path: its
+    kept record}}} for each broken file an upgrade put in the library."""
     if not RESTORE:
         return {}
     jobs = upgrade_jobs(job.get("download_id"))
@@ -2966,7 +3311,7 @@ def restore_plans(app, job, files, broken):
         f = files[fid]
         owner = f["items"][0] if app == "radarr" and f["items"] else int(job["owner"])
         p = plans[fid] = {"back": [], "not": [], "owner": owner, "label": os.path.basename(f["path"]), "want": None, "checks": {},
-                          "extras": {}, "new": f["path"]}
+                          "extras": {}, "new": f["path"], "kept": {}}
         if why:
             p["not"] = [(jobs[fid]["deleted"], why)]
             continue
@@ -2978,15 +3323,21 @@ def restore_plans(app, job, files, broken):
         for old, rb in pairs:
             try:
                 why = "the app kept no copy in its recycle bin" if not rb else "the recycle bin no longer holds it" if not os.path.isfile(rb) \
-                    else "another file holds its path now" if os.path.lexists(old) and old != f["path"] \
                     else "the recycle bin is on another volume, and a restore never copies" if volume(rb) != volume(old) else None
+                if why and KEEP_REPLACED:
+                    rec, stale = kept_copy(app, old, jobs[fid].get("download_id"))
+                    if rec:
+                        rb, why, p["kept"][old] = rec["kept"], None, rec
+                    elif stale:
+                        why += f". {stale}"
+                why = why or ("another file holds its path now" if os.path.lexists(old) and old != f["path"] else None)
                 if why is None and app == "sonarr":
                     why = other_episodes(old, f["items"])
                 sig = bin_sig(rb)   # before the check, so a change during the check shows too
                 if why is None:
                     why, p["checks"][old] = old_file_check(rb, original, kids, f.get("runtime") or 0)
                 if why is None:
-                    p["extras"][old] = old_extras(old, rb)
+                    p["extras"][old] = kept_extras(p["kept"][old]) if old in p["kept"] else old_extras(old, rb)
             except Exception as ex:   # the time limit too: a check that did not end keeps the old file in the bin
                 why = mask(f"its check failed: {type(ex).__name__}: {ex}")[:200]
             if why:
@@ -3002,12 +3353,11 @@ def old_extras(old, rb):
     already gets _2, _3 before the extension, the video's own rule. The app sets each file's mtime when it recycles it,
     so the copy of each name nearest the video's mtime, within EXTRA_SLACK seconds, is this upgrade's."""
     stem, folder, t0, best = os.path.splitext(os.path.basename(old))[0], os.path.dirname(rb), os.path.getmtime(rb), {}
-    starts = lambda n: n.startswith(stem) and n[len(stem):len(stem) + 1] in (".", "-")
     for n in os.listdir(folder):
         x, (base, ext) = os.path.join(folder, n), os.path.splitext(n)
         plain = re.sub(r"_\d+$", "", base) + ext
-        name = plain if starts(plain) else n
-        if x == rb or ext.lower() in VIDEO_EXT or not starts(name) or not os.path.isfile(x):
+        name = plain if extra_of(stem, plain) else n
+        if x == rb or not extra_of(stem, name) or not os.path.isfile(x):
             continue
         gap = abs(os.path.getmtime(x) - t0)
         if gap <= EXTRA_SLACK and gap < best.get(name, (None, gap + 1))[1]:
@@ -3120,13 +3470,15 @@ def rescan_wait(app, owner):
 
 
 def restore(app, job, plans):
-    """Move the old files of plans back from the recycle bin, after regrab() had the app delete the broken files. The
-    app puts a deleted file in its recycle bin and drops its record, so the path is free even when the old file had
-    the same name. One rename on the same volume per file, so nothing is copied. The path is checked right before, so
-    it never overwrites a file. The bin file must still be the one the plan checked: the app gives a freed bin name to
-    the next file it recycles, the broken file included. Returns one entry per old file, {"file_id", "label", "old",
-    "recycle", "result", "extras"}, and keeps them in job["restore"] for the decision line and the Plex analyze, see
-    restore_log(). The caller re-monitors, then rescan_back() has the app link the files."""
+    """Move the old files of plans back from the recycle bin, or from the hook's own copies, after regrab() had the app
+    delete the broken files. The app puts a deleted file in its recycle bin and drops its record, so the path is free
+    even when the old file had the same name. One rename on the same volume per file, so nothing is copied. The path is
+    checked right before, so it never overwrites a file. The bin file must still be the one the plan checked: the app
+    gives a freed bin name to the next file it recycles, the broken file included. A grab after the import may have
+    linked the broken file, so each rename first makes the kept copies of its path stale, see kept_replaced(). Returns
+    one entry per old file, {"file_id", "label", "old", "recycle", "result", "extras"}, and keeps them in job["restore"]
+    for the decision line and the Plex analyze, see restore_log(). The caller re-monitors, then rescan_back() has the
+    app link the files."""
     out = []
     for fid, p in plans.items():
         for old, rb, sig in p["back"]:
@@ -3137,12 +3489,14 @@ def restore(app, job, plans):
                     result = "not restored: another file holds its path now"
                 else:
                     os.makedirs(os.path.dirname(old), exist_ok=True)   # the app may remove an empty folder after the delete
+                    kept_replaced(old)
                     os.rename(rb, old)
                     result = "restored"
             except OSError as ex:
                 result = mask(f"not restored: {type(ex).__name__}: {ex}")[:300]
             out.append(dict(file_id=fid, owner=p["owner"], label=p["label"], want=p["want"], old=old, new=p["new"], recycle=rb, result=result,
-                            check=p["checks"].get(old), extras=restore_extras(p["extras"].get(old) or []) if result == "restored" else []))
+                            check=p["checks"].get(old), extras=restore_extras(p["extras"].get(old) or []) if result == "restored" else [],
+                            **({"kept": True} if old in p["kept"] else {})))
         out += [dict(file_id=fid, owner=p["owner"], label=p["label"], old=old, result=f"not restored: {why}") for old, why in p["not"]]
     job["restore"] = out
     return out
@@ -3200,7 +3554,8 @@ def restore_text(app, job, back, text):
     others = len({r["file_id"] for r in back if r["file_id"] != fid and r["result"] == "restored"})
     if came:
         linked, it = all(r.get("linked") for r in mine if r["result"] == "restored"), "it" if len(came) == 1 else "them"
-        text = (f'{RESTORED}{"s" if len(came) > 1 else ""} from the recycle bin: {", ".join(came)}. '
+        src = "its own copy" if all(r.get("kept") for r in mine if r["result"] == "restored") else "the recycle bin"
+        text = (f'{RESTORED}{"s" if len(came) > 1 else ""} from {src}: {", ".join(came)}. '
                 + (f"{name} links {it} again. " if linked
                    else f"{name} did not link {it} within {RESTORE_WAIT} seconds, so rescan the item by hand. ")
                 + text.replace("deleted the file", "deleted the broken upgrade", 1))
@@ -3272,14 +3627,17 @@ def movie_item(m, kids_profiles_by_id=None):
             arr_decide.kids_title("radarr", m.get("genres"), profile, m.get("studio")), ctx)
 
 
-def episode_item(s, eps):
+def episode_item(s, eps, series_eps=None):
     """movie_item() for the episodes of one Sonarr file. ctx lists each episode's runtime, never their sum, because a
-    segment show lists every segment at the whole slot."""
+    segment show lists every segment at the whole slot. series_eps, all episodes of the series, saves the title check
+    one list call per file, see episode_title()."""
     num = "".join(f'E{e["episodeNumber"]:02d}' for e in eps)
     label = f'{s["title"]} S{eps[0]["seasonNumber"]:02d}{num}' if eps else s["title"]
     want = {"guids": guids(s, ("tvdb", "tmdb", "imdb")), "title": s["title"], "show": True}
     ctx = {"ids": {"tmdb": s.get("tmdbId"), "tvdb": s.get("tvdbId")}, "year": s.get("year"),
-           "listed": [e.get("runtime") or 0 for e in eps], "titles": titles(s)}
+           "listed": [e.get("runtime") or 0 for e in eps], "titles": titles(s), "series_id": s.get("id"), "episode_ids": [e["id"] for e in eps if "id" in e],
+           "anime": s.get("seriesType") == "anime",
+           **({"episodes": series_eps} if series_eps else {})}
     return (label, (s.get("originalLanguage") or {}).get("name"), episode_runtime(eps), want, arr_decide.kids_title("sonarr", s.get("genres")),
             ctx)
 
@@ -3486,11 +3844,12 @@ def spoken_of(expected):
     return None if expected is None else sorted(set(expected.get("spoken") or []) | set(expected.get("unmapped") or []))
 
 
-def metadata(app, path, j, size, d, original, release, ctx, fresh=False, asked=None):
+def metadata(app, path, j, size, d, original, release, ctx, fresh=False, asked=None, nfo=None):
     """arr_meta's checks of one probed file against its item, ctx from movie_item() or episode_item(). Returns
     {"trusted", "expected", "other", "evidence", "tmdb"}. A TMDB failure reads as unknown. TMDB's status goes to
     status.json only after a live answer, because a cache hit says nothing about the key. fresh is a second check
-    before a re-grab, see tmdb_ask(). asked is the tmdb_ask() the decision already made, so TMDB is asked once."""
+    before a re-grab, see tmdb_ask(). asked is the tmdb_ask() the decision already made, so TMDB is asked once. nfo is
+    the episode title of the release's NFO, see release_nfo_title(). It wins over the title in the release name."""
     trusted = arr_meta.trusted_duration(j, size, arr_meta.last_packet(path))
     token, ids = CFG.get("TMDB_TOKEN") or None, ctx.get("ids") or {}
     cache = os.path.join(CFG["STATE_DIR"], "tmdb-recheck.json" if fresh else "tmdb.json")
@@ -3501,12 +3860,58 @@ def metadata(app, path, j, size, d, original, release, ctx, fresh=False, asked=N
     kind = "episode" if app == "sonarr" else "special" if (expected or {}).get("special") else "movie"
     name = release or os.path.basename(path)
     args = (d["tracks"], original, expected, trusted, ctx.get("listed") or 0, name, kind, ctx.get("year"), ctx.get("titles") or ())
-    ev, other = arr_meta.wrong_content_evidence(*args), None
+    ev, other = arr_meta.wrong_content_evidence(*args, episode=episode_title(app, ctx, nfo, release, path) if kind == "episode" else None), None
     if kind != "episode" and ev["points"] and trusted.get("seconds"):   # another film matters only for a movie with a point already
         other = arr_meta.other_film(name, ids.get("tmdb"), trusted["seconds"], token=token, cache=cache)
         if other:
             ev = arr_meta.wrong_content_evidence(*args, other)
     return {"trusted": trusted, "expected": expected, "other": other, "evidence": ev, "tmdb": ev["tmdb"]}
+
+
+def episode_title(app, ctx, nfo, release, path):
+    """arr_meta.episode_title_verdict() of an episode file, or None when neither the NFO, the release name nor the
+    file name gives a title. Only then does it read the series' episodes, unless ctx holds them, as in a backfill. A
+    failed read is verdict "unknown", so the other checks still run. A file with no scene name has Sonarr's own name,
+    and the alert says so, because Sonarr wrote that name in the order it had at the import."""
+    name = release or os.path.basename(path)
+    said, title = ("the release's NFO", nfo) if nfo else \
+        ("the release's title" if release else "the file name's title", arr_meta.release_episode_title(name))
+    if not title or not ctx.get("series_id"):
+        return None
+    try:
+        eps = ctx.get("episodes") or arr(app, f"episode?seriesId={ctx['series_id']}")
+    except Exception as ex:
+        return {"kind": "episode_title", "verdict": "unknown", "points": 0, "why": mask(f"the episode list did not read: {type(ex).__name__}: {ex}")[:200]}
+    return arr_meta.episode_title_verdict(title, eps, ctx.get("episode_ids") or (), name, [t for t, _ in ctx.get("titles") or ()], said,
+                                          ctx.get("anime"))
+
+
+NFO_MAX = 64 << 10   # bytes of a scene NFO that release_nfo_title() reads
+
+
+def release_nfo_title(source, release=""):
+    """The episode title of the scene NFO beside source, the file Sonarr imported from, or None. The NFO counts when its
+    name is the video's, or when it is the one NFO in a folder named like the video or the release. A download folder
+    that holds the NFOs of other releases gives none. The hook reads it at the event, because a usenet download folder
+    can be gone when the worker runs. Any error gives None, so the import never fails on it."""
+    try:
+        folder, name = os.path.split(source)
+        stem, nfos = os.path.splitext(name)[0].lower(), [n for n in os.listdir(folder) if n.lower().endswith(".nfo")]
+        own = [n for n in nfos if n[:-4].lower() == stem] or \
+            (nfos if len(nfos) == 1 and os.path.basename(folder).lower() in (stem, release.lower()) else [])
+        if not own:
+            return None
+        if not os.path.isfile(os.path.join(folder, own[0])):   # open() of a FIFO would block the app's import
+            return None
+        with open(os.path.join(folder, own[0]), "rb") as f:
+            raw = f.read(NFO_MAX)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:   # a scene NFO is code page 437
+            text = raw.decode("cp437")
+        return arr_meta.nfo_episode_title(text)
+    except Exception:
+        return None
 
 
 def tmdb_key_alert(app, code):
@@ -3889,7 +4294,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         if job is not None:
             signal.alarm(BUDGET)   # the checks get their own limit. The edit is done, so a timeout costs only the checks.
         try:
-            meta = metadata(app, path, j, size, d, original, release, ctx, asked=asked)
+            meta = metadata(app, path, j, size, d, original, release, ctx, asked=asked, nfo=(job or {}).get("nfo_title"))
             rec.update(trusted=meta["trusted"], expected=meta["expected"], other_film=meta["other"], evidence=meta["evidence"],
                        tmdb=meta["tmdb"])
             ev = meta["evidence"]
@@ -3948,6 +4353,10 @@ def file_alerts(d, file_checks, meta, original, ctx):
         listed = ctx.get("listed") or 0
         shown = max(listed) if isinstance(listed, list) else listed
         out.append(("runtime", f'It runs {arr_meta.hms(meta["trusted"]["seconds"])}, but the listed runtime is {shown} minutes.'))
+    for s in (ev or {}).get("signals", []):
+        if s["kind"] == "episode_title" and s["verdict"] == "other":
+            out.append(("episode", f'{s["why"][:1].upper()}{s["why"][1:]}. Check the series\' episode order in Sonarr, or import the file to '
+                                   f'{s["names"]} by hand.'))
     return out
 
 
@@ -4068,30 +4477,126 @@ def trim_inputs(path, j, hp, folder):
 KEEP_DIR = f".{CFG['NAME']}-originals"   # hidden, so the apps and Plex never scan it
 
 
-def originals_root(path):
-    """Where a repack keeps the original: KEEP_DIR at the top of the mount that holds path. With a mount such as /data
-    that sits above every root folder of the apps and every Plex section, so none of them scans it. The dot keeps it
-    hidden too."""
-    m = os.path.dirname(os.path.abspath(path))
+def mount_top(folder):
+    """The nearest folder at or above folder that is a mount point. It reads only."""
+    m = os.path.abspath(folder)
     while m != "/" and not os.path.ismount(m):
         m = os.path.dirname(m)
-    return os.path.join(m, KEEP_DIR)
+    return m
+
+
+def keep_root(path, name):
+    """The folder named name, KEEP_DIR or RECYCLE_DIR, where the hook keeps a file of path. It reads only, so a dry run
+    may ask. The hook takes the first of these that fits:
+    1. name at the top of the mount that holds path, when it exists and is writable. Every install before 1.7.0 keeps
+       its folders there.
+    2. name at the mount top, to create, when the mount top is writable. With a mount such as /data above every root
+       folder of the apps and every Plex section, none of them scans it.
+    3. A writable folder name that exists on the path from the mount top down to the file's own folder, the highest
+       first. So the choice stays the same from run to run.
+    4. name to create in the highest writable folder on that path, as in a Docker volume that only root may write.
+    5. name at the mount top. No folder on the path is writable, so the keep fails and names the mount top.
+    Each one sits on the file's mount, so a hard link from the file works. A folder whose real path is on another mount,
+    as one above a symlink to a share, never comes in. The dot hides it from the apps' disk scans and Plex."""
+    folder = os.path.dirname(os.path.abspath(path))
+    top, steps = mount_top(folder), [folder]
+    while steps[0] != top and steps[0] != "/":   # the folders from the mount top down to the file's own
+        steps.insert(0, os.path.dirname(steps[0]))
+    own = mount_top(os.path.realpath(folder))   # a folder named through a symlink can sit on another mount
+    steps = [f for f in steps if mount_top(os.path.realpath(f)) == own]
+    writable = lambda f: os.path.isdir(f) and os.access(f, os.W_OK | os.X_OK)
+    here = os.path.join(top, name)
+    if top in steps and not os.path.lexists(here) and writable(top):
+        return here
+    for f in steps:   # the mount top first, so a writable folder there wins
+        if writable(os.path.join(f, name)):
+            return os.path.join(f, name)
+    for f in steps:
+        if f != top and writable(f) and not os.path.lexists(os.path.join(f, name)):
+            return os.path.join(f, name)
+    return here
+
+
+def originals_root(path):
+    """Where a repack keeps the original of path: KEEP_DIR in the folder keep_root() picks."""
+    return keep_root(path, KEEP_DIR)
+
+
+RECYCLE_DIR = f".{CFG['NAME']}-recycle"   # hidden, as KEEP_DIR, see replaced_root()
+
+
+def replaced_root(path):
+    """Where a grab keeps the library file of path that an upgrade may replace, see keep_grab(): RECYCLE_DIR in the
+    folder keep_root() picks."""
+    return keep_root(path, RECYCLE_DIR)
+
+
+FOLDERS = "kept-folders.json"   # the file in STATE_DIR that lists each folder a keep wrote in, see remember_folder()
+
+
+def kept_folders(strict=False):
+    """The folders of FOLDERS, set() when there is no file. A file that does not read or parse gives set() too, or the
+    error with strict. write_json() replaces it whole."""
+    try:
+        with open(os.path.join(CFG["STATE_DIR"], FOLDERS)) as f:
+            return set(json.load(f))
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, TypeError):
+        if strict:
+            raise
+        return set()
+
+
+def remember_folder(root):
+    """Add root, a KEEP_DIR or RECYCLE_DIR the hook wrote in, to FOLDERS, so a prune reaches a folder that keep_root()
+    put below a root folder too. A folder stays in the list while it is missing, as on a NAS that is down, and a prune of
+    it does nothing. A file that does not parse stays as it is, so no folder drops out. Never raises. An error logs a
+    line."""
+    if root in kept_folders():
+        return
+    path = os.path.join(CFG["STATE_DIR"], FOLDERS)
+    try:
+        with open(path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            write_json(path, sorted(kept_folders(strict=True) | {root}))
+    except (OSError, ValueError, TypeError) as ex:
+        with contextlib.suppress(OSError):
+            log(dict(source="hook", path=root, result="warning", note=mask(f"the hook could not record the folder: {type(ex).__name__}: {ex}")[:300]))
+
+
+def prune_roots(originals):
+    """The folders a prune clears: each folder of FOLDERS, and the RECYCLE_DIR of each grab link of KEPT. originals
+    False leaves out each KEEP_DIR. A folder of another name never comes in, so a prune never removes another folder."""
+    names = (KEEP_DIR, RECYCLE_DIR) if originals else (RECYCLE_DIR,)
+    found = kept_folders()
+    for r in kept_read():
+        k = r["kept"]
+        while k not in ("", "/") and os.path.basename(k) != RECYCLE_DIR:
+            k = os.path.dirname(k)
+        found.add(k)
+    return {f for f in found if os.path.basename(f) in names}
 
 
 LINK_REFUSED = {errno.EPERM, errno.EXDEV, errno.EMLINK, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}   # a copy keeps the original then
 KEEP_COPY_FREE = 1 << 30   # bytes a copy of a kept original leaves free, see keep_original()
 
 
+def keep_folder(path):
+    """The folder a keep of path writes in: originals_root() when it exists, else the folder that creates it."""
+    root = originals_root(path)
+    return root if os.path.isdir(root) else os.path.dirname(root)
+
+
 def keepable(path, st):
     """Why the original of path cannot be kept, or None. The keep is a hard link, or a copy where the file system
-    refuses one, see keep_original(). So a folder on another file system needs room for a copy, and the folder must be
+    refuses one, see keep_original(). So a folder on another file system needs room for a copy, and keep_folder() must be
     writable. It writes nothing, so a dry run may ask."""
-    root = originals_root(path)
-    where = root if os.path.isdir(root) else os.path.dirname(root)
+    where = keep_folder(path)
     try:
         other, free = os.stat(where).st_dev != st.st_dev, shutil.disk_usage(where).free
     except OSError as ex:
-        return f"{where} does not read: {ex}"
+        return f"{where} does not read ({ex})"
     if other and free < st.st_size + KEEP_COPY_FREE:
         return f"{where} is on another file system with {free / 1e9:.1f} GB free, too little for a copy of {st.st_size / 1e9:.1f} GB"
     return None if os.access(where, os.W_OK) else f"{where} is not writable"
@@ -4105,10 +4610,13 @@ def keep_original(path, note=None):
     system, too many links, or a mount or a container that allows no link), it is a copy with the mode and times of
     path, and note["kept_how"] says so. The copy needs the size of path plus KEEP_COPY_FREE free, else it raises
     OSError and the fix does not run. It is written under a hidden name, compared with path by size and hash, and only
-    then renamed to the kept name. So a crash leaves no file that looks kept, and the swap waits for a whole copy."""
+    then renamed to the kept name. So a crash leaves no file that looks kept, and the swap waits for a whole copy.
+    Every fix that replaces or moves a library file keeps it here first, so the links of path from a grab go stale."""
+    kept_replaced(path)
     root = originals_root(path)
     keep = os.path.join(root, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time())), os.path.relpath(path, os.path.dirname(root)))
     os.makedirs(os.path.dirname(keep), exist_ok=True)
+    remember_folder(root)
     try:
         os.link(path, keep)
         return keep
@@ -4163,18 +4671,24 @@ def prune_originals(root):
     return gone
 
 
-def repack_skip(path, st):
-    """Why a repack of the file st describes cannot run, or None: a hard link, the size cap, low space, or no place to keep
-    the original."""
+def repack_block(path, st):
+    """(code, text) of why a repack of the file st describes cannot run, or (None, None). The codes, in the order of the
+    checks, are "hardlinked", "cap" for the size cap, "space" for low space and "keep" for no place to keep the original.
+    dry_remux() words each code for a dry run."""
     fs = os.statvfs(os.path.dirname(path))
-    if st.st_nlink > 1:   # the rename would split the link from the download client's copy
-        return "hardlinked"
+    if links(path, st) > 1:   # the rename would split the link from the download client's copy
+        return "hardlinked", "hardlinked"
     if st.st_size > REPACK_MAX:
-        return f"over the {REPACK_MAX / 1e9:.0f} GB repack cap"
+        return "cap", f"over the {REPACK_MAX / 1e9:.0f} GB repack cap"
     if fs.f_bavail * fs.f_frsize < 2 * st.st_size:
-        return f"low space: {fs.f_bavail * fs.f_frsize / 1e9:.1f} GB free for {st.st_size / 1e9:.1f} GB"
+        return "space", f"low space: {fs.f_bavail * fs.f_frsize / 1e9:.1f} GB free for {st.st_size / 1e9:.1f} GB"
     why = KEEP_DAYS and keepable(path, st)
-    return f"the original cannot be kept: {why}" if why else None
+    return ("keep", f"the original cannot be kept: {why}") if why else (None, None)
+
+
+def repack_skip(path, st):
+    """Why a repack of the file st describes cannot run, or None, see repack_block()."""
+    return repack_block(path, st)[1]
 
 
 class SourceChanged(Exception):
@@ -5377,7 +5891,7 @@ def convert_skip(app, path, new, st, ids):
     """Why a conversion of the file st describes cannot run, or None: a hard link, the size cap, low space, no item id to
     import the new name with, or the .mkv name taken by another file. It writes nothing."""
     fs = os.statvfs(os.path.dirname(path))
-    if st.st_nlink > 1:   # the rename would split the link from the download client's copy
+    if links(path, st) > 1:   # the rename would split the link from the download client's copy
         return "hardlinked"
     if st.st_size > REPACK_MAX:
         return f"over the {REPACK_MAX / 1e9:.0f} GB repack cap"
@@ -6046,6 +6560,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             signal.signal(signal.SIGTERM, term)   # from here a stop waits for the swap and the job's end, as for mkvpropedit
         with no_stop():
             if new == path:
+                kept_replaced(path)   # no keep_original() before this rename, unless forced
                 os.replace(tmp, path)
                 if lock is not None:   # process() takes it again at the gate. Kept, it would deadlock a worker waiting there.
                     fcntl.flock(lock, fcntl.LOCK_UN)
@@ -6171,7 +6686,7 @@ def edit(rec, j, edits, apply, replan=None):
     path = rec["path"]
     rec = dict(rec, before=flags(j), edits=edits, undo=["mkvpropedit", path] + propedit_args(edits, 2))
     before = os.stat(path)
-    if before.st_nlink > 1:   # a hardlink shares the edit with the download client's copy
+    if links(path, before) > 1:   # a hardlink shares the edit with the download client's copy
         return dict(rec, result="hardlinked, not edited")
     if not apply:
         return dict(rec, result="dry run")
@@ -6346,7 +6861,11 @@ def try_lock(name):
 
 def queue_job(job):
     """Write one job file into the queue. hook() and the Webhook listener in arr_serve.py both call it, so the worker
-    reads one format. Returns the job file's name."""
+    reads one format. Returns the job file's name. The old files of an upgrade claim the hook's own copies of their grab,
+    see kept_replaced()."""
+    for old in (job.get("deleted") or "").split("|") if KEEP_REPLACED else ():
+        if old:
+            kept_replaced(old, job.get("download_id") or "")
     os.makedirs(queue_dir(), exist_ok=True)
     name = f"{time.time_ns()}-{os.getpid()}.json"
     with open(os.path.join(queue_dir(), "." + name), "w") as f:
@@ -6360,6 +6879,24 @@ def hook():
     if not app:
         print(__doc__); return
     event = os.environ[f"{app}_eventtype"]
+    if event == "Grab" and KEEP_REPLACED and KEEP_DAYS:   # keep the files the grab may replace. An error logs, and the app gets its answer.
+        try:
+            owner = int(os.environ[f"{app}_movie_id" if app == "radarr" else "sonarr_series_id"])
+            eps = []
+            if app == "sonarr":   # Sonarr names the episodes of a grab by numbers only
+                absolute = os.environ.get("sonarr_release_absoluteepisodenumbers", "").split(",")
+                if os.environ.get("sonarr_series_type", "").lower() == "anime" and all(n.strip().isdigit() for n in absolute):
+                    # An anime batch can cross a season, and the season number names the first episode's only
+                    nums = {int(n) for n in absolute}
+                    eps = [e["id"] for e in arr(app, f"episode?seriesId={owner}") if e.get("absoluteEpisodeNumber") in nums]
+                else:
+                    nums = {int(n) for n in os.environ.get("sonarr_release_episodenumbers", "").split(",") if n.strip()}
+                    season = int(os.environ["sonarr_release_seasonnumber"])
+                    eps = [e["id"] for e in arr(app, f"episode?seriesId={owner}&seasonNumber={season}") if e.get("episodeNumber") in nums]
+            keep_grab(app, owner, os.environ.get(f"{app}_download_id") or "", eps)
+        except Exception as ex:
+            with contextlib.suppress(OSError):
+                log(dict(source="hook", app=app, result="error", note=mask(f"the grab kept nothing: {type(ex).__name__}: {ex}")[:300]))
     if event != "Download":   # Test, and anything the connection was not meant to send
         for w in bin_warnings(app) if event == "Test" else []:
             print(f"arr-media-guard: warning: {w}")
@@ -6371,6 +6908,8 @@ def hook():
            "file_id": env("radarr_moviefile_id") if app == "radarr" else env("sonarr_episodefile_id"),
            "episode_ids": env("sonarr_episodefile_episodeids"), "download_id": env(f"{app}_download_id"),
            "release": env("radarr_moviefile_scenename") if app == "radarr" else env("sonarr_episodefile_scenename")}
+    if app == "sonarr":   # read now, because a usenet download folder can be gone when the worker runs
+        job["nfo_title"] = release_nfo_title(env("sonarr_episodefile_sourcepath") or "", job["release"] or "")
     job.update(deleted=env(f"{app}_deletedpaths"), recycled=env(f"{app}_deletedrecyclebinpaths"))   # an upgrade's old files, see old_files()
     queue_job(job)
     print(f"arr-media-guard: queued {job['path']}", flush=True)
@@ -6497,11 +7036,31 @@ def stale_work_dirs():
                     shutil.rmtree(f)
 
 
+def prune_kept():
+    """Remove the kept files older than KEEP_DAYS in each folder of prune_roots(), once a day. At KEEP_ORIGINALS_DAYS 0 it
+    leaves the kept originals, as the audit does. The worker runs it, off the app's call path, so a host with no
+    nightly audit prunes too. STATE_DIR/kept-pruned holds the day of the last run, and an error never stops the
+    worker."""
+    mark, today = os.path.join(CFG["STATE_DIR"], "kept-pruned"), time.strftime("%Y-%m-%d", time.localtime(time.time()))
+    try:
+        with contextlib.suppress(OSError), open(mark) as f:
+            if f.read().strip() == today:
+                return
+        with open(mark, "w") as f:
+            f.write(today + "\n")
+        for root in sorted(prune_roots(KEEP_DAYS > 0)):
+            prune_originals(root)
+    except Exception as ex:
+        with contextlib.suppress(OSError):
+            log(dict(source="hook", result="warning", note=mask(f"the kept files were not pruned: {type(ex).__name__}: {ex}")[:300]))
+
+
 def worker(lock):
     """Drain the queue, with the pending Plex lookups in between. Exits when both are empty. HOOK_WORKERS 1 runs one
     file job at a time in this process. A larger value hands the jobs to coordinate()."""
     signal.signal(signal.SIGALRM, time_up)   # the default action kills the process before it can log
     stale_work_dirs()
+    prune_kept()
     for n in os.listdir(queue_dir()):   # half-written jobs a killed hook left behind
         f = os.path.join(queue_dir(), n)
         if n.startswith(".") and time.time() - os.path.getmtime(f) > 3600:
@@ -6958,18 +7517,18 @@ def backfill(argv):
         return scan(app, a, "audio" if a.check_audio else "video")
     work, library = [], 0   # (file, (label, original, runtime, Plex lookup, kids, metadata context)), and all files for an estimate
     if app == "radarr":
-        for m in arr(app, "movie"):
+        for m in app_list(app):
             f = movie_file(m)
             library += bool(f)
             if f and (not ids or m["id"] in ids):
                 work.append((f, movie_item(m, kids_profiles())))
     else:
-        for s in arr(app, "series"):
+        for s in app_list(app):
             library += (s.get("statistics") or {}).get("episodeFileCount") or 0
             if (ids and s["id"] not in ids) or not (s.get("statistics") or {}).get("episodeFileCount"): continue
             eps = arr(app, f"episode?seriesId={s['id']}")
             for f in arr(app, f"episodefile?seriesId={s['id']}"):
-                work.append((f, episode_item(s, [e for e in eps if e.get("episodeFileId") == f["id"]])))
+                work.append((f, episode_item(s, [e for e in eps if e.get("episodeFileId") == f["id"]], eps)))
     # The app lists the files. Each file's own tracks select it, see selected(), because the app's stored mediaInfo goes
     # stale and can miss a subtitle track.
     unconverted = [w for w in work if not w[0]["path"].lower().endswith(".mkv")]   # --convert takes only these, docs/design.md, "Conversion"
@@ -7049,7 +7608,7 @@ def backfill(argv):
                   f'{" | not forced: " + rec["repack"]["not_forced"][:150] if (rec.get("repack") or {}).get("not_forced") else ""}'
                   f'{" | name forced: " + rec["repack"]["forced_name"][:150] if (rec.get("repack") or {}).get("forced_name") else ""}'
                   f'{" | " + "; ".join(rec.get("notes", [])) if rec.get("notes") else ""}'
-                  f'{" | ALERT " + "; ".join(rec["alerts"]) if rec.get("alerts") else ""}', flush=True)
+                  f'{" | ALERT " + "; ".join(dry_alerts(rec)) if rec.get("alerts") else ""}', flush=True)
         if a.apply and (rec["result"] == "edited" or {"repacked", *REPAIRED} & set(rec.get("reasons", []))) and want and CFG["PLEX_URL"]:
             p = plex_after(app, "backfill", rec, want)
             if (p["want"] or {}).get("folder") and a.plex_later:   # --plex-flush scans them later, one section at a time
@@ -7110,7 +7669,8 @@ def sub_text(rec):
             for k, f in sorted((rec.get("flash") or {}).items())]
     out += [f'{e["name"]}: {e["action"]} {e["result"]}' for e in rec.get("sidecars") or []]
     out += [f'whole-file read of {", ".join(f["tracks"])} in {f["took"]} s' + (f', {f["why"]}' if f.get("why") else "") for f in [rec.get("full_read")] if f]
-    return "; ".join(out) + (f' | {rec["subremux"]["result"][:150]}' if (rec.get("subremux") or {}).get("result") else "")
+    r = remux_said(rec)[:150]
+    return "; ".join(out) + (f" | {r}" if r else "")
 
 
 def sub_count(c, rec, took):
@@ -7149,7 +7709,7 @@ def sub_time_items(app, paths):
         mine = [p for p in paths if s.get("path") and p.startswith(s["path"].rstrip("/") + "/")]
         if mine:
             eps = arr(app, f"episode?seriesId={s['id']}")
-            out += [(app, f, episode_item(s, [e for e in eps if e.get("episodeFileId") == f["id"]])) for f in arr(app, f"episodefile?seriesId={s['id']}")
+            out += [(app, f, episode_item(s, [e for e in eps if e.get("episodeFileId") == f["id"]], eps)) for f in arr(app, f"episodefile?seriesId={s['id']}")
                     if f.get("path") in mine]
     return out
 
@@ -7162,7 +7722,8 @@ def sub_time(argv):
     the item only for its original language and the other inputs of the check, see sub_time_items(). A path no app
     lists runs with no item, so no original language is known, and it keeps every flag except those a subtitle
     verdict turns off, see process(). A lookup that fails, by an error, a timeout or an app restart, is not the same:
-    --apply then stops before any change, and a dry run says so."""
+    --apply then stops before any change, and a dry run says so. An app the user set up in part fails the same way, see
+    no_key()."""
     ap = argparse.ArgumentParser(prog="arr-media-guard --sub-time")
     ap.add_argument("paths", nargs="+", metavar="PATH"); ap.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
@@ -7170,12 +7731,17 @@ def sub_time(argv):
     os.nice(19)   # it hears and reads files on the NAS, so it yields to imports and to Plex
     subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
     langs()
-    left, work, failed = [os.path.abspath(p) for p in a.paths], [], []
+    left, work, failed, unset = [os.path.abspath(p) for p in a.paths], [], [], []
     for app in APPS:
         try:
             found = sub_time_items(app, left) if left else []
-        except FileNotFoundError as ex:   # no config.xml: the app does not run on this host
-            print(f"{app} does not run on this host: {mask(str(ex))[:150]}", flush=True)
+        except FileNotFoundError as ex:   # no API key and no config.xml, so the app lists nothing
+            why = no_key(app, ex)
+            if why:   # the user set the app up in part, so it fails as a lookup does
+                failed.append(why)
+                print(why, flush=True)
+            else:   # the user did not set the app up
+                unset.append(app)
             continue
         except Exception as ex:   # an error, a timeout or a restart: the app could not say what it lists
             failed.append(mask(f"the {app} lookup failed: {type(ex).__name__}: {ex}")[:200])
@@ -7185,8 +7751,12 @@ def sub_time(argv):
         left = [p for p in left if p not in {f.get("path") for _, f, _ in found}]
     if failed and a.apply and left:   # a failed lookup never applies: it would decide with no original language
         sys.exit(f"--sub-time --apply stops, and nothing changed: {'; '.join(failed)}")
+    if len(unset) == len(APPS):   # one line for every path
+        print("no Sonarr or Radarr is set up, so this run knows no original language. Set SONARR_URL and SONARR_API_KEY, or RADARR_URL "
+              "and RADARR_API_KEY, so an app can name the original language.", flush=True)
     for p in left:
-        print(f"{'no app could be asked, so this dry run' if failed else 'no app lists it, so it'} knows no original language: {p}", flush=True)
+        if len(unset) < len(APPS):
+            print(f"{'no app could be asked, so this dry run' if failed else 'no app lists it, so it'} knows no original language: {p}", flush=True)
         work.append((None, {"path": p}, (os.path.basename(p), None, 0, None, False, {"listed": 0})))
     skipped, burst, missed, absent = set(), {}, [], []
     for app, f, info in work:
@@ -7231,10 +7801,71 @@ def apply_missed(rec):
     return f'the sidecar {", ".join(left)} stays as it was' if left else None
 
 
+WOULD_REMUX = "--apply would remux the file."
+HARDLINKED = ("--apply would leave the file as it is, because it has another hard link, such as the download client's copy. Run "
+              "--apply again after the other link is gone, for example after the download client removes its copy.")
+
+
+def dry_remux(rec):
+    """What --apply would do with the subtitle remux that a dry run planned for the file of rec, and what to fix so it
+    can, as one or more sentences. None when the run planned no remux. A skip asks repack_block() again for its reason.
+    A folder that keeps no original names the uid and gid of this run, which PUID and PGID set in Docker."""
+    codes, path = (rec.get("subremux") or {}).get("codes") or [], rec["path"]
+    if "subtitle_remux_skipped" not in codes:
+        return WOULD_REMUX if "would_remux_subtitles" in codes else None
+    st = os.stat(path)
+    code, why = repack_block(path, st)
+    if code == "hardlinked":
+        return HARDLINKED
+    if code == "cap":
+        return f"--apply would skip the remux, because the file is {why}. Raise REPACK_MAX_GB to remux it."
+    if code == "space":
+        folder, fs = os.path.dirname(path), os.statvfs(os.path.dirname(path))
+        return (f"--apply would skip the remux, because {folder} has {fs.f_bavail * fs.f_frsize / 1e9:.1f} GB free, and the remux needs "
+                f"{2 * st.st_size / 1e9:.1f} GB there. Free space in {folder}.")
+    root, folder, user = originals_root(path), keep_folder(path), f"uid {os.getuid()} and gid {os.getgid()}"
+    if code == "keep" and not os.access(folder, os.W_OK) and folder == root:
+        return (f"--apply would skip the remux, because {user} cannot write to {root}, where it keeps the original. Make {root} "
+                "writable for them. In Docker, PUID and PGID set them.")
+    if code == "keep" and not os.access(folder, os.W_OK):   # creating the folder is enough
+        return (f"--apply would skip the remux, because {user} cannot create {root}, where it keeps the original. Create {root}, "
+                f"writable for {user}. In Docker, PUID and PGID set them.")
+    if code == "keep":   # a keep folder on another file system with no room for a copy, or one that does not read
+        k = keepable(path, st) or why
+        return f"--apply would skip the remux, because it cannot keep the original. {k[:1].upper()}{k[1:]}."
+    return WOULD_REMUX   # no code: the cause is gone since the check
+
+
+def dry_alerts(rec):
+    """The alerts of rec as a one-shot dry run prints them. The subtitle alerts come from sub_alerts() with dry, so a
+    sentence on the remux or on the flags says what --apply would do. The other alerts, the decision log and an import
+    keep their texts."""
+    alerts, kinds = rec.get("alerts") or [], rec.get("alert_kinds") or []
+    if rec.get("apply") or not {"submatch", "subtiming"} & set(kinds):
+        return alerts
+    sync, rm = {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}, rec.get("subremux") or {}
+    stay = sorted({p for p, r in (rec.get("subcheck") or {}).items() if p.startswith("s") and p[1:].isdigit() and r["verdict"] == "mismatch"}
+                  - set(rm.get("removed") or []))   # the tracks process() passed, by place. A sidecar has a name instead.
+    try:
+        dry = dict(sub_alerts(rec, sync, stay, dry=True))
+    except OSError:   # the file is gone since the check
+        return alerts
+    return [f"{k}: {dry[k]}" if k in dry else a for a, k in zip(alerts, kinds)]
+
+
+def remux_said(rec):
+    """The result of the subtitle remux of rec for a report column. A dry run says what --apply would do."""
+    rm = rec.get("subremux") or {}
+    if rec.get("apply") or not rm.get("codes"):
+        return rm.get("result") or ""
+    return "--apply would remux" if "would_remux_subtitles" in rm["codes"] else "--apply would skip the remux"
+
+
 def sub_time_text(rec):
     """The report of --sub-time on one file: its result, then one line per subtitle with its place or sidecar name,
     codec, language, role, method, verdict, offset and ratio, and action, then the rows of the sweep and the alerts."""
     rm, done = rec.get("subremux") or {}, {e["name"]: e for e in rec.get("sidecars") or []}
+    pending = remux_said(rec)[:100]   # the action of a track the remux planned for
     tracks = {t["i"]: t for t in rm.get("tracks_before") or rec.get("tracks") or []}   # the places the check named
     stem = os.path.splitext(os.path.basename(rec["path"]))[0]
     tags = lambda n: n[len(stem) + 1:-4].lower().split(".")   # a sidecar's name gives its language and flags
@@ -7248,7 +7879,7 @@ def sub_time_text(rec):
         if p in done:
             act = f'sidecar {done[p]["result"]}' + (f': {done[p]["left"]}' if done[p].get("left") else "")
         elif p in (rm.get("remove") or []) or p in (rm.get("fixed") or []):
-            act = ("removed" if p in (rm.get("remove") or []) else "retimed") if rm.get("done") else rm["result"][:100]
+            act = ("removed" if p in (rm.get("remove") or []) else "retimed") if rm.get("done") else pending
         elif r["verdict"] == "mismatch":
             act = "flags off" if not r.get("held") else "none, held"
         elif r["verdict"] == "weak":
@@ -7264,7 +7895,7 @@ def sub_time_text(rec):
                    f' | {method} | {verdict} | {when} | {act} | {why}')
     for k, f in sorted((rec.get("flash") or {}).items()):
         act = "report only, WebVTT" if f.get("report_only") else f'sidecar {done[k]["result"]}' if k in done \
-            else ("lengthened" if rm.get("done") else rm["result"][:100]) if k in (rm.get("ended") or []) else "ends stay"
+            else ("lengthened" if rm.get("done") else pending) if k in (rm.get("ended") or []) else "ends stay"
         out.append(f'  {k} | flash | median {f["median"]:.2f} s | {f["lengthened"]} of {f["cues"]} ends lengthened | {act} | first '
                    + ", ".join(f"{a:.3f} {o:.3f}->{n:.3f}" for a, o, n in f["first"]))
     for k, rows in sorted((rec.get("sweep") or {}).items()):
@@ -7283,7 +7914,7 @@ def sub_time_text(rec):
         f = rec["sweep_facts"]
         cost = "sweep: words from the cache" if f.get("runs") and f.get("cached") == f["runs"] else f'sweep cost: {f["cpu"]} CPU s, {f["took"]} s'
         out.append(f'  {cost}' + "".join(f"; no words from {x}" for x in f["failed"]))
-    out += [f"  ALERT {a}" for a in rec.get("alerts") or []]
+    out += [f"  ALERT {a}" for a in dry_alerts(rec)]
     return "\n".join(out)
 
 
@@ -7468,13 +8099,18 @@ def audit(argv):
             for code in check.get("invariants", []):
                 add(broken, code, r.get("label")); seen.append(("breaks a rule", r))
         tmdb = arr_meta.tmdb_day_status(day)
-        if KEEP_DAYS:   # the nightly run drops the originals a repack kept longer than KEEP_DAYS
-            try:
-                for root in sorted({originals_root(os.path.join(r["path"], "x")) for r in arr(app, "rootfolder")}):
-                    gone = prune_originals(root)
-                    if gone: print(f"removed {len(gone)} kept originals older than {KEEP_DAYS} days under {root}")
-            except Exception as ex:
-                print(mask(f"kept originals not pruned: {type(ex).__name__}: {ex}")[:200])
+        # The nightly run drops the originals a repack kept, and the grab links, older than KEEP_DAYS. At 0 it drops every
+        # grab link and leaves the originals, which no run pruned at 0 before 1.7.0.
+        roots = prune_roots(KEEP_DAYS > 0)   # a folder below a root folder, as on a mount per show or a fallback, too
+        try:
+            roots |= {f(os.path.join(r["path"], "x")) for r in arr(app, "rootfolder") for f in ((originals_root, replaced_root) if KEEP_DAYS else (replaced_root,))}
+        except FileNotFoundError as ex:   # api_key() found no key and no config.xml
+            print(no_key(app, ex) or f"{app.capitalize()} is not set up, so the audit prunes no kept folder under its root folders.")
+        except Exception as ex:
+            print(mask(f"kept folders under the root folders not pruned: {type(ex).__name__}: {ex}")[:200])
+        for root in sorted(roots):
+            gone = prune_originals(root)
+            if gone: print(f"removed {len(gone)} kept folders older than {KEEP_DAYS} days under {root}")
         # one summary line a night, so Loki sees each host even on a day without imports
         to_syslog(logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", sum(map(len, further.values()))), ("undecided", sum(map(len, undecided.values()))),
@@ -7588,13 +8224,13 @@ def library(app, ids):
     """Every file of the local app as (file id, path, label, original language, listed runtime, kids), in file id order."""
     out = []
     if app == "radarr":
-        for m in arr(app, "movie"):
+        for m in app_list(app):
             f = movie_file(m) if not ids or m["id"] in ids else {}
             if f:
                 out.append((f["id"], f["path"], f'{m["title"]} ({m.get("year")})',
                             (m.get("originalLanguage") or {}).get("name"), m.get("runtime") or 0, movie_item(m, kids_profiles())[4]))
     else:
-        for s in arr(app, "series"):
+        for s in app_list(app):
             if (ids and s["id"] not in ids) or not (s.get("statistics") or {}).get("episodeFileCount"): continue
             eps = arr(app, f"episode?seriesId={s['id']}")
             for f in arr(app, f"episodefile?seriesId={s['id']}"):
@@ -7760,6 +8396,8 @@ def main(argv):
                 api_key(app)
                 for w in bin_warnings(app):
                     print(f"warning: {w}")
+        for w in path_warnings():
+            print(f"warning: {w}")
         arr_decide.selftest()
     elif mode in (["--backfill"], ["--audit"], ["--subhunt"], ["--sub-time"]) and arr_decide.POLICY is None:
         sys.exit(policy_help())

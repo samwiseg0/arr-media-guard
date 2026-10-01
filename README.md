@@ -28,9 +28,12 @@ re-encodes.
   A certain fault deletes the file, marks the grab failed and lets the app search again. A daily cap limits this.
 - **Restore after a bad upgrade.** When the broken file was an upgrade, the old file comes back from the app's
   recycle bin, if it checks clean. Turn on the app's recycle bin, on the media's file system. `--selftest` and Test warn
-  when it is off or elsewhere.
+  when it is off or elsewhere. With `KEEP_REPLACED=true`, the hook keeps its own hard link of each file a grab may
+  replace, so the restore also works with no usable recycle bin.
 - **Wrong content.** It checks the file against TMDB and its own duration. It alerts, and it re-grabs only when you
-  turn that on.
+  turn that on. For an episode, it also reads the episode title from the release's NFO or name. When that title
+  belongs to another episode of the series, it alerts "Wrong episode" and names both episodes. That alert never
+  re-grabs.
 - **Header repair.** A lossless `mkvmerge` remux repairs a Matroska header with a wrong duration or a subtitle that runs
   past the end. The original stays for a week.
 - **Conversion.** It can convert AVI, MP4, M4V, TS and WebM files into Matroska. It proves every stream of the new
@@ -73,6 +76,11 @@ It reads `/etc/arr-media-guard.env`. Set `ARR_MEDIA_GUARD_ENV` to use another fi
 
 Sonarr and Radarr run the script as their own user. That user must be able to write `STATE_DIR`, `LOG` and your media
 files. Both apps share the state folder and its locks, so give them a shared group, or run both as the same user.
+The hook keeps `.<NAME>-originals`, and with `KEEP_REPLACED=true` also `.<NAME>-recycle`, at the top of each mount.
+When the app user cannot write there, it takes the highest folder on the file's path that the user can write, such as
+a show's folder. A folder of that name that exists on the path wins, so the place stays the same from run to run. When
+no folder on the path is writable, every header repair, subtitle remux and conversion of the file is skipped, and a
+grab keeps nothing. Then create the folders at the top of the mount and give them to that user.
 
 The decision log grows by one line per file. Rotate it weekly with logrotate. Keep `delaycompress` next to `compress`,
 because a Plex folder scan reads the rest of `LOG.1` after a rotation. Leave out `copytruncate`, because the script
@@ -106,20 +114,22 @@ the end of the line. Every key is optional. [examples/arr-media-guard.env](examp
 | `STATE_DIR` | `/var/lib/arr-media-guard` | The queue, the locks, the caches, the scan lists and `status.json`. |
 | `POLICY_FILE` | `/etc/arr-media-guard.policy.json` | The decision policy. Without it the hook edits nothing and alerts once. |
 | `LID_DIR` | `/opt/arr-media-guard-lid` | The language detection venv and model. |
-| `NAME` | `arr-media-guard` | The syslog tag and the name in alert footers. It also names two hidden folders. `.<NAME>-originals` at the top of each mount holds kept originals. `.<NAME>-convert` beside a video holds a remux's temp file, and the original and the extras during a conversion. Letters, digits, `.`, `_` and `-` only. |
+| `NAME` | `arr-media-guard` | The syslog tag and the name in alert footers. It also names three hidden folders. `.<NAME>-originals` at the top of each mount holds kept originals, and `.<NAME>-recycle` beside it holds the files `KEEP_REPLACED` keeps. Where the hook cannot write the top of a mount, both go to the highest folder below it that it can write. `.<NAME>-convert` beside a video holds a remux's temp file, and the original and the extras during a conversion. Letters, digits, `.`, `_` and `-` only. |
 | `INSTANCE` | the host name | The name of this host in logs and alerts. |
-| `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989` | The app APIs. |
+| `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989` | The app APIs. An app counts as set up when its API key reads, or when its URL differs from the URLs the env files ship. `--sub-time` says nothing of an app that is not set up. A command that names the app stops with one line. An app at a shipped URL with no API key counts as not set up, also when you keep that URL on purpose. |
 | `RADARR_DIR`, `SONARR_DIR` | `/var/lib/radarr`, `/var/lib/sonarr` | The app's own folder. The script reads the API key from `config.xml` there. The conversion and the subtitle hunter read the app's database, `radarr.db` or `sonarr.db`, there too. |
 | `RADARR_API_KEY`, `SONARR_API_KEY` | empty | The API key, for an app whose folder this host does not see. Empty: the key in `config.xml`. The conversion and the subtitle hunter still need the folder. |
-| `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. Plex must see the files under the same paths as the apps. An empty `PLEX_URL` turns every Plex call off. |
+| `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. An empty `PLEX_URL` turns every Plex call off. |
+| `PLEX_PATH_MAP` | empty | `PLEX_PATH:LOCAL_PATH` pairs joined by `\|`, when Plex sees the files under other paths than this script. Empty: `PATH_MAP`, see [Path maps](#path-maps). |
 | `DISCORD_WEBHOOK` | empty | Alerts and scan summaries. Empty: nothing is posted. |
 | `TMDB_TOKEN` | empty | A TMDB API read token. Empty: Radarr's bundled key, read from `/opt/Radarr/Radarr.Common.dll`. |
 | `REGRAB` | `audio,video` | The kinds of fault that re-grab: `audio` (broken audio), `video` (corrupt video), `content` (wrong content) and `damage` (a damaged source that a conversion shows). A kind not listed gets the second check and only alerts "would re-grab". `none` turns every re-grab off. An unknown kind is left out, and a blank value re-grabs nothing. `--selftest` fails on both. |
 | `REGRAB_CAP` | `30` | Re-grabs per app in 24 hours, then it alerts only. Every kind shares the one count. `0` turns every re-grab off. |
 | `RESTORE` | `true` | A re-grab of a broken upgrade puts back the old file from the recycle bin. |
+| `KEEP_REPLACED` | `false` | At each grab, hard-link the library files the grab may replace, with their subtitles, `.nfo` and images, into `.<NAME>-recycle` at the top of their mount, or in the highest folder below it that the hook can write. A restore uses this copy when the app's recycle bin has none it can use. Turn on **On Grab** in the app's connection. The hook keeps nothing on a file system that refuses a hard link, such as an SMB/CIFS share, some FUSE mounts and Docker Desktop file sharing. Each copy stays, and holds its disk space, for `KEEP_ORIGINALS_DAYS`. Then the nightly audit, or the worker's prune once a day, removes it. With `KEEP_ORIGINALS_DAYS` at 0, it keeps nothing. A value other than `true` or `false` keeps nothing, and `--selftest` fails on it. `--selftest` and Test warn when the connection sends no Grab, or when the hook cannot hard-link a file on a mount. |
 | `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
 | `SUBTITLES` | `fix` | What the subtitle check of an import does. Needs language detection. `off`: no check. `check`: it reads, reports and alerts, and changes nothing. `fix`: it also removes a wrong track, moves a wrong sidecar, retimes and lengthens flash cues. `deep`: `fix`, then a deep analysis after the import, which reads the whole file for unindexed subtitle tracks, hears one window a minute and times the subtitles that had no reference. It runs only while no import waits. `--sub-check` and `--sub-time` ignore it. Without `--apply` they report, and with it they fix. An unknown level acts as `check`, and `--selftest` fails on it. |
-| `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced in `.<NAME>-originals`, as a hard link, or as a verified copy where the file system refuses a link. `0` keeps nothing. |
+| `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced in `.<NAME>-originals`, as a hard link, or as a verified copy where the file system refuses a link. `KEEP_REPLACED` keeps its links as long. The nightly audit and the worker's daily prune remove them in every folder the hook kept a file in, also one below a root folder. `0` keeps nothing. At `0` a prune removes every grab link and leaves the originals already kept. |
 | `REPACK_MAX_GB` | `30` | A larger file is never remuxed or converted. |
 | `CONVERT` | `false` | Convert every imported file that is not Matroska. A backfill converts only with `--convert`. |
 | `CONVERT_MAX_FILES` | `200` | Conversions one `--convert --apply` run makes. |
@@ -174,7 +184,7 @@ The decision reads its rules from `POLICY_FILE`, JSON. A missing key is an error
 In each app, open Settings, Connect, add a **Custom Script**, and set:
 
 - Name: `arr-media-guard`
-- Triggers: **On File Import** and **On File Upgrade**
+- Triggers: **On File Import** and **On File Upgrade**. With `KEEP_REPLACED=true`, also **On Grab**.
 - Path: `/usr/local/bin/arr-media-guard`
 - Arguments: empty
 
@@ -263,8 +273,9 @@ results under `subcheck`, `subtime`, `flash` and `sweep`.
 
 With `--apply`, a built-in track gets its new times, new ends or its removal in one remux that the packet proof checks.
 A sidecar is written again or moved. The original file or sidecar is kept for `KEEP_ORIGINALS_DAYS` (7) days at
-`<mount>/.<NAME>-originals/<UTC time>/<path from the mount>`, where the mount holds the file. To undo a change, move the kept
-original back over the file with `mv`, then rescan the item in the app.
+`<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. The folder is the top of the mount that holds the file,
+or the highest folder below it that the hook can write. To undo a change, move the kept original back over the file
+with `mv`, then rescan the item in the app.
 
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.
@@ -334,7 +345,7 @@ services:
     volumes: [./radarr:/config, /srv/media:/data]
     ports: ["7878:7878"]
   arr-media-guard:
-    image: ghcr.io/samwiseg0/arr-media-guard:1.6.0
+    image: ghcr.io/samwiseg0/arr-media-guard:1.7.0
     container_name: arr-media-guard
     environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # TZ: your time zone, for AUDIT_TIME and the log times
     volumes:
@@ -352,20 +363,22 @@ services:
    because the image has no Radarr install to read the bundled key from. Then run `docker compose up -d` again.
 3. In each app, open Settings, Connect, add a **Webhook**, and set:
    - Name: `arr-media-guard`
-   - Triggers: **On File Import** and **On File Upgrade** only
+   - Triggers: **On File Import** and **On File Upgrade** only. With `KEEP_REPLACED=true`, also **On Grab**.
    - URL: `http://arr-media-guard:8484/sonarr` in Sonarr, `http://arr-media-guard:8484/radarr` in Radarr
    - Method: `POST`
    - Username and Password: `WEBHOOK_USER` and `WEBHOOK_PASSWORD`
 
    Test checks the policy, the API key and each root folder of the app, and Save runs it. A failed Test names what
-   to fix. Turn on the app's recycle bin, on the media's file system, so a bad upgrade can be undone. Test warns in
-   the log when it is off or elsewhere.
+   to fix. Turn on the app's recycle bin, on the media's file system, and mount it at the app's path, or add a pair
+   for it to the app's path map, so a bad upgrade can be undone. Test warns in the log when it is off, elsewhere or not
+   mounted. With `KEEP_REPLACED=true`, the hook also keeps its own copies, and a restore uses them when the bin has none.
 
 | Mount | What it holds |
 | --- | --- |
 | `/config` | The env file, `policy.json`, the state folder `state/` and the decision log in `logs/`. |
 | `/var/lib/sonarr`, `/var/lib/radarr` | The app's config folder, read-only. The script reads the API key from `config.xml`, and a conversion reads the app's database. SQLite reads a live WAL database through a read-only mount, also from another container. |
-| The media | At the same path as in the apps, `/data` above. Else set `PATH_MAP`. |
+| The media | At the same path as in the apps, `/data` above. Else set a path map, see [Path maps](#path-maps). |
+| Sonarr's download folder | Optional, read-only. The episode title check reads the scene NFO of each import there, through Sonarr's path map. Without it, only the release name gives a title. |
 
 The Docker section at the end of the env file sets the paths under `/config` and these keys. Every other key in
 [The env file](#the-env-file) works the same way.
@@ -374,22 +387,78 @@ The Docker section at the end of the env file sets the paths under `/config` and
 | --- | --- | --- |
 | `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | empty | The basic auth of the Webhook connection. Printable ASCII. Without both, the listener does not start. |
 | `RADARR_URL`, `SONARR_URL` | `http://radarr:7878`, `http://sonarr:8989` | The apps as this container reaches them. |
-| `PATH_MAP` | empty | `APP_PATH:LOCAL_PATH` pairs joined by `\|`, for example `/data:/media`, when this container sees the media at other paths. Plex must see the files under the apps' paths. A pair that is not two absolute paths fails `--selftest`, and the listener does not start. |
-| `AUDIT_TIME` | `07:30` | The local time of the nightly audit of each app, which also removes kept originals older than `KEEP_ORIGINALS_DAYS`, and of the weekly log rotation. Empty: neither runs. |
+| `PATH_MAP` | empty | `APP_PATH:LOCAL_PATH` pairs joined by `\|`, for example `/data:/media`, when this container sees the media at other paths. Each program whose own map is empty takes it. |
+| `SONARR_PATH_MAP`, `RADARR_PATH_MAP` | empty | The map of one app, in the format of `PATH_MAP`. Empty: `PATH_MAP`. |
+| `AUDIT_TIME` | `07:30` | The local time of the nightly audit of each app, which also removes kept originals and the grab links of `KEEP_REPLACED` older than `KEEP_ORIGINALS_DAYS`, and of the weekly log rotation. Empty: neither runs. |
 | `INSTANCE` | `arr-media-guard` | The name of this install in logs and alerts. The host name of a container changes with each new container. |
 
 Set `TZ` on the container to your time zone, for example `TZ=Europe/Berlin`. Without it the container runs in UTC, so
 `AUDIT_TIME` and the times in the decision log are UTC.
 
-The listener takes each post only with the right user and password, and a body of at most 1 MiB. It asks the app
-for the file by its id and uses the path the API gives. It refuses a file of another item, and an old file outside
-the item's folder or the recycle bin, with a line in the decision log. Each request has 10 seconds in all, and 32 run
-at once, so a slow or idle client never holds up an app. 64 more connections may wait for a thread, and the listener
+The listener takes each post only with the right user and password, and a body of at most 1 MiB. It asks the app for
+the file by its id and uses the path the API gives. It refuses a file of another item, and an old file outside the
+item's folder or the recycle bin, with a line in the decision log. Each request has 10 seconds in all, and 32 run at
+once, so a slow or idle client never holds up an app. 64 more connections may wait for a thread, and the listener
 closes each new one past those 96 at once. A post with a wrong path or wrong credentials never reaches the decision
 log. The listener counts them and prints one summary line a minute at most. The compose example publishes no port of
 arr-media-guard on purpose: only the apps on the compose network reach it. The worker runs in the same container, and
 the listener starts it again when a job waits. The script runs as `PUID:PGID`, so the files it writes keep the owner
-of the media. A stop waits for a running flag edit. The healthcheck asks `http://127.0.0.1:8484/health`.
+of the media. Set `PUID` and `PGID` to the user and group the apps run as. The start script,
+`docker/arr-media-guard.sh`, runs the script with `setpriv --clear-groups`, which drops every other group. So a media
+folder that only a supplementary group of that user may write stays read-only for the hook. The hook keeps
+`.<NAME>-originals`, and with `KEEP_REPLACED=true` also `.<NAME>-recycle`, at the top of each mount. When `PUID:PGID`
+cannot write there, as at the root of a Docker volume, it takes the highest folder on the file's path that `PUID:PGID`
+can write. A folder of that name that exists on the path wins, so the place stays the same from run to run. When no
+folder on the path is writable, every header repair, subtitle remux and conversion of the file is skipped, and a grab
+keeps nothing. Then create the folders at the top of the mount and give them to `PUID:PGID`. A stop waits for a
+running flag edit. The healthcheck asks `http://127.0.0.1:8484/health`.
+
+### Path maps
+
+Sonarr, Radarr, Plex and this container can each see the media under other paths. A path map pairs the paths of one
+program with the paths this script sees. `SONARR_PATH_MAP`, `RADARR_PATH_MAP` and `PLEX_PATH_MAP` each hold the map of
+one program. Each pair is `PROGRAM_PATH:LOCAL_PATH`, both absolute, and `|` joins the pairs. A path may hold spaces. A
+map that is empty takes `PATH_MAP`, so one map serves every program that sees the same paths. A pair matches whole
+folder names only, so `/mnt/TV` never matches `/mnt/TV Shows`. When two pairs match, the longer one wins. A pair that is
+not two absolute paths fails `--selftest`, and the listener does not start.
+
+`--selftest` and the listener start check the maps against each app's root folders. A root folder this script does not
+see gives a warning, and so does one that no Plex library folder holds. Each warning names the folder and the setting
+to fix.
+
+In this example, the host keeps the three libraries in `/srv/media`, and each program mounts them at its own paths.
+
+| Library | Sonarr | Radarr | Plex | This container |
+| --- | --- | --- | --- | --- |
+| TV | `/mnt/TV` | | `/mnt/TV Shows` | `/media/TV` |
+| Anime | `/mnt/Anime` | | `/mnt/Anime` | `/media/Anime` |
+| Movies | | `/movies` | `/mnt/Movies` | `/media/Movies` |
+
+```yaml
+services:
+  sonarr:
+    volumes: [/srv/media/TV:/mnt/TV, /srv/media/Anime:/mnt/Anime]
+  radarr:
+    volumes: [/srv/media/Movies:/movies]
+  plex:
+    volumes: ["/srv/media/TV:/mnt/TV Shows", /srv/media/Anime:/mnt/Anime, /srv/media/Movies:/mnt/Movies]
+  arr-media-guard:
+    volumes: [/srv/media:/media]   # one mount, which holds TV, Anime and Movies
+```
+
+```
+SONARR_PATH_MAP='/mnt/TV:/media/TV|/mnt/Anime:/media/Anime'
+RADARR_PATH_MAP='/movies:/media/Movies'
+PLEX_PATH_MAP='/mnt/TV Shows:/media/TV|/mnt/Anime:/media/Anime|/mnt/Movies:/media/Movies'
+```
+
+This container mounts `/srv/media` once. A rename never crosses two mounts, even on one file system. Give each app a
+recycle bin in a folder it mounts, such as `/mnt/TV/.recycle` in Sonarr and `/movies/.recycle` in Radarr. Both sit in
+`/srv/media`, so the maps above reach them, and a restore can rename a file back from the bin. Radarr leaves a hidden
+folder out of its root folder list. Sonarr lists `.recycle` as an unmapped folder in Library Import. Do not import it.
+Its disk scan never reads it. A kept folder at a root folder's top level, such as `/media/TV/.<NAME>-originals`, shows
+there the same way, and Plex skips it too. With `KEEP_REPLACED=true` the hook keeps its own copies, and the app bins
+are optional.
 
 ### Commands in Docker
 
@@ -403,7 +472,7 @@ one-off container as `$RUN ARGS` below, with the mounts of the compose file.
 ```
 RUN="docker run --rm --network media_default -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
   -v $PWD/arr-media-guard:/config -v $PWD/sonarr:/var/lib/sonarr:ro -v $PWD/radarr:/var/lib/radarr:ro \
-  -v /srv/media:/data ghcr.io/samwiseg0/arr-media-guard:1.6.0"
+  -v /srv/media:/data ghcr.io/samwiseg0/arr-media-guard:1.7.0"
 EXEC="docker exec -it arr-media-guard arr-media-guard"
 ```
 
@@ -413,7 +482,7 @@ The last column names what else it needs:
 
 - **API**: the app's URL, and its key from the config folder mount or `<APP>_API_KEY`.
 - **DB**: the app's config folder at `RADARR_DIR` or `SONARR_DIR`, `/var/lib/<app>` by default, for its database.
-- **Media**: the media at the apps' paths, or `PATH_MAP`. An apply writes there.
+- **Media**: the media at the apps' paths, or a path map. An apply writes there.
 - **LID**: language detection, which the image holds.
 - **Plex** and **Discord**: `PLEX_URL` and `PLEX_TOKEN`, and `DISCORD_WEBHOOK`. Without them the command skips the
   analyze or the post.
@@ -466,28 +535,30 @@ old `STATE_DIR` into `./arr-media-guard/state`, and start it.
 
 `--sub-time` runs on one file with no Sonarr, no Radarr and no settings. Put the video in a folder, open a terminal in
 that folder, and mount it at `/media`. The first command is a dry run. It prints one line for each subtitle, the flash
-check and the sweep of heard windows, and it changes nothing. It prints what `--apply` would change. A line that starts
-with `ALERT subtiming` and ends with "The file stays as it was" names such a change, and it is no error. The second
-command makes the changes.
+check and the sweep of heard windows, and it changes nothing. A line that starts with `ALERT` names something the check
+found, and it is no error. When the check asks for a remux, the line says what `--apply` would do. When `--apply`
+would skip the remux, the line says why and what to fix. The second command makes the changes.
 
 Linux and macOS:
 
 ```
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.6.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.6.0 --sub-time "/media/Episode.mkv" --apply
+docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv"
+docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv" --apply
 ```
 
 Windows PowerShell:
 
 ```
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.6.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.6.0 --sub-time "/media/Episode.mkv" --apply
+docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv"
+docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv" --apply
 ```
 
-The first lines say that Radarr and Sonarr do not run. That is expected. No app lists the file, so the run keeps every
+The first line says that no Sonarr or Radarr is set. That is expected. No app names the file, so the run keeps every
 flag, except that a subtitle whose words do not match the audio loses its default and forced flags. With `--apply`, a
 remux that the packet proof checks writes the new times, the new ends or the removal. The original stays as a hard link
-at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the mounted folder, and the output names that path. A later
+at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the mounted folder, and the output names that path. So the
+mounted folder must be writable for `PUID:PGID`. When the dry run plans a remux and that folder is not writable, it names
+the folder, the uid and the gid. A later
 `--apply` that keeps an original in the same folder removes the kept originals older than `KEEP_ORIGINALS_DAYS`, 7 days
 by default. Move a kept original out of that folder to keep it longer. To undo the change, move it back over the file:
 

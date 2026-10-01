@@ -292,6 +292,198 @@ def as_sonarr(monkeypatch, env, series, eps):
         monkeypatch.setenv(k, v)
 
 
+
+# --- the episode title of an import ------------------------------------------------------------------------------------
+
+SHOW_EPS = [{"id": 31, "seasonNumber": 4, "episodeNumber": 15, "title": "A Rainy Day", "runtime": 11},
+            {"id": 32, "seasonNumber": 4, "episodeNumber": 21, "title": "Ship Voyage", "runtime": 11}]
+
+
+def titled_import(monkeypatch, env, release="Show.D.S04E15.1080p.WEB.H264-GRP", nfo=None):
+    """A Sonarr import of S04E15 whose release names its title. nfo writes the release folder Sonarr imported from,
+    with a scene NFO that holds nfo. Returns the app's GET calls."""
+    as_sonarr(monkeypatch, env, {"id": 5, "title": "Show D", "originalLanguage": {"name": "English"}}, SHOW_EPS[:1])
+    calls = []
+    def fake_arr(app, p):
+        calls.append(p)
+        return {"series/5": {"id": 5, "title": "Show D", "originalLanguage": {"name": "English"}}, "episode?episodeFileId=9": SHOW_EPS[:1],
+                "episode?seriesId=5": SHOW_EPS}[p]
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setenv("sonarr_episodefile_scenename", release)
+    if nfo is not None:
+        folder = os.path.join(os.path.dirname(os.path.dirname(env["path"])), "downloads", release)
+        os.makedirs(folder)
+        open(os.path.join(folder, release.lower() + ".nfo"), "wb").write(nfo.encode("cp437"))
+        monkeypatch.setenv("sonarr_episodefile_sourcepath", os.path.join(folder, release.lower() + ".mkv"))
+    return calls
+
+
+@pytest.mark.parametrize("source", ["NFO", "title"])
+def test_an_import_whose_release_names_another_episode_alerts_and_changes_nothing(env, monkeypatch, source):
+    """The release follows another episode order. Its NFO, or its name, gives the title of what Sonarr lists as S04E21,
+    and it was imported as S04E15. The hook alerts "Wrong episode", logs the signal, and re-grabs nothing."""
+    monkeypatch.setattr(hook, "REGRAB", {"audio", "video", "content"})
+    if source == "NFO":
+        calls = titled_import(monkeypatch, env, nfo="Title.........: Ship Voyage/That's Not It\nSize....: 1 GB\n")
+    else:
+        calls = titled_import(monkeypatch, env, release="Show.D.S04E15.Ship.Voyage.1080p.WEB.H264-GRP")
+    hook.main([])
+    rec = decided(env)
+    said = "Ship Voyage/That's Not It" if source == "NFO" else "Ship Voyage"
+    text = (f"The release's {source} says {said}, which Sonarr lists as S04E21. It was imported as S04E15. Check the series' episode "
+            "order in Sonarr, or import the file to S04E21 by hand.")
+    (sig,) = [x for x in rec["evidence"]["signals"] if x["kind"] == "episode_title"]
+    assert f"episode: {text}" in rec["alerts"] and sig["verdict"] == "other" and sig["episodes"] == [32] and not rec["evidence"]["regrab"], rec
+    assert [b for m, u, b in env["http"] if "discord" in u and text in json.dumps(b) and "Wrong episode" in json.dumps(b)], env["http"]
+    assert env["writes"] == [] and calls.count("episode?seriesId=5") == 1, (env["writes"], calls)
+
+
+def test_an_import_whose_release_names_no_title_reads_no_episode_list(env, monkeypatch):
+    calls = titled_import(monkeypatch, env)
+    hook.main([])
+    rec = decided(env)
+    assert "episode?seriesId=5" not in calls and not [x for x in rec["evidence"]["signals"] if x["kind"] == "episode_title"], calls
+
+
+def test_a_failed_episode_list_leaves_the_other_checks(env, monkeypatch):
+    def fake_arr(app, p):
+        if p.startswith("episode?seriesId"):
+            raise urllib.error.URLError("the app restarts")
+        return {"series/5": {"id": 5, "title": "Show D"}, "episode?episodeFileId=9": SHOW_EPS[:1]}[p]
+    titled_import(monkeypatch, env, release="Show.D.S04E15.Ship.Voyage.1080p.WEB.H264-GRP")
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    hook.main([])
+    rec = decided(env)
+    (sig,) = [x for x in rec["evidence"]["signals"] if x["kind"] == "episode_title"]
+    assert sig["verdict"] == "unknown" and "the app restarts" in sig["why"] and "meta_error" not in rec and rec["tmdb"], rec
+
+
+def test_a_backfill_reads_the_episode_list_once_per_series(env, monkeypatch):
+    """The backfill already lists the series' episodes, so the title check of each file reads them from there."""
+    eps = [dict(e, episodeFileId=i) for e, i in zip(SHOW_EPS, (21, 22))]
+    second = os.path.join(os.path.dirname(env["path"]), "S04E21.mkv")
+    shutil.copy(env["path"], second)
+    calls = []
+    def fake_arr(app, p):
+        calls.append(p)
+        return {"series": [{"id": 5, "title": "Show D", "statistics": {"episodeFileCount": 2}}], "episode?seriesId=5": eps,
+                "episodefile?seriesId=5": [{"id": 21, "path": env["path"], "sceneName": "Show.D.S04E15.Ship.Voyage.1080p.WEB.H264-GRP"},
+                                           {"id": 22, "path": second, "sceneName": "Show.D.S04E21.Ship.Voyage.1080p.WEB.H264-GRP"}]}[p]
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "sonarr"])
+    verdicts = {r["path"]: [x["verdict"] for x in r["evidence"]["signals"] if x["kind"] == "episode_title"] for r in log_lines(env) if r.get("evidence")}
+    assert verdicts == {env["path"]: ["other"], second: ["imported"]} and calls.count("episode?seriesId=5") == 1, (verdicts, calls)
+
+
+def test_the_nfo_beside_the_source_gives_the_title_only_when_it_is_the_releases_own(tmp_path):
+    """A download folder that holds the NFOs of other releases gives no title."""
+    rel = tmp_path / "Show.D.S04E15.1080p.WEB.H264-GRP"
+    rel.mkdir()
+    (rel / "grp.nfo").write_bytes("Title : Ship Voyage\r\n".encode("cp437") + b"\xdb\xdb\r\n")   # cp437 art
+    src = str(rel / "show.d.s04e15.1080p.web.h264-grp.mkv")
+    assert hook.release_nfo_title(src) == "Ship Voyage"   # the one NFO of a folder named like the release
+    (tmp_path / "other.nfo").write_text("Title : Night Shift\n")
+    (tmp_path / "another.nfo").write_text("Title : Day One\n")
+    assert hook.release_nfo_title(str(tmp_path / "show.d.s04e15.mkv")) is None   # a shared download folder
+    (tmp_path / "show.d.s04e15.nfo").write_text("Episode Title : Ship Voyage\n")
+    assert hook.release_nfo_title(str(tmp_path / "show.d.s04e15.mkv")) == "Ship Voyage"   # its own name
+    loose = tmp_path / "Loose"
+    loose.mkdir()
+    (loose / "x.nfo").write_text("Title : Night Shift\n")
+    assert hook.release_nfo_title(str(loose / "show.d.s04e15.mkv"), "Show.D.S04E15") is None
+    assert hook.release_nfo_title(str(tmp_path / "gone" / "x.mkv")) is None and hook.release_nfo_title(None) is None
+
+
+def test_a_file_with_no_scene_name_says_the_title_comes_from_its_name(env, monkeypatch):
+    """Sonarr named the file in the order it had at the import, and the order changed since."""
+    renamed = os.path.join(os.path.dirname(env["path"]), "Show D - S04E15 - Ship Voyage WEBDL-1080p.mkv")
+    shutil.copy(env["path"], renamed)
+    eps = [dict(SHOW_EPS[0], episodeFileId=21), SHOW_EPS[1]]
+    monkeypatch.setattr(hook, "arr", lambda app, p: {"series": [{"id": 5, "title": "Show D", "statistics": {"episodeFileCount": 1}}],
+                                                      "episode?seriesId=5": eps,
+                                                      "episodefile?seriesId=5": [{"id": 21, "path": renamed, "sceneName": None}]}[p])
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "sonarr"])
+    (sig,) = [x for r in log_lines(env) if r.get("evidence") for x in r["evidence"]["signals"] if x["kind"] == "episode_title"]
+    assert sig["why"].startswith("the file name's title says Ship Voyage, which Sonarr lists as S04E21"), sig
+
+
+def test_an_nfo_that_is_no_file_never_blocks_the_import(tmp_path):
+    """A FIFO named like the video would block open() and the app's import thread with it."""
+    os.mkfifo(tmp_path / "show.d.s04e15.nfo")
+    got = []
+    t = threading.Thread(target=lambda: got.append(hook.release_nfo_title(str(tmp_path / "show.d.s04e15.mkv"))), daemon=True)
+    t.start()
+    t.join(5)
+    if t.is_alive():   # unblock the reader, so the thread ends
+        os.close(os.open(tmp_path / "show.d.s04e15.nfo", os.O_WRONLY | os.O_NONBLOCK))
+    assert got == [None]
+
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "episode_title")
+TESTER_NFO = "spongebob.squarepants.s04e15.1080p.web.h264-outpost31.nfo"   # as the download client left it, lower case
+TESTER_RELEASE = "SpongeBob.SquarePants.S04E15.1080p.WEB.H264-OUTPOST31"   # the folder and the video, mixed case
+
+
+def tester_import(monkeypatch, env, tmp_path, release=TESTER_RELEASE, nfo=TESTER_NFO):
+    """A tester's import of S04E15 from a download folder named like the release, with the NFO nfo in it."""
+    eps = json.load(open(os.path.join(FIXTURES, "spongebob-s00-s04-episodes.json")))
+    own = [e for e in eps if (e["seasonNumber"], e["episodeNumber"]) == (4, 15)]
+    as_sonarr(monkeypatch, env, {}, own)
+    monkeypatch.setattr(hook, "arr", lambda app, p: {"series/5": {"id": 5, "title": "SpongeBob SquarePants"}, "episode?episodeFileId=9": own,
+                                                      "episode?seriesId=5": eps}[p])
+    folder = tmp_path / "downloads" / "complete" / release
+    folder.mkdir(parents=True)
+    if nfo:
+        shutil.copy(os.path.join(FIXTURES, TESTER_NFO), folder / nfo)
+    monkeypatch.setenv("sonarr_episodefile_sourcepath", str(folder / f"{release}.mkv"))
+    monkeypatch.setenv("sonarr_episodefile_scenename", release)
+    return folder
+
+
+def test_the_testers_release_alerts_the_two_episodes_it_holds(env, monkeypatch, tmp_path):
+    """The release follows another episode order. Its NFO names two segments that Sonarr lists as S04E23 and S04E27,
+    and Sonarr imported it as S04E15 by its number. The language and the runtime both match."""
+    tester_import(monkeypatch, env, tmp_path)
+    hook.main([])
+    rec = decided(env)
+    text = ("The release's NFO says Squidtastic Voyage/That's No Lady, which Sonarr lists as S04E23, S04E27. It was imported as "
+            "S04E15. Check the series' episode order in Sonarr, or import the file to S04E23 and S04E27 by hand.")
+    assert f"episode: {text}" in rec["alerts"] and not rec["evidence"]["regrab"] and env["writes"] == [], rec["alerts"]
+
+
+@pytest.mark.parametrize("nfo", [TESTER_NFO, "outpost31.nfo"])
+def test_the_testers_nfo_counts_by_its_name_or_as_the_one_nfo_of_the_release_folder(tmp_path, monkeypatch, env, nfo):
+    """Its name is the video's in lower case. Renamed, it is still the one NFO of a folder named like the video. With a
+    second NFO beside it, only the name decides."""
+    folder = tester_import(monkeypatch, env, tmp_path, nfo=nfo)
+    source = str(folder / f"{TESTER_RELEASE}.mkv")
+    assert hook.release_nfo_title(source, TESTER_RELEASE) == "Squidtastic Voyage/That's No Lady"
+    (folder / "sample.nfo").write_text("Title: Ghost Host\n")
+    assert hook.release_nfo_title(source, TESTER_RELEASE) == ("Squidtastic Voyage/That's No Lady" if nfo == TESTER_NFO else None)
+
+
+def test_the_release_now_in_the_library_gives_no_signal(env, monkeypatch, tmp_path):
+    """Its title is S04E15's own, so it alerts nothing. The REPACK flag is no part of the title."""
+    tester_import(monkeypatch, env, tmp_path, release="SpongeBob.SquarePants.S04E15.Ghost.Host.REPACK.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune",
+                  nfo=None)
+    hook.main([])
+    rec = decided(env)
+    (sig,) = [x for x in rec["evidence"]["signals"] if x["kind"] == "episode_title"]
+    assert sig["verdict"] == "imported" and "episode" not in rec["alert_kinds"], (sig, rec["alerts"])
+
+
+def test_the_hook_reads_the_nfo_at_the_event(env, monkeypatch):
+    """The worker may run after the download client removed the folder, so the queued job holds the title."""
+    titled_import(monkeypatch, env, nfo="Title: Ship Voyage\n")
+    monkeypatch.setattr(hook.os, "fork", lambda: 4242)
+    with pytest.raises(SystemExit):
+        hook.main([])
+    (name,) = queue(env)
+    assert json.load(open(os.path.join(hook.queue_dir(), name)))["nfo_title"] == "Ship Voyage"
+
+
 # --- the hook ------------------------------------------------------------------------------------
 
 def test_test_event_answers_at_once(env, monkeypatch, capsys):
@@ -465,6 +657,22 @@ def test_hardlinked_file_is_not_edited(env, tmp_path):
     os.link(env["path"], tmp_path / "client-copy.mkv")
     hook.main([])
     assert env["mkvpropedit"] == [] and log_lines(env)[0]["result"] == "hardlinked, not edited"
+
+
+@pytest.mark.parametrize("client", [False, True])
+def test_the_hooks_own_grab_link_never_blocks_an_edit(env, monkeypatch, tmp_path, client):
+    """A grab linked the file, with KEEP_REPLACED on. The edit reaches the kept copy too, which is right. A download
+    client's link still blocks it."""
+    monkeypatch.setattr(hook, "KEEP_REPLACED", True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "mount_top", lambda f: str(tmp_path / "media"))
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d1")
+    if client:
+        os.link(env["path"], tmp_path / "client-copy.mkv")
+    hook.main([])
+    assert len(env["mkvpropedit"]) == (0 if client else 1)
+    assert [r["result"] for r in log_lines(env) if r.get("outcome")] == ["hardlinked, not edited" if client else "edited"]
 
 
 def test_sonarr_alerts_go_to_the_same_webhook_as_sonarr(env, monkeypatch):
@@ -4678,6 +4886,7 @@ def test_the_mount_holds_the_originals_above_every_root_folder(tmp_path, monkeyp
     mount = "/data"
     monkeypatch.setattr(hook.os.path, "ismount", lambda p: p in (mount, "/"))
     assert hook.originals_root(f"{mount}/movies/Film G/Film G.mkv") == f"{mount}/.arr-media-guard-originals"
+    assert hook.replaced_root(f"{mount}/movies/Film G/Film G.mkv") == f"{mount}/.arr-media-guard-recycle"
 
 
 def test_a_remux_that_lost_frames_is_refused(mkvs, tmp_path, monkeypatch):
@@ -5244,6 +5453,530 @@ def test_a_manual_import_checks_its_plan_again_before_the_delete(env, monkeypatc
     assert env["writes"] == [] and os.path.exists(env["path"]) and not os.path.exists(old)
     assert action(env)[1] == ("Radarr has no grab record for it, so the file stays. The old file did not come back: its recycle bin copy or "
                               "its path changed before the delete.")
+
+
+# --- the hook's own copy of a replaced file (KEEP_REPLACED) ---------------------------------------------
+
+def keep_on(monkeypatch, tmp_path):
+    """KEEP_REPLACED on, with the top of the mount at tmp_path/media. Returns replaced_root()."""
+    monkeypatch.setattr(hook, "KEEP_REPLACED", True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "mount_top", lambda f: str(tmp_path / "media"))
+    return str(tmp_path / "media" / hook.RECYCLE_DIR)
+
+
+def kept_upgrade(env, monkeypatch, tmp_path):
+    """The upgrade of upgrade(), with its grab first: the library holds the old file and its .en.srt, and the Grab
+    event links both. The app's side of the import is left to the test. Returns (old path, its .en.srt, recycle bin
+    path, the kept link of the old file)."""
+    keep_on(monkeypatch, tmp_path)
+    old, rb = upgrade(env, monkeypatch, "Film A (1979) HDTV-720p.mkv")
+    os.replace(rb, old)
+    srt = old[:-4] + ".en.srt"
+    open(srt, "w").write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    env["movies"]["movie/7"]["movieFile"] = {"id": 10, "path": old}
+    monkeypatch.setenv("radarr_eventtype", "Grab")
+    hook.main([])
+    monkeypatch.setenv("radarr_eventtype", "Download")
+    del env["movies"]["movie/7"]["movieFile"]   # the import replaced it
+    (k,) = [r["kept"] for r in hook.kept_read() if "of" not in r]
+    return old, srt, rb, k
+
+
+@pytest.mark.parametrize("case", ["no bin", "bin emptied", "other volume", "bin not visible"])
+def test_the_hooks_own_copy_comes_back_when_the_bin_has_none(env, monkeypatch, tmp_path, case):
+    """The grab linked the old file and its subtitle. The app's bin has no copy the restore can use, so the old file and
+    its subtitle come back from the hook's own copy, after the same checks a bin copy gets."""
+    old, srt, rb, k = kept_upgrade(env, monkeypatch, tmp_path)
+    if case == "other volume":   # the app copied both into its bin on another file system
+        shutil.copy(old, rb)
+        shutil.copy(srt, os.path.join(os.path.dirname(rb), os.path.basename(srt)))
+        monkeypatch.setattr(hook, "volume", lambda p: 64 if "/.recycle/" in p else 63)
+    os.remove(old)
+    os.remove(srt)
+    monkeypatch.setenv("radarr_deletedrecyclebinpaths", {"no bin": "", "bin emptied": rb, "other volume": rb,
+                                                         "bin not visible": "/nonexistent/recycle/" + os.path.basename(old)}[case])
+    silent(env, monkeypatch, env["path"])
+    hook.main([])
+    assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+                             ("POST", "command", {"name": "RescanMovie", "movieId": 7}), ("POST", "history/failed/2101", None)]
+    assert open(old, "rb").read() == b"old" * 300 and open(srt).read().endswith("Hello\n") and not os.path.exists(k)
+    rec = decided(env)
+    (r,) = rec["restore"]
+    assert (r["result"], r["kept"], r["recycle"], r["linked"]) == ("restored", True, k, True) and r["check"]["audio"]["certain"] is None
+    assert [(x["file"], x["result"]) for x in r["extras"]] == [(srt, "restored")]
+    assert action(env)[1].startswith("The hook put back the old file from its own copy: Film A (1979) HDTV-720p.mkv. Radarr links it again.")
+    assert {a[a.index("-i") + 1] for a in env["ffmpeg"]} == {env["path"], k}   # the own copy got the audio check of a bin copy
+    (kept,) = [x for x in hook.kept_read() if "of" not in x]
+    assert kept["import"] == "a1b2c3d4"   # the import of its own grab claimed it
+
+
+def test_a_usable_bin_copy_wins_over_the_hooks_own_copy(env, monkeypatch, tmp_path):
+    old, srt, rb, k = kept_upgrade(env, monkeypatch, tmp_path)
+    os.replace(old, rb)
+    os.replace(srt, os.path.join(os.path.dirname(rb), os.path.basename(srt)))
+    silent(env, monkeypatch, env["path"])
+    hook.main([])
+    (r,) = decided(env)["restore"]
+    assert (r["result"], r["recycle"], "kept" in r) == ("restored", rb, False) and r["extras"][0]["result"] == "restored"
+    assert os.path.exists(old) and os.path.exists(k)   # the own copy waits for its prune
+    assert action(env)[1].startswith("The hook put back the old file from the recycle bin: ")
+
+
+@pytest.mark.parametrize("by, why", [
+    ("repair", "The hook's own copy is older, because the hook changed the file after the grab"),
+    ("import", "The hook's own copy is older, because another import replaced the file after the grab"),
+    ("gone", "The hook's own copy is gone"),
+    ("replaced", "The hook's own copy is no longer the file the grab linked")])
+def test_a_stale_own_copy_never_comes_back(env, monkeypatch, tmp_path, by, why):
+    """After the grab, a header repair renamed a new file over the old path, or another download's import replaced
+    it. The own copy then holds an older version. Or the copy went, or another file took its name. The plain re-grab
+    runs and the plan names why."""
+    old, srt, rb, k = kept_upgrade(env, monkeypatch, tmp_path)
+    if by == "repair":   # repack() keeps the original, then renames its new file over the path
+        hook.keep_original(old)
+        open(old + ".tmp", "wb").write(b"repaired" * 300)
+        os.replace(old + ".tmp", old)
+    elif by == "import":
+        hook.queue_job({"app": "radarr", "deleted": old, "download_id": "another1"})
+        for n in hook.queued():
+            os.remove(os.path.join(hook.queue_dir(), n))
+    elif by == "gone":
+        os.remove(k)
+    else:
+        os.remove(k)
+        open(k, "wb").write(b"old" * 300)
+    os.remove(old)
+    os.remove(srt)
+    monkeypatch.setenv("radarr_deletedrecyclebinpaths", "")
+    silent(env, monkeypatch, env["path"])
+    hook.main([])
+    assert [m for m, p, b in env["writes"]] == ["DELETE", "PUT", "POST"] and not os.path.exists(old) and os.path.exists(k) == (by != "gone")
+    (r,) = decided(env)["restore"]
+    assert r["result"] == f"not restored: the app kept no copy in its recycle bin. {why}"
+    assert action(env)[1].endswith(f"The old file did not come back: the app kept no copy in its recycle bin. {why}.")
+    if by in ("repair", "import"):
+        assert {x["stale"] for x in hook.kept_read()} == {why.split("because ")[1]}   # the subtitle follows its video
+
+
+def test_a_stale_extra_stays_out_and_its_video_comes_back(env, monkeypatch, tmp_path):
+    """A sidecar fix rewrote the subtitle after the grab. The video comes back, and the older subtitle stays out."""
+    old, srt, rb, k = kept_upgrade(env, monkeypatch, tmp_path)
+    hook.keep_original(srt)
+    open(srt, "w").write("retimed")
+    os.remove(old)
+    os.remove(srt)
+    monkeypatch.setenv("radarr_deletedrecyclebinpaths", "")
+    silent(env, monkeypatch, env["path"])
+    hook.main([])
+    (r,) = decided(env)["restore"]
+    assert (r["result"], r["kept"], r["extras"]) == ("restored", True, []) and os.path.exists(old) and not os.path.exists(srt)
+
+
+def test_the_import_claims_the_copy_of_a_grab_with_no_download_id(env, monkeypatch, tmp_path):
+    """A grab with no download id matches by the old path. The first import that replaces the path claims it. A second
+    import replaced the file the claim kept, so the claim goes stale. A grab of another download goes stale too. A
+    change by the hook after the import leaves a claim alone."""
+    keep_on(monkeypatch, tmp_path)
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "")
+    env["clock"][0] += 1
+    hook.keep_grab("radarr", 7, "d2")   # a later grab of the same file, in the next second
+    hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": "x1"})
+    hook.kept_replaced(env["path"])   # the hook repairs the new file of x1
+    assert sorted((r["download_id"], r.get("import"), r.get("stale")) for r in hook.kept_read()) == [
+        ("", "x1", None), ("d2", None, "another import replaced the file after the grab")]
+    assert hook.kept_copy("radarr", env["path"], "x1")[0]["download_id"] == ""
+    hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": ""})   # a manual import at the same path
+    assert [r.get("stale") for r in hook.kept_read() if r["download_id"] == ""] == ["another import replaced the file after the grab"]
+    assert hook.kept_copy("radarr", env["path"], "x1") == (None, "The hook's own copy is older, because another import replaced the file after "
+                                                              "the grab")
+
+
+def test_an_in_place_conversion_makes_the_own_copy_stale(env, monkeypatch, tmp_path):
+    """A .mkv that holds MP4 converts under its own name with no kept original. Its grab link goes stale."""
+    keep_on(monkeypatch, tmp_path)
+    mp4_named_mkv(env)
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d1")
+    assert hook.convert("radarr", env["path"], hook.mkvmerge(env["path"]), os.stat(env["path"]), True, {"app_id": 7})[0] == "repacked"
+    (r,) = hook.kept_read()
+    assert r["stale"] == "the hook changed the file after the grab" and open(r["kept"], "rb").read() == b"x" * 1000
+
+
+def test_a_season_pack_grab_links_each_file_once_with_its_extras(env, monkeypatch, tmp_path, capsys):
+    """Sonarr names the episodes of a grab by season and number. A two-episode file is linked once, an episode with no
+    file and a file of another episode give nothing. An extra is named like its video."""
+    root = keep_on(monkeypatch, tmp_path)
+    folder = tmp_path / "media" / "Show" / "Season 1"
+    folder.mkdir(parents=True)
+    e12, e4, e5 = (str(folder / n) for n in ("Show - s01e01-e02.mkv", "Show - s01e04.mkv", "Show - s01e05.mkv"))
+    for p in (e12, e4, e5, e12[:-4] + ".en.srt", e12[:-4] + "-thumb.jpg", e12[:-4] + " Proper.nfo"):
+        open(p, "w").write(p)
+    season = [{"id": 100 + n, "episodeNumber": n, "episodeFileId": f} for n, f in ((1, 201), (2, 201), (3, 0), (4, 204), (5, 205))]
+    api = {"episode?seriesId=5&seasonNumber=1": season,
+           "episode?episodeIds=101&episodeIds=102&episodeIds=103&episodeIds=104": [dict(e, seriesId=5) for e in season[:4]],
+           "episodefile/201": {"id": 201, "path": e12}, "episodefile/204": {"id": 204, "path": e4}}
+    monkeypatch.setattr(hook, "arr", lambda app, p: api[p])
+    for k in [k for k in os.environ if k.startswith("radarr_")]:
+        monkeypatch.delenv(k)
+    for k, v in (("sonarr_eventtype", "Grab"), ("sonarr_series_id", "5"), ("sonarr_release_seasonnumber", "1"),
+                 ("sonarr_release_episodenumbers", "1,2,3,4"), ("sonarr_download_id", "pack1")):
+        monkeypatch.setenv(k, v)
+    hook.main([])
+    assert capsys.readouterr().out == "arr-media-guard: Grab ok\n"
+    recs = hook.kept_read()
+    assert sorted((os.path.basename(r["old"]), os.path.basename(r.get("of") or "")) for r in recs) == [
+        ("Show - s01e01-e02-thumb.jpg", "Show - s01e01-e02.mkv"), ("Show - s01e01-e02.en.srt", "Show - s01e01-e02.mkv"),
+        ("Show - s01e01-e02.mkv", ""), ("Show - s01e04.mkv", "")]
+    (stamp,) = os.listdir(root)
+    for r in recs:
+        assert r["kept"] == os.path.join(root, stamp, "Show", "Season 1", os.path.basename(r["old"])) and r["download_id"] == "pack1"
+        assert os.stat(r["kept"]).st_ino == os.stat(r["old"]).st_ino == r["ino"]
+    (line,) = log_lines(env)
+    assert line["result"] == "kept_replaced" and len(line["kept"]) == 4 and "note" not in line
+
+
+def test_a_grab_of_an_item_with_no_file_keeps_nothing(env, monkeypatch, tmp_path, capsys):
+    root = keep_on(monkeypatch, tmp_path)
+    grabbed(env, monkeypatch)
+    monkeypatch.setenv("radarr_eventtype", "Grab")
+    hook.main([])
+    assert capsys.readouterr().out == "arr-media-guard: Grab ok\n"
+    assert not os.path.exists(root) and hook.kept_read() == [] and not os.path.exists(hook.CFG["LOG"])
+
+
+def test_a_refused_link_keeps_nothing_of_that_file_and_logs_one_line(env, monkeypatch, tmp_path):
+    """A hard link the file system refuses is never replaced by a copy, which could lose the race to the import."""
+    keep_on(monkeypatch, tmp_path)
+    open(env["path"][:-4] + ".en.srt", "w").write("x")
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    tries = []
+    monkeypatch.setattr(hook.os, "link", lambda a, b: tries.append(a) or (_ for _ in ()).throw(OSError(hook.errno.EXDEV, "Invalid cross-device link")))
+    assert hook.keep_grab("radarr", 7, "d1")["note"] == f"not kept: {env['path']}: Invalid cross-device link"
+    assert os.listdir(tmp_path / "media" / hook.RECYCLE_DIR) == []   # the empty stamp folder went
+    assert tries == [env["path"]] and hook.kept_read() == [] and [r["result"] for r in log_lines(env)] == ["not_kept_replaced"]
+
+
+def test_a_grab_the_api_fails_logs_and_still_answers_ok(env, monkeypatch, tmp_path, capsys):
+    keep_on(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "arr", lambda app, p: (_ for _ in ()).throw(urllib.error.URLError("refused")))
+    monkeypatch.setenv("radarr_eventtype", "Grab")
+    hook.main([])
+    assert capsys.readouterr().out == "arr-media-guard: Grab ok\n"
+    (line,) = log_lines(env)
+    assert (line["result"], line["note"]) == ("error", "the grab kept nothing: URLError: <urlopen error refused>")
+
+
+def test_a_grab_leaves_the_prune_to_the_audit_and_a_record_stays_while_its_link_does(env, monkeypatch, tmp_path):
+    """The app waits for its grab, so the grab never prunes the NAS. An old record whose link the prune has not removed
+    yet stays, and its link never blocks an edit. An old record whose link is gone goes."""
+    root = keep_on(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "prune_originals", lambda root: pytest.fail("the grab pruned"))
+    lib = tmp_path / "media" / "Film B (1980)"
+    lib.mkdir()
+    old, gone = str(lib / "Film B (1980).mkv"), os.path.join(root, "20000101T000000Z", "Film C (1981)", "c.mkv")
+    open(old, "w").write("b")
+    link = os.path.join(root, "20000101T000000Z", "Film B (1980)", "Film B (1980).mkv")
+    os.makedirs(os.path.dirname(link))
+    os.link(old, link)
+    hook.write_json(os.path.join(hook.CFG["STATE_DIR"], hook.KEPT), [
+        dict(app="radarr", old=old, kept=link, download_id="", time=env["clock"][0] - 8 * 86400, ino=os.stat(link).st_ino),
+        dict(app="radarr", old="/m/c.mkv", kept=gone, download_id="", time=env["clock"][0] - 8 * 86400, ino=1)])
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d1")
+    assert sorted(os.listdir(root)) == ["20000101T000000Z", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(env["clock"][0]))]
+    assert sorted(r["old"] for r in hook.kept_read()) == sorted([old, env["path"]])
+    assert hook.links(old, os.stat(old)) == 1
+
+
+@pytest.mark.parametrize("days", [7, 0])
+def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, tmp_path, capsys, days):
+    """With KEEP_ORIGINALS_DAYS set to 0 after use, the audit removes every grab link folder, so no link stays for ever.
+    It leaves the originals at 0, as every release before 1.7.0 did."""
+    root = keep_on(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "KEEP_DAYS", days)
+    stamps = ["20000101T000000Z", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(env["clock"][0] - 3600))]
+    for r in (root, str(tmp_path / "media" / hook.KEEP_DIR)):
+        for n in stamps:
+            os.makedirs(os.path.join(r, n))
+    env["movies"]["rootfolder"] = [{"path": str(tmp_path / "media")}]
+    open(hook.CFG["LOG"], "w").close()
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    left = [] if days == 0 else stamps[1:]
+    assert os.listdir(root) == left and sorted(os.listdir(tmp_path / "media" / hook.KEEP_DIR)) == (stamps if days == 0 else left)
+    assert f"removed {2 - len(left)} kept folders older than {days} days under {root}" in capsys.readouterr().out
+
+
+def show_mount(monkeypatch, tmp_path):
+    """A show on its own mount below the root folder tmp_path/media, as a dataset per show. Returns its folder and its
+    RECYCLE_DIR. The rest of tmp_path/media is one mount."""
+    show = tmp_path / "media" / "Show (2001)"
+    show.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(hook, "mount_top", lambda f: str(show if f == str(show) or f.startswith(str(show) + "/") else tmp_path / "media"))
+    return show, str(show / hook.RECYCLE_DIR)
+
+
+def test_the_audit_prunes_the_grab_links_of_a_mount_below_a_root_folder(env, monkeypatch, tmp_path):
+    """The root folders name only the top mount. A record names the show's own mount, so its links are pruned too."""
+    keep_on(monkeypatch, tmp_path)
+    show, root = show_mount(monkeypatch, tmp_path)
+    old = os.path.join(root, "20000101T000000Z", "Show (2001)", "e1.mkv")
+    os.makedirs(os.path.dirname(old))
+    open(old, "w").write("x")
+    hook.write_json(os.path.join(hook.CFG["STATE_DIR"], hook.KEPT), [dict(app="sonarr", old=str(show / "e1.mkv"), kept=old, download_id="",
+                                                                         time=env["clock"][0] - 8 * 86400, ino=os.stat(old).st_ino)])
+    env["movies"]["rootfolder"] = [{"path": str(tmp_path / "media")}]
+    open(hook.CFG["LOG"], "w").close()
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert os.listdir(root) == []
+
+
+def test_the_worker_prunes_the_grab_links_once_a_day(env, monkeypatch, tmp_path):
+    """A host with no nightly audit still prunes. The worker of an import does it at its start, once a day, off the
+    app's call path."""
+    keep_on(monkeypatch, tmp_path)
+    show, root = show_mount(monkeypatch, tmp_path)
+    old = os.path.join(root, "20000101T000000Z", "Show (2001)", "e1.mkv")
+    os.makedirs(os.path.dirname(old))
+    hook.write_json(os.path.join(hook.CFG["STATE_DIR"], hook.KEPT), [dict(app="sonarr", old=str(show / "e1.mkv"), kept=old, download_id="",
+                                                                         time=env["clock"][0] - 8 * 86400, ino=1)])
+    hook.main([])   # an import of Film A forks the worker
+    assert decided(env) and os.listdir(root) == []
+    os.makedirs(os.path.join(root, "20000102T000000Z"))
+    hook.main([])
+    assert os.listdir(root) == ["20000102T000000Z"]   # one prune a day
+    env["clock"][0] += 86400
+    hook.main([])
+    assert os.listdir(root) == []
+
+
+def test_a_bin_under_another_mount_top_of_one_file_system_is_another_volume(env, monkeypatch, tmp_path):
+    """Two bind mounts of one file system share st_dev, but a rename between them fails with EXDEV. The bin sits on
+    its own mount, so the old file stays in it, and the plain re-grab runs."""
+    old, rb = upgrade(env, monkeypatch, "Film A (1979) HDTV-720p.mkv")
+    silent(env, monkeypatch, env["path"])
+    real, mount = os.path.ismount, str(tmp_path / "media" / ".recycle")
+    monkeypatch.setattr(hook.os.path, "ismount", lambda p: p == mount or real(p))
+    assert os.stat(rb).st_dev == os.stat(os.path.dirname(old)).st_dev and hook.volume(rb) != hook.volume(old)
+    hook.main([])
+    (r,) = decided(env)["restore"]
+    assert r["result"] == "not restored: the recycle bin is on another volume, and a restore never copies" and os.path.exists(rb)
+
+
+def test_a_root_folder_named_through_a_symlink_shares_the_mount_top_of_its_target(monkeypatch, tmp_path):
+    """/tv points to /mnt/nas/tv, and the bin sits on /mnt/nas. A rename between them works, so they are one volume."""
+    nas = tmp_path / "nas"
+    (nas / "tv" / "Show A").mkdir(parents=True)
+    (nas / "recycle").mkdir()
+    os.symlink(nas / "tv", tmp_path / "tv")
+    real = os.path.ismount
+    monkeypatch.setattr(hook.os.path, "ismount", lambda p: p == str(nas) or real(p))
+    assert hook.volume(str(tmp_path / "tv" / "Show A" / "a.mkv")) == hook.volume(str(nas / "recycle" / "a.mkv"))
+
+
+def test_a_dry_line_never_prints_none_when_the_remux_planned_nothing(env):
+    """dry_remux() gives None when the run planned no remux. The track's line then says why it stays."""
+    rec = {"path": env["path"], "source": "backfill", "subremux": {"remove": ["s1"], "codes": [], "result": "subtitle remux failed: x"}}
+    (kind, text), = hook.sub_alerts(rec, {"s1": {"why": "the words differ"}}, ["s1"], dry=True)
+    assert "None" not in text and text.endswith("It stays in the file, because subtitle remux failed: x. --apply would turn its default and "
+                                                "forced flags off."), text
+
+
+def volume_root(monkeypatch, tmp_path, *blocked):
+    """A Docker volume at tmp_path/vol as the mount top, and the folders blocked that the hook may not write, as for a
+    uid that does not own them. A mode would not stop root. Returns the mount top."""
+    top = tmp_path / "vol"
+    top.mkdir(exist_ok=True)
+    monkeypatch.setattr(hook, "mount_top", lambda f: str(top))
+    real, no = os.access, {str(top / b) if b else str(top) for b in blocked}
+    monkeypatch.setattr(hook.os, "access", lambda p, mode, **k: False if str(p) in no and mode & os.W_OK else real(p, mode, **k))
+    return top
+
+
+def test_a_mount_top_the_hook_cannot_write_keeps_in_the_highest_writable_folder(env, monkeypatch, tmp_path):
+    """The tester's layout: the volume root only root may write, a writable folder below it. The original and the grab
+    link go there, on the file's mount, so each is a hard link of the file."""
+    top = volume_root(monkeypatch, tmp_path, "")
+    path = top / "Temp" / "Show" / "e1.mkv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x")
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    assert (hook.originals_root(str(path)), hook.replaced_root(str(path))) == (str(top / "Temp" / hook.KEEP_DIR), str(top / "Temp" / hook.RECYCLE_DIR))
+    assert hook.keepable(str(path), os.stat(path)) is None
+    kept = hook.keep_original(str(path))
+    assert kept.startswith(str(top / "Temp" / hook.KEEP_DIR) + "/") and kept.endswith("/Show/e1.mkv")
+    assert (os.stat(kept).st_ino, os.stat(kept).st_dev) == (os.stat(path).st_ino, os.stat(path).st_dev)
+    assert hook.kept_folders() == {str(top / "Temp" / hook.KEEP_DIR)}
+
+
+def test_a_folder_at_the_mount_top_wins_and_a_fallback_stays_where_it_is(env, monkeypatch, tmp_path):
+    """An existing writable folder at the mount top keeps every install where it is, even when the top itself is not
+    writable. A fallback folder that exists stays the choice when a higher folder becomes writable later."""
+    top = volume_root(monkeypatch, tmp_path, "", "TV")
+    path = top / "TV" / "Show" / "e1.mkv"
+    path.parent.mkdir(parents=True)
+    assert hook.originals_root(str(path)) == str(top / "TV" / "Show" / hook.KEEP_DIR)
+    os.mkdir(top / "TV" / "Show" / hook.KEEP_DIR)   # the first run made it
+    volume_root(monkeypatch, tmp_path, "")   # TV became writable
+    assert hook.originals_root(str(path)) == str(top / "TV" / "Show" / hook.KEEP_DIR)
+    os.mkdir(top / hook.KEEP_DIR)
+    assert hook.originals_root(str(path)) == str(top / hook.KEEP_DIR)
+
+
+def test_a_folder_on_another_mount_than_the_file_never_takes_the_keep(env, monkeypatch, tmp_path):
+    """data is on the local disk and writable, and data/tv is a symlink to a share. The mount top as written is the
+    local one, and a keep there would be a copy on the system disk. The folder goes on the share instead."""
+    local, nas = tmp_path / "local", tmp_path / "nas"
+    (local / "data").mkdir(parents=True)
+    (nas / "tv" / "Show").mkdir(parents=True)
+    os.symlink(nas / "tv", local / "data" / "tv")
+    real = os.path.ismount
+    monkeypatch.setattr(hook.os.path, "ismount", lambda p: str(p) in (str(local), str(nas)) or real(p))
+    path = local / "data" / "tv" / "Show" / "e1.mkv"
+    assert hook.mount_top(os.path.dirname(path)) == str(local)
+    assert hook.originals_root(str(path)) == str(local / "data" / "tv" / hook.KEEP_DIR)
+    assert hook.replaced_root(str(path)) == str(local / "data" / "tv" / hook.RECYCLE_DIR)
+
+
+def test_the_folder_record_never_loses_a_folder(env, monkeypatch, tmp_path):
+    """A folder that is missing for a while, as on a NAS that is down, stays in the record. A record that does not parse
+    stays as it is, and the hook logs one line."""
+    a, b = tmp_path / "a" / hook.KEEP_DIR, tmp_path / "b" / hook.KEEP_DIR
+    a.mkdir(parents=True)
+    hook.remember_folder(str(a))
+    a.rmdir()
+    hook.remember_folder(str(b))
+    assert hook.kept_folders() == {str(a), str(b)}
+    record = os.path.join(hook.CFG["STATE_DIR"], hook.FOLDERS)
+    open(record, "w").write('["/x/.arr-media-guard-originals", ')
+    hook.remember_folder(str(tmp_path / "c" / hook.KEEP_DIR))
+    assert open(record).read() == '["/x/.arr-media-guard-originals", '
+    (line,) = log_lines(env)
+    assert line["result"] == "warning" and line["note"].startswith("the hook could not record the folder: JSONDecodeError")
+
+
+def test_with_no_writable_folder_the_reason_names_the_mount_top(env, monkeypatch, tmp_path):
+    top = volume_root(monkeypatch, tmp_path, "", "TV", "TV/Show")
+    path = top / "TV" / "Show" / "e1.mkv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x")
+    assert hook.originals_root(str(path)) == str(top / hook.KEEP_DIR)
+    assert hook.keepable(str(path), os.stat(path)) == f"{top} is not writable"
+
+
+def test_the_prunes_reach_a_fallback_folder_below_a_root_folder(env, monkeypatch, tmp_path, capsys):
+    """The root folder and the mount top are not writable, so both folders sit in the show's folder. The audit finds
+    neither from the root folders, so FOLDERS names them. Each prune clears only a folder of the two names."""
+    top = volume_root(monkeypatch, tmp_path, "", "TV")
+    monkeypatch.setattr(hook, "KEEP_REPLACED", True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    show = top / "TV" / "Show"
+    show.mkdir(parents=True)
+    path = show / "e1.mkv"
+    path.write_bytes(b"x")
+    hook.keep_original(str(path))
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": str(path)}
+    hook.keep_grab("radarr", 7, "d1")
+    other = tmp_path / "other"
+    (other / "20000101T000000Z").mkdir(parents=True)
+    hook.write_json(os.path.join(hook.CFG["STATE_DIR"], hook.FOLDERS), sorted(hook.kept_folders() | {str(other)}))
+    folders = [str(show / hook.KEEP_DIR), str(show / hook.RECYCLE_DIR)]
+    assert hook.kept_folders() == {*folders, str(other)}
+    for f in folders:
+        os.mkdir(os.path.join(f, "20000101T000000Z"))
+    env["movies"]["rootfolder"] = [{"path": str(top / "TV")}]
+    open(hook.CFG["LOG"], "w").close()
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert all("20000101T000000Z" not in os.listdir(f) and len(os.listdir(f)) == 1 for f in folders)
+    assert os.listdir(other) == ["20000101T000000Z"]   # never a folder of another name
+    os.mkdir(os.path.join(folders[0], "20000102T000000Z"))
+    hook.prune_kept()   # the worker's daily prune reaches it too
+    assert "20000102T000000Z" not in os.listdir(folders[0]) and os.listdir(other) == ["20000101T000000Z"]
+
+
+def test_a_restore_makes_a_later_grab_link_of_its_path_stale(env, monkeypatch, tmp_path):
+    """An RSS grab linked the broken upgrade before the hook found it broken. The re-grab puts the old file back over
+    that path, so the later grab's link holds the deleted broken file. It must never come back."""
+    keep_on(monkeypatch, tmp_path)
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d2")   # links the broken file
+    rb = str(tmp_path / "bin.mkv")
+    open(rb, "wb").write(b"old" * 300)
+    os.remove(env["path"])   # the app's delete of the broken file
+    plan = {"back": [(env["path"], rb, hook.bin_sig(rb))], "not": [], "owner": 7, "label": "x", "want": None, "checks": {}, "extras": {},
+            "new": env["path"], "kept": {}}
+    assert hook.restore("radarr", {}, {11: plan})[0]["result"] == "restored"
+    hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": "d2"})   # d2's import replaces the old file
+    assert hook.kept_copy("radarr", env["path"], "d2") == (None, "The hook's own copy is older, because the hook changed the file after the grab")
+
+
+def test_a_renamed_file_still_finds_the_hooks_own_link(env, monkeypatch, tmp_path):
+    """The app renamed the file after a grab that never imported. The link still counts as the hook's own."""
+    keep_on(monkeypatch, tmp_path)
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d1")
+    new = env["path"][:-4] + " Proper.mkv"
+    os.rename(env["path"], new)
+    assert hook.links(new, os.stat(new)) == 1
+    os.link(new, tmp_path / "client-copy.mkv")
+    assert hook.links(new, os.stat(new)) == 2   # a download client's copy still counts
+
+
+def test_an_error_after_the_first_link_removes_the_links_of_the_grab(env, monkeypatch, tmp_path):
+    """No link may stay without its record, or it would count as a download client's copy."""
+    root = keep_on(monkeypatch, tmp_path)
+    open(env["path"][:-4] + ".en.srt", "w").write("x")
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    monkeypatch.setattr(hook, "write_json", lambda path, data: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    with pytest.raises(OSError):
+        hook.keep_grab("radarr", 7, "d1")
+    assert os.listdir(root) == [] and os.stat(env["path"]).st_nlink == 1
+
+
+@pytest.mark.parametrize("age, kept", [(7 * 86400 - 1800, False), (7 * 86400 - 7200, True)])
+def test_a_copy_near_its_prune_stays_out_of_a_plan(env, monkeypatch, tmp_path, age, kept):
+    """The nightly prune could remove the copy after the app deleted the broken file. So a copy within an hour of
+    KEEP_ORIGINALS_DAYS stays out."""
+    keep_on(monkeypatch, tmp_path)
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": env["path"]}
+    hook.keep_grab("radarr", 7, "d1")
+    hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": "d1"})
+    env["clock"][0] += age
+    rec, why = hook.kept_copy("radarr", env["path"], "d1")
+    assert bool(rec) == kept and why == (None if kept else "The hook's own copy is too close to its prune at KEEP_ORIGINALS_DAYS")
+
+
+def test_a_file_the_api_lists_and_that_is_not_on_disk_logs_one_line(env, monkeypatch, tmp_path):
+    """The import won the race to the grab."""
+    keep_on(monkeypatch, tmp_path)
+    gone = env["path"][:-4] + " HDTV-720p.mkv"
+    env["movies"]["movie/7"]["movieFile"] = {"id": 11, "path": gone}
+    assert hook.keep_grab("radarr", 7, "d1")["note"] == f"not kept: {gone}: the file is not on disk"
+    assert hook.kept_read() == [] and [r["result"] for r in log_lines(env)] == ["not_kept_replaced"]
+
+
+def test_an_anime_batch_across_a_season_matches_the_absolute_numbers(env, monkeypatch, tmp_path):
+    """Sonarr maps an anime batch 12-14 to S01E12, S02E01 and S02E02, and sends season 1 with numbers 12,1,2."""
+    root = keep_on(monkeypatch, tmp_path)
+    folder = tmp_path / "media" / "Show"
+    folder.mkdir()
+    paths = {(s, e): str(folder / f"Show - s{s:02d}e{e:02d}.mkv") for s, e in ((1, 1), (1, 2), (1, 12), (2, 1), (2, 2))}
+    for p in paths.values():
+        open(p, "w").write(p)
+    eps = [{"id": 100 * s + e, "seasonNumber": s, "episodeNumber": e, "absoluteEpisodeNumber": 11 * (s - 1) + e + (1 if s == 2 else 0),
+            "episodeFileId": 1000 + 100 * s + e, "seriesId": 5} for s, e in paths]
+    assert [e["absoluteEpisodeNumber"] for e in eps] == [1, 2, 12, 13, 14]
+    api = {"episode?seriesId=5": eps, "episode?episodeIds=112&episodeIds=201&episodeIds=202": [e for e in eps if e["id"] in (112, 201, 202)],
+           **{f"episodefile/{e['episodeFileId']}": {"path": paths[e["seasonNumber"], e["episodeNumber"]]} for e in eps}}
+    monkeypatch.setattr(hook, "arr", lambda app, p: api[p])
+    for k in [k for k in os.environ if k.startswith("radarr_")]:
+        monkeypatch.delenv(k)
+    for k, v in (("sonarr_eventtype", "Grab"), ("sonarr_series_id", "5"), ("sonarr_series_type", "Anime"), ("sonarr_release_seasonnumber", "1"),
+                 ("sonarr_release_episodenumbers", "12,1,2"), ("sonarr_release_absoluteepisodenumbers", "12,13,14"), ("sonarr_download_id", "b1")):
+        monkeypatch.setenv(k, v)
+    hook.main([])
+    assert sorted(os.path.basename(r["old"]) for r in hook.kept_read()) == ["Show - s01e12.mkv", "Show - s02e01.mkv", "Show - s02e02.mkv"]
 
 
 # --- the conversion into Matroska (docs/design.md, "Conversion") -----------------------------------------
@@ -6567,12 +7300,16 @@ def test_plex_flush_sends_one_gated_scan_per_section(env, monkeypatch, tmp_path)
     assert open(listing).read().splitlines() == ["/elsewhere/Show C"]
 
 
-def test_plex_flush_maps_the_listed_folders_to_the_apps_paths(env, monkeypatch, tmp_path):
-    """The list holds local paths, and Plex holds the apps' paths. The folder job holds a local path too, so the scan maps
-    it back once. The second pair makes the app root a local prefix as well, which a second mapping would turn wrong."""
+@pytest.mark.parametrize("own", [False, True])
+def test_plex_flush_maps_the_listed_folders_to_the_plex_paths(env, monkeypatch, tmp_path, own):
+    """The list holds local paths. The folder job holds a local path too, so the scan maps it to Plex's path once. The
+    second pair makes the Plex root a local prefix as well, which a second mapping would turn wrong. Plex takes
+    PLEX_PATH_MAP, else PATH_MAP. A Sonarr map that differs never reaches Plex."""
     sent = refreshes(env, monkeypatch)
-    root = str(tmp_path / "media")   # where Plex and the app see the files
-    monkeypatch.setattr(hook, "PATH_MAP", [(root, "/local/media"), ("/elsewhere", root)])
+    root = str(tmp_path / "media")   # where Plex sees the files
+    pairs = [(root, "/local/media"), ("/elsewhere", root)]
+    monkeypatch.setattr(hook, "PATH_MAP", [] if own else pairs)
+    monkeypatch.setattr(hook, "MAPS", {"plex": pairs, "sonarr": [("/tv", "/local/media")]} if own else {})
     listing = os.path.join(hook.CFG["STATE_DIR"], "plex-later-sonarr.txt")
     with open(listing, "w") as f:
         f.write("/local/media/Show A/Season 1\n")
@@ -8052,7 +8789,10 @@ def test_a_backfill_checks_subtitles_only_with_sub_check(env, monkeypatch, capsy
     hook.main(["--backfill", "radarr", "--sub-check"])
     out = capsys.readouterr().out
     assert len(env["words"]) == 1 and got == [(False, got[0][1], [])] and env["mkvpropedit"] == [] and env["repacks"] == []
-    assert "s1 match" in out and "fix +2.00 s 1/1" in out and "s2 mismatch" in out and "would remux subtitles" in out, out
+    assert "s1 match" in out and "fix +2.00 s 1/1" in out and "s2 mismatch" in out and "| --apply would remux" in out, out
+    # KEEP_ORIGINALS_DAYS 0 keeps the track in the file. The dry run says that --apply turns its flags off, and the log keeps the import text.
+    assert ("The track would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set KEEP_ORIGINALS_DAYS "
+            "above 0 to remove it. --apply would turn its default and forced flags off.") in out and "It loses its default and forced flags." in log_lines(env)[-1]["alerts"][0], out
     assert "subtitle check: 1 files checked, 1 tracks match, 1 do not, 0 unknown, 1 timing fixes, 12 CPU seconds" in out, out
     hook.main(["--backfill", "radarr", "--sub-check"])
     assert len(env["words"]) == 2
@@ -9386,8 +10126,8 @@ def test_sub_time_times_the_tracks_the_word_check_cannot_read(env, monkeypatch, 
     assert rec["alert_kinds"] == ["subtiming"] and "Subtitle track s2, s3 needs new times, but would remux subtitles" in rec["alerts"][0], rec
     assert "s4" not in rec["alerts"][0] and not [u for m, u, b in env["http"] if "discord" in u]   # a weak fit alerts nothing, and nothing posts
     lines = out.splitlines()
-    assert any(x.startswith("  s2 | ") and " | fre | full | reference s1 | fit 1.00 | +2.00 s 1/1 | would remux" in x for x in lines), out
-    assert any(x.startswith("  s3 | ") and " | spa | full | reference s1 | fit 1.00 | +2.00 s 1/1 | would remux" in x for x in lines), out
+    assert any(x.startswith("  s2 | ") and " | fre | full | reference s1 | fit 1.00 | +2.00 s 1/1 | --apply would remux" in x for x in lines), out
+    assert any(x.startswith("  s3 | ") and " | spa | full | reference s1 | fit 1.00 | +2.00 s 1/1 | --apply would remux" in x for x in lines), out
     assert any(x.startswith("  s4 | ") and "| weak " in x and "| report only |" in x for x in lines), out
     assert any(x.startswith("  s1 | ") and "| words, a reference: in time | match | in time | none |" in x for x in lines), out
 
@@ -9546,6 +10286,212 @@ def test_sub_time_never_applies_when_a_lookup_fails(env, monkeypatch, capsys, fa
     assert seen == [] and "--sub-time --apply stops, and nothing changed: the radarr lookup failed" in str(ex.value), ex.value
     hook.main(["--sub-time", env["path"]])
     assert seen == [env["path"]] and f"no app could be asked, so this dry run knows no original language: {env['path']}" in capsys.readouterr().out
+
+
+REAL_ARR, REAL_RESUB = hook.arr, hook.resub   # the env fixture fakes the app API, and the subtitle tests fake the remux
+
+
+def env_values(*names):
+    """The KEY='value' lines of the env files names, the last one winning, as the image's first start writes them."""
+    out = {}
+    for n in names:
+        for line in open(os.path.join(FILES, n)):
+            k, sep, v = line.strip().partition("=")
+            if sep and not k.startswith("#"):
+                out[k] = v.strip("'\"")
+    return out
+
+
+def nothing_set(monkeypatch, tmp_path, urls=None):
+    """No app is set up: no API key and no config.xml. urls holds the <APP>_URL values, empty by default."""
+    for app in hook.APPS:
+        for k, v in (("DIR", str(tmp_path / "no-app")), ("API_KEY", ""), ("URL", "")):
+            monkeypatch.setitem(hook.CFG, f"{app.upper()}_{k}", v)
+    for k, v in (urls or {}).items():
+        monkeypatch.setitem(hook.CFG, k, v)
+    monkeypatch.setattr(hook, "arr", REAL_ARR)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+
+
+def not_writable(monkeypatch, folder):
+    """keepable() finds folder not writable, as for a uid that does not own it. A mode would not stop root."""
+    real = os.access
+    monkeypatch.setattr(hook.os, "access", lambda p, mode, **k: False if str(p) == str(folder) and mode == os.W_OK else real(p, mode, **k))
+
+
+def test_the_env_files_ship_only_the_urls_that_set_up_no_app():
+    urls = {k: v for n in ("examples/arr-media-guard.env", "docker/arr-media-guard.env") for k, v in env_values(n).items() if k in ("RADARR_URL", "SONARR_URL")}
+    assert urls and all(v in hook.SHIPPED_URLS[k[:-4].lower()] for k, v in urls.items()), urls
+
+
+@pytest.mark.parametrize("setup", ["none", "image", "host one app", "url of its own"])
+def test_sub_time_says_nothing_of_an_app_the_user_did_not_set_up(env, monkeypatch, capsys, tmp_path, setup):
+    """An app with no API key and no config.xml, and no URL or a URL as the env files ship it, is not set up. It stays
+    silent, and with no app set up one line says so for every path. The image writes both env files, so a one-off
+    container has both URLs. A host that runs Radarr only asks Radarr. A URL of the user's own with no key is a setup in
+    part: it fails as a lookup does, and --apply stops."""
+    other = tmp_path / "loose.mkv"
+    shutil.copy(env["path"], other)
+    urls = {"none": {}, "image": env_values("examples/arr-media-guard.env", "docker/arr-media-guard.env"),
+            "host one app": env_values("examples/arr-media-guard.env"), "url of its own": {"RADARR_URL": "http://media-box:7878"}}[setup]
+    nothing_set(monkeypatch, tmp_path, {k: v for k, v in urls.items() if k in ("RADARR_URL", "SONARR_URL")})
+    if setup == "host one app":
+        (tmp_path / "radarr").mkdir()
+        (tmp_path / "radarr" / "config.xml").write_text("<Config><ApiKey>k3y</ApiKey></Config>")
+        monkeypatch.setitem(hook.CFG, "RADARR_DIR", str(tmp_path / "radarr"))   # Radarr lists no movie, see the env fixture's Plex-only http
+    seen = []
+    monkeypatch.setattr(hook, "process", lambda app, path, *a, **k: seen.append((app, path)) or {"result": "no change", "path": path, "label": "x"})
+    hook.main(["--sub-time", env["path"], str(other)])
+    out = capsys.readouterr().out.splitlines()
+    assert seen == [(None, env["path"]), (None, str(other))] and not [x for x in out if "sonarr" in x.lower() and setup != "none" and "set up, so" not in x], out
+    if setup in ("none", "image"):
+        assert out[0] == ("no Sonarr or Radarr is set up, so this run knows no original language. Set SONARR_URL and SONARR_API_KEY, or "
+                          "RADARR_URL and RADARR_API_KEY, so an app can name the original language.") \
+            and not [x for x in out if "knows no original language:" in x or "API key" in x], out
+    elif setup == "host one app":
+        assert out[:2] == [f"no app lists it, so it knows no original language: {p}" for p in (env["path"], other)], out
+    else:
+        failed = (f"RADARR_URL is set, but the Radarr API key does not read: [Errno 2] No such file or directory: "
+                  f"'{tmp_path / 'no-app' / 'config.xml'}'. Set RADARR_API_KEY.")
+        assert out[:3] == [failed] + [f"no app could be asked, so this dry run knows no original language: {p}" for p in (env["path"], other)], out
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--sub-time", env["path"], "--apply"])
+        assert str(ex.value) == f"--sub-time --apply stops, and nothing changed: {failed}" and len(seen) == 2, ex.value
+
+
+@pytest.mark.parametrize("argv", [["--backfill", "radarr"], ["--backfill", "sonarr", "--sub-check"], ["--backfill", "radarr", "--check-video"]])
+def test_a_backfill_of_an_app_that_is_not_set_stops_with_one_line(env, monkeypatch, tmp_path, argv):
+    nothing_set(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as ex:
+        hook.main(argv)
+    assert str(ex.value) == f"{argv[1].capitalize()} is not set up. Set {argv[1].upper()}_URL and {argv[1].upper()}_API_KEY.", ex.value
+
+
+def test_the_audit_of_an_app_that_is_not_set_says_it_prunes_nothing(env, monkeypatch, capsys, tmp_path):
+    nothing_set(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    out = capsys.readouterr().out
+    assert out.startswith("Radarr is not set up, so the audit prunes no kept folder under its root folders.\n") and "not pruned" not in out, out
+
+
+@pytest.mark.parametrize("case", ["writable", "no keep folder", "keep folder", "size cap", "low space", "no room"])
+def test_a_dry_run_says_what_apply_would_do_with_the_remux(env, monkeypatch, capsys, tmp_path, case):
+    """A one-shot dry run with no app set on a file whose cues flash. --apply would remux the file, or skip the remux
+    for a reason the dry run names with what to fix. Without the keep folder, creating it is enough. The dry run never
+    says "The file stays as it was", because it changes no file. A --sub-check backfill prints the same. The decision
+    log keeps the alert of an import, and --apply prints it."""
+    flash_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    keep = tmp_path / ".kept"
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(keep))
+    monkeypatch.setattr(hook.os, "getuid", lambda: 80)   # PUID and PGID, as the tester ran it
+    monkeypatch.setattr(hook.os, "getgid", lambda: 81)
+    if case == "keep folder":
+        keep.mkdir()
+    if case in ("no keep folder", "keep folder"):
+        not_writable(monkeypatch, keep if case == "keep folder" else tmp_path)
+    if case == "size cap":
+        monkeypatch.setattr(hook, "REPACK_MAX", 999)
+    if case == "low space":
+        monkeypatch.setattr(hook.os, "statvfs", lambda p: types.SimpleNamespace(f_bavail=1, f_frsize=1000))
+    if case == "no room":   # a keep folder on another file system, with no room for a copy
+        monkeypatch.setattr(hook, "keepable", lambda p, st: f"{tmp_path} is on another file system with 0.1 GB free, too little for a copy of 0.0 GB")
+    fake_arr = hook.arr
+    nothing_set(monkeypatch, tmp_path)
+    hook.main(["--sub-time", env["path"]])
+    out, rec = capsys.readouterr().out, decided(env)
+    skip = "--apply would skip the remux, because "
+    said = {"writable": "--apply would remux the file.",
+            "no keep folder": f"{skip}uid 80 and gid 81 cannot create {keep}, where it keeps the original. Create {keep}, writable for uid 80 and gid 81.",
+            "keep folder": f"{skip}uid 80 and gid 81 cannot write to {keep}, where it keeps the original. Make {keep} writable for them.",
+            "size cap": f"{skip}the file is over the 0 GB repack cap. Raise REPACK_MAX_GB to remux it.",
+            "low space": f"{skip}{os.path.dirname(env['path'])} has 0.0 GB free, and the remux needs 0.0 GB there. Free space in "
+                         f"{os.path.dirname(env['path'])}.",
+            "no room": f"{skip}it cannot keep the original. {tmp_path} is on another file system with 0.1 GB free, too little for a copy of 0.0 GB."}[case]
+    said += " In Docker, PUID and PGID set them." if "keep folder" in case else ""
+    result = {"writable": "would remux subtitles", "no keep folder": f"subtitle remux skipped, the original cannot be kept: {tmp_path} is not writable",
+              "keep folder": f"subtitle remux skipped, the original cannot be kept: {keep} is not writable",
+              "size cap": "subtitle remux skipped, over the 0 GB repack cap", "low space": "subtitle remux skipped, low space: 0.0 GB free for 0.0 GB",
+              "no room": f"subtitle remux skipped, the original cannot be kept: {tmp_path} is on another file system with 0.1 GB free, too "
+                         "little for a copy of 0.0 GB"}[case]
+    logged = f"subtiming: Subtitle track s1 needs new times, but {result}: track 2: new ends for 40 of 40 cues. The file stays as it was."
+    act = "--apply would remux" if case == "writable" else "--apply would skip the remux"
+    assert f"  ALERT subtiming: Subtitle track s1 needs new times. {said}\n" in out + "\n" and "stays as it was" not in out, out
+    assert f"| 40 of 40 ends lengthened | {act} | first " in out, out
+    assert not rec["apply"] and rec["alerts"] == [logged], rec["alerts"]
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    out = capsys.readouterr().out
+    assert f" | ALERT subtiming: Subtitle track s1 needs new times. {said}\n" in out and f"lengthened | {act} | ALERT" in out, out
+    if case != "writable":
+        nothing_set(monkeypatch, tmp_path)
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--sub-time", env["path"], "--apply"])
+        assert ex.value.code == hook.SUB_TIME_MISSED and f"  ALERT {logged}\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", ["hardlinked", "no keep folder", "KEEP_ORIGINALS_DAYS 0"])
+def test_a_dry_run_says_what_apply_would_do_with_a_track_that_does_not_match(env, monkeypatch, capsys, tmp_path, case):
+    """The English subtitle, flagged default, holds another film's lines. The remux would remove it, through the real
+    resub(). A hardlinked file stays as it is under --apply, flags included. Without a writable keep folder the track
+    would stay and lose its flags. With KEEP_ORIGINALS_DAYS 0 no removal is planned, and --apply turns the flags off.
+    The decision log and --apply keep the texts of sub_alerts()."""
+    why = "the heard words match the cues at 10%, 12%"
+    sub_time_film(env, monkeypatch, [("eng", True, {})], {"s1": REF}, sync={"s1": dict(IN_TIME, verdict="mismatch", why=why)})
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    keep = tmp_path / ".kept"
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(keep))
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0 if case == "KEEP_ORIGINALS_DAYS 0" else 7)
+    monkeypatch.setattr(hook.os, "getuid", lambda: 80)
+    monkeypatch.setattr(hook.os, "getgid", lambda: 81)
+    if case == "hardlinked":
+        os.link(env["path"], tmp_path / "seed.mkv")   # the download client's copy
+    if case == "no keep folder":
+        not_writable(monkeypatch, tmp_path)
+    nothing_set(monkeypatch, tmp_path)
+    hook.main(["--sub-time", env["path"]])
+    out, rec = capsys.readouterr().out, decided(env)
+    head = f"submatch: Subtitle track s1 does not match the audio, {why}."
+    said = {"hardlinked": "--apply would leave the file as it is, because it has another hard link, such as the download client's copy. Run "
+                          "--apply again after the other link is gone, for example after the download client removes its copy.",
+            "no keep folder": (f"--apply would skip the remux, because uid 80 and gid 81 cannot create {keep}, where it keeps the original. "
+                               f"Create {keep}, writable for uid 80 and gid 81. In Docker, PUID and PGID set them. The track would stay in "
+                               "the file. --apply would turn its default and forced flags off."),
+            "KEEP_ORIGINALS_DAYS 0": ("The track would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. "
+                                      "Set KEEP_ORIGINALS_DAYS above 0 to remove it. --apply would turn its default and forced flags off.")}[case]
+    because = {"hardlinked": "subtitle remux skipped, hardlinked: remove track 2",
+               "no keep folder": f"subtitle remux skipped, the original cannot be kept: {tmp_path} is not writable: remove track 2",
+               "KEEP_ORIGINALS_DAYS 0": "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"}[case]
+    logged = f"{head} It stays in the file, because {because}. It loses its default and forced flags."
+    assert f"  ALERT {head} {said}\n" in out + "\n" and rec["alerts"] == [logged], (out, rec["alerts"])
+    assert rec["result"] == ("hardlinked, not edited" if case == "hardlinked" else "dry run"), rec["result"]
+    nothing_set(monkeypatch, tmp_path)
+    if case == "KEEP_ORIGINALS_DAYS 0":   # the flag edit is the whole change, and it happens
+        hook.main(["--sub-time", env["path"], "--apply"])
+    else:
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--sub-time", env["path"], "--apply"])
+        assert ex.value.code == hook.SUB_TIME_MISSED
+    assert f"  ALERT {logged}\n" in capsys.readouterr().out + "\n"
+
+
+def test_an_import_keeps_its_alert_when_the_original_cannot_be_kept(env, monkeypatch, tmp_path):
+    """The import path builds the same alert as a dry run, and only a one-shot dry run prints it another way. The alert
+    an import logs and posts keeps its text."""
+    flash_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    not_writable(monkeypatch, tmp_path)
+    hook.main([])
+    rec = decided(env)
+    text = (f"Subtitle track s1 needs new times, but subtitle remux skipped, the original cannot be kept: {tmp_path} is not writable: "
+            "track 2: new ends for 40 of 40 cues. The file stays as it was.")
+    assert rec["apply"] and rec["alerts"] == [f"subtiming: {text}"] and hook.dry_alerts(rec) == rec["alerts"], rec["alerts"]
+    assert [b for m, u, b in env["http"] if "discord" in u and text in json.dumps(b)], env["http"]
 
 
 def test_the_sweep_alerts_on_a_part_off_the_fitted_line(env, monkeypatch):

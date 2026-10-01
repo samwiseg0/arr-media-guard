@@ -84,6 +84,8 @@ def scrub(h, text):
 def creds(h, app):
     """SABnzbd and NZBHydra2 URLs and keys from the app's own database, read-only. The API masks both keys."""
     path = os.path.join(h.app_dir(app), f"{app}.db")
+    if not os.path.isfile(path):   # SQLite gives only "unable to open database file"
+        sys.exit(f"{path} does not read. Set {app.upper()}_DIR to {app.capitalize()}'s folder.")
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         sab = next((json.loads(s) for i, s in db.execute("select Implementation, Settings from DownloadClients") if i == "Sabnzbd"), None)
