@@ -83,7 +83,7 @@ def scrub(h, text):
 
 def creds(h, app):
     """SABnzbd and NZBHydra2 URLs and keys from the app's own database, read-only. The API masks both keys."""
-    path = h.CFG.get(app.upper() + "_DB") or f"/var/lib/{app}/{app}.db"
+    path = os.path.join(h.app_dir(app), f"{app}.db")
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         sab = next((json.loads(s) for i, s in db.execute("select Implementation, Settings from DownloadClients") if i == "Sabnzbd"), None)

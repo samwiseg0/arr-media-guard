@@ -430,7 +430,7 @@ def test_creds_come_from_the_apps_database(env, tmp_path, monkeypatch):
     db.execute("insert into DownloadClients values ('SABnzbd', 'Sabnzbd', ?)", (json.dumps({"host": "sab.x", "port": 443, "useSsl": True, "apiKey": "S"}),))
     db.execute("insert into Indexers values ('NZB', 'Newznab', ?)", (json.dumps({"baseUrl": "https://search.x/", "apiPath": "/api", "apiKey": "H"}),))
     db.commit()
-    monkeypatch.setitem(hook.CFG, "RADARR_DB", str(tmp_path / "radarr.db"))
+    monkeypatch.setitem(hook.CFG, "RADARR_DIR", str(tmp_path))   # radarr.db in RADARR_DIR
     assert REAL_CREDS(hook, "radarr") == {"sab": "https://sab.x:443/api", "sab_key": "S", "hydra": "https://search.x/api", "hydra_key": "H"}
 
 

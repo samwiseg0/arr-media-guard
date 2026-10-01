@@ -29,6 +29,7 @@
   arr-media-guard --audit <radarr|sonarr> (--plan-from FILE | --since 24h|DATE) [--source hook|backfill] [--post]
   arr-media-guard --sub-time PATH [PATH ...] [--apply]
   arr-media-guard --subhunt radarr --ids ID [ID ...] [--apply] [--force]
+  arr-media-guard --serve                   the Webhook listener for Sonarr and Radarr in Docker, see arr_serve.py
   arr-media-guard --selftest
 
 Hook mode reads the app's radarr_* or sonarr_* variables. It answers Test at once. On a Download
@@ -59,19 +60,20 @@ When the decision abstains on the audio language, or finds none it can use, arr_
 whose language is not certain. Its answer enters the decision. After the edit, arr_meta.py checks the file against
 TMDB and its own duration sources. The language and runtime alerts trust those checks. When the evidence adds up to
 a re-grab, the worker re-grabs the download the way it does for broken audio. Its second check hears the audio and
-asks TMDB again, past both caches. That needs WRONG_CONTENT_REGRAB in the env file. Until then it logs and posts
-"would re-grab" and deletes nothing. The outcome names what happened: would_regrab only when every guard passed.
+asks TMDB again, past both caches. That needs content in REGRAB, the env file's list of re-grab kinds. Until then it
+logs and posts "would re-grab" and deletes nothing. The outcome names what happened: would_regrab only when every guard passed.
 status.json records the TMDB and policy checks for Zabbix.
 
 Each text subtitle and .srt sidecar in the language of a main audio track is checked against the audio, see
 docs/design.md, "Subtitle match". arr_lid.py hears two short windows, and arr_subsync.py compares the words with the
 cues. A track that does not match leaves the file in a remux that the packet proof checks, or loses its flags when the
-remux fails. A sidecar that does not match moves to KEEP_DIR, or stays out of a conversion. A subtitle off by an offset
-or a frame-rate ratio gets new times, and a text subtitle whose cues flash gets ends a viewer can read. The check runs
-on imports, and a backfill runs it only with --sub-check.
+remux fails. A sidecar that does not match moves to .<NAME>-originals, or stays out of a conversion. A subtitle off by
+an offset or a frame-rate ratio gets new times, and a text subtitle whose cues flash gets ends a viewer can read. The
+check runs on imports, and a backfill runs it only with --sub-check. SUBTITLES in the env file sets what an import
+does: off, check (it reads, reports and alerts, and changes nothing), fix (the default) or deep.
 
 An import also times every other subtitle, other languages and PGS or VobSub pictures, against a subtitle whose words
-matched, as far as its time limit allows. With SUB_DEEP_ANALYSIS on, it then queues a deep analysis of the file, which
+matched, as far as its time limit allows. With SUBTITLES deep, it then queues a deep analysis of the file, which
 the worker runs while no import waits: a read of the whole file for subtitle tracks the Cues do not index, one heard
 window a minute, and the timing the import could not do. --sub-time runs all of it on the files it names, past the cache.
 
@@ -81,13 +83,14 @@ skips the flag edit. When the app grabbed the file, the worker deletes it, re-mo
 marks the grab failed, so the app blocklists the post and searches again. A download is one unit:
 the worker samples every file it imported, deletes each broken one, re-monitors their items, then
 marks the grab failed once. Clean files stay. At most 30 re-grabs per app in 24 hours (REGRAB_CAP in
-the env file), after that it alerts only. A fault in one or two samples alerts only.
+the env file), after that it alerts only. Every kind of re-grab counts against it. A fault in one or two
+samples alerts only.
 
 When the audio is not certainly broken, the worker checks the video in three stages. Each runs only when the
 earlier ones found nothing certain. The first compares the Matroska Segment size with the file size. The second reads
 64 KiB at 256 places and looks for zero-filled pages. The third decodes three 5-second windows of the main video
-stream at the audio sample positions. A certain fault skips the edit and re-grabs the download the same way, with its
-own cap of 30 a day (VIDEO_REGRAB_CAP). Its second check samples other parts of the file. A stage the job's time
+stream at the audio sample positions. A certain fault skips the edit and re-grabs the download the same way, under
+the same REGRAB_CAP. Its second check samples other parts of the file. A stage the job's time
 limit cannot hold is skipped and logged, and an error in the check is no verdict. See docs/design.md, "Corrupt video".
 
 An upgrade's old file waits in the app's recycle bin. When it passes the same audio and video checks, a re-grab of the
@@ -139,9 +142,14 @@ import arr_subsync  # noqa: E402
 ENV_FILE = os.environ.get("ARR_MEDIA_GUARD_ENV", "/etc/arr-media-guard.env")
 BUDGET = 300          # seconds a hook run may take from the lock to mkvpropedit
 LOCK_WAIT = 3600      # seconds a hook waits for the lock, so a holder stuck on the NAS never blocks later imports forever
-APPS = {"radarr": (7878, "/var/lib/radarr/config.xml"), "sonarr": (8989, "/var/lib/sonarr/config.xml")}
-SECRETS = ("PLEX_TOKEN", "DISCORD_WEBHOOK", "TMDB_TOKEN")
-LIB = ("arr_decide.py", "arr_meta.py", "arr_status.py", "arr_subhunt.py", "arr_lid.py", "arr_subsync.py")   # the modules beside arr_decide.py
+APPS = {"radarr": 7878, "sonarr": 8989}   # each app and its default port
+SECRETS = ("PLEX_TOKEN", "DISCORD_WEBHOOK", "TMDB_TOKEN", "RADARR_API_KEY", "SONARR_API_KEY", "WEBHOOK_PASSWORD")
+# Keys a release removed, with the key that replaced each. A line with one in the env file is ignored, and --selftest
+# names it.
+REMOVED = {"RADARR_CONFIG": "RADARR_DIR", "SONARR_CONFIG": "SONARR_DIR", "RADARR_DB": "RADARR_DIR", "VIDEO_REGRAB_CAP": "REGRAB_CAP",
+           "WRONG_CONTENT_REGRAB": "REGRAB", "DAMAGE_REGRAB": "REGRAB", "KEEP_DIR": "NAME", "HIDE_DIR": "NAME", "SUB_CHECK": "SUBTITLES",
+           "SUB_TIMING": "SUBTITLES", "SUB_DEEP_ANALYSIS": "SUBTITLES"}
+LIB = ("arr_decide.py", "arr_meta.py", "arr_status.py", "arr_subhunt.py", "arr_lid.py", "arr_subsync.py", "arr_serve.py")   # the modules beside arr_decide.py
 COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-grab fault. amber: other alerts. green: a clean scan.
 TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": "Broken duration header", "edit": "Flag edit failed",
           "policy": "Policy did not load", "content": "Wrong content", "repack": "Repack failed", "video": "Video check uncertain",
@@ -149,7 +157,7 @@ TITLES = {"language": "Wrong language", "runtime": "Wrong runtime", "duration": 
           "sublang": "Subtitle language", "submatch": "Wrong subtitle", "subtiming": "Subtitle timing"}
 # the alert kinds that come with a re-grab action
 CERTAIN = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
-WOULD = "A re-grab would delete"   # the start of the action while WRONG_CONTENT_REGRAB is off
+WOULD = "A re-grab would delete"   # the start of the action for a kind REGRAB does not list
 UNCONFIRMED = "A second check did not find the same fault"   # the start of the action when the second check disagrees
 RESTORED = "The hook put back the old file"   # the start of the action when the job's own old file came back, see restore_text()
 # The result of a wrong-content verdict per regrab() code, so the outcome says what happened: would_regrab only when the
@@ -193,32 +201,52 @@ SUB_RESERVE = 150                     # seconds of the job's time limit it leave
 LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_language", "audio_untagged_or_missing"}   # reason codes
 
 
-def settings():
-    """KEY='value' lines of the env file, with defaults for everything but the secrets."""
-    folders = {"KEEP_DIR": ".arr-media-guard-originals", "HIDE_DIR": ".arr-media-guard-convert"}
-    cfg = {"INSTANCE": os.uname().nodename, "LOG": "/var/log/arr-media-guard.jsonl", "STATE_DIR": "/var/lib/arr-media-guard",
-           "PLEX_URL": "", "LID_DIR": "/opt/arr-media-guard-lid", "NAME": "arr-media-guard", **folders, **{k: "" for k in SECRETS}}
+def env_file():
+    """{KEY: value} of the KEY='value' lines of the env file, {} when it does not read."""
+    out = {}
     try:
         for line in open(ENV_FILE):
             k, sep, v = line.strip().partition("=")
-            if sep and not k.startswith("#"): cfg[k] = v.strip("'\"")
+            if sep and not k.startswith("#"): out[k] = v.strip("'\"")
     except OSError:
         pass
-    for k, default in folders.items():   # one hidden folder name, so the apps and Plex never scan it
-        if cfg[k] in (".", "..") or not cfg[k].startswith(".") or "/" in cfg[k]: cfg[k] = default
-    return cfg
+    return out
+
+
+def settings():
+    """KEY='value' lines of the env file, with defaults for everything but the secrets."""
+    return {"INSTANCE": os.uname().nodename, "LOG": "/var/log/arr-media-guard.jsonl", "STATE_DIR": "/var/lib/arr-media-guard",
+            "PLEX_URL": "", "LID_DIR": "/opt/arr-media-guard-lid", "NAME": "arr-media-guard", **{k: "" for k in SECRETS}, **env_file()}
 
 
 CFG = settings()
-REGRAB_CAP = int(CFG.get("REGRAB_CAP") or 30)   # re-grabs per app in 24 hours, a download counts once. Then alerts only.
-VIDEO_REGRAB_CAP = int(CFG.get("VIDEO_REGRAB_CAP") or 30)   # the same for corrupt video, counted apart from REGRAB_CAP
-WRONG_CONTENT_REGRAB = CFG.get("WRONG_CONTENT_REGRAB", "").lower() == "true"   # off: a wrong-content file only alerts
-DAMAGE_REGRAB = CFG.get("DAMAGE_REGRAB", "true").lower() != "false"   # off: a conversion that shows a damaged source only alerts
+REGRAB_CAP = int(CFG.get("REGRAB_CAP") or 30)   # re-grabs of every kind per app in 24 hours, a download counts once. Then alerts only.
+CONFIG_ERRORS = []   # env file values the script cannot read. --selftest fails on them, and the worker logs them.
+if not re.fullmatch(r"[A-Za-z0-9._-]+", CFG["NAME"]):   # NAME names folders, see KEEP_DIR and HIDE_DIR
+    CONFIG_ERRORS.append(f"NAME {CFG['NAME']!r} holds other characters than letters, digits, '.', '_' and '-', so the script uses "
+                         "arr-media-guard.")
+    CFG["NAME"] = "arr-media-guard"
+REGRAB_KINDS = ("audio", "video", "content", "damage")   # broken audio, corrupt video, wrong content, a damaged source
+_kinds = [k.strip().lower() for k in CFG.get("REGRAB", "audio,video").split(",") if k.strip()]
+REGRAB = {k for k in _kinds if k in REGRAB_KINDS}   # the kinds that re-grab. Another kind only alerts "would re-grab".
+if _kinds == ["none"]:   # the one way to turn every re-grab off
+    _kinds = []
+elif not _kinds:   # a blank value re-grabs nothing, the safest reading
+    CONFIG_ERRORS.append("REGRAB is blank, so nothing re-grabs. Write REGRAB='none' to turn every re-grab off.")
+if set(_kinds) - REGRAB:   # an unknown kind is left out, so it never re-grabs
+    CONFIG_ERRORS.append(f"REGRAB names {', '.join(sorted(set(_kinds) - REGRAB))}, which is no re-grab kind, so it is left out. "
+                         f"The kinds are {', '.join(REGRAB_KINDS)}.")
 REPACK_MAX = float(CFG.get("REPACK_MAX_GB") or 30) * 1e9   # a larger file that is not Matroska is logged and skipped. A header repair too.
 HEADER_REPAIR = CFG.get("HEADER_REPAIR", "true").lower() != "false"   # off: a header issue is logged and never remuxed
-SUB_CHECK = CFG.get("SUB_CHECK", "true").lower() != "false"     # the subtitle match check of an import, docs/design.md, "Subtitle match"
-SUB_TIMING = CFG.get("SUB_TIMING", "true").lower() != "false"   # off: a subtitle whose times need a fix only alerts
-SUB_DEEP_ANALYSIS = CFG.get("SUB_DEEP_ANALYSIS", "false").lower() == "true"   # on: an import queues the deep analysis of its file, see deep_analysis(). Off by default.
+# What the subtitle check of an import does, docs/design.md, "Subtitle match". off: no check. check: it reads, reports
+# and alerts, and changes nothing. fix: it also removes, retimes and lengthens. deep: fix, and a deep analysis after the
+# import, see deep_analysis(). --sub-check and --sub-time ignore it, see sub_on() and sub_fixes().
+SUBTITLES_LEVELS = ("off", "check", "fix", "deep")
+SUBTITLES = CFG.get("SUBTITLES", "fix").strip().lower()
+if SUBTITLES not in SUBTITLES_LEVELS:   # the safest reading: read and report, change nothing
+    CONFIG_ERRORS.append(f"SUBTITLES {SUBTITLES!r} is no level, so the subtitle check of an import runs as check. The levels are "
+                         f"{', '.join(SUBTITLES_LEVELS)}.")
+    SUBTITLES = "check"
 SUB_TIMEOUT = 90       # seconds the subtitle check may hear one file, the model load included
 SUB_MIN_SECONDS = 300  # a shorter file is never checked: its two windows would sit too close for a timing fit
 STEP_ALERT = 1.0       # seconds the windows of a piecewise result must differ by to alert. A smaller step goes to the log only.
@@ -294,18 +322,63 @@ def http(url, method="GET", body=None, headers=None, timeout=15):
     return json.loads(raw) if raw.strip()[:1] in (b"{", b"[") else raw
 
 
+def app_dir(app):
+    """The app's own folder, RADARR_DIR or SONARR_DIR. The script reads config.xml and <app>.db there."""
+    return CFG.get(app.upper() + "_DIR") or f"/var/lib/{app}"
+
+
+def api_key(app):
+    """The app's API key: <APP>_API_KEY from the env file, else the key in config.xml in app_dir(). The key alone serves
+    every mode but the conversion and the subtitle hunter, which read the app's database too."""
+    return CFG.get(app.upper() + "_API_KEY") or \
+        re.search(r"<ApiKey>([^<]+)</ApiKey>", open(os.path.join(app_dir(app), "config.xml")).read()).group(1)
+
+
+# PATH_MAP='/tv:/media/tv|/movies:/media/movies' pairs the path an app uses with the path this script sees, as in Docker.
+_pairs = [pair.split(":") for pair in CFG.get("PATH_MAP", "").split("|") if pair]
+PATH_MAP = [tuple(p) for p in _pairs if len(p) == 2 and p[0].startswith("/") and p[1].startswith("/")]
+PATH_MAP_ERROR = None if len(PATH_MAP) == len(_pairs) else \
+    "PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths, joined by '|'. A pair that is not one is left out."
+if PATH_MAP_ERROR:   # --serve refuses to start on it
+    CONFIG_ERRORS.append(PATH_MAP_ERROR)
+
+
+def mapped(x, back=False):
+    """x with each path under an app prefix of PATH_MAP moved to its local prefix, in every string of a list or dict.
+    back maps a local path to the app's path. The longest prefix wins, and a prefix matches whole folder names only."""
+    if not PATH_MAP:
+        return x
+    if isinstance(x, dict):
+        return {k: mapped(v, back) for k, v in x.items()}
+    if isinstance(x, list):
+        return [mapped(v, back) for v in x]
+    for a, b in sorted(PATH_MAP, key=lambda m: -len(m[back])) if isinstance(x, str) else ():
+        src, dst = (b, a) if back else (a, b)
+        if x == src or x.startswith(src.rstrip("/") + "/"):
+            return dst.rstrip("/") + x[len(src.rstrip("/")):] or "/"
+    return x
+
+
+def app_query(path):
+    """An API path whose query values are local paths, with those values mapped to the app's paths."""
+    if not PATH_MAP or "?" not in path:
+        return path
+    base, q = path.split("?", 1)
+    return base + "?" + urllib.parse.urlencode([(k, mapped(v, True)) for k, v in urllib.parse.parse_qsl(q, keep_blank_values=True)])
+
+
 def arr(app, path):
-    """GET from the local Sonarr or Radarr. The key comes from the app's own config.xml."""
-    port, conf = APPS[app]
-    key = re.search(r"<ApiKey>([^<]+)</ApiKey>", open(CFG.get(app.upper() + "_CONFIG", conf)).read()).group(1)
-    return http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{path}", headers={"X-Api-Key": key}, timeout=60)
+    """GET from the local Sonarr or Radarr. The paths in the answer are the ones this script sees, see mapped()."""
+    port = APPS[app]
+    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path)}", headers={"X-Api-Key": api_key(app)},
+                       timeout=60))
 
 
 def arr_write(app, path, method, body=None):
     """A write to the local Sonarr or Radarr. The re-grabs and the rescan after a repack use it."""
-    port, conf = APPS[app]
-    key = re.search(r"<ApiKey>([^<]+)</ApiKey>", open(CFG.get(app.upper() + "_CONFIG", conf)).read()).group(1)
-    return http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{path}", method, body, {"X-Api-Key": key}, timeout=60)
+    port = APPS[app]
+    return mapped(http(f"{CFG.get(app.upper() + '_URL', f'http://127.0.0.1:{port}')}/api/v3/{app_query(path)}", method, mapped(body, True),
+                       {"X-Api-Key": api_key(app)}, timeout=60))
 
 
 def mkvmerge(path):
@@ -581,6 +654,7 @@ def plex_find(path, want):
     so Plex and the apps must see the files under the same paths. The third value is the key of the library section
     that lists the item.
     """
+    path = mapped(path, True)   # Plex sees the files under the apps' paths
     parts = lambda v: [p.get("file") for m in v.get("Media", []) for p in m.get("Part", [])]
     leaves = lambda v: plex_get(f'/library/metadata/{v["ratingKey"]}/allLeaves').get("Metadata", []) if want.get("show") else [v]
     t = want["title"]
@@ -786,7 +860,7 @@ def plex_flush(argv):
     f, folders = os.path.join(CFG["STATE_DIR"], f"plex-later-{app}.txt"), []
     with contextlib.suppress(FileNotFoundError), open(f) as fh:
         fcntl.flock(fh, fcntl.LOCK_SH)
-        folders = sorted({line.strip().rstrip("/") + "/" for line in fh if line.strip()})
+        folders = sorted({mapped(line.strip(), True).rstrip("/") + "/" for line in fh if line.strip()})
     roots, left = {}, list(folders)   # (section, location) -> its folders
     for d in plex_get("/library/sections").get("Directory", []) if folders else []:
         for loc in d.get("Location", []):
@@ -796,7 +870,7 @@ def plex_flush(argv):
                 left = [x for x in left if x not in mine]
     seen, skipped = [0, collections.defaultdict(float), None], set()   # see after_analyze()
     for (section, root), mine in sorted(roots.items()):
-        p = plex_folder_job(app, "backfill", f"section {section}", root, None)
+        p = plex_folder_job(app, "backfill", f"section {section}", mapped(root), None)   # a local path, as every folder job holds
         done, code = plex_analyze(p, skipped, ready=lambda s=section: after_analyze(seen, s))
         log(dict(app=app, source="backfill", label=p["label"], path=root, result="plex", plex=done, plex_reason=code, section=section,
                  folders=len(mine)))
@@ -804,7 +878,7 @@ def plex_flush(argv):
         if code == "plex_scan_sent":   # only now these folders leave the list, so a stop before keeps them listed
             with open(f, "r+") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
-                keep = [line for line in fh if line.strip() and line.strip().rstrip("/") + "/" not in mine]
+                keep = [line for line in fh if line.strip() and mapped(line.strip(), True).rstrip("/") + "/" not in mine]
                 fh.seek(0); fh.truncate(); fh.writelines(keep)
         else:
             left += mine
@@ -846,13 +920,13 @@ def plex_folder_scan(p, send=False):
     location holds the folder, as (keys, other, section) like plex_find(), ([], False, None) when none does. After them,
     with send: GET /library/sections/<section>/refresh?path=<folder>, Plex's partial scan, as (message, reason code).
     It scans that one folder, never the section."""
-    folder = p["path"].rstrip("/") + "/"
+    folder = mapped(p["path"], True).rstrip("/") + "/"   # Plex sees the files under the apps' paths
     if not send:
         for d in plex_get("/library/sections").get("Directory", []):
             if any(folder.startswith(loc["path"].rstrip("/") + "/") for loc in d.get("Location", [])):
                 return ["folder"], False, d["key"]
         return [], False, None
-    q = urllib.parse.urlencode({"path": p["path"], "X-Plex-Token": CFG["PLEX_TOKEN"]})
+    q = urllib.parse.urlencode({"path": mapped(p["path"], True), "X-Plex-Token": CFG["PLEX_TOKEN"]})
     try:
         http(f'{CFG["PLEX_URL"]}/library/sections/{p["section"]}/refresh?{q}')
     except Exception as ex:
@@ -1707,8 +1781,15 @@ def lid_kept(path, index):
 
 
 def sub_on(source, sub_check=False):
-    """The subtitle match check runs: on an import, and in a backfill only with --sub-check."""
-    return SUB_CHECK and (source == "hook" or sub_check)
+    """The subtitle match check runs: on an import and in the deep analysis unless SUBTITLES is off, and in a backfill
+    only with --sub-check or --sub-time, whatever SUBTITLES says."""
+    return SUBTITLES != "off" if source in ("hook", "deep_analysis") else sub_check
+
+
+def sub_fixes(source):
+    """Whether the subtitle check may change the file: remove a track, retime, lengthen cues, move a sidecar or turn a
+    flag off. An import and the deep analysis do at SUBTITLES fix or deep. --sub-check and --sub-time do with --apply."""
+    return source not in ("hook", "deep_analysis") or SUBTITLES in ("fix", "deep")
 
 
 def sub_audio(ts, edits=()):
@@ -2093,15 +2174,15 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None):
     out, ends = [], ends or {}
     for n, s in sorted(sides.items()):
         r, plan = sync.get(n) or {}, ends.get(n)
-        fix = SUB_TIMING and (r.get("timing") or {}).get("fix")
+        fix = (r.get("timing") or {}).get("fix")
         if r.get("verdict") != "mismatch" and not fix and not plan:
             continue
         move = r.get("verdict") == "mismatch"
         e = {"name": n, "action": "move" if move else "retime" if fix else "lengthen",
              "why": r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan)) if x)}
         out.append(e)
-        if not apply:
-            e["result"] = "dry run"
+        if not apply or not sub_fixes(source):
+            e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is check, so the file stays as it is")
             continue
         tmp = repack_tmp(s["path"])
         try:
@@ -2153,7 +2234,7 @@ def sub_alerts(rec, sync, unmatched):
     for p in unmatched:
         why = rm["result"] if p in (rm.get("remove") or []) and not rm.get("removed") else rm.get("kept_back") or "the file was not remuxed"
         wrong.append(f"Subtitle track {p} does not match the audio, {sync[p]['why']}. It stays in the file, because {why}. "
-                     "It loses its default and forced flags.")
+                     + ("It loses its default and forced flags." if sub_fixes(rec.get("source")) else "Its flags stay."))
     for e in rec.get("sidecars") or []:
         if e["action"] == "move":
             where = f"It moved to {e['kept']}." if e.get("kept") else f"It stays beside the file: {e.get('left') or 'a dry run'}."
@@ -2176,10 +2257,10 @@ def sub_alerts(rec, sync, unmatched):
     if (rm.get("fixed") or rm.get("ended")) and not rm.get("done"):
         late.append(f"Subtitle track {', '.join(sorted({*(rm.get('fixed') or []), *(rm.get('ended') or [])}))} needs new times, but "
                     f"{rm['result']}. The file stays as it was.")
-    if not SUB_TIMING:
-        late += [f"Subtitle {p} needs new times: {r['timing']['why']}. SUB_TIMING is off, so its times stay."
+    if not sub_fixes(rec.get("source")):
+        late += [f"Subtitle {p} needs new times: {r['timing']['why']}. SUBTITLES is check, so its times stay."
                  for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
-        late += [f"Subtitle {p} flashes its cues: its median cue shows {f['median']:.2f} s. SUB_TIMING is off, so its ends stay."
+        late += [f"Subtitle {p} flashes its cues: its median cue shows {f['median']:.2f} s. SUBTITLES is check, so its ends stay."
                  for p, f in sorted((rec.get("flash") or {}).items())]
     far = [f'{k} at {arr_meta.hms(w["at"])} by {w["off"]:+.2f} s' for k, rows in sorted((rec.get("sweep") or {}).items()) for w in rows
            if id(w) in sweep_steps(rows)]
@@ -2600,24 +2681,24 @@ def save_unit(download_id, unit):
     write_json(os.path.join(CFG["STATE_DIR"], "units.json"), dict(keep, **{download_id: unit}))
 
 
-def regrab_times(slot):
-    """(regrabs.json, the times in slot of the last 24 hours)."""
+def regrab_times(app):
+    """(regrabs.json, the re-grab times of app in the last 24 hours). Every kind of re-grab shares the one count."""
     try:
         done = json.load(open(os.path.join(CFG["STATE_DIR"], "regrabs.json")))
     except (OSError, ValueError):
         done = {}
-    return done, [t for t in done.get(slot, []) if time.time() - t < 86400]
+    return done, [t for t in done.get(app, []) if time.time() - t < 86400]
 
 
-def count_regrab(slot, cap):
-    """Count one re-grab in slot of regrabs.json. The read, the cap check and the write run under regrabs.json.lock,
-    so parallel job processes never lose a count or pass the cap together. False when the cap is reached."""
+def count_regrab(app):
+    """Count one re-grab of app in regrabs.json. The read, the cap check and the write run under regrabs.json.lock,
+    so parallel job processes never lose a count or pass REGRAB_CAP together. False when the cap is reached."""
     with open(os.path.join(CFG["STATE_DIR"], "regrabs.json.lock"), "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        done, recent = regrab_times(slot)
-        if len(recent) >= cap:
+        done, recent = regrab_times(app)
+        if len(recent) >= REGRAB_CAP:
             return False
-        write_json(os.path.join(CFG["STATE_DIR"], "regrabs.json"), dict(done, **{slot: recent + [time.time()]}))
+        write_json(os.path.join(CFG["STATE_DIR"], "regrabs.json"), dict(done, **{app: recent + [time.time()]}))
     return True
 
 
@@ -2667,7 +2748,7 @@ RESULTS = {"audio": ("broken audio", "audio checked", "broken files"), "content"
            "video": ("corrupt video", "video checked", "corrupt files"), "damage": ("damaged source", "source checked", "damaged files")}
 
 
-def regrab(app, job, fault, probe, kind="audio", dry=False):
+def regrab(app, job, fault, probe, kind="audio"):
     """A download is one unit. Check every file it imported, delete each faulty one, re-monitor their items, then
     mark the grab failed once. That order matters: the app searches at once, and a faulty file still on disk would
     make it reject the replacement as not an upgrade. Clean files stay. Returns (code, what was done as one sentence).
@@ -2675,11 +2756,11 @@ def regrab(app, job, fault, probe, kind="audio", dry=False):
 
     fault is the certain fault found in the job's file. probe(path, f, fresh) checks a file from scratch and returns
     (its certain fault or None, log fields), see audio_probe(), content_probe(), video_probe() and damage_probe(). Every
-    second check passes fresh=True. kind is audio, content, video or damage. Corrupt video counts against
-    VIDEO_REGRAB_CAP, the other kinds share REGRAB_CAP. dry stops after the second check of the job's file and deletes
-    nothing: the wrong-content re-grab while it is switched off.
+    second check passes fresh=True. kind is audio, content, video or damage. Every kind counts against the one
+    REGRAB_CAP of the app. A kind REGRAB does not list stops after the second check of the job's file and deletes
+    nothing.
     """
-    name = "Radarr" if app == "radarr" else "Sonarr"
+    name, dry = "Radarr" if app == "radarr" else "Sonarr", kind not in REGRAB
     records = []
     if job.get("download_id"):
         records = arr(app, "history?" + urllib.parse.urlencode({"downloadId": job["download_id"], "pageSize": 1000})).get("records", [])
@@ -2689,16 +2770,15 @@ def regrab(app, job, fault, probe, kind="audio", dry=False):
     if not grabs or not job.get("file_id"):
         return "no_grab", f"{name} has no grab record for it, so the file stays."
     unit = units().get(job["download_id"])
-    slot, cap = (f"{app}-video", VIDEO_REGRAB_CAP) if kind == "video" else (app, REGRAB_CAP)   # the counts in regrabs.json
-    capped = f"The cap of {cap} re-grabs a day is reached, so the file stays."
-    if not unit and len(regrab_times(slot)[1]) >= cap:   # a first look. count_regrab() counts under the lock.
+    capped = f"The cap of {REGRAB_CAP} re-grabs a day is reached, so the file stays."
+    if not unit and len(regrab_times(app)[1]) >= REGRAB_CAP:   # a first look. count_regrab() counts under the lock.
         return "capped", capped
     try:
         # A NAS error that clears, or a header that probes differently, must never cost a file: check again first.
         if probe(job["path"], None, fresh=True)[0] != fault:
             return "unconfirmed", f"{UNCONFIRMED}, so the file stays."
         if dry:
-            return "would_regrab", f"{WOULD} the file and search again. WRONG_CONTENT_REGRAB is off, so the file stays."
+            return "would_regrab", f"{WOULD} the file and search again. REGRAB does not list {kind}, so the file stays."
         files = unit_files(app, records, job)
         broken = {int(job["file_id"])}
         unit = unit or {"time": time.time(), "failed": False, "deleted": [], "clean": [], "kind": kind}
@@ -2721,7 +2801,7 @@ def regrab(app, job, fault, probe, kind="audio", dry=False):
         plans = restore_plans(app, job, files, broken)   # read-only: which old files of an upgrade may come back
     finally:
         signal.alarm(0)
-    if not unit["failed"] and not unit["deleted"] and not count_regrab(slot, cap):   # a new unit counts once, and only now that it acts
+    if not unit["failed"] and not unit["deleted"] and not count_regrab(app):   # a new unit counts once, and only now that it acts
         return "capped", capped
     step = "the delete"
     with no_stop():   # the changes finish before a SIGTERM lands, so a stop never leaves a deleted file unmarked
@@ -2797,6 +2877,27 @@ def volume(path):
     while path not in ("", "/") and not os.path.exists(path):
         path = os.path.dirname(path)
     return os.stat(path).st_dev
+
+
+def bin_warnings(app):
+    """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, or its bin sits
+    on another file system than a root folder, and a restore only renames. [] when all is well or the app does not
+    answer. --selftest and the Test event print them, and neither fails on them."""
+    name = "Radarr" if app == "radarr" else "Sonarr"
+    try:
+        rbin = (arr(app, "config/mediamanagement") or {}).get("recycleBin") or ""
+        roots = [r["path"] for r in arr(app, "rootfolder")]
+    except Exception:
+        return []
+    if not rbin:
+        return [f"{name} has no recycle bin, so the restore after a bad upgrade cannot work. Set one in Media Management, "
+                "on the media's file system."]
+    with contextlib.suppress(OSError):
+        other = [r for r in roots if volume(r) != volume(rbin)]
+        if other:
+            return [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
+                    "bad upgrade needs a rename. Move the bin onto the media's file system."]
+    return []
 
 
 def old_file_check(path, original, kids, runtime):
@@ -2964,9 +3065,8 @@ def restore_manual(app, job, fault, probe, kind):
         signal.alarm(0)
     if not any(p["back"] for p in plans.values()):
         return "no_grab", restore_text(app, job, restore(app, job, plans), stays)
-    slot, cap = (f"{app}-video", VIDEO_REGRAB_CAP) if kind == "video" else (app, REGRAB_CAP)
-    if not count_regrab(slot, cap):
-        return "capped", f"The cap of {cap} re-grabs a day is reached, so the file stays."
+    if not count_regrab(app):
+        return "capped", f"The cap of {REGRAB_CAP} re-grabs a day is reached, so the file stays."
     step = "reading which items are monitored"
     with no_stop():   # the changes finish before a SIGTERM lands
         try:
@@ -3435,9 +3535,9 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     see reshared().
 
     job is the queued hook job. With it, a certain audio or video fault skips the edit and re-grabs the file. So does a
-    conversion that shows the original damaged, while DAMAGE_REGRAB is on. The video
+    conversion that shows the original damaged. A kind REGRAB does not list only says it would re-grab. The video
     check runs only when the audio is not certainly broken. audio or video False skips a check the file already had
-    with its download. Wrong content re-grabs after the edit, or only says it would while WRONG_CONTENT_REGRAB is off.
+    with its download. Wrong content re-grabs after the edit, or only says it would.
     kids and release are the item context of the decision, ids the app's ids of the item, ctx the metadata context of
     movie_item() or episode_item(). keep_plan adds the plan_record() as "plan". lock is the held file lock. It is
     released after the edit, because the metadata checks only read, and taken again before a wrong-content re-grab
@@ -3467,7 +3567,8 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
         if shared and apply and not pool:
             raise Replan("the file needs a repack")
         was = path
-        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force, subs_on, arr_decide.codes(original))
+        result, rec["repack"], path = convert(app, path, j, st, apply, rec["ids"], lock, pool, force, subs_on and sub_fixes(source),
+                                                arr_decide.codes(original))
         if lock is not None and not pool and result.startswith(("repacked", "repack failed")):   # convert() let the lock go, see there
             gated(lock, fcntl.LOCK_EX)
         if job is not None and "warnings" in rec["repack"]:
@@ -3487,7 +3588,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
             if not would:
                 convert_list(app, rec)
             damage = rec["repack"].get("damage")
-            if damage and job is not None and apply and DAMAGE_REGRAB:   # the original is damaged: it re-grabs like broken audio
+            if damage and job is not None and apply:   # the original is damaged: it re-grabs like broken audio
                 code, action = regrab(app, job, damage["fault"], damage_probe(damage, j), "damage")
                 rec.update(result=f"damaged source: {damage['fault']}", regrab=code)
                 refused = f" The proof refused the new file, because {damage['refusal']}." if damage.get("refusal") else ""
@@ -3602,7 +3703,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
                 fcntl.flock(lock, fcntl.LOCK_UN)
             before = (rec.get("repack") or {}).get("subcheck") or {}   # a conversion checked the tracks already: the same windows
             sync = sub_match(path, j, d, {r["audio"]: r["starts"] for r in before.values() if r.get("starts")} or None, sides, known, items, full,
-                             line=not sub_time, deep=source == "hook" and SUB_DEEP_ANALYSIS)
+                             line=not sub_time, deep=source == "hook" and SUBTITLES == "deep")
             if sub_time and sync:   # --sub-time and the deep analysis
                 rec["sweep"], rec["sweep_facts"] = sub_sweep(path, j, items, sync, deep=source == "deep_analysis")
                 for k, r in sync.items():   # a fix stands only when the sweep confirms it
@@ -3627,14 +3728,15 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
     if sync or timed_by:
         tracks = {p: r for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others}
         unmatched = {p for p, r in tracks.items() if r["verdict"] == "mismatch"}
-        fixes = {p: r["timing"]["fix"] for p, r in tracks.items() if (r.get("timing") or {}).get("fix")} if SUB_TIMING else {}
+        fixes = {p: r["timing"]["fix"] for p, r in tracks.items() if (r.get("timing") or {}).get("fix")} if sub_fixes(source) else {}
+        unmatched = unmatched if sub_fixes(source) else set()   # SUBTITLES check turns no flag off. The alerts read sync.
     remove = sorted(unmatched) if KEEP_DAYS else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
     flashy = flash_check(path, j, sidecar_subs(path), full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
     vtt = {p for p, c in sub_codecs(j).items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
     if flashy:
         rec["flash"] = {k: {"cues": len(v), "median": round(statistics.median(o - a for a, _, o, _ in v), 3), "lengthened": sum(n != o for _, _, o, n in v),
                             "first": [[a, o, n] for a, _, o, n in v[:3]], **({"report_only": "WebVTT"} if k in vtt else {})} for k, v in flashy.items()}
-    ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt} if SUB_TIMING else {}
+    ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt} if sub_fixes(source) else {}
     if (FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
     if fixes or remove or ends:
@@ -3664,7 +3766,9 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
             unmatched = set(renumber(dict.fromkeys(unmatched), gone))
             tags = arr_decide.retag(j, got, known, langs(), said, read)
     stay = sorted({p for p, r in sync.items() if p not in sides and r["verdict"] == "mismatch"} - set((rec.get("subremux") or {}).get("removed") or []))
-    if stay and not KEEP_DAYS:   # the tracks that stay, by their place before any remux, for the alert
+    if stay and not sub_fixes(source):   # the tracks that stay, by their place before any remux, for the alert
+        rec.setdefault("subremux", {}).update(kept_back="SUBTITLES is check, so the file stays as it is")
+    elif stay and not KEEP_DAYS:
         rec.setdefault("subremux", {}).update(kept_back="KEEP_ORIGINALS_DAYS is 0, so the original could not be kept")
     if unmatched or (rec.get("subremux") or {}).get("done"):
         d = arr_decide.decide(j, original, kids, release, heard, spoken, wrong, unmatched)
@@ -3718,11 +3822,11 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
             rec["reasons"] = rec["reasons"] + [vfields["code"]]
         if doubts:
             rest.append(("video", sentences(doubts)))
-    if shared and not (certain or vcertain or WRONG_CONTENT_REGRAB):   # the checks found nothing to re-grab
+    if shared and not (certain or vcertain or "content" in REGRAB):   # the checks found nothing to re-grab
         shared.settle()
     sides, sync_all = {s["name"]: s for s in sidecar_subs(path)} if flashy else {**sides, **others}, {**sync, **timed_by}   # the sidecars act alike
-    side_ends = {n: v for n, v in flashy.items() if n in sides} if SUB_TIMING else {}
-    acts = [n for n in sides if (sync_all.get(n) or {}).get("verdict") == "mismatch" or (SUB_TIMING and ((sync_all.get(n) or {}).get("timing") or {}).get("fix"))
+    side_ends = {n: v for n, v in flashy.items() if n in sides}   # at SUBTITLES check, sidecar_fix() only reports
+    acts = [n for n in sides if (sync_all.get(n) or {}).get("verdict") == "mismatch" or ((sync_all.get(n) or {}).get("timing") or {}).get("fix")
             or n in side_ends]
     if shared and apply and (certain or vcertain or (mkv and (d["edits"] or acts))):
         shared.exclusive(st)
@@ -3799,7 +3903,7 @@ def process(app, path, label, original, runtime, apply=True, post=True, source="
                     gated(lock, fcntl.LOCK_EX)
                     signal.alarm(BUDGET)
                 code, action = regrab(app, job, "wrong content", content_probe(app, job["owner"], original, kids, release, ctx, heard),
-                                      "content", dry=not WRONG_CONTENT_REGRAB)
+                                      "content")
                 rec["edit_result"], rec["result"], rec["regrab"] = rec["result"], CONTENT_RESULTS[code] + ev["why"], code
                 first.append(("content", content_text(ev), action))
             elif ev["regrab"]:
@@ -3961,7 +4065,7 @@ def trim_inputs(path, j, hp, folder):
     return args, counts, removed
 
 
-KEEP_DIR = CFG["KEEP_DIR"]
+KEEP_DIR = f".{CFG['NAME']}-originals"   # hidden, so the apps and Plex never scan it
 
 
 def originals_root(path):
@@ -5228,7 +5332,7 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=()):
     keep = []
     for s in subs:
         r = got.get(s["name"]) or {}
-        fix = SUB_TIMING and (r.get("timing") or {}).get("fix")
+        fix = (r.get("timing") or {}).get("fix")
         if r.get("verdict") == "mismatch" or (fix and apply):
             why = (keepable(s["path"], os.stat(s["path"])) or None) if KEEP_DAYS else "KEEP_ORIGINALS_DAYS is 0"
         if r.get("verdict") == "mismatch":   # rather no subtitle than a wrong one
@@ -5442,7 +5546,7 @@ class Refused(RuntimeError):
     original back into the app first."""
 
 
-HIDE_DIR = CFG["HIDE_DIR"]   # the hidden folder beside an extra where it waits while the app drops the old record
+HIDE_DIR = f".{CFG['NAME']}-convert"   # the hidden folder beside an extra where it waits while the app drops the old record
 PENDING_MU = threading.Lock()   # the conversion workers of a backfill are threads, and flock alone does not order them
 SWAP_POLL = 600                 # seconds a swap tries for the exclusive lock without the gate, see swap_lock()
 EXTRA_ROWS_WAIT = 120           # seconds settle_extras() waits for the app to delete the old record's extra rows
@@ -5472,9 +5576,9 @@ def pending_edit(key=None, entry=None):
 
 
 def app_db(app, query, args):
-    """The rows of one read-only query of the app's own database beside its config.xml. Sonarr 4 has no API for extra
+    """The rows of one read-only query of the app's own database, <app>.db in app_dir(). Sonarr 4 has no API for extra
     files or a file's original path. A read that fails raises, so no conversion runs blind."""
-    con = sqlite3.connect(f"file:{os.path.join(os.path.dirname(APPS[app][1]), app + '.db')}?mode=ro", uri=True, timeout=30)
+    con = sqlite3.connect(f"file:{os.path.join(app_dir(app), app + '.db')}?mode=ro", uri=True, timeout=30)
     try:
         return con.execute(query, args).fetchall()
     finally:
@@ -6144,12 +6248,12 @@ def deep_analysis_queued():
 
 def queue_deep_analysis(job, rec, inputs):
     """Queue the deep analysis of the file an import job checked (docs/design.md, "Subtitle match"), when
-    SUB_DEEP_ANALYSIS is on, SUB_CHECK is on, and the Matroska file holds a subtitle track or has an .srt beside it. The
+    SUBTITLES is deep, and the Matroska file holds a subtitle track or has an .srt beside it. The
     job carries inputs, the decision inputs of the import: its label, original language, runtime, Plex lookup, kids
     flag, metadata context and release name. So the deep analysis asks no app and decides as the import did. The job
     file is named by the path, so a newer import of the path replaces a queued one. Returns its name, or None."""
     path, ids = rec.get("path"), rec.get("ids") or {}
-    if not (SUB_DEEP_ANALYSIS and SUB_CHECK and path and path.lower().endswith(".mkv") and os.path.exists(path)) or \
+    if not (SUBTITLES == "deep" and path and path.lower().endswith(".mkv") and os.path.exists(path)) or \
             not (any(t["i"].startswith("s") for t in rec.get("tracks") or []) or side_stats(path)):
         return None
     name = f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
@@ -6240,12 +6344,25 @@ def try_lock(name):
         return None
 
 
+def queue_job(job):
+    """Write one job file into the queue. hook() and the Webhook listener in arr_serve.py both call it, so the worker
+    reads one format. Returns the job file's name."""
+    os.makedirs(queue_dir(), exist_ok=True)
+    name = f"{time.time_ns()}-{os.getpid()}.json"
+    with open(os.path.join(queue_dir(), "." + name), "w") as f:
+        json.dump(job, f)
+    os.replace(os.path.join(queue_dir(), "." + name), os.path.join(queue_dir(), name))   # a worker never sees half a job
+    return name
+
+
 def hook():
     app = "radarr" if "radarr_eventtype" in os.environ else "sonarr" if "sonarr_eventtype" in os.environ else None
     if not app:
         print(__doc__); return
     event = os.environ[f"{app}_eventtype"]
     if event != "Download":   # Test, and anything the connection was not meant to send
+        for w in bin_warnings(app) if event == "Test" else []:
+            print(f"arr-media-guard: warning: {w}")
         print(f"arr-media-guard: {event} ok"); return
     env = os.environ.get
     job = {"app": app, "event": event, "time": time.time(),
@@ -6255,11 +6372,7 @@ def hook():
            "episode_ids": env("sonarr_episodefile_episodeids"), "download_id": env(f"{app}_download_id"),
            "release": env("radarr_moviefile_scenename") if app == "radarr" else env("sonarr_episodefile_scenename")}
     job.update(deleted=env(f"{app}_deletedpaths"), recycled=env(f"{app}_deletedrecyclebinpaths"))   # an upgrade's old files, see old_files()
-    os.makedirs(queue_dir(), exist_ok=True)
-    name = f"{time.time_ns()}-{os.getpid()}.json"
-    with open(os.path.join(queue_dir(), "." + name), "w") as f:
-        json.dump(job, f)
-    os.replace(os.path.join(queue_dir(), "." + name), os.path.join(queue_dir(), name))   # a worker never sees half a job
+    queue_job(job)
     print(f"arr-media-guard: queued {job['path']}", flush=True)
     lock = try_lock("worker.lock")
     if not lock:
@@ -6405,6 +6518,8 @@ def worker(lock):
             pending_recover(app, False)
     if BAD_WORKERS is not None:   # the hook call never breaks on it
         log(dict(source="hook", result="warning", note=f"HOOK_WORKERS {BAD_WORKERS!r} is not a whole number of 1 or more, so 1 runs"[:200]))
+    for why in CONFIG_ERRORS:
+        log(dict(source="hook", result="warning", note=why[:300]))
     pending = load_plex()   # plex_job() dicts, the analyze of each edited file, with those a stopped worker kept
     if HOOK_WORKERS > 1:
         return coordinate(lock, HOOK_WORKERS, pending)
@@ -7149,8 +7264,7 @@ def sub_time_text(rec):
                    f' | {method} | {verdict} | {when} | {act} | {why}')
     for k, f in sorted((rec.get("flash") or {}).items()):
         act = "report only, WebVTT" if f.get("report_only") else f'sidecar {done[k]["result"]}' if k in done \
-            else ("lengthened" if rm.get("done") else rm["result"][:100]) if k in (rm.get("ended") or []) else "SUB_TIMING is off, ends stay" if not SUB_TIMING \
-            else "ends stay"
+            else ("lengthened" if rm.get("done") else rm["result"][:100]) if k in (rm.get("ended") or []) else "ends stay"
         out.append(f'  {k} | flash | median {f["median"]:.2f} s | {f["lengthened"]} of {f["cues"]} ends lengthened | {act} | first '
                    + ", ".join(f"{a:.3f} {o:.3f}->{n:.3f}" for a, o, n in f["first"]))
     for k, rows in sorted((rec.get("sweep") or {}).items()):
@@ -7635,8 +7749,17 @@ def main(argv):
     if mode in (["--selftest"], ["--backfill"], ["--audit"], ["--subhunt"], ["--sub-time"]) and armed:
         status("policy", "failed" if arr_decide.POLICY is None else "ok", POLICY_ERROR or "", touch=mode != ["--selftest"])
     if mode == ["--selftest"]:
+        for k in sorted(set(env_file()) & set(REMOVED)):
+            print(f"unused key {k} in {ENV_FILE}: {REMOVED[k]} replaced it")
+        if CONFIG_ERRORS:
+            sys.exit("selftest failed: " + " ".join(CONFIG_ERRORS))
         if arr_decide.POLICY is None:   # the rules test runs on its own copy, so check the live policy loaded too
             sys.exit(f"selftest failed: {policy_help()}")
+        for app in APPS:   # a warning only: an app this host does not run has no key here
+            with contextlib.suppress(OSError, AttributeError):
+                api_key(app)
+                for w in bin_warnings(app):
+                    print(f"warning: {w}")
         arr_decide.selftest()
     elif mode in (["--backfill"], ["--audit"], ["--subhunt"], ["--sub-time"]) and arr_decide.POLICY is None:
         sys.exit(policy_help())
@@ -7651,6 +7774,9 @@ def main(argv):
     elif mode == ["--subhunt"]:
         import arr_subhunt   # only this mode needs it
         arr_subhunt.main(sys.modules[__name__], argv[1:])   # the running module, so the hunter shares CFG and OUTCOMES
+    elif mode == ["--serve"]:
+        import arr_serve   # only this mode needs it
+        arr_serve.main(sys.modules[__name__], argv[1:])
     elif argv:
         print(__doc__); sys.exit(2)
     else:

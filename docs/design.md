@@ -178,7 +178,7 @@ other alert. Green is a clean scan summary. Mentions are off, and the secrets ar
 | Language | No main audio track is English, the original language or a language TMDB lists. |
 | Runtime | The trusted duration is far off the listed runtime, see "Metadata checks". |
 | Duration | The header duration disagrees with the size or the other duration sources. The size check trusts BPS tags only from mkvmerge, because ffmpeg copies stale tags. Else it allows 50 Mbit/s up to 1080p and 150 above. |
-| Content | The evidence adds up to a re-grab. The title says "would re-grab" while `WRONG_CONTENT_REGRAB` is off. |
+| Content | The evidence adds up to a re-grab. The title says "would re-grab" when `REGRAB` does not list `content`. |
 | Audio, Video | See "Broken audio" and "Corrupt video". |
 | Edit | mkvpropedit failed, or the second probe shows the old flags. |
 | Damaged source | The conversion of an import shows a damaged source, see "Damaged source". |
@@ -238,7 +238,11 @@ each broken one, monitors the items again, and then marks the grab failed once. 
 once and would reject the replacement while a broken file is on disk, so the order matters. A delete
 goes to the app's recycle bin, and an upgrade first gets its old file back, see "Restore after a bad
 upgrade". `units.json` keeps each download for 7 days. `REGRAB_CAP` (30) limits the re-grabs per app
-a day, and a season pack counts once. Past the cap, or with no grab record, the worker only alerts.
+a day, and a season pack counts once. Broken audio, wrong content, a damaged source and corrupt video
+share that one count in `regrabs.json`, and 0 turns every re-grab off. Past the cap, or with no grab
+record, the worker only alerts. `REGRAB` lists the kinds that re-grab, `audio,video` by default. A
+kind it does not list still gets the grab record, the cap and the second check. The worker then logs
+`would_regrab` for wrong content, posts "would re-grab" and deletes nothing.
 
 ## Corrupt video
 
@@ -274,8 +278,8 @@ goes ahead.
 
 A certain fault re-grabs like broken audio. The second check moves its zero reads by half a step and
 its windows to 30, 70 and 95 percent, and it must find the same fault class. So a local fault may
-stay an amber "Corrupt video, not confirmed". `VIDEO_REGRAB_CAP` (30) is a separate daily cap, and 0
-turns the video re-grab off. Decode each certain file and each doubt of a `--check-video` scan in
+stay an amber "Corrupt video, not confirmed". It counts against the same `REGRAB_CAP` as broken audio.
+Decode each certain file and each doubt of a `--check-video` scan in
 full before you act on it.
 
 ## Restore after a bad upgrade
@@ -339,7 +343,7 @@ run their checks side by side. A job is *settled* when its checks are done and n
 from it. Before a job edits or re-grabs, it waits until every older job of the download is settled.
 So a download ends the same way as with one worker.
 
-**Deep analysis.** With `SUB_DEEP_ANALYSIS=true`, an import job queues one deep analysis job for its file in
+**Deep analysis.** With `SUBTITLES=deep`, an import job queues one deep analysis job for its file in
 `STATE_DIR/deep-analysis/`, named by the path, so a newer import of the path replaces it. The worker runs one only when no
 import job waits, one at a time per host, and never drops one by age, only when its file is gone. The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
@@ -473,7 +477,7 @@ stream first, and the app must list the new file before the original goes.
 language, forced and hearing-impaired flags from the name. Its text can overrule the name's language,
 see "Subtitle text". A sidecar that ends past the video, or
 has cues out of order, is timed for another cut and stays beside the file. `mkvmerge
---disable-lacing --track-order` writes the temp file into `HIDE_DIR` beside the video. The apps' disk
+--disable-lacing --track-order` writes the temp file into `.<NAME>-convert` beside the video. The apps' disk
 scan and Plex skip a hidden folder, so they never import a partial file. A hidden file beside the
 video is not enough. The app's scan takes it as an extra of the item and can rename it or send it to
 the recycle bin. A swap once hid it with the extras, and the link to the new name failed. An
@@ -540,7 +544,7 @@ whose edit list hides the last frames of a still picture, which mkvmerge keeps. 
 to the refusal a person saw. A file converts when the proof refuses it with the same text as the
 last refusal the decision log holds for its path. Another refusal, or none in the log, is not
 forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
-import, the extras and the checks after them. The original is kept in `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
+import, the extras and the checks after them. The original is kept in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, as a
 header repair keeps it, so one move undoes the conversion. See "Kept originals" for the hard link and its copy fallback. The option needs `KEEP_ORIGINALS_DAYS`
 above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
 "forced". A listed path that is not in the run's work list is reported and skipped. The hook
@@ -558,10 +562,10 @@ extra whose name maps to other episodes still refuses the file, and the refusal 
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
-into `HIDE_DIR`, the new file is linked in as `<base>.mkv`, and the original moves to a held name in
-`HIDE_DIR`. The app then takes the new file. Only then are the original and the sidecars deleted. When a
+into `.<NAME>-convert`, the new file is linked in as `<base>.mkv`, and the original moves to a held name in
+`.<NAME>-convert`. The app then takes the new file. Only then are the original and the sidecars deleted. When a
 step fails after that, `convert_undo()` reads the app first and never deletes a file the app lists. A
-failure removes the temp file last, after the extras are back, and then the empty `HIDE_DIR`.
+failure removes the temp file last, after the extras are back, and then the empty `.<NAME>-convert`.
 
 **The app takes the new file.** A `ManualImport` command names the item. It carries the old record's
 quality, languages, release group and indexer flags, so the app never parses the new name. The file
@@ -615,9 +619,9 @@ original stays and gets the import's audio and video checks. The decision line h
 hook did.
 
 Only a hook job re-grabs. A library backfill with `--convert` lists a damaged file in
-`convert-<app>.txt`, and it never re-grabs. `DAMAGE_REGRAB=false` turns the re-grab off. A failed
-conversion then alerts "Repack failed". A file ffprobe cannot read is skipped and listed, with no
-"Repack failed" alert.
+`convert-<app>.txt`, and it never re-grabs. The re-grab needs `damage` in `REGRAB`, which is off by
+default. Without it the hook checks the original again and posts "Damaged source, would re-grab". A
+file ffprobe cannot read is skipped and listed, with no "Repack failed" alert.
 
 ## Header repair
 
@@ -670,7 +674,7 @@ decision runs on the new file, and the app rescans the item. A backfill dry run 
 
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for
 `KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
-hard-linked to `<mount>/<KEEP_DIR>/<UTC time>/<path from the mount>`, where the mount is the mount
+hard-linked to `<mount>/.<NAME>-originals/<UTC time>/<path from the mount>`, where the mount is the mount
 point that holds the file. With the app root folders and the Plex sections below the mount, nothing
 scans the folder. A hard link needs no space and never leaves the path missing.
 
@@ -680,8 +684,8 @@ plus 1 GB free, else the fix is skipped and says why. It is written under a hidd
 by size and hash, and only then renamed to the kept name. So the swap waits for a whole copy, and a crash leaves no
 file that looks kept. The log and the report of `--sub-time` say "copied" instead of "hard-linked". Any other link
 error skips the fix, as before. To undo a repair, move the kept file back and rescan the item.
-`KEEP_DIR` and `HIDE_DIR` must be hidden folder names that start with a dot. Any other value takes the
-default.
+`NAME` names both hidden folders, `.<NAME>-originals` and `.<NAME>-convert`. A `NAME` with other
+characters than letters, digits, `.`, `_` and `-` fails `--selftest`, and the script uses `arr-media-guard`.
 Each keep and the nightly audit remove the time folders older than the setting.
 
 ## Subtitle hunter
@@ -757,8 +761,8 @@ films of their own. A movie under half its listing scores two on runtime, when a
 TMDB agree. A special never does, because its listing may count the broadcast slot. A series never
 gets the release-language point, because a docuseries changes language per episode.
 
-**The switch.** `WRONG_CONTENT_REGRAB` is off by default. While it is off, the hook still checks the
-grab record, the cap and a second check. It then logs `would_regrab`, posts "Wrong content, would
+**The switch.** `REGRAB` leaves out `content` by default. Then the hook still checks the grab
+record, the cap and a second check. It then logs `would_regrab`, posts "Wrong content, would
 re-grab" and deletes nothing. Read those posts for a while before you turn it on. A verdict judges
 only files of the job's own item. The second check probes the file again, hears the audio past the
 cache, and asks TMDB through an empty cache.
@@ -866,8 +870,10 @@ language of a main audio track. The check hears the track that plays when it spe
 track that does. A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
 5 minutes are never checked. Nor is Japanese, Chinese or Thai text, which has no spaces between its words, so the
 check could never give a verdict. So a file with no such track or sidecar costs nothing. The check runs on imports, and a
-backfill runs it only with `--sub-check`. `SUB_CHECK=false` turns it off. It needs language detection, see "Audio
-language detection".
+backfill runs it only with `--sub-check`. `SUBTITLES` sets what an import does with it: `off` runs no check, `check`
+reads, reports and alerts and changes nothing, `fix` (the default) acts, and `deep` adds the deep analysis. An unknown
+level acts as `check`. `--sub-check` and `--sub-time` ignore `SUBTITLES`, because a person asked for them. Without
+`--apply` they report, and with it they fix. It needs language detection, see "Audio language detection".
 
 **The read.** `subtitle_cues()` reads every cue with its start and end, by the Cues, as `subtitle_read()` does. A cue
 ends at its BlockDuration. A sidecar and an MP4 track are read as SubRip text.
@@ -987,7 +993,7 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 
 - A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitle"
   alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
-  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `HIDE_DIR`. Its work files, the
+  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
   extracted text, the proof's reads and the cover attachments, go into a folder under `STATE_DIR`, never the system
   temp dir, which is often a small tmpfs. The trim, the damage read, the conversion and the video windows keep their
   work files there too. A worker that starts removes a work folder that a killed step left over a day ago. ffmpeg
@@ -1010,15 +1016,15 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 - A removal cannot be undone without the kept original. So with `KEEP_ORIGINALS_DAYS` 0, or when the remux or the
   proof fails, the track stays in the file. It gets the role `unmatched` instead, which no policy lists, so it never
   becomes a default. It loses its default and forced flags with mkvpropedit (`subtitle_audio_mismatch`), and the alert
-  says why it stayed. A retime of another track in the same file keeps that. `SUB_TIMING=false` keeps the times and
-  alerts.
-- A sidecar beside a Matroska file that does not match moves into `KEEP_DIR` as a kept original, with a log line and
+  says why it stayed. A retime of another track in the same file keeps that. `SUBTITLES=check` keeps the times, the
+  tracks, the sidecars and the flags, and alerts.
+- A sidecar beside a Matroska file that does not match moves into `.<NAME>-originals` as a kept original, with a log line and
   the alert. A sidecar whose times need a fix is written again with new times, as UTF-8, and its original is kept the
   same way. With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. Bazarr can download the same wrong file
   again, and the hook does not tell Bazarr. A later check moves it again.
-- In a conversion, a sidecar that does not match is not muxed. It moves into `KEEP_DIR`, and with
+- In a conversion, a sidecar that does not match is not muxed. It moves into `.<NAME>-originals`, and with
   `KEEP_ORIGINALS_DAYS` 0 it stays beside the file. A built-in track that does not match is left out of the remux, and
-  the proof leaves it out too. The conversion then keeps the original in `KEEP_DIR`, as a forced conversion does, and
+  the proof leaves it out too. The conversion then keeps the original in `.<NAME>-originals`, as a forced conversion does, and
   the alert names it. With `KEEP_ORIGINALS_DAYS` 0, or no place to keep it, the track stays in, and the check of the new
   file turns its flags off. A sidecar whose times need a fix is muxed with new times, and its original is kept. A
   built-in track whose times need a fix gets them after the conversion. The check of the new file reads the same
@@ -1051,7 +1057,7 @@ time, 3 seconds at least and 7 at most. The reading time counts the visible char
 longer. A built-in track gets its new ends in
 the remux of "Actions": mkvextract writes its text, the ends go in, and mkvmerge reads it back, which keeps each packet
 and the ASS header byte for byte. The proof then holds each end to the plan. A sidecar is written again, and its
-original is kept. A fix goes to the log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUB_TIMING=false`
+original is kept. A fix goes to the log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUBTITLES=check`
 keeps the ends and alerts. A WebVTT track that flashes is reported and never rewritten. Imports, `--sub-check`,
 `--sub-time` and the deep analysis run it.
 
@@ -1091,7 +1097,7 @@ ratio also scales each cue's duration. With no reference, nothing is read.
 a time, and each read and each fit starts only while its time limit leaves 150 seconds. A track it has no time for is
 `deferred`, and so is every track after it. The flash check reads its tracks the same way. So a deadline never ends an
 import in an error, and the flag edit still runs. An import never reads a whole file, so a track the Cues do not index
-is skipped, and the log says so under `unindexed`. With `SUB_DEEP_ANALYSIS=true`
+is skipped, and the log says so under `unindexed`. With `SUBTITLES=deep`
 an import with a subtitle track or sidecar then queues a deep analysis of its file, see "How it runs". The deep
 analysis runs the check of `--sub-time` with the edits, the proof, the kept originals and the Plex analyze of an import,
 and it posts only its subtitle alerts. `--sub-check` adds the whole-file read and hears no sweep, because a sweep of a
@@ -1117,7 +1123,7 @@ library would take weeks.
   more, and every such offset lies under 0.75 seconds.
 
 **--sub-time.** `arr-media-guard --sub-time PATH [PATH ...] [--apply]` runs all of it on each named file, past the cache,
-and writes the cache. It acts as a backfill does, with the file lock, `HIDE_DIR`, `KEEP_DIR`, the proof and a Plex
+and writes the cache. It acts as a backfill does, with the file lock, `.<NAME>-convert`, `.<NAME>-originals`, the proof and a Plex
 analyze after an edit. Its alerts print and never post. An app names the item only for the original language and the
 inputs of the check: one list call per app, and the episode files of the one series that holds the path. A path no app
 lists, such as a copy, runs with no original language, so the decision cannot be trusted. It keeps every flag then, as
@@ -1168,3 +1174,76 @@ are these:
 - The policy status is `failed`.
 - `last_hook_run` is older than 2 days. The nightly audit writes the policy status every day, so a
   stale file means the audit schedule or the script stopped.
+
+## Webhook
+
+A Custom Script connection runs the script inside the app's container. In Docker, that container
+then needs Python, ffmpeg and mkvtoolnix. So the image runs `arr-media-guard --serve`, an HTTP
+listener in `arr_serve.py`, and each app gets a Webhook connection to it. The listener writes the
+same job file as `hook()`, through `queue_job()`, so the worker, the queue and the checks are one
+code path.
+
+**The fields.** The job takes these values. The Webhook body has each field the Custom Script
+variables give, and the listener still asks the API for the path.
+
+| Job key | Custom Script variable | Webhook field | Source in the job |
+| --- | --- | --- | --- |
+| `owner` | `radarr_movie_id`, `sonarr_series_id` | `movie.id`, `series.id` | the body, checked against the file record |
+| `file_id` | `radarr_moviefile_id`, `sonarr_episodefile_id` | `movieFile.id`, `episodeFile.id` | the body |
+| `path` | `radarr_moviefile_path`, `sonarr_episodefile_path` | `movieFile.path`, `episodeFile.path` | the API, `moviefile/<id>` or `episodefile/<id>` |
+| `release` | `radarr_moviefile_scenename`, `sonarr_episodefile_scenename` | `movieFile.sceneName`, `episodeFile.sceneName` | the API, the same record |
+| `episode_ids` | `sonarr_episodefile_episodeids` | `episodes[].id` | the API, `episode?episodeFileId=<id>` |
+| `download_id` | `radarr_download_id`, `sonarr_download_id` | `downloadId` | the body, text of at most 200 characters |
+| `deleted` | `<app>_deletedpaths` | `deletedFiles[].path` | the body, each path in the item's folder from the API |
+| `recycled` | `<app>_deletedrecyclebinpaths` | `deletedFiles[].recycleBinPath` | the body, each path in `recycleBin` of `config/mediamanagement` |
+
+`eventType` is `Download` for an import and an upgrade, and `Test` for Test. A live test used
+Sonarr 4.0 and Radarr 6.4. Both send `deletedFiles[].recycleBinPath` on an upgrade. Sonarr's On
+Import Complete trigger also sends `Download`, but with `episodeFiles` and no `episodeFile`. The
+listener refuses it and says which triggers to use.
+
+**Trust.** Each post needs HTTP basic auth, the only auth the Webhook connection sends. The apps
+send it with the first request. The listener refuses a body over 1 MiB before it reads it. It never
+uses the path in the body. The file record must belong to the item the body names, and its path
+must be a plain absolute path that this container sees. An old file must sit in the item's folder,
+and its recycle bin copy in the app's recycle bin, because a restore renames the copy back over the
+old path. A refusal answers 4xx or 5xx, and the decision log gets a line with source `webhook`. The
+app shows the answer in its Test and in its log.
+
+**Paths.** The image must see the media at the apps' paths, or `PATH_MAP` pairs the two. `arr()` and
+`arr_write()` map every path in an API answer to the local path, and every path in a query or a
+body back to the app's path. Plex gets the apps' paths. The script reads `config.xml` and the app's
+database in `RADARR_DIR` or `SONARR_DIR`, `/var/lib/<app>` by default, so the compose file mounts
+the app's config folder there, read-only. SQLite reads a live WAL database through that mount from another container. On a
+test Radarr, the image read a movie file row that sat only in the WAL.
+
+**Requests.** The listener serves 32 requests at once on a pool of threads. Each request has 10
+seconds for its headers and body together, so a client that sends one byte at a time loses its
+connection, and an idle connection gives its thread back. Up to 64 more connections wait for a
+thread, and the listener closes one past that at once. Only an app's post with the right credentials
+gets a line on stdout and, when refused, a line in the decision log. The listener counts every other
+refusal, a wrong path, wrong credentials, a malformed or cut request, and prints one summary line a
+minute at most. A live test with one byte every 5 seconds held the one-request listener of the first
+build for 465 seconds, and a Sonarr import notice failed.
+
+**The worker.** The listener starts a worker after each job, and again every 60 seconds while a job
+waits and no worker holds `worker.lock`. So a job queued while a worker was stopping, or left by a
+stopped container, still runs. The worker is a new program in its own session, `arr-media-guard
+--serve --worker`, because a fork would copy the listener's threads and a lock one of them held. It
+reads the env file and the policy at its start. In the image, tini is PID 1 and passes SIGTERM, as
+`docker stop` sends it, to the listener. The listener sends it on to the worker's process group and
+waits for it. A job that has not written goes back to the queue, and a flag edit or a re-grab ends
+first, see "Crashes and stops".
+
+**Daily jobs.** A native install runs the nightly audit from a systemd timer, and the audit removes
+kept originals older than `KEEP_ORIGINALS_DAYS`. logrotate rotates the decision log. In the image,
+the listener runs both once a day at `AUDIT_TIME`, the audit for each app whose API key reads. A day
+the container was down at that time runs at the next start.
+
+**One-off containers.** Every other mode runs in a one-off container of the same image, or with
+`docker exec` in the service. A one-off container mounts the same `/config`, so its file lock, its
+scan state and its decision log are the service's. flock works across containers on one host,
+because both open the same file. A live test held the lock in the service for 20 seconds, and a
+one-off apply waited for it. tini gives each mode the signals of a terminal. Python as PID 1 ignores a
+SIGTERM it has no handler for. Without tini, `--plex-flush` ran on through a `docker stop` to its
+end.
