@@ -436,6 +436,41 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
     return {"windows": windows, "cached": False, "reused": reused, "model": key, "took": round(time.time() - t0, 2), "profile": prof}
 
 
+def waits(gate, queue):
+    """Another hearing waits for the host's model: it holds gate, the lid.turn.gate file of the hook, while it waits for
+    its turn. Or a job file waits in the directory queue. Either one makes the sweep yield, see sweep()."""
+    if queue and any(n.endswith(".json") and not n.startswith(".") for n in os.listdir(queue)):
+        return True
+    if not gate:
+        return False
+    with open(gate, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def sweep(path, audio_index, starts, lang, group, secs=WORD_SECS, gate=None, queue=None, **kw):
+    """listen() over the windows of starts, group of them at a time, in this one process, for the sweep of --sub-time.
+    The model loads once, each group is one clip, and each group's words are cached as listen() caches them. Before
+    each group after the first it yields when another hearing or a job waits, see waits(): it returns what it heard,
+    with "yielded", and the caller hears the rest later. Returns listen()'s answer over all windows, "cached" when
+    every group was."""
+    out = {"windows": [], "cached": True, "reused": 0, "took": 0.0, "profile": {}}
+    for k in range(0, len(starts), group):
+        if k and waits(gate, queue):
+            out["yielded"] = True
+            break
+        r = listen(path, audio_index, starts[k:k + group], lang, secs, **kw)
+        out["windows"] += r["windows"]
+        out.update(cached=out["cached"] and r["cached"], reused=out["reused"] + r["reused"], took=round(out["took"] + r["took"], 2), model=r["model"])
+        for step, (cpu, wall) in (r.get("profile") or {}).items():
+            got = out["profile"].get(step, [0, 0])
+            out["profile"][step] = [round(got[0] + cpu, 2), round(got[1] + wall, 2)]
+    return out
+
+
 def words_get(cache, path, audio_index, model, lang, starts, secs=WORD_SECS):
     """The cached windows of listen() for path as it is now, or None."""
     st = os.stat(path)
@@ -491,6 +526,9 @@ def main(argv=None):
     ap.add_argument("--words", nargs="+", metavar="LANG START", help="the subtitle check: the words of a window from each START")
     ap.add_argument("--secs", type=float, default=WORD_SECS, help="the seconds of each --words window")
     ap.add_argument("--more", nargs="+", help="a second window per --words START, - for none, heard when its window hears too little")
+    ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the sweep, see sweep()")
+    ap.add_argument("--yield-gate", help="the sweep yields while another hearing holds this gate file, see waits()")
+    ap.add_argument("--yield-queue", help="the sweep yields while a job file waits in this directory, see waits()")
     ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
     a = ap.parse_args(argv)
     if a.fetch:
@@ -500,8 +538,12 @@ def main(argv=None):
     try:
         if a.words:
             more = [None if x == "-" else float(x) for x in a.more] if a.more else None
-            r = listen(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.secs, model=a.model, model_dir=a.model_dir, cache=a.cache,
-                       more=more)
+            if a.group:
+                r = sweep(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.group, a.secs, a.yield_gate, a.yield_queue, model=a.model,
+                          model_dir=a.model_dir, cache=a.cache)
+            else:
+                r = listen(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.secs, model=a.model, model_dir=a.model_dir, cache=a.cache,
+                           more=more)
         else:
             threads = min(a.threads, WORD_THREADS) if a.then_words else a.threads   # the shared model runs the subtitle check's thread count
             r = identify(a.path, a.index, a.duration, a.expect, a.model, a.model_dir, a.cache, threads, a.fresh, a.keep_pcm or bool(a.then_words))

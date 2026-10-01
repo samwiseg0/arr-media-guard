@@ -19,7 +19,10 @@ re-encodes.
 - **Subtitle match.** Whisper hears two short windows of the audio, and the hook compares the words with each text
   subtitle and `.srt` sidecar in the audio's language. A subtitle of another episode leaves the file in a proven
   remux, or stays out of a conversion. A sidecar of another episode moves to the kept originals, and Bazarr can
-  download it again. A subtitle that runs late by an offset or a frame-rate ratio gets new times.
+  download it again. A subtitle that runs late by an offset or a frame-rate ratio gets new times. A text subtitle
+  whose cues flash for a tenth of a second gets ends a viewer can read. `--sub-time` also times the subtitles it
+  cannot hear, other languages and PGS or VobSub pictures, against a subtitle that matched the audio. An import does
+  that too, as its time allows, and `SUB_DEEP_ANALYSIS` adds the rest in a deep analysis while no import waits.
 - **Broken audio and corrupt video.** It samples the audio that will play and decodes three short video windows.
   A certain fault deletes the file, marks the grab failed and lets the app search again. A daily cap limits this.
 - **Restore after a bad upgrade.** When the broken file was an upgrade, the old file comes back from the app's
@@ -119,7 +122,8 @@ the end of the line. Every key is optional. [examples/arr-media-guard.env](examp
 | `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
 | `SUB_CHECK` | `true` | Compare each text subtitle and sidecar of an import with the audio. Needs language detection. `false`: no check. |
 | `SUB_TIMING` | `true` | Give a matching subtitle new times when its times are off. `false`: it alerts only. |
-| `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced, hard-linked into `KEEP_DIR`. `0` keeps nothing. |
+| `SUB_DEEP_ANALYSIS` | `false` | `true`: after an import, a deep analysis reads the whole file for unindexed subtitle tracks, hears one window a minute, and times the subtitles that had no reference. It runs only while no import waits. |
+| `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced in `KEEP_DIR`, as a hard link, or as a verified copy where the file system refuses a link. `0` keeps nothing. |
 | `REPACK_MAX_GB` | `30` | A larger file is never remuxed or converted. |
 | `CONVERT` | `false` | Convert every imported file that is not Matroska. A backfill converts only with `--convert`. |
 | `CONVERT_MAX_FILES` | `200` | Conversions one `--convert --apply` run makes. |
@@ -207,6 +211,7 @@ arr-media-guard --backfill sonarr --convert                   # the files that a
 arr-media-guard --backfill sonarr --convert --apply           # convert them, CONVERT_MAX_FILES a run
 arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
 arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
+arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # time every subtitle of one file, dry
 arr-media-guard --subhunt radarr --ids 123                    # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
 arr-media-guard --audit radarr --since 24h --post             # the hook's edits of the last day, to Discord
 ```
@@ -222,6 +227,50 @@ run skips a file that stays as it was, with the same sidecars, and needs nothing
 stopped. It hears at the backfill's priority with one Whisper thread. The last line
 counts the files checked, the verdicts, the timing fixes and the CPU time, and estimates the time for the whole
 library.
+
+### Time the subtitles of one file
+
+```
+arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv"           # dry run: changes nothing
+arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv" --apply   # makes the changes
+```
+
+`--sub-time` runs the subtitle check of `--sub-check` on each file it names, and reads the cache of neither. It then
+times every other subtitle against a track or sidecar whose words matched the audio, and hears one window a minute. The
+file needs no app. For a path outside Sonarr and Radarr, such as a copy, it runs with no item, so it knows no original
+language. A mismatch then counts unless the file also holds audio in another language. With `--apply` it then keeps
+every audio and subtitle flag. Only a subtitle that does not match the audio loses its default and forced flags. When
+an app lookup fails, `--apply` stops before any change and exits 1. A planned change can also fail to happen. Examples
+are a remux or a header repair that failed or was skipped, a flag edit that failed, and a sidecar left as it was.
+`--apply` then lists each such file and exits 3. A path that holds no file is skipped, and the run then exits 4.
+Otherwise it exits 0.
+
+A subtitle track that old mkvmerge versions left out of the Cues index is read from the whole file. That read keeps
+only the cue times and text as ffmpeg streams them, so it writes no file.
+
+Each subtitle gets one line. The columns are:
+
+- the track's place, such as `s3`, or the sidecar's name
+- the codec, the language and the role (`full`, `sdh` or `dub`)
+- the method. `words` is the check against the heard audio, with `a reference: in time`, `fixed` or `clean sweep` when
+  it times other tracks. `reference s1` means the track was timed against `s1`. `reference, none` means no track
+  could time it.
+- the verdict. The word check gives `match`, `mismatch` or `unknown`. The reference timing gives `fit` or `weak` with
+  its score, where a weak fit only reports, or `unknown` or `deferred`.
+- the new times, as an offset and a frame-rate ratio, or `in time`
+- the action, such as `none`, `retimed`, `removed`, `flags off`, `report only` or the remux it would make
+- why
+
+A `flash` line names a text track whose cues show for a tenth of a second, and the new ends of its first cues. The sweep
+table has one row per heard window: its time, the heard words, the share that matched the cues, the cues whose first
+word matched, and their offset. `ALERT` marks two neighbouring windows 1 second or more off the fitted line the same
+way. One such window alone is marked "one window alone" and does not alert. The decision log holds the
+results under `subcheck`, `subtime`, `flash` and `sweep`.
+
+With `--apply`, a built-in track gets its new times, new ends or its removal in one remux that the packet proof checks.
+A sidecar is written again or moved. The original file or sidecar is kept for `KEEP_ORIGINALS_DAYS` (7) days at
+`<mount>/<KEEP_DIR>/<UTC time>/<path from the mount>`, where the mount holds the file. To undo a change, move the kept
+original back over the file with `mv`, then rescan the item in the app.
 
 Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
 line nightly with a systemd timer or cron to review the hook's own edits.

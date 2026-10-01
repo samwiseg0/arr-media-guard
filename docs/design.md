@@ -339,6 +339,20 @@ run their checks side by side. A job is *settled* when its checks are done and n
 from it. Before a job edits or re-grabs, it waits until every older job of the download is settled.
 So a download ends the same way as with one worker.
 
+**Deep analysis.** With `SUB_DEEP_ANALYSIS=true`, an import job queues one deep analysis job for its file in
+`STATE_DIR/deep-analysis/`, named by the path, so a newer import of the path replaces it. The worker runs one only when no
+import job waits, one at a time per host, and never drops one by age, only when its file is gone. The queue drains with
+no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
+two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
+job waits in the queue. It also stops for a waiting import job after the whole-file read, before each read and each fit
+of a track, and before the remux. It then goes back to its queue. Its next run finds the words heard so far in the
+cache, and the whole-file read in a `.read` file beside the job. With `HOOK_WORKERS=1` an import job so waits at most
+for one step: the whole-file read of one film, the read or fit of one track, one pair of windows, or one remux. With
+more workers it runs in a job process of its own. A deep analysis decides with the inputs its import stored in the job:
+the original language, the release name, the kids flag and the rest, so it asks no app. It never hears the language
+again. It keeps every flag the import set, after a remux of its own too. Only a subtitle verdict changes a flag: a
+track whose words do not match the audio loses its default and forced flags.
+
 **Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
 job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
 inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending Plex analyzes go to
@@ -526,8 +540,8 @@ whose edit list hides the last frames of a still picture, which mkvmerge keeps. 
 to the refusal a person saw. A file converts when the proof refuses it with the same text as the
 last refusal the decision log holds for its path. Another refusal, or none in the log, is not
 forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
-import, the extras and the checks after them. The original is hard-linked into `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
-header repair keeps it, so one move undoes the conversion. The option needs `KEEP_ORIGINALS_DAYS`
+import, the extras and the checks after them. The original is kept in `KEEP_DIR` for `KEEP_ORIGINALS_DAYS`, as a
+header repair keeps it, so one move undoes the conversion. See "Kept originals" for the hard link and its copy fallback. The option needs `KEEP_ORIGINALS_DAYS`
 above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
 "forced". A listed path that is not in the run's work list is reported and skipped. The hook
 never forces a conversion.
@@ -658,8 +672,14 @@ A header repair, a tail cut, a trim and a subtitle removal keep the file they re
 `KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
 hard-linked to `<mount>/<KEEP_DIR>/<UTC time>/<path from the mount>`, where the mount is the mount
 point that holds the file. With the app root folders and the Plex sections below the mount, nothing
-scans the folder. A hard link needs no space and never leaves the path missing. When a link is not
-possible, the repair is skipped. To undo a repair, move the kept file back and rescan the item.
+scans the folder. A hard link needs no space and never leaves the path missing.
+
+Some file systems refuse a hard link. A keep folder on another file system does, and so do a file with too many links
+and some container or Windows mounts. The original is then copied, with its mode and times. The copy needs the file's size
+plus 1 GB free, else the fix is skipped and says why. It is written under a hidden name, compared with the original
+by size and hash, and only then renamed to the kept name. So the swap waits for a whole copy, and a crash leaves no
+file that looks kept. The log and the report of `--sub-time` say "copied" instead of "hard-linked". Any other link
+error skips the fix, as before. To undo a repair, move the kept file back and rescan the item.
 `KEEP_DIR` and `HIDE_DIR` must be hidden folder names that start with a dot. Any other value takes the
 default.
 Each keep and the nightly audit remove the time folders older than the setting.
@@ -754,7 +774,8 @@ under 8 seconds of speech is dropped, and the next cut comes from another positi
 once three samples hold speech. faster-whisper names the language of each one. It uses the `small`
 model, int8 on CPU, because `small` names a wrong language less often than `tiny` and `base`. A
 sample under 0.6 names no language. The module answers only with two or more votes, all for one
-language, averaging 0.8 or more. Otherwise `lang` is null, and `why` names the rule that failed.
+language, averaging 0.8 or more. Otherwise `lang` is null, and `why` names the rule that failed. The onnxruntime of the
+Whisper venv writes an empty `/tmp/mat-debug-<pid>.log` on each start. The hook removes the one its own hearing left.
 
 **What it cannot hear.** Whisper does not know Irish, Scottish Gaelic, Mixtec, Zulu, Xhosa, Quechua
 or Kurdish, and it names a neighbour for them. It knows Belarusian but gets it wrong (`WEAK`). When
@@ -920,7 +941,9 @@ the median lead of right tracks, so a fixed copy lands within the spread of thos
 
 - The track is in time when the cues at the file's start and end, and at every window, sit under 0.75 seconds off. So
   the drift is judged by the error it causes at the file's ends, where it is largest. Right tracks sat closer, and a
-  24/23.976 drift of an 18-minute episode sat farther.
+  24/23.976 drift of an 18-minute episode sat farther. A plain shift under 0.75 seconds is in time too. A right track
+  can trend a few tenths of a second over the file, and a line through two of its windows then runs past 0.75 seconds
+  at a file's end. A shift would only move the rest of the track off.
 - A ratio of 1, 25/23.976, 25/24 or 24/23.976, or the inverse of one, fits when every window, a middle one too, lies
   within 0.3 seconds of one offset at that ratio. The middle window must also lie within 0.3 seconds of the line through
   the early and the late window, and that line must stay under 0.75 seconds from the offset at the file's ends. The
@@ -936,6 +959,20 @@ the median lead of right tracks, so a fixed copy lands within the spread of thos
   speech is in the audio, many seconds away for a 25 fps track. When it hears under 8 words, as on a chant that
   Whisper drops, a window of 24 seconds elsewhere in that part is heard in the same process. When both hear too
   little, the track keeps its times with no alert.
+- Two windows can also land on a short patch of a right track that sits early or late. So on an import, and in a
+  `--sub-check` backfill, a small fix needs one more hearing. A small fix moves the cues under 1.5 seconds at both
+  ends of the file. A fix that moves them more, as a frame-rate drift does, keeps the rules above. The hearing takes a
+  window at about a third and one at about two thirds of the file, away from the windows heard already. A window that
+  hears too little gets a window of 24 seconds elsewhere in its part. Each of them must hold 3 matched cues and sit
+  within 0.3 seconds of the fix's line. A window too thin to judge confirms nothing. These windows never change the
+  verdict, and the hearing costs one more run of the model with two windows. A small fix they do not confirm is not
+  applied, with no alert. An import with the deep analysis on queues it, and the deep analysis judges the track. Else
+  only the decision log holds the fix. A check after a conversion picks the same windows again.
+- `--sub-time` and the deep analysis hear no such windows, because their sweep judges the fix. After the fix, the
+  sweep's windows with 3 matched cues must sit at least as close to the fitted line as they sat to the audio before: as
+  many within 0.3 seconds, and at a median distance no larger. A sweep that shows the track in time so blocks the fix,
+  and so does a sweep that heard under 3 such windows. The track then keeps its times, with no alert, and a clean
+  sweep makes it a reference.
 - No ratio that fits is two offsets, a different cut, and the times stay. It alerts when the windows differ by 1
   second or more. A smaller step, as a right track can show, goes only to the decision log and the backfill report.
   Two ratios that fit and move the cues apart by more than 0.3 seconds at the file's ends give no fix and alert, a
@@ -950,7 +987,11 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 
 - A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitle"
   alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
-  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `HIDE_DIR`. ffmpeg copies every
+  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `HIDE_DIR`. Its work files, the
+  extracted text, the proof's reads and the cover attachments, go into a folder under `STATE_DIR`, never the system
+  temp dir, which is often a small tmpfs. The trim, the damage read, the conversion and the video windows keep their
+  work files there too. A worker that starts removes a work folder that a killed step left over a day ago. ffmpeg
+  copies every
   kept stream with `-copyinkf`, and reads a retimed track from a second input of the same file with `-itsoffset` and
   `-itsscale`. A cue that the fix moves before 0 starts at 0, through the `setts` filter. A negative time would make
   ffmpeg move every stream. When the audio has a codec delay, as AAC, Opus, AC-3 or MP3 that ffmpeg wrote into Matroska
@@ -958,7 +999,9 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   as it was, and the "subtiming" alert says the remux failed. A fix that moves no cue before 0 passes. mkvmerge moved
   AAC lace times by 2 ms in a Matroska to Matroska remux, and the proof refused it, while ffmpeg keeps the times it
   reads.
-- mkvpropedit then puts back the Segment UID, and each kept track's UID, BCP 47 tag, name and flags. The new file must
+- mkvpropedit then puts back the Segment UID, and each kept track's UID, BCP 47 tag, name and flags. ffmpeg reads an
+  image attachment, such as a cover, as a picture stream and would write it as a video track. So the map leaves it
+  out, and mkvpropedit adds it back with its name, type and UID. The new file must
   keep the type, codec and language of each kept track in order, its UID, its BCP 47 tag, the properties in
   `KEEP_PROPS` (its name, flags and codec private data), and the count of attachments and chapters. The proof of
   "Conversion" must pass with the retimed tracks' times as the fix moves them. It also holds each stream to its own
@@ -995,6 +1038,99 @@ for its size and mtime and its sidecars, and ask for nothing more. So a stopped 
 after a dry run still acts, and a new sidecar from Bazarr is checked. `--sub-check` also takes a file with a sidecar
 that the flag backfill leaves out. The decision log holds each result in `subcheck`, the remux in `subremux` and the
 sidecar actions in `sidecars`.
+
+**Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.
+The check reads the CueDuration of each subtitle entry from the Cues, which mkvmerge and ffmpeg write, so it reads no
+block for this. A text track or `.srt` sidecar whose median cue shows under 0.5 seconds, in any language and role,
+forced too, flashes. Only a cue with a visible character counts, so a cue of tags or of a zero-width space is left
+out, and the track needs 20 such cues. Half its short cues must also end over two frames before the next cue starts.
+A sign drawn frame by frame, or a karaoke line, runs straight into its next event, so it never flashes. Right text
+tracks show their median cue for a second or more, and a flash track for about a seventh of a second. Only a cue under
+0.5 seconds gets a new end: the next cue's start less two frames (0.083 s), at most the start plus twice the reading
+time, 3 seconds at least and 7 at most. The reading time counts the visible characters, 17 a second. A cue only gets
+longer. A built-in track gets its new ends in
+the remux of "Actions": mkvextract writes its text, the ends go in, and mkvmerge reads it back, which keeps each packet
+and the ASS header byte for byte. The proof then holds each end to the plan. A sidecar is written again, and its
+original is kept. A fix goes to the log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUB_TIMING=false`
+keeps the ends and alerts. A WebVTT track that flashes is reported and never rewritten. Imports, `--sub-check`,
+`--sub-time` and the deep analysis run it.
+
+**Reference timing.** A text track in another language than the audio, Japanese, Chinese or Thai text, a PGS or VobSub
+track, and an `.srt` sidecar the word check leaves out get their times from a reference. A reference is a track or
+sidecar of the same file whose words matched and whose times are in time or fixed, with its fix applied. Forced and
+commentary tracks stay out. The fit reads no words. It compares when the cues show, in the manner of alass, so a
+translation that splits or merges lines still fits. It tries each ratio at the offset the cue starts point to, and keeps
+the one where the cues cover the most of the reference's, each cue counted up to 10 seconds. The score is that overlap
+above its mean at ten offsets far from the best, so dense cues do not score by chance. A right pair scores well over
+0.3, and another episode's track or another film's scores near 0. Under 0.3 is a weak fit, which only reports. A fit
+then pairs cue starts with reference starts in ten slices of the span, each at its own offset, and the rules of
+"Timing" judge the slices. Every slice must lie within 0.3 seconds of the fix, and a ratio needs a middle slice on its
+line. So a cut, in one step or in several, gives no fix and an alert, and the alert says the track disagrees with its
+reference. Five slices fixed more shifted copies of real tracks, but they let a cut in steps pass several times as
+often, so the fit keeps ten.
+
+- **Sparse slices.** A slice where the track or the reference starts under 6 cues is left out, such as the credits or
+  a song only one side times. Chance pairs of so few starts can outvote the right offset. Each half of the span needs 3
+  slices that are not left out, else no fix.
+- **The slice search.** A slice searches its offset within 60 seconds of the whole track's offset, so a cut of up to a
+  minute shows. A search over the whole 120 seconds let chance put a slice of a right track far off, which read as a
+  cut. A peak more than 1 second from the track's offset must hold over 1.5 times the pairs of any other offset, else
+  the slice has no clear offset and the times stay. A peak at the track's offset needs no such margin, because a right
+  slice often holds a second peak one line away.
+
+The reference is in audio time. A fixed reference moves by its fix. An in-time reference moves by its own measured
+offset, which can reach 0.75 seconds. So a target's offset to the audio is its offset to the reference plus the
+reference's offset, and a fix comes only when that total is 0.75 seconds or more. The fix moves the target to the
+audio. When a second reference also fits the target, the fix must give the same times against it at both ends of the
+file, else the times stay. A picture cue is a PGS display set with an object up to the next set, or a VobSub packet up
+to its stop command, and it ends 10 seconds after it starts at most. A PGS block is one small read of its first bytes.
+The fixes go into the one remux with the word check's. ffmpeg's copy of a PGS or VobSub track passes the proof, and a
+ratio also scales each cue's duration. With no reference, nothing is read.
+
+**Two stages.** An import, `--sub-check` and `--sub-time` run the reference timing. An import reads and fits one track at
+a time, and each read and each fit starts only while its time limit leaves 150 seconds. A track it has no time for is
+`deferred`, and so is every track after it. The flash check reads its tracks the same way. So a deadline never ends an
+import in an error, and the flag edit still runs. An import never reads a whole file, so a track the Cues do not index
+is skipped, and the log says so under `unindexed`. With `SUB_DEEP_ANALYSIS=true`
+an import with a subtitle track or sidecar then queues a deep analysis of its file, see "How it runs". The deep
+analysis runs the check of `--sub-time` with the edits, the proof, the kept originals and the Plex analyze of an import,
+and it posts only its subtitle alerts. `--sub-check` adds the whole-file read and hears no sweep, because a sweep of a
+library would take weeks.
+
+- **The whole-file read.** Old mkvmerge versions wrote no cue entry for a subtitle block, and many files in a library
+  come from them. For those tracks `--sub-check`, `--sub-time` and the deep analysis read the whole file once, with one
+  ffmpeg at nice 19 and idle I/O that writes each track in its own format into its own pipe. The read keeps only the
+  cue times and text as they arrive. A PGS track keeps only its PCS segments, because its pictures can take GBs. So
+  the read writes no file and needs no free space. `--sub-check` and `--sub-time` read under the shared file lock.
+  The deep analysis reads before it takes the lock, since a film takes minutes. The read is kept by the file's size
+  and mtime, so a file that changed meanwhile is read again under the lock. ffmpeg reads mkvmerge's WebVTT codec id
+  as unknown, so such a track stays unread.
+- **The sweep.** `--sub-time` and the deep analysis hear one 10-second window a minute of each track the word check
+  reads, at its densest cues. One arr_lid.py process hears them with the model loaded once, two windows a Whisper run,
+  and each pair is cached like the other hearings. Each row gives the heard words, the overlap, the cues whose first
+  word matched and their offset. A row with 3 such cues and 1 second or more off the fitted line alerts when its
+  neighbour among such rows is off 1 second or more the same way. A part of the file that is off holds such windows in
+  a row. One window alone goes to the log only, because Whisper can hear a word with the line before it and move one
+  window's offset by a second. The sweep never changes a time.
+- **A clean sweep.** A match with too few anchors for a fix is a reference when its sweep is clean: in each half of the
+  file 3 windows or more heard 8 words and gave an offset, every window that heard 8 words matched at 50 percent or
+  more, and every such offset lies under 0.75 seconds.
+
+**--sub-time.** `arr-media-guard --sub-time PATH [PATH ...] [--apply]` runs all of it on each named file, past the cache,
+and writes the cache. It acts as a backfill does, with the file lock, `HIDE_DIR`, `KEEP_DIR`, the proof and a Plex
+analyze after an edit. Its alerts print and never post. An app names the item only for the original language and the
+inputs of the check: one list call per app, and the episode files of the one series that holds the path. A path no app
+lists, such as a copy, runs with no original language, so the decision cannot be trusted. It keeps every flag then, as
+the deep analysis does, and only a subtitle verdict changes a flag. An app that does not run on the host lists nothing.
+A lookup that fails, by an error, a timeout or an app restart, is not the same: `--apply` then stops before any
+change, and a dry run says why it knows no original language.
+
+A research prototype of lapse's peak sigma scored another episode's track almost as high as a right one, so the fit
+keeps the lift.
+
+**Centre channel.** Whisper hears the mono mix of all channels. The centre channel alone kept the language verdicts,
+but a subtitle check lost its match where the centre channel was quiet and the mix still held the words. The mix
+stays.
 
 ## Status file
 

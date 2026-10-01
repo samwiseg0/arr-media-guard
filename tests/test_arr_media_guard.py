@@ -29,6 +29,7 @@ import copy
 import datetime
 import fcntl
 import gc
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -696,6 +697,12 @@ def plex_analyzed():
     """The worker's record of the last analyze per section, and its read of the decision log, start empty in each test."""
     hook.PLEX_ANALYZED.clear()
     hook.PLEX_LOGGED[:] = [0, collections.defaultdict(float), None]
+
+
+@pytest.fixture(autouse=True)
+def state_dir_in_tmp(tmp_path_factory, monkeypatch):
+    """STATE_DIR is a folder of the test, so no test writes to the host's. env sets its own."""
+    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path_factory.mktemp("state")))
 
 
 def drain(pending):
@@ -1907,10 +1914,11 @@ def test_a_malformed_policy_never_stops_the_import_of_the_script(tmp_path, monke
     envfile = tmp_path / "env"
     envfile.write_text(f"POLICY_FILE='{bad}'\n")
     monkeypatch.setenv("ARR_MEDIA_GUARD_ENV", str(envfile))
+    before = hook.arr_decide.POLICY   # another test in this process may have loaded an equal policy anew
     loader = importlib.machinery.SourceFileLoader("arr_media_guard_bad", os.path.join(FILES, "arr-media-guard"))
     fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("arr_media_guard_bad", loader))
     loader.exec_module(fresh)   # AttributeError inside set_policy, caught at import
-    assert fresh.POLICY_ERROR.startswith("AttributeError") and hook.arr_decide.POLICY is POLICY
+    assert fresh.POLICY_ERROR.startswith("AttributeError") and hook.arr_decide.POLICY is before
 
 
 def test_a_missing_policy_alerts_once_and_skips(env, monkeypatch):
@@ -2759,9 +2767,19 @@ INTERRUPT = """
 import importlib.machinery, importlib.util, json, os, sys, time
 loader = importlib.machinery.SourceFileLoader("h", sys.argv[1])
 h = importlib.util.module_from_spec(importlib.util.spec_from_loader("h", loader)); loader.exec_module(h)
+h.CFG["STATE_DIR"] = os.path.join(os.path.dirname(os.path.dirname(sys.argv[2])), "state")   # the work folders go there
+os.makedirs(h.CFG["STATE_DIR"], exist_ok=True)
 h.mkvmerge = lambda p: time.sleep(60)   # the checks never end, so the signal lands inside the conversion
 print(h.convert("radarr", sys.argv[2], {"container": {"type": "MP4/QuickTime"}, "tracks": []}, os.stat(sys.argv[2]), True), flush=True)
 """
+
+
+def written(path):
+    """The file at path holds a byte. It may go at any moment, when the process that writes it stops."""
+    try:
+        return os.stat(path).st_size > 0
+    except FileNotFoundError:
+        return False
 
 
 @pytest.mark.parametrize("tool", ["fake", "mkvmerge"])
@@ -2784,12 +2802,12 @@ def test_an_interrupted_repack_leaves_no_temp_file(media, tmp_path, tool, sig):
     before, tmp = path.read_bytes(), hook.repack_tmp(str(path))
     p = subprocess.Popen([sys.executable, "-c", INTERRUPT, os.path.join(FILES, "arr-media-guard"), str(path)], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.time() + 30
-    while not (os.path.exists(tmp) and os.path.getsize(tmp)) and time.time() < deadline:
+    deadline = time.time() + 120   # mkvmerge runs at nice 19 and idle I/O, so a loaded host starts it late
+    while not written(tmp) and time.time() < deadline:
         time.sleep(0.005)
     assert os.path.exists(tmp), p.communicate(timeout=5)
     p.send_signal(sig)
-    out, err = p.communicate(timeout=30)
+    out, err = p.communicate(timeout=120)
     assert p.returncode == (128 + signal.SIGTERM if sig == signal.SIGTERM else -signal.SIGINT), (p.returncode, out, err)
     assert os.listdir(path.parent) == [path.name] and path.read_bytes() == before, err
 
@@ -4241,12 +4259,12 @@ def test_an_interrupted_header_repair_leaves_no_temp_file(mkvs, tmp_path, tool, 
     before, tmp = path.read_bytes(), hook.repack_tmp(str(path))
     p = subprocess.Popen([sys.executable, "-c", HEADER_INTERRUPT, os.path.join(FILES, "arr-media-guard"), str(path)], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.time() + 30
-    while not (os.path.exists(tmp) and os.path.getsize(tmp)) and time.time() < deadline:
+    deadline = time.time() + 120   # mkvmerge runs at nice 19 and idle I/O, so a loaded host starts it late
+    while not written(tmp) and time.time() < deadline:
         time.sleep(0.005)
     assert os.path.exists(tmp), p.communicate(timeout=5)
     p.send_signal(sig)
-    out, err = p.communicate(timeout=30)
+    out, err = p.communicate(timeout=120)
     assert p.returncode == (128 + signal.SIGTERM if sig == signal.SIGTERM else -signal.SIGINT), (p.returncode, out, err)
     assert os.listdir(path.parent) == [path.name] and path.read_bytes() == before, err
 
@@ -4593,7 +4611,7 @@ def test_a_repack_keeps_the_original_for_a_week(mkvs, tmp_path, monkeypatch, cas
     if case == "no place":
         monkeypatch.setattr(hook, "keepable", lambda p, s: f"{root} is on another file system")
     if case == "link fails":
-        monkeypatch.setattr(hook.os, "link", lambda a, b: (_ for _ in ()).throw(OSError(18, "Invalid cross-device link")))
+        monkeypatch.setattr(hook.os, "link", lambda a, b: (_ for _ in ()).throw(OSError(5, "Input/output error")))   # no refusal, see LINK_REFUSED
     if case == "killed":
         monkeypatch.setattr(hook.os, "replace", lambda a, b: (_ for _ in ()).throw(SystemExit(143)))
         with pytest.raises(SystemExit):
@@ -4613,7 +4631,7 @@ def test_a_repack_keeps_the_original_for_a_week(mkvs, tmp_path, monkeypatch, cas
         assert path.read_bytes() == before and "warnings" not in info
         return
     if case == "link fails":
-        assert result == "header repair failed: the original could not be kept, so it stays: [Errno 18] Invalid cross-device link"
+        assert result == "header repair failed: the original could not be kept, so it stays: [Errno 5] Input/output error"
         assert path.read_bytes() == before and sorted(os.listdir(lib)) == [path.name]
         return
     kept = info["kept"]
@@ -7733,11 +7751,12 @@ def cue_el(i, data):
 
 def test_cue_blocks_takes_only_entries_with_a_relative_position():
     """The byte search needs a CueRelativePosition right after the CueClusterPosition. An entry where another element
-    comes there, a CueDuration here, is left out, so its value never reads as a position."""
+    comes there, a CueDuration here, is left out, so its value never reads as a position. A CueDuration after the
+    CueRelativePosition gives the block's duration."""
     d = hook.arr_decide
     point = lambda rest: cue_el(d.CUEPOINT, cue_el(d.CUETIME, b"\x00") + cue_el(d.CUETRACKPOS, cue_el(d.CUETRACK, b"\x02") + cue_el(0xF1, b"\x05") + rest))
-    b = point(cue_el(0xF0, b"\x03")) + point(cue_el(0xB2, b"\x07")) + point(cue_el(0xF0, b"\x09"))
-    assert d.cue_blocks(b, {2}, 10) == {2: [(5, 3), (5, 9)]} and d.cue_blocks(b, {2}, 1) == {2: [(5, 3)]} and d.cue_blocks(b, {3}, 10) == {}
+    b = point(cue_el(0xF0, b"\x03")) + point(cue_el(0xB2, b"\x07")) + point(cue_el(0xF0, b"\x09") + cue_el(0xB2, b"\x8a"))
+    assert d.cue_blocks(b, {2}, 10) == {2: [(5, 3, None), (5, 9, 138)]} and d.cue_blocks(b, {2}, 1) == {2: [(5, 3, None)]} and d.cue_blocks(b, {3}, 10) == {}
 
 
 def test_block_frame_checks_the_track_and_the_lacing():
@@ -7783,12 +7802,13 @@ def hearing(env, monkeypatch, cues, lines=talk.RIGHT, answer=None, spoken=lambda
     hears lines in the windows asked, or gives answer. spoken(i) False drops line i, for a window with little speech.
     env["words"] records (audio index, language, windows) per hearing."""
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want: {p: c for p, c in cues.items() if p in want})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: {p: c for p, c in cues.items() if p in want})
 
-    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None):
+    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None):
         if not words:
             return {"why": "no language hearing in these tests"}
         env.setdefault("words", []).append((index, words[0], list(words[1])))
+        env.setdefault("group", []).extend(words[4:5])
         if answer:
             return answer
         got = [dict(w, secs=words[2]) for w in talk.heard(words[1], lines, secs=words[2], keep=spoken)]
@@ -7895,7 +7915,7 @@ def late_english_film(env, monkeypatch, lines=talk.RIGHT, **kw):
     env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
     hearing(env, monkeypatch, {"s1": talk.cues(lines, **(kw or {"offset": 2.0}))})
     got = []
-    def fake_resub(path, j, st, apply, fixes, drop=()):
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
         got.append((apply, fixes, list(drop)))
         if env.get("resub_fails"):
             return "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
@@ -8008,7 +8028,7 @@ def removal_film(env, monkeypatch, tmp_path, fails=False):
     monkeypatch.setattr(hook, "KEEP_DAYS", 7)
     got, env["resub_fails"] = [], fails
 
-    def fake_resub(path, j, st, apply, fixes, drop=()):
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
         got.append((apply, fixes, list(drop)))
         if fails:
             return "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
@@ -8259,7 +8279,7 @@ def test_convert_subs_leaves_out_what_does_not_match(monkeypatch, tmp_path):
                 "Film A (1979).en.sdh.srt": {"verdict": "match", "why": "", "timing": {"fix": {"rate": "1/1", "offset": 2.0}}},
                 "s1": {"verdict": "mismatch", "why": "the heard words match the cues at 0%, 3% at best", "timing": None}}
     asked = []
-    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: asked.append(sorted(items)) or verdicts)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False: asked.append(sorted(items)) or verdicts)
     info = {}
     keep, drop = hook.convert_subs(str(video), j, streams, subs, talk.DURATION, True, str(tmp_path), info)
     assert asked == [sorted(verdicts)] and drop == [(2, 2)] and info["tracks_unmatched"] == ["s1"]
@@ -8432,7 +8452,7 @@ def test_a_conversion_keeps_a_translated_sidecar(monkeypatch, tmp_path):
     (tmp_path / "Film A (1979).en.srt").write_text(srt_text(talk.cues(talk.OTHER)))
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     monkeypatch.setattr(hook, "KEEP_DAYS", 7)
-    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: {k: {"verdict": "mismatch", "why": "5%", "timing": None} for k in items})
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False: {k: {"verdict": "mismatch", "why": "5%", "timing": None} for k in items})
     subs, info = hook.sidecar_subs(str(video)), {}
     keep, drop = hook.convert_subs(str(video), sub_probe(audio=(("eng", True),)), [], subs, talk.DURATION, True, str(tmp_path), info, {"jpn", "jap"})
     assert [s["name"] for s in keep] == ["Film A (1979).en.srt"] and drop == [] and "sidecars_unmatched" not in info
@@ -8471,7 +8491,7 @@ def test_a_conversion_with_no_place_to_keep_the_original_keeps_the_track(monkeyp
     monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=srt_text([(1, 2, "Hello")] * 30), stderr=""))
     asked = []
-    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None: asked.append(sorted(items)) or
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False: asked.append(sorted(items)) or
                         {k: {"verdict": "mismatch", "why": "5%", "timing": None} for k in items})
     for days, drop in ((0, []), (7, [(2, 2)])):
         monkeypatch.setattr(hook, "KEEP_DAYS", days)
@@ -8612,10 +8632,10 @@ def test_a_language_check_runs_the_subtitle_hearings_with_its_model(env, monkeyp
     env["probe"] = sub_probe(("eng", False, {}), audio=(("eng", True),))
     env["probe"]["tracks"][1]["properties"]["language_ietf"] = "es"   # the two tags disagree, so the language check runs
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want: {"s1": talk.cues(talk.RIGHT)} if "s1" in want else {})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: {"s1": talk.cues(talk.RIGHT)} if "s1" in want else {})
     seen = []
 
-    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None):
+    def fake_lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None):
         if then:
             with open(then) as f:
                 seen.append((keep, json.load(f)))
@@ -8643,10 +8663,10 @@ def test_a_ratio_hears_a_middle_window_where_its_speech_is(env, monkeypatch, rat
     quiet = lambda i: not (chant and audio_mid - 1 <= talk.FIRST + talk.GAP * i < audio_mid + S.WINDOW)
     hearing(env, monkeypatch, {"s1": track}, spoken=quiet)
     got = []
-    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
     hook.main([])
     r = decided(env)["subcheck"]["s1"]
-    (_, _, first), (_, _, mid) = env["words"]
+    (_, _, first), (_, _, mid) = env["words"]   # a drift of seconds needs no windows on the line, see arr_subsync.needs_line()
     assert len(first) == 2 and mid == [pytest.approx(audio_mid, abs=0.1)], (first, mid, audio_mid)
     assert 0.4 <= (mid[0] - first[0]) / (first[1] - first[0]) <= 0.6, (first, mid)
     assert bool(env["more"][1]) == chant, env["more"]   # the window of THIRD seconds, heard only when the first hears too little
@@ -8695,11 +8715,182 @@ def test_a_far_drift_hears_where_the_ratio_puts_the_speech(env, monkeypatch):
     track = talk.cues(talk.RIGHT, rate=rate)
     hearing(env, monkeypatch, {"s1": track}, spoken=silent_late_windows(track))
     got = []
-    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
     hook.main([])
     r = decided(env)["subcheck"]["s1"]
     assert [len(ws) for _, _, ws in env["words"]] == [2, 2, 1], env["words"]   # the first hearing, the drift hearing, the middle
     assert r["verdict"] == "match" and Fraction(r["timing"]["fix"]["rate"]) == rate and got, r
+
+
+def patched_windows(offset):
+    """where() for talk.cues(): the cues around the two windows of the first hearing sit offset s off, and every other
+    cue is in time, as a short patch of a right track that the windows happen to land on."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    first = S.windows(talk.cues(talk.RIGHT), talk.DURATION, stop)
+    return lambda i: offset if any(a - 5 <= talk.FIRST + talk.GAP * i <= a + S.WINDOW + 5 for a in first) else 0.0
+
+
+@pytest.mark.parametrize("deep", [True, False])
+def test_an_import_never_fixes_a_right_track_whose_two_windows_land_on_a_patch(env, monkeypatch, deep):
+    """The cues around both windows of the first hearing sit 0.85 s early, and the rest of the track is in time. The two
+    windows ask for a fix under LINE_SHIFT, so the import hears a window at a third and one at two thirds of the file.
+    Those sit in time, off the fix's line, so the times stay, and the deep analysis judges the track."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", deep)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=patched_windows(-0.85))})
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: pytest.fail("a patch is no reason to retime a track"))
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: os.remove(os.path.join(hook.deep_analysis_dir(), n)))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    assert t["fix"] is None and t["unconfirmed"]["rate"] == "1/1" and len(env["words"]) == 2 and len(t["line"]) == 2, t
+    assert "do not sit on its line" in t["why"] and t["why"].endswith("the deep analysis judges it" if deep else "the times stay"), t["why"]
+
+
+def test_an_import_fixes_a_drift_whose_window_at_two_thirds_is_noisy(env, monkeypatch):
+    """A 25/23.976 drift. Around two thirds of the file only 3 lines are heard, and their cues sit 0.48 s early. A fix
+    that moves the cues by seconds keeps the rules of fit(), and the noisy window vetoes nothing, so the drift is fixed."""
+    rate = Fraction(25025, 24000)
+    region = lambda i: 0.62 * talk.DURATION <= talk.FIRST + talk.GAP * i <= 0.72 * talk.DURATION
+    kept = [i for i in range(talk.LINES) if region(i)][::12][:3]
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, rate=rate, where=lambda i: -0.48 if region(i) else 0.0)},
+            spoken=lambda i: not region(i) or i in kept)
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    assert t["fix"] and Fraction(t["fix"]["rate"]) == rate and got, t
+
+
+def test_an_import_fixes_a_small_shift_that_the_windows_on_its_line_confirm(env, monkeypatch):
+    """A track 1.2 s late everywhere. The windows at a third and two thirds sit on the fix's line, so the fix stands."""
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=1.2)})
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append(fixes) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    assert near_fix(t["fix"], 1.2) and t["why"].endswith("sit on its line") and got and near_fix(list(got[0].values())[0], 1.2), t
+
+
+def test_sub_time_hears_no_windows_on_the_line_as_its_sweep_judges_the_fix(env, monkeypatch):
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=1.2)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": sweep_rows([1.2] * 10)}, {"cpu": 0, "took": 0, "failed": []}))
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--sub-time", env["path"]])
+    assert len(env["words"]) == 1 and near_fix(decided(env)["subcheck"]["s1"]["timing"]["fix"], 1.2), env["words"]
+
+
+def test_the_windows_on_the_line_land_at_a_third_and_two_thirds_with_their_longer_windows(env, monkeypatch):
+    """A track 1.2 s late. The hearing on the line asks for one window of WINDOW seconds in each part of LINE_PARTS,
+    where the fix puts the speech, and a window of THIRD seconds in the same part for each."""
+    S = hook.arr_subsync
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, offset=1.2)})
+    real, asked = hook.lid_run, []
+    monkeypatch.setattr(hook, "lid_run", lambda *a, words=None, **k: asked.append(words) or real(*a, words=words, **k))
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    lang, ws, secs, more = asked[-1][:4]
+    parts = [(a * talk.DURATION - 1.2, b * talk.DURATION) for a, b in S.LINE_PARTS]
+    assert secs == S.WINDOW and len(ws) == len(more) == 2 and all(lo <= w <= hi and lo <= m <= hi for w, m, (lo, hi) in zip(ws, more, parts)), asked[-1]
+    assert all(abs(w - m) >= S.WINDOW for w, m in zip(ws, more)) and decided(env)["subcheck"]["s1"]["timing"]["line"] == ws
+
+
+def test_the_windows_on_the_line_are_placed_in_cue_time_and_heard_in_audio_time(env, monkeypatch):
+    """A track 1.2 s late, and an earlier hearing at 373.3 s in the audio, which is 374.5 s in cue time. The windows on
+    the line are picked from the cues in cue time, away from the windows heard already, each moved to cue time. A
+    longer window of THIRD seconds goes in each part too. Both are heard where the fix puts their speech, 1.2 s
+    earlier in the audio."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    english_film(env, ("eng", False, {}))
+    track = talk.cues(talk.RIGHT, offset=1.2)
+    hearing(env, monkeypatch, {"s1": track})
+    real, asked = hook.lid_run, []
+    monkeypatch.setattr(hook, "lid_run", lambda *a, words=None, **k: asked.append(words) or real(*a, words=words, **k))
+    first = S.windows(track, talk.DURATION, stop)
+    r = hook.sub_verdicts(env["path"], env["probe"], {"s1": ("eng", 0, track)}, starts={0: [[first, S.WINDOW], [[373.3], S.WINDOW]]})["s1"]
+    fix = r["timing"]["fix"]
+    taken = [a + 1.2 for a in first + [373.3]]   # the windows heard, in cue time
+    cue = S.windows(track, talk.DURATION, stop, taken=taken, parts=S.LINE_PARTS)
+    long = S.windows(track, talk.DURATION, stop, secs=S.THIRD, taken=taken + cue, parts=S.LINE_PARTS)
+    audio = lambda ws: [round(S.moved(a * 1000, fix) / 1000, 1) for a in ws]
+    assert near_fix(fix, 1.2) and cue == [384.7, 726.8] and asked[-1][1:4] == (audio(cue), S.WINDOW, audio(long)), (asked[-1], cue, long)
+
+
+def test_a_check_after_a_conversion_hears_the_windows_on_the_line_of_the_check_before(env, monkeypatch):
+    """The second check replays the hearings of the first, the windows on the line too, and hears no new pair."""
+    english_film(env, ("eng", False, {}))
+    track = talk.cues(talk.RIGHT, offset=1.2)
+    hearing(env, monkeypatch, {"s1": track})
+    items = {"s1": ("eng", 0, track)}
+    first = hook.sub_verdicts(env["path"], env["probe"], items)["s1"]
+    env["words"].clear()
+    again = hook.sub_verdicts(env["path"], env["probe"], items, starts={0: first["starts"]})["s1"]
+    assert [w for _, _, w in env["words"]] == [s[0] for s in first["starts"]] and first["starts"][-1][3:] == ["line"], (env["words"], first["starts"])
+    assert again["timing"]["fix"] == first["timing"]["fix"] and again["timing"]["line"] == first["timing"]["line"], again["timing"]
+
+
+def test_a_backfill_never_promises_a_deep_analysis_it_does_not_queue(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=patched_windows(-0.85))})
+    rec = hook.process("radarr", env["path"], "Film A (1979)", "English", round(talk.DURATION / 60), apply=False, post=False, source="backfill",
+                       sub_check=True)
+    t = rec["subcheck"]["s1"]["timing"]
+    assert t["fix"] is None and t["why"].endswith("so the times stay"), t["why"]
+
+
+def test_a_replan_names_its_reason_in_the_log(env, monkeypatch):
+    real, calls = hook.process, []
+
+    def process(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise hook.Replan("a subtitle needs a remux", {"cpu": 1.0, "took": 1.0, "failed": [], "runs": 1, "cached": 0})
+        return real(*a, **k)
+    monkeypatch.setattr(hook, "process", process)
+    hook.run_job(enqueue(env, 0, env["path"]), [], shared=True)
+    warning = [r for r in log_lines(env) if r.get("result") == "warning"][0]
+    assert warning["note"] == "re-planned with the file lock exclusive: a subtitle needs a remux", warning
+
+
+@pytest.mark.parametrize("report", ["sub_time_text", "sub_text"])
+def test_an_unconfirmed_fix_reads_as_times_stay_in_both_reports(report):
+    r = {"verdict": "match", "why": "95%", "windows": [], "timing": {"fix": None, "unconfirmed": {"rate": "1/1", "offset": 0.85}, "why": "a fix of -0.85 s, but no"}}
+    text = getattr(hook, report)({"result": "no change", "label": "f", "path": "/m/f.mkv", "subcheck": {"s1": r}})
+    assert ("| times stay |" if report == "sub_time_text" else "(times stay: a fix of -0.85 s, but no)") in text, text
+
+
+def test_the_sweep_judges_a_fix_only_by_the_windows_to_trust():
+    """Windows with under 3 matched cues, or with no offset, say nothing about the fix."""
+    rows = sweep_rows([1.2] * 5, lambda at: 1.2) + [dict(w, cues=2, off=2.0) for w in sweep_rows([0.0] * 5)] + \
+        [dict(w, offset=None, off=1.5) for w in sweep_rows([0.0] * 5)]
+    assert hook.sweep_confirms(rows) is None
+
+
+def test_an_episode_the_app_lists_again_joins_the_unit_once(monkeypatch):
+    monkeypatch.setattr(hook, "arr", lambda app, p: [{"id": 27, "episodeFileId": 70, "seriesId": 5, "runtime": 22}] * 2)
+    out = hook.unit_files("sonarr", [], {"owner": "5", "file_id": "70", "episode_ids": "27", "path": "/tv/S01E02.mkv"})
+    assert out[70]["items"] == [27] and [e["id"] for e in out[70]["eps"]] == [27], out
+
+
+def test_a_slow_trend_of_a_right_track_gets_no_fix(env, monkeypatch):
+    """A film of 52 minutes whose cues slide from 0.1 s to 0.85 s early, a trend no frame-rate ratio explains. The line
+    through the two windows runs past MIN_SHIFT at the file's end, but a plain shift under MIN_SHIFT is all a fix could
+    do, and it would move the early part off. So the times stay."""
+    lines = talk.script(1) + talk.script(5) + talk.script(6)
+    dur = talk.FIRST + talk.GAP * len(lines) + 60
+    english_film(env, ("eng", False, {}))
+    env["probe"]["container"]["properties"]["duration"] = int(dur * 1e9)
+    env["movies"]["movie/7"]["runtime"] = round(dur / 60)
+    at = lambda i: talk.FIRST + talk.GAP * i
+    hearing(env, monkeypatch, {"s1": talk.cues(lines, where=lambda i: -0.1 - 0.75 * at(i) / dur)}, lines=lines)
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: pytest.fail("a slow trend is no reason to retime a track"))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    assert t["fix"] is None and t["why"] == "in time" and len(env["words"]) == 1, t
 
 
 def test_only_the_first_hearing_names_a_mismatch(env, monkeypatch):
@@ -8724,7 +8915,7 @@ def test_a_window_with_too_few_matched_cues_hears_a_longer_window(env, monkeypat
     early = hook.arr_subsync.windows(sorted(track), talk.DURATION, hook.arr_decide.STOPWORDS["eng"])[0]
     inside = [i for i in range(talk.LINES) if early <= talk.FIRST + talk.GAP * i < early + hook.arr_subsync.WINDOW]
     hearing(env, monkeypatch, {"s1": track}, spoken=lambda i: i not in inside[2:])
-    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(): ("subtitles remuxed", {"warnings": None}))
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: ("subtitles remuxed", {"warnings": None}))
     hook.main([])
     r = decided(env)["subcheck"]["s1"]
     assert [ws for _, _, ws in env["words"]][1] == [round(early - (hook.arr_subsync.THIRD - hook.arr_subsync.WINDOW) / 2, 1)], env["words"]
@@ -8739,3 +8930,1788 @@ def test_a_piecewise_step_under_a_second_goes_to_the_report_only(step, alerts, m
     sync = {"s1": {"verdict": "match", "why": "the heard words match", "windows": [], "timing": t}}
     assert [k for k, _ in hook.sub_alerts({}, sync, [])] == (["subtiming"] if alerts else [])
     assert "times stay: the cues are off" in hook.sub_text({"subcheck": sync})
+
+
+# --- --sub-time: picture tracks, flash cues and the reference timing (docs/design.md, "Subtitle match") -------------
+
+def pgs_sup(cues, fade=()):
+    """A PGS .sup file that shows a small box for each cue (start, end) and clears it at the end. A cue whose index is
+    in fade gets a palette update halfway through, as a fade does."""
+    seg = lambda t, kind, data: b"PG" + struct.pack(">II", round(t * 90000), 0) + bytes([kind]) + struct.pack(">H", len(data)) + data
+    pcs = lambda number, state, update, objects: struct.pack(">HHBHBBBB", 160, 90, 0x10, number, state, update, 0, objects) \
+        + (struct.pack(">HBBHH", 0, 0, 0, 10, 10) if objects else b"")
+    wds, rle = bytes([1, 0]) + struct.pack(">HHHH", 10, 10, 4, 2), (b"\x01" * 4 + b"\x00\x00") * 2
+    ods = struct.pack(">HBB", 0, 0, 0xC0) + (len(rle) + 4).to_bytes(3, "big") + struct.pack(">HH", 4, 2) + rle
+    out = b""
+    for n, (a, b) in enumerate(cues):
+        out += seg(a, 0x16, pcs(3 * n, 0x80, 0, 1)) + seg(a, 0x17, wds) + seg(a, 0x14, bytes([0, 0, 1, 235, 128, 128, 255])) + seg(a, 0x15, ods) \
+            + seg(a, 0x80, b"")
+        if n in fade:
+            out += seg((a + b) / 2, 0x16, pcs(3 * n + 1, 0, 1, 1)) + seg((a + b) / 2, 0x14, bytes([0, 1, 1, 128, 128, 128, 128])) + seg((a + b) / 2, 0x80, b"")
+        out += seg(b, 0x16, pcs(3 * n + 2, 0, 0, 0)) + seg(b, 0x17, wds) + seg(b, 0x80, b"")
+    return out
+
+
+PIC_CUES = [(2.0 * i, 2.0 * i + 1.5) for i in range(1, 19)]
+
+
+def flash_srt(n=20):
+    """A SubRip text of n written lines whose cues each show 0.138 s, one every 2 s, with CRLF line breaks inside some."""
+    t = lambda x: f"00:00:{int(x):02d},{round(x % 1 * 1000):03d}"
+    return "".join(f"{i}\r\n{t(2 * i)} --> {t(2 * i + 0.138)}\r\n" + (f"Line {i}\r\nand more {i}" if i % 3 == 0 else f"Short {i}") + "\r\n\r\n"
+                   for i in range(1, n + 1))
+
+
+@pytest.fixture(scope="module")
+def pic_mkv(tmp_path_factory):
+    """Matroska files of 40 seconds: pgs.mkv holds a SubRip track and a PGS track of PIC_CUES, the third cue with a
+    palette update. vob.mkv holds the same cues as VobSub, which ffmpeg makes from the PGS track. flash.mkv holds a
+    SubRip and an ASS track whose cues each show a seventh of a second."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvextract")):
+        pytest.skip("needs ffmpeg and mkvtoolnix")
+    d = tmp_path_factory.mktemp("pic")
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
+              "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
+    (d / "t.sup").write_bytes(pgs_sup(PIC_CUES, fade={2}))
+    (d / "s.srt").write_text("".join(f"{i}\n00:00:{2 * i:02d},000 --> 00:00:{2 * i + 1:02d},500\n{talk.RIGHT[i]}\n\n" for i in range(1, 19)))
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "pgs.mkv"), str(d / "av.mp4"), "--language", "0:eng", str(d / "s.srt"), "--language", "0:spa", str(d / "t.sup")],
+             check=True)
+    (d / "plain.sup").write_bytes(pgs_sup(PIC_CUES))   # ffmpeg would turn a palette update into a cue of its own
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "plain.mkv"), str(d / "av.mp4"), str(d / "plain.sup")], check=True)
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-fix_sub_duration", "-i", str(d / "plain.mkv"), "-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "dvdsub",
+              str(d / "vob.mkv")], check=True)
+    (d / "f.srt").write_bytes(flash_srt().encode())
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, "
+            "SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,28,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,"
+            "100,0,0,1,2,1,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    (d / "f.ass").write_text(head + "".join(f"Dialogue: 0,0:00:{2 * i:02d}.00,0:00:{2 * i:02d}.14,Default,,0,0,0,,{{\\i1}}Line {i}{{\\i0}}\\Nnext\n"
+                                                   for i in range(1, 21)))
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "flash.mkv"), str(d / "av.mp4"), "--language", "0:eng", str(d / "f.srt"), "--language", "0:eng",
+              "--track-name", "0:Styled", str(d / "f.ass")], check=True)
+    return d
+
+
+def test_picture_cues_read_pgs_display_sets_and_vobsub_stops(pic_mkv):
+    """A PGS set with an object starts a cue and the next set ends it, while a palette update keeps it. A VobSub cue
+    ends at the stop command of its packet."""
+    path = str(pic_mkv / "pgs.mkv")
+    got = hook.picture_cues(path, REAL_MKVMERGE(path), {"s1", "s2"})
+    assert list(got) == ["s2"] and [(a, b) for a, b, _ in got["s2"]] == PIC_CUES, got
+    path = str(pic_mkv / "vob.mkv")
+    got = hook.picture_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    stop = 131 * 1024 / 90000   # ffmpeg's stop command for 1.5 s, in units of 1024/90000 s. The BlockDuration says 1.5 s.
+    assert [a for a, _, _ in got] == [a for a, _ in PIC_CUES] and all(abs(b - a - stop) < 0.001 for a, b, _ in got), got[:3]
+
+
+def test_a_picture_cue_ends_at_span(pic_mkv, tmp_path):
+    """A PGS cue that stays on screen for 30 s counts SPAN seconds, so a long sign never outweighs the dialogue."""
+    (tmp_path / "long.sup").write_bytes(pgs_sup([(2.0, 32.0), (33.0, 34.5)]))
+    path = str(tmp_path / "long.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", path, str(pic_mkv / "av.mp4"), str(tmp_path / "long.sup")], check=True)
+    assert [(a, b) for a, b, _ in hook.picture_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]] == [(2.0, 2.0 + hook.arr_subsync.SPAN), (33.0, 34.5)]
+
+
+def test_spu_stop_reads_the_stop_command_and_the_cue_ends_at_span():
+    """A control sequence at 0x10 holds its time, 131 units of 1024/90000 s, a colour command and the stop. A packet
+    with no stop names nothing."""
+    spu = b"\x00\x20\x00\x10" + bytes(12) + (131).to_bytes(2, "big") + b"\x00\x10" + b"\x03\x11\x11" + b"\x02\xff"
+    assert hook.spu_stop(spu) == pytest.approx(131 * 1024 / 90000) and hook.spu_stop(b"\x00\x08\x00\x04\x00\x00\x00\x04\xff") is None
+
+
+def test_block_head_reads_the_start_of_a_cut_block():
+    d = hook.arr_decide
+    block = cue_el(d.SIMPLEBLOCK, bytes([0x82]) + b"\x00\x10\x80" + b"\x16\x00\x0b" + bytes(11))
+    assert d.block_head(block[:12], 2) == (b"\x16\x00\x0b" + bytes(3), (16, None))
+    assert d.block_head(block, 3) == (None, None) and d.block_head(cue_el(d.BLOCKGROUP, block), 2)[1] == (16, None)
+
+
+@pytest.mark.parametrize("name, codec", [("pgs.mkv", "S_HDMV/PGS"), ("vob.mkv", "S_VOBSUB")])
+def test_resub_retimes_a_picture_track_through_the_proof(pic_mkv, tmp_path, monkeypatch, name, codec):
+    """ffmpeg copies a PGS or VobSub track with -itsoffset and -itsscale, and the proof shows every packet the same."""
+    path = str(tmp_path / name)
+    shutil.copy(pic_mkv / name, path)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    j = REAL_MKVMERGE(path)
+    tid = next(t["id"] for t in j["tracks"] if t["properties"].get("codec_id") == codec)
+    for fix in ({"rate": "1/1", "offset": 2.0}, {"rate": "25025/24000", "offset": 0.0}):
+        j = REAL_MKVMERGE(path)
+        result, info = hook.resub(path, j, os.stat(path), True, {tid: fix})
+        assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    pos = f"s{[t['id'] for t in j['tracks'] if t['type'] == 'subtitles'].index(tid) + 1}"
+    got = hook.picture_cues(path, REAL_MKVMERGE(path), {pos})[pos]
+    want = [max(0, hook.arr_subsync.moved(hook.arr_subsync.moved(a * 1000, {"rate": "1/1", "offset": 2.0}), {"rate": "25025/24000", "offset": 0.0})) / 1000
+            for a, _ in PIC_CUES]
+    assert len(got) == 18 and all(abs(a - w) <= 0.003 for (a, _, _), w in zip(got, want)), (got[:3], want[:3])
+
+
+def test_flash_check_finds_the_flash_tracks_by_their_cue_durations(pic_mkv, monkeypatch):
+    """The Cues give each block's duration, so a track whose median entry is long is never read in full."""
+    path = str(pic_mkv / "flash.mkv")
+    plans = hook.flash_check(path, REAL_MKVMERGE(path), [])
+    assert sorted(plans) == ["s1", "s2"] and plans["s1"][0][2:] == (2.138, 3.917) and plans["s2"][0][2:] == (2.14, 3.92), plans["s1"][:2]
+    assert hook.cue_lengths(path, REAL_MKVMERGE(path), {"s1"}) == {"s1": [0.138] * 20}
+    path, read = str(pic_mkv / "pgs.mkv"), []
+    monkeypatch.setattr(hook, "subtitle_cues", lambda *a: read.append(a) or {})
+    assert hook.flash_check(path, REAL_MKVMERGE(path), []) == {} and read == []
+
+
+def test_resub_lengthens_flash_ends_and_keeps_text_starts_and_the_ass_header(pic_mkv, tmp_path, monkeypatch):
+    """The new ends go in through mkvextract, the text and mkvmerge. Each packet keeps its bytes and start, the ASS
+    header stays, and the proof holds each end to the plan. A retime of the same track, by a ratio too, moves the new
+    ends with it."""
+    path = str(tmp_path / "flash.mkv")
+    shutil.copy(pic_mkv / "flash.mkv", path)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    j = REAL_MKVMERGE(path)
+    plans = hook.flash_check(path, j, [])
+    fix = {"rate": "25025/24000", "offset": 1.0}
+    result, info = hook.resub(path, j, os.stat(path), True, {2: fix}, (), {2: plans["s1"], 3: plans["s2"]})
+    assert result == "subtitles remuxed" and [(e["stream"], e.get("ended")) for e in info["proof"] if e.get("ended")] == [("subtitle 2", 20), ("subtitle 3", 20)]
+    new = REAL_MKVMERGE(path)
+    assert new["tracks"][3]["properties"]["codec_private_data"] == j["tracks"][3]["properties"]["codec_private_data"]
+    assert [t["properties"].get("track_name") for t in new["tracks"]] == [t["properties"].get("track_name") for t in j["tracks"]]
+    got = hook.subtitle_cues(path, new, {"s1", "s2"})
+    at = lambda t: hook.arr_subsync.moved(t * 1000, fix) / 1000
+    assert got["s1"][2][0] == pytest.approx(at(6.0), abs=0.002) and got["s1"][2][1:] == (pytest.approx(at(7.917), abs=0.002), "Line 3\r\nand more 3"), got["s1"][:3]
+    assert got["s2"][0] == (2.0, 3.92, "{\\i1}Line 1{\\i0}\\Nnext"), got["s2"][:1]
+
+
+def test_the_proof_holds_each_end_to_the_plan(pic_mkv, tmp_path):
+    src = str(pic_mkv / "flash.mkv")
+    plan = [e for _, _, _, e in hook.flash_check(src, REAL_MKVMERGE(src), [])["s1"]]
+    why = hook.prove(src, src, [], str(tmp_path), ended={0: plan})[0]
+    assert why.startswith("stream subtitle 2 ends cue 1 at 2.138 s, and the plan at 3.917 s"), why
+    assert hook.prove(src, src, [], str(tmp_path), ended={0: [2 * i + 0.138 for i in range(1, 21)]})[0] is None
+    assert "ends 20 cues, and the plan 19" in hook.prove(src, src, [], str(tmp_path), ended={0: [2 * i + 0.138 for i in range(1, 20)]})[0]
+
+
+def test_set_ends_pairs_each_cue_or_refuses():
+    plan = [(2.0, "a", 2.1, 3.0), (4.0, "b", 4.1, 5.5)]
+    text = "1\n00:00:02,000 --> 00:00:02,100\na\n\n2\n00:00:04,000 --> 00:00:04,100\nb\n"
+    assert hook.set_ends(text, False, plan) == text.replace("00:00:02,100", "00:00:03,000").replace("00:00:04,100", "00:00:05,500")
+    with pytest.raises(RuntimeError, match="the plan's at 4.0"):
+        hook.set_ends(text.replace("00:00:04,000", "00:00:04,500"), False, plan)
+    with pytest.raises(RuntimeError, match="holds 1 cues, and the plan 2"):
+        hook.set_ends(text.split("\n\n")[0], False, plan)
+    ass = "Dialogue: 0,0:00:04.00,0:00:04.10,Default,,0,0,0,,b\nDialogue: 0,0:00:02.00,0:00:02.10,Default,,0,0,0,,a\n"
+    assert hook.set_ends(ass, True, plan) == ass.replace("0:00:04.10", "0:00:05.50").replace("0:00:02.10", "0:00:03.00")
+    with pytest.raises(KeyError):
+        hook.set_ends(ass.replace(",,b", ",,c"), True, plan)
+    # two events of one start and text, as two layers of a line: each takes its own end, in the order of the text
+    twin = "Dialogue: 0,0:00:02.00,0:00:02.10,Default,,0,0,0,,a\nDialogue: 1,0:00:02.00,0:00:09.00,Default,,0,0,0,,a\n"
+    assert hook.set_ends(twin, True, [(2.0, "a", 2.1, 3.0), (2.0, "a", 9.0, 9.0)]) == twin.replace("0:00:02.10", "0:00:03.00")
+
+
+def test_ended_track_refuses_a_mkvextract_warning(pic_mkv, tmp_path, monkeypatch):
+    """mkvextract exits 1 on a warning. A fix never builds on one."""
+    src = str(pic_mkv / "flash.mkv")
+    j = REAL_MKVMERGE(src)
+    plan = hook.flash_check(src, j, [])["s1"]
+    real = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: types.SimpleNamespace(returncode=1, stdout="Warning: a gap", stderr="")
+                        if "mkvextract" in argv and real(argv, **k) else real(argv, **k))
+    with pytest.raises(RuntimeError, match="mkvextract exited 1: Warning: a gap"):
+        hook.ended_track(src, j, next(t["id"] for t in j["tracks"] if t["type"] == "subtitles"), plan, str(tmp_path))
+
+
+def test_timed_ends_a_cue_with_no_duration_at_the_next_cue_or_after_5_s():
+    assert hook.timed([(1.0, None, "a"), (3.0, None, "b"), (20.0, 0.5, "c"), (30.0, None, "d")]) == \
+        [(1.0, 3.0, "a"), (3.0, 8.0, "b"), (20.0, 20.5, "c"), (30.0, 35.0, "d")]
+
+
+def test_a_flash_sidecar_is_rewritten_and_its_original_kept(env, monkeypatch, tmp_path):
+    """A sidecar in any language, forced too, whose cues flash gets new ends. The original is kept, the fix goes to the
+    log only, and with KEEP_ORIGINALS_DAYS 0 it stays as it was with an alert."""
+    english_film(env)
+    side = env["path"][:-4] + ".fr.forced.srt"
+    with open(side, "w", newline="") as f:
+        f.write(flash_srt())
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    hook.main([])
+    rec = decided(env)
+    assert rec["flash"][os.path.basename(side)]["lengthened"] == 20 and rec["sidecars"][0]["result"] == "retimed" and rec["alert_kinds"] == [], rec
+    assert "00:00:02,000 --> 00:00:03,917\nShort 1" in open(side).read()
+    kept = rec["sidecars"][0]["kept"]
+    assert open(kept, newline="").read() == flash_srt()
+    with open(side, "w", newline="") as f:
+        f.write(flash_srt())
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    hook.main([])
+    rec = [r for r in log_lines(env) if r.get("outcome")][-1]
+    assert rec["sidecars"][0]["result"] == "left" and rec["alert_kinds"] == ["subtiming"] and open(side, newline="").read() == flash_srt(), rec
+
+
+def flash_film(env, monkeypatch, fails=False):
+    """An English film with a French SubRip track whose cues flash, and a fake remux that records its call."""
+    english_film(env, ("fre", False, {}))
+    cs = [(10.0 + 3 * i, 10.138 + 3 * i, f"ligne {i}") for i in range(40)]
+    monkeypatch.setattr(hook, "cue_lengths", lambda path, j, want, full=False, stop=None: {"s1": [0.138] * 40} if "s1" in want else {})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: {"s1": cs} if "s1" in want else {})
+    got = []
+
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
+        got.append((apply, fixes, list(drop), ends))
+        return ("subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}) if fails else ("subtitles remuxed", {"warnings": None})
+    monkeypatch.setattr(hook, "resub", fake_resub)
+    return got
+
+
+def test_an_import_lengthens_flash_ends_in_a_remux_and_logs_it_only(env, monkeypatch):
+    """A track in any language whose cues flash gets new ends in the remux. The fix goes to the log, with no alert."""
+    got = flash_film(env, monkeypatch)
+    hook.main([])
+    rec = decided(env)
+    (apply, fixes, drop, ends), = got
+    assert apply and fixes == {} and drop == [] and list(ends) == [2] and ends[2][0] == (10.0, "ligne 0", 10.138, 12.917), ends
+    assert rec["flash"]["s1"]["lengthened"] == 40 and rec["reasons"][0] == "subtitle_ends_lengthened" and rec["alert_kinds"] == [], rec
+
+
+def test_sub_timing_off_keeps_flash_ends_and_alerts(env, monkeypatch):
+    got = flash_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "SUB_TIMING", False)
+    hook.main([])
+    rec = decided(env)
+    assert got == [] and rec["alert_kinds"] == ["subtiming"] and "s1 flashes its cues" in rec["alerts"][0] and "SUB_TIMING is off" in rec["alerts"][0]
+
+
+def test_a_failed_flash_fix_alerts(env, monkeypatch):
+    flash_film(env, monkeypatch, fails=True)
+    hook.main([])
+    rec = decided(env)
+    assert rec["alert_kinds"] == ["subtiming"] and "Subtitle track s1 needs new times, but subtitle remux failed" in rec["alerts"][0], rec["alerts"]
+
+
+def test_flash_check_skips_a_track_whose_read_came_short(env, monkeypatch):
+    """The Cues list 41 entries and the read gets 40 cues: a plan for part of the track never runs."""
+    got = flash_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "cue_lengths", lambda path, j, want, full=False, stop=None: {"s1": [0.138] * 41})
+    hook.main([])
+    assert got == [] and "flash" not in decided(env)
+
+
+# --- the --sub-time command ------------------------------------------------------------------------------------------
+
+REF = talk.show(11, n=170)   # a reference whose words matched, in audio time, within talk.DURATION
+IN_TIME = {"verdict": "match", "why": "the heard words match the cues at 90%, 92%", "windows": [], "timing": {"fix": None, "why": "in time"}}
+
+
+def sub_time_film(env, monkeypatch, subs, cues, sync=None, pictures=None, sides=None):
+    """An English film for --sub-time with the subtitles subs of sub_probe(), their cues {position: cues}, the word
+    check's results sync (s1 in time by default), picture cues and sidecars {suffix: cues}. The hearing and the sweep
+    are faked, and the remux records its calls."""
+    english_film(env, *subs)
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    for ext, cs in (sides or {}).items():
+        with open(env["path"][:-4] + ext, "w") as f:
+            f.write(srt_text(cs))
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: {p: c for p, c in cues.items() if p in want})
+    monkeypatch.setattr(hook, "picture_cues", lambda path, j, want, full=False, stop=None: {p: c for p, c in (pictures or {}).items() if p in want})
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False: {k: dict(v, audio=0, starts=[]) for k, v in (sync or {"s1": IN_TIME}).items()
+                                                                                   if k in items})
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    got = []
+
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
+        got.append((apply, fixes, list(drop)))
+        return ("subtitles remuxed", {"warnings": None, "kept": "/kept/f.mkv"}) if apply else ("would remux subtitles: x", {})
+    monkeypatch.setattr(hook, "resub", fake_resub)
+    return got
+
+
+def near_fix(fix, offset):
+    return fix["rate"] == "1/1" and abs(fix["offset"] - offset) <= 0.01
+
+
+def test_sub_time_times_the_tracks_the_word_check_cannot_read(env, monkeypatch, capsys):
+    """A French track and a Spanish PGS track run 2 s late, and a German track holds another episode. The English track
+    matched in time, so it is the reference. The French and the PGS track get their fix in one remux. The German track
+    is a weak fit: it only reports, with no fix and no alert. A forced and a commentary track stay out."""
+    subs = [("eng", False, {}), ("fre", False, {}), ("spa", False, {"codec_id": "S_HDMV/PGS"}), ("ger", False, {}),
+            ("eng", False, {"forced_track": True, "track_name": "Forced"}), ("fre", False, {"track_name": "Commentary"})]
+    late = talk.moved_to(REF, offset=2.0)
+    got = sub_time_film(env, monkeypatch, subs, {"s1": REF, "s2": late, "s4": talk.show(12, n=170), "s5": late, "s6": late},
+                        pictures={"s3": [(a, b, "") for a, b, _ in late]})
+    hook.main(["--sub-time", env["path"]])
+    out = capsys.readouterr().out
+    rec = decided(env)
+    assert set(rec["subtime"]) == {"s2", "s3", "s4"} and rec["subtime"]["s4"]["verdict"] == "weak", rec["subtime"]
+    (apply, fixes, drop), = got
+    assert not apply and sorted(fixes) == [3, 4] and all(near_fix(f, 2.0) for f in fixes.values()) and drop == [], got
+    assert rec["alert_kinds"] == ["subtiming"] and "Subtitle track s2, s3 needs new times, but would remux subtitles" in rec["alerts"][0], rec
+    assert "s4" not in rec["alerts"][0] and not [u for m, u, b in env["http"] if "discord" in u]   # a weak fit alerts nothing, and nothing posts
+    lines = out.splitlines()
+    assert any(x.startswith("  s2 | ") and " | fre | full | reference s1 | fit 1.00 | +2.00 s 1/1 | would remux" in x for x in lines), out
+    assert any(x.startswith("  s3 | ") and " | spa | full | reference s1 | fit 1.00 | +2.00 s 1/1 | would remux" in x for x in lines), out
+    assert any(x.startswith("  s4 | ") and "| weak " in x and "| report only |" in x for x in lines), out
+    assert any(x.startswith("  s1 | ") and "| words, a reference: in time | match | in time | none |" in x for x in lines), out
+
+
+def test_sub_time_applies_and_analyzes_in_plex(env, monkeypatch, capsys):
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    assert got[0][0] and list(got[0][1]) == [3] and rec["subremux"]["codes"] == ["subtitle_retimed"], got
+    assert analyzes(env) == ["/library/metadata/7101/analyze"] and ("POST", "command", {"name": "RescanMovie", "movieId": 7}) in env["writes"], env["writes"]
+
+
+def test_sub_time_carries_the_reference_fix_into_the_target(env, monkeypatch):
+    """The English reference runs 2 s late, and the word check fixes it. The French track runs 2 s late too. Against
+    the fixed reference it is 2 s late, so it gets the same fix, in the same remux."""
+    late = talk.moved_to(REF, offset=2.0)
+    fixed = dict(IN_TIME, timing={"fix": {"rate": "1/1", "offset": 2.0}, "why": "a fix of +2.00 s"})
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": late, "s2": late}, sync={"s1": fixed})
+    rows = [{"at": 60.0 * k, "words": 15, "overlap": 0.9, "cues": 4, "offset": 2.0, "off": 0.0} for k in range(1, 12)]   # the sweep confirms the fix
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": rows}, {"cpu": 0, "took": 0, "failed": []}))
+    hook.main(["--sub-time", env["path"]])
+    (apply, fixes, drop), = got
+    assert sorted(fixes) == [2, 3] and near_fix(fixes[3], 2.0), fixes
+
+
+def test_sub_time_with_no_reference_says_why(env, monkeypatch, capsys):
+    unmatched = dict(IN_TIME, verdict="unknown", why="2 of 2 windows hold under 8 heard words", timing=None)
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {}), ("spa", False, {"codec_id": "S_HDMV/PGS"})],
+                        {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)}, sync={"s1": unmatched})
+    monkeypatch.setattr(hook, "picture_cues", lambda *a, **k: pytest.fail("with no reference no track is read"))
+    hook.main(["--sub-time", env["path"]])
+    r = decided(env)["subtime"]["s2"]
+    assert got == [] and r["verdict"] == "unknown" and r["why"].startswith("no track or sidecar of the file matched the audio"), r
+    assert "| reference, none | unknown |" in capsys.readouterr().out
+
+
+def test_a_word_check_removal_and_a_reference_retime_share_one_remux(env, monkeypatch):
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    wrong = dict(IN_TIME, verdict="mismatch", why="the heard words match the cues at 3%, 5% at best", timing=None)
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("eng", False, {"track_name": "SDH"}), ("fre", False, {})],
+                        {"s1": REF, "s2": REF, "s3": talk.moved_to(REF, offset=2.0)}, sync={"s1": IN_TIME, "s2": wrong})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    (apply, fixes, drop), = got
+    assert apply and list(fixes) == [4] and drop == [3] and decided(env)["subremux"]["codes"] == ["subtitle_retimed", "subtitle_mismatch_removed"], got
+
+
+def test_sub_time_retimes_an_other_language_sidecar_and_keeps_its_original(env, monkeypatch, tmp_path):
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    got = sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF}, sides={".es.srt": talk.moved_to(REF, offset=2.0)})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    e, = rec["sidecars"]
+    assert got == [] and e["action"] == "retime" and e["result"] == "retimed" and e["kept"].startswith(str(tmp_path / ".kept")), rec["sidecars"]
+    first = hook.sidecar_subs(env["path"])[0]["cues"][0]
+    assert abs(first[0] / 1000 - REF[0][0]) <= 0.002, first
+
+
+def test_a_cut_found_by_the_reference_alerts_in_print_and_never_posts(env, monkeypatch, capsys):
+    cut = talk.moved_to(REF, offset=2.0, cut=(talk.DURATION / 2, 3.0))
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": cut})
+    hook.main(["--sub-time", env["path"]])
+    rec, out = decided(env), capsys.readouterr().out
+    assert got == [] and rec["alert_kinds"] == ["subtiming"] and "Subtitle track s2 disagrees with the reference track s1: the cues are off by" in rec["alerts"][0], rec["alerts"]
+    assert "  ALERT subtiming: Subtitle track s2 disagrees with the reference track s1" in out and not [u for m, u, b in env["http"] if "discord" in u]
+
+
+def test_sub_time_ignores_the_cache_and_writes_it(env, monkeypatch, capsys):
+    """A --sub-check backfill skips a file whose verdicts are cached. --sub-time checks it anyway and writes the cache."""
+    sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF})
+    hook.main(["--sub-time", env["path"]])
+    assert hook.sub_cached(env["path"])
+    hook.main(["--sub-time", env["path"]])
+    assert len([r for r in log_lines(env) if r.get("outcome")]) == 2
+
+
+def test_sub_time_finds_the_item_with_one_list_call(env, monkeypatch, tmp_path, capsys):
+    """Radarr lists its movies once. Sonarr lists its series once, and reads the episode files of the series whose folder
+    holds the path, never of another series. The folder of Show A is a prefix of the folder of Show AB and holds none
+    of its files. A path no app lists runs with no item."""
+    show = tmp_path / "tv" / "Show AB"
+    show.mkdir(parents=True)
+    ep = show / "Show AB - S01E02.mkv"
+    shutil.copy(env["path"], ep)
+    other = tmp_path / "loose.mkv"
+    shutil.copy(env["path"], other)
+    calls, seen = [], []
+
+    def fake_arr(app, p):
+        calls.append((app, p.split("?")[0] if "seriesId" not in p else p))
+        return {("radarr", "movie"): [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})], ("radarr", "qualityprofile"): [],
+                ("sonarr", "series"): [{"id": 4, "title": "Show A", "path": str(tmp_path / "tv" / "Show A")}, {"id": 5, "title": "Show AB", "path": str(show)},
+                                       {"id": 6, "title": "Show B", "path": str(tmp_path / "tv" / "Show B")}],
+                ("sonarr", "episode?seriesId=5"): [{"episodeFileId": 21, "seasonNumber": 1, "episodeNumber": 2, "runtime": 20}],
+                ("sonarr", "episodefile?seriesId=5"): [{"id": 21, "path": str(ep), "seriesId": 5}]}[(app, p)]
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setattr(hook, "PROFILES", {})
+    monkeypatch.setattr(hook, "process", lambda app, path, label, original, runtime, **k: seen.append((app, path, label, original, runtime, k["sub_time"]))
+                        or {"result": "no change", "path": path, "label": label})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--sub-time", env["path"], str(ep), str(other)])
+    assert calls == [("radarr", "movie"), ("radarr", "qualityprofile"), ("sonarr", "series"), ("sonarr", "episode?seriesId=5"),
+                     ("sonarr", "episodefile?seriesId=5")], calls
+    assert seen == [("radarr", env["path"], "Film A (1979)", "English", 120, True), ("sonarr", str(ep), "Show AB S01E02", None, 20, True),
+                    (None, str(other), "loose.mkv", None, 0, True)], seen
+    assert f"no app lists it, so it knows no original language: {other}" in capsys.readouterr().out
+
+
+def test_sub_time_on_a_missing_file_says_so_and_exits_4(env, monkeypatch, capsys):
+    unlisted(env, monkeypatch)
+    gone = os.path.join(os.path.dirname(env["path"]), "Gone.mkv")
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--sub-time", gone])
+    assert ex.value.code == hook.SUB_TIME_NO_FILE == 4 and f"no file at the path, skipped: {gone}" in capsys.readouterr().out
+
+
+def test_a_job_whose_episode_ids_repeat_asks_the_app_for_each_id_once(monkeypatch, tmp_path):
+    """Sonarr answers 500 to a list that names an id twice. The job's own episode is in its unit from the start, the app
+    lists it again, and a job may carry it twice. Each list the hook builds names it once."""
+    asked = []
+
+    def fake_arr(app, p):
+        asked.append(p)
+        if p.startswith("episode?episodeIds="):
+            assert p == "episode?episodeIds=27", p
+            return [{"id": 27, "episodeFileId": 70, "seriesId": 5, "runtime": 22}]
+        if p == "episode?episodeFileId=70":
+            return [{"id": 27}]
+        if p == "episodefile/70":
+            return {"seriesId": 5, "path": str(tmp_path / "S01E02.mkv")}
+        if p == "rootfolder":
+            return [{"path": str(tmp_path)}]
+        raise AssertionError(p)
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    job = {"owner": "5", "file_id": "70", "episode_ids": "27,27", "path": "/tv/gone/S01E02.mkv"}
+    assert hook.unit_files("sonarr", [], job)[70]["items"] == [27] and hook.job_episodes({"episode_ids": "28,27,28"}) == [27, 28]
+    (tmp_path / "S01E02.mkv").write_bytes(b"x")
+    assert hook.moved("sonarr", job) == (str(tmp_path / "S01E02.mkv"), None)   # the app's one episode is the job's
+
+
+@pytest.mark.parametrize("fail", [TimeoutError("timed out"), ConnectionResetError("the app restarts")])
+def test_sub_time_never_applies_when_a_lookup_fails(env, monkeypatch, capsys, fail):
+    """A lookup that fails gives no original language, and a decision without it can turn the wrong tracks on. So
+    --apply stops before any change. A dry run goes on and says why it knows no original language."""
+    def fake_arr(app, p):
+        if app == "radarr":
+            raise fail
+        return []
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    seen = []
+    monkeypatch.setattr(hook, "process", lambda app, path, *a, **k: seen.append(path) or {"result": "no change", "path": path, "label": "x"})
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--sub-time", "--apply", env["path"]])
+    assert seen == [] and "--sub-time --apply stops, and nothing changed: the radarr lookup failed" in str(ex.value), ex.value
+    hook.main(["--sub-time", env["path"]])
+    assert seen == [env["path"]] and f"no app could be asked, so this dry run knows no original language: {env['path']}" in capsys.readouterr().out
+
+
+def test_the_sweep_alerts_on_a_part_off_the_fitted_line(env, monkeypatch):
+    """The sweep hears one window a minute. The cues of the middle minutes sit 1.5 s late, where no window of the
+    check lies, so the check finds the track in time. The sweep's rows there sit 1.5 s off the fitted line, and the
+    printed alert says so."""
+    english_film(env, ("eng", False, {}))
+    mid = lambda i: 1.5 if 0.45 * talk.DURATION <= talk.FIRST + talk.GAP * i < 0.55 * talk.DURATION else 0.0
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=mid)})
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: pytest.fail("the sweep only reports"))
+    rec = hook.process("radarr", env["path"], "Film A (1979)", "English", round(talk.DURATION / 60), apply=False, post=False, source="backfill",
+                       sub_time=True)
+    rows = rec["sweep"]["s1"]
+    assert rec["subcheck"]["s1"]["timing"]["why"] == "in time" and len(rows) == len({round(w["at"] // 60) for w in rows}) >= 15, rows
+    far = [w for w in rows if hook.sweep_far(w)]
+    assert far and all(0.45 * talk.DURATION - 10 <= w["at"] <= 0.55 * talk.DURATION and abs(w["off"] - 1.5) <= 0.1 for w in far), far
+    assert [len(ws) for _, _, ws in env["words"][1:]] == [len(rows)] and env["group"] == [2], env["words"]   # one process hears the sweep
+    assert "The sweep heard parts of the file off the fitted line: s1 at" in " ".join(rec["alerts"]), rec["alerts"]
+
+
+def test_sweep_far_needs_enough_cues_and_a_step():
+    row = {"at": 60.0, "words": 20, "overlap": 0.9, "cues": 3, "offset": 1.0, "off": 1.0}
+    assert hook.sweep_far(row) and not hook.sweep_far(dict(row, cues=2)) and not hook.sweep_far(dict(row, off=0.99))
+    assert hook.sweep_far(dict(row, off=-1.0)) and not hook.sweep_far(dict(row, off=None))
+
+
+def test_sweep_steps_need_two_neighbouring_windows_off_the_same_way():
+    row = lambda at, off, cues=4: {"at": at, "words": 20, "overlap": 0.9, "cues": cues, "offset": off, "off": off}
+    one = [row(60, 0.1), row(120, 1.07), row(180, 0.12)]
+    two = [row(60, 0.1), row(120, 1.2), row(180, None, 0), row(240, 1.3), row(300, 0.1)]   # an untrusted row between them
+    assert hook.sweep_steps(one) == set() and hook.sweep_steps(two) == {id(two[1]), id(two[3])}
+    assert hook.sweep_steps([row(60, 1.2), row(120, -1.3)]) == set() and hook.sweep_steps([row(60, 1.2), row(120, 1.1, 2)]) == set()
+
+
+def test_one_sweep_window_off_the_line_goes_to_the_log_only(env, monkeypatch, capsys):
+    """Whisper heard a word with the line before it, so one window of the sweep sits 1.07 s off. Its neighbours sit on
+    the line. No alert goes out, and the report marks the window."""
+    sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF})
+    rows = [{"at": 60.0 * k, "words": 15, "overlap": 0.9, "cues": 4, "offset": 1.07 if k == 4 else 0.1, "off": 1.07 if k == 4 else 0.1}
+            for k in range(1, 12)]
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": rows}, {"cpu": 0, "took": 0, "failed": []}))
+    hook.main(["--sub-time", env["path"]])
+    rec, out = decided(env), capsys.readouterr().out
+    assert "subtiming" not in rec["alert_kinds"] and "+1.07 s off the fitted line, one window alone" in out and "ALERT" not in out, (rec["alert_kinds"], out)
+
+
+def test_resub_keeps_a_cover_attachment_out_of_the_streams(sync_mkv, tmp_path, monkeypatch):
+    """ffmpeg reads an image attachment as a cover picture stream and would write it back as a video track. The remux
+    leaves it out of the map and mkvpropedit adds it back with its name, type and UID, so the tracks stay the same."""
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
+    path = str(tmp_path / "f.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", path, str(sync_mkv / "f.mkv"), "--attachment-mime-type", "image/png", "--attach-file", str(tmp_path / "cover.png")],
+             check=True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    j = REAL_MKVMERGE(path)
+    result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": 1.0}})
+    new = REAL_MKVMERGE(path)
+    assert result == "subtitles remuxed" and [t["codec"] for t in new["tracks"]] == [t["codec"] for t in j["tracks"]], (result, new["tracks"])
+    assert new["attachments"] == j["attachments"]
+
+
+def test_resub_writes_nothing_to_the_system_temp_dir(pic_mkv, tmp_path, monkeypatch):
+    """A remux with a cover, a track that gets a ratio fix and new ends, and a track that gets new ends. The system temp
+    dir does not exist, so any file there would fail the remux. The work folder under STATE_DIR goes after it."""
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
+    path = str(tmp_path / "flash.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", path, str(pic_mkv / "flash.mkv"), "--attachment-mime-type", "image/png", "--attach-file", str(tmp_path / "cover.png")],
+             check=True)
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    j = REAL_MKVMERGE(path)
+    plans = hook.flash_check(path, j, [])
+    monkeypatch.setattr(hook.tempfile, "tempdir", str(tmp_path / "no-system-temp"))
+    result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "25025/24000", "offset": 1.0}}, (), {2: plans["s1"], 3: plans["s2"]})
+    assert result == "subtitles remuxed" and REAL_MKVMERGE(path)["attachments"] == j["attachments"], (result, info.get("warnings"))
+    assert os.listdir(hook.CFG["STATE_DIR"]) == [] and not os.path.exists(tmp_path / "no-system-temp")
+
+
+def test_the_trim_the_damage_read_the_conversion_and_the_windows_write_nothing_to_the_system_temp_dir(mkvs, convertible, tmp_path, monkeypatch):
+    """The system temp dir does not exist, so a file there would fail these steps. Their work files go under STATE_DIR,
+    and no work folder stays. The steps run as their own tests show."""
+    monkeypatch.setattr(hook.tempfile, "tempdir", str(tmp_path / "no-system-temp"))
+    for name in ("trim", "windows", "convert"):
+        (tmp_path / name).mkdir()
+    test_a_subtitle_trim_cuts_late_lines_and_keeps_everything_else(mkvs, tmp_path / "trim", monkeypatch)
+    test_windows_follow_the_video_stream_of_a_file_that_is_not_matroska(tmp_path / "windows")
+    test_a_real_asf_conversion_overwrites_its_empty_temp_file(convertible, tmp_path / "convert", monkeypatch)
+    path, hashed, real = str(mkvs / "subtitle.mkv"), [], hook.packet_hashes
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, text, folder, timeout: hashed.append(folder) or real(path, maps, bsf, text, folder, timeout))
+    assert hook.source_read({"read": "ffmpeg"}, path, hook.mkvmerge(path)) is None   # the damage read of a clean file
+    assert len(hashed) == 1 and os.path.dirname(hashed[0]) == hook.CFG["STATE_DIR"], hashed
+    assert not [n for n in os.listdir(hook.CFG["STATE_DIR"]) if n.startswith(tuple(f".{k}-" for k in hook.WORK_KINDS))]
+    assert not os.path.exists(tmp_path / "no-system-temp")
+
+
+def test_a_worker_removes_the_work_folders_a_killed_step_left(env, monkeypatch):
+    """A SIGKILL leaves a work folder under STATE_DIR. A worker removes one older than a day, and one of a step that
+    may still run stays."""
+    for name, age in ((".resub-old", 86400 + 60), (".convert-old", 86400 + 60), (".trim-new", 60), (".keep-me", 86400 + 60)):
+        os.makedirs(os.path.join(hook.CFG["STATE_DIR"], name))
+        os.utime(os.path.join(hook.CFG["STATE_DIR"], name), (time.time() - age, time.time() - age))
+    run_worker()
+    assert {".trim-new", ".keep-me"} <= set(os.listdir(hook.CFG["STATE_DIR"])) and not {".resub-old", ".convert-old"} & set(os.listdir(hook.CFG["STATE_DIR"]))
+
+
+def refused_link(sync_mkv, tmp_path, monkeypatch, err=hook.errno.EPERM):
+    """A copy of f.mkv with its own mode and times, a keep folder, and a file system that refuses a hard link with err."""
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    os.chmod(path, 0o640)
+    os.utime(path, (1_600_000_000, 1_600_000_000))
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook.os, "link", lambda a, b: (_ for _ in ()).throw(OSError(err, os.strerror(err))))
+    return path, open(path, "rb").read(), os.stat(path)
+
+
+def kept_files(tmp_path):
+    return sorted(os.path.relpath(os.path.join(d, n), tmp_path / ".kept") for d, _, ns in os.walk(tmp_path / ".kept") for n in ns)
+
+
+@pytest.mark.parametrize("err", [hook.errno.EPERM, hook.errno.EXDEV])
+def test_a_refused_hard_link_keeps_a_verified_copy_of_the_original(sync_mkv, tmp_path, monkeypatch, capsys, err):
+    """A container that blocks link(), or a keep folder on another file system, refuses the hard link. The original is
+    copied with its mode and times, compared, and kept, and then the fix runs. The report says it was copied."""
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch, err)
+    result, info = hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    kept, k = info["kept"], os.stat(info["kept"])
+    assert result == "subtitles remuxed" and open(kept, "rb").read() == before and open(path, "rb").read() != before, result
+    assert info["kept_how"] == f"copied, because the hard link failed: {os.strerror(err)}" and kept_files(tmp_path) == [os.path.relpath(kept, tmp_path / ".kept")]
+    assert (k.st_ino, k.st_nlink, k.st_mode, k.st_mtime) == (k.st_ino, 1, st.st_mode, st.st_mtime) and k.st_ino != os.stat(path).st_ino
+    text = hook.sub_time_text({"result": "no change", "label": "f", "path": path, "subremux": dict(info, done=True)})
+    assert f"original kept at {kept}, copied, because the hard link failed" in text, text
+
+
+def test_a_refused_hard_link_with_no_room_for_a_copy_leaves_the_file(sync_mkv, tmp_path, monkeypatch):
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch)
+    monkeypatch.setattr(hook.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=st.st_size + hook.KEEP_COPY_FREE - 1))
+    result, info = hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert result.startswith("subtitle remux failed: the original could not be kept, so it stays: the hard link failed (Operation not permitted)"), result
+    assert "too little for a copy" in result and open(path, "rb").read() == before and kept_files(tmp_path) == []
+
+
+def test_a_copy_that_does_not_match_the_original_is_never_kept(sync_mkv, tmp_path, monkeypatch):
+    """A write went wrong, so the copy holds a byte more. The fix does not run, and no file looks kept."""
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch)
+    real = os.fsync
+
+    def fsync(fd):
+        if os.readlink(f"/proc/self/fd/{fd}").endswith(".copying"):
+            os.write(fd, b"x")
+        return real(fd)
+    monkeypatch.setattr(hook.os, "fsync", fsync)
+    result, info = hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert result.startswith("subtitle remux failed: the original could not be kept, so it stays: the copy of the original does not match it"), result
+    assert open(path, "rb").read() == before and kept_files(tmp_path) == []
+
+
+def test_the_prune_removes_a_kept_copy_as_it_removes_a_kept_link(sync_mkv, tmp_path, monkeypatch):
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch)
+    note = {}
+    kept = hook.keep_original(path, note)
+    os.rename(os.path.dirname(kept), tmp_path / ".kept" / "20000101T000000Z")   # a keep from long ago
+    assert note["kept_how"].startswith("copied") and hook.prune_originals(str(tmp_path / ".kept")) == ["20000101T000000Z"] and kept_files(tmp_path) == []
+
+
+def test_a_crash_while_the_original_is_copied_leaves_no_file_that_looks_kept(sync_mkv, tmp_path, monkeypatch):
+    """SIGTERM lands when the copy is written but not yet compared. Until then the copy has a hidden name, and it goes."""
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch)
+    real, seen = os.fsync, []
+
+    def fsync(fd):
+        name = os.readlink(f"/proc/self/fd/{fd}")
+        if name.endswith(".copying"):
+            seen.append(kept_files(tmp_path))
+            raise SystemExit(143)
+        return real(fd)
+    monkeypatch.setattr(hook.os, "fsync", fsync)
+    with pytest.raises(SystemExit):
+        hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert len(seen) == 1 and [os.path.basename(n) for n in seen[0]] == [".f.mkv.copying"], seen
+    assert open(path, "rb").read() == before and kept_files(tmp_path) == []
+
+
+def test_the_flash_check_reads_no_track_once_stop_is_true(pic_mkv, monkeypatch):
+    """An import stops at its deadline, and the deep analysis for a waiting import. Each track waits on stop()."""
+    path = str(pic_mkv / "flash.mkv")
+    j, reads, real = REAL_MKVMERGE(path), [], hook.subtitle_cues
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: reads.append(sorted(want)) or real(path, j, want, full))
+    assert sorted(hook.flash_check(path, j, [], stop=lambda: len(reads) >= 1)) == ["s1"] and reads == [["s1"]]
+
+
+def test_a_track_whose_cues_lack_a_duration_is_read_for_the_flash_check(pic_mkv, monkeypatch):
+    """An entry with no CueDuration hides the track's median, so the check reads the blocks and times them."""
+    path = str(pic_mkv / "flash.mkv")
+    real = hook.arr_decide.cue_blocks
+    monkeypatch.setattr(hook.arr_decide, "cue_blocks", lambda b, tracks, cap: {n: [(c, r, None if k == 5 else d) for k, (c, r, d) in enumerate(v)]
+                                                                                 for n, v in real(b, tracks, cap).items()})
+    lens = hook.cue_lengths(path, REAL_MKVMERGE(path), {"s1", "s2"})
+    assert lens["s1"][5] is None and lens["s1"][:5] == [0.138] * 5, lens
+    plans = hook.flash_check(path, REAL_MKVMERGE(path), [])
+    assert sorted(plans) == ["s1", "s2"] and plans["s1"][0][2:] == (2.138, 3.917), plans
+
+
+def test_an_unindexed_track_that_reads_back_empty_gets_no_cues(noidx_mkv, monkeypatch):
+    """The whole-file read gives no cue for s2. The flash check, the reference timing and the match check pass it."""
+    path = str(noidx_mkv / "unindexed.mkv")
+    j = REAL_MKVMERGE(path)
+    monkeypatch.setattr(hook, "full_read", lambda path, j: {"cues": {"s1": talk.cues(talk.RIGHT), "s2": [], "s4": []}, "why": None})
+    assert hook.flash_check(path, j, [], full=True) == {}
+    assert list(hook.subtitle_cues(path, j, {"s1", "s2"}, full=True)) == ["s1"] and hook.picture_cues(path, j, {"s4"}, full=True) == {}
+
+
+def test_a_flash_track_that_is_also_late_gets_its_shift_and_its_ends_in_one_remux(env, monkeypatch):
+    """Each cue shows 0.14 s, and the track runs 2 s late. The check judges the cues by their new ends, so under 1 in 4
+    falling in their spans no longer blocks the shift. The one remux takes the shift and the new ends."""
+    english_film(env, ("eng", False, {}))
+    cs = [(a, round(a + 0.14, 3), t) for a, _, t in talk.cues(talk.RIGHT, offset=2.0)]
+    hearing(env, monkeypatch, {"s1": cs})
+    monkeypatch.setattr(hook, "cue_lengths", lambda path, j, want, full=False: {"s1": [0.14] * len(cs)} if "s1" in want else {})
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append((fixes, ends)) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    (fixes, ends), = got
+    assert near_fix(t["fix"], 2.0) and list(fixes) == list(ends) and near_fix(list(fixes.values())[0], 2.0), (t, got)
+
+
+def test_a_flash_track_that_leaves_the_file_gets_no_new_ends(env, monkeypatch):
+    """The English track holds another episode's lines, and its cues flash. It leaves the file, so the remux gives it
+    no new ends."""
+    english_film(env, ("eng", False, {}))
+    cs = [(a, a + 0.138, t) for a, _, t in talk.cues(talk.OTHER)]
+    hearing(env, monkeypatch, {"s1": cs})
+    monkeypatch.setattr(hook, "cue_lengths", lambda path, j, want, full=False, stop=None: {"s1": [0.138] * len(cs)} if "s1" in want else {})
+    monkeypatch.setattr(hook, "KEEP_DAYS", 7)
+    got = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: got.append((list(drop), ends)) or ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    assert got == [([2], {})] and decided(env)["flash"]["s1"]["lengthened"] == len(cs), got
+
+
+@pytest.mark.parametrize("timing", [{"fix": None, "piecewise": True, "offsets": [0.1, 2.1], "why": "the cues are off, which no ratio explains"},
+                                    {"fix": None, "unfixed": 2.0, "why": "the ratios 1/1, 1000/1001 fit and move the cues apart"},
+                                    {"fix": None, "confirm": {"rate": "1001/960"}, "why": "a fix waits for a middle window"},
+                                    {"fix": None, "few": [100.0], "why": "under two windows hold 3 cues whose first words matched"}])
+def test_a_match_with_unsure_times_is_no_reference(env, monkeypatch, timing):
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)},
+                        sync={"s1": dict(IN_TIME, timing=timing)})
+    hook.main(["--sub-time", env["path"]])
+    r = decided(env)["subtime"]["s2"]
+    assert got == [] and r["verdict"] == "unknown" and r["why"].startswith("no track or sidecar of the file matched"), r
+
+
+def test_a_forced_sidecar_stays_out_of_the_reference_timing(env, monkeypatch):
+    sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF}, sides={".fr.forced.srt": REF, ".fr.srt": REF})
+    hook.main(["--sub-time", env["path"]])
+    names = sorted(decided(env)["subtime"])
+    assert names == ["Film A (1979) WEBDL-1080p.fr.srt"], names
+
+
+# --- subtitle tracks the Cues do not index, WebVTT flash and a clean sweep ------------------------------------------
+
+@pytest.fixture(scope="module")
+def noidx_mkv(pic_mkv):
+    """unindexed.mkv holds a SubRip, an ASS, a WebVTT and a PGS track whose blocks no cue entry indexes, as old
+    mkvmerge versions wrote them, and vobsub.mkv the VobSub track of vob.mkv the same way. ffmpeg reads mkvmerge's
+    WebVTT codec id as unknown."""
+    d = pic_mkv
+    (d / "w.vtt").write_text("WEBVTT\n\n" + "".join(f"00:00:{2 * i:02d}.000 --> 00:00:{2 * i:02d}.120\nvtt line {i}\n\n" for i in range(1, 19)))
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "unindexed.mkv"), str(d / "av.mp4"), "--cues", "0:none", str(d / "s.srt"), "--cues", "0:none",
+              str(d / "f.ass"), "--cues", "0:none", str(d / "w.vtt"), "--cues", "0:none", str(d / "plain.sup")], check=True)
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "vobsub.mkv"), "--cues", "2:none", str(d / "vob.mkv")], check=True)
+    return d
+
+
+def test_full_read_takes_the_tracks_the_cues_do_not_index_in_one_pass(noidx_mkv, monkeypatch, tmp_path):
+    """One ffmpeg pass at the lowest priority. It writes each track into a pipe, and nothing into STATE_DIR or the
+    system temp dir."""
+    path = str(noidx_mkv / "unindexed.mkv")
+    j = REAL_MKVMERGE(path)
+    assert hook.cue_less(path, j) == {"s1", "s2", "s3", "s4"} and hook.subtitle_cues(path, j, {"s1", "s2", "s3"}) == {}
+    (tmp_path / "state").mkdir(); (tmp_path / "systemp").mkdir()
+    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(hook.tempfile, "tempdir", str(tmp_path / "systemp"))
+    monkeypatch.setattr(hook, "FULL", {})
+    runs, real = [], hook.subprocess.Popen
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **k: runs.append(argv) or real(argv, **k))
+    got = hook.subtitle_cues(path, j, {"s1", "s2", "s3"}, full=True)
+    assert got["s1"][0] == (2.0, 3.5, talk.RIGHT[1]) and got["s2"][0] == (2.0, 2.14, "{\\i1}Line 1{\\i0}\\Nnext"), got
+    assert "s3" not in got   # ffmpeg reads mkvmerge's S_TEXT/WEBVTT as an unknown codec, so no read takes it
+    assert [(a, b) for a, b, _ in hook.picture_cues(path, j, {"s4"}, full=True)["s4"]] == PIC_CUES
+    assert hook.cue_lengths(path, j, {"s2"}, full=True) == {"s2": [pytest.approx(0.14)] * 20}
+    ffmpeg = [a for a in runs if "ffmpeg" in a]
+    assert len(ffmpeg) == 1 and ffmpeg[0][:5] == ["ionice", "-c3", "nice", "-n", "19"] and ffmpeg[0].count("-map") == 3, ffmpeg   # one pass for all
+    assert len([a for a in ffmpeg[0] if a.startswith("pipe:")]) == 3, ffmpeg
+    assert os.listdir(tmp_path / "state") == [] and os.listdir(tmp_path / "systemp") == []
+    path = str(noidx_mkv / "vobsub.mkv")
+    got = hook.picture_cues(path, REAL_MKVMERGE(path), {"s1"}, full=True)["s1"]
+    assert [a for a, _, _ in got] == [a for a, _ in PIC_CUES] and all(abs(b - a - 1.5) < 0.002 for a, b, _ in got), got[:2]
+
+
+def test_a_whole_file_read_of_a_file_with_no_statistics_tags_needs_no_free_space(noidx_mkv, monkeypatch, tmp_path):
+    """The read keeps only the cues as ffmpeg streams them. So a file with no statistics tags reads with no free space
+    anywhere, writes nothing, and leaves no pipe open."""
+    path = str(tmp_path / "nostats.mkv")
+    shutil.copy(noidx_mkv / "unindexed.mkv", path)
+    REAL_RUN(["mkvpropedit", "-q", path, "--delete-track-statistics-tags"], check=True)
+    j = REAL_MKVMERGE(path)
+    assert not any("tag_number_of_bytes" in t["properties"] for t in j["tracks"]) and hook.cue_less(path, j) == {"s1", "s2", "s3", "s4"}
+    (tmp_path / "state").mkdir(); (tmp_path / "systemp").mkdir()
+    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(hook.tempfile, "tempdir", str(tmp_path / "systemp"))
+    monkeypatch.setattr(hook.shutil, "disk_usage", lambda p: types.SimpleNamespace(total=0, used=0, free=0))
+    monkeypatch.setattr(hook, "FULL", {})
+    kept, real = [], hook.full_cues
+    monkeypatch.setattr(hook, "full_cues", lambda data, fmt: (kept.append(data) if fmt == "sup" else None) or real(data, fmt))
+    fds = len(os.listdir("/proc/self/fd"))
+    got = hook.full_read(path, j)
+    assert got["why"] is None and sorted(got["cues"]) == ["s1", "s2", "s4"] and [(a, b) for a, b, _ in got["cues"]["s4"]] == PIC_CUES, got
+    assert len(kept) == 1 and [x[10] for x in sup_segments(kept[0])] == [0x16] * 2 * len(PIC_CUES), kept   # only the PCS stay
+    assert os.listdir(tmp_path / "state") == [] and os.listdir(tmp_path / "systemp") == [] and len(os.listdir("/proc/self/fd")) == fds
+
+
+def test_a_failed_full_read_says_why(noidx_mkv, monkeypatch, tmp_path):
+    path = str(noidx_mkv / "unindexed.mkv")
+    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook, "FULL", {})
+    real = hook.subprocess.Popen
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **k: real(["sh", "-c", "echo Invalid data >&2; exit 1"] if "ffmpeg" in argv else argv, **k))
+    got = hook.full_read(path, REAL_MKVMERGE(path))
+    assert got["cues"] == {} and got["why"].startswith("the whole-file read failed: RuntimeError: ffmpeg exited 1: Invalid data"), got
+
+
+def sup_segments(data):
+    """The segments of a sup stream: "PG", PTS and DTS, type, size and data."""
+    out, k = [], 0
+    while k < len(data):
+        out.append(data[k:k + 13 + int.from_bytes(data[k + 11:k + 13], "big")]); k += len(out[-1])
+    return out
+
+
+def test_sup_pcs_keeps_the_pcs_of_whole_segments_at_any_pipe_chunk():
+    """The read feeds each PGS track's sup stream to sup_pcs() in pipe chunks. Any cut gives the cues of the whole
+    stream, only the PCS segments stay, and at most one part segment waits. A lost sync raises."""
+    whole = pgs_sup(PIC_CUES, fade={2})
+    segs = sup_segments(whole)
+    for size in (1, 5, 13, 64, len(whole)):
+        buf, kept = bytearray(), b""
+        for k in range(0, len(whole), size):
+            buf += whole[k:k + size]
+            kept += hook.sup_pcs(buf)
+            assert len(buf) < max(map(len, segs)), (size, k)
+        assert buf == b"" and kept == b"".join(x for x in segs if x[10] == 0x16) and hook.full_cues(kept, "sup") == hook.full_cues(whole, "sup"), size
+    assert hook.sup_pcs(bytearray(b"P")) == b""
+    for bad in (b"X", b"PX", segs[0] + b"XG" + segs[1]):
+        with pytest.raises(ValueError):
+            hook.sup_pcs(bytearray(bad))
+
+
+def test_a_whole_file_read_stops_ffmpeg_and_closes_its_pipes_on_a_lost_sync_or_out_of_time(noidx_mkv, monkeypatch):
+    """A lost sync fails the read and says why. The job's time limit passes on. Either way ffmpeg stops and no pipe
+    stays open."""
+    path = str(noidx_mkv / "unindexed.mkv")
+    j, procs, real = REAL_MKVMERGE(path), [], hook.subprocess.Popen
+    fake = lambda argv: ["bash", "-c", f"printf XXXX >&{argv[-1][5:]}; exec sleep 60"]   # s4, the PGS track, is the last output
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **k: procs.append(real(fake(argv) if "ffmpeg" in argv else argv, **k)) or procs[-1])
+    monkeypatch.setattr(hook, "FULL", {})
+    fds = len(os.listdir("/proc/self/fd"))
+    got = hook.full_read(path, j)
+    assert got["cues"] == {} and got["why"] == "the whole-file read failed: ValueError: a PGS track's sup stream lost its sync", got
+    assert procs[-1].returncode == -signal.SIGKILL and len(os.listdir("/proc/self/fd")) == fds
+
+    def up(*a):
+        raise hook.arr_meta.OutOfTime()
+    monkeypatch.setattr(hook, "FULL", {})
+    monkeypatch.setattr(hook, "sup_pcs", up)
+    with pytest.raises(hook.arr_meta.OutOfTime):
+        hook.full_read(path, j)
+    assert procs[-1].returncode == -signal.SIGKILL and len(os.listdir("/proc/self/fd")) == fds
+
+
+def test_an_import_skips_a_track_the_cues_do_not_index_and_says_why(env, monkeypatch):
+    """An import never reads the whole file. --sub-check does, so a backfill passes full to the readers."""
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {})
+    monkeypatch.setattr(hook, "cue_less", lambda path, j: {"s1"})
+    fulls = []
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: fulls.append(full) or {})
+    hook.main([])
+    rec = decided(env)
+    assert rec["unindexed"]["tracks"] == ["s1"] and "an import never reads the whole file" in rec["subcheck"]["s1"]["why"] and not any(fulls), rec
+    fulls.clear()
+    hook.process("radarr", env["path"], "Film A (1979)", "English", 120, apply=False, post=False, source="backfill", sub_check=True)
+    assert fulls and all(fulls)
+
+
+def test_a_webvtt_flash_track_only_reports(env, monkeypatch):
+    got = flash_film(env, monkeypatch)
+    env["probe"]["tracks"][2]["properties"]["codec_id"] = "S_TEXT/WEBVTT"
+    hook.main([])
+    rec = decided(env)
+    assert got == [] and rec["flash"]["s1"]["report_only"] == "WebVTT" and rec["alert_kinds"] == [], rec
+    assert "s1 flashes, 40 of 40 ends need a fix, WebVTT: report only" in hook.sub_text(rec)
+
+
+@pytest.mark.parametrize("off, fixed", [(0.3, True), (1.0, False)])
+def test_a_clean_sweep_makes_a_match_with_too_few_anchors_a_reference(env, monkeypatch, off, fixed):
+    """The English track matched, but too few of its cues anchored a fix. Its sweep heard ten windows in time, so it
+    times the French track. With one window 1 s off, the sweep is not clean and there is no reference."""
+    few = dict(IN_TIME, timing={"fix": None, "few": [100.0], "why": "under two windows hold 3 cues whose first words matched"})
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)}, sync={"s1": few})
+    rows = [{"at": 60.0 + 100 * k, "words": 15, "overlap": 0.9, "cues": 4, "offset": off if k == 4 else 0.1, "off": 0.1} for k in range(10)]
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": rows}, {"cpu": 0, "took": 0, "failed": []}))
+    hook.main(["--sub-time", env["path"]])
+    rec = decided(env)
+    assert bool(got) == fixed and rec.get("references") == ({"s1": "clean sweep"} if fixed else {}), (got, rec.get("references"))
+
+
+# --- the deep analysis after an import (docs/design.md, "How it runs" and "Subtitle match") ------------------------
+
+INPUTS = {"label": "Film A (1979)", "original": "English", "runtime": 120, "want": None, "kids": False, "ctx": {"listed": 120}, "release": ""}
+
+
+def queue_analysis(env, path, age=0.0, owner="7", **inputs):
+    """A deep analysis job for path, the way an import queues one, age seconds old, with the import's inputs."""
+    rec = {"path": path, "ids": {"app_id": owner, "file_id": None}, "tracks": [{"i": "s1"}]}
+    name = hook.queue_deep_analysis({"app": "radarr", "owner": owner}, rec, dict(INPUTS, **inputs))
+    job = os.path.join(hook.deep_analysis_dir(), name)
+    with open(job) as f:
+        data = json.load(f)
+    hook.write_json(job, dict(data, time=data["time"] - age))
+    os.utime(job, (time.time() - age, time.time() - age))
+    return name
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_imports_go_first_and_the_deep_analysis_drains_while_idle(pool, monkeypatch, workers):
+    """A deep analysis job two days old waits behind an import and still runs: it never drops by age. The worker runs
+    it with no new event, and stops once both queues are empty."""
+    monkeypatch.setattr(hook, "HOOK_WORKERS", workers)
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    a, b, c = films(pool, 3)
+    queue_analysis(pool, a, age=2 * 86400, owner="1")
+    enqueue(pool, 0, b, owner="2")
+    enqueue(pool, 1, c, owner="3")
+    real = hook.process
+    monkeypatch.setattr(hook, "process", lambda app, path, *x, **k: trace("process", path=path, source=k.get("source", "hook")) or real(app, path, *x, **k))
+    run_worker()
+    order = [(r["path"], r["source"]) for r in traced("process")]
+    assert order[0][1] == "hook" and (a, "deep_analysis") in order and order.index((a, "deep_analysis")) > 0, order
+    if workers == 1:   # both imports before any deep analysis, which never starts only to yield
+        assert order[:2] == [(b, "hook"), (c, "hook")] and order[2] == (a, "deep_analysis"), order
+        assert not [r for r in log_lines(pool) if r.get("result") == "yielded"]
+    assert hook.queued() == [] and not claimed() and set(finals(pool)) == {a, b, c}, finals(pool)
+    assert hook.deep_analysis_queued() == [] and (b, "deep_analysis") in order, "the deep analysis the import of b queued ran too"
+
+
+def test_a_re_import_replaces_the_queued_deep_analysis(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    first = queue_analysis(env, env["path"], age=100)
+    second = queue_analysis(env, env["path"])
+    assert first == second and hook.deep_analysis_queued() == [first]
+    monkeypatch.setattr(hook, "SUB_CHECK", False)
+    assert hook.queue_deep_analysis({"app": "radarr"}, {"path": env["path"], "tracks": [{"i": "s1"}]}, INPUTS) is None   # it needs the check on
+    monkeypatch.setattr(hook, "SUB_CHECK", True)
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", False)
+    assert hook.queue_deep_analysis({"app": "radarr"}, {"path": env["path"], "tracks": [{"i": "s1"}]}, INPUTS) is None   # off by default
+
+
+def test_the_deep_analysis_queue_runs_the_job_queued_longest_ago_first(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    paths = []
+    for k in range(3):
+        paths.append(os.path.join(os.path.dirname(env["path"]), f"Film {k}.mkv"))
+        shutil.copy(env["path"], paths[-1])
+    names = [queue_analysis(env, p, age=age) for p, age in zip(paths, (100, 300, 200))]
+    assert hook.deep_analysis_queued() == [names[1], names[2], names[0]]
+
+
+def test_an_import_preempts_the_deep_analysis_between_two_sweep_groups(env, monkeypatch):
+    """The sweep yields after its first group, because an import arrived. The deep analysis job stays queued, the
+    worker runs the import, and the next run of the deep analysis hears the rest."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    real, calls = hook.lid_run, []
+
+    def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None):
+        got = real(path, index, j, expect, timeout, fresh, keep, words, then, yield_to)
+        if words and len(words) > 4 and words[4]:   # the sweep
+            calls.append((len(words[1]), yield_to))
+            if len(calls) == 1:   # an import arrives during the first group
+                enqueue(env, 5, env["path"])
+                return dict(got, windows=got["windows"][:2], yielded=True)
+        return got
+    monkeypatch.setattr(hook, "lid_run", lid_run)
+    name = queue_analysis(env, env["path"])
+    order = []
+    monkeypatch.setattr(hook, "run_job", lambda n, pending, **k: order.append("import") or os.remove(os.path.join(hook.queue_dir(), n)))
+    real_deep = hook.deep_analysis
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: order.append("deep") or real_deep(n, pending, where))
+    run_worker()
+    assert order == ["deep", "import", "deep"] and hook.deep_analysis_queued() == [], order
+    assert calls[0][1] == (os.path.join(hook.CFG["STATE_DIR"], "lid.turn.gate"), hook.queue_dir()) and calls[1][0] == calls[0][0], calls   # the cache holds the pair heard
+    yielded = [r for r in log_lines(env) if r.get("result") == "yielded"]
+    assert len(yielded) == 1 and yielded[0]["job"] == name and "an import waits, after 2 of" in yielded[0]["note"], yielded
+    rec = decided(env)
+    assert rec["source"] == "deep_analysis" and len(rec["sweep"]["s1"]) == calls[0][0] and "tmdb" not in rec, rec
+
+
+def test_an_import_times_other_tracks_against_a_proven_reference_and_queues_the_deep_analysis(env, monkeypatch):
+    """Stage 1: the English track matched in time in its two windows, so the import fixes the French track 2 s late.
+    It hears no sweep and reads no whole file. The deep analysis of the file is queued for the rest."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: pytest.fail("an import hears no sweep"))
+    monkeypatch.setattr(hook, "full_read", lambda *a, **k: pytest.fail("an import reads no whole file"))
+    queued = []
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: queued.append(n) or os.remove(os.path.join(hook.deep_analysis_dir(), n)))
+    hook.main([])
+    rec = decided(env)
+    (apply, fixes, drop), = got
+    assert apply and list(fixes) == [3] and near_fix(fixes[3], 2.0) and rec["references"] == {"s1": "in time"}, got
+    assert queued == [f"deep-analysis-{hashlib.sha1(env['path'].encode()).hexdigest()[:16]}.json"], queued
+
+
+@pytest.mark.parametrize("codec, reader", [("S_HDMV/PGS", "picture_cues"), ("S_TEXT/UTF8", "subtitle_cues")])
+def test_an_import_defers_what_it_has_no_time_to_read_or_fit(env, monkeypatch, codec, reader):
+    """The job's time limit leaves 50 s over SUB_RESERVE. The file holds 40 Spanish tracks, PGS or text. Each read takes
+    15 s and each fit 12 s, and a track is fitted right after its read. Two tracks are read and fitted before the time
+    runs out, and the other 38 wait unread. The import still ends with its flags decided, and it queues the deep
+    analysis."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    late = [(a + 2.0, b + 2.0, "") for a, b, _ in REF]
+    got = sub_time_film(env, monkeypatch, [("eng", False, {})] + [("spa", False, {"codec_id": codec})] * 40, {"s1": REF})
+    tick = lambda s: env["clock"].__setitem__(0, env["clock"][0] + s)
+
+    def read(path, j, want, full=False):
+        out = {}
+        for p in sorted(want):
+            if p == "s1":   # the word check's own read of the English track
+                out[p] = REF
+                continue
+            tick(15)
+            reads.append(p)
+            out[p] = late
+        return out
+    reads = []
+    monkeypatch.setattr(hook, reader, read)
+    real = hook.arr_subsync.reference
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: tick(12) or real(*a, **k))
+    monkeypatch.setattr(hook.signal, "getitimer", lambda which: (hook.SUB_RESERVE + 50, 0))
+    queued = []
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: queued.append(n) or os.remove(os.path.join(hook.deep_analysis_dir(), n)))
+    hook.main([])
+    rec = decided(env)
+    assert [rec["subtime"][f"s{k}"]["verdict"] for k in range(2, 42)] == ["fit", "fit"] + ["deferred"] * 38, rec["subtime"]
+    assert reads == ["s2", "s3"] and rec["result"] == "no change" and got and list(got[0][1]) == [3, 4] and len(queued) == 1, (reads, rec["result"], got)
+
+
+def test_a_read_that_crosses_the_deadline_defers_its_fit_and_the_sidecars(env, monkeypatch):
+    """40 s over SUB_RESERVE. The first PGS track is read and fitted in 27 s. The second read starts in time and ends at
+    42 s, past the deadline, so its fit waits for the deep analysis. So does the French sidecar."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    late = [(a + 2.0, b + 2.0, "") for a, b, _ in REF]
+    got = sub_time_film(env, monkeypatch, [("eng", False, {})] + [("spa", False, {"codec_id": "S_HDMV/PGS"})] * 3, {"s1": REF},
+                        sides={".fr.srt": talk.moved_to(REF, offset=2.0)})
+    tick, reads = lambda s: env["clock"].__setitem__(0, env["clock"][0] + s), []
+    monkeypatch.setattr(hook, "picture_cues", lambda path, j, want, full=False: [tick(15), reads.extend(sorted(want))] and {p: late for p in want})
+    real = hook.arr_subsync.reference
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: tick(12) or real(*a, **k))
+    monkeypatch.setattr(hook.signal, "getitimer", lambda which: (hook.SUB_RESERVE + 40, 0))
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: os.remove(os.path.join(hook.deep_analysis_dir(), n)))
+    hook.main([])
+    r = decided(env)["subtime"]
+    side = os.path.basename(env["path"])[:-4] + ".fr.srt"
+    assert reads == ["s2", "s3"] and [r[p]["verdict"] for p in ("s2", "s3", "s4", side)] == ["fit", "deferred", "deferred", "deferred"], (reads, r)
+    assert got and list(got[0][1]) == [3], got
+
+
+def test_sub_check_reads_the_whole_file_and_hears_no_sweep(env, monkeypatch):
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: pytest.fail("--sub-check hears no sweep"))
+    hook.main(["--backfill", "radarr", "--sub-check"])
+    assert got and list(got[0][1]) == [3], got
+
+
+@pytest.mark.parametrize("argv", [["--sub-time", None], ["--backfill", "radarr", "--sub-check"]])
+def test_the_whole_file_read_runs_under_the_file_lock(env, monkeypatch, argv):
+    """--sub-time and --sub-check read the cues, and a track the Cues do not index from the whole file, while they
+    hold the file lock. Only the hearing runs without it."""
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": REF})
+    ops, reads = [], []
+    real = hook.fcntl.flock
+    monkeypatch.setattr(hook.fcntl, "flock", lambda f, op: (ops.append(op) if f.name.endswith("/lock") else None) or real(f, op))
+    fake = hook.subtitle_cues
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: reads.append((full, bool(ops) and not ops[-1] & hook.fcntl.LOCK_UN))
+                        or fake(path, j, want, full))
+    hook.main([x or env["path"] for x in argv])
+    assert len(reads) >= 2 and all(full and held for full, held in reads), reads
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_a_deep_analysis_after_a_yield_reads_the_whole_file_once(env, monkeypatch, changed):
+    """The whole-file read of a film takes minutes. A deep analysis that yielded finds it in its .read file, unless the
+    file changed since, by its size or mtime."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    reads = []
+    monkeypatch.setattr(hook, "full_read", lambda path, j: reads.append(path) or {"cues": {}, "tracks": [], "took": 0, "cpu": 0, "why": None})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: (_ for _ in ()).throw(hook.Yielded("an import waits")))
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    monkeypatch.setattr(hook, "FULL", {})   # a new job process
+    if changed:
+        with open(env["path"], "ab") as f:
+            f.write(b"y")
+    hook.deep_analysis(name, [])
+    assert reads == [env["path"]] * (2 if changed else 1) and hook.deep_analysis_queued() == [name], reads
+
+
+def test_an_import_with_no_reference_reads_no_other_track(env, monkeypatch):
+    """Nothing matched, so no track can be timed: the import reads none of them."""
+    unmatched = dict(IN_TIME, verdict="unknown", why="2 of 2 windows hold under 8 heard words", timing=None)
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {}), ("spa", False, {"codec_id": "S_HDMV/PGS"})], {"s1": REF, "s2": REF},
+                  sync={"s1": unmatched})
+    reads = []
+    real = hook.subtitle_cues
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: reads.append(sorted(want)) or real(path, j, want, full))
+    monkeypatch.setattr(hook, "picture_cues", lambda *a, **k: pytest.fail("no picture track is read with no reference"))
+    hook.main([])
+    assert reads == [["s1"]] and "subtime" not in decided(env), reads   # the word check's own read only
+
+
+def test_a_deep_analysis_reads_the_whole_file_again_when_it_changed_before_the_lock(env, monkeypatch):
+    """The deep analysis reads the whole file before it takes the file lock. An edit lands after that read, so the
+    file's size and mtime differ, and the read runs again under the lock. The .read file goes at the end."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    monkeypatch.setattr(hook, "cue_less", lambda path, j: {"s1"})
+    monkeypatch.setattr(hook, "ff_streams", lambda path: ("matroska", [{"codec_type": "subtitle", "codec_name": "subrip"}], 600.0))
+    env["cc_text"] = srt_text(talk.cues(talk.RIGHT))
+    reads, popen = [], hook.subprocess.Popen
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **k: popen(reads.append(os.path.getsize(env["path"])) or  # ffmpeg writes the SubRip text
+                        ["bash", "-c", f'printf %s "$1" >&{argv[-1][5:]}', "bash", env["cc_text"]] if "-map" in argv else argv, **k))
+    real = hook.deep_waits
+
+    def deep_waits():   # an edit lands between the read and the lock
+        if len(reads) == 1 and os.path.getsize(env["path"]) == 1000:
+            with open(env["path"], "ab") as f:
+                f.write(b"y")
+        return real()
+    monkeypatch.setattr(hook, "deep_waits", deep_waits)
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    rec = decided(env)
+    assert reads == [1000, 1001] and rec["full_read"]["tracks"] == ["s1"] and os.listdir(hook.deep_analysis_dir()) == [], (reads, rec.get("full_read"))
+
+
+def test_a_deep_analysis_decides_with_the_inputs_of_its_import(env, monkeypatch):
+    """The import stores its release name, original language, kids flag and the rest in the job. The deep analysis
+    passes them to the decision, so a rule such as ENGLISH_RELEASE decides as it did on the import."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    monkeypatch.setenv("radarr_moviefile_scenename", "Film.A.1979.1080p.WEB-DL")
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    real, seen = hook.process, []
+    monkeypatch.setattr(hook, "process", lambda app, path, label, original, runtime, **k: seen.append((original, runtime, k["release"], k["kids"], k.get("source", "hook")))
+                        or real(app, path, label, original, runtime, **k))
+    hook.main([])
+    assert seen == [("English", round(talk.DURATION / 60), "Film.A.1979.1080p.WEB-DL", False, s) for s in ("hook", "deep_analysis")], seen
+
+
+def test_a_deep_analysis_yields_before_its_remux_when_an_import_waits(env, monkeypatch):
+    """The French track needs a fix of 2 s. The check runs again under the exclusive lock before a remux, and an import
+    arrives during its fit, so the remux waits for the next run."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    real, fits = hook.arr_subsync.reference, []
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: (fits.append(1) or len(fits) < 2 or enqueue(env, 1, env["path"])) and real(*a, **k))
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    yielded = [r for r in log_lines(env) if r.get("result") == "yielded"]
+    assert len(fits) == 2 and got == [] and len(yielded) == 1 and hook.deep_analysis_queued() == [name], (fits, got, yielded)
+
+
+def test_an_import_stores_the_inputs_of_its_decision_in_the_deep_job(env, monkeypatch):
+    """A kids film with an edit and an English sidecar. The deep job holds the label, kids flag, metadata context and
+    Plex lookup that the import used."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    env["movies"]["movie/7"]["qualityProfileId"] = 8   # the Kids profile
+    open(env["path"][:-4] + ".en.srt", "w").write(srt_text(REF))
+    real, seen, wants, jobs = hook.process, [], [], []
+    monkeypatch.setattr(hook, "process", lambda app, path, label, original, runtime, **k: seen.append((label, k["kids"], k.get("ctx")))
+                        or real(app, path, label, original, runtime, **k))
+    real_after = hook.plex_after
+    monkeypatch.setattr(hook, "plex_after", lambda app, source, rec, want: wants.append(want) or real_after(app, source, rec, want))
+
+    def deep(n, pending, where=None):
+        with open(os.path.join(hook.deep_analysis_dir(), n)) as f:
+            jobs.append(json.load(f))
+        os.remove(os.path.join(hook.deep_analysis_dir(), n))
+    monkeypatch.setattr(hook, "deep_analysis", deep)
+    hook.main([])
+    got = jobs[0]["inputs"]
+    json_of = lambda x: json.loads(json.dumps(x))   # the job file holds JSON, so a tuple comes back as a list
+    assert seen[0][1] is True and [got["label"], got["kids"], got["ctx"]] == json_of(seen[0]) and wants and got["want"] == json_of(wants[0]), (seen, got)
+
+
+def test_a_deep_analysis_passes_the_stored_inputs_to_the_decision(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    real, seen = hook.process, []
+    monkeypatch.setattr(hook, "process", lambda app, path, label, original, runtime, **k: seen.append((label, k["kids"], k["ctx"], k["ids"]))
+                        or real(app, path, label, original, runtime, **k))
+    hook.deep_analysis(queue_analysis(env, env["path"], label="Film B (1980)", kids=True, ctx={"listed": 99}), [])
+    assert seen == [("Film B (1980)", True, {"listed": 99}, {"app_id": "7", "file_id": None})], seen
+
+
+def test_a_deep_remux_asks_the_app_to_rescan_its_item(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = decided(env)
+    assert rec["subremux"]["done"] and rec["subremux"]["rescan"] == "sent", rec["subremux"]
+    assert ("POST", "command", {"name": "RescanMovie", "movieId": 7}) in env["writes"], env["writes"]
+
+
+def test_a_flag_edit_that_changes_nothing_is_never_sent(env, monkeypatch):
+    """The subtitle is not default, so an edit that turns its default flag off changes nothing."""
+    english_film(env, ("eng", False, {}))
+    rec = hook.edit({"path": env["path"]}, env["probe"], [["track:=10", 0, 1], ["track:=10", 0, 1, "flag-forced"]], True)
+    assert rec["result"] == "no change" and env["mkvpropedit"] == [], rec
+
+
+def sweep_rows(offsets, fit=lambda at: 0.0):
+    """Sweep rows, one a minute, that heard enough, at the raw offsets, and off the line fit(at) of a fix."""
+    return [{"at": 60.0 * k, "words": 15, "overlap": 0.9, "cues": 4, "offset": o, "off": round(o - fit(60.0 * k), 2)} for k, o in enumerate(offsets, 1)]
+
+
+@pytest.mark.parametrize("before, after", [
+    ([0.29] * 7 + [2.0] * 4, [0.0] * 6 + [0.35] * 5),   # a closer median, but fewer windows within 0.3 s
+    ([0.0] * 6 + [2.0] * 5, [0.3] * 6 + [0.31] * 5)])   # as many windows within 0.3 s, but a farther median
+def test_the_sweep_blocks_a_fix_that_is_worse_by_either_measure(before, after):
+    rows = [dict(w, off=o) for w, o in zip(sweep_rows(before), after)]
+    assert hook.sweep_confirms(rows).startswith("the sweep puts ")
+
+
+def test_a_window_on_the_line_that_hears_too_little_gets_its_longer_window(env, monkeypatch):
+    """A track 1.2 s late. Nobody speaks around the window at a third of the file, so its window of 24 seconds elsewhere
+    in that part confirms the fix."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    track = talk.cues(talk.RIGHT, offset=1.2)
+    fix = {"rate": "1/1", "offset": 1.2}
+    first = S.windows(track, talk.DURATION, stop)
+    third = S.moved(S.windows(track, talk.DURATION, stop, taken=[S.moved(a * 1000, fix) / 1000 + 1.2 for a in first], parts=S.LINE_PARTS)[0] * 1000, fix) / 1000
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": track}, spoken=lambda i: not third - 2 <= talk.FIRST + talk.GAP * i <= third + S.WINDOW + 2)
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: ("subtitles remuxed", {"warnings": None}))
+    hook.main([])
+    t = decided(env)["subcheck"]["s1"]["timing"]
+    assert near_fix(t["fix"], 1.2) and env["more"][-1] and t["why"].endswith("sit on its line"), (t, env["more"])
+
+
+def test_the_windows_on_the_line_avoid_the_windows_heard_already():
+    """A window heard already near a third of the file, as a middle window can lie. The window on the line there goes
+    elsewhere in that part, so no audio is heard twice."""
+    S, stop = hook.arr_subsync, hook.arr_decide.STOPWORDS["eng"]
+    track = talk.cues(talk.RIGHT, offset=1.2)
+    free = S.windows(track, talk.DURATION, stop, parts=S.LINE_PARTS)
+    got = S.windows(track, talk.DURATION, stop, taken=[free[0]], parts=S.LINE_PARTS)
+    assert abs(got[0] - free[0]) >= S.WINDOW and got[1] == free[1], (free, got)
+
+
+def test_the_sweep_confirms_a_drift_fix_and_blocks_a_fix_of_a_track_in_time():
+    """A drift from 0.2 s to 2.9 s early sits within 0.47 s of the fitted line, much closer than to the audio: the fix
+    stands. A track whose windows sit within 0.31 s of the audio moves up to 0.94 s off after a fix of 0.87 s and a
+    ratio: the fix goes. So does a fix the sweep heard too little to judge."""
+    drift = [-0.2 - 2.7 * k / 20 for k in range(21)]
+    line = lambda at: -0.2 - 2.7 * (at / 60 - 1) / 20
+    rows = sweep_rows(drift, line)
+    for k in (3, 9, 15):   # the windows of a real drift wander around the line
+        rows[k]["off"] = 0.47 if k != 9 else -0.4
+    assert hook.sweep_confirms(rows) is None
+    right = [0.05 if k % 2 else -0.1 for k in range(21)]
+    right[20] = 0.31
+    wrong_line = lambda at: -0.87 + (at / 60) * 0.1   # the line of +0.87 s and 1000/1001 after the fix
+    assert hook.sweep_confirms(sweep_rows(right, wrong_line)).startswith("the sweep puts ")
+    assert hook.sweep_confirms(sweep_rows([0.1, 0.2])) == "the sweep heard 2 windows to judge the fix by, under 3, so the times stay"
+
+
+@pytest.mark.parametrize("how", ["sub-time", "deep"])
+def test_a_fix_that_the_sweep_does_not_confirm_is_never_applied(env, monkeypatch, how):
+    """The word check asks for +0.87 s and 1000/1001 from two windows, as on a track whose late window hit a short
+    patch. The sweep hears the track in time, so no remux runs. Its clean sweep makes it a reference, and its rows
+    sit off the audio, as no line is fitted."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    fixed = dict(IN_TIME, timing={"fix": {"rate": "1000/1001", "offset": 0.87}, "why": "a fix of +0.87 s and the ratio 1000/1001"})
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": REF}, sync={"s1": fixed})
+    rows = sweep_rows([0.05, -0.05] * 8, lambda at: 0.87 - 0.001 * at)
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": copy.deepcopy(rows)}, {"cpu": 0, "took": 0, "failed": []}))
+    if how == "deep":
+        hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    else:
+        hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    t = rec["subcheck"]["s1"]["timing"]
+    assert got == [] and t["fix"] is None and t["unconfirmed"] == fixed["timing"]["fix"] and t["swept"] and "the sweep puts" in t["why"], t
+    assert rec["references"] == {"s1": "clean sweep"} and [w["off"] for w in rec["sweep"]["s1"]] == [w["offset"] for w in rows], rec.get("references")
+    assert "subtiming" not in rec.get("alert_kinds", []), rec.get("alerts")
+
+
+def test_sweep_offset_is_the_median_and_not_the_mean():
+    assert hook.sweep_offset([{"words": 15, "offset": x} for x in (0.4, 0.5, 2.0)]) == 0.5
+
+
+def test_a_sweep_row_with_too_few_cues_never_splits_a_step():
+    row = lambda at, off, cues=4: {"at": at, "words": 20, "overlap": 0.9, "cues": cues, "offset": off, "off": off}
+    rows = [row(60, 0.1), row(120, 1.2), row(180, 0.2, 2), row(240, 1.3), row(300, 0.1)]
+    assert hook.sweep_steps(rows) == {id(rows[1]), id(rows[3])}
+
+
+@pytest.mark.parametrize("ref, says", [("s1", "the reference track s1"), ("Film.en.srt", "the reference sidecar Film.en.srt")])
+def test_the_alert_names_a_reference_sidecar_as_a_sidecar(ref, says):
+    sync = {"s2": {"reference": ref, "timing": {"fix": None, "piecewise": True, "offsets": [0.1, 2.1], "why": "the cues are off"}}}
+    (kind, text), = hook.sub_alerts({}, sync, set())
+    assert kind == "subtiming" and text.startswith(f"Subtitle track s2 disagrees with {says}: the cues are off."), text
+
+
+def test_a_failed_lookup_never_stops_apply_when_a_later_app_lists_every_path(env, monkeypatch, tmp_path):
+    """Radarr times out, and Sonarr lists the episode. Every path has its item, so --apply goes on."""
+    show = tmp_path / "tv" / "Show A"
+    show.mkdir(parents=True)
+    ep = show / "Show A - S01E02.mkv"
+    shutil.copy(env["path"], ep)
+
+    def fake_arr(app, p):
+        if app == "radarr":
+            raise TimeoutError("timed out")
+        return {"series": [{"id": 5, "title": "Show A", "path": str(show)}], "episode?seriesId=5": [{"episodeFileId": 21, "seasonNumber": 1, "episodeNumber": 2, "runtime": 20}],
+                "episodefile?seriesId=5": [{"id": 21, "path": str(ep), "seriesId": 5}]}[p]
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setattr(hook, "PROFILES", {})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    seen = []
+    monkeypatch.setattr(hook, "process", lambda app, path, *a, **k: seen.append((app, path)) or {"result": "no change", "path": path, "label": "x"})
+    hook.main(["--sub-time", str(ep), "--apply"])
+    assert seen == [("sonarr", str(ep))], seen
+
+
+def test_a_file_with_no_subtitle_gets_no_deep_analysis(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    assert hook.queue_deep_analysis({"app": "radarr"}, {"path": env["path"], "tracks": [{"i": "a1"}]}, INPUTS) is None
+    open(env["path"][:-4] + ".en.srt", "w").write(srt_text(REF))
+    assert hook.queue_deep_analysis({"app": "radarr"}, {"path": env["path"], "tracks": [{"i": "a1"}]}, INPUTS)
+
+
+def unlisted(env, monkeypatch):
+    """No app lists the file. Radarr lists no movie, and Sonarr does not run on the host, which is no failed lookup."""
+    def fake_arr(app, p):
+        if app == "sonarr":
+            raise FileNotFoundError("/var/lib/sonarr/config.xml")
+        return []
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+
+
+def test_sub_time_keeps_every_flag_of_a_file_no_app_lists(env, monkeypatch):
+    """A copy of a Japanese film with English dub audio and an English subtitle on. No app lists it, so no original
+    language is known. A decision without one would give the dub the default and turn the subtitle off. --apply
+    keeps every flag."""
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    unlisted(env, monkeypatch)
+    assert hook.arr_decide.decide(env["probe"], None)["edits"]
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    assert env["mkvpropedit"] == [] and rec["flags_kept"].startswith("no app lists the file") and rec["result"] == "no change", rec
+
+
+@pytest.mark.parametrize("how", ["unlisted", "deep"])
+def test_a_subtitle_verdict_still_turns_the_flags_off_when_the_other_flags_stay(env, monkeypatch, how):
+    """The English subtitle holds another film's lines, so it loses its default flag. With KEEP_ORIGINALS_DAYS 0 it
+    stays in the file. That edit is the only one."""
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    if how == "unlisted":
+        unlisted(env, monkeypatch)
+        hook.main(["--sub-time", env["path"], "--apply"])
+    else:
+        hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "mismatch" and rec["edits"] == [["track:=10", 0, 1]] and env["mkvpropedit"], rec.get("edits")
+
+
+def test_a_subtitle_verdict_also_clears_the_forced_flag_when_the_other_flags_stay(env, monkeypatch):
+    """A full English subtitle flagged forced and default holds another film's lines. On a file no app lists it loses
+    both flags, and nothing else changes."""
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    english_film(env, ("eng", True, {"forced_track": True, "tag_number_of_frames": "400"}))
+    env["probe"]["container"]["properties"]["writing_application"] = "mkvmerge v92.0"   # its statistics tags count
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    unlisted(env, monkeypatch)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "mismatch" and rec["edits"] == [["track:=10", 0, 1], ["track:=10", 0, 1, "flag-forced"]], rec.get("edits")
+
+
+@pytest.mark.parametrize("how", ["unlisted", "deep"])
+def test_a_verdict_edit_keeps_its_result_when_the_decision_abstains(env, monkeypatch, how):
+    """English audio plays, and a second audio track is untagged, so a decision with no original language abstains.
+    The English subtitle holds another film's lines, so it loses its default flag. The result stays "edited", and the
+    reason stays in "undecided". The deep analysis asks Plex to analyze the file, and the cache holds nothing pending."""
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    env["probe"] = sub_probe(("eng", True, {}), audio=(("eng", True), ("und", False)))
+    env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    cached, analyzed = [], []
+    monkeypatch.setattr(hook, "sub_cache", lambda path, verdicts, pending: cached.append(pending))
+    monkeypatch.setattr(hook, "plex_after", lambda app, source, rec, want: analyzed.append(rec["path"]) or {})
+    if how == "unlisted":
+        unlisted(env, monkeypatch)
+        hook.main(["--sub-time", env["path"], "--apply"])
+    else:
+        hook.deep_analysis(queue_analysis(env, env["path"], original=None, want={"guids": ["tmdb://90001"]}), [])
+    rec = decided(env)
+    assert rec["result"] == "edited" and rec["undecided"] == "the original-language track may be the untagged one", (rec["result"], rec.get("undecided"))
+    assert rec["edits"] == [["track:=10", 0, 1]] and cached == [False] and analyzed == ([env["path"]] if how == "deep" else []), (cached, analyzed)
+
+
+def test_a_deep_remux_keeps_the_flags_of_its_import(env, monkeypatch):
+    """The deep analysis retimes the French track. A decision would now turn the English subtitle's default off, but
+    the import set the flags, so they stay after the remux too."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    got = sub_time_film(env, monkeypatch, [("eng", True, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    assert hook.arr_decide.decide(env["probe"], "English")["edits"]
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = decided(env)
+    assert got and got[-1][0] and rec["subremux"]["done"] and env["mkvpropedit"] == [] and "flags_kept" in rec, (got, rec.get("result"))
+
+
+def test_a_deep_analysis_never_hears_the_language_again(env, monkeypatch):
+    """The audio is untagged, so the import heard its language. The deep analysis decides with what the import stored."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    env["probe"] = sub_probe(("eng", False, {}), audio=(("und", True),))
+    assert "audio_untagged_or_missing" in hook.arr_decide.decide(env["probe"], "English")["reasons"]
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    monkeypatch.setattr(hook, "hear", lambda *a, **k: pytest.fail("the deep analysis heard the language again"))
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    assert decided(env)["source"] == "deep_analysis"
+
+
+def test_a_deep_analysis_stops_between_two_tracks_when_an_import_arrives(env, monkeypatch):
+    """Two tracks in time need no remux. An import arrives during the first fit, so the second track waits unread for
+    the next run, and the job goes back to its queue."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {}), ("spa", False, {})], {"s1": REF, "s2": REF, "s3": REF})
+    real, fits = hook.arr_subsync.reference, []
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: (fits.append(1) or enqueue(env, 1, env["path"])) and real(*a, **k))
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    assert fits == [1] and [r["result"] for r in log_lines(env) if r.get("job") == name] == ["yielded"], fits
+
+
+def test_a_deep_job_with_no_stored_inputs_is_dropped(env, monkeypatch):
+    """A job of an older version holds no decision inputs. It never runs, as it would decide with no original language."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    name = queue_analysis(env, env["path"])
+    job = os.path.join(hook.deep_analysis_dir(), name)
+    with open(job) as f:
+        data = json.load(f)
+    hook.write_json(job, {k: v for k, v in data.items() if k != "inputs"})
+    monkeypatch.setattr(hook, "process", lambda *a, **k: pytest.fail("a job with no inputs ran"))
+    hook.deep_analysis(name, [])
+    rec = decided(env)
+    assert rec["result"] == "dropped, the job holds no decision inputs of its import" and hook.deep_analysis_queued() == [], rec
+
+
+def test_a_yield_never_overwrites_a_newer_deep_job_of_the_path(env, monkeypatch):
+    """A newer import of the path queued its own job while the claimed one ran. The claimed one yields and goes, and
+    the newer job keeps its inputs."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: (_ for _ in ()).throw(hook.Yielded("an import waits")))
+    name = queue_analysis(env, env["path"], original="French")
+    os.makedirs(hook.claimed_dir(), exist_ok=True)
+    os.replace(os.path.join(hook.deep_analysis_dir(), name), os.path.join(hook.claimed_dir(), name))
+    queue_analysis(env, env["path"], original="Spanish")
+    hook.deep_analysis(name, [], hook.claimed_dir())
+    with open(os.path.join(hook.deep_analysis_dir(), name)) as f:
+        assert json.load(f)["inputs"]["original"] == "Spanish" and not claimed()
+
+
+def test_sweep_offset_takes_the_median_of_the_windows_that_heard_enough():
+    rows = [{"words": 15, "offset": x} for x in (0.4, 0.5, 0.6)] + [{"words": 2, "offset": -3.0}] * 4 + [{"words": 15, "offset": None}]
+    assert hook.sweep_offset(rows) == 0.5 and hook.sweep_offset([]) == 0.0
+
+
+def test_a_clean_sweep_reference_moves_into_audio_time_by_its_sweep(env, monkeypatch):
+    """The English reference sits 0.6 s late, as its sweep heard. Windows under MIN_WORDS words say nothing. The French
+    track sits 0.2 s early against the audio, so it keeps its times."""
+    few = dict(IN_TIME, timing={"fix": None, "few": [100.0], "why": "under two windows hold 3 cues whose first words matched"})
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": talk.moved_to(REF, offset=0.6), "s2": talk.moved_to(REF, offset=-0.2)},
+                        sync={"s1": few})
+    rows = [{"at": 60.0 + 100 * k, "words": 15, "overlap": 0.9, "cues": 4, "offset": 0.6, "off": 0.0} for k in range(10)]
+    rows += [{"at": 65.0 + 100 * k, "words": 2, "overlap": 0.0, "cues": 0, "offset": -3.0, "off": 0.0} for k in range(11)]
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": rows}, {"cpu": 0, "took": 0, "failed": []}))
+    hook.main(["--sub-time", env["path"]])
+    rec = decided(env)
+    assert got == [] and rec["references"] == {"s1": "clean sweep"} and rec["subtime"]["s2"]["timing"]["why"] == "in time", rec["subtime"]["s2"]
+
+
+def test_a_yielded_deep_analysis_goes_back_to_its_queue_unless_the_path_was_queued_again(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: (_ for _ in ()).throw(hook.Yielded("an import waits")))
+    name = queue_analysis(env, env["path"])
+    os.makedirs(hook.claimed_dir(), exist_ok=True)
+    os.replace(os.path.join(hook.deep_analysis_dir(), name), os.path.join(hook.claimed_dir(), name))   # a job process claimed it
+    hook.deep_analysis(name, [], hook.claimed_dir())
+    assert hook.deep_analysis_queued() == [name] and not os.path.exists(os.path.join(hook.claimed_dir(), name))
+    os.replace(os.path.join(hook.deep_analysis_dir(), name), os.path.join(hook.claimed_dir(), name))
+    queue_analysis(env, env["path"])   # a newer import of the path, while the claimed one runs
+    hook.deep_analysis(name, [], hook.claimed_dir())
+    assert hook.deep_analysis_queued() == [name] and not os.path.exists(os.path.join(hook.claimed_dir(), name))
+
+
+def test_a_deep_analysis_left_claimed_by_a_dead_worker_goes_back_to_its_queue(env, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    name = queue_analysis(env, env["path"])
+    os.makedirs(hook.claimed_dir(), exist_ok=True)
+    os.replace(os.path.join(hook.deep_analysis_dir(), name), os.path.join(hook.claimed_dir(), name))
+    ran = []
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, where=None: ran.append(n) or os.remove(os.path.join(hook.deep_analysis_dir(), n)))
+    run_worker()
+    assert ran == [name] and not claimed()
+    # a newer import of the path queued its own job meanwhile: that job stays, and the claimed one goes
+    queue_analysis(env, env["path"], original="French")
+    os.replace(os.path.join(hook.deep_analysis_dir(), name), os.path.join(hook.claimed_dir(), name))
+    queue_analysis(env, env["path"], original="Spanish")
+    hook.requeue(name)
+    with open(os.path.join(hook.deep_analysis_dir(), name)) as f:
+        assert json.load(f)["inputs"]["original"] == "Spanish" and not claimed()
+
+
+def test_the_deep_analysis_posts_only_its_subtitle_alerts(env, monkeypatch):
+    """The import alerted on the runtime. The deep analysis runs no metadata check and posts no other alert."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    english_film(env, ("eng", False, {}))
+    env["movies"]["movie/7"]["runtime"] = 300   # the file runs far shorter than the app lists
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=lambda i: 8.0 if talk.FIRST + talk.GAP * i > talk.DURATION / 2 else 0.0)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    hook.main([])
+    first = decided(env)
+    assert "runtime" in first["alert_kinds"] and "subtiming" in first["alert_kinds"], first["alert_kinds"]
+    rec = [r for r in log_lines(env) if r.get("outcome") and r["source"] == "deep_analysis"][-1]
+    assert rec["alert_kinds"] == ["subtiming"] and "trusted" not in rec, rec["alert_kinds"]
+
+
+@pytest.mark.parametrize("original", ["Japanese", None])
+def test_a_deep_analysis_of_an_unchanged_file_keeps_the_flags_of_its_import(env, monkeypatch, original):
+    """A Japanese film: the Japanese audio plays, the English dub is off, and the English subtitle is on. The deep
+    analysis asks no app and decides with the original language its import had. With none, the decision would turn the
+    dub on and the subtitle off, but the subtitle verdict needs no new decision, so the flags stay."""
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    japanese_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    monkeypatch.setattr(hook, "arr", lambda app, p: pytest.fail(f"the deep analysis asked {app} for {p}"))
+    assert hook.arr_decide.decide(env["probe"], "Japanese")["edits"] == [] and hook.arr_decide.decide(env["probe"], None)["edits"]
+    hook.deep_analysis(queue_analysis(env, env["path"], original=original), [])
+    rec = decided(env)
+    assert rec["source"] == "deep_analysis" and rec["outcome"] == "no_change" and env["mkvpropedit"] == [], rec
+    assert ("flags_kept" in rec) == (original is None) and rec["subcheck"]["s1"]["verdict"] == "match", rec
+
+
+def test_a_hearing_leaves_no_onnxruntime_log_in_the_system_temp_dir(env, monkeypatch, tmp_path):
+    """onnxruntime in the Whisper venv creates an empty log named by the process id on import. The hearing removes the
+    one its own process left. A file of the same name from before the hearing, or one with content, stays."""
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    monkeypatch.setattr(hook, "ORT_LOG", str(tmp / "mat-debug-{}.log"))
+    old = tmp / "mat-debug-40.log"   # from an earlier process that had the pid of the first hearing
+    old.write_text("")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    (tmp / "mat-debug-42.log").write_text("a line")
+
+    class P:
+        def __init__(self, argv, **k):
+            self.pid = P.pid
+            log = tmp / f"mat-debug-{self.pid}.log"
+            if not log.exists():   # a log with content from onnxruntime's debug mode is left as it is
+                log.write_text("")
+        def communicate(self, timeout=None): return ('{"windows": []}', "")
+        def poll(self): return 0
+    for pid in (40, 42, 43):
+        P.pid = pid
+        monkeypatch.setattr(hook.subprocess, "Popen", P)
+        hook.lid_cli(env["path"], 0, env["probe"], (), 60, False, words=("eng", [10.0], 10.0))
+    assert sorted(os.listdir(tmp)) == ["mat-debug-40.log", "mat-debug-42.log"]   # the log of the hearing with pid 43 went
+
+
+def test_the_report_after_a_removal_names_each_track_as_the_check_saw_it():
+    """s1, an English track, left the file. The tracks after it moved up, so the report takes the places the check
+    named. The alert names who removed it."""
+    before = [{"i": "s1", "lang": "eng", "codec": "SubRip/SRT", "role": "full"}, {"i": "s2", "lang": "spa", "codec": "SubRip/SRT", "role": "full"}]
+    rec = {"result": "no change", "label": "Film A", "path": "/m/Film A.mkv", "source": "backfill", "tracks": before[1:2] and [dict(before[1], i="s1")],
+           "subcheck": {"s1": {"verdict": "mismatch", "why": "the heard words match the cues at 5%", "timing": None},
+                        "s2": {"verdict": "match", "why": "95%", "timing": {"fix": None, "why": "in time"}}},
+           "subremux": {"done": True, "result": "subtitles remuxed", "remove": ["s1"], "removed": ["s1"], "kept": "/k/Film A.mkv", "tracks_before": before}}
+    lines = hook.sub_time_text(rec).splitlines()
+    assert lines[2].startswith("  s1 | SubRip/SRT | eng | full") and "removed" in lines[2] and lines[3].startswith("  s2 | SubRip/SRT | spa"), lines
+    sync = rec["subcheck"]
+    assert "This run removed it" in hook.sub_alerts(rec, sync, set())[0][1] and "The hook removed it" in hook.sub_alerts(dict(rec, source="hook"), sync, set())[0][1]
+
+
+def test_swept_before_counts_the_sweep_of_the_pass_that_raised_replan():
+    rec = {"sweep_facts": {"cpu": 0.0, "took": 0.2, "failed": [], "runs": 2, "cached": 2}}
+    first = {"cpu": 170.5, "took": 172.0, "failed": ["audio 0: no words"], "runs": 2, "cached": 0}
+    got = hook.swept_before(rec, hook.Replan("a subtitle needs a remux", first))["sweep_facts"]
+    assert got == {"cpu": 170.5, "took": 172.2, "failed": ["audio 0: no words"], "runs": 4, "cached": 2}
+    assert hook.swept_before({"sweep_facts": dict(rec["sweep_facts"])}, hook.Replan("the file changed"))["sweep_facts"] == rec["sweep_facts"]
+
+
+def test_a_sub_time_apply_reports_the_sweep_of_both_passes(env, monkeypatch, capsys):
+    """The apply hears the sweep, finds a fix, and plans again under the exclusive lock. The second pass finds the words
+    in the cache. The report still counts what the first pass heard."""
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    facts = iter([{"cpu": 170.5, "took": 172.0, "failed": [], "runs": 2, "cached": 0}, {"cpu": 0.0, "took": 0.2, "failed": [], "runs": 2, "cached": 2}])
+    monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({"s1": sweep_rows([0.0] * 10)}, next(facts)))
+    hook.main(["--sub-time", env["path"], "--apply"])
+    out = capsys.readouterr().out
+    assert got and "sweep cost: 170.5 CPU s, 172.2 s" in out and "words from the cache" not in out, out[-300:]
+
+
+def test_a_sweep_partly_from_the_cache_reports_its_cost():
+    text = hook.sub_time_text({"result": "no change", "label": "f", "path": "/m/f.mkv", "sweep_facts": {"cpu": 30.5, "took": 31.0, "failed": [], "runs": 2, "cached": 1}})
+    assert "sweep cost: 30.5 CPU s, 31.0 s" in text and "words from the cache" not in text
+
+
+@pytest.mark.parametrize("rec, why", [
+    ({"result": "error: OSError: gone"}, "error: OSError: gone"),
+    ({"result": "VERIFY FAILED, flags did not change"}, "VERIFY FAILED, flags did not change"),
+    ({"result": "edited", "sidecars": [{"name": "f.fr.srt", "result": "left"}, {"name": "f.es.srt", "result": "retimed"}]}, "the sidecar f.fr.srt stays as it was"),
+    ({"result": "no change", "header_repair": {"result": "header repair failed: the original could not be kept, so it stays: too little for a copy"}},
+     "header repair failed: the original could not be kept, so it stays: too little for a copy"),
+    ({"result": "no change", "header_repair": {"result": "header repair skipped, hardlinked: x"}}, "header repair skipped, hardlinked: x"),
+    ({"result": "edited", "subremux": {"fixed": ["s2"], "done": True}, "header_repair": {"result": "header repaired"}}, None)])
+def test_apply_missed_names_each_change_that_did_not_happen(rec, why):
+    assert hook.apply_missed(rec) == why
+
+
+def test_a_verdict_edit_keeps_its_result_when_the_decision_drops(env, monkeypatch):
+    """A decision that drops its plan, as when a rule it needs failed, has no edits of its own. The subtitle verdict
+    still turns the flags off, and the result stays "edited" with the reason in "dropped"."""
+    monkeypatch.setattr(hook, "KEEP_DAYS", 0)
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: ({}, {"cpu": 0, "took": 0, "failed": []}))
+    real = hook.arr_decide.decide
+    monkeypatch.setattr(hook.arr_decide, "decide", lambda *a, **k: dict(real(*a, **k), edits=[], dropped=["a rule it needs did not load"]))
+    unlisted(env, monkeypatch)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = decided(env)
+    assert rec["result"] == "edited" and rec["dropped"] == ["a rule it needs did not load"] and rec["edits"] == [["track:=10", 0, 1]], rec["result"]
+
+
+def test_keepable_needs_room_for_a_copy_only_on_another_file_system(tmp_path, monkeypatch):
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    path = tmp_path / "f.mkv"
+    path.write_bytes(b"x" * 1000)
+    st = os.stat(path)
+    other = types.SimpleNamespace(st_dev=st.st_dev + 1, st_size=1000)
+    monkeypatch.setattr(hook.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=1000 + hook.KEEP_COPY_FREE))
+    assert hook.keepable(str(path), st) is None and hook.keepable(str(path), other) is None
+    monkeypatch.setattr(hook.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=1000 + hook.KEEP_COPY_FREE - 1))
+    assert hook.keepable(str(path), st) is None   # a hard link needs no room
+    assert hook.keepable(str(path), other).startswith(f"{tmp_path} is on another file system with 1.1 GB free, too little for a copy")
+
+
+def test_a_copy_of_the_same_size_with_other_bytes_is_never_kept(sync_mkv, tmp_path, monkeypatch):
+    """A write went wrong in place, so the copy has the size of the original and other bytes. The hash sees it."""
+    path, before, st = refused_link(sync_mkv, tmp_path, monkeypatch)
+    real = os.fsync
+
+    def fsync(fd):
+        if os.readlink(f"/proc/self/fd/{fd}").endswith(".copying"):
+            os.pwrite(fd, b"y", 100)
+        return real(fd)
+    monkeypatch.setattr(hook.os, "fsync", fsync)
+    result, info = hook.resub(path, REAL_MKVMERGE(path), st, True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert "the copy of the original does not match it" in result and open(path, "rb").read() == before and kept_files(tmp_path) == [], result
+
+
+def test_a_damage_work_folder_that_a_killed_step_left_goes_when_a_worker_starts(env):
+    folder = hook.work_dir("damage")
+    assert os.path.dirname(folder) == hook.CFG["STATE_DIR"] and os.path.basename(folder).startswith(".damage-")
+    os.utime(folder, (time.time() - 86400 - 60, time.time() - 86400 - 60))
+    hook.stale_work_dirs()
+    assert not os.path.exists(folder)
+
+
+def test_lid_cli_passes_the_sweep_group_and_where_to_yield(env, monkeypatch):
+    seen = []
+
+    class P:
+        pid = 1
+        def __init__(self, argv, **k): seen.append(argv)
+        def communicate(self, timeout=None): return ('{"windows": []}', "")
+        def poll(self): return 0
+    monkeypatch.setattr(hook.subprocess, "Popen", P)
+    hook.lid_cli(env["path"], 0, env["probe"], (), 60, False, words=("eng", [10.0, 70.0], 10.0, None, 2), yield_to=("/s/lid.turn.gate", "/s/queue"))
+    argv = seen[0]
+    assert argv[argv.index("--group") + 1] == "2" and argv[argv.index("--yield-gate") + 1] == "/s/lid.turn.gate" and argv[-2:] == ["--yield-queue", "/s/queue"]
+
+
+def test_job_processes_run_one_deep_analysis_at_a_time(pool, monkeypatch):
+    monkeypatch.setattr(hook, "SUB_DEEP_ANALYSIS", True)
+    a, b = films(pool, 2)
+    queue_analysis(pool, a, owner="1")
+    queue_analysis(pool, b, owner="2")
+    real = hook.process
+
+    def process(app, path, *x, **k):
+        trace("deep start", path=path); real_wait(0.3)
+        try:
+            return real(app, path, *x, **k)
+        finally:
+            trace("deep end", path=path)
+    monkeypatch.setattr(hook, "process", process)
+    run_worker()
+    rows = [r["what"] for r in traced() if r["what"] in ("deep start", "deep end")]
+    assert rows == ["deep start", "deep end"] * 2 and len({r["pid"] for r in traced("deep start")}) == 2, traced()
+    assert hook.deep_analysis_queued() == [] and not claimed()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_the_sweep_report_says_when_its_words_came_from_the_cache(env, monkeypatch, cached):
+    """An apply after a dry run finds the sweep's words in the cache, so it heard nothing and cost no CPU time."""
+    english_film(env, ("eng", False, {}))
+    items = {"s1": ("eng", 0, talk.cues(talk.RIGHT))}
+    monkeypatch.setattr(hook, "lid_run", lambda path, index, j, expect, timeout, words=None, yield_to=None, **k:
+                        {"windows": [{"at": a, "words": []} for a in words[1]], "cached": cached, "cpu": 0.0 if cached else 30.5, "took": 0.2})
+    rows, facts = hook.sub_sweep(env["path"], env["probe"], items, {})
+    text = hook.sub_time_text({"result": "no change", "label": "Film A", "path": env["path"], "sweep": rows, "sweep_facts": facts})
+    assert ("  sweep: words from the cache" in text) == cached and ("sweep cost: 30.5 CPU s" in text) != cached, text[-200:]
+
+
+@pytest.mark.parametrize("result", ["subtitle remux failed: the original could not be kept, so it stays", "subtitle remux skipped, low space: 1.0 GB free"])
+def test_sub_time_apply_exits_3_when_a_planned_change_did_not_happen(env, monkeypatch, capsys, result):
+    """The French track needs a fix of 2 s, and the remux fails. The dry run of the same file exits 0."""
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None: (result if apply else "would remux subtitles: x", {}))
+    hook.main(["--sub-time", env["path"]])
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--sub-time", env["path"], "--apply"])
+    assert ex.value.code == hook.SUB_TIME_MISSED == 3 and f"{env['path']}: {result}" in capsys.readouterr().out
+
+
+def test_a_sweep_that_yields_to_a_waiting_hearing_hears_the_rest_with_its_next_turn(env, monkeypatch):
+    """Another hearing waited at the gate, so the sweep stopped after one pair. --sub-time takes the turn again and
+    hears the rest. It never yields to the job queue, which only the deep analysis leaves for."""
+    english_film(env, ("eng", False, {}))
+    items = {"s1": ("eng", 0, talk.cues(talk.RIGHT))}
+    calls = []
+
+    def lid_run(path, index, j, expect, timeout, words=None, yield_to=None, **k):
+        calls.append((list(words[1]), yield_to))
+        ws = words[1][:2] if len(calls) == 1 else words[1]
+        return dict({"windows": [{"at": a, "words": []} for a in ws], "cpu": 1.0, "took": 1.0}, **({"yielded": True} if len(calls) == 1 else {}))
+    monkeypatch.setattr(hook, "lid_run", lid_run)
+    enqueue(env, 1, env["path"])   # an import waits in the queue, which --sub-time does not wait for
+    rows, facts = hook.sub_sweep(env["path"], env["probe"], items, {})
+    assert len(calls) == 2 and calls[1][0] == calls[0][0][2:] and calls[0][1][1] is None and len(rows["s1"]) == len(calls[0][0]), calls
+
+
+def test_a_target_is_judged_against_the_audio_and_not_the_reference_offset(env, monkeypatch):
+    """The English reference is in time but sits 0.6 s late, its measured offset. The French track sits 0.2 s early
+    against the audio. Against the audio it is in time, so it keeps its times. Against the reference it would get a
+    fix of -0.8 s and end 0.6 s late."""
+    early = talk.moved_to(REF, offset=-0.2)
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": talk.moved_to(REF, offset=0.6), "s2": early},
+                        sync={"s1": dict(IN_TIME, timing={"fix": None, "why": "in time", "offset": 0.6})})
+    hook.main(["--sub-time", env["path"]])
+    r = decided(env)["subtime"]["s2"]
+    assert got == [] and r["timing"]["why"] == "in time", r
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_right_targets_beside_an_offset_reference_keep_their_times(env, monkeypatch, seed):
+    """Right tracks jitter up to 0.3 s against the audio, and the reference sits up to 0.5 s off it, both ways."""
+    rnd = random.Random(seed)
+    off = rnd.choice((-0.5, -0.3, 0.3, 0.5))
+    target = [(a + rnd.uniform(-0.3, 0.3), b, x) for a, b, x in REF]
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": talk.moved_to(REF, offset=off), "s2": target},
+                        sync={"s1": dict(IN_TIME, timing={"fix": None, "why": "in time", "offset": off})})
+    hook.main(["--sub-time", env["path"]])
+    assert got == [] and decided(env)["subtime"]["s2"]["timing"]["why"] == "in time", decided(env)["subtime"]["s2"]

@@ -1194,11 +1194,12 @@ def last_cues(b):
 
 
 def cue_blocks(b, tracks, cap):
-    """{track number: [(Cluster position, position inside the Cluster data)]} of the first cap cue entries of each track
-    in tracks, from the data of a whole Cues element. A film's Cues hold tens of thousands of cue points, and a walk over
-    each one in Python is slow. So this search finds the CueTrackPositions of the wanted tracks by their bytes: a
-    one-byte CueTrack, then the CueClusterPosition and the CueRelativePosition, in the order mkvmerge and ffmpeg write
-    them. An entry in another shape is left out."""
+    """{track number: [(Cluster position, position inside the Cluster data, CueDuration in ticks or None)]} of the first
+    cap cue entries of each track in tracks, from the data of a whole Cues element. A film's Cues hold tens of
+    thousands of cue points, and a walk over each one in Python is slow. So this search finds the CueTrackPositions of
+    the wanted tracks by their bytes: a one-byte CueTrack, then the CueClusterPosition and the CueRelativePosition, in
+    the order mkvmerge and ffmpeg write them, and a CueDuration after them when there is one. mkvmerge and ffmpeg write
+    one for each subtitle block. An entry in another shape is left out."""
     # ponytail: a byte search. A muxer that writes the elements in another order or size gives no entries, so no answer.
     out = {n: [] for n in tracks if 0 < n < 128}
     if not out:
@@ -1207,7 +1208,9 @@ def cue_blocks(b, tracks, cap):
         n, p = m[1][0], m.end() + (m[2][0] & 0x7F)
         r = len(out[n]) < cap and b[p:p + 1] == b"\xf0" and element(b, p)
         if r and r[2] and r[1] + r[2] <= len(b):
-            out[n].append((int.from_bytes(b[m.end():p], "big"), int.from_bytes(b[r[1]:r[1] + r[2]], "big")))
+            d = b[r[1] + r[2]:r[1] + r[2] + 1] == b"\xb2" and element(b, r[1] + r[2])
+            out[n].append((int.from_bytes(b[m.end():p], "big"), int.from_bytes(b[r[1]:r[1] + r[2]], "big"),
+                           int.from_bytes(b[d[1]:d[1] + d[2]], "big") if d and d[2] and d[1] + d[2] <= len(b) else None))
             if all(len(v) >= cap for v in out.values()):
                 break
     return {n: v for n, v in out.items() if v}
@@ -1225,6 +1228,23 @@ def block_frame(b, number):
     if not 0 < k <= 4 or e[2] < k + 3 or int.from_bytes(b[d:d + k], "big") & ((1 << 7 * k) - 1) != number or b[d + k + 2] & 0x06:
         return None
     return b[d + k + 3:d + e[2]]
+
+
+def block_head(b, number):
+    """(the frame's first bytes, (the timestamp relative to its Cluster, None)) of the SimpleBlock, or of the Block that
+    opens a BlockGroup, at the start of b, as block_frame() and block_times() give them. b may end inside the block,
+    since the first bytes of a picture subtitle say whether it shows or clears. (None, None) when b holds no block of
+    track number there, or a laced one."""
+    e = element(b, 0)
+    if e and e[0] == BLOCKGROUP:
+        e = element(b, e[1])
+    if not e or e[2] is None or e[0] not in (SIMPLEBLOCK, BLOCK) or e[1] >= len(b):
+        return None, None
+    d = e[1]; k = 9 - b[d].bit_length()   # the track number is an EBML variable-size integer
+    if not 0 < k <= 4 or e[2] < k + 3 or len(b) < d + k + 3 or int.from_bytes(b[d:d + k], "big") & ((1 << 7 * k) - 1) != number \
+            or b[d + k + 2] & 0x06:
+        return None, None
+    return b[d + k + 3:min(len(b), d + e[2])], (int.from_bytes(b[d + k:d + k + 2], "big", signed=True), None)
 
 
 def block_times(b):

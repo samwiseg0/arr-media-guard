@@ -180,7 +180,7 @@ def check(heard, cues, lang, duration):
     MATCH or more is a match. All at MISMATCH or less is a mismatch. Anything else is unknown. A track under
     MIN_TRACK_CUES cues is unknown too."""
     stop = arr_decide.STOPWORDS.get(lang, frozenset())
-    cues = sorted(cues)
+    cues = unflashed(sorted(cues))   # the ends of a flash track say nothing, see flash(), so its spans take the new ends
     if len(cues) < MIN_TRACK_CUES:
         return {"verdict": "unknown", "why": f"the track holds {len(cues)} cues, under {MIN_TRACK_CUES}", "windows": [], "timing": None}
     fl = flat(cues, stop)
@@ -202,6 +202,36 @@ def check(heard, cues, lang, duration):
     if all(g["overlap"] <= MISMATCH for g in got):
         return dict(out, verdict="mismatch", why=f"the heard words match the cues at {lap} at best")
     return dict(out, verdict="unknown", why=f"the heard words match the cues at {lap}, between {MISMATCH:.0%} and {MATCH:.0%} or apart")
+
+
+LINE_PARTS = ((0.28, 0.38), (0.62, 0.72))   # the parts of the file, as windows() takes them, of the windows that confirm a fix
+LINE_SHIFT = 1.5  # seconds a fix moves the cues at both file ends, under which it needs the windows of LINE_PARTS
+
+
+def needs_line(fix, duration):
+    """A fix that two windows alone must not carry: one that moves the cues under LINE_SHIFT at both file ends. A short
+    patch of a right track that sits early or late can put one window off, and a line through two windows then passes
+    for a small shift or a slight ratio. A fix that moves the cues more, as a frame-rate drift does, keeps the rules of
+    fit(), which hold on real drifts."""
+    return bool(fix) and all(abs(moved(t * 1000, fix) / 1000 - t) < LINE_SHIFT for t in (0.0, duration))
+
+
+def on_line(heard, cues, lang, fix, parts):
+    """Whether each part of parts, [(window start, the start of its longer window or None)], holds a heard window with
+    MIN_CUES anchors, see anchors(), whose median sits within TOLERANCE of the line of fix, as fit() judges its windows.
+    The longer window counts when the window heard too little. A part with no such window confirms nothing, so a
+    window too thin to judge never lets a fix through."""
+    stop, cues = arr_decide.STOPWORDS.get(lang, frozenset()), unflashed(sorted(cues))
+    fl, index = flat(cues, stop), collections.defaultdict(list)
+    for p, x in enumerate(fl):
+        index[x[2]].append(p)
+    r, o, got = float(Fraction(fix["rate"])), fix["offset"], {w["at"]: w for w in heard}
+    held = lambda a: anchors(match_window(said(got[a], stop), fl, index)["pairs"], cues) if a in got else []
+    for a, b in parts:
+        e = held(a) if len(held(a)) >= MIN_CUES or b is None else held(b)
+        if len(e) < MIN_CUES or abs(statistics.median(c - r * t for t, c in e) - CUE_LEAD * r - o) > TOLERANCE:
+            return False
+    return True
 
 
 def anchors(pairs, cues):
@@ -237,7 +267,7 @@ def timing(got, cues, duration):
     return dict(r, few=few) if few and not (r["fix"] or r.get("piecewise") or "unfixed" in r or r["why"] == "in time") else r
 
 
-def fit(got, ends, pairs, cues, duration):
+def fit(got, ends, pairs, cues, duration, lead=CUE_LEAD, unit="window"):
     """The fix of a matched track's times, from match_window() of its windows in time order, their anchors ends and
     the matched pairs of all windows. Returns {"fix": {"rate": "p/q", "offset": seconds} or None, "why"}.
     "piecewise" marks windows that no ratio explains, a different cut. "unfixed" holds the offset of a track that is
@@ -259,7 +289,8 @@ def fit(got, ends, pairs, cues, duration):
     The ratio with the least error at the file's ends wins, and a plain offset wins a near tie. A ratio other than 1
     needs a middle window, see middle(), because windows near the ends cannot tell a drift from a cut between them.
     Two ratios that fit, a plain offset among them, and move the cues apart give no fix. AGREE of the matched cues must fall in their spans
-    after the fix."""
+    after the fix. lead is CUE_LEAD, and 0 for the parts of reference() that pair cue starts with cue starts. unit names a
+    window or a part in the why."""
     if len(got) < 2:
         return {"fix": None, "why": f"under two windows hold {MIN_CUES} cues whose first words matched"}
     at = [statistics.median(t for t, _ in e) for e in ends]   # each window's place in the audio
@@ -273,15 +304,15 @@ def fit(got, ends, pairs, cues, duration):
         on = lambda t: m[0] + slope * (t - at[0])
         return m, on(0), on(duration), max((abs(m[k] - on(at[k])) for k in range(1, len(m) - 1)), default=0.0)
     _, a0, a1, _ = line(1)
-    d = [round(statistics.median(c - t for t, c in e) - CUE_LEAD, 2) for e in ends]
-    if max(abs(a0 - CUE_LEAD), abs(a1 - CUE_LEAD), *(abs(x) for x in d)) < MIN_SHIFT:
-        return {"fix": None, "why": "in time", "offset": round((a0 + a1) / 2 - CUE_LEAD, 3)}
+    d = [round(statistics.median(c - t for t, c in e) - lead, 2) for e in ends]
+    if max(abs(a0 - lead), abs(a1 - lead), *(abs(x) for x in d)) < MIN_SHIFT:
+        return {"fix": None, "why": "in time", "offset": round((a0 + a1) / 2 - lead, 3)}
     fits = {}
     for r in RATES:   # every window within TOLERANCE of one offset and of the line through the others, and the ends under MIN_SHIFT
         m, b0, b1, miss = line(r)
         mid, half = (max(m) + min(m)) / 2, (max(m) - min(m)) / 2
         if half <= TOLERANCE and miss <= TOLERANCE and max(abs(b0 - mid), abs(b1 - mid)) < MIN_SHIFT:
-            fits[r] = (round(mid - CUE_LEAD * float(r), 3), max(abs(b0 - mid), abs(b1 - mid)))
+            fits[r] = (round(mid - lead * float(r), 3), max(abs(b0 - mid), abs(b1 - mid)))
     span = "".join(f", {x:+.2f} s" for x in d[1:-1]) + f" and {d[-1]:+.2f} s late"
     if not fits:
         return {"fix": None, "piecewise": True, "offsets": d,
@@ -290,6 +321,10 @@ def fit(got, ends, pairs, cues, duration):
     rate = Fraction(1) if Fraction(1) in fits and fits[Fraction(1)][1] <= fits[rate][1] + TOLERANCE / 2 else rate
     to = lambda r, t: (t - fits[r][0]) / float(r)   # where a cue at t moves
     offset, name = fits[rate][0], f"{rate.numerator}/{rate.denominator}"
+    if rate == 1 and abs(offset) < MIN_SHIFT:
+        # A plain shift under MIN_SHIFT: every window sits in time, and only the line through two of them ran past
+        # MIN_SHIFT at a file's end. A slow trend of a right track does that, and a fix would move it off.
+        return {"fix": None, "why": "in time", "offset": offset}
     what = f"{offset:+.2f} s" + ("" if rate == 1 else f" and the ratio {name}")
     if rate != 1 and not any(abs((a - at[0]) / (at[-1] - at[0]) - 0.5) <= MIDDLE for a in at[1:-1]):   # no middle window yet
         return {"fix": None, "confirm": {"rate": name, "offset": offset, "ends": [round(at[0], 1), round(at[-1], 1)]},
@@ -297,12 +332,12 @@ def fit(got, ends, pairs, cues, duration):
     near = [r for r in fits if fits[r][1] <= fits[rate][1] + TOLERANCE / 2]   # the fits as good as the best, within the noise
     if any(abs(to(r, t) - to(rate, t)) > TOLERANCE for r in near for t in (0, duration)):   # a plain offset too
         return {"fix": None, "unfixed": fits[rate][0], "why": "the ratios " + ", ".join(f"{r.numerator}/{r.denominator}" for r in near)
-                + " fit the windows and move the cues apart, so the ratio is not certain"}
-    share = agree(pairs, cues, rate, offset + CUE_LEAD * float(rate))
+                + f" fit the {unit}s and move the cues apart, so the ratio is not certain"}
+    share = agree(pairs, cues, rate, offset + lead * float(rate))
     if share < AGREE:
         return {"fix": None, "unfixed": offset, "why": f"after a fix of {what}, {share:.0%} of the matched cues fall in their spans, under {AGREE:.0%}"}
     return {"fix": {"rate": name, "offset": offset},
-            "why": f"a fix of {what} puts every window within {TOLERANCE} s and {share:.0%} of the matched cues in their spans"}
+            "why": f"a fix of {what} puts every {unit} within {TOLERANCE} s and {share:.0%} of the matched cues in their spans"}
 
 
 def middle(confirm, duration):
@@ -333,3 +368,257 @@ def moved(ms, fix):
     """A cue time in ms after fix: (time - offset) / rate."""
     rate = Fraction(fix["rate"])
     return round((ms / 1000 - fix["offset"]) / float(rate) * 1000)
+
+
+# Flash cues (docs/design.md, "Subtitle match"). A track whose cues each show for a tenth of a second has right starts
+# and ends too short to read. The fix only lengthens a cue, so a right track keeps its ends.
+FLASH = 0.5       # seconds of the median cue of a flash track. Right text tracks show their median cue for a second or more.
+GAP = 0.5         # the share of its short cues that must end over FRAMES before the next cue starts. Signs and karaoke run
+                  # on into the next event.
+FRAMES = 0.083    # seconds of two frames, which a new end leaves before the next cue starts
+READ_RATE = 17    # visible characters a second of the reading time
+HOLD = (3.0, 7.0) # seconds a new end may reach past the start: max(3, twice the reading time), 7 at most
+TAG = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # tags, ASS blocks and ASS breaks, which a viewer never sees
+BLANK = re.compile(r"[\s\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")   # spaces, and the zero-width and direction marks
+
+
+def flash(cues):
+    """The new ends of a track whose cues flash, one per cue of cues [(start, end, text)] in their order, or None.
+    Only a cue with a visible character counts, and a text of None counts as one. A track flashes when it holds
+    MIN_TRACK_CUES such cues, their median shows under FLASH seconds, and GAP of the short ones end over FRAMES before
+    the next cue. Only a short cue gets a new end: the next later start less FRAMES, but at most the start plus HOLD,
+    twice the reading time, 3 s at least and 7 s at most. The reading time counts the visible characters at READ_RATE a
+    second. A cue whose end is later already keeps it."""
+    shown = lambda text: len(BLANK.sub("", TAG.sub("", text))) if text is not None else 0
+    seen = [(s, e) for s, e, text in cues if text is None or shown(text)]
+    if len(seen) < MIN_TRACK_CUES or statistics.median(e - s for s, e in seen) >= FLASH:
+        return None
+    starts = sorted({s for s, _, _ in cues}) + [float("inf")]
+    later = lambda s: starts[bisect.bisect_right(starts, s)]
+    short = [(s, e) for s, e in seen if e - s < FLASH]
+    if sum(later(s) - e > FRAMES for s, e in short) < GAP * len(short):
+        return None
+    cap = lambda s, text: s + min(max(HOLD[0], 2 * shown(text) / READ_RATE), HOLD[1])
+    return [round(max(e, min(later(s) - FRAMES, cap(s, text))), 3) if e - s < FLASH and (text is None or shown(text)) else e for s, e, text in cues]
+
+
+# The reference timing of --sub-time (docs/design.md, "Subtitle match"). A track the word check cannot read gets its
+# times from a reference: a track or sidecar of the same file whose words matched the audio and whose times are right
+# or fixed. The fit reads no words. It compares when the cues show, so a translation from another source still fits
+# where it splits or merges lines.
+SEARCH = 120.0    # seconds of offset the search for the reference covers each way
+STEP = 0.1        # seconds of one offset bin of that search
+NULL = (-53, -37, -23, -13, -7, 7, 13, 23, 37, 53)   # seconds from the best offset where the fit measures the overlap by chance
+FIT = 0.3         # the least lift over chance of a fit. A right pair lifts well over it, and another episode's track or
+                  # another film's lifts near 0.
+PAIR = 0.5        # seconds a cue start may sit from a reference cue start to anchor its part
+SPAN = 10.0       # seconds a cue counts at most in the overlap, so a long sign does not outweigh the dialogue. A picture cue
+                  # also ends there. The overlap of cue spans, and this cap, come from alass and the AutoSubSync research.
+SLICES = 10       # slices of the reference's span, each fit at its own offset. Every slice must sit within TOLERANCE of the
+                  # fix, so a cut in steps never passes as a ratio. Five slices hold more cues each, but on real tracks
+                  # they let a cut in steps pass several times as often.
+SPARSE = 6        # cue starts a slice needs on each side, else it is left out: the credits, or a song only one side
+                  # times. Chance pairs of so few starts can outvote the right offset.
+HALF = 3          # slices each half of the span needs that are not left out, so the fix holds at both ends
+REACH = 60.0      # seconds of offset a slice searches each way from the offset of the whole track's search, so a cut of a
+                  # minute shows. A search as wide as SEARCH let chance put a slice of a right track far off.
+CLEAR = 1.5       # a slice's peak over 1 s from the search's offset needs more than CLEAR times the votes of any other
+                  # offset. A peak at that offset needs no margin: a right slice often holds a second peak one line away.
+
+
+def spans(cues):
+    """[[start, end]] of the time cues [(start, end, ...)] show a line, each cue SPAN seconds at most, overlaps merged."""
+    out = []
+    for s, e, *_ in sorted(cues):
+        e = min(max(s, e), s + SPAN)
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def shown(a, b, rate=1, offset=0.0):
+    """The share of the shorter of the spans a and b that the other covers too, after a moves to (t - offset) / rate."""
+    a, i, j, both = [((s - offset) / float(rate), (e - offset) / float(rate)) for s, e in a], 0, 0, 0.0
+    while i < len(a) and j < len(b):
+        both += max(0.0, min(a[i][1], b[j][1]) - max(a[i][0], b[j][0]))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    least = min(sum(e - s for s, e in a), sum(e - s for s, e in b))
+    return both / least if least > 0 else 0.0
+
+
+def lift(a, b, rate, offset):
+    """shown() at the offset over its mean at the NULL offsets, as a share of what was left above that mean. 0 is
+    chance, 1 a perfect fit. Dense cues cover much of each other at any offset, so the raw share alone misleads."""
+    base = statistics.fmean(shown(a, b, rate, offset + d) for d in NULL)
+    return (shown(a, b, rate, offset) - base) / (1 - base) if base < 1 else 0.0
+
+
+def near(ts, rs, rate, offset, tol):
+    """[(reference start, cue start, cue index)] of the cue starts ts that lie within tol of their nearest reference
+    start of rs after the fit, cue = rate * reference + offset."""
+    m, out = [float(rate) * a + offset for a in rs], []
+    for i, t in enumerate(ts):
+        k = bisect.bisect_left(m, t)
+        k = min((x for x in (k - 1, k) if 0 <= x < len(m)), key=lambda x: abs(m[x] - t), default=None)
+        if k is not None and abs(m[k] - t) <= tol:
+            out.append((rs[k], t, i))
+    return out
+
+
+def align(ts, rs, rate, around=0.0, reach=SEARCH, clear=0):
+    """The offset that puts the most cue starts ts near reference starts rs at rate, as cue = rate * reference +
+    offset, or None. Each pair whose offset lies within reach of around votes for it in bins of STEP, and three
+    neighbour bins count as one. The peak nearest around wins a tie. With clear, a peak over 1 s from around needs more
+    than clear times the votes of every offset over 1 s from it, else there is no offset. The median of the pairs near
+    the peak refines it, at 1 s and then at PAIR."""
+    m, votes = [float(rate) * a for a in rs], collections.Counter()
+    for t in ts:
+        for x in m[bisect.bisect_left(m, t - around - reach):bisect.bisect_right(m, t - around + reach)]:
+            votes[round((t - x) / STEP)] += 1
+    if not votes:
+        return None
+    three = lambda b: votes[b - 1] + votes[b] + votes[b + 1]
+    peak = min(votes, key=lambda b: (-three(b), abs(b * STEP - around)))
+    if clear and abs(peak * STEP - around) > 1.0 and any(clear * three(b) >= three(peak) for b in votes if abs(b - peak) * STEP > 1.0):
+        return None
+    offset = STEP * peak
+    for tol in (1.0, PAIR):
+        got = near(ts, rs, rate, offset, tol)
+        offset = statistics.median(t - float(rate) * a for a, t, _ in got) if got else offset
+    return round(offset, 3)
+
+
+def unflashed(cues):
+    """cues [(start, end, text or nothing)] with the new ends of flash() when they flash, else as they are. A picture
+    cue has no text, and an empty text counts as unknown, so it counts as a visible cue."""
+    ends = flash([(c[0], c[1], c[2] if len(c) > 2 and c[2] else None) for c in cues])
+    return [(c[0], n, *c[2:]) for c, n in zip(cues, ends)] if ends else cues
+
+
+def sliced(cues, ts, ref, rate, offset, duration):
+    """fit() of cues against the reference cues ref in SLICES slices of the reference's span, after the search put the
+    cues at rate and offset. Each slice pairs cue starts with reference starts at its own best offset, so a cut shows
+    as slices at different offsets. fit() judges the slices by the rules of the word check: every slice within
+    TOLERANCE of one line, a middle slice on it for a ratio, and the file's ends under MIN_SHIFT. There is no lead,
+    since both sides are cue starts.
+
+    A slice where the cues or the reference start under SPARSE times, such as the credits, is left out. Each half of
+    the span needs HALF slices that are not, else no fix. A slice searches its offset within REACH of the search's,
+    and a peak away from the search's offset must be clear, see align(). A slice with no clear peak, or with under
+    MIN_CUES pairs, gives no fix."""
+    rs = [c[0] for c in ref]
+    lo, hi = rs[0], rs[-1]
+    ends, pairs, kept = [], [], []
+    for k in range(SLICES):
+        a, b = lo + k * (hi - lo) / SLICES, lo + (k + 1) * (hi - lo) / SLICES
+        mine = [t for t in ts if a <= (t - offset) / float(rate) < b]
+        if min(len(mine), bisect.bisect_left(rs, b) - bisect.bisect_left(rs, a)) < SPARSE:
+            continue
+        here = align(mine, rs, rate, offset, REACH, CLEAR)
+        if here is None:
+            return {"fix": None, "why": f"slice {k + 1} of {SLICES} has no clear offset within {REACH:.0f} s of the fit, so the times stay"}
+        got = near(mine, rs, rate, here, PAIR)
+        if len(got) < MIN_CUES:
+            return {"fix": None, "why": f"slice {k + 1} of {SLICES} holds {len(got)} cues near the reference, under {MIN_CUES}, so the times stay"}
+        first = ts.index(mine[0])
+        ends.append([(x, t) for x, t, _ in got])
+        pairs += [(x, (None, first + i)) for x, _, i in got]
+        kept.append(k)
+    early = sum(k < SLICES / 2 for k in kept)
+    if min(early, len(kept) - early) < HALF:
+        return {"fix": None, "why": f"the early half of the reference holds {early} slices with enough cues, and the late half "
+                f"{len(kept) - early}, under {HALF}, so the times stay"}
+    timing = fit(kept, ends, pairs, cues, duration, lead=0.0, unit="slice")
+    if "confirm" in timing:   # a slice cannot be heard again: its place is fixed
+        timing = {"fix": None, "why": "the middle slice lies too far from the centre to confirm the ratio " + timing["confirm"]["rate"]}
+    return timing
+
+
+def reference(cues, refs, duration):
+    """The times of a subtitle from a reference (docs/design.md, "Subtitle match"). cues is [(start, end, ...)] in
+    seconds, refs {name: the cues of a reference in audio time: moved by its own fix, or by its own measured offset
+    when it is in time}, duration the file's. So a fix moves the cues to the audio, and the in-time rule judges them
+    against the audio.
+
+    The search tries each ratio of RATES at the offset that the cue starts point to, see align(), and keeps the one
+    where the cues show over the most of the reference's, see shown(). Starts alone miss where a translation splits or
+    merges lines. The best reference wins by lift(). A lift under FIT is a weak fit, such as another episode's track:
+    it only reports. A fit then fits the slices, see sliced(). A fix must agree with every other reference the cues fit
+    at FIT or more: both must move the cues to within TOLERANCE of each other at the file's start and end.
+
+    Flash cues get their new ends first, on both sides, see flash(): ends of a tenth of a second overlap nothing.
+
+    Returns {"verdict": "fit", "weak" or "unknown", "why", "reference", "score": the lift, "rate", "offset": the best
+    ratio and offset of the search, "timing": fit() or None}."""
+    cues, refs = unflashed(sorted(cues)), {k: unflashed(sorted(c)) for k, c in refs.items()}
+    if len(cues) < MIN_TRACK_CUES:
+        return {"verdict": "unknown", "why": f"the track holds {len(cues)} cues, under {MIN_TRACK_CUES}", "timing": None}
+    refs = {k: c for k, c in refs.items() if len(c) >= MIN_TRACK_CUES}
+    if not refs:
+        return {"verdict": "unknown", "why": "no track or sidecar of the file matched the audio in its words with its times right or fixed",
+                "timing": None}
+    ts, mine, found = [c[0] for c in cues], spans(cues), []
+    for name, ref in sorted(refs.items()):
+        rs, theirs = [c[0] for c in ref], spans(ref)
+        tried = [(shown(mine, theirs, r, o), r, o) for r in RATES if (o := align(ts, rs, r)) is not None]
+        _, r, o = max(tried, key=lambda x: (x[0], x[1] == 1), default=(0.0, Fraction(1), 0.0))   # no cue within SEARCH: chance
+        found.append((round(lift(mine, theirs, r, o), 3), name, r, o))
+    score, name, rate, offset = max(found, key=lambda x: x[0])
+    out = {"reference": name, "score": score, "rate": f"{rate.numerator}/{rate.denominator}", "offset": offset, "timing": None}
+    if score < FIT:
+        return dict(out, verdict="weak", why=f"the cues fit {name} at a lift of {score:.2f} over chance, under {FIT}, so they may belong "
+                    "to another episode or cut")
+    timing = sliced(cues, ts, refs[name], rate, offset, duration)
+    fix = timing.get("fix")
+    to = lambda f, t: moved(t * 1000, f) / 1000 if f else t
+    says = lambda f: f'{f["offset"]:+.2f} s' + ("" if f["rate"] == "1/1" else f' and the ratio {f["rate"]}')
+    for lifted, other, r, o in found:   # a second reference must give the same times
+        if fix and other != name and lifted >= FIT:
+            them = sliced(cues, ts, refs[other], r, o, duration)
+            if any(abs(to(fix, t) - to(them.get("fix"), t)) > TOLERANCE for t in (0, duration)):   # a fix moves some cue MIN_SHIFT or more
+                timing = {"fix": None, "unfixed": fix["offset"], "why": f"a fix of {says(fix)} fits {name}, but {other} "
+                          + (f"needs a fix of {says(them['fix'])}" if them.get("fix") else f"says {them['why'].removesuffix(', so the times stay')}") + ", so the times stay"}
+                break
+    return dict(out, verdict="fit", why=f"the cues fit {name} at a lift of {score:.2f} over chance", timing=timing)
+
+
+SWEPT = 3         # windows of the sweep in each half of the file that heard MIN_WORDS words and put an offset on the cues,
+                  # before a clean sweep makes a match with too few anchors a reference, see clean()
+
+
+def clean(rows, duration):
+    """The sweep() rows show a track in time: in each half of the file SWEPT windows or more heard MIN_WORDS words and
+    gave an offset, every window that heard MIN_WORDS words matched at MATCH or more, and every such offset lies under
+    MIN_SHIFT."""
+    heard = [r for r in rows if r["words"] >= MIN_WORDS]
+    timed = [r for r in heard if r["offset"] is not None]
+    return all(sum((r["at"] < duration / 2) == early for r in timed) >= SWEPT for early in (True, False)) \
+        and all(r["overlap"] >= MATCH for r in heard) and all(abs(r["offset"]) < MIN_SHIFT for r in timed)
+
+
+def sweep(heard, cues, lang, timing=None):
+    """One row per heard window of the sweep of --sub-time, in time order: {"at", "words": its heard content words,
+    "overlap", "cues": the matched cues whose first word matched, "offset": their median cue start less the heard time
+    and CUE_LEAD, or None, "off": that offset less the fitted line there, or None}. The fitted line is the fix of
+    timing, the word check's, else no offset. The rows only report."""
+    stop, cues = arr_decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
+    fl, index = flat(cues, stop), collections.defaultdict(list)
+    for p, x in enumerate(fl):
+        index[x[2]].append(p)
+    fix = (timing or {}).get("fix")
+    rate, offset = (float(Fraction(fix["rate"])), fix["offset"]) if fix else (1.0, 0.0)
+    rows = []
+    for w in sorted(heard, key=lambda w: w["at"]):
+        g = match_window(said(w, stop), fl, index)
+        e = anchors(g["pairs"], cues)
+        o = round(statistics.median(c - t for t, c in e) - CUE_LEAD, 2) if e else None
+        at = statistics.median(t for t, _ in e) if e else w["at"]
+        rows.append({"at": w["at"], "words": g["words"], "overlap": g["overlap"], "cues": len(e), "offset": o,
+                     "off": None if o is None else round(o - (rate - 1) * (at + CUE_LEAD) - offset, 2)})
+    return rows
+

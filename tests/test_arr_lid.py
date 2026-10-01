@@ -369,3 +369,36 @@ def test_jobs_hear_the_windows_the_hook_would_pick(ears, tmp_path):
     (got,) = arr_lid.jobs(media, str(spec), cache)
     first = arr_subsync.windows(cues, 1320.0, arr_decide.STOPWORDS["eng"])
     assert got == {"index": 1, "starts": first} and arr_lid.words_get(cache, media, 1, arr_lid.tag(arr_lid.MODEL), "eng", first) is not None
+
+
+def test_the_sweep_hears_each_group_as_one_clip_in_one_process(monkeypatch, capsys):
+    """--group hears the --words windows two at a time through listen(), so the model loads once and each pair is
+    cached as the subtitle check caches its windows."""
+    calls = []
+    monkeypatch.setattr(arr_lid, "listen", lambda path, idx, starts, lang, secs, **kw: calls.append(starts) or
+                        {"windows": [{"at": s, "secs": secs, "words": []} for s in starts], "cached": len(calls) > 1, "reused": 0, "took": 1.5,
+                         "model": "small@x", "profile": {"whisper": [2.0, 2.5]}})
+    assert arr_lid.main(["f.mkv", "0", "600", "--words", "eng", "10", "70", "130", "--secs", "10", "--group", "2"]) == 0
+    got = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert calls == [[10.0, 70.0], [130.0]] and [w["at"] for w in got["windows"]] == [10.0, 70.0, 130.0], (calls, got)
+    assert not got["cached"] and got["took"] == 3.0 and got["profile"] == {"whisper": [4.0, 5.0]}
+
+
+def test_the_sweep_yields_between_groups_when_a_job_or_a_hearing_waits(monkeypatch, tmp_path):
+    """A job file in the queue, or another hearing at the gate, stops the sweep after the group it is on. The first
+    group always runs, so a sweep never stalls."""
+    calls, queue, gate = [], tmp_path / "queue", tmp_path / "lid.turn.gate"
+    queue.mkdir()
+    monkeypatch.setattr(arr_lid, "listen", lambda path, idx, starts, lang, secs, **kw: calls.append(starts) or
+                        {"windows": [{"at": s, "secs": secs, "words": []} for s in starts], "cached": False, "reused": 0, "took": 1.0, "model": "m"})
+    (queue / "1-2.json").write_text("{}")
+    got = arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0, 190.0], "eng", 2, gate=str(gate), queue=str(queue))
+    assert got["yielded"] and calls == [[10.0, 70.0]] and len(got["windows"]) == 2
+    (queue / "1-2.json").unlink()
+    calls.clear()
+    import fcntl
+    with open(gate, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)   # a hook job waits for the model
+        assert arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=str(queue)).get("yielded") and len(calls) == 1
+    calls.clear()
+    assert "yielded" not in arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=str(queue)) and len(calls) == 2
