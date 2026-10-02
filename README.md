@@ -164,7 +164,8 @@ RADARR_4K_API_KEY='the key from Settings > General of that Radarr'
 - A bad entry is left out, and `--selftest` names it.
 
 **Docker.** One container serves every instance. Each instance posts to `/<name>`, so the Webhook URL of the 4K
-Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in the table above. For example:
+Sonarr is `http://arr-media-guard:8484/sonarr-4k`, and of the 4K Radarr `http://arr-media-guard:8484/radarr-4k`.
+The other fields are as in the table above. For example:
 
 ```yaml
   sonarr:
@@ -173,6 +174,12 @@ Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in th
   sonarr-4k:
     image: lscr.io/linuxserver/sonarr:latest
     volumes: [./sonarr-4k:/config, /srv/media:/data]   # Webhook URL http://arr-media-guard:8484/sonarr-4k
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    volumes: [./radarr:/config, /srv/media:/data]      # Webhook URL http://arr-media-guard:8484/radarr
+  radarr-4k:
+    image: lscr.io/linuxserver/radarr:latest
+    volumes: [./radarr-4k:/config, /srv/media:/data]   # Webhook URL http://arr-media-guard:8484/radarr-4k
   arr-media-guard:
     image: ghcr.io/samwiseg0/arr-media-guard:latest
     environment:
@@ -180,9 +187,12 @@ Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in th
       PGID: 1000
       TZ: Etc/UTC
       SONARR_API_KEY: CHANGE_ME              # Settings > General in Sonarr
-      APP_INSTANCES: sonarr-4k:sonarr
+      RADARR_API_KEY: CHANGE_ME              # Settings > General in Radarr
+      APP_INSTANCES: sonarr-4k:sonarr,radarr-4k:radarr
       SONARR_4K_URL: http://sonarr-4k:8989
       SONARR_4K_API_KEY: CHANGE_ME           # Settings > General in the 4K Sonarr
+      RADARR_4K_URL: http://radarr-4k:7878
+      RADARR_4K_API_KEY: CHANGE_ME           # Settings > General in the 4K Radarr
     volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
     stop_grace_period: 1m
     restart: unless-stopped

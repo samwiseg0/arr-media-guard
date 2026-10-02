@@ -16,9 +16,11 @@ services:
       # PLEX_URL: http://CHANGE_ME:32400   # Plex re-analyzes each edited item
       # PLEX_TOKEN: CHANGE_ME
       # DISCORD_WEBHOOK: CHANGE_ME         # alerts and scan summaries
-      # APP_INSTANCES: sonarr-4k:sonarr    # a second instance, with the Webhook URL http://<this host>:8484/sonarr-4k
+      # APP_INSTANCES: sonarr-4k:sonarr,radarr-4k:radarr   # more instances, each with the Webhook URL http://<this host>:8484/<name>
       # SONARR_4K_URL: http://CHANGE_ME:8989
-      # SONARR_4K_API_KEY: CHANGE_ME
+      # SONARR_4K_API_KEY: CHANGE_ME       # Settings > General in the 4K Sonarr
+      # RADARR_4K_URL: http://CHANGE_ME:7878
+      # RADARR_4K_API_KEY: CHANGE_ME       # Settings > General in the 4K Radarr
     volumes:
       - ./arr-media-guard:/config          # the env file, the policy and the decision log
       - amg-state:/config/state            # the state store, which needs a local disk
