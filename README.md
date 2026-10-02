@@ -60,12 +60,15 @@ These steps run it next to the apps, on one compose network. For apps on other h
    ```
    The state store is SQLite in WAL mode and needs a local disk, so it gets a volume of its own. To ship syslog to
    Loki, also mount `/dev/log`. Each command in the container then writes its logfmt lines to the host's syslog.
-2. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `/config`. The
-   listener exits until the env file has a Webhook user and password.
-3. Set `WEBHOOK_USER` and `WEBHOOK_PASSWORD` in `./arr-media-guard/arr-media-guard.env`. Set `SONARR_API_KEY` and
-   `RADARR_API_KEY` to the keys in each app's Settings > General. Set `TMDB_TOKEN` too, because the image has no Radarr
-   install to read the bundled key from.
-4. Run `docker compose up -d` again.
+2. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `/config`.
+   `WEBHOOK_USER` and `WEBHOOK_PASSWORD` in the env file are the user and password of the Webhook connection. The user
+   is `arr-admin`. The listener generates a random password at its first start and writes it into the env file. You can
+   set your own pair instead. Each takes any printable ASCII, and the user takes no `:`.
+3. Open `./arr-media-guard/arr-media-guard.env`. Copy `WEBHOOK_USER` and `WEBHOOK_PASSWORD` into the Username and
+   Password of each app's Webhook connection, see [Add it to Sonarr and Radarr](#add-it-to-sonarr-and-radarr). Every app
+   takes the same pair. Set `SONARR_API_KEY` and `RADARR_API_KEY` to the keys in each app's Settings > General. Set
+   `TMDB_TOKEN` too, because the image has no Radarr install to read the bundled key from.
+4. Run `docker compose restart arr-media-guard`, so the listener reads the keys.
 
 [docs/docker.md](docs/docker.md) has a full compose file, the mounts, path maps for other media paths, and the
 listener.
@@ -213,7 +216,7 @@ The worker logs it at each start.
 - In Docker the file is `./arr-media-guard/arr-media-guard.env`. Restart the container after you change it.
 - On a host it is `/etc/arr-media-guard.env`. Set the environment variable `ARR_MEDIA_GUARD_ENV` to use another file.
 - [examples/arr-media-guard.env](examples/arr-media-guard.env) lists every key with its default.
-  [docker/arr-media-guard.env](docker/arr-media-guard.env) adds the Docker keys.
+  [docker/arr-media-guard.env](docker/arr-media-guard.env) holds the Docker values and the Docker keys.
 
 The command `arr-media-guard` is a launcher. It runs the package `arr_media_guard/` in its own folder, symlinks
 resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another folder.
@@ -297,19 +300,20 @@ These keys are for `arr-media-guard-subhunt`, see [docs/features.md](docs/featur
 
 ### Docker
 
-The Docker section at the end of the env file sets the paths under `/config`, the Docker defaults of the keys above,
-and these keys.
+In Docker, the env file holds the Docker values of the keys above, as the paths under `/config`. The Docker section
+at its end holds these keys.
 
 | Key | Default in Docker | What it does |
 | --- | --- | --- |
-| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | empty | The basic auth of the Webhook connection, in printable ASCII. Without both, the listener does not start. |
+| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | `arr-admin`, empty | The user and password of the Webhook connection of each app, in printable ASCII. The user takes no `:`. An empty password gets a random one at the listener's start, in the env file. Without a user, the listener does not start. |
 | `AUDIT_TIME` | `07:30` | The local time of the nightly audit and the weekly log rotation. Empty: neither runs. |
 
 ## Update
 
 1. In Docker, set the new version in `image:`, then run `docker compose pull arr-media-guard` and
    `docker compose up -d arr-media-guard`. On a host, run `sudo git -C /opt/arr-media-guard pull`.
-2. Add the keys a new release names to your env file. An update never changes that file.
+2. Add the keys a new release names to your env file. An update never changes that file. In Docker, each start writes
+   the image's env file to `arr-media-guard.env.example` beside yours, so you can compare the two.
 3. Run the selftest.
 
 In Docker, `/config` keeps the env file, the policy and the decision log. The volume `amg-state` keeps the state store

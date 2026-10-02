@@ -70,11 +70,18 @@ Every Docker install sets `SONARR_API_KEY`, `RADARR_API_KEY` and `TMDB_TOKEN` in
 ## The env file in Docker
 
 The first start writes `arr-media-guard.env` and `policy.json` into `/config`. It writes the env file only on its first
-start, so add by hand the keys a new release names.
+start, so add by hand the keys a new release names. Each start writes the image's env file as
+`arr-media-guard.env.example`, so the keys of a new release show there.
 
-The Docker section at the end of the env file sets the paths under `/config`, and the Docker keys in the README's
-settings. Every other key works as on a host. The listener reads the env file and the policy when it starts. Restart the
-container after you change either.
+`WEBHOOK_USER` and `WEBHOOK_PASSWORD` are the user and password of the Webhook connection. The Webhook connection of
+each app takes the same pair as its Username and Password. Each takes any printable ASCII, and the user takes no `:`.
+The env file starts with the user `arr-admin` and an empty password. When the password is empty, the listener generates
+a random one at its start and writes it into the env file. The container log then names the file, and never shows the
+password. Without a user, the listener does not start.
+
+The env file holds the Docker values in place of the host values, as the paths under `/config`. The Docker section at
+its end holds the Docker keys in the README's settings. Every other key works as on a host. The listener reads the env
+file and the policy when it starts. Restart the container after you change either.
 
 ## User and group
 

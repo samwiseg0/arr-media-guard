@@ -220,7 +220,7 @@ def conversion(ctx):
             rec["ids"]["file_id"] = fid
             if ctx.mode == "import":
                 job.update(path=path, file_id=str(fid))
-        logs.log(dict(rec, result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
+        logs.log(dict(rec, outcome="repacked", result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
         if ctx.mode == "convert":   # the language backfill decides the flags later, from its own cache
             rec["repack"]["rescan"] = "after the run"
@@ -290,7 +290,7 @@ def header(ctx):
             h.get("blocked") or [f'the video check failed: {ctx.vpre[2].get("error")}']), {}
     rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
     if code in config.REPAIRED:
-        logs.log(dict(rec, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+        logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
         refresh(ctx)
 
 
@@ -415,7 +415,7 @@ def subtitle_checks(ctx):
                                       if x] if done else [code])
         if done:
             rec["subremux"]["tracks_before"] = logs.track_log(d["tracks"])   # the places the check named, before a removal moves the tracks up
-            logs.log(dict(rec, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+            logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
             checks.lid_carry(path, st)   # the proof shows the same audio
             refresh(ctx, duration=False)
             gone = set(remove)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch

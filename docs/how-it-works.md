@@ -67,10 +67,11 @@ at first and at most an hour apart, for a day. See [design.md](design.md#webhook
 [design.md](design.md#memory). In Docker the listener starts `arr-media-guard --serve --worker` after each job, and
 every 60 seconds while a job waits.
 
-At its start the worker removes the work folders a killed step left. It prunes the kept files once a day. It puts back
+At its start the worker checks the state store. A broken store moves aside as `state.sqlite.corrupt-<time>`, and a
+new one starts with the jobs the worker can read from the old one. The worker then removes the work folders a killed step left. It prunes the kept files once a day. It puts back
 the jobs a dead worker left, and takes the Plex analyzes a stopped worker kept. It then runs the import jobs, oldest
 first, and exits when the queue is empty and no Plex analyze waits. With `HOOK_WORKERS` above 1, it forks one process
-per job. A job process that crashes three times drops its job. See [design.md](design.md#how-it-runs).
+per job. A job process that crashes writes a decision line with the error, and three crashes drop its job. See [design.md](design.md#how-it-runs).
 
 Before the checks, the worker skips a job whose file a re-grab of its download deleted. It drops a job whose file is
 gone and a job older than a day. When the app renamed the file, the worker asks the app for the new path by the file

@@ -155,9 +155,10 @@ class Settings:
         return self.own_map(who) or self.path_map
 
     def secrets(self):
-        """{key: value} of each secret setting that a URL or an error text may hold, for mask(). WEBHOOK_PASSWORD is in
-        no URL and no error text, and the listener never logs the Authorization header."""
+        """{key: value} of each secret setting that a URL, an error text or a log line may hold, for mask(). mask() skips
+        a value under MASK_MIN characters, so a short WEBHOOK_PASSWORD never breaks a path."""
         return {"PLEX_TOKEN": self.plex_token, "DISCORD_WEBHOOK": self.discord_webhook, "TMDB_TOKEN": self.tmdb_token,
+                "WEBHOOK_PASSWORD": self.webhook_password,
                 **{f"{env_key(app)}_API_KEY": a.api_key for app, a in self.apps.items()},
                 "SABNZBD_API_KEY": self.sabnzbd_api_key, "NEWZNAB_API_KEY": self.newznab_api_key}
 

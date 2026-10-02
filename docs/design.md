@@ -190,7 +190,8 @@ the state store stops a repeat, and an upgrade to a file of another size alerts 
 | `policy` | The policy file is missing or does not load. |
 
 A fault that the second check did not find again is amber, "not confirmed". A missing or rejected
-TMDB key posts one embed a day. A 429 from Discord waits `retry_after` and retries once.
+TMDB key posts one embed a day. A 429 from Discord waits `retry_after` and retries once. A state store that the
+worker moved aside posts one embed a day too, see "State".
 
 **One output model.** The checks and the steps keep codes and facts. A finding is `{"kind": <kind>, ...facts}`, and its
 kind is the alert kind above. A finding the hook acted on holds the action, `{"code": <code>, ...facts}`. `report.py`
@@ -396,7 +397,17 @@ it drops its lock, so no job is lost. A job older than a day is dropped.
 `HOOK_WORKERS` (1) sets how many jobs run at a time. Set it to about the cores the host can spare.
 With more than 1, the worker claims each job by one change in the state store, forks one process
 per job, and sends every Plex analyze itself, so the idle-section gate holds. A season pack of 200
-episodes runs at most `HOOK_WORKERS` processes at a time.
+episodes runs at most `HOOK_WORKERS` processes at a time. A job process that crashes writes one decision line with
+outcome `error`, the exception and a short trace, because its stderr is often `/dev/null`. A job whose processes crash
+`CRASH_TRIES` times in one worker run is not claimed again in that run, also when the store lost its crash count.
+
+**No store connection crosses a fork.** SQLite keeps the locks of a process in its memory. A forked child that opens
+the store while a copy of its parent's connection lives in it takes no real lock. Another process can then checkpoint
+and delete the WAL that the child writes, and the store breaks ([How To Corrupt An SQLite Database
+File](https://sqlite.org/howtocorrupt.html), section 2.6). So the hook and the worker fork through `store.fork()`. It
+closes the connection of the process first, and it refuses the fork while any descriptor still holds a store file.
+`db()` raises when it finds a connection of another process. The hook and the worker fork with one thread. The
+listener never forks, and the thread pools of a backfill or a scan share one process, which SQLite supports.
 
 **Time limit.** A job has 300 seconds from the file lock to mkvpropedit. mkvpropedit has no limit,
 because a kill mid-write can break the header. A remux, its proof and its swap have none either, and
@@ -467,6 +478,15 @@ of each decision line that the audit and `--force-convert` read. The store keeps
 editing marks for 14 days, two weekly rotations of the log. `--audit --since` reads that window.
 A store error loses such a fact and never stops the job.
 
+A worker checks the store at its start with `PRAGMA quick_check`. A store that reads as no database, or fails the
+check, moves aside as `state.sqlite.corrupt-<time>` with its `-wal` and `-shm` files, and a new store starts. The worker
+reads the jobs of the old store from its table, without the index, and queues each one in the new store, unclaimed. A
+broken store can still have taken the job of an import. The worker writes one decision line with outcome
+`store_corrupt`, which syslog gets too. It says what the check found, how many jobs moved and how many rows did not
+read. It posts one embed at most each day, and the file `store-alert` keeps the time of the last one. The other records
+of the old store are not in the new one. A hook that finds the store broken writes its job into `queue/` and starts
+the worker, so that job runs on the new store.
+
 These stay files of their own: the decision log, `status.json` (a monitoring agent reads it),
 `lid.sqlite` (the language detection reads it), the locks (`lock`, `lock.gate`, `lid.turn`,
 `lid.turn.gate`, `worker.lock`, `subhunt.lock`), and the lists for a person: `convert-<app>.txt` and
@@ -503,7 +523,9 @@ The outcome, reason and Plex codes are stable, so queries and alerts can match o
 that makes a result gives its outcome code with it, and a result with no code logs `other`. The
 reason codes come from the `say()` calls in
 `decide.py` and from the header and restore steps. An `editing` line with the undo goes
-out before each edit, so a crashed edit still has a record. A missing or broken policy file never
+out before each edit, so a crashed edit still has a record. A repack, a header repair and a subtitle
+remux each write a line before anything else runs, with the code of the step in `outcome`. Only a
+decision line has `schema`. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
 the log weekly with compression. The code never reads the log back, see "State".
 

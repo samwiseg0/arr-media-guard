@@ -14,11 +14,10 @@ if [ "$(id -u)" = 0 ]; then
     # /config/state is the state store's own mount, a named volume that Docker creates owned by root. Without that
     # mount, mkdir creates it in /config. chown -R below goes into a mount too, so it gives either one to PUID:PGID.
     mkdir -p /config/state /config/logs
-    # The first start writes the env file: every key of the example, then the Docker settings, which win.
-    if [ ! -e /config/arr-media-guard.env ]; then
-        cat /opt/arr-media-guard/examples/arr-media-guard.env /opt/arr-media-guard/docker/arr-media-guard.env > /config/arr-media-guard.env
-        chmod 0640 /config/arr-media-guard.env
-    fi
+    # Each start writes the env file of this image as arr-media-guard.env.example, so the keys of a new release show.
+    # The first start also writes it as the env file. A later start never changes the env file.
+    install -m 0640 /opt/arr-media-guard/docker/arr-media-guard.env.example /config/arr-media-guard.env.example
+    [ -e /config/arr-media-guard.env ] || install -m 0640 /config/arr-media-guard.env.example /config/arr-media-guard.env
     [ -e /config/policy.json ] || cp /opt/arr-media-guard/examples/policy.json /config/policy.json
     chown -R "${PUID}:${PGID}" /config
     exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "/opt/arr-media-guard/$cmd" "$@"

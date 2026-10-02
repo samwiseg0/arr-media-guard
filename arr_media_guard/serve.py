@@ -7,9 +7,9 @@ is installed in their containers.
   arr-media-guard --serve
 
 It listens on port PORT. Each instance posts to /<its name>, Radarr to /radarr and Sonarr to /sonarr, with HTTP basic
-auth. The user and password are WEBHOOK_USER and WEBHOOK_PASSWORD in the env file. Without both, the listener does not
-start. The body gives the same runner.Event that hook() reads from the Custom Script variables, with the checks of
-runner.Event.from_webhook().
+auth. The user and password are WEBHOOK_USER and WEBHOOK_PASSWORD in the env file. When the password is empty, the
+listener writes a new one at its start, see new_password(). Without a user, the listener does not start. The body gives
+the same runner.Event that hook() reads from the Custom Script variables, with the checks of runner.Event.from_webhook().
 A Download event (an import or an upgrade) becomes its job through queue_job(), so the worker and the queue stay one
 code path. A Test event runs runner.app_check(), as the hook's Test does. With KEEP_REPLACED on, a Grab event
 hard-links the files the grab may replace, see grab(). The listener refuses a body that fails a check with a log line.
@@ -27,7 +27,7 @@ the nightly audit of each app, which also removes kept originals older than KEEP
 decision log with logrotate. SIGTERM stops the listener.
 It sends SIGTERM to the worker and waits for it, so a flag edit is never cut. See docs/design.md, "Webhook".
 """
-import base64, concurrent.futures, contextlib, datetime, hmac, http.server, json, os, signal, socket, sqlite3, subprocess, sys, threading, time
+import base64, concurrent.futures, contextlib, datetime, hmac, http.server, json, os, secrets, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time
 
 from . import apps, cli, config, decide, logs, runner, store, vault
 
@@ -40,6 +40,7 @@ QUIET = 60             # seconds between two summary lines of the requests refus
 POLL = 2               # seconds the listener waits for a request before it looks for a stop
 TICK = 60              # seconds between two looks for a waiting job with no worker, and for the daily jobs
 START_WAIT = 120       # seconds the start check asks again an app that does not answer, as one that starts beside the listener
+USER = "arr-admin"     # the WEBHOOK_USER of the Docker env file. new_password() writes it when WEBHOOK_USER is empty.
 BANNER = r"""
                                    _  _                                     _
  __ _ _ _ _ _  ___  _ __   ___  __| |(_) __ _  ___  __ _ _  _  __ _ _ _  __| |
@@ -369,9 +370,45 @@ def start_check():
         note(app, "warning", f"the start check failed: {why}", logged=False) if why else note(app, "start check", "ok", logged=False)
 
 
+def new_password(user):
+    """(user, password) after a new WEBHOOK_PASSWORD went into the env file, in place of its empty line. An empty user
+    becomes USER the same way. A temp file and a rename write the file, so a crash never leaves half a file. The file
+    keeps its owner and mode. The log line says where the password is, and never shows it."""
+    path, keys = config.ENV_FILE, {} if user else {"WEBHOOK_USER": USER}   # a user already set keeps its line
+    keys["WEBHOOK_PASSWORD"] = secrets.token_urlsafe(24)   # 32 characters of A-Z, a-z, 0-9, '-' and '_'
+    try:
+        st = os.stat(path)
+        with open(path) as f:   # each line of a key, as config.env_file() reads it
+            lines = [f"{k}='{keys[k]}'" if (k := line.strip().partition("=")[0]) in keys else line for line in f.read().rstrip("\n").split("\n")]
+        lines += [f"{k}='{v}'" for k, v in keys.items() if f"{k}='{v}'" not in lines]   # a key the file does not hold
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".env-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                os.fchown(fd, st.st_uid, st.st_gid)
+                os.fchmod(fd, st.st_mode & 0o7777)
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+    except OSError as ex:
+        sys.exit(f"arr-media-guard --serve: WEBHOOK_PASSWORD is empty, and the listener did not write a new one to {path}: {ex}. "
+                 "Set WEBHOOK_USER and WEBHOOK_PASSWORD in it")
+    print(f"arr-media-guard: generated a Webhook password and wrote it to {path} as WEBHOOK_PASSWORD. In the README's compose file, "
+          "that is ./arr-media-guard/arr-media-guard.env on the host. In the Webhook connection of each app, set Username to "
+          "WEBHOOK_USER and Password to WEBHOOK_PASSWORD from that file.", flush=True)
+    return user or USER, keys["WEBHOOK_PASSWORD"]
+
+
 def listen_config():
-    """(Authorization header value, AUDIT_TIME) from the env file, or exit with what to fix."""
+    """(Authorization header value, AUDIT_TIME) from the env file, or exit with what to fix. An empty password gets a new
+    one, see new_password()."""
     user, pw = config.CFG.webhook_user, config.CFG.webhook_password
+    if not pw:
+        user, pw = new_password(user)
     if not user or not pw:
         sys.exit(f"arr-media-guard --serve: set WEBHOOK_USER and WEBHOOK_PASSWORD in {config.ENV_FILE}. The Webhook connection of each app "
                  "uses the same two")

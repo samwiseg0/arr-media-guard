@@ -28,6 +28,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -340,6 +341,82 @@ def test_config_refuses_to_start_without_credentials_or_with_a_bad_setting(monke
     settings(map_error="PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths")
     with pytest.raises(SystemExit, match="PATH_MAP takes pairs"):   # a map that left a pair out would edit the wrong paths
         arr_serve.listen_config()
+
+
+def webhook_env(tmp_path, monkeypatch, settings, text):
+    """An env file that holds text, with mode 0640, as the listener's env file. CFG takes its Webhook pair."""
+    env = tmp_path / "arr-media-guard.env"
+    env.write_text(text)
+    env.chmod(0o640)
+    monkeypatch.setattr(arr_serve.config, "ENV_FILE", str(env))
+    pair = h.env_file(str(env))
+    settings(webhook_user=pair.get("WEBHOOK_USER", ""), webhook_password=pair.get("WEBHOOK_PASSWORD", ""), path_map=[], map_error=None)
+    return env
+
+
+def password_of(env):
+    pair = h.env_file(str(env))
+    return pair["WEBHOOK_USER"], pair["WEBHOOK_PASSWORD"]
+
+
+@pytest.mark.parametrize("user_line, user", [("WEBHOOK_USER=''", "arr-admin"), ('WEBHOOK_USER="guard"', "guard")])
+def test_an_empty_password_is_generated_into_the_env_file_in_place(tmp_path, monkeypatch, settings, capsys, user_line, user):
+    """The listener writes a new password in place of the empty line, and the user arr-admin when that is empty too.
+    A user already set keeps its line. The other lines and the mode stay. The log line never shows the password."""
+    env = webhook_env(tmp_path, monkeypatch, settings, f"# the top\nLOG='/x.jsonl'\n{user_line}\nWEBHOOK_PASSWORD=''\n# the end\n")
+    auth = arr_serve.listen_config()[0]
+    got_user, pw = password_of(env)
+    assert (got_user, len(pw)) == (user, 32) and re.fullmatch(r"[A-Za-z0-9_-]+", pw), pw   # token_urlsafe(24): no ':' and no quote
+    assert auth == b"Basic " + base64.b64encode(f"{user}:{pw}".encode())
+    lines = env.read_text().splitlines()
+    assert lines == ["# the top", "LOG='/x.jsonl'", user_line if user == "guard" else "WEBHOOK_USER='arr-admin'", f"WEBHOOK_PASSWORD='{pw}'", "# the end"]
+    assert oct(env.stat().st_mode & 0o7777) == oct(0o640) and [p.name for p in tmp_path.iterdir()] == [env.name]
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1 and pw not in out, out
+    assert f"generated a Webhook password and wrote it to {env} as WEBHOOK_PASSWORD." in out, out
+    assert "set Username to WEBHOOK_USER and Password to WEBHOOK_PASSWORD from that file." in out, out
+
+
+def test_a_key_the_env_file_does_not_hold_is_added_and_each_start_gets_a_new_password(tmp_path, monkeypatch, settings):
+    env = webhook_env(tmp_path, monkeypatch, settings, "LOG='/x.jsonl'")
+    arr_serve.listen_config()
+    user, first = password_of(env)
+    assert env.read_text() == f"LOG='/x.jsonl'\nWEBHOOK_USER='arr-admin'\nWEBHOOK_PASSWORD='{first}'\n" and user == "arr-admin"
+    seen = {first}
+    for _ in range(3):
+        env.write_text("WEBHOOK_PASSWORD=''\n")
+        user, pw = arr_serve.new_password("guard")
+        assert (user, env.read_text()) == ("guard", f"WEBHOOK_PASSWORD='{pw}'\n") and pw not in seen
+        seen.add(pw)
+
+
+@pytest.mark.parametrize("text", ["WEBHOOK_USER='guard'\nWEBHOOK_PASSWORD='s3cret-pass'\n", "WEBHOOK_USER=\"guard\"\nWEBHOOK_PASSWORD=s3cret-pass\n",
+                                  "WEBHOOK_USER=''\nWEBHOOK_PASSWORD='s3cret-pass'\n", "WEBHOOK_PASSWORD='s3cret-pass'\n"])
+def test_a_password_already_set_is_never_changed(tmp_path, monkeypatch, settings, capsys, text):
+    """A pair already set starts the listener as it is. A user left empty with a password set keeps the refusal, and
+    the file stays as it was."""
+    env = webhook_env(tmp_path, monkeypatch, settings, text)
+    before = env.stat()
+    if "WEBHOOK_USER=''" in text or "WEBHOOK_USER" not in text:
+        with pytest.raises(SystemExit, match="set WEBHOOK_USER and WEBHOOK_PASSWORD in "):
+            arr_serve.listen_config()
+    else:
+        assert arr_serve.listen_config()[0] == AUTH.encode()
+    assert env.read_text() == text and env.stat().st_mtime_ns == before.st_mtime_ns and "generated" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("step", ["fsync", "replace"])
+def test_a_failed_write_leaves_the_env_file_whole_and_stops_with_why(tmp_path, monkeypatch, settings, capsys, step):
+    """The new file goes to a temp file and a rename. A failed step leaves the old file and no temp file."""
+    text = "LOG='/x.jsonl'\nWEBHOOK_USER='guard'\nWEBHOOK_PASSWORD=''\n"
+    env = webhook_env(tmp_path, monkeypatch, settings, text)
+
+    def fail(*a):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(arr_serve.os, step, fail)
+    with pytest.raises(SystemExit, match=r"WEBHOOK_PASSWORD is empty, and the listener did not write a new one to .*No space left"):
+        arr_serve.listen_config()
+    assert env.read_text() == text and [p.name for p in tmp_path.iterdir()] == [env.name] and "generated" not in capsys.readouterr().out
 
 
 def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch, settings):
@@ -1135,7 +1212,7 @@ def test_the_listener_queues_starts_a_worker_and_stops_on_sigterm(app, monkeypat
     monkeypatch.setattr(arr_serve, "spawn", lambda what: subprocess.Popen(
         [sys.executable, "-c", FAKE_WORKER, h.store.path(), str(marks), str(kid)], start_new_session=True))
     out = tmp_path / "stdout"
-    pid = os.fork()
+    pid = h.store.fork()   # the test process holds a connection to the store, see store.fork()
     if not pid:
         try:
             sys.stdout = open(out, "w", buffering=1)   # the listener's lines, for the parent to read
@@ -1199,7 +1276,7 @@ def test_the_listener_runs_the_daily_jobs_again_once_the_last_run_ended(app, mon
     monkeypatch.setattr(arr_serve, "TICK", 0.2)
     monkeypatch.setattr(arr_serve, "daily_due", lambda at, now=None: next(due, False))
     monkeypatch.setattr(arr_serve, "spawn", lambda what: subprocess.Popen([sys.executable, "-c", f"open({str(marks)!r}, 'a').write('run\\n')"]))
-    pid = os.fork()
+    pid = h.store.fork()   # the test process holds a connection to the store, see store.fork()
     if not pid:
         try:
             arr_serve.main([])
@@ -1468,6 +1545,70 @@ def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path
     r = subprocess.run([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], capture_output=True, text=True, timeout=60,
                        env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
     assert r.returncode == 1 and "--serve: RADARR_PATH_MAP takes pairs APP_PATH:LOCAL_PATH" in r.stderr, r.stderr
+
+
+def image_env():
+    """The env file of the image, as the Dockerfile writes it."""
+    return subprocess.run([sys.executable, os.path.join(FILES, "docker", "merge_env.py")], capture_output=True, text=True, check=True).stdout
+
+
+def test_a_fresh_env_file_gets_a_password_and_the_listener_takes_it(tmp_path):
+    """The image's env file as the first start writes it, with the paths of this test. The listener generates the
+    password, starts and takes the pair from the file. Its output never shows the password."""
+    port, env, out = free_port(), tmp_path / "arr-media-guard.env", tmp_path / "out"
+    env.write_text(image_env() + f"AUDIT_TIME=''\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\nRADARR_DIR='/nonexistent'\nSONARR_DIR='/nonexistent'\n"
+                   f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\n")
+    with open(out, "w") as f:
+        p = subprocess.Popen([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], stdout=f, stderr=subprocess.STDOUT,
+                             env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
+    try:
+        for _ in range(100):
+            if "listening on port" in out.read_text():
+                break
+            time.sleep(0.1)
+        user, pw = h.env_file(str(env))["WEBHOOK_USER"], h.env_file(str(env))["WEBHOOK_PASSWORD"]
+        assert user == "arr-admin" and len(pw) == 32, out.read_text()
+        for secret, code in ((pw, 200), (pw[:-1], 401)):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("POST", "/radarr", b'{"eventType": "Other"}', {"Authorization": "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode()})
+            assert c.getresponse().status == code
+            c.close()
+    finally:
+        p.send_signal(signal.SIGTERM)
+        p.wait(timeout=20)
+    text = out.read_text()
+    assert text.count("arr-media-guard: generated a Webhook password") == 1 and pw not in text, text
+
+
+def test_each_start_writes_the_example_and_only_the_first_start_the_env_file(tmp_path, monkeypatch):
+    """The start script as root, with its paths in tmp_path and id, chown and setpriv as stubs. The first start writes
+    the image's env file as the env file and as the example, both 0640. A later start writes the example again and
+    leaves the env file alone, so the generated password stays in the env file only."""
+    opt, cfg, stubs = tmp_path / "opt", tmp_path / "config", tmp_path / "bin"
+    for d in (opt / "docker", opt / "examples", stubs):
+        d.mkdir(parents=True)
+    image = image_env()
+    (opt / "docker" / "arr-media-guard.env.example").write_text(image)
+    (opt / "examples" / "policy.json").write_text("{}")
+    for path, body in ((opt / "arr-media-guard", "exit 0"), (stubs / "id", "echo 0"), (stubs / "chown", "exit 0"),
+                       (stubs / "setpriv", 'shift 3\nexec "$@"')):
+        path.write_text(f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+    script = tmp_path / "start.sh"
+    with open(os.path.join(FILES, "docker", "arr-media-guard.sh")) as f:
+        script.write_text(f.read().replace("/opt/arr-media-guard", str(opt)).replace("/config", str(cfg)))
+    run = dict(os.environ, PATH=f"{stubs}:{os.environ['PATH']}", PUID="1000", PGID="1000")
+    subprocess.run(["sh", str(script), "--serve"], check=True, env=run)
+    env, example = cfg / "arr-media-guard.env", cfg / "arr-media-guard.env.example"
+    assert env.read_text() == example.read_text() == image
+    assert {oct(p.stat().st_mode & 0o7777) for p in (env, example)} == {oct(0o640)}
+    monkeypatch.setattr(arr_serve.config, "ENV_FILE", str(env))
+    pw = arr_serve.new_password("arr-admin")[1]
+    mine = env.read_text()
+    example.write_text("# the example of an older image\n")
+    subprocess.run(["sh", str(script), "--serve"], check=True, env=run)
+    assert env.read_text() == mine and f"WEBHOOK_PASSWORD='{pw}'" in mine
+    assert example.read_text() == image and pw not in image
 
 
 def test_a_missing_recycle_bin_warns_in_the_test_and_the_selftest_and_fails_neither(server, app, monkeypatch, settings, capsys):

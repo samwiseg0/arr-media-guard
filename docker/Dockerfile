@@ -17,9 +17,11 @@ RUN python3 -m venv /opt/arr-media-guard-lid/venv \
     && /opt/arr-media-guard-lid/venv/bin/python /opt/arr-media-guard/arr_media_guard/lid.py --fetch --model-dir /opt/arr-media-guard-lid/models \
     && touch /opt/arr-media-guard-lid/ready
 
-# The bytecode is compiled here, because PYTHONDONTWRITEBYTECODE stops each run from writing it.
+# The bytecode is compiled here, because PYTHONDONTWRITEBYTECODE stops each run from writing it. merge_env.py writes the
+# env file of the image, which the start script copies into /config.
 COPY . /opt/arr-media-guard/
 RUN python3 -m compileall -q /opt/arr-media-guard/arr_media_guard /opt/arr-media-guard/arr_subhunt.py \
+    && python3 /opt/arr-media-guard/docker/merge_env.py > /opt/arr-media-guard/docker/arr-media-guard.env.example \
     && ln -s /opt/arr-media-guard/docker/arr-media-guard.sh /usr/local/bin/arr-media-guard \
     && ln -s /opt/arr-media-guard/docker/arr-media-guard.sh /usr/local/bin/arr-media-guard-subhunt
 

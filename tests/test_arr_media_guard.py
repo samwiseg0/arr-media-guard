@@ -963,6 +963,12 @@ def test_secrets_never_reach_the_log(env, monkeypatch):
     assert "plex-t0ken-1234" not in line and "discord.invalid" not in line and "<PLEX_TOKEN>" in line
 
 
+def test_a_long_webhook_password_never_reaches_the_log(env, settings):
+    settings(webhook_password="Kx9-generated-0123456789-abcdefghij")
+    hook.log(dict(source="test", result="warning", note="the body named Kx9-generated-0123456789-abcdefghij"))
+    assert log_lines(env)[-1]["note"] == "the body named <WEBHOOK_PASSWORD>"
+
+
 def test_hardlinked_file_is_not_edited(env, tmp_path):
     os.link(env["path"], tmp_path / "client-copy.mkv")
     hook.main([])
@@ -2627,7 +2633,8 @@ def lid(env, monkeypatch, tmp_path, answer):
 
 
 def decided(env):
-    return [r for r in log_lines(env) if r.get("outcome")][0]
+    """The first decision line. A decision line has the schema, see report.render(). An interim line has an outcome too."""
+    return [r for r in log_lines(env) if "schema" in r][0]
 
 
 def test_language_detection_decides_an_undecided_file_and_carries_its_cache(env, monkeypatch, tmp_path):
@@ -4168,6 +4175,12 @@ def traced(what=None):
     return [r for r in rows if what is None or r["what"] == what]
 
 
+def real_fork():
+    """A real fork with no connection to the store across it, see store.fork(). The env fixture fakes os.fork."""
+    hook.store.close()
+    return REAL_FORK()
+
+
 def real_wait(seconds):
     threading.Event().wait(seconds)   # time.sleep is the fixture's fake clock
 
@@ -4339,7 +4352,7 @@ def test_sigterm_requeues_the_jobs_in_flight_and_leaves_no_child(pool, monkeypat
         return None, [], []
     monkeypatch.setattr(hook, "check_audio", check)
     name = enqueue(pool, 0, path, owner="1")
-    coordinator = REAL_FORK()
+    coordinator = real_fork()
     if not coordinator:   # the worker in its own process, so the SIGTERM never reaches pytest
         try:
             run_worker()
@@ -4365,7 +4378,7 @@ def test_sigterm_requeues_the_jobs_in_flight_and_leaves_no_child(pool, monkeypat
 
 def test_sigterm_waits_for_mkvpropedit(tmp_path):
     done = tmp_path / "rc"
-    pid = REAL_FORK()
+    pid = real_fork()
     if not pid:
         code = 1
         try:
@@ -4423,7 +4436,7 @@ def test_regrab_counts_stay_whole_under_parallel_processes(tmp_path, monkeypatch
         hook.store.drop("regrabs")
         pids = []
         for i in range(6):
-            pid = REAL_FORK()
+            pid = real_fork()
             if not pid:
                 try:
                     read = hook.regrab_times
@@ -4443,7 +4456,7 @@ def test_log_lines_and_alert_markers_stay_whole_across_processes(env, monkeypatc
     monkeypatch.setattr(hook, "post", lambda app, emb: trace("post") or "sent")
     pids = []
     for i in range(6):
-        pid = REAL_FORK()
+        pid = real_fork()
         if not pid:
             try:
                 hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"})
@@ -4458,13 +4471,197 @@ def test_log_lines_and_alert_markers_stay_whole_across_processes(env, monkeypatc
     assert len(lines) == 300 and len(traced("post")) == 1
 
 
+STORE_HOOK = """
+import os, random, sys, time
+lib, ran, writes = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.path.insert(0, lib)
+from arr_media_guard import cli, logs, runner, store
+def job(name, pending, shared=False, claimed=False):   # a job that writes the store many times
+    path = runner.job_of(name, claimed)["path"]
+    fd = os.open(ran, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    os.write(fd, (name + "\\n").encode())
+    os.close(fd)
+    for i in range(writes):
+        store.put("stress", f"{name}|{i}", i)
+        store.decided(time.time(), "radarr", path, "{}")
+        time.sleep(random.random() * 0.004)
+    runner.drop_job(name, claimed)
+runner.run_job, logs.to_syslog = job, lambda line: None
+cli.main([])
+"""
+
+
+def free(f):
+    """Whether this process got the flock of f, which no other process holds."""
+    try:
+        REAL_FLOCK(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def test_real_hook_runs_and_job_processes_keep_the_store_whole(tmp_path):
+    """Real hook runs of Download events, 8 at a time. Each queues its job and forks the worker, which forks a job
+    process per job, HOOK_WORKERS 4 at a time. Each job writes the store 10 times. A connection that crossed a fork
+    held no real lock, so another process deleted the WAL under it, see store.fork(). Each of 12 such rounds broke the
+    store of 2.0.0."""
+    for k in range(3):
+        base, hooks = tmp_path / f"r{k}", []
+        (base / "state").mkdir(parents=True)
+        (base / "env").write_text(f"STATE_DIR={base}/state\nLOG={base}/log.jsonl\nHOOK_WORKERS=4\nRADARR_URL=http://127.0.0.1:9\n")
+        try:
+            for i in range(30):
+                while sum(p.poll() is None for p in hooks) >= 8:
+                    real_wait(0.01)
+                env = dict(os.environ, ARR_MEDIA_GUARD_ENV=str(base / "env"), radarr_eventtype="Download", radarr_movie_id=str(i + 1),
+                           radarr_moviefile_id=str(i + 1), radarr_moviefile_path=f"/media/Film {i}/Film {i}.mkv")
+                hooks.append(subprocess.Popen([sys.executable, "-c", STORE_HOOK, FILES, str(base / "ran"), "10"], env=env,
+                                              stdout=subprocess.DEVNULL))
+            for p in hooks:
+                p.wait(60)
+            with open(base / "state" / "worker.lock") as f:   # the worker and its job processes hold it until the queue is empty
+                assert wait_until(lambda: free(f), 60)
+        finally:   # a worker that loops on a broken store
+            for pid in filter(str.isdigit, os.listdir("/proc")):
+                with contextlib.suppress(OSError):
+                    if str(base).encode() in open(f"/proc/{pid}/cmdline", "rb").read():
+                        os.kill(int(pid), signal.SIGKILL)
+        with contextlib.closing(sqlite3.connect(base / "state" / "state.sqlite")) as db:
+            assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+            assert db.execute("SELECT count(*) FROM kv WHERE ns = 'stress'").fetchone()[0] == 300
+        ran = (base / "ran").read_text().split()
+        assert len(ran) == len(set(ran)) == 30   # no job lost, none run twice
+
+
+def test_a_job_process_that_crashes_leaves_a_decision_line(pool, monkeypatch):
+    """A job process on a host has its stderr on /dev/null, so its decision line is the only trace of a crash. The line
+    masks the secrets before the cut. requeue() still counts each crash, and the third one drops the job."""
+    (path,) = films(pool, 1)
+    secret = hook.CFG.plex_token
+    def crash(name, pending, shared=False, claimed=False):   # the token starts at character 292 of the result
+        raise RuntimeError("x" * 271 + secret + "y" * 400)
+    monkeypatch.setattr(hook, "run_job", crash)
+    enqueue(pool, 0, path, owner="1")
+    run_worker()
+    lines = [r for r in log_lines(pool) if r.get("outcome") == "error"]
+    crashes = [r for r in lines if r["result"].startswith("error: RuntimeError: xxx")]
+    assert len(crashes) == hook.CRASH_TRIES and all(r["result"].endswith("x<PLEX_TO") and "crash" in r["trace"] for r in crashes), crashes
+    assert not any(secret[:8] in json.dumps(r) for r in crashes)
+    assert lines[-1]["result"] == f"error: the job process exited 1, {hook.CRASH_TRIES} times, so the job is dropped"
+    assert hook.queued() == [] and not claimed()
+
+
+def test_a_corrupt_store_moves_aside_and_the_import_runs_on_a_new_one(env, monkeypatch):
+    """The store reads as no database. The hook writes its job as a file and starts the worker. The worker moves the
+    store aside with its -wal and -shm files, starts a new one, and runs the job. One error line goes to the log and to
+    syslog, and one ops embed to Discord, at most one a day."""
+    state, bad = hook.CFG.state_dir, b"no database " * 400
+    def break_store():
+        hook.store.close()
+        for end, data in (("", bad), ("-wal", b"w" * 4096), ("-shm", b"s" * 32768)):
+            with open(os.path.join(state, "state.sqlite" + end), "wb") as f:
+                f.write(data)
+    moved = lambda: sorted(n for n in os.listdir(state) if n.startswith("state.sqlite.corrupt-"))
+    posts = lambda: [b for m, u, b in env["http"] if m == "POST" and "discord" in u and b["embeds"][0]["title"] == "State store moved"]
+    hook.store.db()
+    break_store()
+    hook.main([])
+    (name,) = {n[:36] for n in moved()}
+    assert moved() == [name, name + "-shm", name + "-wal"] and open(os.path.join(state, name), "rb").read() == bad
+    assert [r["outcome"] for r in log_lines(env) if "schema" in r] == ["store_corrupt", "edited"]   # the job ran on the new store
+    assert hook.store.corrupt() is None and os.listdir(hook.queue_dir()) == []
+    errors = [r for r in log_lines(env) if r.get("outcome") == "store_corrupt"]
+    assert [r["result"] for r in errors] == [f"error: the state store read as no database, so it moved to {name} and a new one started. "
+                                             "0 queued jobs went to the new one, and 0 did not read. The read of its jobs stopped at a broken page."]
+    assert len([x for x in env["syslog"] if "outcome=store_corrupt" in x]) == 1 and len(posts()) == 1
+    real_wait(1.1)   # the next move gets a name of its own
+    break_store()
+    hook.check_store()
+    assert len(moved()) == 6 and len([r for r in log_lines(env) if r.get("outcome") == "store_corrupt"]) == 2 and len(posts()) == 1
+    os.utime(os.path.join(state, hook.STORE_ALERT), (0, 0))   # the last embed went out over a day ago
+    real_wait(1.1)
+    break_store()
+    hook.check_store()
+    assert len(moved()) == 9 and len(posts()) == 2
+
+
+def test_the_jobs_of_a_store_with_a_broken_index_go_to_the_new_store(env):
+    """A store with a zeroed index page still took the INSERT of each job. The worker reads the jobs from the table without
+    the index and queues each one in the new store, unclaimed. A claimed copy of a queued name comes over once. A job
+    that is no JSON does not read."""
+    names = [enqueue(env, n, env["path"]) for n in range(3)]
+    hook.store.write("INSERT INTO jobs (name, claimed, at, job) VALUES (?, 1, ?, ?)", names[0], time.time(), json.dumps({"app": "radarr"}))
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", "9-9.json", time.time(), "{broken")
+    db = hook.store.db()
+    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    (page,) = db.execute("SELECT rootpage FROM sqlite_master WHERE name = 'sqlite_autoindex_jobs_1'").fetchone()
+    size = db.execute("PRAGMA page_size").fetchone()[0]
+    hook.store.close()
+    with open(hook.store.path(), "r+b") as f:
+        f.seek((page - 1) * size)
+        f.write(bytes(size))
+    assert hook.store.corrupt().startswith("failed PRAGMA quick_check: ")
+    hook.check_store()
+    (line,) = [r for r in log_lines(env) if r.get("outcome") == "store_corrupt"]
+    assert line["result"].endswith(". 3 queued jobs went to the new one, and 1 did not read."), line["result"]
+    assert hook.store.corrupt() is None and hook.queued() == sorted(names) and not claimed()
+
+
+def test_a_job_that_always_crashes_stops_in_one_worker_run_when_the_store_loses_its_count(pool, monkeypatch):
+    """The store drops the crash count of requeue(), so the job would come back without end. The coordinator counts the
+    crashes itself and stops claiming the job after CRASH_TRIES, with one error line. The job stays queued."""
+    (path,) = films(pool, 1)
+    monkeypatch.setattr(hook, "run_job", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr(hook, "put_job", lambda *a, **k: None)
+    name = enqueue(pool, 0, path, owner="1")
+    run_worker()
+    crashes = [r for r in log_lines(pool) if r.get("outcome") == "error" and r["result"].startswith("error: ZeroDivisionError")]
+    stops = [r for r in log_lines(pool) if r.get("result") == "error" and "crashed" in r.get("note", "")]
+    assert len(crashes) == hook.CRASH_TRIES and len(stops) == 1 and hook.queued() == [name] and not claimed()
+
+
+def test_a_deep_analysis_that_yields_often_is_no_crash(pool, monkeypatch):
+    """A yield puts the job back and exits 0, so the crash count of coordinate() never stops it."""
+    def deep(name, pending, shared=False, claimed=False):
+        trace("run")
+        if len(traced("run")) <= hook.CRASH_TRIES:
+            hook.requeue(name)   # a yield, see deep_analysis()
+        else:
+            hook.drop_job(name, claimed)
+    monkeypatch.setattr(hook, "run_job", deep)
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", "deep-analysis-0123456789abcdef.json", time.time(), "{}")
+    run_worker()
+    assert len(traced("run")) == hook.CRASH_TRIES + 1 and hook.deep_analysis_queued() == [] and not claimed()
+
+
+@pytest.mark.parametrize("case", ["repack", "header", "resub"])
+def test_each_interim_result_line_carries_its_outcome_code(env, monkeypatch, tmp_path, case):
+    """A repack, a header repair and a subtitle remux each log a line before anything else runs. Each line carries the
+    code of its step, as a decision line does."""
+    rescan = lambda app, p, method, body=None: env["writes"].append((method, p, body))
+    if case == "repack":
+        mp4_named_mkv(env)
+        monkeypatch.setattr(hook, "arr_write", rescan)
+    elif case == "header":
+        header_issue(env, monkeypatch)
+        monkeypatch.setattr(hook, "arr_write", rescan)
+    else:
+        removal_film(env, monkeypatch, tmp_path)
+    hook.main([])
+    result, code = {"repack": ("repacked", "repacked"), "header": ("header repaired", "header_repaired"),
+                    "resub": ("subtitles remuxed", "subtitles_remuxed")}[case]
+    (line,) = [r for r in log_lines(env) if r.get("result") == result and "schema" not in r]
+    assert line["outcome"] == code
+
+
 def test_a_failed_fork_puts_the_job_back_and_the_next_pass_runs_it(pool, monkeypatch):
     (path,) = films(pool, 1)
     forks = []
     def fork():
         forks.append(1)
         if len(forks) == 1: raise BlockingIOError(11, "Resource temporarily unavailable")
-        return REAL_FORK()
+        return real_fork()
     monkeypatch.setattr(hook.os, "fork", fork)
     enqueue(pool, 0, path, owner="1")
     run_worker()
@@ -4644,7 +4841,7 @@ def test_hook_conversions_remux_side_by_side_and_swap_alone(pool, monkeypatch):
     for n, p in enumerate(paths):
         enqueue(pool, n, p, owner=str(n + 1), file_id=str(11 + n))
     run_worker()
-    assert {r["path"]: r["reasons"][0] for r in log_lines(pool) if "outcome" in r} == {p[:-4] + ".mkv": "repacked" for p in paths}
+    assert {r["path"]: r["reasons"][0] for r in log_lines(pool) if "schema" in r} == {p[:-4] + ".mkv": "repacked" for p in paths}
     assert len(traced("edit start")) == 3 and traced("edit unlocked") == []   # each flag edit after a conversion holds the lock exclusive
     assert all(os.path.exists(p[:-4] + ".mkv") and not os.path.exists(p) for p in paths)
     spans = {r["n"]: [r["t"], None] for r in traced("remux start")}
@@ -4848,7 +5045,7 @@ def test_sigterm_after_an_edit_finishes_the_job_and_keeps_its_plex_analyze(pool,
         return run(argv, **kw)
     monkeypatch.setattr(hook.subprocess, "run", edit)
     enqueue(pool, 0, path, owner="1")
-    coordinator = REAL_FORK()
+    coordinator = real_fork()
     if not coordinator:
         try:
             run_worker()
@@ -5191,7 +5388,7 @@ def test_the_hook_repairs_a_header_then_edits_the_new_file(env, monkeypatch):
     hook.main([])
     rec = decided(env)
     assert (rec["outcome"], rec["reasons"][0], rec["header_repair"]["code"]) == ("edited", "header_repaired", "header_repaired"), rec
-    assert [r.get("outcome", r["result"]) for r in log_lines(env)][:3] == ["header repaired", "editing", "edited"]   # the record of the repair comes first
+    assert [r.get("outcome", r["result"]) for r in log_lines(env)][:3] == ["header_repaired", "editing", "edited"]   # the record of the repair comes first
     assert calls["repairs"] == [True] and len(calls["checks"]) == 1   # the check before the repair stands for the same streams after it
     assert rec["video"]["header"]["repairable"] is True and rec["header_repair"]["rescan"] == "sent"
     assert env["writes"] == [("POST", "command", {"name": "RescanMovie", "movieId": 7})]
@@ -8024,7 +8221,7 @@ def test_backfill_conversions_run_side_by_side_and_swap_under_the_exclusive_lock
     out = capsys.readouterr().out
     assert "2 files that are not .mkv, APPLY" in out and 'summary: {"repacked": 2}' in out   # each file counts once
     assert sorted(x for x in out.splitlines() if x.startswith("repacked")) == ["repacked     Film A (1979)", "repacked     Film A Extended (1979)"]
-    assert [r["outcome"] for r in log_lines(env) if r.get("outcome")] == ["repacked", "repacked"]
+    assert [r["outcome"] for r in log_lines(env) if "schema" in r] == ["repacked", "repacked"]
     # swap_lock() takes the exclusive lock without the gate, and no flag edit follows in a --convert run
     assert set(locks) == {("remux", fcntl.LOCK_SH), ("swap", fcntl.LOCK_EX | fcntl.LOCK_NB), ("command", fcntl.LOCK_UN), ("moviefile/bulk", fcntl.LOCK_UN),
                           ("command", None)}, locks   # the rescans at the end of the run, in the main thread, hold no lock either
@@ -8088,7 +8285,7 @@ def test_a_conversion_worker_lets_its_slot_go_while_the_app_imports(env, monkeyp
         return real(app, p, method, body)
     env["on_write"] = slow_import
     hook.main(["--backfill", "radarr", "--convert", "--apply", "--workers", "2"])
-    assert waits == [3, 3, 3] and [r["outcome"] for r in log_lines(env) if r.get("outcome")] == ["repacked"] * 3
+    assert waits == [3, 3, 3] and [r["outcome"] for r in log_lines(env) if "schema" in r] == ["repacked"] * 3
     assert sorted(os.listdir(os.path.dirname(paths[0]))) == sorted(os.path.basename(p)[:-4] + ".mkv" for p in paths)
 
 
@@ -8101,7 +8298,7 @@ def test_a_convert_backfill_skips_the_hearing_and_the_flag_work(env, monkeypatch
     monkeypatch.setattr(hook.arr_decide, "retag", lambda j, *a, **k: dict(real_retag(j, *a, **k), ask={"a1"}))
     monkeypatch.setattr(hook, "hear", lambda *a, **k: pytest.fail("a --convert run hears nothing"))
     hook.main(["--backfill", "radarr", "--convert", "--apply", "--workers", "2"])
-    assert sorted(r["outcome"] for r in log_lines(env) if r.get("outcome")) == ["repacked", "repacked"] and env["mkvpropedit"] == []
+    assert sorted(r["outcome"] for r in log_lines(env) if "schema" in r) == ["repacked", "repacked"] and env["mkvpropedit"] == []
     assert sorted(w[2]["movieId"] for w in env["writes"] if w[1] == "command" and w[2]["name"] == "RescanMovie") == [7, 8]
     assert all(os.path.exists(p[:-4] + ".mkv") for p in paths)
 
@@ -13277,7 +13474,7 @@ def test_a_busy_store_never_slows_or_fails_an_import(env, monkeypatch, settings)
     file too, a worker starts for them, and the worker moves them into the queue of the store."""
     settings(keep_replaced=True, keep_days=7)
     monkeypatch.setattr(hook.store, "HOOK_WAIT", 0.5)
-    monkeypatch.setattr(hook.os, "fork", lambda: 4242)
+    monkeypatch.setattr(hook.store, "fork", lambda: 4242)   # the other writer below is a connection of this process
     monkeypatch.setenv("radarr_deletedpaths", "|".join(f"/m/Film A (1979)/old{n}.mkv" for n in range(3)))
     monkeypatch.setenv("radarr_deletedrecyclebinpaths", "||")
     hook.store.db()
@@ -13321,7 +13518,7 @@ def test_parallel_claims_take_each_job_once(env):
     names = [enqueue(env, n, env["path"]) for n in range(20)]
     pids = []
     for i in range(6):
-        pid = REAL_FORK()
+        pid = real_fork()
         if not pid:
             try:
                 with open(os.path.join(hook.CFG.state_dir, f"got{i}"), "w") as f:

@@ -4,7 +4,7 @@
 records of the kept files, the re-grab counts, the caches, the scan progress and the facts that the readers of the
 decision log need. A change runs in one short transaction, which takes the place of a lock file. status.json and
 lid.sqlite stay files of their own."""
-import contextlib, json, os, sqlite3, threading, time
+import contextlib, json, os, pathlib, sqlite3, threading, time
 
 from . import config
 
@@ -25,7 +25,6 @@ TABLES = (
     "CREATE INDEX IF NOT EXISTS decisions_path ON decisions (path)",
     "PRAGMA user_version = 1")
 LOCAL = threading.local()   # db(): the connection of this thread
-INHERITED = []              # connections of a parent process. SQLite asks that a forked child never uses or closes them.
 
 
 def path():
@@ -34,16 +33,15 @@ def path():
 
 def db():
     """The connection of this thread to the store in STATE_DIR. A new store gets its tables. A store file that was
-    removed or replaced gets a new connection."""
+    removed or replaced gets a new connection. A connection never crosses a fork, see fork()."""
     here, pid = path(), os.getpid()
     got = getattr(LOCAL, "db", None)
-    with contextlib.suppress(OSError):
-        if got and got[:3] == (pid, here, os.stat(here).st_ino):
-            return got[3]
     if got and got[0] != pid:
-        INHERITED.append(got[3])
-    elif got:
-        got[3].close()
+        raise RuntimeError("a connection to the state store crossed a fork. Fork with store.fork().")
+    with contextlib.suppress(OSError):
+        if got and got[1:3] == (here, os.stat(here).st_ino):
+            return got[3]
+    close()
     os.makedirs(config.CFG.state_dir, exist_ok=True)
     # A new store file gets mode 0o666, and SQLite gives its WAL files the mode of the store, so both apps' users write.
     # The close of any descriptor of the file drops every POSIX lock of this process on it, SQLite's too. So db() opens
@@ -51,15 +49,106 @@ def db():
     with contextlib.suppress(FileExistsError):
         os.close(os.open(here, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666))
     c = sqlite3.connect(here, timeout=wait, isolation_level=None)
-    c.execute("PRAGMA journal_size_limit = 4194304")   # bytes the -wal file keeps once a checkpoint resets it. The listener runs for days.
-    ino = os.stat(here).st_ino
-    if not c.execute("PRAGMA user_version").fetchone()[0]:
-        c.execute("PRAGMA auto_vacuum = INCREMENTAL")   # before the first table, see shrink()
-        c.execute("PRAGMA journal_mode = WAL")
-        for t in TABLES:
-            c.execute(t)
+    try:
+        c.execute("PRAGMA journal_size_limit = 4194304")   # bytes the -wal file keeps once a checkpoint resets it. The listener runs for days.
+        ino = os.stat(here).st_ino
+        if not c.execute("PRAGMA user_version").fetchone()[0]:
+            c.execute("PRAGMA auto_vacuum = INCREMENTAL")   # before the first table, see shrink()
+            c.execute("PRAGMA journal_mode = WAL")
+            for t in TABLES:
+                c.execute(t)
+    except BaseException:   # as on a store that reads as no database. The close frees its files for fork() now, and changes none.
+        c.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        c.close()
+        raise
     LOCAL.db = (pid, here, ino, c)
     return c
+
+
+def close():
+    """Close the connection of this thread. The next db() opens a new one."""
+    got, LOCAL.db = getattr(LOCAL, "db", None), None
+    if got:
+        got[3].close()
+
+
+def fork():
+    """os.fork() with no connection to the store open in this process. SQLite keeps the locks of a process in the
+    memory of the process. A child that opens the store while a copy of a parent's connection lives in it takes no
+    real lock. Another process can then checkpoint and delete the WAL that the child writes, and the store breaks
+    (sqlite.org/howtocorrupt.html, section 2.6). So the connection of this thread closes first. The hook and the worker
+    fork with one thread. The fork raises OSError while a descriptor of this process still holds a store file, as the
+    connection of another thread would."""
+    close()
+    names, held = {os.path.realpath(path()) + end for end in ("", "-wal", "-shm")}, set()
+    for fd in os.listdir("/proc/self/fd"):
+        with contextlib.suppress(OSError):   # the descriptor of the listing itself is gone
+            held.add(os.readlink(f"/proc/self/fd/{fd}"))
+    if names & held:
+        raise OSError("a connection to the state store is open in another thread, so the process does not fork")
+    return os.fork()
+
+
+def corrupt():
+    """What is wrong with the store file, or None when it reads. PRAGMA quick_check reads every page, about 0.3 seconds
+    for 80 MB. A read of the jobs table alone missed 4 of 6 broken stores in a test. The test connection never
+    checkpoints at its close, so the -wal file stays as it was for a person to read."""
+    if not os.path.exists(path()):
+        return None
+    c = sqlite3.connect(pathlib.Path(path()).absolute().as_uri() + "?mode=rw", uri=True, timeout=wait)
+    try:
+        c.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        found = c.execute("PRAGMA quick_check").fetchone()[0]
+        return None if found == "ok" else f"failed PRAGMA quick_check: {' '.join(found.split())[:200]}"
+    except sqlite3.DatabaseError as ex:
+        code = ex.sqlite_errorcode & 0xff
+        return "read as no database" if code == sqlite3.SQLITE_NOTADB else f"is malformed: {ex}" if code == sqlite3.SQLITE_CORRUPT else None
+    finally:
+        c.close()
+
+
+def recover():
+    """Move a corrupt store aside as state.sqlite.corrupt-<local time>, with its -wal and -shm files, start a new one,
+    and carry the jobs over, see carry(). Returns (the moved path, what corrupt() found, the jobs carried, the rows that
+    did not read, whether the read of the jobs table stopped early), or None when the store reads. The -wal file goes
+    first, so a new store never replays the old WAL. The worker calls it under worker.lock, see runner.check_store()."""
+    why = corrupt()
+    if not why:
+        return None
+    close()
+    moved = f"{path()}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+    for end in ("-wal", "-shm", ""):
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(path() + end, moved + end)
+    db()
+    return moved, why, *carry(moved)
+
+
+def carry(moved):
+    """Copy each job of the moved store into the new one, queued and unclaimed, unless the new store holds its name. A
+    store that broke can still have taken the INSERT of a job, and that job would never run. The rows are read from the
+    table without its index, read-only, and the close never checkpoints. Returns (the jobs carried, the rows whose job
+    did not read, whether the read stopped early at a broken page)."""
+    carried, lost = 0, 0
+    try:
+        old = sqlite3.connect(pathlib.Path(moved).absolute().as_uri() + "?mode=ro", uri=True, timeout=wait)
+    except sqlite3.Error:
+        return 0, 0, True
+    try:
+        old.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        for name, at, job in old.execute("SELECT name, at, job FROM jobs NOT INDEXED"):
+            try:
+                json.loads(job)
+            except (TypeError, ValueError):
+                lost += 1
+                continue
+            carried += write("INSERT INTO jobs (name, at, job) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE name = ?)",
+                             name, at, job, name).rowcount
+        return carried, lost, False
+    except sqlite3.DatabaseError:
+        return carried, lost, True
+    finally:
+        old.close()
 
 
 @contextlib.contextmanager

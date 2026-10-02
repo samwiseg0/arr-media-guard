@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
-import contextlib, dataclasses, fcntl, hashlib, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error
+import collections, contextlib, dataclasses, fcntl, hashlib, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error
 
 from . import apps, checks, cli, config, content, convert, decide, logs, plex, process, regrab, report, store, subtitles, vault
 
@@ -541,8 +541,13 @@ def waiting():
     analyzes a stopped worker kept, or a job file in queue_dir() that a busy store left there. A worker exits once no
     import waits, so a deep analysis job left by a stopped container waits for this check."""
     files = os.listdir(queue_dir()) if os.path.isdir(queue_dir()) else []   # read only, so the hook and the listener never wait here
-    return bool(store.read("SELECT 1 FROM jobs WHERE claimed = 1 OR name LIKE 'deep-analysis-%' OR due <= ? LIMIT 1", time.time_ns())
-                or store.get("plex", "pending") or any(not n.startswith(".") for n in files))
+    if any(not n.startswith(".") for n in files):
+        return True
+    try:
+        return bool(store.read("SELECT 1 FROM jobs WHERE claimed = 1 OR name LIKE 'deep-analysis-%' OR due <= ? LIMIT 1", time.time_ns())
+                    or store.get("plex", "pending"))
+    except sqlite3.DatabaseError:   # a worker looks at a store that does not read, see check_store()
+        return True
 
 
 def ensure_worker(spawn=None):
@@ -559,7 +564,7 @@ def ensure_worker(spawn=None):
         lock.close()
         return spawn("worker")
     # ponytail: the worker stays in the app's cgroup, so an app restart kills it. Its jobs stay queued for the next event.
-    if os.fork():
+    if store.fork():
         os._exit(0)            # the app gets its answer now, the child keeps the worker lock
     os.setsid()
     store.wait, store.until = store.WAIT, None   # the hook's run waits HOOK_WAIT in all
@@ -720,9 +725,35 @@ def prune_kept():
             logs.log(dict(source="hook", result="warning", note=config.mask(f"the kept files were not pruned: {type(ex).__name__}: {ex}")[:300]))
 
 
+STORE_ALERT = "store-alert"   # the file in STATE_DIR whose mtime is the time of the last "State store moved" embed
+
+
+def check_store():
+    """Move a broken store aside, start a new one, and carry its jobs over, see store.recover(). A worker does it at its
+    start, so the job files the hook wrote meanwhile go into the new store, see adopt(). One error decision line goes to
+    the log and to syslog. One ops embed goes to Discord, at most one per KEY_ALERT_EVERY. A file keeps the time of the
+    last embed, because the new store does not hold it."""
+    got = store.recover()
+    if not got:
+        return
+    moved, why, carried, lost, stopped = got
+    name = os.path.basename(moved)
+    jobs = f"{carried} queued jobs went to the new one, and {lost} did not read" + (". The read of its jobs stopped at a broken page" if stopped else "")
+    logs.decision(dict(source="hook", outcome="store_corrupt", result=f"error: the state store {why}, so it moved to {name} and a new one "
+                       f"started. {jobs}."), time.time())
+    mark = os.path.join(config.CFG.state_dir, STORE_ALERT)
+    if os.path.exists(mark) and time.time() - os.path.getmtime(mark) < content.KEY_ALERT_EVERY:
+        return
+    open(mark, "w").close()
+    app = next(iter(config.CFG.apps))
+    logs.post(app, logs.embed(app, "State store moved", f"The state store {why}. It moved to {name}, and a new one started. {jobs}. "
+                              "Its other records are not in the new one.", "amber", []))
+
+
 def worker(lock):
     """Drain the queue, with the pending Plex lookups in between. Exits when both are empty. HOOK_WORKERS 1 runs one
     file job at a time in this process. A larger value hands the jobs to coordinate()."""
+    check_store()
     stale_work_dirs()
     prune_kept()
     for n, in store.read("SELECT name FROM jobs WHERE claimed = 1 ORDER BY name"):   # jobs of job processes that died. A live one would still hold worker.lock.
@@ -773,18 +804,20 @@ def coordinate(lock, n, pending):
     worker leaves it: the same files deleted, the same files edited. A conversion's swap does not wait, see
     docs/design.md, "One download".
 
-    A job process that died leaves its job claimed, and requeue() puts it back. SIGTERM starts no new job and passes
+    A job process that died leaves its job claimed, and requeue() puts it back. A job whose processes crash CRASH_TRIES
+    times in one run is not claimed again in that run, also when the store lost the count of requeue(). SIGTERM starts no new job and passes
     SIGTERM on. A job process that has not written stops at once and its job goes back to the queue. One that has
     edited or re-grabbed finishes its job first, see job_term(). This process then keeps the pending analyze requests
     for the next worker, see save_plex(), and exits."""
-    stop = []
+    stop, crashes = [], collections.Counter()   # crashes: job name -> the crashes of its job processes in this run
     signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
     running, warned, told = {}, False, False   # running: the read end of a job's pipe -> [pid, job name, bytes read]
+    live = lambda names: [x for x in names if crashes[x] < config.CRASH_TRIES]   # a store that lost the crash count never loops
     while True:
-        jobs = queued()
+        jobs = live(queued())
         warned = backlog(jobs, warned)
         if not jobs and not any(x[1].startswith("deep-analysis-") for x in running.values()):   # one deep analysis job at a time, when no import waits
-            jobs = deep_analysis_queued()[:1]
+            jobs = live(deep_analysis_queued())[:1]
         while jobs and len(running) < n and not stop:
             name = jobs.pop(0)
             if not claim(name):   # gone since the listing
@@ -792,7 +825,7 @@ def coordinate(lock, n, pending):
             old, pipe = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}), ()   # blocked until the child has its own handler
             try:
                 pipe = r, w = os.pipe()
-                pid = os.fork()
+                pid = store.fork()
             except OSError as ex:   # out of processes, memory or file descriptors. The job goes back, and the next pass tries again.
                 signal.pthread_sigmask(signal.SIG_SETMASK, old)
                 logs.log(dict(source="hook", job=name, result="warning", note=f"no job process: {type(ex).__name__}: {ex}"[:200]))
@@ -824,7 +857,7 @@ def coordinate(lock, n, pending):
                 return
         elif not running and not pending:
             lock.close()           # release first, then look once more: a job queued meanwhile found the lock held
-            if not queued():   # a deep analysis job queued here was claimed at the top of this pass
+            if not live(queued()):   # a deep analysis job queued here was claimed at the top of this pass
                 return
             lock = try_lock("worker.lock")
             if not lock:
@@ -841,7 +874,21 @@ def coordinate(lock, n, pending):
                 continue
             os.close(r)
             pid, name, out = running.pop(r)
-            finished(name, os.waitpid(pid, 0)[1], out, pending)
+            status = os.waitpid(pid, 0)[1]
+            finished(name, status, out, pending)
+            if os.waitstatus_to_exitcode(status) not in (0, 128 + signal.SIGTERM):   # a crash, see finished(). A yield exits 0.
+                crashes[name] += 1
+                if crashes[name] == config.CRASH_TRIES and still_queued(name):   # requeue() drops it, unless the store lost the count
+                    logs.log(dict(source="hook", job=name, result="error", note=f"the job process crashed {config.CRASH_TRIES} times in this "
+                                  "worker run, and the store still holds the job, so this worker does not run it again"))
+
+
+def still_queued(name):
+    """Whether the store holds the job name. A store that does not read counts as holding it."""
+    try:
+        return bool(store.read("SELECT 1 FROM jobs WHERE name = ?", name))
+    except sqlite3.Error:
+        return True
 
 
 def job_process(name, w, sigmask):
@@ -849,7 +896,7 @@ def job_process(name, w, sigmask):
     the TMDB pause as JSON to the pipe w. It never returns. SIGTERM before a write raises SystemExit, see job_term().
     subprocess.run() and the other callers kill their child on the way out, so no ffmpeg or mkvmerge outlives the job.
     The stopped job stays claimed, and coordinate() puts it back in the queue. After a write the job runs to its end."""
-    code = 1
+    code, started = 1, time.time()
     try:
         STOP.update(held=False, asked=False, term=None)   # a fresh job, whatever the parent process had done
         signal.signal(signal.SIGTERM, job_term)
@@ -860,8 +907,10 @@ def job_process(name, w, sigmask):
         code = 0
     except SystemExit as ex:
         code = ex.code if isinstance(ex.code, int) else 1
-    except BaseException:
-        pass
+    except BaseException as ex:   # its stderr may be /dev/null, so the line is its only trace. requeue() counts the crash.
+        with contextlib.suppress(Exception):
+            logs.decision(dict(source="hook", job=name, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300],
+                               trace=traceback.format_exc(limit=3)[-800:]), started)
     finally:
         os._exit(code)
 

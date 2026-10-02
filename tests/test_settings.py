@@ -21,6 +21,8 @@ Run: pytest tests/test_settings.py
 import itertools
 import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -156,9 +158,34 @@ def test_each_program_map_reads_paths_with_spaces_and_an_empty_one_takes_path_ma
     assert (m.map_key("sonarr"), m.map_key("radarr")) == ("SONARR_PATH_MAP", "PATH_MAP")
 
 
+def image_env():
+    """The env file of the image, as the Dockerfile writes it with docker/merge_env.py."""
+    return subprocess.run([sys.executable, os.path.join(FILES, "docker", "merge_env.py")], capture_output=True, text=True, check=True).stdout
+
+
+def env_lines(text):
+    """[(key, value)] of the key lines of an env file, in their order."""
+    return [(k, v) for k, sep, v in (line.partition("=") for line in text.splitlines()) if sep and not k.startswith("#")]
+
+
+def test_the_image_env_file_holds_each_key_once_with_the_docker_value_in_its_place():
+    """Each key of the example stays in its place, once, and a Docker value takes the place of the example's. The keys
+    the example does not hold go to the end. #INSTANCE in the example is the place of INSTANCE. The Docker comments go
+    with their keys, and the note at the top of the Docker file stays out."""
+    text = image_env()
+    example, docker = (env_lines(open(os.path.join(FILES, *f)).read()) for f in (("examples", "arr-media-guard.env"), ("docker", "arr-media-guard.env")))
+    keys, at = [k for k, _ in env_lines(text)], [k for k, _ in example].index("NAME") + 1
+    assert keys == [k for k, _ in example][:at] + ["INSTANCE"] + [k for k, _ in example][at:] + ["WEBHOOK_USER", "WEBHOOK_PASSWORD", "AUDIT_TIME"]
+    assert dict(env_lines(text)) == dict(example + docker)   # the Docker value wins, and every other value is the example's
+    assert "# Mount a named volume here. The state store is SQLite in WAL mode and needs a local disk.\nSTATE_DIR='/config/state'\n" in text
+    assert "by their compose service names.\nRADARR_URL='http://radarr:7878'\nSONARR_URL='http://sonarr:8989'\n# Each app's own folder" in text
+    assert "\nNEWZNAB_URL=''\n\n# --- Docker ---\n# The user and password of the Webhook connection." in text
+    assert "merge_env.py" not in text and text.endswith("\nAUDIT_TIME='07:30'\n")
+
+
 def test_the_docker_env_file_keeps_every_map_on_path_map_until_one_is_set(tmp_path):
-    """The image writes the example env file, then the Docker section. A line added after them wins."""
-    text = "".join(open(os.path.join(FILES, *f)).read() for f in (("examples", "arr-media-guard.env"), ("docker", "arr-media-guard.env")))
+    """The image writes its env file, see image_env(). A line added after it wins."""
+    text = image_env()
     m = load(tmp_path, text)
     assert (maps(m), m.CFG.path_map, m.CFG.errors, m.CFG.keep_replaced) == ({}, [], [], False)
     m = load(tmp_path, text + "PATH_MAP='/tv:/media/TV'\nRADARR_PATH_MAP='/movies:/media/Movies'\nPLEX_PATH_MAP='/mnt/Movies:/media/Movies'\n")
@@ -289,12 +316,12 @@ def test_each_app_takes_its_own_keys_and_mask_hides_each_secret(tmp_path):
         "<RADARR_API_KEY> <PLEX_TOKEN> <DISCORD_WEBHOOK> <TMDB_TOKEN>"
 
 
-def test_mask_leaves_a_short_secret_and_the_webhook_password_alone(tmp_path):
+def test_mask_leaves_a_short_secret_alone_and_masks_a_long_webhook_password(tmp_path):
     """A secret under 12 characters may be a word of a path, as WEBHOOK_PASSWORD='movies' was. The undo command of an
-    editing line must keep its path. WEBHOOK_PASSWORD is in no URL and no error text, so mask() never looks for it."""
+    editing line must keep its path. A long WEBHOOK_PASSWORD is masked, as the 32 characters the listener generates are."""
     m = load(tmp_path, "WEBHOOK_PASSWORD='movies'\nRADARR_API_KEY='media'\nPLEX_TOKEN='0123456789ab'\n")
     assert m.mask("mkvpropedit /media/movies/A.mkv ?X-Plex-Token=0123456789ab") == "mkvpropedit /media/movies/A.mkv ?X-Plex-Token=<PLEX_TOKEN>"
-    assert load(tmp_path, "WEBHOOK_PASSWORD='a-long-password-1234'\n").mask("a-long-password-1234") == "a-long-password-1234"
+    assert load(tmp_path, "WEBHOOK_PASSWORD='a-long-password-1234'\n").mask("a-long-password-1234") == "<WEBHOOK_PASSWORD>"
 
 
 def test_the_errors_keep_the_order_the_worker_logged_them_in(tmp_path):
