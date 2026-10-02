@@ -33,7 +33,8 @@ flowchart TD
     meta --> discord["Discord, one alert per finding"]
     discord --> decision["Decision line in LOG, logfmt line in syslog"]
     decision --> plex["Plex analyze after two idle checks"]
-    decision --> deep["Deep analysis job, with SUBTITLES=deep"]
+    decision --> deep["Deep analysis job, with SUBTITLES=deep, runs while no import waits"]
+    deep -->|"it changed the file"| plex
 ```
 
 ## 1. An event arrives
@@ -150,8 +151,8 @@ the worker until Plex is ready.
   and each live TMDB answer records the key. See [design.md](design.md#status-file).
 
 With `SUBTITLES=deep`, an import of a file with subtitles also queues a deep analysis of it. The worker runs it
-only while no import waits, and it stops between two steps when an import arrives. See
-[design.md](design.md#how-it-runs).
+only while no import waits, and it stops between two steps when an import arrives. When it changes the file, it
+queues a Plex analyze of the item, behind the same gate as an import. See [design.md](design.md#how-it-runs).
 
 ## The Test event and the start check
 
