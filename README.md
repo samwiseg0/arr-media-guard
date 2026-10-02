@@ -269,6 +269,8 @@ resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another fold
 | `KEEP_REPLACED` | `false` | At each grab, keep a hard link of each file the grab may replace, for a restore. See [docs/regrabs.md](docs/regrabs.md#keep-replaced-files). |
 | `KEEP_ORIGINALS_DAYS` | `7` | Days the hook keeps a file it replaced, and each grab link. `0` keeps nothing. |
 
+With file system snapshots (ZFS, Btrfs), the hook needs no copies of its own. Set `KEEP_ORIGINALS_DAYS='0'` and leave `KEEP_REPLACED` off. A broken upgrade is still re-grabbed. The old file then comes back from the app's recycle bin, or from a snapshot by hand.
+
 ### Repairs and conversion
 
 | Key | Default | What it does |
