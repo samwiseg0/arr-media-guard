@@ -507,14 +507,14 @@ def audit(argv):
                 add(headers, "would repair header", r["label"])
             if r["undecided"]: add(undecided, r["undecided"], r["label"])
             elif r["dropped"]: add(dropped, "; ".join(r["dropped"]), r["label"])
-            elif r.get("skipped"): add(skipped, f'{r.get("outcome", "other")}, {r["skipped"]}', r["label"])   # by reason, not by file
+            elif r.get("skipped"): add(skipped, f'{logs.SKIPPED.get(r.get("outcome"), r.get("outcome", "other"))} ({r["skipped"]})', r["label"])   # by reason, not by file
             elif r.get("repack"): add(repacked, r["repack"], r["label"])
             elif r["edits"]:
                 add(classes, r["class"], r["label"])
                 for _, x in decide.invariants(r["tracks"], r["edits"], r["cls"], set(r["orig"])): add(broken, x, r["label"])
         title = f"Plan audit: {logs.app_name(app)}"
         text = (f"{sum(map(len, classes.values()))} of {len(rows)} files would change, in {len(classes)} classes. "
-                f"{sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} dropped by an invariant.")
+                f"{sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} with a planned track change not made")
         worth = bool(undecided or dropped or skipped or broken)   # a plan that only changes files posts nothing
     else:
         start, last, day, seen = since_time(a.since), {}, [], []   # seen: ("changed" or a problem code, its decision line), see logs.audit_embed()
@@ -531,13 +531,13 @@ def audit(argv):
                 add(headers, {"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "subtitles removed",
                               "tail_removed": "tail removed"}[code], r.get("label")); seen.append(("changed", r))
             elif code in ("header_repair_failed", "header_repair_skipped"):
-                add(skipped, code.replace("_", " "), r.get("label")); seen.append(("repair", r))
+                add(skipped, logs.audit_problem("repair", r), r.get("label")); seen.append(("repair", r))
             if r["outcome"] == "undecided":
-                add(undecided, r.get("abstain") or r.get("undecided"), r.get("label")); seen.append(("undecided", r))
+                add(undecided, logs.UNDECIDED.get(r.get("abstain")) or r.get("undecided") or r.get("abstain"), r.get("label")); seen.append(("undecided", r))
             elif r["outcome"] == "dropped":
-                add(dropped, ",".join(r.get("invariants") or []) or r.get("result"), r.get("label")); seen.append(("dropped", r))
+                add(dropped, report.and_list(logs.DROPPED.get(c, c) for c in r.get("invariants") or []) or r.get("result"), r.get("label")); seen.append(("dropped", r))
             elif r["outcome"] == "not_matroska" or r["outcome"].startswith("repack_"):   # a repack that failed or was skipped
-                add(skipped, f'not Matroska: {r.get("container")}, {r["outcome"]}', r.get("label")); seen.append(("convert", r))
+                add(skipped, f'{logs.audit_problem("convert", r)} (not Matroska: {r.get("container")})', r.get("label")); seen.append(("convert", r))
             elif "edited" in (r["outcome"], r.get("edit_result")):   # an edit before a wrong-content verdict too
                 last[r["path"]] = r; seen.append(("changed", r))
         for path, r in sorted(last.items()):   # the state each edited file was left in, from the check right after the edit
@@ -560,44 +560,48 @@ def audit(argv):
             if check["edits"]:
                 add(further, f'{check["edits"]} further edits', r.get("label")); seen.append(("further", r))
             for code in check.get("invariants", []):
-                add(broken, code, r.get("label")); seen.append((f"broken:{code}", r))
+                add(broken, logs.BROKEN.get(code, code), r.get("label")); seen.append((f"broken:{code}", r))
         tmdb = content.tmdb_day_status(day)
         # The nightly run drops the originals a repack kept, and the grab links, older than keep_days. At 0 it drops every
         # grab link and leaves the originals.
+        say = lambda kind, text: print(f"arr-media-guard: {app} {kind}: {text}" if config.SERVE else text)   # as serve.note() writes a line
         roots = vault.prune_roots(config.CFG.keep_days > 0)   # a folder below a root folder, as on a mount per show or a fallback, too
         try:
             roots |= {f(os.path.join(r["path"], "x")) for r in apps.arr(app, "rootfolder") for f in ((vault.originals_root, vault.replaced_root) if config.CFG.keep_days else (vault.replaced_root,))}
         except FileNotFoundError as ex:   # api_key() found no key and no config.xml
-            print(apps.no_key(app, ex) or f"{app.capitalize()} is not set up, so the audit prunes no kept folder under its root folders.")
+            say("warning", apps.no_key(app, ex) or f"{app.capitalize()} is not set up, so the audit prunes no kept folder under its root folders.")
         except Exception as ex:
-            print(config.mask(f"kept folders under the root folders not pruned: {type(ex).__name__}: {ex}")[:200])
+            say("warning", config.mask(f"kept folders under the root folders not pruned: {type(ex).__name__}: {ex}")[:200])
         for root in sorted(roots):
             gone = vault.prune_originals(root)
-            if gone: print(f"removed {len(gone)} kept folders older than {config.CFG.keep_days} days under {root}")
+            if gone: say("audit", f"removed {len(gone)} kept folders older than {config.CFG.keep_days} days under {root}")
         with contextlib.suppress(sqlite3.Error):   # a busy store shrinks the next night
             store.shrink()
         # one summary line a night, so Loki sees each host even on a day without imports
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", sum(map(len, further.values()))), ("undecided", sum(map(len, undecided.values()))),
                           ("dropped", sum(map(len, dropped.values()))), ("broken", sum(map(len, broken.values()))), ("tmdb", tmdb)]))
-        title = f"Edit audit: {logs.app_name(app)}"
-        text = (f"{len(last)} files edited since {start.isoformat(timespec='minutes')}, {sum(map(len, further.values()))} of them "
-                f"plan a further edit. {sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} dropped by an invariant.")
+        n = len({r.get("path") for what, r in seen if what != "changed"})   # the files with a problem, as logs.audit_embed() counts them
+        title = f"Audit check: {n} problem{'' if n == 1 else 's'} · {logs.app_name(app)}"
+        text = (f"{len(last)} file{'' if len(last) == 1 else 's'} changed since {start.isoformat(timespec='minutes')}. "
+                f"{sum(map(len, further.values()))} of them still have tracks to change. {sum(map(len, undecided.values()))} undecided, "
+                f"{sum(map(len, dropped.values()))} with a planned track change not made")
         worth = any(what != "changed" for what, _ in seen)   # the post goes out only for a problem, the syslog line every night
     n_broken, n_skipped, n_repacked, n_headers = (sum(map(len, x.values())) for x in (broken, skipped, repacked, headers))
-    text += f" {n_broken} break an invariant on re-check." if n_broken else " Every plan keeps the invariants."
+    text += f", {n_broken} with a track problem after the {'planned ' if a.plan_from else ''}change."
     text += f" {n_repacked} {'would be ' if a.plan_from else ''}repacked into Matroska." if n_repacked else ""
     text += f" {n_headers} {'would get' if a.plan_from else 'got'} a new header from a remux." if n_headers else ""
     text += f" {n_skipped} skipped: the container is not Matroska, or a header repair failed or was skipped." if n_skipped else ""
     fields = (lines_field("Classes", classes) + lines_field("Undecided", undecided) + lines_field("Dropped", dropped)
-              + lines_field("Further edits", further) + lines_field("Invariants broken", broken) + lines_field("Repacked", repacked)
+              + lines_field("Further edits", further) + lines_field("Track problem after the change", broken) + lines_field("Repacked", repacked)
               + lines_field("Header repaired", headers) + lines_field("Skipped", skipped))
     if not a.plan_from:
         fields.append(("TMDB", tmdb))   # the day's metadata checks: ok, unavailable n times, key broken, or no checks
-    print(title); print(text)
-    for name, value in fields: print(f"\n{name}:\n{value}")
+    if not config.SERVE:   # the container log takes the summary line above, one line per event
+        print(title); print(text)
+        for name, value in fields: print(f"\n{name}:\n{value}")
     if a.post and worth:
-        print("post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))]) if a.plan_from else logs.audit_embed(app, seen, tmdb)))
+        print(f"arr-media-guard: {app} audit post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))]) if a.plan_from else logs.audit_embed(app, seen, tmdb)))
 
 
 def library(app, ids):

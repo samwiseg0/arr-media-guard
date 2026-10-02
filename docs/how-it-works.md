@@ -161,8 +161,8 @@ Press Test in the app's connection, or Save it, and the app sends a Test event. 
 the policy loaded and that the app's API answers with its key. It also checks that this script sees each root folder of
 the app. On a host it checks the Instance Name too, see [Named instances](#named-instances). A failed check fails the
 Test and names what to fix. On a host the script answers `arr-media-guard: Test ok` or exits 1. The listener answers 200
-or 500. A recycle bin that is off or out of reach only warns. Without one, the restore after a bad upgrade needs
-`KEEP_REPLACED`.
+or 500. When `KEEP_REPLACED` keeps no copies, a recycle bin that is off or out of reach warns. Without a bin, the
+restore after a bad upgrade needs `KEEP_REPLACED`.
 
 In Docker, the listener prints a banner and listens. In a thread it checks the path maps, then runs the Test checks for
 each app with an API key. It asks an app that does not answer again for 2 minutes. A failed check prints a warning,

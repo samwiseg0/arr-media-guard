@@ -44,7 +44,7 @@ def kept_replaced(path, download_id=None, app=None):
                 if download_id is not None and "import" not in r and r["download_id"] in ("", download_id) and r["app"] == app:
                     r["import"] = download_id
                 else:
-                    r["stale"] = "the hook changed the file after the grab" if download_id is None else "another import replaced the file after the grab"
+                    r["stale"] = "arr-media-guard changed the file after the grab" if download_id is None else "another import replaced the file after the grab"
     except Exception as ex:
         with contextlib.suppress(OSError):
             logs.log(dict(source="hook", path=path, result="warning", note=config.mask(f"the hook could not mark the kept copies of the file: {type(ex).__name__}: {ex}")[:300]))
@@ -59,14 +59,14 @@ def kept_copy(app, old, download_id):
     if mine:
         r = max(mine, key=lambda r: r["time"])
         if time.time() - r["time"] > config.CFG.keep_days * 86400 - regrab.KEEP_MARGIN:
-            return None, "The hook's own copy is too close to its prune at KEEP_ORIGINALS_DAYS"
+            return None, "The kept copy is too close to its removal at KEEP_ORIGINALS_DAYS"
         try:
             same = os.stat(r["kept"]).st_ino == r["ino"]
         except OSError:
-            return None, "The hook's own copy is gone"
-        return (r, None) if same else (None, "The hook's own copy is no longer the file the grab linked")
+            return None, "The kept copy is gone"
+        return (r, None) if same else (None, "The kept copy changed after the grab")
     stale = [r["stale"] for r in recs if "stale" in r and r["download_id"] in ("", download_id or "")]
-    return None, f"The hook's own copy is older, because {stale[-1]}" if stale else None
+    return None, f"The kept copy is older, because {stale[-1]}" if stale else None
 
 
 def links(st):

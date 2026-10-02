@@ -227,12 +227,14 @@ again when a job waits.
   links of `KEEP_REPLACED` older than `KEEP_ORIGINALS_DAYS`. At the same time the listener runs the weekly log
   rotation. Empty: neither runs.
 - It answers the Test of each app. Test checks the policy, the API key and each root folder of the app. A failed Test
-  names what to fix. Test warns in the log when the app's recycle bin is off, elsewhere or not mounted.
+  names what to fix. When `KEEP_REPLACED` keeps no copies, Test warns in the log when the app's recycle bin is off,
+  elsewhere or not mounted.
 - At its start it prints a banner, then runs the same checks for each app with an API key and prints one line per app.
   It asks an app that does not answer again for 2 minutes. A failed check warns, and the listener keeps running.
-- The container log also carries the logfmt summary of each decision line, see [monitoring.md](monitoring.md#syslog).
+- The container log also carries the logfmt summary of each decision line and of each nightly audit, see
+  [monitoring.md](monitoring.md#syslog).
 - A stop waits for a running flag edit.
-- The healthcheck asks `http://127.0.0.1:8484/health`.
+- The healthcheck asks `http://127.0.0.1:8484/health`. A healthcheck that passes writes no line to the container log.
 
 [design.md](design.md#webhook) has the rules behind the listener.
 

@@ -341,8 +341,8 @@ only when all of these hold:
   old s01e01-e02 file never comes back for a broken s01e01.
 - The bin is on the file system of the old path, so the move is a rename. Keep the recycle bin on
   the media's file system, or no old file comes back.
-- The bin exists where the hook runs. `--selftest` and Test warn when it does not, as in a container
-  that does not mount it.
+- The bin exists where the hook runs. When `KEEP_REPLACED` keeps no copies, `--selftest` and Test
+  warn when it does not, as in a container that does not mount it.
 - The old file passes the import's audio and video checks. A certain fault, an audio sample that
   did not run, or a stopped video check keeps it out. Other doubts do not, because it played before.
 - The bin file still has the inode, size and mtime the plan checked, because the app may give a
@@ -396,9 +396,9 @@ in the folders of the app's root folders and in each folder a record names. The 
 mount below a root folder, such as a dataset per show. The worker also prunes the folders the
 records name once a day, so a host with no nightly audit prunes too. A grab never prunes, so the app
 never waits for it. With `0`, the hook keeps nothing, and a prune removes every grab link.
-`--selftest` and Test warn when the app's saved connection to the hook does not send Grab, and when
-the hook cannot hard-link a file on a mount. They probe each mount with a small temp file that they
-remove. With the copies working, a bin warning says that the copies stand in.
+`--selftest` and Test warn when the app has no saved connection to the hook, when that connection
+does not send Grab, and when the hook cannot hard-link a file on a mount. They probe each mount with a small temp file that they
+remove. With the copies working, the bin gives no warning.
 
 Two bind mounts of one file system share `st_dev`, but a rename between them fails. So the restore
 and the bin warning compare the mount tops too. A bin under another mount top counts as another
@@ -1551,9 +1551,9 @@ stopped container, still runs. The worker is a new program in its own session, `
 --serve --worker`, because a fork would copy the listener's threads and a lock one of them held. It
 reads the env file and the policy at its start. A program run as `--serve` sets `config.SERVE`, so
 the logfmt summary of each decision line also goes to stdout, the container log. The nightly audit
-runs as `--serve --audit` for the same reason. In the image, tini is PID 1 and passes SIGTERM, as
-`docker stop` sends it, to the listener. The listener sends it on to the worker's process group and
-waits for it. A job that has not written goes back to the queue, and a flag edit or a re-grab ends
+runs as `--serve --audit` for the same reason, and writes only its summary line there. In the image,
+tini is PID 1 and passes SIGTERM, as `docker stop` sends it, to the listener. The listener sends it
+on to the worker's process group and waits for it. A job that has not written goes back to the queue, and a flag edit or a re-grab ends
 first, see "Crashes and stops".
 
 **Daily jobs.** A host install runs the nightly audit from a systemd timer, and the audit removes
@@ -1595,8 +1595,9 @@ run that matches no instance asks no app and queues nothing, and its Test fails 
 `runner.name_clash()` reads the Instance Name of an instance from `system/status`, the value the
 Custom Script gets. A 4K Sonarr that kept the name `Sonarr` would run as `sonarr`, against the other
 API with its own ids and paths. So the hook's Test checks the name of every instance of the program
-and fails on a clash, because the misnamed app's Test reaches another instance. The selftest, the
-listener's Test and its start check warn of a clash, because there the URL path picks the instance.
+and fails on a clash, because the misnamed app's Test reaches another instance. The selftest on a host
+warns of a clash. The listener's Test, its start check and a selftest in the image skip the name,
+because there the URL path picks the instance. The image says so with `ARR_MEDIA_GUARD_IMAGE=1`.
 A connection saved before a rename never runs its Test again. So the hook keeps the run's Instance
 Name in the job, and the worker reads the name of each instance of the program once per worker. It
 refuses a job while a clash stands, with one error line that names the Instance Name to set. A job of

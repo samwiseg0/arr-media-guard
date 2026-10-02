@@ -68,7 +68,8 @@ def g(tmp_path, monkeypatch):
                   "episodefile/9": {"id": 9, "seriesId": 5, "path": f"/tv/Show A/Season 1/{NAME}", "sceneName": "Show.A.S01E01.1080p-GRP"},
                   "episode?episodeFileId=9": [{"id": 31, "seasonNumber": 1, "episodeNumber": 1, "runtime": 22, "seriesId": 5, "episodeFileId": 9}],
                   "episode?episodeIds=31": [{"id": 31, "seasonNumber": 1, "episodeNumber": 1, "seriesId": 5, "episodeFileId": 9}],
-                  "rootfolder": [{"path": "/tv"}], "config/mediamanagement": {"recycleBin": ""}, "notification": [],
+                  "rootfolder": [{"path": "/tv"}], "config/mediamanagement": {"recycleBin": ""},
+                  "notification": [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://guard:8484/{app}"}]}],
                   "system/status": {"instanceName": {"sonarr": "Sonarr", "sonarr-4k": "Sonarr 4K"}[app]}}
            for app, host in HOSTS.items()}
 
@@ -229,21 +230,31 @@ def test_a_job_of_the_listener_or_of_a_single_instance_skips_the_name_check(g, m
     assert g.job_refused({"app": "sonarr", "instance_name": "Sonarr"}).startswith("the run named 'Sonarr' may come from another instance")
 
 
-def test_a_misnamed_instance_only_warns_in_the_listener_and_the_selftest(g, post, capsys):
-    """In Docker the URL path picks the instance, so the Test, the start check and the selftest name the clash and
-    pass."""
+def test_a_misnamed_instance_warns_in_the_selftest_and_never_in_the_listener(g, post, monkeypatch, capsys):
+    """The URL path of the Webhook picks the instance, so the listener's Test and start check skip the Instance Name. The
+    owner saw this line at the first start of 2.1.0 in Docker:
+    arr-media-guard: radarr warning: Radarr names its instance 'RadarrHD', so its Custom Script runs go to no instance. ...
+    The selftest on a host names the clash and passes."""
     g.api[HOSTS["sonarr-4k"]]["system/status"]["instanceName"] = "Sonarr"
     clash = CLASH.format("Sonarr", "the instance sonarr")
-    code, text = post("/sonarr-4k", {"eventType": "Test"})
-    assert code == 200 and text.startswith(f"arr-media-guard: Test ok. Warning: {clash} Warning: ")
-    assert post("/sonarr", {"eventType": "Test"})[1].startswith("arr-media-guard: Test ok. Warning: Sonarr has no recycle bin.")
+    monkeypatch.setattr(g, "SERVE", True)   # serve.main() sets it in the listener
+    assert post("/sonarr-4k", {"eventType": "Test"}) == (200, "arr-media-guard: Test ok.\n")
+    assert post("/sonarr", {"eventType": "Test"}) == (200, "arr-media-guard: Test ok.\n")
     capsys.readouterr()
     g.arr_serve.start_check()
     out = capsys.readouterr().out.splitlines()
-    assert f"arr-media-guard: sonarr-4k warning: {clash}" in out and "arr-media-guard: sonarr-4k start check: ok" in out
+    assert "warning" not in " ".join(out) and "arr-media-guard: sonarr-4k start check: ok" in out
+    assert not [c for c in g.calls if c[2] == "system/status"]
+    monkeypatch.setattr(g, "SERVE", False)
     g.main(["--selftest"])
     out = capsys.readouterr().out.splitlines()
     assert f"warning: {clash}" in out and out[-1] == "selftest ok"
+    monkeypatch.setattr(g, "IMAGE", True)   # docker exec ... --selftest: no app runs a Custom Script in the image
+    g.main(["--selftest"])
+    out = capsys.readouterr().out.splitlines()
+    assert not [x for x in out if "warning" in x] and out[-1] == "selftest ok"
+    with open(os.path.join(amg.ROOT, "docker", "Dockerfile")) as f:
+        assert "ARR_MEDIA_GUARD_IMAGE=1" in f.read()
 
 
 # --- the listener ------------------------------------------------------------------------------------------------------
@@ -297,8 +308,7 @@ def test_a_path_that_is_no_instance_gets_404_and_no_line(g, post, path):
 
 def test_the_test_event_and_the_start_check_run_per_instance(g, post, capsys):
     code, text = post("/sonarr-4k", {"eventType": "Test"})
-    assert (code, text.strip()) == (200, "arr-media-guard: Test ok. Warning: Sonarr-4k has no recycle bin. The hook keeps its own copy of each "
-                                         "file an upgrade replaces, so the restore after a bad upgrade still works.")
+    assert (code, text.strip()) == (200, "arr-media-guard: Test ok.")   # KEEP_REPLACED stands in for the recycle bin
     assert {c[:2] for c in g.calls} == {(HOSTS["sonarr-4k"], KEYS["sonarr-4k"])}
     g.calls.clear()
     capsys.readouterr()
@@ -332,7 +342,7 @@ def test_grab_links_and_old_files_never_mix_between_instances_that_share_a_libra
     assert g.keep_grab("sonarr", "5", "SABnzbd_nzo_1", [31])["kept"]
     g.claim_kept({"app": "sonarr-4k", "deleted": p, "download_id": "SABnzbd_nzo_1"})
     assert g.kept_copy("sonarr-4k", p, "SABnzbd_nzo_1") == (None, None)
-    assert g.kept_copy("sonarr", p, "SABnzbd_nzo_1") == (None, "The hook's own copy is older, because another import replaced the file after the grab")
+    assert g.kept_copy("sonarr", p, "SABnzbd_nzo_1") == (None, "The kept copy is older, because another import replaced the file after the grab")
     later = g.time.time() + 5   # the next grab links into a stamp folder of its own
     monkeypatch.setattr(g.time, "time", lambda: later)
     assert g.keep_grab("sonarr", "5", "SABnzbd_nzo_2", [31])["kept"]

@@ -426,7 +426,7 @@ def path_warnings(per_app=True):
             if not os.path.isdir(r) and per_app:
                 where = f"{name}'s root folder {r}" if mapped(r, app, True) == r else \
                     f"{r}, where {map_key(app)} puts {name}'s root folder {mapped(r, app, True)}"
-                out.append(f"this script does not see {where}. Mount the media there, or {map_fix(app)}.")
+                out.append(f"this {config.here()} does not see {where}. Mount the media there, or {map_fix(app)}.")
     if not config.CFG.plex_url or not roots:
         return out
     try:
@@ -438,7 +438,7 @@ def path_warnings(per_app=True):
         if not any(p == x or p.startswith(x + "/") or x.startswith(p + "/") for x in locs):
             where, fix = "" if p == r.rstrip("/") else f", which {map_key('plex')} puts at {p} in Plex", map_fix("plex")
             out.append(f"no Plex library folder holds {name}'s root folder {r}{where}. {fix[0].upper()}{fix[1:]}, so Plex finds the "
-                       "files the hook edits.")
+                       "files arr-media-guard edits.")
     return out
 
 

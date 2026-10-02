@@ -466,7 +466,7 @@ class Event:
             owner = item.get("id") if isinstance(item, dict) else None
             ids = [] if a.film or not isinstance(eps, list) else [e.get("id") if isinstance(e, dict) else None for e in eps]
             if not (positive(owner) and all(positive(i) for i in ids) and isinstance(down, str) and len(down) <= MAX_ID):
-                raise Refused(400, f"the Grab body has no {a.kind} id, episode ids or downloadId that the hook can read")
+                raise Refused(400, f"the Grab body has no {a.kind} id, episode ids or downloadId that arr-media-guard can read")
             return dataclasses.replace(ev, owner=str(owner), download_id=down, eps=sorted(set(ids)))
         if ev.event != "Download":
             return ev
@@ -539,7 +539,8 @@ def app_check(app, until=0, policy=True, routed=False):
     seconds until the monotonic time until. policy=False leaves the policy to a caller that checks it once for every
     app. routed is a Custom Script run, the hook's Test, where the Instance Name picks the instance. It checks the name
     of every instance of the program, because a run of a misnamed one reaches the Test of another, and a clash fails.
-    Elsewhere the URL path of the Webhook picks the instance, and a clash of app only warns."""
+    --selftest on a host checks the name of app, and a clash only warns. Under the listener and in the image, the URL
+    path of the Webhook picks the instance, so it checks no name."""
     if policy and decide.POLICY is None:
         return config.policy_help(), []
     short = apps.ARR_TIMEOUT.set(TEST_TIMEOUT)
@@ -552,13 +553,13 @@ def app_check(app, until=0, policy=True, routed=False):
                 if time.monotonic() >= until:
                     return config.mask(f"the {apps.ARR[app].name} API did not answer: {type(ex).__name__}: {ex}")[:300], []
                 time.sleep(min(ASK_AGAIN, max(0, until - time.monotonic())))
-        peers = [a for a in config.CFG.apps if config.program(a) == config.program(app)] if routed else [app]
+        peers = [a for a in config.CFG.apps if config.program(a) == config.program(app)] if routed else [] if config.SERVE or config.IMAGE else [app]
         clashes = [c for c in map(name_clash, peers) if c]
         if clashes and routed:
             return " ".join(clashes), []
         missing = [r for r in roots if not os.path.isdir(r)]
         if missing:
-            return (f"this {'container' if config.SERVE else 'script'} does not see the root folders {', '.join(missing)}. Mount the "
+            return (f"this {config.here()} does not see the root folders {', '.join(missing)}. Mount the "
                     f"media at the app's paths, or {apps.map_fix(app)}"), clashes
         return None, clashes + regrab.bin_warnings(app)
     finally:

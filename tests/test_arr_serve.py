@@ -585,9 +585,9 @@ def test_one_path_map_for_every_program_misses_plex_and_the_check_names_it(teste
              sonarr={"path_map": []}, radarr={"path_map": []})
     assert h.plex_find(tester["ep"], {"guids": ["tvdb://5"], "title": "Show A", "show": True}) == ([], False, None)
     want = [f"no Plex library folder holds Sonarr's root folder {m}/TV, which PATH_MAP puts at /mnt/TV in Plex. "
-            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits.",
+            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files arr-media-guard edits.",
             f"no Plex library folder holds Radarr's root folder {m}/Movies, which PATH_MAP puts at /movies in Plex. "
-            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits."]
+            "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files arr-media-guard edits."]
     assert sorted(h.path_warnings()) == sorted(want)
     arr_serve.path_check()
     assert sorted(capsys.readouterr().out.splitlines()) == sorted(f"arr-media-guard: warning: {w}" for w in want)
@@ -603,12 +603,14 @@ def test_the_path_check_names_a_root_folder_this_script_does_not_see_and_its_set
         f"this script does not see {tester['media']}/TV/Kids, where SONARR_PATH_MAP puts Sonarr's root folder /mnt/TV/Kids. "
         "Mount the media there, or fix SONARR_PATH_MAP.",
         "this script does not see Radarr's root folder /films4k. Mount the media there, or fix RADARR_PATH_MAP.",
-        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files the hook edits."])
+        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files arr-media-guard edits."])
     assert h.path_warnings(per_app=False) == [   # the listener's start check names a root folder it does not see
-        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files the hook edits."]
+        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files arr-media-guard edits."]
     # A Plex library inside a root folder, or one that holds it, counts. Without PLEX_URL there is no Plex check.
     tester["api"]["plex/library/sections"]["MediaContainer"]["Directory"].append({"key": "5", "Location": [{"path": "/films4k/uhd"}]})
     assert all(w.startswith("this script does not see") for w in h.path_warnings())
+    monkeypatch.setattr(h, "SERVE", True)   # docker exec --serve, or the listener
+    assert all(w.startswith("this container does not see") for w in h.path_warnings())
     settings(plex_url="")
     tester["calls"].clear()
     assert len(h.path_warnings()) == 2 and not any(c[0] == "plex" for c in tester["calls"])
@@ -620,7 +622,7 @@ def test_with_no_map_set_the_path_check_says_to_set_one(tester, settings):
     tester["api"]["sonarr/rootfolder"] = [{"path": "/mnt/TV"}]
     assert h.path_warnings() == [
         "this script does not see Sonarr's root folder /mnt/TV. Mount the media there, or set SONARR_PATH_MAP or PATH_MAP.",
-        "no Plex library folder holds Sonarr's root folder /mnt/TV. Set PLEX_PATH_MAP or PATH_MAP, so Plex finds the files the hook edits."]
+        "no Plex library folder holds Sonarr's root folder /mnt/TV. Set PLEX_PATH_MAP or PATH_MAP, so Plex finds the files arr-media-guard edits."]
 
 
 def test_a_pair_with_trailing_slashes_maps_the_root_folder_itself(tester, settings):
@@ -1021,6 +1023,21 @@ def test_the_healthcheck_needs_no_credentials(server):
     assert server("GET", "/radarr")[0] == 404
 
 
+def test_a_healthcheck_that_passes_writes_no_access_line(server, app, capsys):
+    """Docker and the host ask /health at each interval. The owner saw these lines fill the container log of 2.1.0:
+    arr-media-guard: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+    A healthcheck that fails keeps its line, and so does every other request."""
+    capsys.readouterr()
+    assert server("GET", "/health")[:2] == (200, "ok\n")
+    assert capsys.readouterr().out == ""
+    server("POST", "/radarr", {"eventType": "Test"})
+    assert '"POST /radarr HTTP/1.1" 200' in capsys.readouterr().out
+    hd = arr_serve.Handler.__new__(arr_serve.Handler)   # a /health answer the listener never gives today
+    hd.command, hd.path, hd.requestline, hd.quiet, hd.client_address = "GET", "/health", "GET /health HTTP/1.1", False, ("127.0.0.1", 1)
+    hd.log_request(503)
+    assert capsys.readouterr().out == 'arr-media-guard: 127.0.0.1 "GET /health HTTP/1.1" 503 -\n'
+
+
 # --- the worker and the daily jobs --------------------------------------------------------------------------------------
 
 def test_the_listener_starts_a_worker_only_when_work_waits_and_no_worker_runs(app, monkeypatch):
@@ -1127,9 +1144,11 @@ def test_under_the_listener_the_summary_line_goes_to_stdout_too(app, monkeypatch
     assert ran == [(["--audit", "radarr", "--since", "24h", "--post"], True)]
 
 
-def test_under_the_listener_the_audit_summary_goes_to_stdout_too(app, monkeypatch, capsys):
+def test_under_the_listener_the_audit_writes_only_its_summary_line(app, monkeypatch, capsys):
     """The nightly audit runs as --serve --audit, see daily(). Its one summary line goes to syslog and to the container
-    log."""
+    log. The terminal text stays out of the container log. The owner saw it there after each summary line of 2.1.0:
+    Edit audit: Radarr docker
+    0 files edited since 2026-10-01T11:26-04:00, 0 of them plan a further edit. ..."""
     sent = []
     monkeypatch.setattr(syslog, "syslog", lambda priority, line: sent.append(line))
     monkeypatch.setattr(h.os, "nice", lambda n: None)
@@ -1137,7 +1156,11 @@ def test_under_the_listener_the_audit_summary_goes_to_stdout_too(app, monkeypatc
     monkeypatch.setattr(h, "SERVE", False)   # main() sets it, and the test ends with it unset
     arr_serve.main(["--audit", "radarr", "--since", "24h"])
     (line,) = sent
-    assert line.startswith("arr=radarr source=audit outcome=summary ") and line + "\n" in capsys.readouterr().out, line
+    assert line.startswith("arr=radarr source=audit outcome=summary edited=0 further=0 undecided=0 dropped=0 broken=0 tmdb=")
+    assert capsys.readouterr().out == line + "\n"
+    monkeypatch.setattr(h, "SERVE", False)
+    h.main(["--audit", "radarr", "--since", "24h"])   # in a terminal, only the text
+    assert capsys.readouterr().out.startswith(f"Audit check: 0 problems · Radarr {h.CFG.instance}\n0 files changed since ")
 
 
 def test_spawn_starts_a_new_program_in_its_own_session(monkeypatch):
@@ -1729,6 +1752,10 @@ def test_a_recycle_bin_beside_the_media_gives_no_warning(app):
 
 # --- KEEP_REPLACED: the Grab event and its warnings ---------------------------------------------------------------
 
+GRAB_ON = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://x/{a}"}]}
+           for a in ("radarr", "sonarr")]   # a saved connection of each app that sends Grab
+
+
 def keep_on(monkeypatch, tmp_path):
     """KEEP_REPLACED on, with the top of the mount at tmp_path. Returns replaced_root()."""
     monkeypatch.setattr(h, "CFG", dataclasses.replace(h.CFG, keep_replaced=True))
@@ -1769,44 +1796,50 @@ def test_a_grab_that_fails_answers_ok_and_logs_why(server, app, monkeypatch, tmp
     assert app["calls"] == ([("radarr", "movie/8")] if body.get("movie") == {"id": 8} else [])
     (line,) = log_lines()
     assert (line["source"], line["result"]) == ("webhook", "error") and line["note"].startswith("the grab kept nothing: ")
+    assert "hook" not in line["note"]
 
 
 def test_keep_replaced_warns_when_the_connection_to_the_hook_sends_no_grab(app, monkeypatch, tmp_path):
     """The connection to this hook is a Custom Script with this script's path, or a Webhook to /radarr. Before the first
-    Save the API lists none, and nothing warns."""
+    Save the API lists none, and that warns too, because then a grab keeps nothing."""
     keep_on(monkeypatch, tmp_path)
     script = {"name": "guard", "implementation": "CustomScript", "onGrab": False, "fields": [{"name": "path", "value": h.__file__}]}
     web = {"name": "guard-web", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://arr-media-guard:8484/radarr/"}]}
     other = {"name": "Discord", "implementation": "Discord", "onGrab": False, "fields": [{"name": "webHookUrl", "value": "https://x.invalid/radarr"}]}
     app["api"]["notification"] = [script, other]
-    assert h.bin_warnings("radarr") == ["KEEP_REPLACED is on, but Radarr's connection guard does not send Grab, so the hook keeps nothing. "
+    assert h.bin_warnings("radarr") == ["KEEP_REPLACED is on, but Radarr's connection guard does not send Grab, so arr-media-guard keeps nothing. "
                                         "Turn on On Grab in that connection."]
     script["onGrab"] = True
     assert h.bin_warnings("radarr") == []
     app["api"]["notification"] = [web, other]
     assert "Radarr's connection guard-web does not send Grab" in h.bin_warnings("radarr")[0]
     app["api"]["notification"] = [other]
-    assert h.bin_warnings("radarr") == [] and not [n for n in os.listdir(tmp_path) if n.startswith(".link-probe-")]   # the probe left nothing
+    assert h.bin_warnings("radarr") == ["KEEP_REPLACED is on, but Radarr has no saved connection to arr-media-guard, so arr-media-guard "
+                                        "keeps nothing at a grab. Save the connection with On Grab on."]
+    assert not [n for n in os.listdir(tmp_path) if n.startswith(".link-probe-")]   # the probe left nothing
 
 
 def test_keep_replaced_warns_on_a_mount_that_takes_no_hard_link(app, monkeypatch, tmp_path):
     keep_on(monkeypatch, tmp_path)
-    app["api"]["notification"] = []
+    app["api"]["notification"] = GRAB_ON
     monkeypatch.setattr(h.os, "link", lambda a, b: (_ for _ in ()).throw(OSError(h.errno.EPERM, "Operation not permitted")))
-    assert h.bin_warnings("radarr") == [f"KEEP_REPLACED is on, but {tmp_path} takes no hard link (Operation not permitted), so the hook keeps "
+    assert h.bin_warnings("radarr") == [f"KEEP_REPLACED is on, but {tmp_path} takes no hard link (Operation not permitted), so arr-media-guard keeps "
                                         "nothing on that mount. Keep the media on a file system that takes hard links."]
     assert not [n for n in os.listdir(tmp_path) if n.startswith(".link-probe-")]
 
 
 def test_keep_replaced_says_where_the_grab_links_go_when_the_mount_top_is_not_writable(app, monkeypatch, tmp_path):
-    """The hook keeps them in a folder below the mount top. One at a root folder's top level shows in Library Import."""
+    """The hook keeps them in a folder below the mount top. One at a root folder's top level shows in Library Import. The
+    copies work, so a recycle bin on another file system gives no warning after these lines."""
     keep_on(monkeypatch, tmp_path)
-    app["api"]["notification"] = []
+    app["api"]["notification"] = GRAB_ON
+    real_volume = h.volume
+    monkeypatch.setattr(h, "volume", lambda p: -1 if p.startswith(app["rbin"]) else real_volume(p))
     real = os.access
     monkeypatch.setattr(h.os, "access", lambda p, mode, **k: False if str(p) == str(tmp_path) and mode & os.W_OK else real(p, mode, **k))
     movies, tv = os.path.join(str(tmp_path), "movies"), os.path.join(str(tmp_path), "tv")
     assert h.bin_warnings("sonarr") == [
-        f"uid {os.getuid()} and gid {os.getgid()} cannot write in {tmp_path}, so the hook keeps the grab links of {r} in {r}/{h.CFG.recycle_dir}. "
+        f"uid {os.getuid()} and gid {os.getgid()} cannot write in {tmp_path}, so arr-media-guard keeps its copies for {r} in {r}/{h.CFG.recycle_dir}. "
         "Sonarr's Library Import lists that folder as unmapped. Do not import it." for r in (movies, tv)]
     assert not [n for r in (movies, tv) for n in os.listdir(r) if n.startswith(".link-probe-")]
 
@@ -1818,11 +1851,11 @@ def test_keep_replaced_names_the_folder_and_the_user_that_cannot_write_it(app, m
     root = keep_on(monkeypatch, tmp_path)
     if made:
         os.mkdir(root)
-    app["api"]["notification"] = []
+    app["api"]["notification"] = GRAB_ON
     monkeypatch.setattr(h.tempfile, "mkstemp", lambda **k: (_ for _ in ()).throw(PermissionError(13, "Permission denied")))
     where, fix = (root, f"Give {root} to them.") if made else (tmp_path, f"Create {root} and give it to them.")
     assert h.bin_warnings("radarr") == [f"KEEP_REPLACED is on, but uid {os.getuid()} and gid {os.getgid()} cannot write in {where} (Permission "
-                                        f"denied), so the hook keeps nothing on that mount. {fix} In Docker, PUID and PGID set them."]
+                                        f"denied), so arr-media-guard keeps nothing on that mount. {fix} In Docker, PUID and PGID set them."]
 
 
 def test_the_link_probe_removes_both_files_when_it_stops_between_them(tmp_path, monkeypatch):
@@ -1837,14 +1870,20 @@ def test_the_link_probe_removes_both_files_when_it_stops_between_them(tmp_path, 
     assert os.listdir(tmp_path) == []
 
 
-def test_a_recycle_bin_the_hook_does_not_see_warns(app):
+@pytest.mark.parametrize("serve, who", [(False, "script"), (True, "container")])
+def test_a_recycle_bin_this_program_does_not_see_warns(app, monkeypatch, serve, who):
+    monkeypatch.setattr(h, "SERVE", serve)
     app["api"]["config/mediamanagement"] = {"recycleBin": "/nonexistent/recycle"}
-    assert h.bin_warnings("radarr") == ["Radarr's recycle bin /nonexistent/recycle does not exist where the hook runs, so the restore after "
-                                        "a bad upgrade cannot use it. Mount it at that path, or set RADARR_PATH_MAP or PATH_MAP."]
+    assert h.bin_warnings("radarr") == [f"this {who} does not see Radarr's recycle bin /nonexistent/recycle, so the restore after a bad "
+                                        "upgrade cannot use it. Mount it at that path, or set RADARR_PATH_MAP or PATH_MAP."]
 
 
 @pytest.mark.parametrize("case", ["no bin", "not here", "other file system"])
-def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in(app, monkeypatch, settings, tmp_path, case):
+def test_with_keep_replaced_working_the_recycle_bin_gives_no_warning(app, monkeypatch, settings, tmp_path, case):
+    """The program keeps its own copy of each file an upgrade replaces, so the bin warning has nothing to act on. The
+    owner saw this line at the first start of 2.1.0 in Docker:
+    arr-media-guard: radarr warning: Radarr's recycle bin /media-storage/v2_media/.recycle/radarr is on another file
+    system than /media-storage/all/movies. The hook keeps its own copy of each file an upgrade replaces, ..."""
     keep_on(monkeypatch, tmp_path)
     app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
     if case == "other file system":
@@ -1852,13 +1891,11 @@ def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in
         monkeypatch.setattr(h, "volume", lambda p: -1 if p.startswith(app["rbin"]) else real(p))
     else:
         app["api"]["config/mediamanagement"] = {"recycleBin": "" if case == "no bin" else "/nonexistent/recycle"}
-    (w,) = h.bin_warnings("radarr")
-    assert w.endswith(" The hook keeps its own copy of each file an upgrade replaces, so the restore after a bad upgrade still works.")
-    assert "cannot" not in w and "needs a rename" not in w
-    settings(keep_days=0)   # keeping nothing, the bin warning says so again
+    assert h.bin_warnings("radarr") == []
+    settings(keep_days=0)   # keeping nothing, the bin warning comes back
     w0, w1 = h.bin_warnings("radarr")
-    assert w0 == "KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so the hook keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0."
-    assert "still works" not in w1
+    assert w0 == "KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so arr-media-guard keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0."
+    assert ("cannot" in w1 or "needs a rename" in w1) and "hook" not in w1
 
 
 def test_the_test_event_and_the_selftest_print_the_keep_warnings(server, app, monkeypatch, settings, tmp_path, capsys):

@@ -231,7 +231,7 @@ def test_map_fix_says_fix_for_a_map_that_is_set_and_set_for_one_that_is_not(tmp_
 def test_a_keep_replaced_value_other_than_true_or_false_keeps_nothing_and_fails_the_selftest(tmp_path):
     m = load(tmp_path, "KEEP_REPLACED='yes'\n")
     assert m.CFG.keep_replaced is False and m.CFG.errors == [
-        "KEEP_REPLACED 'yes' is no switch value, so the hook keeps nothing at a grab. The values are true and false."]
+        "KEEP_REPLACED 'yes' is no switch value, so arr-media-guard keeps nothing at a grab. The values are true and false."]
     with pytest.raises(SystemExit, match="KEEP_REPLACED 'yes' is no switch value"):
         m.main(["--selftest"])
 
@@ -259,9 +259,9 @@ WHOLE = "is not a whole number of {} or more, so it counts as {}."
 
 
 @pytest.mark.parametrize("line, field, value, error", [
-    ("HEADER_REPAIR='off'", "header_repair", True, "HEADER_REPAIR 'off' " + SWITCH.format("the hook repairs a broken header")),
+    ("HEADER_REPAIR='off'", "header_repair", True, "HEADER_REPAIR 'off' " + SWITCH.format("arr-media-guard repairs a broken header")),
     ("RESTORE='no'", "restore", True, "RESTORE 'no' " + SWITCH.format("a re-grab of a broken upgrade puts the old file back")),
-    ("CONVERT='yes'", "convert", False, "CONVERT 'yes' " + SWITCH.format("the hook converts no import")),
+    ("CONVERT='yes'", "convert", False, "CONVERT 'yes' " + SWITCH.format("arr-media-guard converts no import")),
     ("HOOK_WORKERS='0'", "hook_workers", 1, "HOOK_WORKERS '0' is not a whole number of 1 or more, so 1 runs"),
     ("KEEP_ORIGINALS_DAYS='a week'", "keep_days", 7, "KEEP_ORIGINALS_DAYS 'a week' " + WHOLE.format(0, 7)),
     ("KEEP_ORIGINALS_DAYS='-3'", "keep_days", 0, "KEEP_ORIGINALS_DAYS '-3' " + WHOLE.format(0, 0)),

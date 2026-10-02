@@ -72,6 +72,12 @@ CRASH_TRIES = 3                                  # a job whose process died this
 SCHEMA = 2                                       # the decision log's line format. Raise it when a field changes meaning.
 HOST = os.uname().nodename
 SERVE = False   # True in the listener and the worker and daily jobs it starts, all as --serve. serve.main() sets it.
+IMAGE = os.environ.get("ARR_MEDIA_GUARD_IMAGE") == "1"   # docker/Dockerfile sets it. No app runs a Custom Script in the image.
+
+
+def here():
+    """The place a line says this program runs: the container under the listener or in the image, else the script."""
+    return "container" if SERVE or IMAGE else "script"
 REGRAB_KINDS = ("audio", "video", "content", "damage")   # broken audio, corrupt video, wrong content, a damaged source
 # What the subtitle check of an import does, docs/design.md, "Subtitle match". off: no check. check: it reads, reports
 # and alerts, and changes nothing. fix: it also removes, retimes and lengthens. deep: fix, and a deep analysis after the
@@ -289,10 +295,10 @@ def settings(path, environ=os.environ):
         webhook_password=env.get("WEBHOOK_PASSWORD", ""), sabnzbd_api_key=env.get("SABNZBD_API_KEY", ""),
         newznab_api_key=env.get("NEWZNAB_API_KEY", ""), sabnzbd_url=env.get("SABNZBD_URL", ""), newznab_url=env.get("NEWZNAB_URL", ""),
         audit_time=env.get("AUDIT_TIME", "07:30"), regrab=regrab, regrab_cap=regrab_cap,
-        keep_replaced=switch("KEEP_REPLACED", False, "the hook keeps nothing at a grab"),
+        keep_replaced=switch("KEEP_REPLACED", False, "arr-media-guard keeps nothing at a grab"),
         restore=switch("RESTORE", True, "a re-grab of a broken upgrade puts the old file back"),
-        header_repair=switch("HEADER_REPAIR", True, "the hook repairs a broken header"),
-        convert=switch("CONVERT", False, "the hook converts no import"),
+        header_repair=switch("HEADER_REPAIR", True, "arr-media-guard repairs a broken header"),
+        convert=switch("CONVERT", False, "arr-media-guard converts no import"),
         keep_days=number("KEEP_ORIGINALS_DAYS", 7, 7, "is not a whole number of 0 or more, so it counts as {}.", least=0),
         repack_max=repack_max, subtitles=subtitles, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),

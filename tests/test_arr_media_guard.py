@@ -2483,9 +2483,11 @@ def test_audit_of_a_dry_run_groups_classes_and_posts_one_embed(env, tmp_path, ca
     plans.write_text("".join(json.dumps(r) + "\n" for r in rows))
     hook.main(["--audit", "radarr", "--plan-from", str(plans), "--post"])
     out = capsys.readouterr().out
-    assert "4 of 6 files would change, in 2 classes. 1 undecided, 0 dropped by an invariant. 1 break an invariant on re-check." in out
+    assert ("4 of 6 files would change, in 2 classes. 1 undecided, 0 with a planned track change not made, 1 with a track problem after "
+            "the planned change.") in out
     assert "3 English original: English subtitle off (Film 0; Film 1)" in out
-    assert "1 full English subtitle s1 would stay on under English audio (Bad (2020))" in out
+    assert "\nTrack problem after the change:\n1 full English subtitle s1 would stay on under English audio (Bad (2020))" in out
+    assert "arr-media-guard: radarr audit post: sent" in out.splitlines()   # four apps share one container log
     posts = [b for m, u, b in env["http"] if m == "POST"]
     assert len(posts) == 1 and posts[0]["embeds"][0]["title"] == "Plan audit: Radarr " + hook.CFG.instance
 
@@ -2497,7 +2499,8 @@ def test_audit_since_reads_the_check_after_each_edit(env, capsys):
     probes = len(env["events"])
     hook.main(["--audit", "radarr", "--since", "24h", "--source", "hook"])
     out = capsys.readouterr().out
-    assert "1 files edited since" in out and "0 of them plan a further edit" in out and "Every plan keeps the invariants." in out
+    assert "1 file changed since" in out and "0 of them still have tracks to change." in out
+    assert "0 with a track problem after the change." in out and "invariant" not in out
     assert "1 English original: audio switched, foreign subtitle off (Film A (1979))" in out
     assert "lock" not in env["events"][probes:]   # read from the log, the file was not probed again
     assert env["syslog"][-1].startswith("arr=radarr source=audit outcome=summary edited=1 further=0") and env["syslog"][-1].endswith("tmdb=ok")
@@ -2510,13 +2513,20 @@ def test_audit_since_probes_an_edit_logged_without_its_check(env, capsys):
                      rowid)   # a line from before the check existed
     env["files"][env["path"]]["tracks"][1]["properties"]["default_track"] = True   # someone put the Portuguese audio back first
     hook.main(["--audit", "radarr", "--since", "24h"])
-    assert "1 of them plan a further edit" in capsys.readouterr().out
+    assert "1 of them still have tracks to change" in capsys.readouterr().out
     assert log_lines(env)[-1]["source"] == "audit" and log_lines(env)[-1]["recheck"]["edits"] == 1   # a1 loses its flag again
 
 
 def test_a_quiet_night_posts_nothing(env, capsys):
+    """The terminal text uses the words of the Discord audit. The owner saw this text of 2.1.0 in the container log:
+    Edit audit: Radarr docker
+    0 files edited since 2026-10-01T11:26-04:00, 0 of them plan a further edit. 0 undecided, 0 dropped by an invariant.
+    Every plan keeps the invariants."""
     hook.main(["--audit", "sonarr", "--since", "24h", "--source", "hook", "--post"])
-    assert "0 files edited since" in capsys.readouterr().out
+    out = capsys.readouterr().out.splitlines()
+    text = out[out.index(f"Audit check: 0 problems · Sonarr {hook.CFG.instance}") + 1]
+    assert text.startswith("0 files changed since ") and text.endswith(". 0 of them still have tracks to change. 0 undecided, 0 with a "
+                                                                       "planned track change not made, 0 with a track problem after the change."), text
     assert [b for m, u, b in env["http"] if m == "POST"] == []
 
 
@@ -3464,7 +3474,8 @@ def test_a_plan_audit_groups_a_skipped_conversion_by_its_code(env, monkeypatch, 
     assert decided(env)["outcome"] == json.loads(plans.read_text())["outcome"] == "repack_hardlinked"
     assert 'summary: {"repack_hardlinked": 1}' in capsys.readouterr().out
     hook.main(["--audit", "radarr", "--plan-from", str(plans)])
-    assert "1 repack_hardlinked, not Matroska: MP4/QuickTime (Film A (1979))" in capsys.readouterr().out
+    assert ("1 the conversion to MKV was skipped, because the file has another hard link (not Matroska: MP4/QuickTime) (Film A (1979))"
+            in capsys.readouterr().out)   # plain words for the code repack_hardlinked
 
 
 def test_a_dry_run_limit_counts_a_conversion_that_would_run(env, monkeypatch):
@@ -6500,10 +6511,10 @@ def test_a_usable_bin_copy_wins_over_the_hooks_own_copy(env, monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("by, why", [
-    ("repair", "The hook's own copy is older, because the hook changed the file after the grab"),
-    ("import", "The hook's own copy is older, because another import replaced the file after the grab"),
-    ("gone", "The hook's own copy is gone"),
-    ("replaced", "The hook's own copy is no longer the file the grab linked")])
+    ("repair", "The kept copy is older, because arr-media-guard changed the file after the grab"),
+    ("import", "The kept copy is older, because another import replaced the file after the grab"),
+    ("gone", "The kept copy is gone"),
+    ("replaced", "The kept copy changed after the grab")])
 def test_a_stale_own_copy_never_comes_back(env, monkeypatch, tmp_path, by, why):
     """After the grab, a header repair renamed a new file over the old path, or another download's import replaced
     it. The own copy then holds an older version. Or the copy went, or another file took its name. The plain re-grab
@@ -6565,7 +6576,7 @@ def test_the_import_claims_the_copy_of_a_grab_with_no_download_id(env, monkeypat
     assert hook.kept_copy("radarr", env["path"], "x1")[0]["download_id"] == ""
     hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": ""})   # a manual import at the same path
     assert [r.get("stale") for r in hook.kept_read() if r["download_id"] == ""] == ["another import replaced the file after the grab"]
-    assert hook.kept_copy("radarr", env["path"], "x1") == (None, "The hook's own copy is older, because another import replaced the file after "
+    assert hook.kept_copy("radarr", env["path"], "x1") == (None, "The kept copy is older, because another import replaced the file after "
                                                               "the grab")
 
 
@@ -6577,7 +6588,7 @@ def test_an_in_place_conversion_makes_the_own_copy_stale(env, monkeypatch, tmp_p
     hook.keep_grab("radarr", 7, "d1")
     assert hook.convert("radarr", env["path"], hook.mkvmerge(env["path"]), os.stat(env["path"]), True, {"app_id": 7})[0] == "repacked"
     (r,) = hook.kept_read()
-    assert r["stale"] == "the hook changed the file after the grab" and open(r["kept"], "rb").read() == b"x" * 1000
+    assert r["stale"] == "arr-media-guard changed the file after the grab" and open(r["kept"], "rb").read() == b"x" * 1000
 
 
 def test_a_season_pack_grab_links_each_file_once_with_its_extras(env, monkeypatch, tmp_path, capsys):
@@ -6666,10 +6677,12 @@ def test_a_grab_leaves_the_prune_to_the_audit_and_a_record_stays_while_its_link_
     assert hook.links(os.stat(old)) == 1
 
 
-@pytest.mark.parametrize("days", [7, 0])
-def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, settings, tmp_path, capsys, days):
+@pytest.mark.parametrize("days, serve", [(7, False), (0, False), (7, True)])
+def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, settings, tmp_path, capsys, days, serve):
     """With KEEP_ORIGINALS_DAYS set to 0 after use, the audit removes every grab link folder, so no link stays for ever.
-    It leaves the originals at 0, as every release before 1.7.0 did."""
+    It leaves the originals at 0, as every release before 1.7.0 did. Under the listener, the line names the app, because
+    four apps share one container log."""
+    monkeypatch.setattr(hook, "SERVE", serve)
     root = keep_on(monkeypatch, tmp_path)
     settings(keep_days=days)
     stamps = ["20000101T000000Z", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(env["clock"][0] - 3600))]
@@ -6681,7 +6694,8 @@ def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, settings,
     hook.main(["--audit", "radarr", "--since", "24h"])
     left = [] if days == 0 else stamps[1:]
     assert os.listdir(root) == left and sorted(os.listdir(tmp_path / "media" / hook.CFG.keep_dir)) == (stamps if days == 0 else left)
-    assert f"removed {2 - len(left)} kept folders older than {days} days under {root}" in capsys.readouterr().out
+    line = f"removed {2 - len(left)} kept folders older than {days} days under {root}"
+    assert (f"arr-media-guard: radarr audit: {line}" if serve else line) in capsys.readouterr().out.splitlines()
 
 
 def show_mount(monkeypatch, tmp_path):
@@ -6896,7 +6910,7 @@ def test_a_restore_makes_a_later_grab_link_of_its_path_stale(env, monkeypatch, t
             "new": env["path"], "kept": {}}
     assert hook.restore({}, {11: plan})[0]["result"] == "restored"
     hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": "d2"})   # d2's import replaces the old file
-    assert hook.kept_copy("radarr", env["path"], "d2") == (None, "The hook's own copy is older, because the hook changed the file after the grab")
+    assert hook.kept_copy("radarr", env["path"], "d2") == (None, "The kept copy is older, because arr-media-guard changed the file after the grab")
 
 
 def test_a_renamed_file_still_finds_the_hooks_own_link(env, monkeypatch, tmp_path):
@@ -6933,7 +6947,7 @@ def test_a_copy_near_its_prune_stays_out_of_a_plan(env, monkeypatch, tmp_path, a
     hook.queue_job({"app": "radarr", "deleted": env["path"], "download_id": "d1"})
     env["clock"][0] += age
     rec, why = hook.kept_copy("radarr", env["path"], "d1")
-    assert bool(rec) == kept and why == (None if kept else "The hook's own copy is too close to its prune at KEEP_ORIGINALS_DAYS")
+    assert bool(rec) == kept and why == (None if kept else "The kept copy is too close to its removal at KEEP_ORIGINALS_DAYS")
 
 
 def test_a_file_the_api_lists_and_that_is_not_on_disk_logs_one_line(env, monkeypatch, tmp_path):
@@ -8551,6 +8565,25 @@ def test_the_audit_lists_every_file_with_the_problems_first(env):
     assert body[-1] == f"and {122 - (len(body) - 1)} more OK" and len(e["description"]) <= 2000, body[-3:]
     assert e["footer"]["text"] == f"TMDB didn't answer 1 time · arr-media-guard on {host}"
     assert "invariant" not in e["description"] and "undecided" not in e["description"]
+
+
+def test_the_terminal_audit_names_each_problem_in_plain_words(env, capsys):
+    """The fields of --audit in a terminal use the words of the Discord audit. The decision log keeps the codes."""
+    lines = [dict(audit_line("Show J", 1, []), outcome="undecided", result="undecided", abstain="original_missing_bare_tag"),
+             dict(audit_line("Show K", 1, ENGLISH_FIRST), recheck={"edits": 0, "invariants": ["inv_only_english_subtitle_off"]}),
+             dict(audit_line("Show L", 1, []), outcome="dropped", result="dropped", invariants=["inv_audio_default_count"]),
+             dict(audit_line("Show M", 1, []), outcome="repack_failed", container="AVI"),
+             dict(audit_line("Show N", 1, []), outcome="no_change", header_repair={"code": "header_repair_failed"})]
+    for r in lines:
+        hook.store.decided(datetime.datetime.fromisoformat(r["time"]).timestamp(), r["app"], r["path"],
+                           json.dumps({k: r[k] for k in hook.KEPT_KEYS if k in r}))
+    hook.main(["--audit", "sonarr", "--since", "24h"])
+    out = capsys.readouterr().out
+    assert "Undecided:\n1 couldn't decide which audio should play first, because no track is in the original language (Show J S01E01)" in out
+    assert "Track problem after the change:\n1 the only English subtitles are off (Show K S01E01)" in out
+    assert "Dropped:\n1 the wrong number of audio tracks would play by default (Show L S01E01)" in out
+    assert "1 the conversion to MKV failed (not Matroska: AVI) (Show M S01E01)" in out and "1 the file repair failed (Show N S01E01)" in out
+    assert not [c for c in ("inv_", "original_missing", "repack_failed", "header_repair") if c in out], out
 
 
 @pytest.fixture(scope="module")
@@ -14022,11 +14055,11 @@ def test_the_audit_reads_the_decisions_of_its_window_from_the_store(env, capsys)
     old = dict(audit_line("Show H", 1, ENGLISH_FIRST), app="radarr", time="2026-01-01T00:00:00+00:00")
     hook.store.decided(datetime.datetime.fromisoformat(old["time"]).timestamp(), "radarr", old["path"], json.dumps(old))
     hook.main(["--audit", "radarr", "--since", "2026-01-02"])
-    assert "1 files edited since" in capsys.readouterr().out
+    assert "1 file changed since" in capsys.readouterr().out
     hook.main(["--audit", "radarr", "--since", "2025-12-31"])
-    assert "2 files edited since" in capsys.readouterr().out
+    assert "2 files changed since" in capsys.readouterr().out
     hook.main(["--audit", "sonarr", "--since", "2025-12-31"])
-    assert "0 files edited since" in capsys.readouterr().out
+    assert "0 files changed since" in capsys.readouterr().out
     hook.decision(dict(app="radarr", source="hook", path="/m/y.mkv", result="no change", outcome="no_change"), time.time())
     assert [json.loads(r)["path"] for r, in hook.store.read("SELECT rec FROM decisions")] == [env["path"], "/m/y.mkv"]   # the old line went
 

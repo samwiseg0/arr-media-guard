@@ -245,11 +245,11 @@ def volume(path):
 
 
 def bin_warnings(app):
-    """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, its bin does not
-    exist where the hook runs, or it sits on another file system than a root folder, and a restore only renames. With
-    KEEP_REPLACED on, keep_warnings() come first. When they find nothing, a bin warning says that the hook's own copies
-    stand in. [] when all is well or the app does not answer. --selftest and the Test event print them, and neither
-    fails on them."""
+    """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, this program
+    does not see its bin, or the bin sits on another file system than a root folder, and a restore only renames. With
+    KEEP_REPLACED on, keep_warnings() come first. When none of them starts with KEPT_NOTHING, the program keeps its own
+    copy of each replaced file, and the bin needs no warning. [] when all is well or the app does not answer. --selftest and the Test
+    event print them, and neither fails on them."""
     name = apps.ARR[app].name
     try:
         rbin = (apps.arr(app, "config/mediamanagement") or {}).get("recycleBin") or ""
@@ -257,42 +257,47 @@ def bin_warnings(app):
         out = keep_warnings(app, roots) if config.CFG.keep_replaced else []
     except Exception:
         return []
-    own = " The hook keeps its own copy of each file an upgrade replaces, so the restore after a bad upgrade still works." \
-        if config.CFG.keep_replaced and not out else ""
+    if config.CFG.keep_replaced and not any(w.startswith(KEPT_NOTHING) for w in out):   # the kept copies stand in for the bin
+        return out
     if not rbin:
-        return out + [f"{name} has no recycle bin." + own if own else f"{name} has no recycle bin, so the restore after a bad upgrade "
-                      "cannot work. Set one in Media Management, on the media's file system."]
+        return out + [f"{name} has no recycle bin, so the restore after a bad upgrade cannot work. Set one in Media Management, on "
+                      "the media's file system."]
     if not os.path.isdir(rbin):   # a Docker mount or a path map that leaves it out
-        return out + [f"{name}'s recycle bin {rbin} does not exist where the hook runs." + own if own else f"{name}'s recycle bin {rbin} "
-                      "does not exist where the hook runs, so the restore after a bad upgrade cannot use it. Mount it at that path, or "
-                      f"{apps.map_fix(app)}."]
+        return out + [f"this {config.here()} does not see {name}'s recycle bin {rbin}, so the restore "
+                      f"after a bad upgrade cannot use it. Mount it at that path, or {apps.map_fix(app)}."]
     with contextlib.suppress(OSError):
         other = [r for r in roots if volume(r) != volume(rbin)]
         if other:
-            return out + [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}." + own if own else
-                          f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
+            return out + [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
                           "bad upgrade needs a rename. Move the bin onto the media's file system."]
     return out
 
 
+KEPT_NOTHING = "KEEP_REPLACED is on, but "   # starts each warning of keep_warnings() that means a file may go unkept
+
+
 def keep_warnings(app, roots):
-    """Why KEEP_REPLACED keeps nothing for app, as warnings: KEEP_ORIGINALS_DAYS is 0, the app's connection to this hook
-    does not send Grab, or the hook cannot hard-link a file on the mount of a root folder in roots. The connection to
-    this hook is a Custom Script with this script's path, or a Webhook whose URL path is /radarr or /sonarr. The API
-    lists the saved connections, so a Test before a Save sees the old triggers. When keep_root() takes a folder below
-    the mount top, a warning says where the grab links go."""
+    """Why KEEP_REPLACED keeps nothing for app, as warnings that start with KEPT_NOTHING: KEEP_ORIGINALS_DAYS is 0, the
+    app has no saved connection to this hook, its connection does not send Grab, or the hook cannot hard-link a file on
+    the mount of a root folder in roots. The connection to this hook is a Custom Script with this script's path, or a
+    Webhook whose URL path is /radarr or /sonarr. The API lists the saved connections, so a Test before a Save sees the
+    old triggers, or no connection. When keep_root() takes a folder below the mount top, a warning without KEPT_NOTHING
+    says where the copies go."""
     name, out = apps.ARR[app].name, []
     if not config.CFG.keep_days:
-        out.append("KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so the hook keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0.")
+        out.append(f"{KEPT_NOTHING}KEEP_ORIGINALS_DAYS is 0, so arr-media-guard keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0.")
     ours = []
     for n in apps.arr(app, "notification") or []:
         f = {x.get("name"): x.get("value") for x in n.get("fields") or []}
         if (n.get("implementation") == "CustomScript" and os.path.realpath(f.get("path") or "/") == config.SCRIPT) or \
                 (n.get("implementation") == "Webhook" and urllib.parse.urlparse(f.get("url") or "").path.rstrip("/") == f"/{app}"):
             ours.append(n)
-    if ours and not any(n.get("onGrab") for n in ours):
-        out.append(f"KEEP_REPLACED is on, but {name}'s connection {', '.join(str(n.get('name')) for n in ours)} does not send Grab, so the "
-                   "hook keeps nothing. Turn on On Grab in that connection.")
+    if not ours:
+        out.append(f"{KEPT_NOTHING}{name} has no saved connection to arr-media-guard, so arr-media-guard keeps nothing at a grab. "
+                   "Save the connection with On Grab on.")
+    elif not any(n.get("onGrab") for n in ours):
+        out.append(f"{KEPT_NOTHING}{name}'s connection {', '.join(str(n.get('name')) for n in ours)} does not send Grab, so "
+                   "arr-media-guard keeps nothing. Turn on On Grab in that connection.")
     seen = set()
     for r in sorted(roots):
         root = vault.replaced_root(os.path.join(r, "x"))
@@ -301,10 +306,10 @@ def keep_warnings(app, roots):
         seen.add(root)
         why, top = link_probe(root), vault.mount_top(r)
         if why:
-            out.append(f"KEEP_REPLACED is on, but {why}")
+            out.append(f"{KEPT_NOTHING}{why}")
         elif os.path.dirname(root) != top:   # keep_root() took a folder below the mount top
             blocked = os.path.join(top, config.CFG.recycle_dir) if os.path.lexists(os.path.join(top, config.CFG.recycle_dir)) else top
-            out.append(f"uid {os.getuid()} and gid {os.getgid()} cannot write in {blocked}, so the hook keeps the grab links of {r} in {root}."
+            out.append(f"uid {os.getuid()} and gid {os.getgid()} cannot write in {blocked}, so arr-media-guard keeps its copies for {r} in {root}."
                        + (f" {name}'s Library Import lists that folder as unmapped. Do not import it." if os.path.dirname(root) == r.rstrip("/") else ""))
     return out
 
@@ -319,12 +324,12 @@ def link_probe(root):
         os.close(fd)
     except OSError as ex:
         give = f"Give {root} to them." if where == root else f"Create {root} and give it to them."
-        return (f"uid {os.getuid()} and gid {os.getgid()} cannot write in {where} ({ex.strerror or ex}), so the hook keeps nothing on that mount. "
+        return (f"uid {os.getuid()} and gid {os.getgid()} cannot write in {where} ({ex.strerror or ex}), so arr-media-guard keeps nothing on that mount. "
                 f"{give} In Docker, PUID and PGID set them.")
     try:
         os.link(tmp, tmp + ".link")
     except OSError as ex:
-        return (f"{where} takes no hard link ({ex.strerror or ex}), so the hook keeps nothing on that mount. Keep the media on a file system "
+        return (f"{where} takes no hard link ({ex.strerror or ex}), so arr-media-guard keeps nothing on that mount. Keep the media on a file system "
                 "that takes hard links.")
     finally:   # also after a time limit between the link and its removal
         for f in (tmp + ".link", tmp):

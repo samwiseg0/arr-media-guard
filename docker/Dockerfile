@@ -25,7 +25,8 @@ RUN python3 -m compileall -q /opt/arr-media-guard/arr_media_guard /opt/arr-media
     && ln -s /opt/arr-media-guard/docker/arr-media-guard.sh /usr/local/bin/arr-media-guard \
     && ln -s /opt/arr-media-guard/docker/arr-media-guard.sh /usr/local/bin/arr-media-guard-subhunt
 
-ENV ARR_MEDIA_GUARD_ENV=/config/arr-media-guard.env PYTHONDONTWRITEBYTECODE=1 PUID=1000 PGID=1000
+# ARR_MEDIA_GUARD_IMAGE=1 tells the program that no app runs it as a Custom Script here, see config.IMAGE.
+ENV ARR_MEDIA_GUARD_ENV=/config/arr-media-guard.env ARR_MEDIA_GUARD_IMAGE=1 PYTHONDONTWRITEBYTECODE=1 PUID=1000 PGID=1000
 VOLUME /config
 EXPOSE 8484
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \

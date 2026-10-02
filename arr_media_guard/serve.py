@@ -285,9 +285,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_PUT = do_POST   # the Webhook connection may use PUT
 
+    def log_request(self, code="-", size="-"):
+        """No line for a healthcheck that passes. Docker and the host ask /health at each interval."""
+        if not (self.command == "GET" and self.path == "/health" and code == 200):
+            super().log_request(code, size)
+
     def log_message(self, fmt, *args):
-        """One line per request on stdout, with control characters escaped. Never the Authorization header, and never a
-        quiet request."""
+        """One line per request on stdout, with control characters escaped. Never the Authorization header, never a
+        quiet request, and never a healthcheck that passes, see log_request()."""
         if not self.quiet:
             print(f"arr-media-guard: {self.client_address[0]} {(fmt % args).translate(runner.CONTROL)}", flush=True)
 
