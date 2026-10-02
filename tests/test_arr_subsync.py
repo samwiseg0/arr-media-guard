@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Unit tests for arr_subsync.py, the subtitle match check.
+"""Unit tests for subsync.py, the subtitle match check.
 
 The dialogue is written for these tests from a word list. Whisper is faked: a window hears the words of the lines
 spoken in it, at the times the audio holds them. A line is spoken LEAD seconds after its cue starts in a right track.
@@ -28,7 +28,7 @@ from fractions import Fraction
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import arr_subsync as s  # noqa: E402
+from arr_media_guard import subsync as s  # noqa: E402
 
 NAMES = ["mira", "tobin", "juna", "pell"]   # the names both scripts of one show share
 WORDS = ("garden window bicycle pancake lantern river mountain rocket pillow marble ladder violin carpet thunder biscuit "
@@ -489,7 +489,7 @@ def test_a_chant_the_subtitle_holds_still_matches():
     one."""
     lines = [("Tobin rocket! Tobin rocket! Tobin rocket! Tobin rocket!" if i % 3 == 0 else x) for i, x in enumerate(RIGHT)]
     w = heard([EARLY, LATE], lines)
-    stop = s.arr_decide.STOPWORDS["eng"]
+    stop = s.decide.STOPWORDS["eng"]
     assert all(len(s.said(x, stop)) < len(s.words(" ".join(t for _, t in x["words"]), stop)) for x in w)   # the chant counts once
     r = s.check(w, cues(lines), "eng", DURATION)
     assert r["verdict"] == "match" and min(x["overlap"] for x in r["windows"]) >= 0.9 and r["timing"]["why"] == "in time", r

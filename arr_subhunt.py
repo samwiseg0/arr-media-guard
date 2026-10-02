@@ -1,21 +1,8 @@
-# arr-media-guard, a Sonarr and Radarr import hook that sets default tracks and catches broken files.
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Subtitle hunter: replace a Radarr movie file that has no English subtitle with a release that has one.
 
-  arr-media-guard --subhunt radarr --ids ID [ID ...] [--apply] [--force]
+  arr-media-guard-subhunt radarr --ids ID [ID ...] [--apply] [--force]
 
 Some foreign films have no English subtitle track. Radarr deletes the old file when it imports a new one. Its recycle
 bin may keep it, and the hunter never relies on that. So the hunter downloads outside Radarr,
@@ -31,16 +18,17 @@ It works on one movie at a time.
 4. A download passes with a full English subtitle track, the listed runtime within 10 percent, audio in the original
    language, and audio that decodes. A ManualImport in copy mode then replaces the file, under the hook's file lock.
    A hard link keeps the old file until the new one is in place.
-5. A rejected download is deleted and recorded in the hunter's own state file, never in Radarr's blocklist. When
+5. A rejected download is deleted and recorded in the hunter's state in the store, never in Radarr's blocklist. When
    every candidate is rejected, the current file stays and one Discord embed goes to DISCORD_WEBHOOK.
 
 Dry by default. A dry run makes the one Hydra query, prints the ranked candidates and downloads nothing. Every step
-writes a decision line with source "subhunt". The host script is passed in as h. The hunter uses its API client,
-probe, locks, decision log and Discord post. It handles Radarr only. An episode needs its own search.
+writes a decision line with source "subhunt". The hunter uses the package arr_media_guard: the settings, the app adapter
+and its command wait, the probe, the locks, the decision log and the Discord post. The package never imports the hunter.
+It handles Radarr only. An episode needs its own search.
 """
-import argparse, datetime, email.utils, json, os, re, shutil, signal, sqlite3, sys, time, urllib.parse, uuid
+import argparse, datetime, email.utils, os, re, shutil, signal, sys, time, urllib.parse, uuid
 
-import arr_decide
+from arr_media_guard import apps, checks, config, decide, logs, runner, store
 
 CAP = 3                      # rejected candidates per movie. Then the movie is no_subbed_release until --force.
 GRAB_WAIT = 120              # seconds SABnzbd may take to fetch the NZBs. It retries a dead link without pause.
@@ -54,7 +42,7 @@ FLOOR = {1080: 15, 720: 8}   # MiB a minute. A 1080p film under 15 is not 1080p.
 SUB_ROLES = ("full", "sdh")  # the English subtitle roles that count. A forced or signs track translates only a few lines.
 VIDEO = (".mkv", ".mp4", ".m4v", ".avi")
 SAFE_LABELS = ("DUPLICATE", "ALTERNATIVE", "PROPAGATING")   # pause labels a resume may override. ENCRYPTED or TOO LARGE reject.
-LID_TIMEOUT = 120            # seconds one arr_lid.py run may take, the same limit the hook gives it
+LID_TIMEOUT = 120            # seconds one lid.py run may take, the same limit the hook gives it
 HARDSUB = re.compile(r"(?<![a-z])(hc|hcsubs?|hardsubs?|hardcoded|korsubs?)(?![a-z])", re.I)
 SIGNALS = (   # (pattern on the release name after its year, points, label). A dry run prints the labels.
     (r"multi.?subs?|(?<![a-z])(en|eng|english)[ ._-]?(subs?|subtitles?)(?![a-z])", 4, "English subtitles tag"),   # "NL subs" is not
@@ -64,38 +52,33 @@ SIGNALS = (   # (pattern on the release name after its year, points, label). A d
     (r"(?<![a-z])(nordic|swedish|danish|norwegian|finnish|french|truefrench|vff|vfq|german|italian|spanish|castellano|dutch|polish"
      r"|czech|russian|turkish)(subs?)?(?![a-z])", -2, "local release"),
 )
-# The outcome codes of the hunter's decision lines. main() adds them to the host script's OUTCOMES.
-OUTCOMES = (("subhunt dry run", "subhunt_dry_run"), ("subhunt skipped", "subhunt_skipped"), ("subhunt queued", "subhunt_queued"),
-            ("subhunt rejected", "subhunt_rejected"), ("subhunt imported", "subhunt_imported"),
-            ("subhunt import failed", "subhunt_import_failed"), ("subhunt stopped", "subhunt_stopped"),
-            ("no_subbed_release", "no_subbed_release"))
-
-
 def norm(title):
     """A release name reduced to letters and digits, so two posts of one release compare equal."""
     return re.sub(r"[^a-z0-9]", "", (title or "").lower())
 
 
-def scrub(h, text):
+def scrub(text):
     """An error text without secrets. A Hydra NZB link and every SABnzbd call carry a key in the URL."""
-    return re.sub(r"(apikey=)[^&\s'\"]+", r"\1<key>", h.mask(str(text)))[:300]
+    return re.sub(r"(apikey=)[^&\s'\"]+", r"\1<key>", config.mask(str(text)))[:300]
 
 
-def creds(h, app):
-    """SABnzbd and NZBHydra2 URLs and keys from the app's own database, read-only. The API masks both keys."""
-    path = os.path.join(h.app_dir(app), f"{app}.db")
-    if not os.path.isfile(path):   # SQLite gives only "unable to open database file"
-        sys.exit(f"{path} does not read. Set {app.upper()}_DIR to {app.capitalize()}'s folder.")
-    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        sab = next((json.loads(s) for i, s in db.execute("select Implementation, Settings from DownloadClients") if i == "Sabnzbd"), None)
-        hyd = next((json.loads(s) for i, s in db.execute("select Implementation, Settings from Indexers") if i == "Newznab"), None)
-    finally:
-        db.close()
+def creds(app):
+    """SABnzbd and NZBHydra2 URLs from the app's API, and their keys from SABNZBD_API_KEY and NEWZNAB_API_KEY, because
+    the API masks both keys. Each is the first of its kind by id, as the app stores them. SABNZBD_URL and NEWZNAB_URL
+    take the place of the address the app saved, as for a container that does not resolve it. The API path stays."""
+    keys = {"SABNZBD_API_KEY": config.CFG.sabnzbd_api_key, "NEWZNAB_API_KEY": config.CFG.newznab_api_key}
+    missing = [k for k, v in keys.items() if not v]
+    if missing:
+        sys.exit(f"Set {' and '.join(missing)} in the env file. {app.capitalize()}'s API hides the keys of its download clients "
+                 "and indexers.")
+    first = lambda kind, impl: min((p for p in apps.arr(app, kind) if p.get("implementation") == impl), key=lambda p: p["id"], default=None)
+    sab, hyd = first("downloadclient", "Sabnzbd"), first("indexer", "Newznab")
     if not (sab and hyd):
-        sys.exit(f"{path} has no {'SABnzbd download client' if not sab else 'Newznab indexer'}")
-    return {"sab": f'{"https" if sab.get("useSsl") else "http"}://{sab["host"]}:{sab["port"]}{sab.get("urlBase") or ""}/api',
-            "sab_key": sab["apiKey"], "hydra": hyd["baseUrl"].rstrip("/") + (hyd.get("apiPath") or "/api"), "hydra_key": hyd["apiKey"]}
+        sys.exit(f"{app.capitalize()} has no {'SABnzbd download client' if not sab else 'Newznab indexer'}")
+    sab, hyd = ({f["name"]: f.get("value") for f in p.get("fields") or []} for p in (sab, hyd))
+    sab_url = config.CFG.sabnzbd_url or f'{"https" if sab.get("useSsl") else "http"}://{sab["host"]}:{sab["port"]}{sab.get("urlBase") or ""}'
+    return {"sab": sab_url.rstrip("/") + "/api", "sab_key": keys["SABNZBD_API_KEY"],
+            "hydra": (config.CFG.newznab_url or hyd["baseUrl"]).rstrip("/") + (hyd.get("apiPath") or "/api"), "hydra_key": keys["NEWZNAB_API_KEY"]}
 
 
 def pubdate(d):
@@ -108,12 +91,12 @@ def pubdate(d):
         return str(d or "")
 
 
-def search(h, cred, m):
+def search(cred, m):
     """One fresh NZBHydra2 movie query, as a list of items. Hydra asks every indexer behind
     it, so this costs one API hit per indexer. The links in the answer live about 30 minutes, so nothing stores them."""
     q = {"t": "movie", "imdbid": m["imdbId"][2:]} if m.get("imdbId") else \
         {"t": "search", "cat": "2000", "q": f'{m["title"]} {m.get("year") or ""}'.strip()}   # 2000 is newznab's movie category
-    data = h.http(f'{cred["hydra"]}?{urllib.parse.urlencode(dict(q, apikey=cred["hydra_key"], o="json", limit=1000))}', timeout=180)
+    data = apps.http(f'{cred["hydra"]}?{urllib.parse.urlencode(dict(q, apikey=cred["hydra_key"], o="json", limit=1000))}', timeout=180)
     items = (data.get("channel") or {}).get("item") or []
     out = []
     for it in [items] if isinstance(items, dict) else items:
@@ -135,7 +118,7 @@ def imdb_digits(x):
     return re.sub(r"\D", "", str(x or "")).lstrip("0")
 
 
-def rank(h, app, m, results, tried, ctx):
+def rank(app, m, results, tried, ctx):
     """(candidates best first, {skip reason: [names]}) for one movie. One post per name counts, the newest.
 
     Radarr's own parser decides the movie, the quality and the formats of each name, so the filters are the app's
@@ -145,7 +128,7 @@ def rank(h, app, m, results, tried, ctx):
     prof = ctx["profiles"][m["qualityProfileId"]]
     allowed = {q["quality"]["id"] for i in prof["items"] if i.get("allowed") for q in ([i] if i.get("quality") else i.get("items") or [])}
     veto = {fi["format"]: fi["name"] for fi in prof.get("formatItems") or [] if fi["score"] <= VETO}
-    f = h.movie_file(m)   # the record movieFileId names, see movie_file() in the hook
+    f = apps.movie_file(m, app)   # the record movieFileId names, see apps.movie_file()
     have = ((f.get("quality") or {}).get("quality") or {}).get("resolution") or 0
     before, current, runtime = {norm(t["title"]) for t in tried}, norm(f.get("sceneName")), m.get("runtime") or 0
     newest, tags, ours = {}, {}, imdb_digits(m.get("imdbId"))
@@ -158,7 +141,7 @@ def rank(h, app, m, results, tried, ctx):
     for k, r in newest.items():
         why = "tried before" if k in before else "the current file" if k == current else "hardcoded subtitles" if HARDSUB.search(r["title"]) else None
         if not why:
-            p = h.arr(app, "parse?" + urllib.parse.urlencode({"title": r["title"]}))
+            p = apps.arr(app, "parse?" + urllib.parse.urlencode({"title": r["title"]}))
             pm = p.get("parsedMovieInfo") or {}
             qq = (pm.get("quality") or {}).get("quality") or {}
             # An indexer's IMDb tag wins over the name, because Radarr may map a film to another film of the same name.
@@ -191,56 +174,56 @@ def brief(c):
     return {k: c[k] for k in ("title", "indexer", "size", "pubDate", "score", "signals", "cf", "quality")}
 
 
-def sab(h, cred, **q):
-    return h.http(f'{cred["sab"]}?{urllib.parse.urlencode(dict(q, output="json", apikey=cred["sab_key"]))}', timeout=30)
+def sab(cred, **q):
+    return apps.http(f'{cred["sab"]}?{urllib.parse.urlencode(dict(q, output="json", apikey=cred["sab_key"]))}', timeout=30)
 
 
-def add(h, cred, c, paused):
+def add(cred, c, paused):
     """Hand one NZB link to SABnzbd with no category, so Radarr never sees the job. Returns the nzo id."""
-    r = sab(h, cred, mode="addurl", name=c["link"], nzbname=c["title"], priority=-2 if paused else 0)
+    r = sab(cred, mode="addurl", name=c["link"], nzbname=c["title"], priority=-2 if paused else 0)
     if not (r.get("status") and r.get("nzo_ids")):
         raise RuntimeError(f"SABnzbd refused the NZB: {r.get('error') or r}")
     return r["nzo_ids"][0]
 
 
-def job_state(h, cred, nzo):
+def job_state(cred, nzo):
     """("queue" or "history", slot) of a SABnzbd job, or (None, None) when SABnzbd no longer has it."""
     for where in ("queue", "history"):
-        slots = (sab(h, cred, mode=where, nzo_ids=nzo, limit=100).get(where) or {}).get("slots") or []
+        slots = (sab(cred, mode=where, nzo_ids=nzo, limit=100).get(where) or {}).get("slots") or []
         s = next((s for s in slots if s.get("nzo_id") == nzo), None)
         if s:
             return where, s
     return None, None
 
 
-def drop(h, cred, nzo):
+def drop(cred, nzo):
     """Delete a job from SABnzbd's queue and history, with its files."""
     for where in ("queue", "history"):
-        sab(h, cred, mode=where, name="delete", value=nzo, del_files=1)
+        sab(cred, mode=where, name="delete", value=nzo, del_files=1)
 
 
-def wait_fetched(h, cred, nzos):
+def wait_fetched(cred, nzos):
     """The jobs SABnzbd has not fetched after GRAB_WAIT seconds, deleted at once. SABnzbd retries a dead Hydra link
     without pause, and many such jobs can take Hydra down."""
     deadline = time.time() + GRAB_WAIT
     while True:
-        stuck = [n for n in nzos if (job_state(h, cred, n)[1] or {}).get("status") == "Grabbing"]
+        stuck = [n for n in nzos if (job_state(cred, n)[1] or {}).get("status") == "Grabbing"]
         if not stuck or time.time() >= deadline:
             break
         time.sleep(5)
     for n in stuck:
-        drop(h, cred, n)
+        drop(cred, n)
     return stuck
 
 
-def wait_download(h, cred, nzo):
+def wait_download(cred, nzo):
     """(storage path, None, True) when the job completed. Otherwise (None, reason, final). final is False for a reason
     that may pass on a later run: a timeout, or a job SABnzbd lost. A paused job is resumed, which starts a waiting
     candidate. A job SABnzbd paused for a safety reason (ENCRYPTED, UNWANTED, TOO LARGE) is never resumed."""
     deadline, missed = time.time() + DOWNLOAD_WAIT, 0
     while time.time() < deadline:
         try:
-            where, s = job_state(h, cred, nzo)
+            where, s = job_state(cred, nzo)
         except Exception:   # SABnzbd restarting or busy: read again at the next poll
             where, s = "queue", {}
         missed = missed + 1 if where is None else 0
@@ -254,7 +237,7 @@ def wait_download(h, cred, nzo):
             unsafe = [str(x) for x in s.get("labels") or [] if not str(x).upper().startswith(SAFE_LABELS)]
             if unsafe:
                 return None, "SABnzbd paused the job as " + ", ".join(unsafe), True
-            sab(h, cred, mode="queue", name="resume", value=nzo)
+            sab(cred, mode="queue", name="resume", value=nzo)
         time.sleep(POLL)
     return None, f"the download did not finish in {DOWNLOAD_WAIT // 3600} hours", False
 
@@ -267,11 +250,11 @@ def find_video(storage):
     return max(found, key=os.path.getsize, default=None)
 
 
-def cleanup(h, cred, nzo, storage, title, roots):
+def cleanup(cred, nzo, storage, title, roots):
     """Delete a download: the SABnzbd job, then the folder on disk. Returns what happened and never raises.
     The folder goes only when it sits outside the app's root folders, three levels deep, and carries the job's name."""
     try:
-        drop(h, cred, nzo)
+        drop(cred, nzo)
         if not storage or not os.path.exists(storage):
             return "deleted the SABnzbd job"
         p = os.path.realpath(storage)
@@ -281,66 +264,66 @@ def cleanup(h, cred, nzo, storage, title, roots):
         shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
         return f"deleted the SABnzbd job and {storage}"
     except Exception as ex:
-        return scrub(h, f"the delete failed with {type(ex).__name__}: {ex}")
+        return scrub(f"the delete failed with {type(ex).__name__}: {ex}")
 
 
 def english(ts):
-    """A full or SDH English subtitle track in arr_decide's classification."""
+    """A full or SDH English subtitle track in decide's classification."""
     return any(t["kind"] == "s" and t["lang"] == "eng" and t["role"] in SUB_ROLES for t in ts)
 
 
-def heard(h, path, index, j, want):
-    """The language arr_lid.py hears on one audio stream, or None when the install or a sure answer is missing.
-    h.lid_run() reads the install paths from the env file and kills the whole process group on a timeout."""
+def heard(path, index, j, want):
+    """The language lid.py hears on one audio stream, or None when the install or a sure answer is missing.
+    checks.lid_run() reads the install paths from the env file and kills the whole process group on a timeout."""
     try:
-        return h.lid_run(path, index, j, sorted(want), LID_TIMEOUT).get("lang")
+        return checks.lid_run(path, index, j, sorted(want), LID_TIMEOUT).get("lang")
     except Exception:   # a signal only, so no answer lets the track pass
         return None
 
 
-def verdict(h, path, j, ts, original, runtime, kids, release):
+def verdict(path, j, ts, original, runtime, kids, release):
     """What keeps a download out, as a list of reasons. Empty means it may replace the current file.
 
     One limit remains. An English subtitle with no forced flag, no title and no mkvmerge statistics counts as full.
-    So a forced-only track of that kind passes. arr_decide.classify() has no other signal for it."""
+    So a forced-only track of that kind passes. decide.classify() has no other signal for it."""
     out = []
     if not english(ts):
         out.append(f'no full English subtitle (subtitles: {", ".join(t["lang"] + " " + t["role"] for t in ts if t["kind"] == "s") or "none"})')
-    minutes = arr_decide.duration(j) / 60
+    minutes = decide.duration(j) / 60
     if runtime and abs(minutes - runtime) > RUNTIME_SLACK * runtime:
         out.append(f"it runs {minutes:.0f} minutes, and the listed runtime is {runtime}")
-    want, au = arr_decide.codes(original), [t for t in ts if t["kind"] == "a"]
+    want, au = decide.codes(original), [t for t in ts if t["kind"] == "a"]
     main = [(i, t) for i, t in enumerate(au) if t["role"] == "main"]
     if want and not any(t["lang"] in want for _, t in main):
         blind = [i for i, t in main if not t["conf"]]   # untagged, and no title names a language: unknown, not wrong
-        lang = heard(h, path, blind[0], j, want) if blind else None
+        lang = heard(path, blind[0], j, want) if blind else None
         if not blind:
             out.append(f'no {original} audio (audio: {", ".join(t["lang"] for t in au) or "none"})')
         elif lang and lang not in want:
             out.append(f"no {original} audio, the untagged track sounds like {lang}")
     if not out:   # three ffmpeg samples, only for a file that passes the rest
-        edits = arr_decide.decide(j, original, kids, release)["edits"] if path.lower().endswith(".mkv") else []
-        certain = h.check_audio(path, j, edits, runtime)[0]
+        edits = decide.decide(j, original, kids, release)["edits"] if path.lower().endswith(".mkv") else []
+        certain = checks.check_audio(path, j, edits, runtime)[0]
         if certain:
             out.append(f"broken audio: {certain}")
     return out
 
 
-def replace(h, app, m, video, remember):
+def replace(app, m, video, remember):
     """ManualImport of the checked file over the current one, in copy mode. The caller holds the hook's file lock.
     Returns None when the new file is in place, else what went wrong as sentences for the alert.
 
     Radarr deletes the old file before it copies the new one, into its recycle bin when one is set. So a hard link
     keeps the old file until the new one is in place, and a failed import puts it back. The link has a hidden name and no video
-    extension, so Radarr's disk scan and Plex skip it. remember(path) records the link in the state file before the
+    extension, so Radarr's disk scan and Plex skip it. remember(path) records the link in the hunter's state before the
     link exists, so a kill at any later point leaves a record. The caller clears the record once the link is gone.
     Copy mode only reads the download. A move also deletes it, and on a NAS that can fail after Radarr has deleted
     the old file."""
-    old = h.movie_file(m)
-    now = h.movie_file(h.arr(app, f"movie/{m['id']}"))
+    old = apps.movie_file(m, app)
+    now = apps.movie_file(apps.arr(app, f"movie/{m['id']}"), app)
     if now.get("id") != old["id"]:   # an upgrade during a long download. Never replace a file nobody checked.
         return "Radarr changed the movie file during the download, so the hunter did not import."
-    items = h.arr(app, "manualimport?" + urllib.parse.urlencode({"folder": os.path.dirname(video), "filterExistingFiles": "false"}))
+    items = apps.arr(app, "manualimport?" + urllib.parse.urlencode({"folder": os.path.dirname(video), "filterExistingFiles": "false"}))
     it = next((i for i in items if i.get("path") == video), None)
     if not it:
         return "Radarr does not list the file for import."
@@ -355,7 +338,7 @@ def replace(h, app, m, video, remember):
     except OSError as ex:
         return f"The keep link {keep} failed with {type(ex).__name__}, so the hunter did not import."
     try:
-        cmd = h.arr_write(app, "command", "POST", {"name": "ManualImport", "importMode": "copy", "files": [
+        cmd = apps.arr_write(app, "command", "POST", {"name": "ManualImport", "importMode": "copy", "files": [
             {"path": video, "movieId": m["id"], "quality": it.get("quality"), "languages": [m["originalLanguage"]],
              "releaseGroup": it.get("releaseGroup") or ""}]})
     except Exception as ex:
@@ -363,14 +346,11 @@ def replace(h, app, m, video, remember):
             return f"The import command timed out, and Radarr may have queued it. {unsure}"   # nothing moves back
         return f"Radarr refused the import command with {type(ex).__name__}: {ex}. " + restore(path, keep)
     try:
-        deadline = time.time() + IMPORT_WAIT
-        while cmd.get("status") not in ("completed", "failed", "aborted") and time.time() < deadline:
-            time.sleep(5)
-            cmd = h.arr(app, f"command/{cmd['id']}")
-        new = h.movie_file(h.arr(app, f"movie/{m['id']}"))
+        cmd = apps.ARR[app].wait(cmd, IMPORT_WAIT)
+        new = apps.movie_file(apps.arr(app, f"movie/{m['id']}"), app)
     except Exception as ex:   # Radarr's state is unknown, so the link stays
         return f"Reading Radarr after the import failed with {type(ex).__name__}: {ex}. {unsure}"
-    if cmd.get("status") not in ("completed", "failed", "aborted"):   # Radarr may still land the copy, so nothing moves back
+    if cmd.get("status") not in apps.DONE:   # Radarr may still land the copy, so nothing moves back
         return f"Radarr was still importing after {IMPORT_WAIT // 60} minutes. {unsure}"
     if new.get("id") != old["id"] and new.get("size") == size:
         try:
@@ -409,49 +389,48 @@ def show(label, f, ts, results, cands, picks, skipped):
     sys.stdout.flush()
 
 
-def hunt(h, app, mid, a, cred, ctx, st, state):
+def hunt(app, mid, a, cred, ctx):
     """One movie: skip it, list its candidates, or download, check and import them. Returns the last decision record."""
     started = time.time()
-    m = h.arr(app, f"movie/{mid}")
-    label, original, runtime, want, kids, _ = h.movie_item(m, h.kids_profiles())
-    f = h.movie_file(m)
+    m = apps.arr(app, f"movie/{mid}")
+    label, original, runtime, want, kids, _ = apps.movie_item(m, apps.kids_profiles(app))
+    f = apps.movie_file(m, app)
     base = dict(app=app, source="subhunt", apply=a.apply, label=label, path=f.get("path"), original=original,
                 ids={"app_id": mid, "file_id": f.get("id"), "guids": want["guids"]})
-    note = lambda result, t0=started, **kw: h.decision(dict(base, id=uuid.uuid4().hex[:12], result=result, **kw), t0)
-    item = st.get(str(mid)) or {"tried": [], "status": "open"}
+    note = lambda code, result, t0=started, **kw: logs.decision(dict(base, id=uuid.uuid4().hex[:12], result=result, outcome=code, **kw), t0)
+    item = store.get(f"subhunt-{app}", str(mid)) or {"tried": [], "status": "open"}
 
     def save():
-        st[str(mid)] = item
-        h.write_json(state, st)
+        store.put(f"subhunt-{app}", str(mid), item)
 
     def post(title, text, color, release):
-        return h.post(app, h.embed(app, title, text, color, [("Title", label), ("Release", release), ("App", h.app_name(app))]))
+        return logs.post(app, logs.embed(app, title, text, color, [("Title", label), ("Release", release), ("App", logs.app_name(app))]))
 
     if item.get("keep") and os.path.exists(item["keep"]):   # an earlier run left the old file linked. Never go past it.
         text = (f'A keep link from an earlier run still holds the old file of {label} at {item["keep"]}. Check the movie in '
                 "Radarr. Then delete the link, or move it back when the movie has no file. The hunter skips this movie until then.")
-        return note(f'subhunt stopped, the keep link {item["keep"]} from an earlier run is unresolved.',
+        return note("subhunt_stopped", f'subhunt stopped, the keep link {item["keep"]} from an earlier run is unresolved.',
                     alert_result=[post("Subtitle hunter keep link unresolved", text, "red", item.get("release") or "")] if a.apply else [])
     item.pop("keep", None)   # recorded, but the link is gone
     if not f:
-        return note("subhunt skipped, the movie has no file to replace.")
+        return note("subhunt_skipped", "subhunt skipped, the movie has no file to replace.")
     if item["status"] == "no_subbed_release" and not a.force:
-        return note("subhunt skipped, an earlier run found no release with English subtitles. --force hunts again.", tried=item["tried"])
+        return note("subhunt_skipped", "subhunt skipped, an earlier run found no release with English subtitles. --force hunts again.", tried=item["tried"])
     if item["status"] == "import_failed" and not a.force:
-        return note(f'subhunt skipped, an earlier import failed. The checked download is in {item.get("kept")}. --force hunts again.')
-    ts = arr_decide.classify(h.mkvmerge(f["path"]))
+        return note("subhunt_skipped", f'subhunt skipped, an earlier import failed. The checked download is in {item.get("kept")}. --force hunts again.')
+    ts = decide.classify(checks.mkvmerge(f["path"]))
     if english(ts):
-        return note("subhunt skipped, the current file has a full English subtitle.", tracks=h.track_log(ts))
+        return note("subhunt_skipped", "subhunt skipped, the current file has a full English subtitle.", tracks=logs.track_log(ts))
     final = [t for t in item["tried"] if t.get("final", True)]   # a timeout or a lost job is not final, so --force retries it
-    results = search(h, cred, m)
-    cands, skipped = rank(h, app, m, results, final if a.force else item["tried"], ctx)
+    results = search(cred, m)
+    cands, skipped = rank(app, m, results, final if a.force else item["tried"], ctx)
     picks = cands[:max(0, CAP if a.force else CAP - len(final))]
     show(label, f, ts, results, cands, picks, skipped)
     if not a.apply:
-        return note(f"subhunt dry run: {len(cands)} candidates of {len(results)} results, would try {len(picks)}",
-                    candidates=[brief(c) for c in picks], skipped={k: len(v) for k, v in skipped.items()}, tracks=h.track_log(ts))
+        return note("subhunt_dry_run", f"subhunt dry run: {len(cands)} candidates of {len(results)} results, would try {len(picks)}",
+                    candidates=[brief(c) for c in picks], skipped={k: len(v) for k, v in skipped.items()}, tracks=logs.track_log(ts))
     if not cands:   # nothing to try yet. A new release may appear, so the movie stays open and nobody is alerted.
-        return note(f"subhunt stopped, no candidate among {len(results)} results. A later run searches again.",
+        return note("subhunt_stopped", f"subhunt stopped, no candidate among {len(results)} results. A later run searches again.",
                     skipped={k: len(v) for k, v in skipped.items()})
 
     def remember(keep):
@@ -462,19 +441,19 @@ def hunt(h, app, mid, a, cred, ctx, st, state):
         item["tried"].append({"title": c["title"], "indexer": c["indexer"], "why": why, "final": final, "time": int(time.time())})
         save()
         print(f'  rejected {c["title"][:80]}, {why}', flush=True)
-        return note(f'subhunt rejected {c["title"]}: {why}', t0, candidate=brief(c), final=final, **kw)
+        return note("subhunt_rejected", f'subhunt rejected {c["title"]}: {why}', t0, candidate=brief(c), final=final, **kw)
 
     jobs, done, passing = [], set(), 0   # done holds the jobs this run deleted, or kept on purpose
     try:
         for c in picks:   # every NZB now, while the Hydra links live. A network error stops the run and marks nothing.
             try:
-                jobs.append((c, add(h, cred, c, paused=bool(jobs))))
+                jobs.append((c, add(cred, c, paused=bool(jobs))))
             except RuntimeError as ex:   # SABnzbd answered and refused this NZB
-                failed(c, scrub(h, str(ex)), time.time(), False)
+                failed(c, scrub(str(ex)), time.time(), False)
                 passing += 1
         if jobs:
-            note(f"subhunt queued {len(jobs)} releases in SABnzbd", candidates=[brief(c) for c, _ in jobs])
-        dead = wait_fetched(h, cred, [n for _, n in jobs])
+            note("subhunt_queued", f"subhunt queued {len(jobs)} releases in SABnzbd", candidates=[brief(c) for c, _ in jobs])
+        dead = wait_fetched(cred, [n for _, n in jobs])
         for c, nzo in jobs:
             t0 = time.time()
             if nzo in dead:
@@ -482,102 +461,98 @@ def hunt(h, app, mid, a, cred, ctx, st, state):
                 failed(c, f"SABnzbd could not fetch the NZB in {GRAB_WAIT} seconds", t0, False)
                 passing += 1
                 continue
-            storage, why, final = wait_download(h, cred, nzo)
+            storage, why, final = wait_download(cred, nzo)
+            storage = apps.mapped(storage, app)   # SABnzbd's path, which the app's path map pairs with the local path
             video = find_video(storage) if storage else None
             if storage and not video:
                 why, final = f"no video file in {storage} on this host", True
             ts = []
             if video:
                 try:
-                    j = h.mkvmerge(video)
-                    ts = arr_decide.classify(j)
-                    reasons = verdict(h, video, j, ts, original, runtime, kids, c["title"])
+                    j = checks.mkvmerge(video)
+                    ts = decide.classify(j)
+                    reasons = verdict(video, j, ts, original, runtime, kids, c["title"])
                 except Exception as ex:   # a truncated file or a probe timeout rejects this candidate, never the movie
-                    reasons = [scrub(h, f"the check failed with {type(ex).__name__}: {ex}")]
+                    reasons = [scrub(f"the check failed with {type(ex).__name__}: {ex}")]
                 if not reasons:
                     done.add(nzo)   # the download stays until the new file is in place
                     try:
-                        with h.locked():   # the hook's file lock. Its worker probes the new file after this block.
-                            err = replace(h, app, m, video, remember)
-                            gone = None if err else cleanup(h, cred, nzo, storage, c["title"], ctx["roots"])
+                        with runner.locked():   # the hook's file lock. Its worker probes the new file after this block.
+                            err = replace(app, m, video, remember)
+                            gone = None if err else cleanup(cred, nzo, storage, c["title"], ctx["roots"])
                     except Exception as ex:
                         err = f"The import stopped with {type(ex).__name__}: {ex}."
                     if item.get("keep") and not os.path.exists(item["keep"]):
                         item.pop("keep")   # removed after the landing, or moved back
                     if err:
-                        err = scrub(h, err)
+                        err = scrub(err)
                         item.update(status="import_failed", kept=storage, time=int(time.time()))
                         save()
                         text = f"Radarr did not replace the file of {label} with a checked release. {err} The download stays in {storage}."
-                        return note(f"subhunt import failed: {err}", t0, candidate=brief(c), tracks=h.track_log(ts),
+                        return note("subhunt_import_failed", f"subhunt import failed: {err}", t0, candidate=brief(c), tracks=logs.track_log(ts),
                                     alert_result=[post("Subtitle hunter import failed", text, "red", c["title"])])
                     item.update(status="imported", release=c["title"], time=int(time.time()))
                     save()
                     text = f"The hunter replaced the file of {label} with a release that has a full English subtitle."
                     if item.get("keep"):
                         text += f' The keep link {item["keep"]} could not be removed. Delete it by hand.'
-                    return note(f'subhunt imported {c["title"]}', t0, candidate=brief(c), tracks=h.track_log(ts), cleanup=gone,
+                    return note("subhunt_imported", f'subhunt imported {c["title"]}', t0, candidate=brief(c), tracks=logs.track_log(ts), cleanup=gone,
                                 alert_result=[post("English subtitles found", text, "green", c["title"])])
                 why, final = ". ".join(reasons), True
-            gone = cleanup(h, cred, nzo, storage, c["title"], ctx["roots"])
+            gone = cleanup(cred, nzo, storage, c["title"], ctx["roots"])
             done.add(nzo)
-            failed(c, why, t0, final, tracks=h.track_log(ts), cleanup=gone)
+            failed(c, why, t0, final, tracks=logs.track_log(ts), cleanup=gone)
             passing += not final
         if passing:   # a timeout or a lost job may pass later, so the movie stays open
-            return note(f"subhunt stopped, {passing} of {len(picks)} releases failed for a reason that may pass. "
+            return note("subhunt_stopped", f"subhunt stopped, {passing} of {len(picks)} releases failed for a reason that may pass. "
                         "A later run tries other releases, and --force retries these.")
         item.update(status="no_subbed_release", time=int(time.time()))
         save()
         tried = "\n".join(f'{t["title"]}, {t["why"]}' for t in item["tried"])
         text = (f"No release of {label} passed the check, so the current file stays. The hunter skips this movie until a "
                 "run with --force. An external .srt from Bazarr or OpenSubtitles is the remaining option.")
-        sent = h.post(app, h.embed(app, "No release with English subtitles", text, "amber",
-                                   [("Title", label), ("Tried", tried), ("App", h.app_name(app))]))
-        return note(f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])
+        sent = logs.post(app, logs.embed(app, "No release with English subtitles", text, "amber",
+                                   [("Title", label), ("Tried", tried), ("App", logs.app_name(app))]))
+        return note("no_subbed_release", f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])
     finally:   # the paused jobs a pass never reached, and every job of a run that broke off, SIGTERM included
         for c, nzo in jobs:
             if nzo not in done:
                 try:
-                    storage = (job_state(h, cred, nzo)[1] or {}).get("storage")
+                    storage = apps.mapped((job_state(cred, nzo)[1] or {}).get("storage"), app)
                 except Exception:
                     storage = None
-                print("  " + cleanup(h, cred, nzo, storage, c["title"], ctx["roots"]), flush=True)
+                print("  " + cleanup(cred, nzo, storage, c["title"], ctx["roots"]), flush=True)
 
 
-def main(h, argv):
-    """--subhunt <app> --ids ID ... [--apply] [--force]. h is the arr-media-guard module."""
-    ap = argparse.ArgumentParser(prog="arr-media-guard --subhunt")
-    ap.add_argument("app", choices=sorted(h.APPS))
-    ap.add_argument("--ids", type=int, nargs="+", required=True)
-    ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--force", action="store_true")
+def main(argv):
+    """arr-media-guard-subhunt <app> --ids ID ... [--apply] [--force]."""
+    ap = argparse.ArgumentParser(prog="arr-media-guard-subhunt", description="Replace the file of each Radarr movie that has no "
+                                 "English subtitle with a release that has one. A dry run ranks the releases and downloads nothing. "
+                                 "See docs/features.md.")
+    ap.add_argument("app", choices=sorted(a for a in config.CFG.apps if config.program(a) == "radarr"), help="the Radarr instance")
+    ap.add_argument("--ids", type=int, nargs="+", required=True, metavar="ID", help="the Radarr movie ids")
+    ap.add_argument("--apply", action="store_true", help="download, check and import. Without it the run is dry and changes nothing")
+    ap.add_argument("--force", action="store_true", help="hunt again for a movie that an earlier run gave up on, or whose import failed")
     a = ap.parse_args(argv)
-    if a.app != "radarr":
-        ap.error("the subtitle hunter handles radarr only. An episode needs its own search, which is not built.")
-    if arr_decide.POLICY is None:
-        sys.exit("no policy loaded, see arr-media-guard --selftest")
+    logs.status("policy", "failed" if decide.POLICY is None else "ok", config.POLICY_ERROR or "")   # as each mode of the core records it
+    if decide.POLICY is None:
+        sys.exit(config.policy_help())
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a kill runs the finally cleanup, as Ctrl-C does
-    run_lock = h.try_lock("subhunt.lock") if a.apply else None   # held until main returns
+    run_lock = runner.try_lock("subhunt.lock") if a.apply else None   # held until main returns
     if a.apply and not run_lock:   # two runs would overwrite each other's state and download at once
         sys.exit("another subtitle hunter run is active")
-    h.OUTCOMES = h.OUTCOMES + tuple(o for o in OUTCOMES if o not in h.OUTCOMES)   # outcome() reads the global at each call
-    cred = creds(h, a.app)
-    ctx = {"profiles": {p["id"]: p for p in h.arr(a.app, "qualityprofile")},
-           "sizes": {d["quality"]["id"]: d for d in h.arr(a.app, "qualitydefinition")},
-           "roots": [r["path"] for r in h.arr(a.app, "rootfolder")]}
-    state = os.path.join(h.CFG["STATE_DIR"], f"subhunt-{a.app}.json")
-    try:
-        st = json.load(open(state))
-    except (OSError, ValueError):
-        st = {}
+    cred = creds(a.app)
+    ctx = {"profiles": {p["id"]: p for p in apps.arr(a.app, "qualityprofile")},
+           "sizes": {d["quality"]["id"]: d for d in apps.arr(a.app, "qualitydefinition")},
+           "roots": [r["path"] for r in apps.arr(a.app, "rootfolder")]}
     print(f"subtitle hunter, {a.app}, {'APPLY' if a.apply else 'dry run'}, {len(a.ids)} movies", flush=True)
     for n, mid in enumerate(a.ids):
         if n:
             time.sleep(PACE)
         started = time.time()
         try:
-            rec = hunt(h, a.app, mid, a, cred, ctx, st, state)
+            rec = hunt(a.app, mid, a, cred, ctx)
         except Exception as ex:   # one movie's failure never stops the next
-            rec = h.decision(dict(id=uuid.uuid4().hex[:12], app=a.app, source="subhunt", apply=a.apply, ids={"app_id": mid},
-                                  result=scrub(h, f"error: {type(ex).__name__}: {ex}")), started)
+            rec = logs.decision(dict(id=uuid.uuid4().hex[:12], app=a.app, source="subhunt", apply=a.apply, ids={"app_id": mid},
+                                  result=scrub(f"error: {type(ex).__name__}: {ex}"), outcome="error"), started)
         print(f'  {mid}: {rec["result"][:200]}', flush=True)

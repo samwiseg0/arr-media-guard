@@ -13,32 +13,44 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Unit tests for arr_meta.py, the metadata checks behind the wrong-content alerts.
+"""Unit tests for content.py, the metadata checks behind the wrong-content alerts.
 
 The cases follow Radarr alerts of a dry run. Titles, ids, years, runtimes, sizes and durations are made up, and
 each case keeps the ratios its checks read. The probes have the shape of mkvmerge -J. No network: TMDB is a fake _get().
 
 Run: pytest tests/test_arr_meta.py
 """
+import contextlib
+import dataclasses
+import fcntl
 import http.client
 import io
 import json
 import os
-import signal
+import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import arr_meta as M  # noqa: E402
+from arr_media_guard import content as M  # noqa: E402
+from arr_media_guard import config, store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def tmdb_up():
     """Every test starts with TMDB up: DOWN is module state."""
     M.DOWN.update(until=0.0, code="", why="", answered=0.0)
+
+
+@pytest.fixture(autouse=True)
+def state_dir(tmp_path, monkeypatch):
+    """The TMDB cache and the key alert stamp live in the state store, here in a STATE_DIR of the test."""
+    monkeypatch.setattr(config, "CFG", dataclasses.replace(config.CFG, state_dir=str(tmp_path / "state")))
+    return tmp_path / "state"
 
 
 def mkv(header, app, size, tracks=(), attachments=0):
@@ -268,7 +280,7 @@ FILM_M = {"original_language": "cy", "spoken_languages": [{"iso_639_1": "en"}, {
 
 
 def test_expected_languages_cache_and_failure(tmp_path, monkeypatch):
-    cache = str(tmp_path / "tmdb.json")
+    cache = "tmdb"
     fake = FakeTMDB({"/movie/8011": FILM_M})
     monkeypatch.setattr(M, "_get", fake)
     got = M.expected_languages("radarr", {"tmdb": 8011}, "t", cache, now=1000)
@@ -289,12 +301,12 @@ def test_expected_languages_series_by_tvdb(tmp_path, monkeypatch):
                                    "name": "Show D", "first_air_date": "2012-03-14", "genres": [{"id": 99}],
                                    "keywords": {"results": [{"name": "travel"}]}}})
     monkeypatch.setattr(M, "_get", fake)
-    got = M.expected_languages("sonarr", {"tvdb": 7004}, "t", str(tmp_path / "c.json"), now=1)   # no tmdbId: /find
+    got = M.expected_languages("sonarr", {"tvdb": 7004}, "t", "c", now=1)   # no tmdbId: /find
     assert got["original"] == "eng" and got["spoken"] == ["eng"] and got["source"] == "tmdb tv 7005" and got["year"] == 2012
     # the series' own tmdbId comes first, because /find may give another id back
     fake.pages["/tv/1"] = fake.pages["/tv/7005"]
     fake.calls.clear()
-    assert M.expected_languages("sonarr", {"tvdb": 7004, "tmdb": 1}, "t", str(tmp_path / "d.json"), now=1)["source"] == "tmdb tv 1"
+    assert M.expected_languages("sonarr", {"tvdb": 7004, "tmdb": 1}, "t", "d", now=1)["source"] == "tmdb tv 1"
     assert fake.calls == ["/tv/1"]
 
 
@@ -303,10 +315,10 @@ def test_other_film(tmp_path, monkeypatch):
                "release_date": "2018-10-04", "genres": [], "keywords": {"keywords": []}}
     fake = FakeTMDB({"/search/movie": {"results": [{"id": 8013}, {"id": 9013}]}, "/movie/9013": other_p})
     monkeypatch.setattr(M, "_get", fake)
-    got = M.other_film("Film.P.2018.1080p.AMZN.WEB-DL.DDP5.1.x264-GRP", 8013, 6656.5, "t", str(tmp_path / "c.json"), now=1)
+    got = M.other_film("Film.P.2018.1080p.AMZN.WEB-DL.DDP5.1.x264-GRP", 8013, 6656.5, "t", "c", now=1)
     assert got["tmdb"] == 9013 and got["original"] == "tha" and "/movie/8013" not in fake.calls   # the item is never fetched
-    assert M.other_film("Film.P.2018.1080p", 8013, 7920, "t", str(tmp_path / "c.json"), now=1) is None   # no runtime matches
-    assert M.other_film("Film A", 8001, 3600, "t", str(tmp_path / "c.json"), now=1) is None   # no year
+    assert M.other_film("Film.P.2018.1080p", 8013, 7920, "t", "c", now=1) is None   # no runtime matches
+    assert M.other_film("Film A", 8001, 3600, "t", "c", now=1) is None   # no year
 
 
 def test_radarr_token(tmp_path):
@@ -374,7 +386,7 @@ def test_an_edition_skips_the_other_film_search(tmp_path, monkeypatch):
     """TMDB lists some cuts as films of their own. An edition word skips the other-film search."""
     monkeypatch.setattr(M, "_get", FakeTMDB({}))   # any call would raise KeyError
     release = "Film.AB.The.Name.Cut.2004.1080p.BluRay.x264"
-    assert M.other_film(release, 8020, 112 * 60, "t", str(tmp_path / "c.json"), now=1) is None
+    assert M.other_film(release, 8020, 112 * 60, "t", "c", now=1) is None
     ev = M.wrong_content_evidence(ENG, "English", tmdb("eng", ["eng"], 121), AGREE(112), 121, release, "movie", 1977, [("Film AB", 1977)])
     assert ev["points"] == 1 and not ev["regrab"], ev   # the year alone
     assert M.EDITION.search("Film.AC.1986.TV.Version.1080p") and M.EDITION.search("Film.AD.1931.Restored.1080p")
@@ -385,8 +397,8 @@ def test_other_film_drops_far_years(tmp_path, monkeypatch):
     old = {"original_language": "en", "runtime": 104, "title": "Film AE", "release_date": "1977-05-20"}
     new = dict(old, runtime=97, release_date="2013-09-06")
     monkeypatch.setattr(M, "_get", FakeTMDB({"/search/movie": {"results": [{"id": 8030}, {"id": 8031}]}, "/movie/8030": old, "/movie/8031": new}))
-    assert M.other_film("Film.AE.2013.1080p", 0, 104 * 60, "t", str(tmp_path / "c.json"), now=1) is None
-    assert M.other_film("Film.AE.2013.1080p", 0, 97 * 60, "t", str(tmp_path / "c.json"), now=1)["tmdb"] == 8031
+    assert M.other_film("Film.AE.2013.1080p", 0, 104 * 60, "t", "c", now=1) is None
+    assert M.other_film("Film.AE.2013.1080p", 0, 97 * 60, "t", "c", now=1)["tmdb"] == 8031
 
 
 def test_special_never_scores_two_on_runtime():
@@ -422,86 +434,146 @@ def test_tmdb_failure_is_remembered(tmp_path, monkeypatch, status, code):
     fake = Urlopen(status)
     monkeypatch.setattr(M.urllib.request, "urlopen", fake)
     for tid in (1, 2, 3):   # one request, then a pause of TMDB_RETRY seconds
-        assert M.expected_languages("radarr", {"tmdb": tid}, "t", str(tmp_path / "c.json")) is None
+        assert M.expected_languages("radarr", {"tmdb": tid}, "t", "c") is None
     assert fake.calls == 1 and M.tmdb_state(None)[0] == code
     ev = M.wrong_content_evidence(ENG, "English", None, AGREE(90), 90, "", "movie", 2000, [])
     assert ev["tmdb"] == code and ev["signals"][0]["verdict"] == "unknown"
     M.DOWN["until"] = time.time() - 1   # the pause is over: TMDB is asked again
-    M.expected_languages("radarr", {"tmdb": 4}, "t", str(tmp_path / "c.json"))
+    M.expected_languages("radarr", {"tmdb": 4}, "t", "c")
     assert fake.calls == 2
 
 
 def test_tmdb_404_is_an_answer(tmp_path, monkeypatch):
     monkeypatch.setattr(M.urllib.request, "urlopen", Urlopen(404))
-    assert M.expected_languages("radarr", {"tmdb": 1}, "t", str(tmp_path / "c.json")) is None
+    assert M.expected_languages("radarr", {"tmdb": 1}, "t", "c") is None
     assert M.tmdb_state(None)[0] == "no_record" and M.tmdb_state(tmdb("eng", ["eng"], 90))[0] == "found"
 
 
 def test_tmdb_token_missing_and_unsendable(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "radarr_token", lambda: None)
-    assert M.expected_languages("radarr", {"tmdb": 1}, "", str(tmp_path / "c.json")) is None
+    assert M.expected_languages("radarr", {"tmdb": 1}, "", "c") is None
     assert M.tmdb_state(None)[0] == "tmdb_token_missing"
     M.DOWN.update(until=0.0)
     # the token with "\u5100Cannot" on its end, as the unfixed regex read it: urllib cannot put it in a header
-    assert M.expected_languages("radarr", {"tmdb": 1}, "eyJx.eyJy.z\u5100Cannot", str(tmp_path / "c.json")) is None
+    assert M.expected_languages("radarr", {"tmdb": 1}, "eyJx.eyJy.z\u5100Cannot", "c") is None
     assert M.tmdb_state(None)[0] == "tmdb_token_rejected"
 
 
-def test_cache_corrupt_or_unwritable(tmp_path, monkeypatch):
-    monkeypatch.setattr(M, "_get", FakeTMDB({"/movie/8011": FILM_M}))
-    bad = tmp_path / "tmdb.json"
-    bad.write_text("{not json")
-    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", str(bad), now=1)["original"] == "wel"
-    assert "movie/8011" in json.loads(bad.read_text())                    # rewritten whole
-    gone = tmp_path / "missing-dir" / "tmdb.json"
-    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", str(gone), now=1)["original"] == "wel"
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    monkeypatch.setattr(M.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("read-only")))
-    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", str(ro / "tmdb.json"), now=1)["original"] == "wel"
-    assert os.listdir(ro) == []                                              # no .tmp file left behind
+def test_a_cache_write_the_store_refuses_costs_one_more_request(monkeypatch):
+    fake = FakeTMDB({"/movie/8011": FILM_M})
+    monkeypatch.setattr(M, "_get", fake)
+    real = store.put
+    monkeypatch.setattr(store, "put", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
+    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", "tmdb", now=1)["original"] == "wel"
+    assert store.items("tmdb") == {}                                         # nothing cached, and no error
+    monkeypatch.setattr(store, "put", real)
+    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", "tmdb", now=1)["original"] == "wel"
+    assert fake.calls == ["/movie/8011"] * 2 and list(store.items("tmdb")) == ["movie/8011"]
 
 
 def test_find_fallback_for_a_movie(tmp_path, monkeypatch):
     fake = FakeTMDB({"/find/tt811": {"movie_results": [{"id": 8011}]}, "/movie/8011": FILM_M})
     monkeypatch.setattr(M, "_get", fake)
-    assert M.expected_languages("radarr", {"imdb": "tt811"}, "t", str(tmp_path / "c.json"), now=1)["original"] == "wel"
+    assert M.expected_languages("radarr", {"imdb": "tt811"}, "t", "c", now=1)["original"] == "wel"
     fake.pages["/find/tt0"] = {"movie_results": []}
-    assert M.expected_languages("radarr", {"imdb": "tt0"}, "t", str(tmp_path / "c.json"), now=1) is None
-    M.expected_languages("radarr", {"imdb": "tt0"}, "t", str(tmp_path / "c.json"), now=2)
+    assert M.expected_languages("radarr", {"imdb": "tt0"}, "t", "c", now=1) is None
+    M.expected_languages("radarr", {"imdb": "tt0"}, "t", "c", now=2)
     assert fake.calls.count("/find/tt0") == 1                                # a miss is cached too
 
 
 def test_the_hook_time_limit_escapes(monkeypatch):
-    """The hook's time_up() must raise OutOfTime. A TimeoutError is an OSError and would be swallowed here."""
-    def time_up(*_):
-        raise M.OutOfTime("stopped after 300 seconds")
-    old = signal.signal(signal.SIGALRM, time_up)
-    try:
-        monkeypatch.setattr(M, "_get", lambda *a, **k: time.sleep(2))
-        signal.setitimer(signal.ITIMER_REAL, 0.1)
-        with pytest.raises(M.OutOfTime):
-            M.expected_languages("radarr", {"tmdb": 1}, "t", "/nonexistent/c.json", now=1)
-        signal.setitimer(signal.ITIMER_REAL, 0.1)
-        with pytest.raises(M.OutOfTime):
-            M.other_film("Film.P.2018.1080p", 0, 6656, "t", "/nonexistent/c.json", now=1)
-        monkeypatch.setattr(M.subprocess, "run", lambda *a, **k: time.sleep(2))
-        signal.setitimer(signal.ITIMER_REAL, 0.1)
-        with pytest.raises(M.OutOfTime):
-            M.last_packet("/x.mkv")
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old)
+    """A TMDB call or an ffprobe read that the job's time limit cuts raises OutOfTime, and no handler here swallows it.
+    A TimeoutError is an OSError and would be. A cut TMDB call never pauses TMDB."""
+    clock, asked = [1000.0], []
+    monkeypatch.setattr(M.time, "monotonic", lambda: clock[0])
+    def hang(*a, timeout, **k):   # the call waits out its timeout
+        asked.append(timeout)
+        clock[0] += timeout
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(M.urllib.request, "urlopen", hang)
+    for call in (lambda: M.expected_languages("radarr", {"tmdb": 1}, "t", "/nonexistent/c.json", now=1),
+                 lambda: M.other_film("Film.P.2018.1080p", 0, 6656, "t", "/nonexistent/c.json", now=1)):
+        M.DEADLINE.start(4)
+        with pytest.raises(M.OutOfTime, match="^stopped after 4 seconds$"):
+            call()
+        assert M.DOWN["until"] == 0.0 and M.DEADLINE.end is None
+    def slow(argv, timeout, **k):
+        asked.append(timeout)
+        clock[0] += timeout
+        raise M.subprocess.TimeoutExpired(argv, timeout)
+    monkeypatch.setattr(M.subprocess, "run", slow)
+    M.DEADLINE.start(4)
+    with pytest.raises(M.OutOfTime):
+        M.last_packet("/x.mkv")
+    assert M.last_packet("/x.mkv") is None and asked == [4, 4, 4, 30]   # with no limit its own timeout ends the read
     assert not issubclass(M.OutOfTime, OSError)
 
 
-def test_key_alert_once_a_day(tmp_path):
-    assert M.key_alert("tmdb_unavailable", str(tmp_path), now=1000) is None      # an outage is no key problem
-    title, text = M.key_alert("tmdb_token_rejected", str(tmp_path), now=1000)
+def test_a_deadline_raises_once_and_ends_its_limit(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(M.time, "monotonic", lambda: clock[0])
+    d = M.Deadline()
+    assert d.left() is None and d.bound(15) == 15
+    d.start(5)
+    clock[0] += 2
+    assert d.left() == 3 and d.bound(15) == 3 and d.bound(1) == 1
+    clock[0] += 3
+    with pytest.raises(M.OutOfTime, match="^stopped after 5 seconds$"):
+        d.check()
+    assert d.end is None and d.left() is None   # a handler that swallows it lets the job run on with no limit
+    d = M.Deadline(60, "gave up after waiting 60 seconds for the lock")
+    clock[0] += 60
+    with pytest.raises(M.OutOfTime, match="^gave up after waiting 60 seconds for the lock$"):
+        d.bound(15)
+
+
+def test_a_paused_deadline_keeps_the_time_it_had_left(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(M.time, "monotonic", lambda: clock[0])
+    d = M.Deadline(100)
+    clock[0] += 30
+    with d.paused() as left:
+        assert left == 70 and d.left() is None
+        clock[0] += 1000   # a wait with a limit of its own
+    assert d.left() == 70
+    d.stop()
+    with d.paused() as left:
+        assert left is None
+    assert d.end is None
+
+
+def test_a_lock_under_a_deadline_gives_up_and_one_with_none_waits(tmp_path):
+    """fcntl.flock has no timeout, so a running limit tries with LOCK_NB every LOCK_POLL seconds. key_alert() waits for
+    the state store under the job's limit."""
+    path = str(tmp_path / "x.lock")
+    with open(path, "w") as held, open(path, "w") as f:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        threading.Timer(2.0, fcntl.flock, (held, fcntl.LOCK_UN)).start()   # a holder that lets go after 2 s
+        with pytest.raises(M.OutOfTime, match="^gave up$"):
+            M.Deadline(0.3, "gave up").lock(f, fcntl.LOCK_EX)
+        M.Deadline().lock(f, fcntl.LOCK_EX)   # no limit: it waits for the holder
+        fcntl.flock(f, fcntl.LOCK_UN)
+        M.Deadline(5).lock(f, fcntl.LOCK_SH)   # a free lock takes no wait
+    store.db()
+    with contextlib.closing(sqlite3.connect(store.path(), isolation_level=None)) as other:
+        other.execute("BEGIN IMMEDIATE")   # another process writes
+        M.DEADLINE.start(0.3)
+        started = time.perf_counter()
+        with pytest.raises(M.OutOfTime):
+            M.key_alert("tmdb_token_rejected", now=1000)
+        assert time.perf_counter() - started < 5   # the wait ends at the limit
+        other.execute("ROLLBACK")
+    assert M.key_alert("tmdb_token_rejected", now=1000)
+
+
+def test_key_alert_once_a_day(monkeypatch):
+    assert M.key_alert("tmdb_unavailable", now=1000) is None      # an outage is no key problem
+    title, text = M.key_alert("tmdb_token_rejected", now=1000)
     assert title == "TMDB key not working" and "rejected" in text and "TMDB_TOKEN" in text and "re-grab" in text
-    assert M.key_alert("tmdb_token_missing", str(tmp_path), now=1000 + 86399) is None
-    assert "No TMDB key" in M.key_alert("tmdb_token_missing", str(tmp_path), now=1000 + 86400)[1]
-    assert M.key_alert("tmdb_token_missing", str(tmp_path / "missing"), now=1) is None   # no stamp, no alert per file
+    assert M.key_alert("tmdb_token_missing", now=1000 + 86399) is None
+    assert "No TMDB key" in M.key_alert("tmdb_token_missing", now=1000 + 86400)[1]
+    monkeypatch.setattr(store, "put", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    assert M.key_alert("tmdb_token_missing", now=1000 + 2 * 86400) is None   # no stamp, no alert per file
 
 
 def test_tmdb_day_status():
@@ -519,26 +591,16 @@ def test_proxy_garbage_is_unavailable(tmp_path, monkeypatch, error):
     def urlopen(req, timeout):
         raise error
     monkeypatch.setattr(M.urllib.request, "urlopen", urlopen)
-    assert M.expected_languages("radarr", {"tmdb": 1}, "t", str(tmp_path / "c.json")) is None
+    assert M.expected_languages("radarr", {"tmdb": 1}, "t", "c") is None
     assert M.tmdb_state(None)[0] == "tmdb_unavailable"
     M.DOWN.update(until=0.0)
-    assert M.other_film("Film.P.2018.1080p", 0, 6656, "t", str(tmp_path / "c.json"), now=1) is None
+    assert M.other_film("Film.P.2018.1080p", 0, 6656, "t", "c", now=1) is None
     assert M.tmdb_state(None)[0] == "tmdb_unavailable"
-
-
-def test_damaged_cache_entries_are_dropped(tmp_path, monkeypatch):
-    monkeypatch.setattr(M, "_get", FakeTMDB({"/movie/8011": FILM_M}))
-    cache = tmp_path / "tmdb.json"
-    cache.write_text(json.dumps({"movie/8011": {"at": "yesterday", "v": {}}, "a": {"v": 1}, "b": [1], "c": {"at": 5}}))
-    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", str(cache), now=10)["original"] == "wel"
-    assert list(json.loads(cache.read_text())) == ["movie/8011"]
-    cache.write_text("[1, 2]")   # valid JSON, but no map
-    assert M.expected_languages("radarr", {"tmdb": 8011}, "t", str(cache), now=10)["original"] == "wel"
 
 
 def test_answered_counts_live_answers_only(tmp_path, monkeypatch):
     """A cached TMDB answer never counts as a working key: only a live HTTP answer sets DOWN["answered"]."""
-    cache = str(tmp_path / "c.json")
+    cache = "c"
     monkeypatch.setattr(M.urllib.request, "urlopen", Urlopen(body=FILM_M))
     assert M.expected_languages("radarr", {"tmdb": 8011}, "t", cache, now=1) and M.DOWN["answered"] > 0
     M.DOWN["answered"] = 0.0

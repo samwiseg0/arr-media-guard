@@ -13,27 +13,28 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Unit tests for arr_serve.py, the Webhook listener, and for PATH_MAP and the API key in the hook script.
+"""Unit tests for serve.py, the Webhook listener, and for PATH_MAP and the API key.
 
-No network beyond 127.0.0.1. The hook script is loaded by path, as in test_arr_media_guard.py, and the listener gets
-it as its host module. The app API is a fake. The HTTP tests run the real handler on a free local port. One test forks
+No network beyond 127.0.0.1. The package is loaded as h, see amg.py, and h.arr_serve is its listener. The app API is a fake. The HTTP tests run the real handler on a free local port. One test forks
 the real listener and stops it with SIGTERM.
 
 Run: pytest tests/test_arr_serve.py
 """
 import base64
 import contextlib
+import dataclasses
 import datetime
+import hashlib
 import http.client
-import importlib.machinery
-import importlib.util
 import json
 import os
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
+import syslog
 import threading
 import time
 import urllib.error
@@ -41,13 +42,13 @@ import urllib.parse
 
 import pytest
 
+import amg
+
 FILES = os.path.join(os.path.dirname(__file__), "..")
 os.environ["ARR_MEDIA_GUARD_LIB"] = FILES
 os.environ["ARR_MEDIA_GUARD_ENV"] = "/nonexistent/arr-media-guard.env"
-_loader = importlib.machinery.SourceFileLoader("arr_media_guard_serve", os.path.join(FILES, "arr-media-guard"))
-h = importlib.util.module_from_spec(importlib.util.spec_from_loader("arr_media_guard_serve", _loader))
-_loader.exec_module(h)
-import arr_serve  # noqa: E402
+h = amg.load("arr_media_guard_serve")
+arr_serve = h.arr_serve
 
 with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     h.arr_decide.set_policy(json.load(_f))
@@ -58,8 +59,15 @@ def http_error(code):
     return urllib.error.HTTPError("http://app.invalid", code, "error", {}, None)
 
 
+@pytest.fixture(autouse=True)
+def store_waits(monkeypatch):
+    """hook() and the listener bound the waits for the store of their process, and each test starts with the usual ones."""
+    monkeypatch.setattr(h.store, "wait", h.store.WAIT)
+    monkeypatch.setattr(h.store, "until", None)
+
+
 @pytest.fixture
-def app(tmp_path, monkeypatch):
+def app(tmp_path, monkeypatch, settings):
     """A fake Radarr and Sonarr with one film and one episode file on disk, an upgrade's old files and a recycle bin.
     api maps an API path to its answer, or to an exception it raises. Returns the fake's state."""
     movies, tv, rbin = tmp_path / "movies" / "Film A (1979)", tmp_path / "tv" / "Show A" / "Season 1", tmp_path / "recycle"
@@ -69,11 +77,8 @@ def app(tmp_path, monkeypatch):
     film.write_bytes(b"x")
     ep.write_bytes(b"x")
     state = tmp_path / "state"
-    for d in ("queue", "claimed", "alerts"):
-        (state / d).mkdir(parents=True)
-    monkeypatch.setitem(h.CFG, "STATE_DIR", str(state))
-    monkeypatch.setitem(h.CFG, "LOG", str(tmp_path / "log.jsonl"))
-    monkeypatch.setattr(h, "PATH_MAP", [])
+    state.mkdir()
+    settings(state_dir=str(state), log=str(tmp_path / "log.jsonl"), path_map=[])
     monkeypatch.setattr(arr_serve, "REFUSALS", arr_serve.Refusals())
     s = {"film": str(film), "ep": str(ep), "movies": str(movies), "tv": str(tv.parent), "rbin": str(rbin), "calls": [], "api": {
         "moviefile/31": {"id": 31, "movieId": 7, "path": str(film), "sceneName": "Film.A.1979.1080p.WEB-DL-GRP"},
@@ -118,14 +123,24 @@ def hook_job(monkeypatch, env):
     monkeypatch.setattr(h, "try_lock", lambda name: None)   # a worker runs, so hook() only queues
     h.hook()
     (name,) = h.queued()
-    job = json.load(open(os.path.join(h.queue_dir(), name)))
-    os.remove(os.path.join(h.queue_dir(), name))
+    job = h.job_of(name)
+    h.drop_job(name)
     return job
 
 
 def log_lines():
-    with open(h.CFG["LOG"]) as f:
+    with open(h.CFG.log) as f:
         return [json.loads(line) for line in f]
+
+
+def env_event(monkeypatch, env):
+    """The Event hook() reads from the Custom Script variables env, with a time of 0."""
+    for k in list(os.environ):
+        if k.startswith(("radarr_", "sonarr_")):
+            monkeypatch.delenv(k)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return dataclasses.replace(h.Event.from_env("radarr" if "radarr_eventtype" in env else "sonarr"), time=0)
 
 
 # --- the Webhook body gives the job of the Custom Script variables -------------------------------------------------
@@ -137,7 +152,7 @@ def test_a_radarr_upgrade_body_gives_the_job_hook_writes(app, monkeypatch):
                                   "radarr_moviefile_path": app["film"], "radarr_moviefile_scenename": "Film.A.1979.1080p.WEB-DL-GRP",
                                   "radarr_download_id": "SABnzbd_nzo_abc123", "radarr_deletedpaths": f"{old}|{old2}",
                                   "radarr_deletedrecyclebinpaths": f"{copy}|"})
-    got = arr_serve.job_of(h, "radarr", radarr_body(app, isUpgrade=True, deletedFiles=[
+    got = arr_serve.download("radarr", radarr_body(app, isUpgrade=True, deletedFiles=[
         {"id": 30, "path": old, "recycleBinPath": copy}, {"id": 29, "path": old2, "recycleBinPath": None}]))
     assert {k: v for k, v in got.items() if k != "time"} == {k: v for k, v in want.items() if k != "time"}
     assert list(got) == list(want)
@@ -147,7 +162,7 @@ def test_a_sonarr_body_gives_the_job_hook_writes_with_the_apis_episode_ids(app, 
     want = hook_job(monkeypatch, {"sonarr_eventtype": "Download", "sonarr_series_id": "5", "sonarr_episodefile_id": "41",
                                   "sonarr_episodefile_path": app["ep"], "sonarr_episodefile_episodeids": "901,902",
                                   "sonarr_episodefile_scenename": "", "sonarr_download_id": ""})
-    got = arr_serve.job_of(h, "sonarr", sonarr_body(app, episodes=[{"id": 1}]))   # the posted episodes are never used
+    got = arr_serve.download("sonarr", sonarr_body(app, episodes=[{"id": 1}]))   # the posted episodes are never used
     assert {k: v for k, v in got.items() if k != "time"} == {k: v for k, v in want.items() if k != "time"}
     assert got["episode_ids"] == "901,902" and got["deleted"] is None and got["recycled"] is None
 
@@ -161,14 +176,41 @@ def test_a_sonarr_body_reads_the_nfo_beside_its_source_as_the_hook_does(app, mon
     want = hook_job(monkeypatch, {"sonarr_eventtype": "Download", "sonarr_series_id": "5", "sonarr_episodefile_id": "41",
                                   "sonarr_episodefile_path": app["ep"], "sonarr_episodefile_episodeids": "901,902",
                                   "sonarr_episodefile_scenename": "", "sonarr_download_id": "", "sonarr_episodefile_sourcepath": src})
-    got = arr_serve.job_of(h, "sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": src}))
+    got = arr_serve.download("sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": src}))
     assert got["nfo_title"] == want["nfo_title"] == "Night Shift"
-    assert arr_serve.job_of(h, "sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": "../x.mkv"}))["nfo_title"] is None
+    assert arr_serve.download("sonarr", sonarr_body(app, episodeFile={"id": 41, "path": app["ep"], "sourcePath": "../x.mkv"}))["nfo_title"] is None
+
+
+def test_the_hook_and_the_listener_build_the_same_event(app, monkeypatch, settings):
+    """Download, Grab and Test give one Event from the Custom Script variables and from the Webhook body. Sonarr names
+    the episodes of a grab by number in the variables and by id in the body."""
+    hook_of = lambda app_, body: dataclasses.replace(h.Event.from_webhook(app_, body), time=0)
+    old = os.path.join(app["movies"], "Film A (1979) HDTV-720p.mkv")
+    copy = os.path.join(app["rbin"], "Film A (1979)", "Film A (1979) HDTV-720p.mkv")
+    got = env_event(monkeypatch, {"radarr_eventtype": "Download", "radarr_movie_id": "7", "radarr_moviefile_id": "31",
+                                  "radarr_moviefile_path": app["film"], "radarr_moviefile_scenename": "Film.A.1979.1080p.WEB-DL-GRP",
+                                  "radarr_download_id": "SABnzbd_nzo_abc123", "radarr_deletedpaths": old, "radarr_deletedrecyclebinpaths": copy})
+    assert got == hook_of("radarr", radarr_body(app, isUpgrade=True, deletedFiles=[{"id": 30, "path": old, "recycleBinPath": copy}]))
+    assert got.path == app["film"] and got.deleted == old
+    got = env_event(monkeypatch, {"sonarr_eventtype": "Download", "sonarr_series_id": "5", "sonarr_episodefile_id": "41",
+                                  "sonarr_episodefile_path": app["ep"], "sonarr_episodefile_episodeids": "901,902",
+                                  "sonarr_episodefile_scenename": "", "sonarr_download_id": ""})
+    assert got == hook_of("sonarr", sonarr_body(app)) and got.episode_ids == "901,902"
+    app["api"]["episode?seriesId=5&seasonNumber=1"] = [{"id": 903, "episodeNumber": 3}, {"id": 902, "episodeNumber": 2}, {"id": 901, "episodeNumber": 1}]
+    got = env_event(monkeypatch, {"sonarr_eventtype": "Grab", "sonarr_series_id": "5", "sonarr_release_seasonnumber": "1",
+                                  "sonarr_release_episodenumbers": "2,1", "sonarr_download_id": "D1"})
+    assert got == hook_of("sonarr", {"eventType": "Grab", "series": {"id": 5}, "episodes": [{"id": 902}, {"id": 901}], "downloadId": "D1"})
+    assert (got.owner, got.eps, got.download_id) == ("5", [901, 902], "D1")
+    got = env_event(monkeypatch, {"radarr_eventtype": "Grab", "radarr_movie_id": "7"})
+    assert got == hook_of("radarr", {"eventType": "Grab", "movie": {"id": 7}}) and (got.owner, got.eps, got.download_id) == ("7", [], "")
+    for name in ("radarr", "sonarr"):
+        got = env_event(monkeypatch, {f"{name}_eventtype": "Test"})
+        assert got == hook_of(name, {"eventType": "Test"}) == h.Event(name, "Test", 0)
 
 
 def test_the_job_takes_the_apis_path_and_scene_name_and_logs_the_posted_path(app):
     other = os.path.join(app["movies"], "elsewhere.mkv")
-    job = arr_serve.job_of(h, "radarr", radarr_body(app, movieFile={"id": 31, "path": other, "sceneName": "Other.Name-GRP"}))
+    job = arr_serve.download("radarr", radarr_body(app, movieFile={"id": 31, "path": other, "sceneName": "Other.Name-GRP"}))
     assert job["path"] == app["film"] and job["release"] == "Film.A.1979.1080p.WEB-DL-GRP"
     (line,) = log_lines()
     assert line["source"] == "webhook" and line["result"] == "warning" and other in line["note"]
@@ -184,7 +226,6 @@ def test_the_job_takes_the_apis_path_and_scene_name_and_logs_the_posted_path(app
     (dict(downloadId="x" * 201), {}, 400, "downloadId"),
     (dict(downloadId=["a"]), {}, 400, "downloadId"),
     ({}, {"moviefile/31": {"id": 31, "movieId": 7, "path": "/data/../etc/passwd"}}, 400, "no plain absolute path"),
-    ({}, {"moviefile/31": {"id": 31, "movieId": 7, "path": "/nonexistent/Film A.mkv"}}, 500, "does not see it"),
     (dict(deletedFiles=[{"path": "/etc/passwd"}]), {}, 400, "is not in the folder"),
     (dict(deletedFiles="/etc/passwd"), {}, 400, "no list of files"),
     (dict(deletedFiles=[{"path": "{movies}/../other/x.mkv"}]), {}, 400, "is not in the folder"),
@@ -199,50 +240,50 @@ def test_a_body_the_api_does_not_back_is_refused(app, body, api, code, why):
     app["api"]["moviefile/99"] = http_error(404)
     app["api"].update(api)
     body = json.loads(json.dumps(body).replace("{movies}", app["movies"]))
-    with pytest.raises(arr_serve.Refused) as ex:
-        arr_serve.job_of(h, "radarr", radarr_body(app, **body))
+    with pytest.raises(h.runner.Refused) as ex:
+        arr_serve.download("radarr", radarr_body(app, **body))
     assert ex.value.code == code and why in str(ex.value)
 
 
-def test_an_upgrade_maps_the_old_paths_and_the_bin_paths_of_the_app(app, monkeypatch):
+def test_an_upgrade_maps_the_old_paths_and_the_bin_paths_of_the_app(app, monkeypatch, settings):
     """The app names its own paths in the body and in the API. The job holds the local ones, and the checks compare
     local with local."""
-    monkeypatch.setattr(h, "PATH_MAP", [("/app/movies", os.path.dirname(app["movies"])), ("/app/recycle", app["rbin"])])
+    settings(path_map=[("/app/movies", os.path.dirname(app["movies"])), ("/app/recycle", app["rbin"])])
     rel = os.path.relpath(app["film"], os.path.dirname(app["movies"]))
     app["api"].update({"moviefile/31": {"id": 31, "movieId": 7, "path": f"/app/movies/{rel}", "sceneName": "Film.A-GRP"},
                        "movie/7": {"id": 7, "path": "/app/movies/Film A (1979)"}, "config/mediamanagement": {"recycleBin": "/app/recycle"}})
     body = radarr_body(app, movieFile={"id": 31, "path": f"/app/movies/{rel}"},
                        deletedFiles=[{"path": "/app/movies/Film A (1979)/old.mkv", "recycleBinPath": "/app/recycle/Film A (1979)/old.mkv"}])
-    job = arr_serve.job_of(h, "radarr", body)
-    assert job["path"] == app["film"] and not os.path.exists(h.CFG["LOG"])   # the mapped body path is the API's: no warning
+    job = arr_serve.download("radarr", body)
+    assert job["path"] == app["film"] and not os.path.exists(h.CFG.log)   # the mapped body path is the API's: no warning
     assert (job["deleted"], job["recycled"]) == (os.path.join(app["movies"], "old.mkv"), os.path.join(app["rbin"], "Film A (1979)", "old.mkv"))
 
 
 def test_an_upgrade_without_a_recycle_bin_keeps_empty_bin_paths(app):
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}
     old = os.path.join(app["movies"], "old.mkv")
-    job = arr_serve.job_of(h, "radarr", radarr_body(app, deletedFiles=[{"path": old, "recycleBinPath": None}]))
+    job = arr_serve.download("radarr", radarr_body(app, deletedFiles=[{"path": old, "recycleBinPath": None}]))
     assert (job["deleted"], job["recycled"]) == (old, "")
-    with pytest.raises(arr_serve.Refused):   # with no bin, no recycle bin copy can pass
-        arr_serve.job_of(h, "radarr", radarr_body(app, deletedFiles=[{"path": old, "recycleBinPath": app["rbin"] + "/old.mkv"}]))
+    with pytest.raises(h.runner.Refused):   # with no bin, no recycle bin copy can pass
+        arr_serve.download("radarr", radarr_body(app, deletedFiles=[{"path": old, "recycleBinPath": app["rbin"] + "/old.mkv"}]))
 
 
 def test_an_import_complete_event_is_refused_with_what_to_change(app):
-    with pytest.raises(arr_serve.Refused) as ex:
-        arr_serve.job_of(h, "sonarr", sonarr_body(app, episodeFile=None, episodeFiles=[{"id": 41}]))
+    with pytest.raises(h.runner.Refused) as ex:
+        arr_serve.download("sonarr", sonarr_body(app, episodeFile=None, episodeFiles=[{"id": 41}]))
     assert ex.value.code == 400 and "On File Import" in str(ex.value)
 
 
 def test_an_api_error_other_than_404_passes_up(app):
     app["api"]["moviefile/31"] = http_error(500)
     with pytest.raises(urllib.error.HTTPError):
-        arr_serve.job_of(h, "radarr", radarr_body(app))
+        h.Event.from_webhook("radarr", radarr_body(app))
 
 
 # --- PATH_MAP and the API key ---------------------------------------------------------------------------------------
 
-def test_path_map_maps_both_ways_by_the_longest_whole_prefix(monkeypatch):
-    monkeypatch.setattr(h, "PATH_MAP", [("/tv", "/media/tv"), ("/tv/kids", "/kids"), ("/", "/host")])
+def test_path_map_maps_both_ways_by_the_longest_whole_prefix(monkeypatch, settings):
+    settings(path_map=[("/tv", "/media/tv"), ("/tv/kids", "/kids"), ("/", "/host")])
     assert h.mapped("/tv/Show/a.mkv", "sonarr") == "/media/tv/Show/a.mkv"
     assert h.mapped("/tv/kids/Show/a.mkv", "sonarr") == "/kids/Show/a.mkv"
     assert h.mapped("/tvshows/a.mkv", "sonarr") == "/host/tvshows/a.mkv"   # /tv matches whole folder names only
@@ -250,21 +291,20 @@ def test_path_map_maps_both_ways_by_the_longest_whole_prefix(monkeypatch):
     assert h.mapped("/kids/Show/a.mkv", "sonarr", back=True) == "/tv/kids/Show/a.mkv"
     assert h.mapped("/media/tv/a.mkv", "sonarr", back=True) == "/tv/a.mkv"
     assert h.mapped({"a": ["/tv/x", 3, None, "Film /tv"], "b": {"c": "/tv/y"}}, "sonarr") == {"a": ["/media/tv/x", 3, None, "Film /tv"], "b": {"c": "/media/tv/y"}}
-    monkeypatch.setattr(h, "PATH_MAP", [])
+    settings(path_map=[])
     assert h.mapped("/tv/a.mkv", "sonarr") == "/tv/a.mkv"
 
 
-def test_a_map_to_the_root_and_a_blank_query_value_keep_their_shape(monkeypatch):
-    monkeypatch.setattr(h, "PATH_MAP", [("/tv", "/")])
+def test_a_map_to_the_root_and_a_blank_query_value_keep_their_shape(monkeypatch, settings):
+    settings(path_map=[("/tv", "/")])
     assert (h.mapped("/tv", "sonarr"), h.mapped("/tv/a/b.mkv", "sonarr"), h.mapped("/a/b.mkv", "sonarr", back=True)) == ("/", "/a/b.mkv", "/tv/a/b.mkv")
-    monkeypatch.setattr(h, "PATH_MAP", [("/app", "/local")])
+    settings(path_map=[("/app", "/local")])
     assert h.app_query("manualimport?q=&folder=%2Flocal%2Fa", "radarr") == "manualimport?q=&folder=%2Fapp%2Fa"
 
 
-def test_arr_maps_the_answer_the_query_and_the_body(monkeypatch, tmp_path):
+def test_arr_maps_the_answer_the_query_and_the_body(monkeypatch, settings, tmp_path):
     seen = []
-    monkeypatch.setattr(h, "PATH_MAP", [("/data", "/mnt/data")])
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k3y")
+    settings(path_map=[("/data", "/mnt/data")], radarr={"api_key": "k3y"})
     monkeypatch.setattr(h, "http", lambda url, method="GET", body=None, headers=None, timeout=15: seen.append((url, method, body, headers))
                         or {"path": "/data/movies/a.mkv", "folder": "/other/x"})
     assert h.arr("radarr", "parse?title=A&path=%2Fmnt%2Fdata%2Fmovies%2Fa.mkv") == {"path": "/mnt/data/movies/a.mkv", "folder": "/other/x"}
@@ -273,39 +313,37 @@ def test_arr_maps_the_answer_the_query_and_the_body(monkeypatch, tmp_path):
     assert seen[1][2] == {"name": "ManualImport", "files": [{"path": "/data/movies/a.mkv", "movieId": 7}]}
 
 
-def test_the_api_key_comes_from_the_env_file_before_config_xml(monkeypatch, tmp_path):
+def test_the_api_key_comes_from_the_env_file_before_config_xml(monkeypatch, settings, tmp_path):
     conf = tmp_path / "config.xml"
     conf.write_text("<Config><ApiKey>fromxml</ApiKey></Config>")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", str(tmp_path))
-    monkeypatch.setitem(h.CFG, "SONARR_API_KEY", "")
+    settings(sonarr={"dir": str(tmp_path), "api_key": ""})
     assert h.api_key("sonarr") == "fromxml"
-    monkeypatch.setitem(h.CFG, "SONARR_API_KEY", "fromenv")
-    assert h.api_key("sonarr") == "fromenv"
-    assert h.mask("key fromenv") == "key <SONARR_API_KEY>"
+    settings(sonarr={"api_key": "fromenv-0123456789"})
+    assert h.api_key("sonarr") == "fromenv-0123456789"
+    assert h.mask("key fromenv-0123456789") == "key <SONARR_API_KEY>"
 
 
-def test_config_refuses_to_start_without_credentials_or_with_a_bad_setting(monkeypatch):
-    base = {"WEBHOOK_USER": "guard", "WEBHOOK_PASSWORD": "s3cret-pass", "PATH_MAP": "", "AUDIT_TIME": "07:30"}
-    for k, v in base.items():
-        monkeypatch.setitem(h.CFG, k, v)
-    assert arr_serve.config(h) == (AUTH.encode(), "07:30")
-    monkeypatch.setitem(h.CFG, "AUDIT_TIME", "")
-    assert arr_serve.config(h)[1] == ""
-    for k, v in (("WEBHOOK_PASSWORD", ""), ("WEBHOOK_USER", ""), ("WEBHOOK_USER", "a:b"), ("WEBHOOK_PASSWORD", "pässword"),
-                 ("AUDIT_TIME", "7.30")):
-        monkeypatch.setitem(h.CFG, k, v)
+def test_config_refuses_to_start_without_credentials_or_with_a_bad_setting(monkeypatch, settings):
+    base = {"webhook_user": "guard", "webhook_password": "s3cret-pass", "path_map": [], "audit_time": "07:30"}
+    settings(**base)
+    assert arr_serve.listen_config() == (AUTH.encode(), "07:30")
+    settings(audit_time="")
+    assert arr_serve.listen_config()[1] == ""
+    for k, v in (("webhook_password", ""), ("webhook_user", ""), ("webhook_user", "a:b"), ("webhook_password", "pässword"),
+                 ("audit_time", "7.30")):
+        settings(**{k: v})
         with pytest.raises(SystemExit):
-            arr_serve.config(h)
-        monkeypatch.setitem(h.CFG, k, base[k])
-    monkeypatch.delitem(h.CFG, "AUDIT_TIME")
-    assert arr_serve.config(h)[1] == "07:30"   # the default, the time of the native timer
-    monkeypatch.setattr(h, "PATH_MAP_ERROR", "PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths")
+            arr_serve.listen_config()
+        settings(**{k: base[k]})
+    settings(audit_time=h.settings("/nonexistent/arr-media-guard.env").audit_time)   # no AUDIT_TIME key
+    assert arr_serve.listen_config()[1] == "07:30"   # the default, the time of the native timer
+    settings(map_error="PATH_MAP takes pairs APP_PATH:LOCAL_PATH of absolute paths")
     with pytest.raises(SystemExit, match="PATH_MAP takes pairs"):   # a map that left a pair out would edit the wrong paths
-        arr_serve.config(h)
+        arr_serve.listen_config()
 
 
-def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch):
-    monkeypatch.setattr(h, "PATH_MAP", [("/data", "/mnt/data")])
+def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch, settings):
+    settings(path_map=[("/data", "/mnt/data")])
     item = {"ratingKey": "7101", "Guid": [{"id": "tmdb://1"}], "Media": [{"Part": [{"file": "/data/movies/A/a.mkv"}]}]}
     def fake_plex_get(path, **q):
         if path == "/library/sections":
@@ -321,11 +359,11 @@ def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch):
     assert "path=%2Fdata%2Fmovies%2FA&" in sent[0]
 
 
-def test_each_program_maps_by_its_own_map_and_by_whole_folder_names(monkeypatch):
+def test_each_program_maps_by_its_own_map_and_by_whole_folder_names(monkeypatch, settings):
     """"/mnt/TV" is a string prefix of "/mnt/TV Shows". A map takes whole folder names, and the longest prefix wins
     within each map, in both directions. A program without its own map takes PATH_MAP."""
-    monkeypatch.setattr(h, "PATH_MAP", [("/data", "/media")])
-    monkeypatch.setattr(h, "MAPS", {"sonarr": [("/mnt/TV", "/media/TV")], "plex": [("/mnt/TV Shows", "/media/TV"), ("/mnt/TV", "/media/old")]})
+    settings(path_map=[("/data", "/media")], sonarr={"path_map": [("/mnt/TV", "/media/TV")]},
+             plex_path_map=[("/mnt/TV Shows", "/media/TV"), ("/mnt/TV", "/media/old")])
     assert h.mapped("/mnt/TV Shows/A/a.mkv", "sonarr") == "/mnt/TV Shows/A/a.mkv"   # no whole-name match
     assert h.mapped("/mnt/TV/A/a.mkv", "sonarr") == "/media/TV/A/a.mkv"
     assert h.mapped("/media/TV/A/a.mkv", "sonarr", back=True) == "/mnt/TV/A/a.mkv"
@@ -343,7 +381,7 @@ TESTER = {"SONARR_PATH_MAP": "/mnt/TV:{m}/TV|/mnt/Anime:{m}/Anime", "RADARR_PATH
 
 
 @pytest.fixture
-def tester(tmp_path, monkeypatch):
+def tester(tmp_path, monkeypatch, settings):
     """A setup with a path map per program: Sonarr sees TV at /mnt/TV, Radarr sees films at /movies, Plex sees them at
     /mnt/TV Shows and /mnt/Movies, and this container sees all three under its own media folder. Anime has one path in
     Sonarr and Plex. The real arr() runs against a fake HTTP of both apps and Plex. Returns the fake's state."""
@@ -353,13 +391,10 @@ def tester(tmp_path, monkeypatch):
         f.parent.mkdir(parents=True)
         f.write_bytes(b"x")
     (m / "Anime").mkdir()
-    for k, v in TESTER.items():
-        monkeypatch.setitem(h.CFG, k, v.format(m=m))
-    monkeypatch.setattr(h, "MAPS", {who: h.path_map(k)[0] for who, k in h.MAP_KEYS.items()})
-    monkeypatch.setattr(h, "PATH_MAP", [])
-    for k, v in (("SONARR_URL", "http://sonarr.invalid"), ("RADARR_URL", "http://radarr.invalid"), ("SONARR_API_KEY", "ks"),
-                 ("RADARR_API_KEY", "kr"), ("PLEX_URL", "http://plex.invalid"), ("PLEX_TOKEN", "t0ken"), ("LOG", str(tmp_path / "log.jsonl"))):
-        monkeypatch.setitem(h.CFG, k, v)
+    pairs = {k: h.path_map(k, v.format(m=m))[0] for k, v in TESTER.items()}
+    settings(path_map=[], plex_path_map=pairs["PLEX_PATH_MAP"], plex_url="http://plex.invalid", plex_token="plex-t0ken-1234", log=str(tmp_path / "log.jsonl"),
+             sonarr={"path_map": pairs["SONARR_PATH_MAP"], "url": "http://sonarr.invalid", "api_key": "ks"},
+             radarr={"path_map": pairs["RADARR_PATH_MAP"], "url": "http://radarr.invalid", "api_key": "kr"})
     s = {"ep": str(ep), "film": str(film), "media": str(m), "calls": [], "api": {
         "sonarr/episodefile/41": {"id": 41, "seriesId": 5, "path": "/mnt/TV/Show A/Season 1/Show A - S01E02.mkv"},
         "sonarr/episode": [{"id": 901}],
@@ -396,27 +431,27 @@ def test_the_tester_setup_maps_each_import_by_its_app_and_finds_it_in_plex(teste
     under its own path, and the lookup finds it there."""
     body = {"eventType": "Download", "series": {"id": 5}, "episodeFile": {"id": 41, "path": "/mnt/TV/Show A/Season 1/Show A - S01E02.mkv"},
             "deletedFiles": [{"path": "/mnt/TV/Show A/Season 1/old.mkv", "recycleBinPath": ""}]}
-    job = arr_serve.job_of(h, "sonarr", body)
+    job = arr_serve.download("sonarr", body)
     assert (job["path"], job["deleted"]) == (tester["ep"], os.path.join(os.path.dirname(tester["ep"]), "old.mkv"))
-    assert not os.path.exists(h.CFG["LOG"])   # the posted path maps to the API's: no warning
-    film = arr_serve.job_of(h, "radarr", {"eventType": "Download", "movie": {"id": 7}, "movieFile": {"id": 31, "path": "/movies/Film A (1979)/Film A (1979).mkv"}})
+    assert not os.path.exists(h.CFG.log)   # the posted path maps to the API's: no warning
+    film = arr_serve.download("radarr", {"eventType": "Download", "movie": {"id": 7}, "movieFile": {"id": 31, "path": "/movies/Film A (1979)/Film A (1979).mkv"}})
     assert film["path"] == tester["film"]
     rel = os.path.join(tester["media"], "TV", "downloads", "Show.A.S01E02.WEB-GRP")   # Sonarr sees it under /mnt/TV
     os.makedirs(rel)
     open(os.path.join(rel, "show.a.s01e02.web-grp.nfo"), "w").write("Title : Night Shift\n")
-    sourced = arr_serve.job_of(h, "sonarr", dict(body, episodeFile=dict(body["episodeFile"], sourcePath="/mnt/TV/downloads/Show.A.S01E02.WEB-GRP/show.a.s01e02.web-grp.mkv")))
+    sourced = arr_serve.download("sonarr", dict(body, episodeFile=dict(body["episodeFile"], sourcePath="/mnt/TV/downloads/Show.A.S01E02.WEB-GRP/show.a.s01e02.web-grp.mkv")))
     assert sourced["nfo_title"] == "Night Shift"   # the source path maps with Sonarr's map
     outside = os.path.join(os.path.dirname(tester["media"]), "outside", "Show.A.S01E02.WEB-GRP")   # under no folder of the map
     os.makedirs(outside)
     open(os.path.join(outside, "show.a.s01e02.web-grp.nfo"), "w").write("Title : Night Shift\n")
     posted = dict(body, episodeFile=dict(body["episodeFile"], sourcePath=os.path.join(outside, "show.a.s01e02.web-grp.mkv")))
-    assert arr_serve.job_of(h, "sonarr", posted)["nfo_title"] is None
+    assert arr_serve.download("sonarr", posted)["nfo_title"] is None
     assert h.plex_find(job["path"], {"guids": ["tvdb://5"], "title": "Show A", "show": True}) == (["101"], False, "1")
     assert h.plex_find(film["path"], {"guids": ["tmdb://7"], "title": "Film A"}) == (["300"], False, "3")
     p = h.plex_folder_job("sonarr", "hook", "Show A", os.path.dirname(job["path"]), None)
     assert h.plex_folder_scan(p) == (["folder"], False, "1")
     h.plex_folder_scan(dict(p, section="1"), send=True)
-    assert tester["calls"][-1][2:4] == ("/library/sections/1/refresh", {"path": "/mnt/TV Shows/Show A/Season 1", "X-Plex-Token": "t0ken"})
+    assert tester["calls"][-1][2:4] == ("/library/sections/1/refresh", {"path": "/mnt/TV Shows/Show A/Season 1", "X-Plex-Token": "plex-t0ken-1234"})
     h.arr_write("sonarr", "command", "POST", {"name": "RescanSeries", "path": os.path.dirname(job["path"])})
     h.arr("radarr", "parse?" + urllib.parse.urlencode({"path": film["path"]}))
     assert [c[3:] for c in tester["calls"][-2:]] == [({}, {"name": "RescanSeries", "path": "/mnt/TV/Show A/Season 1"}),
@@ -424,27 +459,27 @@ def test_the_tester_setup_maps_each_import_by_its_app_and_finds_it_in_plex(teste
     assert h.path_warnings() == []   # the Music library holds no root folder, so it never warns
 
 
-def test_one_path_map_for_every_program_misses_plex_and_the_check_names_it(tester, monkeypatch, capsys):
+def test_one_path_map_for_every_program_misses_plex_and_the_check_names_it(tester, monkeypatch, settings, capsys):
     """The tester's first setup: PATH_MAP alone. Plex lists TV under /mnt/TV Shows and films under /mnt/Movies, so the
     lookup finds neither, and the path check names each root folder and PLEX_PATH_MAP. --selftest and the listener
     start print the warnings and fail on none."""
     m = tester["media"]
-    monkeypatch.setattr(h, "MAPS", {})
-    monkeypatch.setattr(h, "PATH_MAP", [("/mnt/TV", f"{m}/TV"), ("/mnt/Anime", f"{m}/Anime"), ("/movies", f"{m}/Movies")])
+    settings(path_map=[("/mnt/TV", f"{m}/TV"), ("/mnt/Anime", f"{m}/Anime"), ("/movies", f"{m}/Movies")], plex_path_map=[],
+             sonarr={"path_map": []}, radarr={"path_map": []})
     assert h.plex_find(tester["ep"], {"guids": ["tvdb://5"], "title": "Show A", "show": True}) == ([], False, None)
     want = [f"no Plex library folder holds Sonarr's root folder {m}/TV, which PATH_MAP puts at /mnt/TV in Plex. "
             "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits.",
             f"no Plex library folder holds Radarr's root folder {m}/Movies, which PATH_MAP puts at /movies in Plex. "
             "Fix PATH_MAP, or set PLEX_PATH_MAP, so Plex finds the files the hook edits."]
     assert sorted(h.path_warnings()) == sorted(want)
-    arr_serve.path_check(h)
+    arr_serve.path_check()
     assert sorted(capsys.readouterr().out.splitlines()) == sorted(f"arr-media-guard: warning: {w}" for w in want)
     h.main(["--selftest"])
     out = capsys.readouterr().out
     assert all(f"warning: {w}" in out for w in want) and out.rstrip().endswith("selftest ok")
 
 
-def test_the_path_check_names_a_root_folder_this_script_does_not_see_and_its_setting(tester, monkeypatch):
+def test_the_path_check_names_a_root_folder_this_script_does_not_see_and_its_setting(tester, monkeypatch, settings):
     tester["api"]["sonarr/rootfolder"].append({"path": "/mnt/TV/Kids"})   # mapped, and not there
     tester["api"]["radarr/rootfolder"].append({"path": "/films4k"})       # no pair maps it
     assert sorted(h.path_warnings()) == sorted([
@@ -452,41 +487,43 @@ def test_the_path_check_names_a_root_folder_this_script_does_not_see_and_its_set
         "Mount the media there, or fix SONARR_PATH_MAP.",
         "this script does not see Radarr's root folder /films4k. Mount the media there, or fix RADARR_PATH_MAP.",
         "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files the hook edits."])
+    assert h.path_warnings(per_app=False) == [   # the listener's start check names a root folder it does not see
+        "no Plex library folder holds Radarr's root folder /films4k. Fix PLEX_PATH_MAP, so Plex finds the files the hook edits."]
     # A Plex library inside a root folder, or one that holds it, counts. Without PLEX_URL there is no Plex check.
     tester["api"]["plex/library/sections"]["MediaContainer"]["Directory"].append({"key": "5", "Location": [{"path": "/films4k/uhd"}]})
     assert all(w.startswith("this script does not see") for w in h.path_warnings())
-    monkeypatch.setitem(h.CFG, "PLEX_URL", "")
+    settings(plex_url="")
     tester["calls"].clear()
     assert len(h.path_warnings()) == 2 and not any(c[0] == "plex" for c in tester["calls"])
 
 
-def test_with_no_map_set_the_path_check_says_to_set_one(tester, monkeypatch):
+def test_with_no_map_set_the_path_check_says_to_set_one(tester, settings):
     """No map moves the root folders, so the warnings name no map that puts them anywhere, and they say to set one."""
-    monkeypatch.setattr(h, "MAPS", {})
-    for k, v in (("RADARR_API_KEY", ""), ("RADARR_DIR", "/nonexistent")):   # Sonarr alone
-        monkeypatch.setitem(h.CFG, k, v)
+    settings(plex_path_map=[], sonarr={"path_map": []}, radarr={"path_map": [], "api_key": "", "dir": "/nonexistent"})   # Sonarr alone
     tester["api"]["sonarr/rootfolder"] = [{"path": "/mnt/TV"}]
     assert h.path_warnings() == [
         "this script does not see Sonarr's root folder /mnt/TV. Mount the media there, or set SONARR_PATH_MAP or PATH_MAP.",
         "no Plex library folder holds Sonarr's root folder /mnt/TV. Set PLEX_PATH_MAP or PATH_MAP, so Plex finds the files the hook edits."]
 
 
-def test_a_pair_with_trailing_slashes_maps_the_root_folder_itself(tester, monkeypatch):
+def test_a_pair_with_trailing_slashes_maps_the_root_folder_itself(tester, settings):
     """SONARR_PATH_MAP='/mnt/TV/:/media/TV/' maps /mnt/TV, so the Test event finds each root folder and passes."""
-    monkeypatch.setitem(h.CFG, "SONARR_PATH_MAP", "/mnt/TV/:{m}/TV/|/mnt/Anime//:{m}/Anime/".format(m=tester["media"]))
-    monkeypatch.setitem(h.MAPS, "sonarr", h.path_map("SONARR_PATH_MAP")[0])
+    settings(sonarr={"path_map": h.path_map("SONARR_PATH_MAP", "/mnt/TV/:{m}/TV/|/mnt/Anime//:{m}/Anime/".format(m=tester["media"]))[0]})
     assert h.mapped("/mnt/TV", "sonarr") == f"{tester['media']}/TV" and h.mapped(f"{tester['media']}/Anime", "sonarr", True) == "/mnt/Anime"
-    assert arr_serve.test_event(h, "sonarr") is None and h.path_warnings() == []
+    assert h.app_check("sonarr")[0] is None and h.path_warnings() == []
 
 
-def test_the_path_check_says_when_an_app_or_plex_does_not_answer(tester, monkeypatch):
+def test_the_path_check_says_when_an_app_or_plex_does_not_answer(tester, monkeypatch, settings, capsys):
     tester["api"]["sonarr/rootfolder"] = urllib.error.URLError("refused")
-    tester["api"]["plex/library/sections"] = urllib.error.URLError("http://plex.invalid/library/sections?X-Plex-Token=t0ken refused")
+    tester["api"]["plex/library/sections"] = urllib.error.URLError("http://plex.invalid/library/sections?X-Plex-Token=plex-t0ken-1234 refused")
     assert h.path_warnings() == ["Sonarr did not answer, so its root folders are not checked: URLError: <urlopen error refused>",
                                  "Plex did not answer, so its library folders are not checked: URLError: "
                                  "<urlopen error http://plex.invalid/library/sections?X-Plex-Token=<PLEX_TOKEN> refused>"]
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "")
-    monkeypatch.setitem(h.CFG, "RADARR_DIR", "/nonexistent")   # an app this host does not run is never asked
+    arr_serve.path_check()
+    assert "Sonarr did not answer" in capsys.readouterr().out
+    arr_serve.path_check(per_app=False)   # the listener's start check reports an app that does not answer
+    assert "Sonarr did not answer" not in capsys.readouterr().out
+    settings(radarr={"api_key": "", "dir": "/nonexistent"})   # an app this host does not run is never asked
     tester["calls"].clear()
     h.path_warnings()
     assert not any(c[0] == "radarr" for c in tester["calls"])
@@ -506,7 +543,6 @@ def settled(srv, slots):
 @pytest.fixture
 def server(app, monkeypatch):
     """The real handler on a free local port. send() makes one request and serves it."""
-    monkeypatch.setattr(arr_serve.Handler, "h", h)
     monkeypatch.setattr(arr_serve.Handler, "auth", AUTH.encode())
     srv = arr_serve.Server(("127.0.0.1", 0), arr_serve.Handler)
     srv.queued = False
@@ -534,8 +570,30 @@ def test_a_download_post_queues_the_job_and_asks_for_a_worker(server, app, capsy
     assert code == 200 and text.strip() == f"arr-media-guard: queued {app['film']}"
     assert arr_serve.REFUSALS.n == 0 and '"POST /radarr HTTP/1.1" 200' in capsys.readouterr().out   # an app's post gets its line
     (name,) = h.queued()
-    assert json.load(open(os.path.join(h.queue_dir(), name)))["file_id"] == "31"
-    assert not os.path.exists(h.CFG["LOG"])   # a queued job leaves no decision line of its own
+    assert h.job_of(name)["file_id"] == "31"
+    assert not os.path.exists(h.CFG.log)   # a queued job leaves no decision line of its own
+
+
+STORE_WORKER = """
+import contextlib, json, sqlite3, sys
+with contextlib.closing(sqlite3.connect(sys.argv[1], isolation_level=None)) as db:
+    rows = db.execute("SELECT job FROM jobs").fetchall()
+    db.execute("DELETE FROM jobs")
+print(json.dumps([json.loads(j)["path"] for j, in rows]))
+"""
+
+
+def test_a_worker_gets_each_of_two_downloads_in_a_row(server, app):
+    """The listener's loop and its request threads each hold a connection to the store. A worker in another process
+    takes each job and closes its connection. The second job must reach the next worker too, so no request thread
+    may drop the store locks of the listener, see store.db()."""
+    h.store.db()   # the connection of the listener's loop, see runner.ensure_worker()
+    take = lambda: json.loads(subprocess.run([sys.executable, "-c", STORE_WORKER, h.store.path()], check=True, capture_output=True,
+                                             text=True).stdout)
+    assert server("POST", "/radarr", radarr_body(app))[0] == 200
+    assert take() == [app["film"]]
+    assert server("POST", "/sonarr", sonarr_body(app))[0] == 200
+    assert take() == [app["ep"]]
 
 
 @pytest.mark.parametrize("auth", [None, "Basic " + base64.b64encode(b"guard:wrong").decode(), "Bearer x", AUTH + "x"])
@@ -543,7 +601,7 @@ def test_a_post_without_the_right_credentials_is_refused_before_the_body(server,
     headers = {"Authorization": auth} if auth else {"Authorization": ""}
     code, text, hdrs = server("POST", "/radarr", radarr_body(app), headers=headers)
     assert code == 401 and hdrs.get("WWW-Authenticate") == 'Basic realm="arr-media-guard"'
-    assert h.queued() == [] and app["calls"] == [] and not os.path.exists(h.CFG["LOG"])   # counted, never logged
+    assert h.queued() == [] and app["calls"] == [] and not os.path.exists(h.CFG.log)   # counted, never logged
     assert (arr_serve.REFUSALS.n, arr_serve.REFUSALS.last) == (1, "127.0.0.1")
 
 
@@ -611,10 +669,175 @@ def test_a_refused_download_answers_why_and_logs_it(server, app):
     assert line["source"] == "webhook" and line["app"] == "radarr" and line["result"] == "refused" and "movie 7" in line["note"]
 
 
-def test_an_api_failure_answers_502(server, app):
+@pytest.mark.parametrize("fail", ["moviefile/31", "movie/7"])
+def test_an_import_the_api_does_not_answer_is_queued_and_the_worker_asks_again(server, app, monkeypatch, settings, fail):
+    """The job holds the ids and the body, and one line says why. The worker runs the checks and lookups of the
+    listener, so it finds the file and the old files of the upgrade, and the body's checks still hold."""
+    settings(keep_replaced=True)
+    old = os.path.join(app["movies"], "Film A (1979) HDTV-720p.mkv")
+    body = radarr_body(app, isUpgrade=True, deletedFiles=[{"id": 30, "path": old, "recycleBinPath": None}])
+    answers, app["api"][fail] = app["api"][fail], urllib.error.URLError("refused")
+    code, text, _ = server("POST", "/radarr", body)
+    assert (code, text) == (200, "arr-media-guard: queued Radarr file 31\n")
+    (line,) = log_lines()
+    assert (line["source"], line["result"]) == ("webhook", "warning") and line["note"].startswith("the Radarr API did not answer: URLError")
+    (name,) = h.queued()
+    job = h.job_of(name)
+    assert (job["path"], job["owner"], job["file_id"], job["download_id"], job["deleted"], job["webhook"]) == (None, "7", "31", "SABnzbd_nzo_abc123", None, body)
+    for bad in (dict(body, downloadId=["a"]), dict(body, deletedFiles="/etc/passwd"), dict(body, movie={"id": True})):
+        assert server("POST", "/radarr", bad)[0] == 400   # the body checks hold while the API fails
+    assert h.queued() == [name]
+    claims = []
+    monkeypatch.setattr(h, "kept_replaced", lambda path, down=None, app=None: claims.append((path, down)))
+    monkeypatch.setattr(h, "process", lambda ctx: pytest.fail("the API still fails"))
+    h.run_job(name, [])   # the API still fails: the job goes back to the queue for a try a minute later
+    ((later, due),) = h.store.read("SELECT name, due FROM jobs")
+    assert 59 * 10**9 < due - time.time_ns() <= 60 * 10**9 and h.queued() == [] and not h.waiting() and claims == []
+    assert log_lines()[-1]["note"].endswith("The job goes back to the queue, and the next try runs in 60 seconds")
+    h.queue_job({"app": "radarr", "event": "Download", "time": time.time(), "path": "/nonexistent/x.mkv", "file_id": "1"})
+    (behind,) = h.queued()   # a job queued after it runs first
+    h.drop_job(behind)
+    monkeypatch.setattr(h, "load_plex", lambda: [])
+    h.worker(h.try_lock("worker.lock"))   # nothing is due, so the worker ends at once
+    assert h.store.read("SELECT name FROM jobs") == [(later,)]
+    real = time.time_ns
+    monkeypatch.setattr(h.time, "time_ns", lambda: real() + 61 * 10**9)
+    app["api"][fail] = answers
+    seen = []
+    monkeypatch.setattr(h, "process", lambda ctx: seen.append((ctx.path, ctx.job["time"])) or {"app": ctx.app, "path": ctx.path, "result": "no change"})
+    monkeypatch.setattr(h.Radarr, "item", lambda self, owner, fid: ("Film A (1979)", "English", 120, {"guids": []}, False, {}))
+    assert h.queued() == [later]
+    h.run_job(later, [])
+    assert seen == [(app["film"], job["time"])] and claims == [(old, "SABnzbd_nzo_abc123")]   # the job keeps its age
+    assert log_lines()[-1]["path"] == app["film"] and log_lines()[-1]["result"] == "no change"
+
+
+def test_a_webhook_job_whose_api_never_answers_is_dropped_once_at_the_age_limit(app, monkeypatch):
+    """Each try waits twice as long as the one before, up to an hour. A job older than a day gets one error line."""
+    clock = [time.time()]
+    monkeypatch.setattr(h.time, "time", lambda: clock[0])
+    monkeypatch.setattr(h.time, "time_ns", lambda: int(clock[0] * 10**9))
+    monkeypatch.setattr(h, "process", lambda *a, **k: pytest.fail("the API never answered"))
     app["api"]["moviefile/31"] = urllib.error.URLError("refused")
-    code, text, _ = server("POST", "/radarr", radarr_body(app))
-    assert code == 502 and h.queued() == [] and log_lines()[0]["result"] == "error"
+    h.queue_job(arr_serve.download("radarr", radarr_body(app)))
+    waits = []
+    for _ in range(40):   # a day takes about 30 tries
+        if not h.store.read("SELECT due FROM jobs"):
+            break
+        ((due,),) = h.store.read("SELECT due FROM jobs")
+        clock[0] = max(clock[0], due / 10**9)   # the time of the next try
+        (name,) = h.queued()
+        h.run_job(name, [])
+        waits.append(log_lines()[-1].get("note", "").rpartition("runs in ")[2])
+    assert waits[:8] == [f"{w} seconds" for w in (60, 120, 240, 480, 960, 1920, 3600, 3600)] and waits[-1] == "" and len(waits) < 40
+    (dropped,) = [r for r in log_lines() if r.get("outcome")]
+    assert dropped["result"] == ("error: the Radarr API did not answer for a day, so the import was never checked. The last try: URLError: "
+                                 "<urlopen error refused>") and dropped["job"] == name
+
+
+@pytest.mark.parametrize("api_down", [False, True])
+def test_an_import_this_container_does_not_see_waits_for_its_file_for_a_day(app, monkeypatch, api_down):
+    """A missing mount or a slow NFS cache hides the file at the event, or when the API answers again. The job waits for
+    the file as for the API, and it runs once the file shows. A file that never shows gives one error line at
+    JOB_MAX_AGE. A file the app no longer has drops the job at once."""
+    clock = [time.time()]
+    monkeypatch.setattr(h.time, "time", lambda: clock[0])
+    monkeypatch.setattr(h.time, "time_ns", lambda: int(clock[0] * 10**9))
+    seen = []
+    monkeypatch.setattr(h, "process", lambda ctx: seen.append(ctx.path) or {"app": ctx.app, "path": ctx.path, "result": "no change"})
+    monkeypatch.setattr(h.Radarr, "item", lambda self, owner, fid: ("Film A (1979)", "English", 120, {"guids": []}, False, {}))
+    os.rename(app["film"], app["film"] + ".hidden")
+    answers = app["api"]["moviefile/31"]
+    if api_down:
+        app["api"]["moviefile/31"] = urllib.error.URLError("refused")
+    job = arr_serve.download("radarr", radarr_body(app))
+    assert job.get("unseen") is (None if api_down else True)
+    app["api"]["moviefile/31"] = answers
+
+    def look():   # one try of the worker at the time it is due
+        ((due,),) = h.store.read("SELECT due FROM jobs")
+        clock[0] = max(clock[0], due / 10**9)
+        (name,) = h.queued()
+        h.run_job(name, [])
+
+    h.queue_job(job)
+    look()
+    assert h.job_of(h.store.read("SELECT name FROM jobs")[0][0])["unseen"] is True and seen == []
+    assert log_lines()[-1]["note"] == (f"Radarr lists file 31 at {app['film']}, and this container does not see it there. The job goes back "
+                                       "to the queue, and the next try runs in 60 seconds")
+    look()
+    assert log_lines()[-1]["note"].endswith("the next try runs in 120 seconds") and seen == []
+    os.rename(app["film"] + ".hidden", app["film"])   # the mount shows the file
+    look()
+    assert seen == [app["film"]] and h.store.read("SELECT name FROM jobs") == []
+    os.rename(app["film"], app["film"] + ".hidden")
+    job = arr_serve.download("radarr", radarr_body(app))
+    h.queue_job(job)
+    clock[0] = job["time"] + h.JOB_MAX_AGE + 1
+    look()
+    assert log_lines()[-1]["result"] == (f"error: Radarr lists file 31 at {app['film']}, and this container does not see it there. A day "
+                                         "passed, so the import was never checked") and h.store.read("SELECT name FROM jobs") == []
+    app["api"]["moviefile/31"] = http_error(404)
+    h.queue_job(dict(job, time=clock[0]))
+    look()
+    assert log_lines()[-1]["outcome"] == "file_gone" and h.store.read("SELECT name FROM jobs") == [] and seen == [app["film"]]
+
+
+def test_a_stop_in_a_webhook_job_leaves_one_job_and_claims_the_kept_copies_at_most_once(app, monkeypatch, settings):
+    """A stop at the change that gives the job its next try and its later time, then a stop after the job drops the body
+    and before the claim. Each leaves one row of the job, and the next run neither runs a second copy nor claims twice."""
+    settings(keep_replaced=True)
+    old = os.path.join(app["movies"], "Film A (1979) HDTV-720p.mkv")
+    answers, app["api"]["moviefile/31"] = app["api"]["moviefile/31"], urllib.error.URLError("refused")
+    h.queue_job(arr_serve.download("radarr", radarr_body(app, isUpgrade=True, deletedFiles=[{"id": 30, "path": old, "recycleBinPath": None}])))
+    rows = lambda: [(n, json.loads(j)) for n, j in h.store.read("SELECT name, job FROM jobs")]
+    claims, seen, real_write, real_claim = [], [], h.store.write, h.claim_kept
+    monkeypatch.setattr(h, "kept_replaced", lambda path, down=None, app=None: claims.append((path, down)))
+    monkeypatch.setattr(h.store, "write", lambda sql, *a: (_ for _ in ()).throw(SystemExit(143)) if sql.startswith("UPDATE jobs SET name")
+                        else real_write(sql, *a))
+    (name,) = h.queued()
+    with pytest.raises(SystemExit):
+        h.run_job(name, [])
+    ((n, job),) = rows()
+    assert n == name and "tries" not in job and "webhook" in job   # the change did not happen, and the job is whole
+    monkeypatch.setattr(h.store, "write", real_write)
+    h.run_job(name, [])   # the next run asks again, and the API still fails
+    ((later, job),) = rows()
+    assert later != name and job["tries"] == 1 and h.queued() == []
+    app["api"]["moviefile/31"] = answers
+    real_ns = time.time_ns
+    monkeypatch.setattr(h.time, "time_ns", lambda: real_ns() + 200 * 10**9)
+    (name,) = h.queued()
+    monkeypatch.setattr(h, "claim_kept", lambda job: (_ for _ in ()).throw(SystemExit(143)))
+    with pytest.raises(SystemExit):
+        h.run_job(name, [])
+    ((n, job),) = rows()
+    assert n == name and "webhook" not in job and job["path"] == app["film"]
+    monkeypatch.setattr(h, "claim_kept", real_claim)
+    monkeypatch.setattr(h, "process", lambda ctx: seen.append(ctx.path) or {"app": ctx.app, "path": ctx.path, "result": "no change"})
+    monkeypatch.setattr(h.Radarr, "item", lambda self, owner, fid: ("Film A (1979)", "English", 120, {"guids": []}, False, {}))
+    h.run_job(name, [])
+    assert seen == [app["film"]] and claims == [] and rows() == []
+
+
+def test_a_webhook_job_whose_item_is_gone_is_dropped_at_once(server, app, monkeypatch):
+    """A 404 for the item means the app deleted it. The listener refuses the post, and a queued job ends with one line."""
+    app["api"]["movie/7"] = http_error(404)
+    body = radarr_body(app, isUpgrade=True, deletedFiles=[{"id": 30, "path": os.path.join(app["movies"], "old.mkv"), "recycleBinPath": None}])
+    assert server("POST", "/radarr", body)[:2] == (400, "arr-media-guard: Radarr has no movie 7\n") and h.queued() == []
+    h.queue_job(dict(h.Event.from_webhook("radarr", body, ask=False).job(), webhook=body))   # queued while the API failed
+    (name,) = h.queued()
+    h.run_job(name, [])
+    assert h.store.read("SELECT name FROM jobs") == [] and log_lines()[-1]["result"] == "error: Refused: Radarr has no movie 7"
+
+
+def test_an_import_this_container_does_not_see_is_queued_with_one_line(server, app):
+    """The worker looks for the file by its id, see moved(), so a slow mount never loses the import."""
+    app["api"]["moviefile/31"] = dict(app["api"]["moviefile/31"], path="/nonexistent/Film A.mkv")
+    code, text, _ = server("POST", "/radarr", radarr_body(app, movieFile={"id": 31, "path": "/nonexistent/Film A.mkv"}))
+    assert (code, text) == (200, "arr-media-guard: queued /nonexistent/Film A.mkv\n") and len(h.queued()) == 1
+    (line,) = log_lines()
+    assert line["result"] == "warning" and line["note"].startswith("Radarr lists file 31 at /nonexistent/Film A.mkv, and this container does not see it")
 
 
 def test_a_put_queues_like_a_post(server, app):
@@ -643,7 +866,6 @@ def test_a_slow_body_is_refused_after_the_read_timeout(app, server, monkeypatch)
 
 
 def test_a_body_short_by_one_byte_is_refused(app, monkeypatch):
-    monkeypatch.setattr(arr_serve.Handler, "h", h)
     monkeypatch.setattr(arr_serve.Handler, "auth", AUTH.encode())
     srv = arr_serve.Server(("127.0.0.1", 0), arr_serve.Handler)
     t = threading.Thread(target=srv.handle_request)
@@ -657,15 +879,18 @@ def test_a_body_short_by_one_byte_is_refused(app, monkeypatch):
     srv.server_close()
 
 
-def test_an_api_key_never_reaches_the_answer_or_the_log(server, app, monkeypatch, capsys):
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "s3cretkey1234")
+def test_an_api_key_never_reaches_the_answer_or_the_log(server, app, monkeypatch, settings, capsys):
+    settings(radarr={"api_key": "s3cretkey1234"})
     app["api"]["moviefile/31"] = urllib.error.URLError("refused, key s3cretkey1234")
+    code, text, _ = server("POST", "/radarr", radarr_body(app))   # queued, with a warning line
+    assert code == 200 and "s3cretkey1234" not in text
+    monkeypatch.setattr(h, "queue_job", lambda job: (_ for _ in ()).throw(OSError("no space, key s3cretkey1234")))
     code, text, _ = server("POST", "/radarr", radarr_body(app))
     assert code == 502 and "<RADARR_API_KEY>" in text and "s3cretkey1234" not in text
-    app["api"]["moviefile/31"] = arr_serve.Refused(400, "the key s3cretkey1234 was named")
+    app["api"]["moviefile/31"] = h.runner.Refused(400, "the key s3cretkey1234 was named")
     server("POST", "/radarr", radarr_body(app))
-    lines, out = open(h.CFG["LOG"]).read(), capsys.readouterr().out
-    assert "s3cretkey1234" not in lines + out and lines.count("<RADARR_API_KEY>") == 2 and out.count("<RADARR_API_KEY>") == 2
+    lines, out = open(h.CFG.log).read(), capsys.readouterr().out
+    assert "s3cretkey1234" not in lines + out and lines.count("<RADARR_API_KEY>") == 4 and out.count("<RADARR_API_KEY>") == 4
 
 
 def test_a_log_that_does_not_take_the_line_still_answers(server, app, monkeypatch, capsys):
@@ -681,98 +906,207 @@ def test_the_healthcheck_needs_no_credentials(server):
 
 # --- the worker and the daily jobs --------------------------------------------------------------------------------------
 
-def test_kick_starts_a_worker_only_when_work_waits_and_no_worker_runs(app, monkeypatch):
+def test_the_listener_starts_a_worker_only_when_work_waits_and_no_worker_runs(app, monkeypatch):
     started = []
-    monkeypatch.setattr(arr_serve, "spawn", lambda h, what: started.append((what, h.try_lock("worker.lock") is not None)) or 4242)
-    assert arr_serve.kick(h) is None and started == []   # no work
-    open(os.path.join(h.queue_dir(), "1-1.json"), "w").close()
+    spawn = lambda what: started.append((what, h.try_lock("worker.lock") is not None)) or 4242
+    monkeypatch.setattr(h.os, "fork", lambda: pytest.fail("the listener never forks"))
+    assert h.ensure_worker(spawn) is None and started == []   # no work
+    h.store.write("INSERT INTO jobs (name, at, job) VALUES ('1-1.json', 0, '{}')")
     held = h.try_lock("worker.lock")
-    assert arr_serve.kick(h) is None and started == []   # a worker runs
+    assert h.ensure_worker(spawn) is None and started == []   # a worker runs
     held.close()
-    assert arr_serve.kick(h) == 4242 and started == [("worker", True)]   # the new worker takes the lock itself
+    assert h.ensure_worker(spawn) == 4242 and started == [("worker", True)]   # the new worker takes the lock itself
+
+
+def test_the_start_check_asks_an_app_again_then_warns_and_the_listener_goes_on(app, monkeypatch, settings, capsys):
+    """An app that starts beside the listener is asked again for START_WAIT seconds. The check prints each result and
+    never stops the listener. An app with no API key is not checked."""
+    settings(radarr={"api_key": "radarr-key-1"}, sonarr={"api_key": "", "dir": "/nonexistent"})
+    monkeypatch.setattr(arr_serve, "START_WAIT", 0.5)
+    monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
+    real, roots = h.arr, app["api"]["rootfolder"]
+    def arr(a, p):   # the app answers at the fourth ask: the path check asks once, then the start check
+        if p == "rootfolder" and len([c for c in app["calls"] if c[1] == p]) < 3:
+            app["calls"].append((a, p))
+            raise urllib.error.URLError("refused")
+        return real(a, p)
+    monkeypatch.setattr(h, "arr", arr)
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["arr-media-guard: radarr start check: ok"]   # the path check leaves an app that does not answer to it
+    assert [c for c in app["calls"] if c[1] == "rootfolder"] == [("radarr", "rootfolder")] * 5   # 3 refused, then the check and the bin warnings
+    app["api"]["rootfolder"], app["calls"][:] = urllib.error.URLError("refused"), []
+    started = time.monotonic()
+    arr_serve.start_check()   # it returns, so the listener goes on
+    assert 0.5 <= time.monotonic() - started < 3
+    assert capsys.readouterr().out.splitlines()[-1] == ("arr-media-guard: radarr warning: the start check failed: the Radarr API did not answer: "
+                                                        "URLError: <urlopen error refused>")
+    assert len([c for c in app["calls"] if c[1] == "rootfolder"]) > 3 and not os.path.exists(h.CFG.log)
+    app["api"]["rootfolder"] = roots + [{"path": "/nonexistent/anime"}]
+    app["api"]["config/mediamanagement"] = {"recycleBin": ""}
+    arr_serve.start_check()
+    out = capsys.readouterr().out
+    assert "arr-media-guard: radarr warning: the start check failed: this script does not see the root folders /nonexistent/anime" in out
+    assert "does not see Radarr's root folder" not in out   # one line, from the start check
+    app["api"]["rootfolder"] = roots
+    settings(radarr={"api_key": "radarr-key-1"}, sonarr={"api_key": "sonarr-key-1"})
+    monkeypatch.setattr(h.arr_decide, "POLICY", None)
+    arr_serve.start_check()   # the policy fails once, and each app is still checked
+    out = capsys.readouterr().out.splitlines()
+    assert [line for line in out if "no policy loaded" in line] == [f"arr-media-guard: warning: the start check failed: {h.policy_help()}"]
+    assert "arr-media-guard: radarr start check: ok" in out and "arr-media-guard: sonarr start check: ok" in out
+
+
+def test_the_start_check_names_an_app_with_its_own_url_and_no_api_key(app, settings, capsys):
+    """A container with SONARR_URL and no config.xml mount needs SONARR_API_KEY, and the start check says so. An app
+    with the shipped URL is one the user did not set up, and it stays quiet."""
+    settings(radarr={"api_key": "", "dir": "/nonexistent"}, sonarr={"api_key": "", "dir": "/nonexistent", "url": "http://sonarr.lan:8989"})
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == [
+        "arr-media-guard: sonarr warning: SONARR_URL is set, but the Sonarr API key does not read: [Errno 2] No such file or directory: "
+        "'/nonexistent/config.xml'. Set SONARR_API_KEY."] and app["calls"] == []
+
+
+def test_the_test_checks_wait_10_seconds_for_each_api_call(tester, monkeypatch):
+    """A hung app fails the Test of the hook and of the listener in seconds. Every other call keeps its 60 seconds."""
+    seen, fake = [], h.http
+    def http(url, method="GET", body=None, headers=None, timeout=15):
+        seen.append((url.split("/api/v3/")[1], timeout))
+        return fake(url, method, body, headers, timeout)
+    monkeypatch.setattr(h, "http", http)
+    assert h.app_check("sonarr")[0] is None
+    h.arr("sonarr", "series/5")
+    assert seen == [("rootfolder", 10), ("config/mediamanagement", 10), ("rootfolder", 10), ("series/5", 60)]
+
+
+def test_the_banner_is_the_approved_text_and_never_prints_for_the_worker_or_the_daily_jobs(app, monkeypatch, capsys):
+    """The owner approved the banner byte for byte. The listener prints it, see
+    test_the_listener_prints_each_map_and_checks_the_paths_at_its_start."""
+    assert hashlib.sha256(arr_serve.BANNER.encode()).hexdigest() == "5957819f8847192c271f6877c1286770d63271f63c575fe70939810af8c92111"
+    monkeypatch.setattr(h, "SERVE", False)
+    monkeypatch.setattr(h, "worker", lambda lock: None)
+    monkeypatch.setattr(arr_serve, "daily", lambda: None)
+    arr_serve.main(["--worker"])
+    arr_serve.main(["--daily"])
+    assert capsys.readouterr().out == ""
+
+
+def test_under_the_listener_the_summary_line_goes_to_stdout_too(app, monkeypatch, capsys):
+    """The worker the listener starts runs as --serve --worker, so the container log carries the logfmt line. Syslog gets
+    it as before, and a hook or a backfill prints nothing more."""
+    sent, rec = [], dict(source="hook", app="radarr", outcome="no_change", label="Film A (1979)", id="x1")
+    monkeypatch.setattr(syslog, "syslog", lambda priority, line: sent.append(line))
+    monkeypatch.setattr(h, "SERVE", False)
+    h.decision(rec, time.time())
+    assert capsys.readouterr().out == "" and len(sent) == 1
+    monkeypatch.setattr(h, "worker", lambda lock: h.decision(rec, time.time()))
+    arr_serve.main(["--worker"])
+    assert capsys.readouterr().out == sent[1] + "\n" and sent[1] == sent[0]
+    assert sent[0].startswith("arr=radarr source=hook outcome=no_change ") and sent[0].endswith(' label="Film A (1979)" id=x1')
+    monkeypatch.setattr(h, "SERVE", False)
+    ran = []
+    monkeypatch.setattr(h, "main", lambda argv: ran.append((argv, h.SERVE)))
+    arr_serve.main(["--audit", "radarr", "--since", "24h", "--post"])   # the nightly audit, see daily()
+    assert ran == [(["--audit", "radarr", "--since", "24h", "--post"], True)]
+
+
+def test_under_the_listener_the_audit_summary_goes_to_stdout_too(app, monkeypatch, capsys):
+    """The nightly audit runs as --serve --audit, see daily(). Its one summary line goes to syslog and to the container
+    log."""
+    sent = []
+    monkeypatch.setattr(syslog, "syslog", lambda priority, line: sent.append(line))
+    monkeypatch.setattr(h.os, "nice", lambda n: None)
+    monkeypatch.setattr(h.subprocess, "run", lambda argv, **k: None)   # ionice
+    monkeypatch.setattr(h, "SERVE", False)   # main() sets it, and the test ends with it unset
+    arr_serve.main(["--audit", "radarr", "--since", "24h"])
+    (line,) = sent
+    assert line.startswith("arr=radarr source=audit outcome=summary ") and line + "\n" in capsys.readouterr().out, line
 
 
 def test_spawn_starts_a_new_program_in_its_own_session(monkeypatch):
     seen = []
     monkeypatch.setattr(arr_serve.subprocess, "Popen", lambda argv, **kw: seen.append((argv, kw)))
-    arr_serve.spawn(h, "worker")
+    arr_serve.spawn("worker")
     (argv, kw), = seen
     assert argv[1:] == [os.path.realpath(h.__file__), "--serve", "--worker"] and kw == {"start_new_session": True}
 
 
 def test_the_worker_and_daily_modes_run_their_part(app, monkeypatch):
     ran = []
+    monkeypatch.setattr(h, "SERVE", False)   # main() sets it, and the test ends with it unset
     monkeypatch.setattr(h, "worker", lambda lock: ran.append(("worker", h.try_lock("worker.lock") is None)))
-    monkeypatch.setattr(arr_serve, "daily", lambda h: ran.append(("daily", None)))
-    arr_serve.main(h, ["--worker"])
+    monkeypatch.setattr(arr_serve, "daily", lambda: ran.append(("daily", None)))
+    arr_serve.main(["--worker"])
     held = h.try_lock("worker.lock")
-    arr_serve.main(h, ["--worker"])   # another worker runs: this one exits
+    arr_serve.main(["--worker"])   # another worker runs: this one exits
     held.close()
-    arr_serve.main(h, ["--daily"])
+    arr_serve.main(["--daily"])
     assert ran == [("worker", True), ("daily", None)]
     with pytest.raises(SystemExit, match="usage"):
-        arr_serve.main(h, ["--other"])
+        arr_serve.main(["--other"])
 
 
-@pytest.mark.parametrize("left", ["queue/1-1.json", "claimed/1-1.json", "plex-pending.json", "deep-analysis/deep-analysis-ab.json"])
+@pytest.mark.parametrize("left", ["queued", "claimed", "plex", "deep", "file"])
 def test_work_waits_for_a_queued_or_claimed_job_or_kept_plex_analyzes(app, left):
-    assert not arr_serve.waiting(h)
-    os.makedirs(os.path.join(h.CFG["STATE_DIR"], "deep-analysis"), exist_ok=True)
-    open(os.path.join(h.CFG["STATE_DIR"], ".tmp-x"), "w").close()
-    open(os.path.join(h.CFG["STATE_DIR"], "queue", ".1-1.json"), "w").close()   # half a job is no job
-    assert not arr_serve.waiting(h)
-    open(os.path.join(h.CFG["STATE_DIR"], left), "w").close()
-    assert arr_serve.waiting(h)
+    """A queued, claimed or deep analysis job, the Plex analyzes a stopped worker kept, or a job file the hook wrote
+    while the store was busy. Half a job file and a job put back for later are no work yet."""
+    assert not h.waiting()
+    os.makedirs(h.queue_dir())
+    open(os.path.join(h.queue_dir(), ".1-1.json"), "w").close()   # half a job is no job
+    h.store.write("INSERT INTO jobs (name, due, at, job) VALUES ('9-1.json', ?, 0, '{}')", time.time_ns() + 10**12)
+    assert not h.waiting()
+    if left == "file":
+        open(os.path.join(h.queue_dir(), "1-1.json"), "w").close()
+    elif left == "plex":
+        h.store.put("plex", "pending", [{"path": "/x.mkv"}])
+    else:
+        h.store.write("INSERT INTO jobs (name, claimed, at, job) VALUES (?, ?, 0, '{}')", "deep-analysis-ab.json" if left == "deep" else "1-1.json",
+                      int(left == "claimed"))
+    assert h.waiting()
 
 
 def test_the_daily_jobs_run_once_a_day_after_their_time(app):
     day = datetime.datetime(2026, 9, 30, 7, 29)
-    assert not arr_serve.daily_due(h, "07:30", day)
-    assert arr_serve.daily_due(h, "07:30", day.replace(minute=30))
-    assert not arr_serve.daily_due(h, "07:30", day.replace(hour=23))
-    assert arr_serve.daily_due(h, "07:30", day + datetime.timedelta(days=1, hours=5))   # a missed day runs at the next look
-    assert not arr_serve.daily_due(h, "", day + datetime.timedelta(days=3))
+    assert not arr_serve.daily_due("07:30", day)
+    assert arr_serve.daily_due("07:30", day.replace(minute=30))
+    assert not arr_serve.daily_due("07:30", day.replace(hour=23))
+    assert arr_serve.daily_due("07:30", day + datetime.timedelta(days=1, hours=5))   # a missed day runs at the next look
+    assert not arr_serve.daily_due("", day + datetime.timedelta(days=3))
 
 
-def test_the_daily_jobs_audit_each_app_with_a_key_then_rotate_the_log(app, monkeypatch):
+def test_the_daily_jobs_audit_each_app_with_a_key_then_rotate_the_log(app, monkeypatch, settings):
     runs = []
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k")
-    monkeypatch.setitem(h.CFG, "SONARR_API_KEY", "")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", "/nonexistent")
+    settings(radarr={"api_key": "k"}, sonarr={"api_key": "", "dir": "/nonexistent"})
     monkeypatch.setattr(arr_serve.subprocess, "run", lambda argv, **kw: runs.append(argv))
-    arr_serve.daily(h)
-    assert [r[2:] for r in runs[:-1]] == [["--audit", "radarr", "--since", "24h", "--post"]]
-    state = os.path.join(h.CFG["STATE_DIR"], "logrotate.state")
+    arr_serve.daily()
+    assert [r[2:] for r in runs[:-1]] == [["--serve", "--audit", "radarr", "--since", "24h", "--post"]]   # its summary lines reach the container log
+    state = os.path.join(h.CFG.state_dir, "logrotate.state")
     assert runs[-1][:3] == ["logrotate", "-s", state] and runs[-1][-1].endswith("logrotate.conf")   # the state stays in /config
-    assert open(runs[-1][-1]).read().startswith(h.CFG["LOG"] + " {\n    weekly\n")
+    assert open(runs[-1][-1]).read().startswith(h.CFG.log + " {\n    weekly\n")
 
 
-def test_the_daily_jobs_go_on_without_logrotate(app, monkeypatch, capsys):
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "")
-    monkeypatch.setitem(h.CFG, "RADARR_DIR", "/nonexistent")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", "/nonexistent")
+def test_the_daily_jobs_go_on_without_logrotate(app, monkeypatch, settings, capsys):
+    settings(radarr={"api_key": "", "dir": "/nonexistent"}, sonarr={"dir": "/nonexistent"})
     def run(argv, **kw):
         if argv[0] == "logrotate":
             raise FileNotFoundError(2, "No such file or directory", "logrotate")
     monkeypatch.setattr(arr_serve.subprocess, "run", run)
-    arr_serve.daily(h)
+    arr_serve.daily()
     assert "logrotate is not installed, so the decision log is not rotated" in capsys.readouterr().out
 
 
-def test_an_app_whose_config_xml_holds_no_key_is_left_out(app, monkeypatch, tmp_path):
+def test_an_app_whose_config_xml_holds_no_key_is_left_out(app, monkeypatch, settings, tmp_path):
     (tmp_path / "config.xml").write_text("<Config><Port>8989</Port></Config>")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", str(tmp_path))
-    monkeypatch.setitem(h.CFG, "SONARR_API_KEY", "")
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k")
-    assert arr_serve.apps_on(h) == ["radarr"]
+    settings(sonarr={"dir": str(tmp_path), "api_key": ""}, radarr={"api_key": "k"})
+    assert arr_serve.apps_on() == ["radarr"]
 
 
 FAKE_WORKER = """
-import os, signal, subprocess, sys, time
+import os, signal, sqlite3, subprocess, sys, time
 queue, marks, kid = sys.argv[1:]
 mark = lambda text: open(marks, "a").write(text + "\\n")
-for n in os.listdir(queue):
-    os.remove(os.path.join(queue, n))
+with sqlite3.connect(queue) as db:   # the worker takes the jobs of the store
+    db.execute("DELETE FROM jobs")
 open(kid, "w").write(str(subprocess.Popen(["sleep", "30"]).pid))   # an ffmpeg of the job, in the worker's group
 signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 mark("started")
@@ -790,25 +1124,22 @@ def free_port():
         return s.getsockname()[1]
 
 
-def test_the_listener_queues_starts_a_worker_and_stops_on_sigterm(app, monkeypatch, tmp_path):
+def test_the_listener_queues_starts_a_worker_and_stops_on_sigterm(app, monkeypatch, settings, tmp_path):
     """The real main loop in a forked child: a Download post, the worker it starts, and a stop by SIGTERM. The worker is
     a program in its own session, as spawn() starts it. It blocks SIGTERM for a while, as no_stop() does during a flag
     edit, then keeps the default action, as worker() does. The listener must stop it and wait for it."""
     port, marks, kid = free_port(), tmp_path / "marks", tmp_path / "kid"
-    for k, v in (("WEBHOOK_USER", "guard"), ("WEBHOOK_PASSWORD", "s3cret-pass"), ("AUDIT_TIME", "")):
-        monkeypatch.setitem(h.CFG, k, v)
-    for d in ("claimed", "alerts"):   # the listener makes the state folders itself
-        os.rmdir(os.path.join(h.CFG["STATE_DIR"], d))
+    settings(webhook_user="guard", webhook_password="s3cret-pass", audit_time="")
     monkeypatch.setattr(arr_serve, "PORT", port)
     monkeypatch.setattr(arr_serve, "POLL", 0.1)   # the listener sees the stop at once, while the worker holds its edit
-    monkeypatch.setattr(arr_serve, "spawn", lambda h, what: subprocess.Popen(
-        [sys.executable, "-c", FAKE_WORKER, h.queue_dir(), str(marks), str(kid)], start_new_session=True))
+    monkeypatch.setattr(arr_serve, "spawn", lambda what: subprocess.Popen(
+        [sys.executable, "-c", FAKE_WORKER, h.store.path(), str(marks), str(kid)], start_new_session=True))
     out = tmp_path / "stdout"
     pid = os.fork()
     if not pid:
         try:
             sys.stdout = open(out, "w", buffering=1)   # the listener's lines, for the parent to read
-            arr_serve.main(h, [])
+            arr_serve.main([])
         finally:
             os._exit(0)
     try:
@@ -837,7 +1168,6 @@ def test_the_listener_queues_starts_a_worker_and_stops_on_sigterm(app, monkeypat
                 break
             time.sleep(0.1)
         assert "refused 1 request without the right path or credentials" in out.read_text() and "/nothing" not in out.read_text()
-        assert all(os.path.isdir(os.path.join(h.CFG["STATE_DIR"], d)) for d in ("claimed", "alerts"))
         os.kill(pid, signal.SIGTERM)
         time.sleep(0.5)   # the listener closed its socket, and the worker, still in its edit, holds no copy of it
         with pytest.raises(ConnectionRefusedError):
@@ -860,20 +1190,19 @@ def test_the_listener_queues_starts_a_worker_and_stops_on_sigterm(app, monkeypat
             os.waitpid(pid, 0)
 
 
-def test_the_listener_runs_the_daily_jobs_again_once_the_last_run_ended(app, monkeypatch, tmp_path):
+def test_the_listener_runs_the_daily_jobs_again_once_the_last_run_ended(app, monkeypatch, settings, tmp_path):
     """A daily run is a child of the listener. The listener reaps it, so the next day's run starts."""
     port, marks, due = free_port(), tmp_path / "daily", iter([True, True, True])
-    for k, v in (("WEBHOOK_USER", "guard"), ("WEBHOOK_PASSWORD", "s3cret-pass"), ("AUDIT_TIME", "00:00")):
-        monkeypatch.setitem(h.CFG, k, v)
+    settings(webhook_user="guard", webhook_password="s3cret-pass", audit_time="00:00")
     monkeypatch.setattr(arr_serve, "PORT", port)
     monkeypatch.setattr(arr_serve, "POLL", 0.05)
     monkeypatch.setattr(arr_serve, "TICK", 0.2)
-    monkeypatch.setattr(arr_serve, "daily_due", lambda h, at, now=None: next(due, False))
-    monkeypatch.setattr(arr_serve, "spawn", lambda h, what: subprocess.Popen([sys.executable, "-c", f"open({str(marks)!r}, 'a').write('run\\n')"]))
+    monkeypatch.setattr(arr_serve, "daily_due", lambda at, now=None: next(due, False))
+    monkeypatch.setattr(arr_serve, "spawn", lambda what: subprocess.Popen([sys.executable, "-c", f"open({str(marks)!r}, 'a').write('run\\n')"]))
     pid = os.fork()
     if not pid:
         try:
-            arr_serve.main(h, [])
+            arr_serve.main([])
         finally:
             os._exit(0)
     try:
@@ -891,7 +1220,6 @@ def test_the_listener_runs_the_daily_jobs_again_once_the_last_run_ended(app, mon
 @pytest.fixture
 def live_srv(app, monkeypatch):
     """The real server with its pool, serving in a thread."""
-    monkeypatch.setattr(arr_serve.Handler, "h", h)
     monkeypatch.setattr(arr_serve.Handler, "auth", AUTH.encode())
     srv = arr_serve.Server(("127.0.0.1", 0), arr_serve.Handler)
     t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05})
@@ -899,6 +1227,7 @@ def live_srv(app, monkeypatch):
     yield srv
     srv.shutdown()
     srv.server_close()
+    srv.pool.shutdown(wait=True)   # each handler ends here, so a late one never counts in the next test's REFUSALS
     t.join(20)
 
 
@@ -941,7 +1270,7 @@ def test_a_trickling_client_is_cut_at_the_deadline_and_holds_up_no_app(live, mon
         if arr_serve.REFUSALS.n:
             break
         time.sleep(0.05)
-    assert arr_serve.REFUSALS.n == 1 and not os.path.exists(h.CFG["LOG"])
+    assert arr_serve.REFUSALS.n == 1 and not os.path.exists(h.CFG.log)
 
 
 def test_idle_connections_leave_the_threads_to_an_apps_post(live, monkeypatch):
@@ -966,7 +1295,6 @@ def test_more_idle_connections_than_threads_delay_a_post_at_most_the_deadline(li
 def test_a_connection_past_the_backlog_closes_at_once(app, monkeypatch):
     monkeypatch.setattr(arr_serve, "THREADS", 1)
     monkeypatch.setattr(arr_serve, "BACKLOG", 1)
-    monkeypatch.setattr(arr_serve.Handler, "h", h)
     srv = arr_serve.Server(("127.0.0.1", 0), arr_serve.Handler)
     t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05})
     t.start()
@@ -980,6 +1308,7 @@ def test_a_connection_past_the_backlog_closes_at_once(app, monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+        srv.pool.shutdown(wait=True)   # the idle connection's handler ends here, see live_srv()
         t.join(20)
 
 
@@ -987,7 +1316,7 @@ def test_refused_posts_are_counted_and_summed_up_once_a_minute(server, app, caps
     for _ in range(30):
         assert server("POST", "/radarr", radarr_body(app), headers={"Authorization": "Basic d3Jvbmc6d3Jvbmc="})[0] == 401
         assert server("POST", "/lidarr", {})[0] == 404
-    assert not os.path.exists(h.CFG["LOG"]) and "POST /radarr" not in capsys.readouterr().out   # no line per request
+    assert not os.path.exists(h.CFG.log) and "POST /radarr" not in capsys.readouterr().out   # no line per request
     assert arr_serve.REFUSALS.flush(now=1000.0) == "arr-media-guard: refused 60 requests without the right path or credentials, the last from 127.0.0.1"
     assert arr_serve.REFUSALS.flush(now=1001.0) is None   # nothing new
     server("POST", "/radarr", {}, headers={"Authorization": ""})
@@ -1068,14 +1397,11 @@ def test_the_listener_holds_96_connections_and_closes_the_97th(live, live_srv, m
 
 
 LISTENER = """
-import importlib.machinery, importlib.util, os, sys
+import sys
 sys.path.insert(0, sys.argv[1])
-loader = importlib.machinery.SourceFileLoader("amg", os.path.join(sys.argv[1], "arr-media-guard"))
-h = importlib.util.module_from_spec(importlib.util.spec_from_loader("amg", loader))
-loader.exec_module(h)
-import arr_serve
-arr_serve.PORT, arr_serve.POLL = int(sys.argv[2]), 0.1
-arr_serve.main(h, [])
+from arr_media_guard import serve
+serve.PORT, serve.POLL, serve.START_WAIT = int(sys.argv[2]), 0.1, 1
+serve.main([])
 """
 
 
@@ -1115,8 +1441,8 @@ def test_a_stop_ends_the_listener_at_once_and_prints_the_last_count(tmp_path):
 
 
 def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path):
-    """The start line names the map of each program. The path check runs beside the listener, so an app that does not
-    answer gives a warning and never holds up the start. A bad pair in any map stops the start."""
+    """The start line names the map of each program. The checks run beside the listener, so an app that does not
+    answer gives one warning, from the start check, and never holds up the start. A bad pair in any map stops the start."""
     port, env, out = free_port(), tmp_path / "env", tmp_path / "out"
     base = (f"WEBHOOK_USER='guard'\nWEBHOOK_PASSWORD='s3cret-pass'\nAUDIT_TIME=''\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\n"
             f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\nRADARR_DIR='/nonexistent'\n"
@@ -1127,12 +1453,14 @@ def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path
                              env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
     try:
         for _ in range(100):
-            if "warning: Sonarr did not answer" in out.read_text():
+            if "sonarr warning: the start check failed" in out.read_text():
                 break
             time.sleep(0.1)
         text = out.read_text()
+        assert text.startswith(arr_serve.BANNER + "\narr-media-guard ") and text.count(arr_serve.BANNER) == 1, text   # once, above the listening line
         assert "Path maps: sonarr /data:/media, radarr /data:/media, plex /mnt/TV Shows:/media/TV." in text, text
-        assert "arr-media-guard: warning: Sonarr did not answer, so its root folders are not checked: URLError" in text, text
+        assert "arr-media-guard: sonarr warning: the start check failed: the Sonarr API did not answer: URLError" in text, text
+        assert "Sonarr did not answer, so its root folders are not checked" not in text, text   # the path check leaves it to the start check
     finally:
         p.send_signal(signal.SIGTERM)
         p.wait(timeout=20)
@@ -1142,25 +1470,21 @@ def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path
     assert r.returncode == 1 and "--serve: RADARR_PATH_MAP takes pairs APP_PATH:LOCAL_PATH" in r.stderr, r.stderr
 
 
-def test_a_missing_recycle_bin_warns_in_the_test_and_the_selftest_and_fails_neither(server, app, monkeypatch, capsys):
+def test_a_missing_recycle_bin_warns_in_the_test_and_the_selftest_and_fails_neither(server, app, monkeypatch, settings, capsys):
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}
     code, text, _ = server("POST", "/radarr", {"eventType": "Test"})
     assert code == 200 and "Warning: Radarr has no recycle bin, so the restore after a bad upgrade cannot work." in text
     assert "arr-media-guard: radarr warning: Radarr has no recycle bin" in capsys.readouterr().out
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", "/nonexistent")   # an app this host does not run: no warning, no failure
+    settings(radarr={"api_key": "k"}, sonarr={"dir": "/nonexistent"})   # an app this host does not run: no warning, no failure
     h.main(["--selftest"])
     out = capsys.readouterr().out
     assert "warning: Radarr has no recycle bin" in out and "Sonarr" not in out and out.rstrip().endswith("selftest ok")
 
 
-def test_a_config_xml_with_no_key_gives_no_warning_in_the_selftest(app, monkeypatch, capsys, tmp_path):
+def test_a_config_xml_with_no_key_gives_no_warning_in_the_selftest(app, monkeypatch, settings, capsys, tmp_path):
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}   # a bin warning for any app the selftest asks
     (tmp_path / "config.xml").write_text("<Config><Port>8989</Port></Config>")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", str(tmp_path))
-    monkeypatch.setitem(h.CFG, "RADARR_DIR", "/nonexistent")
-    for k in ("SONARR_API_KEY", "RADARR_API_KEY"):
-        monkeypatch.delitem(h.CFG, k, raising=False)
+    settings(sonarr={"dir": str(tmp_path), "api_key": ""}, radarr={"dir": "/nonexistent", "api_key": ""})
     h.main(["--selftest"])
     out = capsys.readouterr().out
     assert "warning:" not in out and out.rstrip().endswith("selftest ok") and app["calls"] == []
@@ -1178,6 +1502,22 @@ def test_the_custom_script_test_prints_the_bin_warning(app, monkeypatch, capsys)
     h.hook()
     out = capsys.readouterr().out
     assert out.startswith("arr-media-guard: warning: Radarr has no recycle bin") and out.endswith("arr-media-guard: Test ok\n")
+
+
+def test_the_custom_script_test_fails_when_the_api_or_a_root_folder_fails(app, monkeypatch, capsys):
+    """The exit code fails the app's Test, as the listener's 500 does. A broken policy fails it too, see
+    test_a_test_event_fails_when_no_policy_loaded."""
+    env_event(monkeypatch, {"radarr_eventtype": "Test"})
+    app["api"]["rootfolder"] = urllib.error.URLError("refused")
+    with pytest.raises(SystemExit) as ex:
+        h.hook()
+    assert str(ex.value) == "arr-media-guard: the Radarr API did not answer: URLError: <urlopen error refused>"
+    app["api"]["rootfolder"] = [{"path": app["movies"]}, {"path": "/nonexistent/movies"}]
+    with pytest.raises(SystemExit) as ex:
+        h.hook()
+    assert str(ex.value) == ("arr-media-guard: this script does not see the root folders /nonexistent/movies. Mount the media at the app's "
+                             "paths, or set RADARR_PATH_MAP or PATH_MAP")
+    assert "Test ok" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("path", ["config/mediamanagement", "rootfolder"])
@@ -1210,9 +1550,9 @@ def test_a_recycle_bin_beside_the_media_gives_no_warning(app):
 
 def keep_on(monkeypatch, tmp_path):
     """KEEP_REPLACED on, with the top of the mount at tmp_path. Returns replaced_root()."""
-    monkeypatch.setattr(h, "KEEP_REPLACED", True)
+    monkeypatch.setattr(h, "CFG", dataclasses.replace(h.CFG, keep_replaced=True))
     monkeypatch.setattr(h, "mount_top", lambda f: str(tmp_path))
-    return str(tmp_path / h.RECYCLE_DIR)
+    return str(tmp_path / h.CFG.recycle_dir)
 
 
 def test_a_grab_post_links_the_files_the_grab_may_replace(server, app, monkeypatch, tmp_path, capsys):
@@ -1285,7 +1625,7 @@ def test_keep_replaced_says_where_the_grab_links_go_when_the_mount_top_is_not_wr
     monkeypatch.setattr(h.os, "access", lambda p, mode, **k: False if str(p) == str(tmp_path) and mode & os.W_OK else real(p, mode, **k))
     movies, tv = os.path.join(str(tmp_path), "movies"), os.path.join(str(tmp_path), "tv")
     assert h.bin_warnings("sonarr") == [
-        f"uid {os.getuid()} and gid {os.getgid()} cannot write in {tmp_path}, so the hook keeps the grab links of {r} in {r}/{h.RECYCLE_DIR}. "
+        f"uid {os.getuid()} and gid {os.getgid()} cannot write in {tmp_path}, so the hook keeps the grab links of {r} in {r}/{h.CFG.recycle_dir}. "
         "Sonarr's Library Import lists that folder as unmapped. Do not import it." for r in (movies, tv)]
     assert not [n for r in (movies, tv) for n in os.listdir(r) if n.startswith(".link-probe-")]
 
@@ -1323,7 +1663,7 @@ def test_a_recycle_bin_the_hook_does_not_see_warns(app):
 
 
 @pytest.mark.parametrize("case", ["no bin", "not here", "other file system"])
-def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in(app, monkeypatch, tmp_path, case):
+def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in(app, monkeypatch, settings, tmp_path, case):
     keep_on(monkeypatch, tmp_path)
     app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
     if case == "other file system":
@@ -1334,19 +1674,18 @@ def test_with_keep_replaced_working_a_bin_warning_says_the_hooks_copies_stand_in
     (w,) = h.bin_warnings("radarr")
     assert w.endswith(" The hook keeps its own copy of each file an upgrade replaces, so the restore after a bad upgrade still works.")
     assert "cannot" not in w and "needs a rename" not in w
-    monkeypatch.setattr(h, "KEEP_DAYS", 0)   # keeping nothing, the bin warning says so again
+    settings(keep_days=0)   # keeping nothing, the bin warning says so again
     w0, w1 = h.bin_warnings("radarr")
     assert w0 == "KEEP_REPLACED is on, but KEEP_ORIGINALS_DAYS is 0, so the hook keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0."
     assert "still works" not in w1
 
 
-def test_the_test_event_and_the_selftest_print_the_keep_warnings(server, app, monkeypatch, tmp_path, capsys):
+def test_the_test_event_and_the_selftest_print_the_keep_warnings(server, app, monkeypatch, settings, tmp_path, capsys):
     keep_on(monkeypatch, tmp_path)
     app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
     code, text, _ = server("POST", "/radarr", {"eventType": "Test"})
     assert code == 200 and "Warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab" in text
-    monkeypatch.setitem(h.CFG, "RADARR_API_KEY", "k")
-    monkeypatch.setitem(h.CFG, "SONARR_DIR", "/nonexistent")
+    settings(radarr={"api_key": "k"}, sonarr={"dir": "/nonexistent"})
     capsys.readouterr()
     h.main(["--selftest"])
     out = capsys.readouterr().out

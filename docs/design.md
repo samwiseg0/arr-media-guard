@@ -1,13 +1,13 @@
 # Design
 
-arr-media-guard is a Sonarr and Radarr Custom Script connection. On every import and upgrade it
-makes the right audio track play first and sets the subtitle defaults to match. It checks that the
-audio plays and the video decodes, and it re-grabs a file that is certainly broken. The same script
-backfills the library, scans it for broken files and hunts for releases with English subtitles.
+arr-media-guard runs on every Sonarr and Radarr import and upgrade, through a Custom Script
+connection on a host or a Webhook connection in Docker. It makes the right audio track play first and sets the subtitle defaults to match. It checks that the
+audio plays and the video decodes, and it re-grabs a file that is certainly broken. The same command
+backfills the library and scans it for broken files. A second command hunts for releases with English subtitles.
 Some releases of English films carry a foreign default audio track, and Plex plays the default.
 
-This file says what each rule does and why it exists. The README covers the install, the env file,
-the policy file and the app connection.
+This file says what each rule does and why it exists. The README covers the install, the env file
+and the app connection. policy.md covers the policy file.
 
 - A *job* is one imported file. The hook queues it, and a *worker* runs it.
 - To *hear* a track is to let language detection name its spoken language.
@@ -23,7 +23,7 @@ the forced flag of an English subtitle that holds the full dialogue, and it fixe
 "Conversion". It remuxes a broken Matroska header, see "Header repair". It skips a hardlinked file,
 because an edit would also change the download client's copy.
 
-The rules are in `arr_decide.py`. The data they read is in the policy file, so most new cases need
+The rules are in `arr_media_guard/decide.py`. The data they read is in the policy file, so most new cases need
 only a policy change. A decision has four steps.
 
 **1. Classify each track.** Every audio and subtitle track gets a language, a confidence and a role.
@@ -160,9 +160,9 @@ does not wait `PLEX_QUIET` for each file.
 
 **A folder scan.** A renamed file is not in Plex until Plex scans its folder. So a conversion or a
 restore under another name queues a partial scan of its one folder. Plex's work after an analyze
-shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section. The worker reads
-the decision log for this, as `--plex-flush` does, so it also waits for a backfill's analyzes. A backfill writes the
-decision line of an analyzed file before its `PLEX_PACE` pause. After logrotate, the reader finishes `LOG.1` first.
+shows no activity, so the scan also waits `PLEX_SCAN_AFTER` after the last analyze in its section. Each analyze line
+of the decision log also stores its time in the state store, so the worker and `--plex-flush` wait for a backfill's
+analyzes too. A backfill writes the decision line of an analyzed file before its `PLEX_PACE` pause.
 An analyze waits while a folder scan of its section is pending.
 
 ## Alerts
@@ -171,24 +171,47 @@ Every alert is a Discord embed to `DISCORD_WEBHOOK`, one per file and problem. T
 the app and `INSTANCE`. The embed says the problem and what the hook did, and the footer shows the
 TMDB state. Red is broken audio, corrupt video, wrong content or a damaged source. Amber is every
 other alert. Green is a clean scan summary. Mentions are off, and the secrets are masked. A marker in
-`STATE_DIR/alerts/` stops a repeat, and an upgrade to a file of another size alerts again.
+the state store stops a repeat, and an upgrade to a file of another size alerts again.
 
 | Kind | Fires when |
 | --- | --- |
-| Language | No main audio track is English, the original language or a language TMDB lists. |
-| Runtime | The trusted duration is far off the listed runtime, see "Metadata checks". |
-| Duration | The header duration disagrees with the size or the other duration sources. The size check trusts BPS tags only from mkvmerge, because ffmpeg copies stale tags. Else it allows 50 Mbit/s up to 1080p and 150 above. |
-| Content | The evidence adds up to a re-grab. The title says "would re-grab" when `REGRAB` does not list `content`. |
-| Audio, Video | See "Broken audio" and "Corrupt video". |
-| Edit | mkvpropedit failed, or the second probe shows the old flags. |
-| Damaged source | The conversion of an import shows a damaged source, see "Damaged source". |
-| Repack, Header | A conversion or a header repair failed, and the original stays. |
-| Subtitle, Cut | A subtitle runs far past the end. It is not SubRip, or the file may be cut. |
-| Subtitle language | A subtitle's text reads as another language than its tag, and nothing else backs a new tag. |
-| Policy | The policy file is missing or does not load. |
+| `language` | No main audio track is English, the original language or a language TMDB lists. |
+| `runtime` | The trusted duration is far off the listed runtime, see "Metadata checks". |
+| `duration` | The header duration disagrees with the size or the other duration sources. The size check trusts BPS tags only from mkvmerge, because ffmpeg copies stale tags. Else it allows 50 Mbit/s up to 1080p and 150 above. |
+| `episode` | The release names another episode than the one Sonarr imported it as. |
+| `content` | The evidence adds up to a re-grab. The title says "would re-grab" when `REGRAB` does not list `content`. |
+| `audio`, `video` | See "Broken audio" and "Corrupt video". |
+| `edit` | mkvpropedit failed, or the second probe shows the old flags. |
+| `damage` | The conversion of an import shows a damaged source, see "Damaged source". |
+| `repack`, `header` | A conversion or a header repair failed, and the original stays. A conversion a stopped run left alerts as `repack` too. |
+| `subtitle`, `cut` | A subtitle runs far past the end. It is not SubRip, or the file may be cut. |
+| `sublang` | A subtitle's text reads as another language than its tag, and nothing else backs a new tag. |
+| `submatch`, `subtiming` | A subtitle does not match the audio, or its times are off and stay, see "Subtitle match". |
+| `policy` | The policy file is missing or does not load. |
 
 A fault that the second check did not find again is amber, "not confirmed". A missing or rejected
 TMDB key posts one embed a day. A 429 from Discord waits `retry_after` and retries once.
+
+**One output model.** The checks and the steps keep codes and facts. A finding is `{"kind": <kind>, ...facts}`, and its
+kind is the alert kind above. A finding the hook acted on holds the action, `{"code": <code>, ...facts}`. `report.py`
+words them, with one template per finding kind, per action code and per sentence of a subtitle alert.
+`report.render(record, target, tense)` gives each output of one decision:
+
+| Target | Output |
+| --- | --- |
+| `log` | the JSON decision line, with the text of each finding in `alerts` |
+| `logfmt` | the syslog summary, see "Logs" |
+| `embed` | one Discord embed per finding |
+| `cli` | the line a backfill prints for the file |
+
+The tense is `planned` for a dry run and `done` for an apply, so a dry run says what `--apply` would do. The decision
+line of a dry run says the same as its CLI line.
+
+The action codes are `regrabbed`, `restored` (a manual import's old file came back), `searched`, `deleted`,
+`would_regrab`, `unconfirmed`, `capped`, `no_grab`, `failed`, `dry_run` and `no_policy`. The title of a re-grab says
+"old file restored" when the job's own old file came back. Each sentence of a `submatch` or `subtiming` finding has a
+code too: `removed`, `stays`, `sidecar`, `converted_sidecar`, `converted_track`, `sidecar_left`, `off`, `not_retimed`,
+`check_times`, `check_flash` and `sweep`. The codes are stable, and the words may change.
 
 ## Broken audio
 
@@ -229,17 +252,17 @@ sample past the real end decodes nothing.
 
 A gap of over 10 seconds in the video gives no verdict. One stray packet or a timestamp wrap makes
 such a gap in a good file. A silent late sample counts as end credits when every subtitle ends before it and a text
-subtitle has 4 or more events a minute. A whole-file read may use 220 of the job's 300 seconds. The
-hook skips a file too large for that at `READ_RATE`, and a scan reads it later with no time limit.
+subtitle has 4 or more events a minute. A whole-file read may use at most 80 of the job's 300 seconds,
+because the video checks keep 220. The hook skips a file too large for that at `READ_RATE`, and a scan reads it later with no time limit.
 
 **The re-grab.** A certain fault skips the flag edit. A download is one unit. When the app has a
 grab record, the worker samples every file of the download that is still in the library. It deletes
 each broken one, monitors the items again, and then marks the grab failed once. The app searches at
 once and would reject the replacement while a broken file is on disk, so the order matters. A delete
 goes to the app's recycle bin, and an upgrade first gets its old file back, see "Restore after a bad
-upgrade". `units.json` keeps each download for 7 days. `REGRAB_CAP` (30) limits the re-grabs per app
+upgrade". The state store keeps each download for 7 days. `REGRAB_CAP` (30) limits the re-grabs per instance
 a day, and a season pack counts once. Broken audio, wrong content, a damaged source and corrupt video
-share that one count in `regrabs.json`, and 0 turns every re-grab off. Past the cap, or with no grab
+share that one count, and 0 turns every re-grab off. The count and its check run in one transaction. Past the cap, or with no grab
 record, the worker only alerts. `REGRAB` lists the kinds that re-grab, `audio,video` by default. A
 kind it does not list still gets the grab record, the cap and the second check. The worker then logs
 `would_regrab` for wrong content, posts "would re-grab" and deletes nothing.
@@ -330,7 +353,7 @@ lists and that is not on disk gets a line too. An error after the first link rem
 the grab, so no link stays without its record. The Grab answer is always ok, and an error only logs.
 The hook keeps the links in `.<NAME>-recycle`, in the folder that "Kept originals" describes.
 
-`STATE_DIR/kept-replaced.json` holds one record per link. A record names the old path, the kept
+The state store holds one record per link. A record names the old path, the kept
 path, the grab's download id, the time and the inode. The import that replaces the old path claims
 the records of its own grab, or of a grab with no download id. A restore takes the copy only when
 the app's bin has none it can use, and only for the import that claimed it. A usable bin copy wins.
@@ -362,41 +385,54 @@ volume.
 
 ## How it runs
 
-The app waits for the hook to exit. The hook answers the Test event at once. On an import or an
-upgrade it writes one job file into `STATE_DIR/queue/`, forks a worker if none runs, and exits 0.
+The app waits for the hook to exit. The hook answers the Test event with the checks of
+`runner.app_check()`: the policy loaded, the app's API answers with its key, and the script sees each
+root folder. A failed check exits 1, so the Test fails, as the listener's Test does. A recycle bin
+warning only prints. On an import or an upgrade it puts one job into the queue of the state store, forks
+a worker if none runs, and exits 0.
 `worker.lock` keeps one worker. The worker runs the queue oldest first and checks it once more after
 it drops its lock, so no job is lost. A job older than a day is dropped.
 
 `HOOK_WORKERS` (1) sets how many jobs run at a time. Set it to about the cores the host can spare.
-With more than 1, the worker claims each job by an atomic rename into `claimed/`, forks one process
-per job, and sends every Plex analyze itself, so the idle-section gate holds.
+With more than 1, the worker claims each job by one change in the state store, forks one process
+per job, and sends every Plex analyze itself, so the idle-section gate holds. A season pack of 200
+episodes runs at most `HOOK_WORKERS` processes at a time.
 
 **Time limit.** A job has 300 seconds from the file lock to mkvpropedit. mkvpropedit has no limit,
-because a kill mid-write can break the header. The limit raises `arr_meta.OutOfTime`, because a
-network handler would swallow a TimeoutError. The metadata checks after the edit get a new 300
-seconds. Every error is logged, and the import never sees one.
+because a kill mid-write can break the header. A remux, its proof and its swap have none either, and
+the checks after a remux get a new 300 seconds. The limit is a deadline, `content.DEADLINE`. Each
+subprocess, HTTP call and lock wait under it ends at it, and a long read checks it between two
+blocks. It raises `content.OutOfTime`, because a network handler would swallow a TimeoutError. The
+metadata checks after the edit get a new 300 seconds. Every error is logged, and the import never
+sees one.
 
-**The file lock.** Every job, backfill and scan takes `STATE_DIR/lock` and waits an hour at most.
+**The file lock.** Every job, backfill and scan takes `STATE_DIR/lock`. An import job waits an hour at most.
 Reads take it shared. An edit, a re-grab and a conversion's swap take it exclusive. Every taker
 first passes `lock.gate`, so a waiting edit stops new readers and waits only for the reads in
 flight. Linux flock gives a waiting exclusive lock no preference, so without the gate a scan could
 keep an edit out. flock cannot upgrade a lock, so a job that takes it exclusive checks the file's
-inode, size, mtime and `units.json` entry again, and runs again when one changed. Hearing holds no
-lock, because it may wait for the one model.
+inode, size, mtime and the re-grab unit of its download again, and runs again when one changed. Hearing holds no
+lock, because it may wait for the one model. A conversion in a job process builds the new file under the shared lock,
+as a backfill worker does, so the other jobs keep checking and converting. The rest of that job runs under the
+exclusive lock. Under the shared lock a conversion creates its temp file only when none is there. A second job of the
+same file finds it, lets the lock go, and waits until the first job's swap removes it, `SWAP_POLL` (600) seconds at most.
+It then runs again under the exclusive lock. A temp file that a killed job left costs that wait once, and the run under
+the exclusive lock writes over it. The swap also checks that the temp file is still the one its proof read.
 
 **One download.** A re-grab deletes the broken files of the whole download. The jobs of a download
 run their checks side by side. A job is *settled* when its checks are done and no re-grab can come
 from it. Before a job edits or re-grabs, it waits until every older job of the download is settled.
-So a download ends the same way as with one worker.
+So a download ends the same way as with one worker. A conversion's swap does not wait. A re-grab that runs during the
+app's import of the new file skips that file, and the conversion's job then checks the new file itself.
 
 **Deep analysis.** With `SUBTITLES=deep`, an import job queues one deep analysis job for its file in
-`STATE_DIR/deep-analysis/`, named by the path, so a newer import of the path replaces it. The worker runs one only when no
+the state store, named by the path, so a newer import of the path replaces it. The worker runs one only when no
 import job waits, one at a time per host, and never drops one by age, only when its file is gone. The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
 two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
 job waits in the queue. It also stops for a waiting import job after the whole-file read, before each read and each fit
 of a track, and before the remux. It then goes back to its queue. Its next run finds the words heard so far in the
-cache, and the whole-file read in a `.read` file beside the job. With `HOOK_WORKERS=1` an import job so waits at most
+cache, and the whole-file read in the state store. With `HOOK_WORKERS=1` an import job so waits at most
 for one step: the whole-file read of one film, the read or fit of one track, one pair of windows, or one remux. With
 more workers it runs in a job process of its own. A deep analysis decides with the inputs its import stored in the job:
 the original language, the release name, the kids flag and the rest, so it asks no app. It never hears the language
@@ -405,11 +441,39 @@ track whose words do not match the audio loses its default and forced flags.
 
 **Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
 job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
-inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending Plex analyzes go to
-`plex-pending.json` for the next worker. With `KillMode=process` on the app's unit, a stop of the
+inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending Plex analyzes go into
+the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the
 app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
 by the file's id. A 404 or another item drops the job as `file_gone`.
+
+## State
+
+`STATE_DIR/state.sqlite` holds the state: the job queue and the claimed jobs, the re-grab units and
+counts, the records of the kept files and their folders, the pending conversions and Plex analyzes,
+the `--plex-later` folders, the alert markers, the TMDB cache, the scan progress, the subtitle
+hunter's tries, and the fields of each decision line that the audit reads. It is one SQLite file
+in WAL mode, from Python's own `sqlite3`. A change runs in one short transaction. A transaction waits 60 seconds for another writer, or until the job's
+time limit. The app waits for the hook and the listener, so each of their transactions waits 2
+seconds at most, and a hook run waits 2 seconds in all. When the store does not take a job in that
+time, the job goes into `STATE_DIR/queue/` as a file, and the worker moves it into the store. The
+check for waiting work only reads, so it never waits. So a busy store never slows or fails an
+import. A re-grab unit keys on the instance and the download id, because two instances can grab one
+torrent under one download id.
+
+The code never reads the decision log back. Each line the readers need also fills the store: an
+`editing` line without its `edited` line, the time of each Plex analyze per section, and the fields
+of each decision line that the audit and `--force-convert` read. The store keeps decision rows and
+editing marks for 14 days, two weekly rotations of the log. `--audit --since` reads that window.
+A store error loses such a fact and never stops the job.
+
+These stay files of their own: the decision log, `status.json` (a monitoring agent reads it),
+`lid.sqlite` (the language detection reads it), the locks (`lock`, `lock.gate`, `lid.turn`,
+`lid.turn.gate`, `worker.lock`, `subhunt.lock`), and the lists for a person: `convert-<app>.txt` and
+the scan's `<kind>-scan-<app>.txt`, or `<kind>-scan-<app>-ids.txt` for a scan with `--ids`.
+
+In Docker, `STATE_DIR` is `/config/state`, a named volume of its own. SQLite in WAL mode needs a local disk, and
+`/config` may sit on a network share.
 
 ## Memory
 
@@ -431,15 +495,17 @@ The decision log at `LOG` gets one JSON line per file a run looks at. It holds t
 every track as classified, each hearing, the plan with its rules and reason codes, and the undo
 command. It also holds the audio and video verdicts, the metadata evidence, and what a re-grab, a
 conversion, a header repair and Plex did. `outcome` holds the outcome code, `result` a sentence, and
-`recheck` the plan right after an edit, which the audit reads.
+`recheck` the plan right after an edit, which the audit reads. `findings` holds each finding with its
+facts and its action, `alert_kinds` their kinds, and `alerts` their text, see "Alerts". A job whose file the re-grab of
+its download deleted logs `deleted_with_download`, with the fault kind of that re-grab in `fault`.
 
-The outcome, reason and Plex codes are stable, so queries and alerts can match on them. The outcome
-codes come from `OUTCOMES` in the script. The reason codes come from the `reason()` calls in
-`arr_decide.py` and from the script's header and restore steps. An `editing` line with the undo goes
+The outcome, reason and Plex codes are stable, so queries and alerts can match on them. Each step
+that makes a result gives its outcome code with it, and a result with no code logs `other`. The
+reason codes come from the `say()` calls in
+`decide.py` and from the header and restore steps. An `editing` line with the undo goes
 out before each edit, so a crashed edit still has a record. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
-the log weekly with compression, and keep `delaycompress`. A folder scan reads the rest of `LOG.1` after a rotation,
-and plain `compress` has already made it `LOG.1.gz`.
+the log weekly with compression. The code never reads the log back, see "State".
 
 Each decision also goes to syslog as one logfmt line with the tag `NAME`. It holds no path, no track
 list and no secret. The app key is `arr`, because a log store such as Loki often puts the syslog tag
@@ -490,14 +556,14 @@ originals past their age and writes the policy status, see "Status file".
 
 `--check-audio` and `--check-video` scan every file of the app the way the worker checks an import.
 A scan never deletes, edits or re-grabs. It checks `SCAN_WORKERS` files at a time, and each worker
-pauses 2 seconds before a file. It keeps its place in `STATE_DIR`, so it resumes over days, and
-`--restart` starts a new pass. Problems go to a list file and one summary embed. On NFS, idle I/O
+pauses 2 seconds before a file. It keeps its place in the state store, so it resumes over days, and
+`--restart` starts a new pass. Problems go to a list file, `STATE_DIR/<kind>-scan-<app>.txt`, and one summary embed. On NFS, idle I/O
 priority has no effect on the file server, so the worker count and the pause are the throttles.
 
 ## Reverse an edit
 
 Each edit logs `undo`, the complete mkvpropedit command with the old values, before mkvpropedit
-runs. The selectors are track UIDs, so they hold when the track order changed. The README shows how
+runs. The selectors are track UIDs, so they hold when the track order changed. monitoring.md shows how
 to run the undo of a file's last edit. A later import of the same item runs the hook again. Delete the connection in the app to stop that.
 
 ## Conversion
@@ -607,7 +673,11 @@ names, and a later rescan or rename could link a subtitle to the wrong episode a
 extra whose name maps to other episodes still refuses the file, and the refusal names the extra.
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
-a new name, a `converting` line and an entry in `convert-pending.json` come first. The extras move
+a new name, a `converting` line and a pending entry in the state store come first. The entry names the process and
+its pid namespace. A later run reports an entry whose process is gone. The pid of another namespace, as of a
+container beside the host, means nothing here, so such an entry counts as running for one day
+(`JOB_MAX_AGE`), and as stopped after that. A restart of a container or an LXC gives a new namespace, and the
+day keeps such an entry from hiding for ever. The extras move
 into `.<NAME>-convert`, the new file is linked in as `<base>.mkv`, and the original moves to a held name in
 `.<NAME>-convert`. The app then takes the new file. Only then are the original and the sidecars deleted. When a
 step fails after that, `convert_undo()` reads the app first and never deletes a file the app lists. A
@@ -617,15 +687,28 @@ failure removes the temp file last, after the extras are back, and then the empt
 quality, languages, release group and indexer flags, so the app never parses the new name. The file
 is in the item's folder, so the app neither moves nor renames it. The hook puts back the scene name
 and Radarr's edition, because only an import from a download sets them. The apps score custom
-formats on the scene name, else the download path's name, else the file name. So a new name that
-would lose a format scoring above 0, or gain one below 0, refuses the conversion. On Radarr the hook
+formats on the scene name, else the download path's name, else the file name. Sonarr's API leaves out
+the download path, so the hook reads it from the import history: the row with the record's file id, or
+for a row an older Sonarr wrote with no file id, the row of one of its episodes within 60 seconds of
+the record's date. So a new name that would lose a format scoring above 0, or gain one below 0,
+refuses the conversion. On Radarr the hook
 reads the record that `movieFileId` names, because `movie/<id>` shows the old record while it stays.
 
 **The extras.** The rescan that removes the old record would send its extras to the recycle bin. So
-the hook reads them from the app's database, because Sonarr 4 has no API for them, and hides them.
-After the import it rescans, waits until the old record's extra rows are gone, and moves the extras
-back. A second rescan links them to the new file. Metadata files stay in place, because the app
-writes them again.
+the hook hides them during the swap. Radarr lists them in its `extrafile` API. Sonarr 4 has no API for
+them, so the hook follows Sonarr's own rule. A rescan tracks each file under the series folder that is
+no video, sits outside the folders a scan leaves out, and whose name parses as the episodes of one
+file. So the hook walks the series folder and asks Sonarr's parse API about each such file. A file
+beside the video that starts with its base name needs no parse. This covers the sidecars of any
+program, such as a bonus PDF in a sibling folder. Metadata files stay in place, because the app writes
+them again. On Sonarr these are the names its metadata writers claim: `-thumb.jpg`, `.xml`, `.jpg`,
+`.metathumb`, and an `.nfo` with a Kodi tag.
+
+After the import the hook rescans. The extras go back once the rescan completed and the app no longer
+lists the old record. Radarr moves the extras of a dropped record to the bin in a task after the
+command, so the hook also waits until Radarr's API lists no extra of the old record. Sonarr does that
+inside the command, before the command completes (`ExtraFileService`, an `IHandle`). A second rescan
+links the extras to the new file. Radarr's API then reads each link back. Sonarr has no API for that.
 
 **Plex and workers.** A renamed file gets a folder scan. `--plex-later` only lists the folders, and
 `--plex-flush <app>` later sends one scan per library location, which saves the idle waits of a long
@@ -719,12 +802,12 @@ decision runs on the new file, and the app rescans the item. A backfill dry run 
 ## Kept originals
 
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for
-`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one. The original is
+`KEEP_ORIGINALS_DAYS` (7). 0 drops it at once. A conversion keeps nothing, except a forced one and one that leaves out
+a subtitle track that does not match, see "Subtitle match". The original is
 hard-linked to `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. A hard link needs no space and never
 leaves the path missing. `keep_root()` picks the folder, the same way for `.<NAME>-recycle`:
 
-1. The top of the mount that holds the file, when `.<NAME>-originals` exists there and is writable. Every install
-   before 1.7.0 keeps its folder there.
+1. The top of the mount that holds the file, when `.<NAME>-originals` exists there and is writable.
 2. The mount top, when it is writable. With the app root folders and the Plex sections below the mount, nothing
    scans the folder.
 3. A writable `.<NAME>-originals` that exists on the path from the mount top down to the file's folder, the highest
@@ -736,7 +819,7 @@ leaves the path missing. `keep_root()` picks the folder, the same way for `.<NAM
 Each folder sits on the file's mount, so the hard link works. A folder whose real path is on another mount, as one
 above a symlink to a share, never comes in. The dot hides it from the apps' disk scans and Plex. When the app renames
 an item folder that holds such a folder, the folder moves with it, and the prune and the restore no longer find it.
-Sonarr's Library Import lists a hidden folder at a root folder's top level as unmapped. `STATE_DIR/kept-folders.json`
+Sonarr's Library Import lists a hidden folder at a root folder's top level as unmapped. The state store
 records each folder the hook keeps a file in. The nightly audit and the worker's daily prune clear those folders too,
 and a folder of another name never.
 
@@ -745,7 +828,7 @@ and some container or Windows mounts. The original is then copied, with its mode
 plus 1 GB free, else the fix is skipped and says why. It is written under a hidden name, compared with the original
 by size and hash, and only then renamed to the kept name. So the swap waits for a whole copy, and a crash leaves no
 file that looks kept. The log and the report of `--sub-time` say "copied" instead of "hard-linked". Any other link
-error skips the fix, as before. To undo a repair, move the kept file back and rescan the item.
+error skips the fix. To undo a repair, move the kept file back and rescan the item.
 `NAME` names the hidden folders, `.<NAME>-originals`, `.<NAME>-recycle` and `.<NAME>-convert`. A `NAME` with other
 characters than letters, digits, `.`, `_` and `-` fails `--selftest`, and the script uses `arr-media-guard`.
 Each keep and the nightly audit remove the time folders older than the setting.
@@ -757,11 +840,11 @@ that has a full English subtitle. It handles Radarr only, because an episode nee
 release that fails must cost a download, never the current file. So the hunter downloads outside
 Radarr, checks the file, and keeps a hard link of the old file until the new one is in place.
 
-`--subhunt radarr --ids 101` lists the ranked candidates, and `--apply` downloads, checks and
+`arr-media-guard-subhunt radarr --ids 101` lists the ranked candidates, and `--apply` downloads, checks and
 imports. The hunter needs a Newznab indexer, such as NZBHydra2, and a SABnzbd download client in
-Radarr. It reads their keys from Radarr's database, because the API masks them. SABnzbd's download
-path must be the path this script sees. Radarr gets that path through Radarr's path map, unchanged
-when no pair covers it.
+Radarr. It reads their URLs from Radarr's API. The API masks their keys, so the hunter reads them from
+`SABNZBD_API_KEY` and `NEWZNAB_API_KEY`. SABnzbd's download path goes through Radarr's path map, so
+SABnzbd must see the downloads at the path Radarr sees. Radarr gets the path back through the same map.
 
 **Search and rank.** Each movie gets one indexer query by IMDb id. A result must carry this movie's
 IMDb tag, else Radarr must map its name to this movie. The tag comes first, because Radarr can map a
@@ -776,13 +859,13 @@ passes when it has an English full or SDH subtitle and runs within 10 percent of
 Its main audio must be in the original language and decode in three samples.
 
 **Import.** The hunter stops when Radarr changed the movie's file meanwhile. It hard-links the
-current file to a hidden keep name, and the state file records the link first. The import is a
+current file to a hidden keep name, and the state store records the link first. The import is a
 ManualImport in copy mode, because a move can fail on a network share after Radarr deleted the old
 file. When the new file landed, the hunter removes the link and the download. Else the link goes
 back, the movie is marked `import_failed`, and a red embed asks for a rescan. A keep link that still
 exists stops every later run for that movie.
 
-**Give up.** A failed candidate goes into `STATE_DIR/subhunt-radarr.json`, and Radarr's blocklist
+**Give up.** A failed candidate goes into the hunter's state in the state store, and Radarr's blocklist
 stays as it is. When every candidate fails, the movie is marked `no_subbed_release` and keeps its
 file. One amber embed names the other option, an external `.srt` from Bazarr or OpenSubtitles.
 `--force` hunts again. Before the first apply, check that a hard link works on the media share
@@ -791,7 +874,7 @@ long. A later Radarr upgrade can replace the hunted file, so run the hunter agai
 
 ## Metadata checks
 
-`arr_meta.py` checks the app's metadata before a language or runtime alert trusts it. It also adds
+`content.py` checks the app's metadata before a language or runtime alert trusts it. It also adds
 up the evidence for a wrong-content re-grab. A correct file must never be deleted. The hook runs the
 checks after the flag edit.
 
@@ -802,8 +885,7 @@ checks after the flag edit.
   outage costs one timeout per run, and a failure reads as unknown. By default the module reads
   Radarr's bundled TMDB key from `/opt/Radarr/Radarr.Common.dll`. `TMDB_TOKEN` overrides it. The
   `tmdb` code of a record is `found` (TMDB returned the item's record), `no_record`,
-  `tmdb_unavailable`, `tmdb_token_missing` or `tmdb_token_rejected`. Records from before 1.3.0 say
-  `ok` for `found`, and every reader takes both. The syslog line says `not_asked` when the run asked
+  `tmdb_unavailable`, `tmdb_token_missing` or `tmdb_token_rejected`. The syslog line says `not_asked` when the run asked
   TMDB nothing, as in a conversion backfill. `status.json` and the nightly audit keep `ok` for a day
   or a check where TMDB works. A cached answer never counts as live, so it never hides a dead key.
 - **Duration.** A duration is trusted when two sources agree within 30 seconds or 2 percent. The
@@ -825,7 +907,11 @@ checks after the flag edit.
   download folder can be gone when the worker runs. The Webhook gives the folder as
   `episodeFile.sourcePath`, and Sonarr's path map maps it. With a map set, the listener reads only
   under the map's local folders. An NFO counts only when it is a plain file whose name is the
-  video's, or the one NFO in a folder named like the video or the release. A file with no scene name
+  video's, or the one NFO in a folder named like the video or the release. When the job holds no NFO
+  title, the worker reads the release NFO that Sonarr copied beside the video. Sonarr copies it when
+  its Import Extra Files setting lists `nfo`. It names it `<name>.nfo`, or `<name>.nfo-orig` when a
+  metadata writer such as Kodi writes its own `<name>.nfo`. A Kodi `.nfo` is skipped. A backfill and
+  `--sub-time` read it the same way. A file with no scene name
   gives the title of Sonarr's own file name, and the alert says "the file name's title", because
   Sonarr wrote that name in the order it had at the import. The check then reads the series'
   episodes, one call per file, and one per series in a backfill. A file that no episode points to
@@ -864,7 +950,7 @@ cache, and asks TMDB through an empty cache.
 
 ## Audio language detection
 
-`arr_lid.py` hears the spoken language of one audio track. The hook calls it for a main audio track
+`lid.py` hears the spoken language of one audio track. The hook calls it for a main audio track
 whose language is in doubt, see "What it changes" and "Language tags".
 
 **How it hears.** ffmpeg cuts 30-second samples, mono at 16 kHz, at 25, 50 and 75 percent, which
@@ -904,13 +990,13 @@ uses detection only when that file exists, so it never uses a half-built install
 ```
 python3 -m venv /opt/arr-media-guard-lid/venv
 /opt/arr-media-guard-lid/venv/bin/pip install --require-hashes --only-binary=:all: -r arr_lid.requirements.txt
-/opt/arr-media-guard-lid/venv/bin/python arr_lid.py --fetch --model-dir /opt/arr-media-guard-lid/models
+/opt/arr-media-guard-lid/venv/bin/python arr_media_guard/lid.py --fetch --model-dir /opt/arr-media-guard-lid/models
 touch /opt/arr-media-guard-lid/ready        # last
 ```
 
 ## Subtitle text
 
-`text_language()` in `arr_decide.py` names the language of a subtitle text. It needs no model and no
+`text_language()` in `decide.py` names the language of a subtitle text. It needs no model and no
 dependency. Each of 18 languages has a list of common dialogue words: English, Spanish, Portuguese,
 French, German, Italian, Romanian, Dutch, Afrikaans, Swedish, Danish, Norwegian, Polish, Czech,
 Slovak, Turkish, Russian and Ukrainian. A word in one list only is a *telling* word. Its answer is the *read* language.
@@ -956,11 +1042,11 @@ order or size than mkvmerge and ffmpeg. The decision log holds each answer in `r
 
 ## Subtitle match
 
-A text subtitle can hold the lines of another episode or another cut, and so can a sidecar. `arr_subsync.py` checks a
+A text subtitle can hold the lines of another episode or another cut, and so can a sidecar. `subsync.py` checks a
 text subtitle against the audio. The owner's rule is "rather no subtitle than a wrong one".
 
 **What it checks.** A SubRip, ASS, SSA, WebVTT or MP4 timed-text track in a full, SDH or dub role, a `.srt` sidecar in a
-conversion, and a `.srt` sidecar beside a Matroska file. Bazarr writes its downloads there. Its language must be the
+conversion, and a `.srt` sidecar beside a Matroska file, where a program such as Bazarr writes its downloads. Its language must be the
 language of a main audio track. The check hears the track that plays when it speaks that language, else the first main
 track that does. A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
 5 minutes are never checked. Nor is Japanese, Chinese or Thai text, which has no spaces between its words, so the
@@ -976,7 +1062,7 @@ ends at its BlockDuration. A sidecar and an MP4 track are read as SubRip text.
 **The hearing.** The check picks two windows of 10 seconds, one between 5 and 25 percent of the file and one between
 75 and 95 percent. So the line through them covers most of the file, and a drift shows. Each window is the place with
 the most cue words, because dense cues mean speech. Song lyrics (♪) do not count, and the test for them runs after the
-tags are gone, because a font colour holds a #. `arr_lid.listen()` hears both windows as one clip, with the pinned
+tags are gone, because a font colour holds a #. `lid.listen()` hears both windows as one clip, with the pinned
 model, greedy decoding, word times and one thread. One clip runs the encoder once, and its chunk is as long as the
 clip, because Whisper's padding to 30 seconds cost decode time. Two windows of 12 seconds cost more to decode on dense
 dialogue, and two of 15 made the encoder run twice. The words are cached by path, size, mtime, stream, model, language and
@@ -1115,8 +1201,8 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   tracks, the sidecars and the flags, and alerts.
 - A sidecar beside a Matroska file that does not match moves into `.<NAME>-originals` as a kept original, with a log line and
   the alert. A sidecar whose times need a fix is written again with new times, as UTF-8, and its original is kept the
-  same way. With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. Bazarr can download the same wrong file
-  again, and the hook does not tell Bazarr. A later check moves it again.
+  same way. With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. The program that wrote it, such as
+  Bazarr, can download the same wrong file again, and the hook does not tell it. A later check moves it again.
 - In a conversion, a sidecar that does not match is not muxed. It moves into `.<NAME>-originals`, and with
   `KEEP_ORIGINALS_DAYS` 0 it stays beside the file. A built-in track that does not match is left out of the remux, and
   the proof leaves it out too. The conversion then keeps the original in `.<NAME>-originals`, as a forced conversion does, and
@@ -1136,7 +1222,7 @@ time limit, 90 seconds at most.
 **Cache and backfill.** `lid.sqlite` also holds each file's verdicts and the size and mtime of its sidecars, with a mark
 when they ask for an action that no apply made yet. A backfill with `--sub-check` skips a file whose verdicts are cached
 for its size and mtime and its sidecars, and ask for nothing more. So a stopped run goes on where it stopped, an apply
-after a dry run still acts, and a new sidecar from Bazarr is checked. `--sub-check` also takes a file with a sidecar
+after a dry run still acts, and a new sidecar from a program such as Bazarr is checked. `--sub-check` also takes a file with a sidecar
 that the flag backfill leaves out. The decision log holds each result in `subcheck`, the remux in `subremux` and the
 sidecar actions in `sidecars`.
 
@@ -1163,7 +1249,9 @@ commentary tracks stay out. The fit reads no words. It compares when the cues sh
 translation that splits or merges lines still fits. It tries each ratio at the offset the cue starts point to, and keeps
 the one where the cues cover the most of the reference's, each cue counted up to 10 seconds. The score is that overlap
 above its mean at ten offsets far from the best, so dense cues do not score by chance. A right pair scores well over
-0.3, and another episode's track or another film's scores near 0. Under 0.3 is a weak fit, which only reports. A fit
+0.3, and another episode's track or another film's scores near 0. A research prototype of lapse's peak sigma scored
+another episode's track almost as high as a right one, so the fit keeps this score. Under 0.3 is a weak fit, which only
+reports. A fit
 then pairs cue starts with reference starts in ten slices of the span, each at its own offset, and the rules of
 "Timing" judge the slices. Every slice must lie within 0.3 seconds of the fix, and a ratio needs a middle slice on its
 line. So a cut, in one step or in several, gives no fix and an alert, and the alert says the track disagrees with its
@@ -1207,7 +1295,7 @@ library would take weeks.
   and mtime, so a file that changed meanwhile is read again under the lock. ffmpeg reads mkvmerge's WebVTT codec id
   as unknown, so such a track stays unread.
 - **The sweep.** `--sub-time` and the deep analysis hear one 10-second window a minute of each track the word check
-  reads, at its densest cues. One arr_lid.py process hears them with the model loaded once, two windows a Whisper run,
+  reads, at its densest cues. One lid.py process hears them with the model loaded once, two windows a Whisper run,
   and each pair is cached like the other hearings. Each row gives the heard words, the overlap, the cues whose first
   word matched and their offset. A row with 3 such cues and 1 second or more off the fitted line alerts when its
   neighbour among such rows is off 1 second or more the same way. A part of the file that is off holds such windows in
@@ -1230,14 +1318,13 @@ before any change, and a dry run says why it knows no original language. An app 
 API key that reads is set up in part, and it fails the same way. A backfill or a scan of an app that is not set up
 stops with one line that names the settings. So do the audit's pruning and the subtitle hunter.
 
-A dry run prints each subtitle alert as `--apply` would act on it. `sub_alerts()` builds the dry texts from the
-remux's codes, and `repack_block()` gives the reason of a skip again. A file with another hard link stays as it is,
-flags included. A keep folder that is not writable names the folder, the uid and the gid of the run, which `PUID` and
-`PGID` set in Docker. When the folder does not exist, creating it is enough. The decision log, an import and `--apply`
-keep the texts of `sub_alerts()`.
-
-A research prototype of lapse's peak sigma scored another episode's track almost as high as a right one, so the fit
-keeps the lift.
+A dry run says each subtitle alert as `--apply` would act on it, in its decision line and its CLI line. The check
+records what `--apply` would do with the remux. `subtitles.remux_block()` then asks `remux.repack_block()` again for the
+reason of a skip. Its code is `remux` for a remux that would run. Else the code names the reason of the skip, one of
+`hardlinked`, `cap`, `space`, `keep_root`, `keep_create` and `keep`. `report.BLOCKS` words each code. A file with another hard link stays as it
+is, flags included. A keep folder that is not writable names the folder, the uid and the gid of the run, which `PUID`
+and `PGID` set in Docker. When the folder does not exist, creating it is enough. An import and `--apply` say what they
+did.
 
 **Centre channel.** Whisper hears the mono mix of all channels. The centre channel alone kept the language verdicts,
 but a subtitle check lost its match where the centre channel was quiet and the mix still held the words. The mix
@@ -1247,7 +1334,7 @@ stays.
 
 The hook records two checks in `STATE_DIR/status.json`, the TMDB key and the policy file. A
 monitoring agent can read the file and alert on a failed check. Zabbix's `vfs.file.contents` item
-with JSONPath preprocessing is one way. `arr_status.py` writes the file.
+with JSONPath preprocessing is one way. `health.py` writes the file.
 
 ```
 {"version": 1, "last_hook_run": 1790000000,
@@ -1261,14 +1348,14 @@ The tmdb status is `ok`, `unavailable`, `token_missing` or `token_rejected`. A f
 `ok` or `failed`. A check never recorded reads `unknown`. `since` is when the status last changed,
 and `checked` is the last check. `error` keeps the last error text after a recovery, cut to 200
 characters with anything that looks like a token replaced. `last_24h` counts each status over the
-last day. `last_hook_run` is the last write by a job, a backfill, an audit or the subtitle hunter.
+last day. `last_hook_run` is the last write by a job, a backfill, `--sub-time`, an audit or the subtitle hunter.
 
 Each write goes through a temp file and a rename under a lock, with mode 0644. A broken file starts
 fresh, and a failed write never stops a job. Give the state directory mode 0751 or wider, so the
 agent can open the file by name. No file there holds a secret.
 
-The policy status goes in at the start of each job and of each `--backfill`, `--audit` and
-`--subhunt` run. `--selftest` records it only with `ARR_MEDIA_GUARD_RECORD=1` in its environment,
+The policy status goes in at the start of each job and of each `--backfill`, `--sub-time`, `--audit` and
+`arr-media-guard-subhunt` run. `--selftest` records it only with `ARR_MEDIA_GUARD_RECORD=1` in its environment,
 and it never moves `last_hook_run`. So an install step can clear a policy problem, and a selftest
 never hides a stopped audit. The TMDB status goes in only after a live TMDB answer. Useful alerts
 are these:
@@ -1282,11 +1369,13 @@ are these:
 
 ## Webhook
 
-A Custom Script connection runs the script inside the app's container. In Docker, that container
+A Custom Script connection runs the command inside the app's container. In Docker, that container
 then needs Python, ffmpeg and mkvtoolnix. So the image runs `arr-media-guard --serve`, an HTTP
-listener in `arr_serve.py`, and each app gets a Webhook connection to it. The listener writes the
-same job file as `hook()`, through `queue_job()`, so the worker, the queue and the checks are one
-code path.
+listener in `serve.py`, and each app gets a Webhook connection to it. `hook()` reads a
+`runner.Event` from the Custom Script variables, and the listener reads the same Event from the
+body. Both queue its job through `queue_job()` and start a worker through `ensure_worker()`, so
+the worker, the queue and the checks are one code path. A Grab goes from the Event to
+`keep_grab()` in both, and a Test runs `app_check()` in both.
 
 **The fields.** The job takes these values. The Webhook body has each field the Custom Script
 variables give, and the listener still asks the API for the path.
@@ -1315,10 +1404,22 @@ listener refuses it and says which triggers to use.
 **Trust.** Each post needs HTTP basic auth, the only auth the Webhook connection sends. The apps
 send it with the first request. The listener refuses a body over 1 MiB before it reads it. It never
 uses the path in the body. The file record must belong to the item the body names, and its path
-must be a plain absolute path that this container sees. An old file must sit in the item's folder,
+must be a plain absolute path. An old file must sit in the item's folder,
 and its recycle bin copy in the app's recycle bin, because a restore renames the copy back over the
 old path. A refusal answers 4xx or 5xx, and the decision log gets a line with source `webhook`. The
 app shows the answer in its Test and in its log.
+
+**No import is lost.** The listener queues a Download even when the app's API fails or this
+container does not see the file, and writes one warning line for it. The app sends a notice once,
+so a refusal would leave the import unchecked. When the API failed, the job holds the body, and
+the worker runs the same checks and lookups when it takes the job. While the API still fails, the
+job's row in the state store takes its next try and its new time in one change, so one row holds the job at every
+moment. It joins the queue at that time, so it never holds
+up the jobs behind it, and no worker runs for it before then. The first wait is a minute, and each
+next one doubles, up to an hour. At the one-day age limit the job is dropped with one error line
+that says the import was never checked. A 404 for the item means the app deleted it, so the job ends
+at once with one error line. A file the container does not see is looked up again by
+its id, as for a file the app moved, see `moved()`.
 
 **Paths.** The image must see the media at the apps' paths, or a path map pairs the two. Each
 program has its own map, `SONARR_PATH_MAP`, `RADARR_PATH_MAP` or `PLEX_PATH_MAP`. An empty one
@@ -1326,27 +1427,33 @@ takes `PATH_MAP`, so a setup from before the three maps works unchanged. A teste
 the need. Sonarr saw TV at `/mnt/TV`, Radarr saw films at `/movies`, and Plex saw them at
 `/mnt/TV Shows` and `/mnt/Movies`. One map cannot pair those with the container's paths.
 
-Each path that crosses to a program uses that program's map, and every Radarr or Sonarr instance
-counts as its app. `arr()` and `arr_write()` map every path in an API answer to the local path, and
+Each path that crosses to a program uses that program's map. An instance of `APP_INSTANCES` has a map of
+its own, see "Instances". `arr()` and `arr_write()` map every path in an API answer to the local path, and
 every path in a query or a body back to the app's path. The subtitle hunter and the conversion
 reach the app through them too. The listener maps the posted file path and the old files of an
 upgrade with the app's map. The Plex lookup, the folder scan and `--plex-flush` map the local path
-to Plex's path. The lists `--plex-flush` reads hold local paths. The app database reads give
-names and relative paths only. The script joins a relative path to a folder from the API, so the
-reads need no map. The hook's Custom Script variables need none either, because a Custom Script
-runs where the app runs. The subtitle hunter takes SABnzbd's download path as a local path. A pair
-matches whole folder names, so `/mnt/TV` never matches `/mnt/TV Shows`, and the longest pair wins.
+to Plex's path. The lists `--plex-flush` reads hold local paths. Radarr's extra files come with
+relative paths, which the script joins to a folder from the API, so they need no map. The hook's
+Custom Script variables need none either, because a Custom Script runs where the app runs. The
+subtitle hunter maps SABnzbd's download path with Radarr's map. A pair matches whole folder names,
+so `/mnt/TV` never matches `/mnt/TV Shows`, and the longest pair wins.
 
 `--selftest` and the listener start check each map against the app root folders. A root folder
 the script does not see warns, with the app's map setting. A root folder that no Plex library
 folder holds or sits in warns, with `PLEX_PATH_MAP`. The check starts from the root folders, so a
 Plex library that holds none of them, such as music or another host's library, never warns. Both
 are warnings only. A deploy may run `--selftest` while a mount or an app is down. The listener must
-start before the apps answer, so it runs the check in a thread.
+start before the apps answer, so it runs the check in a thread. In the same thread it then runs the
+checks of the Test event for each app with an API key, and prints one line per app to the container
+log. It asks an app that does not answer again for 2 minutes. A failed check warns, and the listener
+keeps running. A policy that did not load warns once, and each app is still checked. The path check
+at the start leaves an app that does not answer and a root folder it does not see to this check, so
+each warns once. Each API call of the Test checks waits at most 10 seconds, so a hung app fails the
+Test fast.
 
-The script reads `config.xml` and the app's database in `RADARR_DIR` or `SONARR_DIR`,
-`/var/lib/<app>` by default, so the compose file mounts the app's config folder there, read-only. SQLite reads a live WAL database through that mount from another container. On a
-test Radarr, the image read a movie file row that sat only in the WAL.
+The image reads the apps only through their APIs, so it needs no app config folder, and the env file
+holds each API key. No feature reads an app's database. A database shared between hosts is not safe,
+and a container on another host keeps every feature.
 
 **Requests.** The listener serves 32 requests at once on a pool of threads. Each request has 10
 seconds for its headers and body together, so a client that sends one byte at a time loses its
@@ -1361,20 +1468,72 @@ build for 465 seconds, and a Sonarr import notice failed.
 waits and no worker holds `worker.lock`. So a job queued while a worker was stopping, or left by a
 stopped container, still runs. The worker is a new program in its own session, `arr-media-guard
 --serve --worker`, because a fork would copy the listener's threads and a lock one of them held. It
-reads the env file and the policy at its start. In the image, tini is PID 1 and passes SIGTERM, as
+reads the env file and the policy at its start. A program run as `--serve` sets `config.SERVE`, so
+the logfmt summary of each decision line also goes to stdout, the container log. The nightly audit
+runs as `--serve --audit` for the same reason. In the image, tini is PID 1 and passes SIGTERM, as
 `docker stop` sends it, to the listener. The listener sends it on to the worker's process group and
 waits for it. A job that has not written goes back to the queue, and a flag edit or a re-grab ends
 first, see "Crashes and stops".
 
-**Daily jobs.** A native install runs the nightly audit from a systemd timer, and the audit removes
+**Daily jobs.** A host install runs the nightly audit from a systemd timer, and the audit removes
 kept originals and grab links older than `KEEP_ORIGINALS_DAYS`. logrotate rotates the decision log.
 In the image, the listener runs both once a day at `AUDIT_TIME`, the audit for each app whose API
-key reads. A day the container was down at that time runs at the next start.
+key reads. When the container was down at that time, they run when it starts again that day.
 
 **One-off containers.** Every other mode runs in a one-off container of the same image, or with
-`docker exec` in the service. A one-off container mounts the same `/config`, so its file lock, its
-scan state and its decision log are the service's. flock works across containers on one host,
+`docker exec` in the service. A one-off container mounts the same `/config` and the same volume `amg-state`, so
+its file lock, its scan state and its decision log are the service's. flock works across containers on one host,
 because both open the same file. A live test held the lock in the service for 20 seconds, and a
 one-off apply waited for it. tini gives each mode the signals of a terminal. Python as PID 1 ignores a
 SIGTERM it has no handler for. Without tini, `--plex-flush` ran on through a `docker stop` to its
 end.
+
+## Instances
+
+One install serves several Sonarr and Radarr instances. `config.settings()` reads the instances
+`radarr` and `sonarr` from the `RADARR_` and `SONARR_` keys, then each `name:program` entry of `APP_INSTANCES`.
+The keys of an instance start with its name in upper case, with `-` as `_`, see `config.env_key()`.
+`apps.ARR` holds one adapter per instance, keyed by its name. Its class is the program, `Radarr` or
+`Sonarr`. `arr()` and `arr_write()` take the instance's URL, API key and path map. Every `app` value
+in the code is an instance name, and `config.program()` gives its program where the logic differs.
+
+**Names.** A name holds letters and digits, with a single `-` between two of them. So it is safe in
+a URL path, a file name and a log line. Two names may not share their keys, and a name may not take
+the keys of another setting, as `plex` would take `PLEX_URL`. A bad entry is left out with a
+selftest error, so no event reaches an instance the user did not mean.
+
+**Events.** In Docker each instance posts to `/<name>`. The listener compares the whole request path
+with the instance names, and answers 404 to every other path without a log line. So text from a
+request never reaches the API, a path or a log as an instance. On a host the Custom Script
+variables start with the program, `sonarr_` or `radarr_`, for every instance. Sonarr and Radarr also
+pass `<program>_instancename`, the Instance Name of Settings > General, at each event
+(`CustomScript.cs` in both). `runner.hook_app()` maps a run to its instance. The one instance of a
+program takes every run, so a host with one of each needs no setting. With more, the Instance Name
+must match an instance name. Case does not count, and each run of other characters counts as `-`. A
+run that matches no instance asks no app and queues nothing, and its Test fails with the names.
+`runner.name_clash()` reads the Instance Name of an instance from `system/status`, the value the
+Custom Script gets. A 4K Sonarr that kept the name `Sonarr` would run as `sonarr`, against the other
+API with its own ids and paths. So the hook's Test checks the name of every instance of the program
+and fails on a clash, because the misnamed app's Test reaches another instance. The selftest, the
+listener's Test and its start check warn of a clash, because there the URL path picks the instance.
+A connection saved before a rename never runs its Test again. So the hook keeps the run's Instance
+Name in the job, and the worker reads the name of each instance of the program once per worker. It
+refuses a job while a clash stands, with one error line that names the Instance Name to set. A job of
+the listener, or of a program with one instance, skips this check.
+
+**State.** Each record of one app in the state store keys on the instance name. That covers the `app` of each job,
+the re-grab times, the pending conversions, the scan progress, the lists of `--plex-flush`, the decision rows and the
+state of the subtitle hunter. So the re-grab cap counts per instance,
+and an instance at its cap never stops another. A grab link of `KEEP_REPLACED` holds its instance.
+An import claims only the links of its own instance. An import of another instance at the same path
+makes them stale, because they no longer hold the file that the import replaced. The old files of an
+upgrade come only from the queued jobs of the same instance, because file ids repeat between
+instances.
+
+**Output.** The `app` field of the decision log and the `arr` key of the logfmt line hold the
+instance name. `status.json` holds no app. An alert posts as `<label> <INSTANCE>`, and the label is
+the instance name with a capital first letter, such as `Sonarr`, `Radarr` or `Sonarr-4k`.
+
+**Checks.** `--selftest`, the Test event and the start check of the listener run
+`runner.app_check()` for each instance whose API key reads. The listener's nightly audit runs for
+each such instance too.

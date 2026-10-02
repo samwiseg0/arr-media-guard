@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Unit tests for arr_status.py, the status file a monitoring agent reads.
+"""Unit tests for health.py, the status file a monitoring agent reads.
 
 Run: pytest tests/test_arr_status.py
 """
@@ -28,7 +28,7 @@ import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, ROOT)
-import arr_status as S  # noqa: E402
+from arr_media_guard import health as S  # noqa: E402
 
 T0 = 1_790_000_000   # a fixed epoch, 800 seconds into its hour
 
@@ -81,10 +81,10 @@ def test_arr_meta_codes_map_to_statuses(tmp_path):
 
 
 def test_every_arr_meta_code_maps_to_a_status():
-    """Every code arr_meta.py sets through _down() or KEY_BROKEN, read from its source, is a known status."""
-    src = os.path.join(ROOT, "arr_meta.py")
+    """Every code content.py sets through _down() or KEY_BROKEN, read from its source, is a known status."""
+    src = os.path.join(ROOT, "arr_media_guard", "content.py")
     if not os.path.exists(src):
-        pytest.skip("arr_meta.py is not in this tree")
+        pytest.skip("content.py is not in this tree")
     with open(src) as f:
         lines = [line for line in f if "_down(" in line or line.startswith("KEY_BROKEN")]
     codes = set(re.findall(r'"(tmdb_[a-z_]+)"', "".join(lines))) | {"found", "no_record"}
@@ -159,7 +159,7 @@ def test_a_failed_write_leaves_the_old_file_and_no_temp_file(tmp_path, monkeypat
         raise OSError("disk full")
     monkeypatch.setattr(S.json, "dump", boom)
     written, note = S.record(d, "policy", "failed", "x", now=T0 + 1)
-    assert not written and note == "arr_status: OSError: disk full"
+    assert not written and note == "status.json: OSError: disk full"
     assert (tmp_path / S.FILE).read_text() == before
     assert sorted(os.listdir(d)) == [S.FILE, S.FILE + ".lock"]
 
@@ -182,7 +182,7 @@ def test_a_broken_or_wrong_shape_file_starts_fresh(tmp_path, text):
 
 def test_an_unwritable_dir_returns_false(tmp_path):
     written, note = S.record(str(tmp_path / "missing"), "tmdb", "ok", now=T0)
-    assert not written and note.startswith("arr_status: FileNotFoundError")
+    assert not written and note.startswith("status.json: FileNotFoundError")
 
 
 def _hammer(d, key, n):

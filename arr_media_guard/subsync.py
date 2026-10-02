@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-# arr-media-guard, a Sonarr and Radarr import hook that sets default tracks and catches broken files.
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """The subtitle match check of arr-media-guard (docs/design.md, "Subtitle match"). Stdlib only.
 
 A text subtitle belongs to the audio when the words Whisper hears in the audio are the words of the cues at the same
-time. arr_lid.listen() hears two short windows of the audio. This module compares those words with the cues.
+time. lid.listen() hears two short windows of the audio. This module compares those words with the cues.
 
 - windows() picks one early and one late window where the cues are dense, so the windows hold speech. They lie near
   the ends of the file, so a drift shows.
@@ -37,7 +24,7 @@ import re
 import statistics
 from fractions import Fraction
 
-import arr_decide
+from . import decide
 
 # The thresholds leave a wide gap between a right track, which matches most heard words of a window, and a wrong
 # track, which matches few, mostly names (docs/design.md, "Subtitle match").
@@ -137,8 +124,8 @@ def said(window, stop):
 
 
 def short(heard, lang):
-    """The places in heard, arr_lid.listen()'s windows, of the windows with under MIN_WORDS content words."""
-    stop = arr_decide.STOPWORDS.get(lang, frozenset())
+    """The places in heard, lid.listen()'s windows, of the windows with under MIN_WORDS content words."""
+    stop = decide.STOPWORDS.get(lang, frozenset())
     return [k for k, w in enumerate(heard) if len(said(w, stop)) < MIN_WORDS]
 
 
@@ -169,7 +156,7 @@ def match_window(heard, fl, index):
 
 
 def check(heard, cues, lang, duration):
-    """Whether the subtitle cues belong to the audio. heard is arr_lid.listen()'s windows, [{"at": start, "words":
+    """Whether the subtitle cues belong to the audio. heard is lid.listen()'s windows, [{"at": start, "words":
     [[seconds from start, word], ...]}]. cues is [(start, end, text)] in seconds, lang the subtitle's 639-2 language,
     whose stopwords drop out, and duration the file's in seconds.
 
@@ -179,7 +166,7 @@ def check(heard, cues, lang, duration):
     with under MIN_WORDS heard content words names nothing, and the verdict needs two windows that do. All of those at
     MATCH or more is a match. All at MISMATCH or less is a mismatch. Anything else is unknown. A track under
     MIN_TRACK_CUES cues is unknown too."""
-    stop = arr_decide.STOPWORDS.get(lang, frozenset())
+    stop = decide.STOPWORDS.get(lang, frozenset())
     cues = unflashed(sorted(cues))   # the ends of a flash track say nothing, see flash(), so its spans take the new ends
     if len(cues) < MIN_TRACK_CUES:
         return {"verdict": "unknown", "why": f"the track holds {len(cues)} cues, under {MIN_TRACK_CUES}", "windows": [], "timing": None}
@@ -221,7 +208,7 @@ def on_line(heard, cues, lang, fix, parts):
     MIN_CUES anchors, see anchors(), whose median sits within TOLERANCE of the line of fix, as fit() judges its windows.
     The longer window counts when the window heard too little. A part with no such window confirms nothing, so a
     window too thin to judge never lets a fix through."""
-    stop, cues = arr_decide.STOPWORDS.get(lang, frozenset()), unflashed(sorted(cues))
+    stop, cues = decide.STOPWORDS.get(lang, frozenset()), unflashed(sorted(cues))
     fl, index = flat(cues, stop), collections.defaultdict(list)
     for p, x in enumerate(fl):
         index[x[2]].append(p)
@@ -606,7 +593,7 @@ def sweep(heard, cues, lang, timing=None):
     "overlap", "cues": the matched cues whose first word matched, "offset": their median cue start less the heard time
     and CUE_LEAD, or None, "off": that offset less the fitted line there, or None}. The fitted line is the fix of
     timing, the word check's, else no offset. The rows only report."""
-    stop, cues = arr_decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
+    stop, cues = decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
     fl, index = flat(cues, stop), collections.defaultdict(list)
     for p, x in enumerate(fl):
         index[x[2]].append(p)

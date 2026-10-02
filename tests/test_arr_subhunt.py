@@ -15,33 +15,30 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Unit tests for arr_subhunt.py, the subtitle hunter.
 
-No network, no SABnzbd, no mkvtoolnix. The hook script is loaded by path, as in test_arr_media_guard.py, and
-the hunter gets it as its host module. NZBHydra2, SABnzbd, the Radarr API, mkvmerge, the audio check and
+No network, no SABnzbd, no mkvtoolnix. The hunter imports the package arr_media_guard, and hook is that package, see
+amg.py. NZBHydra2, SABnzbd, the Radarr API, mkvmerge, the audio check and
 Discord are fakes. The file lock is a real flock in a temp directory.
 
 Run: pytest tests/test_arr_subhunt.py
 """
 import copy
 import fcntl
-import importlib.machinery
-import importlib.util
 import json
 import os
 import signal
-import sqlite3
 import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import amg
+
 FILES = os.path.join(os.path.dirname(__file__), "..")
 os.environ["ARR_MEDIA_GUARD_LIB"] = FILES
 os.environ["ARR_MEDIA_GUARD_ENV"] = "/nonexistent/arr-media-guard.env"
-_loader = importlib.machinery.SourceFileLoader("arr_media_guard_subhunt", os.path.join(FILES, "arr-media-guard"))
-hook = importlib.util.module_from_spec(importlib.util.spec_from_loader("arr_media_guard_subhunt", _loader))
-_loader.exec_module(hook)
-import arr_subhunt as sh  # noqa: E402  (the hook put FILES on sys.path)
-REAL_CREDS = sh.creds   # the fixture replaces creds, one test reads a real database
+hook = amg.load()
+import arr_subhunt as sh  # noqa: E402  (amg put FILES on sys.path)
+REAL_CREDS = sh.creds   # the fixture replaces creds, two tests read the fake API
 
 with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     hook.arr_decide.set_policy(json.load(_f))
@@ -103,7 +100,7 @@ class FakeSab:
     def __init__(self, plans, labels=None):
         self.plans, self.labels, self.jobs, self.calls = plans, labels or {}, {}, []
 
-    def __call__(self, h, cred, **q):
+    def __call__(self, cred, **q):
         self.calls.append(q)
         mode, name, nzo = q["mode"], q.get("name"), q.get("value")
         if mode == "addurl":
@@ -139,7 +136,7 @@ class FakeSab:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, settings):
     """A fake host: the Film A library file, the Radarr API, Hydra, SABnzbd and Discord. Returns the recorded calls.
     Set env["releases"] to [{"title", "probe" or "plan", "size", "age"}] before a run. A probe means the download completes."""
     lib = tmp_path / "movies" / "Film A"
@@ -152,8 +149,7 @@ def env(tmp_path, monkeypatch):
     calls = {"movie": movie, "releases": [], "hydra": [], "imports": [], "posts": [], "land": True, "broken": {}, "signals": [],
              "probes": {old: NO_ENGLISH}, "syslog": [], "tmp": tmp_path, "old": old,
              "keep": str(lib / ".Film A WEBDL-1080p.mkv.subhunt-keep")}
-    monkeypatch.setitem(hook.CFG, "LOG", str(tmp_path / "log.jsonl"))
-    monkeypatch.setitem(hook.CFG, "STATE_DIR", str(tmp_path / "state"))
+    settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path / "state"))
 
     def fake_http(url, method="GET", body=None, headers=None, timeout=15):
         assert url.startswith("https://search.invalid/api?"), url
@@ -173,7 +169,7 @@ def env(tmp_path, monkeypatch):
 
     def fake_write(app, p, method, body=None):
         assert (p, method) == ("command", "POST")
-        with open(os.path.join(hook.CFG["STATE_DIR"], "lock")) as f:   # the import runs under the hook's file lock
+        with open(os.path.join(hook.CFG.state_dir, "lock")) as f:   # the import runs under the hook's file lock
             with pytest.raises(BlockingIOError):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert os.path.samefile(calls["keep"], calls["old"])   # the keep link holds the old file before Radarr deletes it
@@ -196,8 +192,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "post", fake_post)
     monkeypatch.setattr(hook, "to_syslog", calls["syslog"].append)
     monkeypatch.setattr(hook, "PROFILES", {})
-    monkeypatch.setattr(hook, "OUTCOMES", hook.OUTCOMES)
-    monkeypatch.setattr(sh, "creds", lambda h, app: CREDS)
+    monkeypatch.setattr(sh, "creds", lambda app: CREDS)
     monkeypatch.setattr(sh, "GRAB_WAIT", 0)
     monkeypatch.setattr(sh, "DOWNLOAD_WAIT", 5)   # a loop that never ends fails the test in seconds
     monkeypatch.setattr(sh.time, "sleep", lambda s: None)
@@ -220,18 +215,17 @@ def run(env, monkeypatch, *args, wrap=None):
             plans[r["title"]] = str(folder)
     fake = FakeSab(plans, {r["title"]: r["labels"] for r in env["releases"] if "labels" in r})
     monkeypatch.setattr(sh, "sab", wrap(fake) if wrap else fake)
-    sh.main(hook, ["radarr", "--ids", "5017", *args])
+    sh.main(["radarr", "--ids", "5017", *args])
     return fake
 
 
 def lines(env):
-    with open(hook.CFG["LOG"]) as f:
+    with open(hook.CFG.log) as f:
         return [json.loads(line) for line in f]
 
 
 def state(env):
-    with open(os.path.join(hook.CFG["STATE_DIR"], "subhunt-radarr.json")) as f:
-        return json.load(f)["5017"]
+    return hook.store.get("subhunt-radarr", "5017")
 
 
 SUBS, NF, CRIT, NORD = ("Film.A.1972.1080p.BluRay.x264.Eng.Subs-GRP", "Film.A.1972.1080p.NF.WEB-DL.DDP5.1.H.264-XYZ",
@@ -254,7 +248,7 @@ def test_rank_uses_the_apps_rules_and_puts_likely_english_subtitles_first(env):
     results.append(dict(results[3], pubDate="2026-02-01", attrs={"imdb": "90000001"}))   # one indexer mistags PLAIN, another tags it right
     results[3]["attrs"] = {"imdb": "tt0101"}
     ctx = {"profiles": {11: PROFILE}, "sizes": {s["quality"]["id"]: s for s in SIZES}}
-    cands, skipped = sh.rank(hook, "radarr", MOVIE, results, [{"title": "Film.A.1972.1080p.iT.WEB-DL-TRIED"}], ctx)
+    cands, skipped = sh.rank("radarr", MOVIE, results, [{"title": "Film.A.1972.1080p.iT.WEB-DL-TRIED"}], ctx)
     assert [c["title"] for c in cands] == [SUBS, NF, CRIT, "Film.A.1972.1080p.BluRay.x264-PLAIN",   # a tie goes to the newer post
                                            "Film.A.1972.1080p.WEB-DL.H.264-GRP3 (NL subs)", "Film.A.1972.1080p.BluRay.x265-HEVCGRP", NORD]
     assert cands[1]["indexer"] == "G" and "link" not in sh.brief(cands[0])   # the newest post, and never the link in a log
@@ -271,22 +265,22 @@ def test_rank_uses_the_apps_rules_and_puts_likely_english_subtitles_first(env):
 def test_verdict_names_every_reason_a_download_stays_out(env):
     j = probe(["eng"], [("eng", "Signs", False)], minutes=60)
     ts = hook.arr_decide.classify(j)
-    assert sh.verdict(hook, "/d/x.mkv", j, ts, "Japanese", 94, False, "") == [
+    assert sh.verdict("/d/x.mkv", j, ts, "Japanese", 94, False, "") == [
         "no full English subtitle (subtitles: eng forced)", "it runs 60 minutes, and the listed runtime is 94", "no Japanese audio (audio: eng)"]
     env["broken"]["/d/x.mkv"] = "silent audio"
-    assert sh.verdict(hook, "/d/x.mkv", ENGLISH, hook.arr_decide.classify(ENGLISH), "Japanese", 94, False, "") == ["broken audio: silent audio"]
+    assert sh.verdict("/d/x.mkv", ENGLISH, hook.arr_decide.classify(ENGLISH), "Japanese", 94, False, "") == ["broken audio: silent audio"]
 
 
 def test_an_untagged_audio_track_is_unknown_and_arr_lid_decides(env, monkeypatch):
     j = probe(["und"], [("eng", "", False)])
     ts = hook.arr_decide.classify(j)
     heard = []
-    monkeypatch.setattr(sh, "heard", lambda h, path, index, j, want: heard.append((index, sorted(want))) or None)
-    assert sh.verdict(hook, "/d/y.mkv", j, ts, "Japanese", 94, False, "") == [] and heard == [(0, ["jap", "jpn"])]   # no answer passes
+    monkeypatch.setattr(sh, "heard", lambda path, index, j, want: heard.append((index, sorted(want))) or None)
+    assert sh.verdict("/d/y.mkv", j, ts, "Japanese", 94, False, "") == [] and heard == [(0, ["jap", "jpn"])]   # no answer passes
     monkeypatch.setattr(sh, "heard", lambda *a: "jpn")
-    assert sh.verdict(hook, "/d/y.mkv", j, ts, "Japanese", 94, False, "") == []
+    assert sh.verdict("/d/y.mkv", j, ts, "Japanese", 94, False, "") == []
     monkeypatch.setattr(sh, "heard", lambda *a: "eng")
-    assert sh.verdict(hook, "/d/y.mkv", j, ts, "Japanese", 94, False, "") == ["no Japanese audio, the untagged track sounds like eng"]
+    assert sh.verdict("/d/y.mkv", j, ts, "Japanese", 94, False, "") == ["no Japanese audio, the untagged track sounds like eng"]
 
 
 # --- runs ----------------------------------------------------------------------------------------
@@ -296,10 +290,10 @@ def test_dry_run_makes_one_query_and_changes_nothing(env, monkeypatch):
     fake = run(env, monkeypatch)
     assert len(env["hydra"]) == 1 and env["hydra"][0]["t"] == ["movie"] and env["hydra"][0]["imdbid"] == ["0101"]
     assert fake.calls == [] and env["imports"] == [] and env["posts"] == []
-    assert not os.path.exists(os.path.join(hook.CFG["STATE_DIR"], "subhunt-radarr.json"))
+    assert not hook.store.items("subhunt-radarr")
     (rec,) = lines(env)
     assert rec["outcome"] == "subhunt_dry_run" and rec["source"] == "subhunt" and [c["title"] for c in rec["candidates"]] == [SUBS, NF]
-    assert "HYDRAKEY" not in open(hook.CFG["LOG"]).read()
+    assert "HYDRAKEY" not in open(hook.CFG.log).read()
 
 
 def test_a_release_without_english_subtitles_is_deleted_and_the_next_one_imported(env, monkeypatch):
@@ -406,40 +400,58 @@ def test_an_error_is_logged_without_keys_and_never_stops_the_run(env, monkeypatc
 
 def test_sonarr_is_refused(env, monkeypatch):
     with pytest.raises(SystemExit):
-        sh.main(hook, ["sonarr", "--ids", "1"])
+        sh.main(["sonarr", "--ids", "1"])
 
 
 def test_cleanup_deletes_only_the_downloads_own_folder(env, tmp_path, monkeypatch):
     monkeypatch.setattr(sh, "sab", FakeSab({}))
     roots = [str(tmp_path / "movies")]
     lib = tmp_path / "movies" / "Film A"
-    assert "kept" in sh.cleanup(hook, CREDS, "n", str(lib), "Film A", roots) and lib.exists()
+    assert "kept" in sh.cleanup(CREDS, "n", str(lib), "Film A", roots) and lib.exists()
     shared = tmp_path / "downloads" / "complete"
     shared.mkdir(parents=True)
-    assert "kept" in sh.cleanup(hook, CREDS, "n", str(shared), NF, roots) and shared.exists()
+    assert "kept" in sh.cleanup(CREDS, "n", str(shared), NF, roots) and shared.exists()
     own = shared / NF
     own.mkdir()
-    assert sh.cleanup(hook, CREDS, "n", str(own), NF, roots).startswith("deleted") and not own.exists()
+    assert sh.cleanup(CREDS, "n", str(own), NF, roots).startswith("deleted") and not own.exists()
 
 
-def test_creds_come_from_the_apps_database(env, tmp_path, monkeypatch):
-    db = sqlite3.connect(tmp_path / "radarr.db")
-    db.execute("create table DownloadClients (Name, Implementation, Settings)")
-    db.execute("create table Indexers (Name, Implementation, Settings)")
-    db.execute("insert into DownloadClients values ('Seedbox', 'RTorrent', '{}')")
-    db.execute("insert into DownloadClients values ('SABnzbd', 'Sabnzbd', ?)", (json.dumps({"host": "sab.x", "port": 443, "useSsl": True, "apiKey": "S"}),))
-    db.execute("insert into Indexers values ('NZB', 'Newznab', ?)", (json.dumps({"baseUrl": "https://search.x/", "apiPath": "/api", "apiKey": "H"}),))
-    db.commit()
-    monkeypatch.setitem(hook.CFG, "RADARR_DIR", str(tmp_path))   # radarr.db in RADARR_DIR
-    assert REAL_CREDS(hook, "radarr") == {"sab": "https://sab.x:443/api", "sab_key": "S", "hydra": "https://search.x/api", "hydra_key": "H"}
+def provider(pid, impl, **fields):
+    """A download client or an indexer as Radarr's API gives it. The API masks the key."""
+    return {"id": pid, "name": f"{impl} {pid}", "implementation": impl,
+            "fields": [{"name": k, "value": v} for k, v in dict(fields, apiKey="********").items()]}
 
 
-def test_a_missing_app_database_stops_with_one_line(env, tmp_path, monkeypatch):
-    """With no Radarr folder the hunter stops before SQLite, whose error names no file."""
-    monkeypatch.setitem(hook.CFG, "RADARR_DIR", str(tmp_path / "none"))
+def test_creds_take_the_urls_from_the_api_and_the_keys_from_the_env_file(env, monkeypatch, settings):
+    """The URLs come from Radarr's API, which masks the keys. So the keys come from SABNZBD_API_KEY and NEWZNAB_API_KEY.
+    The first client and indexer of each kind by id count, as the database gave them. The API lists them by name."""
+    api = {"downloadclient": [provider(4, "Sabnzbd", host="sab.y", port=8080), provider(1, "RTorrent", host="rt.x"),
+                              provider(2, "Sabnzbd", host="sab.x", port=443, useSsl=True, urlBase="/sabnzbd")],
+           "indexer": [provider(9, "Newznab", baseUrl="https://other.x", apiPath="/api"), provider(3, "Newznab", baseUrl="https://search.x/", apiPath="/api")]}
+    monkeypatch.setattr(hook, "arr", lambda app, p: api[p])
+    settings(sabnzbd_api_key="sab-key-0123456789", newznab_api_key="hydra-key-0123456789")
+    assert REAL_CREDS("radarr") == {"sab": "https://sab.x:443/sabnzbd/api", "sab_key": "sab-key-0123456789", "hydra": "https://search.x/api",
+                                    "hydra_key": "hydra-key-0123456789"}
+    assert hook.mask("apikey=sab-key-0123456789 and hydra-key-0123456789") == "apikey=<SABNZBD_API_KEY> and <NEWZNAB_API_KEY>"   # never in a log line
+    api["indexer"][1] = provider(3, "Newznab", baseUrl="https://search.x/", apiPath="/hydra/api")
+    settings(sabnzbd_url="http://192.0.2.1:8080/sabnzbd/", newznab_url="http://192.0.2.2:5076")   # addresses the container resolves
+    got = REAL_CREDS("radarr")
+    assert (got["sab"], got["hydra"]) == ("http://192.0.2.1:8080/sabnzbd/api", "http://192.0.2.2:5076/hydra/api")   # the API path stays Radarr's
+    api["indexer"] = []
     with pytest.raises(SystemExit) as ex:
-        REAL_CREDS(hook, "radarr")
-    assert str(ex.value) == f"{tmp_path / 'none' / 'radarr.db'} does not read. Set RADARR_DIR to Radarr's folder."
+        REAL_CREDS("radarr")
+    assert str(ex.value) == "Radarr has no Newznab indexer"
+
+
+@pytest.mark.parametrize("keys, missing", [({}, "SABNZBD_API_KEY and NEWZNAB_API_KEY"), ({"SABNZBD_API_KEY": "S"}, "NEWZNAB_API_KEY"),
+                                           ({"NEWZNAB_API_KEY": "H"}, "SABNZBD_API_KEY")])
+def test_a_missing_key_stops_the_hunter_with_one_line(env, monkeypatch, settings, keys, missing):
+    """A missing key stops the hunter before any call. The API cannot give it."""
+    monkeypatch.setattr(hook, "arr", lambda app, p: pytest.fail("no API call"))
+    settings(sabnzbd_api_key=keys.get("SABNZBD_API_KEY", ""), newznab_api_key=keys.get("NEWZNAB_API_KEY", ""))
+    with pytest.raises(SystemExit) as ex:
+        REAL_CREDS("radarr")
+    assert str(ex.value) == f"Set {missing} in the env file. Radarr's API hides the keys of its download clients and indexers."
 
 
 # --- failure paths -------------------------------------------------------------------------------
@@ -447,14 +459,14 @@ def test_a_missing_app_database_stops_with_one_line(env, tmp_path, monkeypatch):
 def test_a_sabnzbd_outage_marks_nothing_and_cleans_up(env, monkeypatch):
     env["releases"] = [{"title": SUBS, "probe": ENGLISH}, {"title": NF, "probe": ENGLISH}, {"title": CRIT, "probe": ENGLISH}]
     def wrap(fake):
-        def outage(h, cred, **q):
+        def outage(cred, **q):
             if q["mode"] == "addurl" and len(fake.jobs) == 1:
                 raise urllib.error.URLError("connection refused")
-            return fake(h, cred, **q)
+            return fake(cred, **q)
         return outage
     fake = run(env, monkeypatch, "--apply", wrap=wrap)
     assert fake.jobs == {} and fake.deleted() == {"nzo1"}   # the job added before the outage is gone
-    assert not os.path.exists(os.path.join(hook.CFG["STATE_DIR"], "subhunt-radarr.json")) and env["posts"] == []
+    assert not hook.store.items("subhunt-radarr") and env["posts"] == []
     assert lines(env)[-1]["outcome"] == "error"
 
 
@@ -482,19 +494,19 @@ def test_a_check_error_rejects_that_candidate_and_the_next_one_runs(env, monkeyp
 def test_zero_results_leave_the_movie_open(env, monkeypatch):
     run(env, monkeypatch, "--apply")
     assert lines(env)[-1]["outcome"] == "subhunt_stopped" and env["posts"] == []
-    assert not os.path.exists(os.path.join(hook.CFG["STATE_DIR"], "subhunt-radarr.json"))
+    assert not hook.store.items("subhunt-radarr")
 
 
 def test_one_missed_read_keeps_a_good_download(env, monkeypatch):
     env["releases"] = [{"title": NF, "probe": ENGLISH}]
     reads = []
     def wrap(fake):
-        def gap(h, cred, **q):
+        def gap(cred, **q):
             if q["mode"] == "history" and "name" not in q:
                 reads.append(1)
                 if len(reads) == 2:   # the job sits between queue and history for one read
                     return {"history": {"slots": []}}
-            return fake(h, cred, **q)
+            return fake(cred, **q)
         return gap
     run(env, monkeypatch, "--apply", wrap=wrap)
     assert state(env)["status"] == "imported" and state(env)["tried"] == []
@@ -534,6 +546,36 @@ def test_sigterm_deletes_every_job_and_folder(env, monkeypatch):
     with pytest.raises(SystemExit) as ex:
         env["signals"][0][1](signal.SIGTERM, None)
     assert ex.value.code == 143
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_sabnzbds_download_path_goes_through_the_apps_path_map(env, monkeypatch, settings, stop):
+    """SABnzbd names a finished download by its own path, which the app sees too. A container on another host sees it at
+    another path, so RADARR_PATH_MAP pairs the two. The hunter checks, imports and deletes the download at the local
+    path. A run that a SIGTERM breaks off deletes it there too."""
+    local = str(env["tmp"] / "downloads")
+    settings(radarr={"path_map": [("/sab/complete", local)]})
+    env["releases"] = [{"title": SUBS, "probe": NO_ENGLISH}, {"title": NF, "probe": ENGLISH}]
+
+    def remote(fake):   # SABnzbd's history names the folder at SABnzbd's path
+        def sab(cred, **q):
+            out = fake(cred, **q)
+            for slot in (out.get("history") or {}).get("slots") or []:
+                if slot.get("storage"):
+                    slot["storage"] = slot["storage"].replace(local, "/sab/complete")
+            return out
+        return sab
+    if stop:
+        monkeypatch.setattr(sh, "verdict", lambda *a: (_ for _ in ()).throw(SystemExit(143)))
+        with pytest.raises(SystemExit):
+            run(env, monkeypatch, "--apply", wrap=remote)
+        assert not (env["tmp"] / "downloads" / SUBS).exists() and env["imports"] == []
+        return
+    run(env, monkeypatch, "--apply", wrap=remote)
+    (body,) = env["imports"]
+    assert body["files"][0]["path"] == os.path.join(local, NF, NF + ".mkv") and state(env)["status"] == "imported"
+    assert state(env)["tried"][0]["why"] == "no full English subtitle (subtitles: por full)"
+    assert not (env["tmp"] / "downloads" / SUBS).exists() and not (env["tmp"] / "downloads" / NF).exists()
 
 
 def test_a_second_apply_run_waits_for_the_first(env, monkeypatch):
@@ -631,3 +673,22 @@ def test_a_failed_size_read_records_no_link(env, monkeypatch):
     run(env, monkeypatch, "--apply")
     assert "keep" not in state(env) and not os.path.exists(env["keep"]) and env["imports"] == []
     assert state(env)["status"] == "import_failed" and open(env["old"], "rb").read() == b"old"
+
+
+@pytest.mark.parametrize("status", ["cancelled", "orphaned"])
+def test_an_import_command_that_ended_another_way_puts_the_old_file_back(env, monkeypatch, status):
+    """Radarr ends a command cancelled or orphaned too. The hunter reads it once, then restores the old file at once."""
+    env["releases"] = [{"title": NF, "probe": ENGLISH}]
+    env["land"] = False
+    real, reads = hook.arr, []
+    def ended(app, p):
+        if not p.startswith("command/"):
+            return real(app, p)
+        reads.append(p)
+        assert len(reads) == 1, "the hunter waits on an ended command"
+        return {"id": 1, "status": status}
+    monkeypatch.setattr(hook, "arr", ended)
+    run(env, monkeypatch, "--apply")
+    assert open(env["old"], "rb").read() == b"old" and not os.path.exists(env["keep"]) and state(env)["status"] == "import_failed"
+    (alert,) = env["posts"]
+    assert f"The import command ended {status}." in alert["description"] and "put the current file back" in alert["description"]

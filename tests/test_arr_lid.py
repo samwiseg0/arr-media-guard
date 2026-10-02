@@ -13,25 +13,27 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Unit tests for arr_lid.py, the spoken-language identification.
+"""Unit tests for lid.py, the spoken-language identification.
 
 The detector is mocked, so these run with the stdlib alone. One test runs the real model. It runs only where
 faster-whisper and a model directory exist (ARR_LID_MODEL_DIR, default /opt/arr-media-guard-lid/models).
 
 Run: pytest tests/test_arr_lid.py
 """
+import contextlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
 FILES = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, FILES)
-import arr_decide  # noqa: E402
-import arr_lid  # noqa: E402
+from arr_media_guard import decide as arr_decide, lid as arr_lid, store  # noqa: E402
 
 
 def s(lang, prob=0.97, speech=20.0):
@@ -361,7 +363,7 @@ def test_listen_hears_a_third_window_in_the_same_process(ears, monkeypatch):
 def test_jobs_hear_the_windows_the_hook_would_pick(ears, tmp_path):
     """After a language check, the subtitle check's hearing runs in the same process. The hook's own check then finds
     the words in the cache."""
-    import arr_subsync
+    from arr_media_guard import subsync as arr_subsync
     calls, media, cache = ears
     cues = [[60.0 + 3 * i, 62.0 + 3 * i, f"garden window lantern number{i}"] for i in range(400)]
     spec = tmp_path / "jobs.json"
@@ -385,16 +387,33 @@ def test_the_sweep_hears_each_group_as_one_clip_in_one_process(monkeypatch, caps
 
 
 def test_the_sweep_yields_between_groups_when_a_job_or_a_hearing_waits(monkeypatch, tmp_path):
-    """A job file in the queue, or another hearing at the gate, stops the sweep after the group it is on. The first
-    group always runs, so a sweep never stalls."""
-    calls, queue, gate = [], tmp_path / "queue", tmp_path / "lid.turn.gate"
-    queue.mkdir()
+    """An import job in the queue of the hook's state store, or another hearing at the gate, stops the sweep after the
+    group it is on. The first group always runs, so a sweep never stalls. A deep analysis job and a job put back for
+    later never stop it."""
+    calls, queue, gate = [], str(tmp_path / "state.sqlite"), tmp_path / "lid.turn.gate"
+    with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
+        for t in store.TABLES:   # the hook's store, as store.db() makes it
+            db.execute(t)
+        db.execute("INSERT INTO jobs (name, at, job) VALUES ('deep-analysis-ab.json', 0, '{}')")
+        db.execute("INSERT INTO jobs (name, due, at, job) VALUES ('9-2.json', ?, 0, '{}')", (time.time_ns() + 10**12,))
     monkeypatch.setattr(arr_lid, "listen", lambda path, idx, starts, lang, secs, **kw: calls.append(starts) or
                         {"windows": [{"at": s, "secs": secs, "words": []} for s in starts], "cached": False, "reused": 0, "took": 1.0, "model": "m"})
-    (queue / "1-2.json").write_text("{}")
-    got = arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0, 190.0], "eng", 2, gate=str(gate), queue=str(queue))
+    assert "yielded" not in arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=queue) and len(calls) == 2
+    calls.clear()
+    with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
+        db.execute("INSERT INTO jobs (name, at, job) VALUES ('1-2.json', 0, '{}')")
+    got = arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0, 190.0], "eng", 2, gate=str(gate), queue=queue)
     assert got["yielded"] and calls == [[10.0, 70.0]] and len(got["windows"]) == 2
-    (queue / "1-2.json").unlink()
+    with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
+        db.execute("DELETE FROM jobs WHERE name = '1-2.json'")
+    (tmp_path / "queue").mkdir()   # a job file the hook wrote while the store was busy
+    (tmp_path / "queue" / ".3-2.json").write_text("{")   # half a job is no job
+    assert not arr_lid.waits(None, queue)
+    (tmp_path / "queue" / "3-2.json").write_text("{}")
+    assert arr_lid.waits(None, queue)
+    (tmp_path / "queue" / "3-2.json").unlink()
+    gone = str(tmp_path / "other" / "state.sqlite")   # a store that does not read is no import, and the look writes nothing
+    assert not arr_lid.waits(None, gone) and not os.path.exists(gone)
     calls.clear()
     import fcntl
     with open(gate, "w") as held:

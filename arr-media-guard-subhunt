@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 samwiseg0
+"""The arr-media-guard-subhunt command, the subtitle hunter in arr_subhunt.py beside this file, symlinks resolved.
+ARR_MEDIA_GUARD_LIB names another folder that holds arr_subhunt.py and the package arr_media_guard."""
+import os, sys
+
+sys.path.insert(0, os.environ.get("ARR_MEDIA_GUARD_LIB") or os.path.dirname(os.path.realpath(__file__)))
+import arr_subhunt  # noqa: E402
+
+arr_subhunt.main(sys.argv[1:])

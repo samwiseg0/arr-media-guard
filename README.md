@@ -1,101 +1,111 @@
 # arr-media-guard
 
-A Custom Script connection for Sonarr and Radarr. It runs on every import and upgrade. It makes the right audio
-track play first and sets the subtitle defaults to match. It re-grabs a file whose audio is broken or whose video is
-corrupt, and posts one Discord alert for each problem it finds. When the apps run in Docker, the image takes a
-Webhook connection instead. See [Run it in Docker](#run-it-in-docker).
+arr-media-guard checks every file that Sonarr or Radarr imports or upgrades. It makes the right audio track play
+first and sets the subtitle defaults to match. It re-grabs a file that is certainly broken, and posts one Discord alert
+for each problem it finds. It edits the track flags in place with `mkvpropedit`, and never re-encodes.
 
-Some release groups ship an English film with a Portuguese, Turkish or Hindi default track. Plex plays the default
-track, so the viewer gets the wrong language. This hook fixes the flags in place with `mkvpropedit`. It never
-re-encodes.
+- **Default tracks.** It picks the audio and the subtitles that play first, from a policy file.
+- **Language detection.** An optional Whisper model hears a track whose language is in doubt.
+- **Subtitle match.** It finds a subtitle of another episode, and retimes a subtitle that runs late.
+- **Broken files.** It re-grabs a file with broken audio or corrupt video, and can restore the old file.
+- **Wrong content.** It alerts when a file holds another film or another episode.
+- **Repairs.** It repairs a wrong Matroska header, and can convert AVI, MP4, M4V, TS and WebM files into Matroska.
+- **Backfill and scans.** It fixes and scans your whole library, and audits its own edits.
+- **Subtitle hunter.** A command of its own replaces a Radarr film that has no English subtitle with a release that
+  has one.
 
-## What it does
-
-- **Default tracks.** It classifies every audio and subtitle track once, then picks the audio and the subtitles from
-  a policy file. When the signals conflict it abstains and edits nothing.
-- **Language detection.** When a track's language is in doubt, an optional Whisper model hears the audio. A count
-  of common words reads the language of subtitle text. A sidecar whose text is in another language than its name
-  goes in with the text's language. A text track with a wrong tag gets a fixed tag, or an alert. When no audio track
-  speaks its language, it also stops showing by itself. An `und` track takes the language its text reads.
-- **Subtitle match.** Whisper hears two short windows of the audio, and the hook compares the words with each text
-  subtitle and `.srt` sidecar in the audio's language. A subtitle of another episode leaves the file in a proven
-  remux, or stays out of a conversion. A sidecar of another episode moves to the kept originals, and Bazarr can
-  download it again. A subtitle that runs late by an offset or a frame-rate ratio gets new times. A text subtitle
-  whose cues flash for a tenth of a second gets ends a viewer can read. `--sub-time` also times the subtitles it
-  cannot hear, other languages and PGS or VobSub pictures, against a subtitle that matched the audio. An import does
-  that too, as its time allows, and `SUBTITLES=deep` adds the rest in a deep analysis while no import waits.
-- **Broken audio and corrupt video.** It samples the audio that will play and decodes three short video windows.
-  A certain fault deletes the file, marks the grab failed and lets the app search again. A daily cap limits this.
-- **Restore after a bad upgrade.** When the broken file was an upgrade, the old file comes back from the app's
-  recycle bin, if it checks clean. Turn on the app's recycle bin, on the media's file system. `--selftest` and Test warn
-  when it is off or elsewhere. With `KEEP_REPLACED=true`, the hook keeps its own hard link of each file a grab may
-  replace, so the restore also works with no usable recycle bin.
-- **Wrong content.** It checks the file against TMDB and its own duration. It alerts, and it re-grabs only when you
-  turn that on. For an episode, it also reads the episode title from the release's NFO or name. When that title
-  belongs to another episode of the series, it alerts "Wrong episode" and names both episodes. That alert never
-  re-grabs.
-- **Header repair.** A lossless `mkvmerge` remux repairs a Matroska header with a wrong duration or a subtitle that runs
-  past the end. The original stays for a week.
-- **Conversion.** It can convert AVI, MP4, M4V, TS and WebM files into Matroska. It proves every stream of the new
-  file packet by packet before the original goes. When the conversion of an import shows a damaged source, the hook
-  re-grabs it like broken audio.
-- **Backfill and scans.** The same script fixes the flags of your whole library, scans it for broken audio or corrupt
-  video, and audits its own edits.
-
-Every file it looks at gets one JSON line in the decision log. Every edit logs its undo command first.
-[docs/design.md](docs/design.md) explains each rule and why it exists.
+[docs/features.md](docs/features.md) says more about each check.
 
 ## Requirements
 
-- Linux, with Sonarr and Radarr on the same host, or the Docker image. It is tested with Sonarr 4 and Radarr 6.
-- Python 3.12 or later.
-- `mkvtoolnix` and `ffmpeg` (for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`).
-  Tested with mkvtoolnix 92 and ffmpeg 7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so every header repair refuses.
+- Docker. The image holds Python, the tools, language detection and its model. It is for amd64. An arm64 image is not
+  published yet.
+- Sonarr 4 and Radarr 6. These are the versions it is tested with.
 - Optional: Plex, a Discord webhook, and a TMDB API read token.
+
+On a host, it needs these instead of Docker:
+
+- Linux and Python 3.12 or later, with Sonarr and Radarr on the same host.
+- `mkvtoolnix` and `ffmpeg`, for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`. It is tested with mkvtoolnix 92
+  and ffmpeg 7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so every header repair refuses.
 - Optional: the language detection venv, about 450 MB, and its model, 464 MB. The pinned wheels are for CPython 3.13
   on x86_64 and aarch64.
-- Known limits: the TMDB key fallback reads `/opt/Radarr`. In Docker, set `TMDB_TOKEN`, and mount each app's config
-  folder at `RADARR_DIR` and `SONARR_DIR`.
 
-## Install
+## Install in Docker
 
-```
-sudo apt install mkvtoolnix ffmpeg python3-venv
-sudo git clone https://github.com/samwiseg0/arr-media-guard /opt/arr-media-guard
-sudo ln -s /opt/arr-media-guard/arr-media-guard /usr/local/bin/arr-media-guard
-sudo install -m 0640 /opt/arr-media-guard/examples/arr-media-guard.env /etc/arr-media-guard.env
-sudo install -m 0644 /opt/arr-media-guard/examples/policy.json /etc/arr-media-guard.policy.json
-sudo mkdir -p /var/lib/arr-media-guard/alerts /var/lib/arr-media-guard/queue /var/lib/arr-media-guard/claimed
-arr-media-guard --selftest
-```
+Docker is the recommended way. The image works wherever Sonarr and Radarr run. It needs each app's API at a URL it
+can reach, and the media at the apps' paths or through [path maps](docs/docker.md#path-maps). The apps reach it
+through a **Webhook** connection, so nothing goes into their containers.
 
-Install the policy file before the selftest. Without it the selftest fails and prints the command that creates it.
+These steps run it next to the apps, on one compose network. For apps on other hosts, see
+[docs/docker.md](docs/docker.md#apps-on-other-hosts). No feature reads an app's database, so every feature works there too.
 
-The script finds its modules in its own folder, symlinks resolved. Set `ARR_MEDIA_GUARD_LIB` to use another folder.
-It reads `/etc/arr-media-guard.env`. Set `ARR_MEDIA_GUARD_ENV` to use another file.
+1. Add the service and its volume to the compose file of your apps:
+   ```yaml
+   services:
+     arr-media-guard:
+       image: ghcr.io/samwiseg0/arr-media-guard:2.0.0
+       container_name: arr-media-guard
+       environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # the apps' user and group, and your time zone
+       volumes:
+         - ./arr-media-guard:/config   # the env file, the policy and the decision log
+         - amg-state:/config/state     # the state store
+         - /srv/media:/data            # the media, at the same path as in the apps
+         # - /dev/log:/dev/log         # optional, for Loki
+       stop_grace_period: 1m
+       restart: unless-stopped
+   volumes:
+     amg-state:
+       name: amg-state
+   ```
+   The state store is SQLite in WAL mode and needs a local disk, so it gets a volume of its own. To ship syslog to
+   Loki, also mount `/dev/log`. Each command in the container then writes its logfmt lines to the host's syslog.
+2. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `/config`. The
+   listener exits until the env file has a Webhook user and password.
+3. Set `WEBHOOK_USER` and `WEBHOOK_PASSWORD` in `./arr-media-guard/arr-media-guard.env`. Set `SONARR_API_KEY` and
+   `RADARR_API_KEY` to the keys in each app's Settings > General. Set `TMDB_TOKEN` too, because the image has no Radarr
+   install to read the bundled key from.
+4. Run `docker compose up -d` again.
 
-Sonarr and Radarr run the script as their own user. That user must be able to write `STATE_DIR`, `LOG` and your media
-files. Both apps share the state folder and its locks, so give them a shared group, or run both as the same user.
-The hook keeps `.<NAME>-originals`, and with `KEEP_REPLACED=true` also `.<NAME>-recycle`, at the top of each mount.
-When the app user cannot write there, it takes the highest folder on the file's path that the user can write, such as
-a show's folder. A folder of that name that exists on the path wins, so the place stays the same from run to run. When
-no folder on the path is writable, every header repair, subtitle remux and conversion of the file is skipped, and a
-grab keeps nothing. Then create the folders at the top of the mount and give them to that user.
+[docs/docker.md](docs/docker.md) has a full compose file, the mounts, path maps for other media paths, and the
+listener.
 
-The decision log grows by one line per file. Rotate it weekly with logrotate. Keep `delaycompress` next to `compress`,
-because a Plex folder scan reads the rest of `LOG.1` after a rotation. Leave out `copytruncate`, because the script
-opens the log for each line.
+## Install on a host
 
-The hook's children run in the app's cgroup. Add `OOMPolicy=continue` to the `[Service]` section of both app units,
-so an OOM kill of a child never restarts the app. See "Memory" in the design notes.
+Use this way when Sonarr and Radarr run on the host. Each app runs the script as a **Custom Script** connection.
 
-### Language detection (optional)
+1. Install the tools, the code and the state folders:
+   ```
+   sudo apt install mkvtoolnix ffmpeg python3-venv
+   sudo git clone https://github.com/samwiseg0/arr-media-guard /opt/arr-media-guard
+   sudo ln -s /opt/arr-media-guard/arr-media-guard /usr/local/bin/arr-media-guard
+   sudo ln -s /opt/arr-media-guard/arr-media-guard-subhunt /usr/local/bin/arr-media-guard-subhunt
+   sudo mkdir -p /var/lib/arr-media-guard
+   ```
+2. Install the env file and the policy file. Without the policy file the selftest fails.
+   ```
+   sudo install -m 0640 /opt/arr-media-guard/examples/arr-media-guard.env /etc/arr-media-guard.env
+   sudo install -m 0644 /opt/arr-media-guard/examples/policy.json /etc/arr-media-guard.policy.json
+   ```
+3. Give the app users write access. Sonarr and Radarr run the script as their own user. That user must be able to
+   write `STATE_DIR`, `LOG` and your media files. Both apps share the state folder and its locks. So give them a shared
+   group, or run both as the same user. [docs/regrabs.md](docs/regrabs.md#where-the-folders-go) says where the hook
+   keeps the files it replaces.
+4. Add `OOMPolicy=continue` to the `[Service]` section of both app units. The hook's children run in the app's
+   cgroup, and this stops an OOM kill of a child from restarting the app. See [Memory](docs/design.md#memory).
+5. Rotate the decision log weekly with logrotate, and leave out `copytruncate`.
+   [docs/monitoring.md](docs/monitoring.md#rotate-the-decision-log) has a ready file.
+6. Schedule `arr-media-guard --audit radarr --since 24h --post` nightly, and the same for `sonarr`. Use a systemd
+   timer or cron. The audit reviews the hook's own edits, and removes old kept originals and grab links.
+7. Run `arr-media-guard --selftest`.
+
+To turn on language detection, also run:
 
 ```
 sudo python3 -m venv /opt/arr-media-guard-lid/venv
 sudo /opt/arr-media-guard-lid/venv/bin/pip install --require-hashes --only-binary=:all: \
     -r /opt/arr-media-guard/arr_lid.requirements.txt
-sudo /opt/arr-media-guard-lid/venv/bin/python /opt/arr-media-guard/arr_lid.py --fetch \
+sudo /opt/arr-media-guard-lid/venv/bin/python /opt/arr-media-guard/arr_media_guard/lid.py --fetch \
     --model-dir /opt/arr-media-guard-lid/models
 sudo touch /opt/arr-media-guard-lid/ready
 ```
@@ -103,488 +113,241 @@ sudo touch /opt/arr-media-guard-lid/ready
 `--fetch` downloads the pinned model once and checks its sha256. The hook uses detection only when `ready` exists.
 Remove `ready` before you change the venv, and create it again after.
 
-## The env file
-
-`/etc/arr-media-guard.env` holds one `KEY='value'` per line. A comment needs its own line, because the value runs to
-the end of the line. Every key is optional. [examples/arr-media-guard.env](examples/arr-media-guard.env) lists them all.
-
-| Key | Default | What it does |
-| --- | --- | --- |
-| `LOG` | `/var/log/arr-media-guard.jsonl` | The decision log. |
-| `STATE_DIR` | `/var/lib/arr-media-guard` | The queue, the locks, the caches, the scan lists and `status.json`. |
-| `POLICY_FILE` | `/etc/arr-media-guard.policy.json` | The decision policy. Without it the hook edits nothing and alerts once. |
-| `LID_DIR` | `/opt/arr-media-guard-lid` | The language detection venv and model. |
-| `NAME` | `arr-media-guard` | The syslog tag and the name in alert footers. It also names three hidden folders. `.<NAME>-originals` at the top of each mount holds kept originals, and `.<NAME>-recycle` beside it holds the files `KEEP_REPLACED` keeps. Where the hook cannot write the top of a mount, both go to the highest folder below it that it can write. `.<NAME>-convert` beside a video holds a remux's temp file, and the original and the extras during a conversion. Letters, digits, `.`, `_` and `-` only. |
-| `INSTANCE` | the host name | The name of this host in logs and alerts. |
-| `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989` | The app APIs. An app counts as set up when its API key reads, or when its URL differs from the URLs the env files ship. `--sub-time` says nothing of an app that is not set up. A command that names the app stops with one line. An app at a shipped URL with no API key counts as not set up, also when you keep that URL on purpose. |
-| `RADARR_DIR`, `SONARR_DIR` | `/var/lib/radarr`, `/var/lib/sonarr` | The app's own folder. The script reads the API key from `config.xml` there. The conversion and the subtitle hunter read the app's database, `radarr.db` or `sonarr.db`, there too. |
-| `RADARR_API_KEY`, `SONARR_API_KEY` | empty | The API key, for an app whose folder this host does not see. Empty: the key in `config.xml`. The conversion and the subtitle hunter still need the folder. |
-| `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. An empty `PLEX_URL` turns every Plex call off. |
-| `PLEX_PATH_MAP` | empty | `PLEX_PATH:LOCAL_PATH` pairs joined by `\|`, when Plex sees the files under other paths than this script. Empty: `PATH_MAP`, see [Path maps](#path-maps). |
-| `DISCORD_WEBHOOK` | empty | Alerts and scan summaries. Empty: nothing is posted. |
-| `TMDB_TOKEN` | empty | A TMDB API read token. Empty: Radarr's bundled key, read from `/opt/Radarr/Radarr.Common.dll`. |
-| `REGRAB` | `audio,video` | The kinds of fault that re-grab: `audio` (broken audio), `video` (corrupt video), `content` (wrong content) and `damage` (a damaged source that a conversion shows). A kind not listed gets the second check and only alerts "would re-grab". `none` turns every re-grab off. An unknown kind is left out, and a blank value re-grabs nothing. `--selftest` fails on both. |
-| `REGRAB_CAP` | `30` | Re-grabs per app in 24 hours, then it alerts only. Every kind shares the one count. `0` turns every re-grab off. |
-| `RESTORE` | `true` | A re-grab of a broken upgrade puts back the old file from the recycle bin. |
-| `KEEP_REPLACED` | `false` | At each grab, hard-link the library files the grab may replace, with their subtitles, `.nfo` and images, into `.<NAME>-recycle` at the top of their mount, or in the highest folder below it that the hook can write. A restore uses this copy when the app's recycle bin has none it can use. Turn on **On Grab** in the app's connection. The hook keeps nothing on a file system that refuses a hard link, such as an SMB/CIFS share, some FUSE mounts and Docker Desktop file sharing. Each copy stays, and holds its disk space, for `KEEP_ORIGINALS_DAYS`. Then the nightly audit, or the worker's prune once a day, removes it. With `KEEP_ORIGINALS_DAYS` at 0, it keeps nothing. A value other than `true` or `false` keeps nothing, and `--selftest` fails on it. `--selftest` and Test warn when the connection sends no Grab, or when the hook cannot hard-link a file on a mount. |
-| `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
-| `SUBTITLES` | `fix` | What the subtitle check of an import does. Needs language detection. `off`: no check. `check`: it reads, reports and alerts, and changes nothing. `fix`: it also removes a wrong track, moves a wrong sidecar, retimes and lengthens flash cues. `deep`: `fix`, then a deep analysis after the import, which reads the whole file for unindexed subtitle tracks, hears one window a minute and times the subtitles that had no reference. It runs only while no import waits. `--sub-check` and `--sub-time` ignore it. Without `--apply` they report, and with it they fix. An unknown level acts as `check`, and `--selftest` fails on it. |
-| `KEEP_ORIGINALS_DAYS` | `7` | Days a repair keeps the file it replaced in `.<NAME>-originals`, as a hard link, or as a verified copy where the file system refuses a link. `KEEP_REPLACED` keeps its links as long. The nightly audit and the worker's daily prune remove them in every folder the hook kept a file in, also one below a root folder. `0` keeps nothing. At `0` a prune removes every grab link and leaves the originals already kept. |
-| `REPACK_MAX_GB` | `30` | A larger file is never remuxed or converted. |
-| `CONVERT` | `false` | Convert every imported file that is not Matroska. A backfill converts only with `--convert`. |
-| `CONVERT_MAX_FILES` | `200` | Conversions one `--convert --apply` run makes. |
-| `CONVERT_WORKERS` | `1` | Conversions a `--convert --apply` run makes at a time. |
-| `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
-| `HOOK_WORKERS` | `1` | Import jobs the hook runs at a time. A season pack still runs at most this many. |
-
-## The policy file
-
-The decision reads its rules from `POLICY_FILE`, JSON. A missing key is an error, never a silent default.
-[examples/policy.json](examples/policy.json):
-
-```json
-{
-  "kids": {
-    "genres": {"radarr": ["Family"], "sonarr": ["Children", "Family"]},
-    "profiles": ["Kids"],
-    "studios": ["Studio A"]
-  },
-  "audio": {
-    "english": ["original"],
-    "foreign": ["original", "english"],
-    "foreign_kids": ["english", "original"]
-  },
-  "subtitles": {
-    "english": ["forced"],
-    "foreign": ["full", "sdh", "forced", "dub"]
-  },
-  "sparse_events": 1.5,
-  "forced_flag_events": 4.0,
-  "density_min_minutes": 15,
-  "min_confidence": 0.7,
-  "forced_clear": {"events": 10.0, "english_only_audio": true, "reference_ratio": 0.8}
-}
-```
-
-| Key | What it does |
-| --- | --- |
-| `kids` | What makes a foreign title a kids title: an app genre, a Radarr quality profile name, or a studio. |
-| `audio` | Per item class, the audio to try in order. `original` is the app's original language. |
-| `subtitles` | Which English subtitle may play, by the audio that plays. `english` lists the roles allowed under English audio, normally `forced` only. `foreign` ranks the roles for other audio, and the file's best match turns on. The roles are `full`, `sdh`, `forced` and `dub`. |
-| `sparse_events` | An English subtitle under this many events a minute counts as forced. |
-| `forced_flag_events` | A forced flag counts only under this many events a minute. |
-| `density_min_minutes` | A shorter file gives no reliable events a minute. |
-| `min_confidence` | The file decides the language only at this confidence. A tag alone is 0.6. |
-| `forced_clear` | A forced English subtitle that holds the full dialogue loses its forced flag under English audio. |
-
-`--selftest` checks the rules against a fixed copy of the example policy, so your changes never fail it.
-
 ## Add it to Sonarr and Radarr
 
-In each app, open Settings, Connect, add a **Custom Script**, and set:
+In each app, open Settings, Connect, and add a connection. Use a **Webhook** in Docker and a **Custom Script** on a
+host.
 
-- Name: `arr-media-guard`
-- Triggers: **On File Import** and **On File Upgrade**. With `KEEP_REPLACED=true`, also **On Grab**.
-- Path: `/usr/local/bin/arr-media-guard`
-- Arguments: empty
+| Field | Webhook (Docker) | Custom Script (host) |
+| --- | --- | --- |
+| Name | `arr-media-guard` | `arr-media-guard` |
+| Triggers | **On File Import** and **On File Upgrade** | **On File Import** and **On File Upgrade** |
+| URL or Path | `http://arr-media-guard:8484/sonarr` in Sonarr, `http://arr-media-guard:8484/radarr` in Radarr | `/usr/local/bin/arr-media-guard` |
+| Method | `POST` | |
+| Username and Password | `WEBHOOK_USER` and `WEBHOOK_PASSWORD` | |
+| Arguments | | empty |
 
-Save runs the Test event. The script answers `arr-media-guard: Test ok`. On an import it queues a job and returns at
-once. A worker process does the checks and the edit.
+With `KEEP_REPLACED=true`, also turn on **On Grab**.
 
-## Dry runs and the backfill
+Turn on each app's recycle bin, on the media's file system, so a bad upgrade can be undone. In Docker, mount the bin
+too, see [docs/regrabs.md](docs/regrabs.md#restore-after-a-bad-upgrade).
 
-A backfill is dry unless you add `--apply`. It runs at nice 19 and idle I/O priority, takes the hook's file lock, and
-never posts to Discord. Run a large one in steps, and note the time before each apply:
+## Several Sonarr or Radarr instances
 
-```
-arr-media-guard --backfill radarr --plan-out /root/radarr-plans.jsonl                        # dry run, one plan per line
-arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl                          # the plans, grouped by rule
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20   # 20 files across the classes
-arr-media-guard --audit radarr --since 2026-01-01T10:00                                      # check the canary's edits
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl               # the rest
-```
-
-Other useful commands:
+One install serves any number of Sonarr and Radarr instances, for example a second Sonarr for 4K. The keys of the
+settings below set up the instances `sonarr` and `radarr`. `APP_INSTANCES` adds more, as `name:program` pairs:
 
 ```
-arr-media-guard --backfill sonarr --ids 101 102               # only these series (movie ids for radarr)
-arr-media-guard --backfill radarr --apply --limit 5           # edit five files, then stop
-arr-media-guard --backfill sonarr --check-audio --limit 2000  # scan for broken audio, resumes where it stopped
-arr-media-guard --backfill sonarr --check-video --restart     # scan for corrupt video, a new pass
-arr-media-guard --backfill sonarr --convert                   # the files that are not .mkv, dry
-arr-media-guard --backfill sonarr --convert --apply           # convert them, CONVERT_MAX_FILES a run
-arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
-arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
-arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # time every subtitle of one file, dry
-arr-media-guard --subhunt radarr --ids 123                    # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
-arr-media-guard --audit radarr --since 24h --post             # the hook's edits of the last day, to Discord
+APP_INSTANCES='sonarr-4k:sonarr,radarr-4k:radarr'
+SONARR_4K_URL='http://sonarr-4k:8989'
+SONARR_4K_API_KEY='the key from Settings > General of that Sonarr'
+RADARR_4K_URL='http://radarr-4k:7878'
+RADARR_4K_API_KEY='the key from Settings > General of that Radarr'
 ```
 
-An apply asks Plex to analyze each edited item, after the section is idle on two checks. When "Scan my library
-automatically" is off in Plex, the analyzes that follow need one idle check each. See docs/design.md, "The burst".
+- A name holds letters and digits, with a single `-` between two of them. The program is `sonarr` or `radarr`.
+- On a host, a Sonarr instance name starts or ends with `sonarr`, and a Radarr instance name holds `radarr`. The
+  Instance Name of each app must match its instance name, and the apps refuse other names.
+- The keys of an instance start with its name in upper case, with `-` as `_`. `sonarr-4k` reads `SONARR_4K_URL`,
+  `SONARR_4K_API_KEY`, `SONARR_4K_DIR` and `SONARR_4K_PATH_MAP`.
+- The URL is required. The folder defaults to `/var/lib/<name>`. An empty map takes `PATH_MAP`.
+- A bad entry is left out, and `--selftest` names it.
 
-`--sub-check` adds the subtitle match check to a backfill, which never runs it by default. It also takes a file with
-a `.srt` sidecar beside it. A dry run prints each verdict and the removal or timing fix it would make, and an apply
-acts as an import does. `--paths` limits the flag backfill, `--convert` and `--sub-check` to the listed files, and
-a scan refuses it. The check caches its verdicts, so a later
-run skips a file that stays as it was, with the same sidecars, and needs nothing more. A stopped run goes on where it
-stopped. It hears at the backfill's priority with one Whisper thread. The last line
-counts the files checked, the verdicts, the timing fixes and the CPU time, and estimates the time for the whole
-library.
-
-### Time the subtitles of one file
-
-```
-arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv"           # dry run: changes nothing
-arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv" --apply   # makes the changes
-```
-
-`--sub-time` runs the subtitle check of `--sub-check` on each file it names, and reads the cache of neither. It then
-times every other subtitle against a track or sidecar whose words matched the audio, and hears one window a minute. The
-file needs no app. For a path outside Sonarr and Radarr, such as a copy, it runs with no item, so it knows no original
-language. A mismatch then counts unless the file also holds audio in another language. With `--apply` it then keeps
-every audio and subtitle flag. Only a subtitle that does not match the audio loses its default and forced flags. When
-an app lookup fails, `--apply` stops before any change and exits 1. A planned change can also fail to happen. Examples
-are a remux or a header repair that failed or was skipped, a flag edit that failed, and a sidecar left as it was.
-`--apply` then lists each such file and exits 3. A path that holds no file is skipped, and the run then exits 4.
-Otherwise it exits 0.
-
-A subtitle track that old mkvmerge versions left out of the Cues index is read from the whole file. That read keeps
-only the cue times and text as ffmpeg streams them, so it writes no file.
-
-Each subtitle gets one line. The columns are:
-
-- the track's place, such as `s3`, or the sidecar's name
-- the codec, the language and the role (`full`, `sdh` or `dub`)
-- the method. `words` is the check against the heard audio, with `a reference: in time`, `fixed` or `clean sweep` when
-  it times other tracks. `reference s1` means the track was timed against `s1`. `reference, none` means no track
-  could time it.
-- the verdict. The word check gives `match`, `mismatch` or `unknown`. The reference timing gives `fit` or `weak` with
-  its score, where a weak fit only reports, or `unknown` or `deferred`.
-- the new times, as an offset and a frame-rate ratio, or `in time`
-- the action, such as `none`, `retimed`, `removed`, `flags off`, `report only` or the remux it would make
-- why
-
-A `flash` line names a text track whose cues show for a tenth of a second, and the new ends of its first cues. The sweep
-table has one row per heard window: its time, the heard words, the share that matched the cues, the cues whose first
-word matched, and their offset. `ALERT` marks two neighbouring windows 1 second or more off the fitted line the same
-way. One such window alone is marked "one window alone" and does not alert. The decision log holds the
-results under `subcheck`, `subtime`, `flash` and `sweep`.
-
-With `--apply`, a built-in track gets its new times, new ends or its removal in one remux that the packet proof checks.
-A sidecar is written again or moved. The original file or sidecar is kept for `KEEP_ORIGINALS_DAYS` (7) days at
-`<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. The folder is the top of the mount that holds the file,
-or the highest folder below it that the hook can write. To undo a change, move the kept original back over the file
-with `mv`, then rescan the item in the app.
-
-Scans never delete or re-grab. They list what they find in `STATE_DIR`. Schedule the `--audit ... --since 24h --post`
-line nightly with a systemd timer or cron to review the hook's own edits.
-
-### Force a conversion
-
-The proof refuses a file that it cannot prove lossless, and the decision log holds the refusal. When you checked the
-refusal and accept it, name the file:
-
-```
-arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
-```
-
-The run then takes only the listed files. A file converts when the proof refuses it for the same reason as the last
-refusal in the decision log. Another refusal, or no logged refusal, is not forced, and the run says why. Every other
-step runs as normal. The original stays in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, so one move puts it back. The
-decision line names the refusal in `repack.forced`, and the nightly audit says the conversion was forced. The option
-needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0. A path that is not in the run's work list is
-reported and skipped.
-
-A listed Sonarr file also skips the check that Sonarr reads its new video name as its own episodes. Scene numbering or an
-alias can make that check wrong while the names are right. The conversion names the episodes by id, so the link stays
-right. This needs no logged refusal. The extras beside the video keep the check, and an extra whose name maps to other
-episodes still refuses the file and is named, so you can fix or remove it. The proof still runs, and a proof refusal is
-forced only as above. The decision
-line names the parse result in `repack.forced_name`, the original stays in `.<NAME>-originals`, and the audit says "name
-forced".
-
-## The decision log
-
-`LOG` gets one JSON line per file that a run looks at: the hook, every backfill, the scans and the audit. A line holds
-the app and item ids, every track with its language, confidence and role, the plan, the reason codes, the alerts and
-an `outcome` code. The same summary goes to syslog as logfmt, tagged `NAME`.
-
-Before each edit the hook writes an `editing` line whose `undo` field is the full `mkvpropedit` command that restores
-the old flags. To reverse the last edit of a film:
-
-```
-python3 - <<'PY'
-import json, subprocess
-recs = [json.loads(line) for line in open("/var/log/arr-media-guard.jsonl")]
-last = [r for r in recs if r.get("result") == "editing" and r["label"] == "Film A (2000)"][-1]
-subprocess.run(last["undo"], check=True)
-PY
-```
-
-`STATE_DIR/status.json` records the TMDB and policy checks for a monitoring agent. See "Status file" in the design
-notes.
-
-## Run it in Docker
-
-The image holds the script, `ffmpeg`, `mkvtoolnix`, the language detection venv and the pinned Whisper model. The build
-checks the model's sha256, and nothing downloads at run time. Sonarr and Radarr reach it through a **Webhook**
-connection, so nothing goes into their containers. The published image is for amd64. An arm64 image is not published
-yet.
+**Docker.** One container serves every instance. Each instance posts to `/<name>`, so the Webhook URL of the 4K
+Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in the table above. For example:
 
 ```yaml
-services:
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
-    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]
-    volumes: [./sonarr:/config, /srv/media:/data]
-    ports: ["8989:8989"]
-  radarr:
-    image: lscr.io/linuxserver/radarr:latest
-    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]
-    volumes: [./radarr:/config, /srv/media:/data]
-    ports: ["7878:7878"]
+    volumes: [./sonarr:/config, /srv/media:/data]      # Webhook URL http://arr-media-guard:8484/sonarr
+  sonarr-4k:
+    image: lscr.io/linuxserver/sonarr:latest
+    volumes: [./sonarr-4k:/config, /srv/media:/data]   # Webhook URL http://arr-media-guard:8484/sonarr-4k
   arr-media-guard:
-    image: ghcr.io/samwiseg0/arr-media-guard:1.7.0
-    container_name: arr-media-guard
-    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # TZ: your time zone, for AUDIT_TIME and the log times
-    volumes:
-      - ./arr-media-guard:/config
-      - ./sonarr:/var/lib/sonarr:ro
-      - ./radarr:/var/lib/radarr:ro
-      - /srv/media:/data
+    image: ghcr.io/samwiseg0/arr-media-guard:2.0.0
+    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]
+    volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
     stop_grace_period: 1m
     restart: unless-stopped
+volumes:
+  amg-state: {name: amg-state}
 ```
 
-1. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `/config`. The
-   listener exits until the env file has a Webhook user and password.
-2. Set `WEBHOOK_USER` and `WEBHOOK_PASSWORD` in `./arr-media-guard/arr-media-guard.env`. Set `TMDB_TOKEN` too,
-   because the image has no Radarr install to read the bundled key from. Then run `docker compose up -d` again.
-3. In each app, open Settings, Connect, add a **Webhook**, and set:
-   - Name: `arr-media-guard`
-   - Triggers: **On File Import** and **On File Upgrade** only. With `KEEP_REPLACED=true`, also **On Grab**.
-   - URL: `http://arr-media-guard:8484/sonarr` in Sonarr, `http://arr-media-guard:8484/radarr` in Radarr
-   - Method: `POST`
-   - Username and Password: `WEBHOOK_USER` and `WEBHOOK_PASSWORD`
+**Host.** Every instance runs the same Custom Script, `/usr/local/bin/arr-media-guard`. Sonarr and Radarr pass their
+Instance Name, from Settings > General, to the script. With one instance of a program, no setting is needed. With
+more, set the Instance Name of each app to match its name in `APP_INSTANCES`. Case does not count, and a space counts as
+`-`. So `Sonarr 4K` matches `sonarr-4k`, and the default `Sonarr` matches `sonarr`. Sonarr takes only an Instance Name
+that starts or ends with `Sonarr`, and Radarr one that holds `Radarr`. The Test fails when the name matches no
+instance. It also fails when another instance of the program has a name that picks the wrong instance, as a 4K Sonarr
+that kept the name `Sonarr`. The worker then refuses the imports of that program, each with one error line, until
+the names differ. The selftest and the Docker checks only warn of it.
 
-   Test checks the policy, the API key and each root folder of the app, and Save runs it. A failed Test names what
-   to fix. Turn on the app's recycle bin, on the media's file system, and mount it at the app's path, or add a pair
-   for it to the app's path map, so a bad upgrade can be undone. Test warns in the log when it is off, elsewhere or not
-   mounted. With `KEEP_REPLACED=true`, the hook also keeps its own copies, and a restore uses them when the bin has none.
+Give the user of each app write access to `STATE_DIR` and `LOG`. Schedule the nightly audit for each instance, as
+`arr-media-guard --audit sonarr-4k --since 24h --post`.
 
-| Mount | What it holds |
-| --- | --- |
-| `/config` | The env file, `policy.json`, the state folder `state/` and the decision log in `logs/`. |
-| `/var/lib/sonarr`, `/var/lib/radarr` | The app's config folder, read-only. The script reads the API key from `config.xml`, and a conversion reads the app's database. SQLite reads a live WAL database through a read-only mount, also from another container. |
-| The media | At the same path as in the apps, `/data` above. Else set a path map, see [Path maps](#path-maps). |
-| Sonarr's download folder | Optional, read-only. The episode title check reads the scene NFO of each import there, through Sonarr's path map. Without it, only the release name gives a title. |
+**What changes per instance.** Every command takes the instance name, as `--backfill sonarr-4k`. The decision log, the
+syslog line and the alerts name the instance. Each instance has its own `REGRAB_CAP` count. A grab link that one
+instance kept never serves another.
 
-The Docker section at the end of the env file sets the paths under `/config` and these keys. Every other key in
-[The env file](#the-env-file) works the same way.
+## Check that it works
+
+1. Run the selftest. In Docker run `docker exec -it arr-media-guard arr-media-guard --selftest`. On a host run
+   `arr-media-guard --selftest`.
+2. Press Test in each app's connection. Save runs it too. Test checks the policy, the app's API and its key, and each
+   root folder of the app. A failed Test names what to fix. On a host the script answers `arr-media-guard: Test ok`, or
+   exits 1 so the Test fails. In Docker, see [docs/docker.md](docs/docker.md#the-listener).
+3. Run a dry run on one file. It prints the planned edit and changes nothing:
+   ```
+   docker exec -it arr-media-guard arr-media-guard --backfill radarr --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
+   ```
+   On a host, leave out `docker exec -it arr-media-guard`.
+
+To try the subtitle check on one file with no app, see [docs/subtitles.md](docs/subtitles.md#try-it-on-one-file).
+
+## Settings
+
+The env file holds one `KEY='value'` per line. A comment needs its own line, because the value runs to the end of the
+line. Every key is optional. A value the script cannot read takes the safest reading, and `--selftest` fails on it.
+The worker logs it at each start.
+
+- In Docker the file is `./arr-media-guard/arr-media-guard.env`. Restart the container after you change it.
+- On a host it is `/etc/arr-media-guard.env`. Set the environment variable `ARR_MEDIA_GUARD_ENV` to use another file.
+- [examples/arr-media-guard.env](examples/arr-media-guard.env) lists every key with its default.
+  [docker/arr-media-guard.env](docker/arr-media-guard.env) adds the Docker keys.
+
+The command `arr-media-guard` is a launcher. It runs the package `arr_media_guard/` in its own folder, symlinks
+resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another folder.
+
+### Files and names
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | empty | The basic auth of the Webhook connection. Printable ASCII. Without both, the listener does not start. |
-| `RADARR_URL`, `SONARR_URL` | `http://radarr:7878`, `http://sonarr:8989` | The apps as this container reaches them. |
-| `PATH_MAP` | empty | `APP_PATH:LOCAL_PATH` pairs joined by `\|`, for example `/data:/media`, when this container sees the media at other paths. Each program whose own map is empty takes it. |
-| `SONARR_PATH_MAP`, `RADARR_PATH_MAP` | empty | The map of one app, in the format of `PATH_MAP`. Empty: `PATH_MAP`. |
-| `AUDIT_TIME` | `07:30` | The local time of the nightly audit of each app, which also removes kept originals and the grab links of `KEEP_REPLACED` older than `KEEP_ORIGINALS_DAYS`, and of the weekly log rotation. Empty: neither runs. |
-| `INSTANCE` | `arr-media-guard` | The name of this install in logs and alerts. The host name of a container changes with each new container. |
+| `LOG` | `/var/log/arr-media-guard.jsonl` | The decision log, see [docs/monitoring.md](docs/monitoring.md). |
+| `STATE_DIR` | `/var/lib/arr-media-guard` | The state store `state.sqlite`, the locks, the scan lists and `status.json`. |
+| `POLICY_FILE` | `/etc/arr-media-guard.policy.json` | The decision policy, see [docs/policy.md](docs/policy.md). |
+| `LID_DIR` | `/opt/arr-media-guard-lid` | The language detection venv and model. |
+| `NAME` | `arr-media-guard` | The syslog tag, the name in alert footers, and the name of the [kept folders](docs/regrabs.md#kept-originals). Letters, digits, `.`, `_` and `-` only. |
+| `INSTANCE` | the host name, in Docker `arr-media-guard` | The name of this install in logs and alerts. A container gets a new host name with each new container. |
 
-Set `TZ` on the container to your time zone, for example `TZ=Europe/Berlin`. Without it the container runs in UTC, so
-`AUDIT_TIME` and the times in the decision log are UTC.
+### Sonarr and Radarr
 
-The listener takes each post only with the right user and password, and a body of at most 1 MiB. It asks the app for
-the file by its id and uses the path the API gives. It refuses a file of another item, and an old file outside the
-item's folder or the recycle bin, with a line in the decision log. Each request has 10 seconds in all, and 32 run at
-once, so a slow or idle client never holds up an app. 64 more connections may wait for a thread, and the listener
-closes each new one past those 96 at once. A post with a wrong path or wrong credentials never reaches the decision
-log. The listener counts them and prints one summary line a minute at most. The compose example publishes no port of
-arr-media-guard on purpose: only the apps on the compose network reach it. The worker runs in the same container, and
-the listener starts it again when a job waits. The script runs as `PUID:PGID`, so the files it writes keep the owner
-of the media. Set `PUID` and `PGID` to the user and group the apps run as. The start script,
-`docker/arr-media-guard.sh`, runs the script with `setpriv --clear-groups`, which drops every other group. So a media
-folder that only a supplementary group of that user may write stays read-only for the hook. The hook keeps
-`.<NAME>-originals`, and with `KEEP_REPLACED=true` also `.<NAME>-recycle`, at the top of each mount. When `PUID:PGID`
-cannot write there, as at the root of a Docker volume, it takes the highest folder on the file's path that `PUID:PGID`
-can write. A folder of that name that exists on the path wins, so the place stays the same from run to run. When no
-folder on the path is writable, every header repair, subtitle remux and conversion of the file is skipped, and a grab
-keeps nothing. Then create the folders at the top of the mount and give them to `PUID:PGID`. A stop waits for a
-running flag edit. The healthcheck asks `http://127.0.0.1:8484/health`.
+| Key | Default | What it does |
+| --- | --- | --- |
+| `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989`, in Docker `http://radarr:7878`, `http://sonarr:8989` | The app APIs as this host or container reaches them, see [docs/commands.md](docs/commands.md#connect-to-the-apps). |
+| `RADARR_DIR`, `SONARR_DIR` | `/var/lib/radarr`, `/var/lib/sonarr` | The app's own folder, which holds `config.xml`. |
+| `RADARR_API_KEY`, `SONARR_API_KEY` | empty | The API key of an app whose folder this host does not see, as in Docker. Empty: the key in `config.xml`. |
+| `APP_INSTANCES` | empty | More instances, as `name:program` pairs joined by `,`. See [Several instances](#several-sonarr-or-radarr-instances). |
+| `SONARR_4K_URL`, `SONARR_4K_API_KEY`, `SONARR_4K_DIR`, `SONARR_4K_PATH_MAP` | empty, `/var/lib/sonarr-4k` for the folder | The keys of the instance `sonarr-4k`. The keys of each instance start with its name in upper case, with `-` as `_`. The URL is required. |
+
+### Plex, Discord and TMDB
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. An empty `PLEX_URL` turns every Plex call off. |
+| `DISCORD_WEBHOOK` | empty | Alerts and scan summaries go here. Empty: nothing is posted. |
+| `TMDB_TOKEN` | empty | A TMDB API read token. Empty: Radarr's bundled key, read from `/opt/Radarr/Radarr.Common.dll`. |
 
 ### Path maps
 
-Sonarr, Radarr, Plex and this container can each see the media under other paths. A path map pairs the paths of one
-program with the paths this script sees. `SONARR_PATH_MAP`, `RADARR_PATH_MAP` and `PLEX_PATH_MAP` each hold the map of
-one program. Each pair is `PROGRAM_PATH:LOCAL_PATH`, both absolute, and `|` joins the pairs. A path may hold spaces. A
-map that is empty takes `PATH_MAP`, so one map serves every program that sees the same paths. A pair matches whole
-folder names only, so `/mnt/TV` never matches `/mnt/TV Shows`. When two pairs match, the longer one wins. A pair that is
-not two absolute paths fails `--selftest`, and the listener does not start.
+| Key | Default | What it does |
+| --- | --- | --- |
+| `PATH_MAP` | empty | `APP_PATH:LOCAL_PATH` pairs joined by `\|`, when this script sees the media at other paths than the apps. |
+| `SONARR_PATH_MAP`, `RADARR_PATH_MAP`, `PLEX_PATH_MAP` | empty | The map of one program. Empty: `PATH_MAP`. Each instance of `APP_INSTANCES` has its own. |
 
-`--selftest` and the listener start check the maps against each app's root folders. A root folder this script does not
-see gives a warning, and so does one that no Plex library folder holds. Each warning names the folder and the setting
-to fix.
+[docs/docker.md](docs/docker.md#path-maps) explains path maps with an example.
 
-In this example, the host keeps the three libraries in `/srv/media`, and each program mounts them at its own paths.
+### Re-grabs and kept files
 
-| Library | Sonarr | Radarr | Plex | This container |
-| --- | --- | --- | --- | --- |
-| TV | `/mnt/TV` | | `/mnt/TV Shows` | `/media/TV` |
-| Anime | `/mnt/Anime` | | `/mnt/Anime` | `/media/Anime` |
-| Movies | | `/movies` | `/mnt/Movies` | `/media/Movies` |
+| Key | Default | What it does |
+| --- | --- | --- |
+| `REGRAB` | `audio,video` | The kinds of fault that re-grab: `audio`, `video`, `content` and `damage`. See [docs/regrabs.md](docs/regrabs.md#re-grabs). |
+| `REGRAB_CAP` | `30` | Re-grabs per instance in 24 hours, then it alerts only. `0` turns every re-grab off. A value that is no whole number acts as `0`, and `--selftest` fails on it. |
+| `RESTORE` | `true` | A re-grab of a broken upgrade puts back the old file from the recycle bin. |
+| `KEEP_REPLACED` | `false` | At each grab, keep a hard link of each file the grab may replace, for a restore. See [docs/regrabs.md](docs/regrabs.md#keep-replaced-files). |
+| `KEEP_ORIGINALS_DAYS` | `7` | Days the hook keeps a file it replaced, and each grab link. `0` keeps nothing. |
 
-```yaml
-services:
-  sonarr:
-    volumes: [/srv/media/TV:/mnt/TV, /srv/media/Anime:/mnt/Anime]
-  radarr:
-    volumes: [/srv/media/Movies:/movies]
-  plex:
-    volumes: ["/srv/media/TV:/mnt/TV Shows", /srv/media/Anime:/mnt/Anime, /srv/media/Movies:/mnt/Movies]
-  arr-media-guard:
-    volumes: [/srv/media:/media]   # one mount, which holds TV, Anime and Movies
-```
+### Repairs and conversion
 
-```
-SONARR_PATH_MAP='/mnt/TV:/media/TV|/mnt/Anime:/media/Anime'
-RADARR_PATH_MAP='/movies:/media/Movies'
-PLEX_PATH_MAP='/mnt/TV Shows:/media/TV|/mnt/Anime:/media/Anime|/mnt/Movies:/media/Movies'
-```
+| Key | Default | What it does |
+| --- | --- | --- |
+| `HEADER_REPAIR` | `true` | Remux a Matroska file whose header is wrong. `false`: log it only. |
+| `REPACK_MAX_GB` | `30` | A larger file is never remuxed or converted. A value that is no number acts as `0`, so no file is remuxed, and `--selftest` fails on it. |
+| `CONVERT` | `false` | Convert every imported file that is not Matroska. A backfill converts only with `--convert`. |
+| `CONVERT_MAX_FILES` | `200` | Conversions one `--convert --apply` run makes. |
+| `CONVERT_WORKERS` | `1` | Conversions a `--convert --apply` run makes at a time. |
 
-This container mounts `/srv/media` once. A rename never crosses two mounts, even on one file system. Give each app a
-recycle bin in a folder it mounts, such as `/mnt/TV/.recycle` in Sonarr and `/movies/.recycle` in Radarr. Both sit in
-`/srv/media`, so the maps above reach them, and a restore can rename a file back from the bin. Radarr leaves a hidden
-folder out of its root folder list. Sonarr lists `.recycle` as an unmapped folder in Library Import. Do not import it.
-Its disk scan never reads it. A kept folder at a root folder's top level, such as `/media/TV/.<NAME>-originals`, shows
-there the same way, and Plex skips it too. With `KEEP_REPLACED=true` the hook keeps its own copies, and the app bins
-are optional.
+### Subtitles and workers
 
-### Commands in Docker
+| Key | Default | What it does |
+| --- | --- | --- |
+| `SUBTITLES` | `fix` | What the subtitle check of an import does: `off`, `check`, `fix` or `deep`. See [docs/subtitles.md](docs/subtitles.md#levels). |
+| `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
+| `HOOK_WORKERS` | `1` | Import jobs the hook runs at a time. A season pack still runs at most this many. |
 
-Every command of a native install runs in the image, as a one-off container or with `docker exec`. Both run as
-`PUID:PGID`, and the exit code of the command is the exit code of `docker run` and `docker exec`. A one-off container
-shares `/config` with the service, so it takes the same file lock and keeps its state beside the service's. Run a long
-command, such as a backfill, a conversion or a scan, as a one-off container. A restart of the service, as an image
-update does, ends every `docker exec` process in it. `docker compose run --rm arr-media-guard ARGS` gives the same
-one-off container as `$RUN ARGS` below, with the mounts of the compose file.
+### Subtitle hunter
 
-```
-RUN="docker run --rm --network media_default -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
-  -v $PWD/arr-media-guard:/config -v $PWD/sonarr:/var/lib/sonarr:ro -v $PWD/radarr:/var/lib/radarr:ro \
-  -v /srv/media:/data ghcr.io/samwiseg0/arr-media-guard:1.7.0"
-EXEC="docker exec -it arr-media-guard arr-media-guard"
-```
+These keys are for `arr-media-guard-subhunt`, see [docs/features.md](docs/features.md#subtitle-hunter).
 
-`media_default` is the compose network, named after the folder of the compose file. Keep `-it` on `docker exec`, so
-Ctrl+C reaches the command, and leave it out in a script. Each command needs `/config`.
-The last column names what else it needs:
+| Key | Default | What it does |
+| --- | --- | --- |
+| `SABNZBD_API_KEY` | empty | The API key of Radarr's SABnzbd download client. Radarr's API hides it. Without it, the hunter stops. |
+| `NEWZNAB_API_KEY` | empty | The API key of Radarr's Newznab indexer, such as NZBHydra2. Radarr's API hides it. Without it, the hunter stops. |
+| `SABNZBD_URL` | empty | SABnzbd as this host or container reaches it, with its URL base, for example `http://sabnzbd:8080`. Empty: the address in Radarr's download client. Set it when that address does not resolve here. |
+| `NEWZNAB_URL` | empty | The Newznab indexer as this host or container reaches it, for example `http://nzbhydra2:5076`. Empty: the address in Radarr's indexer. Set it when that address does not resolve here. |
 
-- **API**: the app's URL, and its key from the config folder mount or `<APP>_API_KEY`.
-- **DB**: the app's config folder at `RADARR_DIR` or `SONARR_DIR`, `/var/lib/<app>` by default, for its database.
-- **Media**: the media at the apps' paths, or a path map. An apply writes there.
-- **LID**: language detection, which the image holds.
-- **Plex** and **Discord**: `PLEX_URL` and `PLEX_TOKEN`, and `DISCORD_WEBHOOK`. Without them the command skips the
-  analyze or the post.
+### Docker
 
-| Native command | One-off container | `docker exec` | Needs |
-| --- | --- | --- | --- |
-| `arr-media-guard` | none, the Webhook listener takes its place | none | |
-| `arr-media-guard --serve` | the service itself | none | API, DB, Media, LID, Plex, Discord |
-| `arr-media-guard --selftest` | `$RUN --selftest` | `$EXEC --selftest` | |
-| `arr-media-guard --backfill sonarr [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--plan-out FILE] [--workers N]` | `$RUN --backfill sonarr ...` | `$EXEC --backfill sonarr ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --sub-check [--apply] [--ids ID ...] [--paths PATH ...]` | `$RUN --backfill sonarr --sub-check ...` | `$EXEC --backfill sonarr --sub-check ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/FILE ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/FILE --only-undecided ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]` | `$RUN --backfill sonarr --convert ...` | `$EXEC --backfill sonarr --convert ...` | API, DB, Media, Plex |
-| `arr-media-guard --backfill sonarr --convert --apply --force-convert PATH ...` | `$RUN --backfill sonarr --convert --apply --force-convert PATH ...` | `$EXEC --backfill sonarr --convert --apply --force-convert PATH ...` | API, DB, Media, Plex |
-| `arr-media-guard --plex-flush sonarr` | `$RUN --plex-flush sonarr` | `$EXEC --plex-flush sonarr` | Plex |
-| `arr-media-guard --backfill sonarr --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-audio ...` | `$EXEC --backfill sonarr --check-audio ...` | API, Media, Discord |
-| `arr-media-guard --backfill sonarr --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-video ...` | `$EXEC --backfill sonarr --check-video ...` | API, Media, Discord |
-| `arr-media-guard --sub-time PATH ... [--apply]` | `$RUN --sub-time /data/PATH ...` | `$EXEC --sub-time /data/PATH ...` | Media, LID. The API names the original language, and Plex gets the analyze after an edit. It exits 0, 1 (an app lookup failed, nothing changed), 3 (a planned change did not happen) or 4 (a path holds no file). |
-| `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | API, Media, Discord |
-| `arr-media-guard --subhunt radarr --ids ID ... [--apply] [--force]` | `$RUN --subhunt radarr --ids ID ...` | `$EXEC --subhunt radarr --ids ID ...` | API, DB, Media, LID, and SABnzbd and NZBHydra2 on the network. The download folder at SABnzbd's path. |
+The Docker section at the end of the env file sets the paths under `/config`, the Docker defaults of the keys above,
+and these keys.
 
-Every `sonarr` above takes `radarr` too, except `--subhunt`, which takes `radarr` only. A file a command names, such
-as `--plan-out` or `--plan-from`, is a path in the container. Put it under `/config` to keep it. The audit needs Media
-and the API to remove kept originals, and the decision log for the rest.
+| Key | Default in Docker | What it does |
+| --- | --- | --- |
+| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | empty | The basic auth of the Webhook connection, in printable ASCII. Without both, the listener does not start. |
+| `AUDIT_TIME` | `07:30` | The local time of the nightly audit and the weekly log rotation. Empty: neither runs. |
 
-`tini` is PID 1 in the image. `docker stop` sends SIGTERM and Ctrl+C sends SIGINT to the command's process group, as
-in a terminal. A scan or a backfill ends the files in flight and stops, and the next run resumes at its saved place. A
-command with no stop of its own, such as `--plex-flush`, ends at once, with exit code 143 after `docker stop` and 130
-after Ctrl+C. A running flag edit, re-grab or swap ends first.
+## Update
 
-With `SUBTITLES=deep`, an import queues a deep analysis of its file, and the worker in the service runs it while no
-import waits. A deep analysis that a stopped container left in `/config/state/deep-analysis/` runs after the next start.
-The listener starts a worker for it within a minute.
+1. In Docker, set the new version in `image:`, then run `docker compose pull arr-media-guard` and
+   `docker compose up -d arr-media-guard`. On a host, run `sudo git -C /opt/arr-media-guard pull`.
+2. Add the keys a new release names to your env file. An update never changes that file.
+3. Run the selftest.
 
-The listener reads the env file and the policy when it starts. Restart the container after you change either.
+In Docker, `/config` keeps the env file, the policy and the decision log. The volume `amg-state` keeps the state store
+and the caches.
 
-**Upgrade.** Set the new version in `image:`, then run `docker compose pull arr-media-guard` and
-`docker compose up -d arr-media-guard`. `/config` keeps the state, the caches and the log. The container writes the
-env file only on its first start, so add by hand the keys a new release names.
+## Remove
 
-**From a native install.** Remove the Custom Script connection in each app and add the Webhook. Copy the keys you
-changed from `/etc/arr-media-guard.env` into the Docker env file, and keep its paths. Keep `NAME`, so the audit still
-finds the kept originals in `.<NAME>-originals`. To keep the caches and the re-grab counts, stop the container, copy the
-old `STATE_DIR` into `./arr-media-guard/state`, and start it.
+1. Remove the connection in each app.
+2. Wait until no job waits. This command prints 0 then. In Docker, run it with `docker exec` and the path
+   `/config/state/state.sqlite`.
+   ```
+   python3 -c 'import sqlite3; print(sqlite3.connect("/var/lib/arr-media-guard/state.sqlite").execute("SELECT count(*) FROM jobs").fetchone()[0])'
+   ```
+3. In Docker, remove the service and the volume from the compose file, and run `docker compose up -d --remove-orphans`.
+   Then run `docker volume rm amg-state`, and remove the `./arr-media-guard` folder.
+4. On a host, remove `/opt/arr-media-guard`, `/opt/arr-media-guard-lid`, `/usr/local/bin/arr-media-guard`,
+   `/usr/local/bin/arr-media-guard-subhunt`, the two files in `/etc`, `STATE_DIR`, `LOG`, the logrotate file and the
+   audit timer.
+5. Remove the `.<NAME>-originals` and `.<NAME>-recycle` folders at the top of each mount when you no longer need the
+   kept files.
 
-**Build it yourself.** `docker build -f docker/Dockerfile -t arr-media-guard .` in a clone.
+The track flags the hook set stay in your files. The decision log holds the undo of each edit, see
+[docs/monitoring.md](docs/monitoring.md#undo-an-edit).
 
-## Try it on one file
+## More docs
 
-`--sub-time` runs on one file with no Sonarr, no Radarr and no settings. Put the video in a folder, open a terminal in
-that folder, and mount it at `/media`. The first command is a dry run. It prints one line for each subtitle, the flash
-check and the sweep of heard windows, and it changes nothing. A line that starts with `ALERT` names something the check
-found, and it is no error. When the check asks for a remux, the line says what `--apply` would do. When `--apply`
-would skip the remux, the line says why and what to fix. The second command makes the changes.
-
-Linux and macOS:
-
-```
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv" --apply
-```
-
-Windows PowerShell:
-
-```
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:1.7.0 --sub-time "/media/Episode.mkv" --apply
-```
-
-The first line says that no Sonarr or Radarr is set. That is expected. No app names the file, so the run keeps every
-flag, except that a subtitle whose words do not match the audio loses its default and forced flags. With `--apply`, a
-remux that the packet proof checks writes the new times, the new ends or the removal. The original stays as a hard link
-at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the mounted folder, and the output names that path. So the
-mounted folder must be writable for `PUID:PGID`. When the dry run plans a remux and that folder is not writable, it names
-the folder, the uid and the gid. A later
-`--apply` that keeps an original in the same folder removes the kept originals older than `KEEP_ORIGINALS_DAYS`, 7 days
-by default. Move a kept original out of that folder to keep it longer. To undo the change, move it back over the file:
-
-```
-mv ".arr-media-guard-originals/<UTC time>/Episode.mkv" "Episode.mkv"                        # Linux and macOS
-Move-Item -Force ".arr-media-guard-originals\<UTC time>\Episode.mkv" "Episode.mkv"          # Windows PowerShell
-```
-
-A folder that refuses hard links, as some Windows and network mounts do, gets a copy of the original instead. The copy is
-checked against the original before the change, and the output says "copied" instead of "hard-linked". It needs the
-file's size plus 1 GB free in that folder. With less, nothing changes, and the output says why.
-
-The command exits 0 when all went well, and 4 when the path holds no file. With `--apply` it exits 3 when a planned
-change did not happen, and 1 when an app lookup failed before any change.
-
-The sweep hears one window a minute and takes a few minutes of CPU. A 24-minute episode took about a minute on the test
-host. The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon, which runs the amd64 image under
-emulation, were not tested.
-
-## Tests
-
-```
-python -m pytest -q
-```
-
-The tests need pytest. The tests on real media files need `ffmpeg` and `mkvtoolnix` and skip without them.
+| File | What it holds |
+| --- | --- |
+| [docs/how-it-works.md](docs/how-it-works.md) | The whole process, from an import to the alert, and the nightly job. Read it first. |
+| [docs/features.md](docs/features.md) | What each check does. |
+| [docs/policy.md](docs/policy.md) | The policy file, which picks the audio and subtitles that play first. |
+| [docs/commands.md](docs/commands.md) | The backfill, dry runs, scans, conversions, the audit and Plex commands, also in Docker. |
+| [docs/subtitles.md](docs/subtitles.md) | The subtitle check, `--sub-time` and its output, and a try on one file. |
+| [docs/regrabs.md](docs/regrabs.md) | Re-grabs, restores after a bad upgrade, and the kept originals. |
+| [docs/docker.md](docs/docker.md) | Docker detail: mounts, user and group, path maps, the listener. |
+| [docs/monitoring.md](docs/monitoring.md) | The decision log, the syslog line, the undo of an edit, log rotation and `status.json`. |
+| [docs/design.md](docs/design.md) | How each rule works, and why it exists. |
+| [docs/development.md](docs/development.md) | The code layout and the tests. |
 
 ## License
 

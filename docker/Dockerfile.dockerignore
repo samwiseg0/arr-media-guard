@@ -1,4 +1,4 @@
-# The build context is the repo root. The image needs the script, its modules, examples/ and docker/.
+# The build context is the repo root. The image needs the two launchers, arr_subhunt.py, the package, examples/ and docker/.
 .git
 .github
 tests

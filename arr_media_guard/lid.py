@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-# arr-media-guard, a Sonarr and Radarr import hook that sets default tracks and catches broken files.
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Spoken-language identification for arr-media-guard. It hears the language of one audio stream.
 
-arr_decide.py trusts track language tags, and tags lie. A Spanish or Japanese film may carry an eng tag, and some
+decide.py trusts track language tags, and tags lie. A Spanish or Japanese film may carry an eng tag, and some
 tracks carry no tag. The hook asks this module only when a tag is missing or conflicts with the app's metadata.
 
 identify() cuts 30-second samples from the stream with ffmpeg, mono at 16 kHz, first at 25, 50 and 75 percent of the
@@ -31,17 +18,17 @@ This half needs only the stdlib. numpy and faster-whisper load only on a cache m
 imports this module inside try/except ImportError, for carry() only. It runs identify() as a subprocess of the
 venv Python in its own process group, with at most 120 seconds, so a slow NAS never costs the flag edit:
 
-    /opt/arr-media-guard-lid/venv/bin/python arr_lid.py PATH INDEX DURATION --cache FILE --model-dir DIR [--fresh] --expect TAG ORIGINAL...
+    /opt/arr-media-guard-lid/venv/bin/python lid.py PATH INDEX DURATION --cache FILE --model-dir DIR [--fresh] --expect TAG ORIGINAL...
 
 INDEX is the ffmpeg audio index (0:a:INDEX), the same index the hook's sample() uses. The CLI prints one JSON line.
 --keep-pcm keeps the audio of each sample in the cache for an hour, so the subtitle check can cut its windows from it.
 
 The subtitle check (docs/design.md, "Subtitle match") asks for the words of short windows instead:
 
-    /opt/arr-media-guard-lid/venv/bin/python arr_lid.py PATH INDEX DURATION --cache FILE --model-dir DIR --words LANG START...
+    /opt/arr-media-guard-lid/venv/bin/python lid.py PATH INDEX DURATION --cache FILE --model-dir DIR --words LANG START...
 
 listen() transcribes every window in one Whisper run and caches the words by the same file identity.
-At install, "arr_lid.py --fetch" downloads the pinned model once and checks its sha256. docs/design.md, section
+At install, "lid.py --fetch" downloads the pinned model once and checks its sha256. docs/design.md, section
 "Audio language detection", has the rules and the install.
 """
 import argparse, fcntl, hashlib, json, os, resource, sqlite3, subprocess, sys, time
@@ -67,8 +54,8 @@ MIN_VOTES = 2
 MIN_PROB = 0.80                          # the mean probability of the agreed language over the votes
 # The subtitle check. Its two windows go through Whisper as one clip, so the encoder runs once. More threads cost more
 # CPU time than they save in wall time, so the check runs one thread.
-WORD_SECS = 10                           # seconds of each window, arr_subsync.WINDOW
-THIRD_SECS = 24                          # seconds of a third window, arr_subsync.THIRD
+WORD_SECS = 10                           # seconds of each window, subsync.WINDOW
+THIRD_SECS = 24                          # seconds of a third window, subsync.THIRD
 MAX_COMPRESSION = 2.4                    # a segment whose text compresses more is a loop, faster-whisper's own threshold
 WORD_THREADS = 1
 PCM_KEEP = 3600                          # seconds a kept language sample stays in the cache for the subtitle check
@@ -383,7 +370,7 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
     """The words Whisper hears in the windows of secs from each start, on ffmpeg audio stream audio_index of path, in
     the language lang (639-2/B). The windows go through Whisper as one clip, so the encoder runs once. A window inside
     a sample the language check kept is cut from that sample, so no audio is decoded twice. more holds a second window
-    per start, or None: when a window hears under arr_subsync.MIN_WORDS words and another does not, or it is the only
+    per start, or None: when a window hears under subsync.MIN_WORDS words and another does not, or it is the only
     window, its window in more, of more_secs, is heard too, in this process with the model loaded.
     Returns {"windows": [{"at", "secs", "words": [[seconds from at, word], ...]}], "cached", "reused": windows cut from a
     kept sample, "model", "took": wall seconds, "profile": CPU and wall seconds of the model load, the audio decode and
@@ -424,8 +411,8 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
                     for k, s in enumerate(ws)], used
         windows, reused = hear_all(starts, secs)
         if more:
-            import arr_subsync
-            few = arr_subsync.short(windows, code(lang))
+            from . import subsync
+            few = subsync.short(windows, code(lang))
             extra = [more[k] for k in few if k < len(more) and more[k] is not None] if len(few) < len(windows) or len(windows) == 1 else []
             if extra:
                 got, used = hear_all(extra, more_secs)
@@ -438,9 +425,19 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
 
 def waits(gate, queue):
     """Another hearing waits for the host's model: it holds gate, the lid.turn.gate file of the hook, while it waits for
-    its turn. Or a job file waits in the directory queue. Either one makes the sweep yield, see sweep()."""
-    if queue and any(n.endswith(".json") and not n.startswith(".") for n in os.listdir(queue)):
-        return True
+    its turn. Or an import job waits in the queue of queue, the hook's state store, or as a file in the queue folder
+    beside it. Either one makes the sweep yield, see sweep(). A store that does not read is no import."""
+    if queue:
+        folder = os.path.join(os.path.dirname(queue), "queue")   # the job files of a busy store, see runner.queue_job()
+        if os.path.isdir(folder) and any(not n.startswith(".") for n in os.listdir(folder)):
+            return True
+        try:
+            with closing(sqlite3.connect(f"file:{queue}?mode=ro", uri=True, timeout=5)) as db:   # the jobs table of the hook's store.py
+                if db.execute("SELECT 1 FROM jobs WHERE claimed = 0 AND due <= ? AND name NOT LIKE 'deep-analysis-%'",
+                              (time.time_ns(),)).fetchone():
+                    return True
+        except sqlite3.Error:
+            pass
     if not gate:
         return False
     with open(gate, "a") as f:
@@ -484,18 +481,18 @@ def words_get(cache, path, audio_index, model, lang, starts, secs=WORD_SECS):
 def jobs(path, spec, cache, model=MODEL, model_dir=MODEL_DIR):
     """The subtitle check's hearings in the process of a language check, so the model loads once. spec is a JSON file
     of [{"index", "lang", "cues": [[start, end, text], ...], "duration"}], one per audio stream. The windows come from
-    arr_subsync.windows() with the samples the language check kept, as the hook picks them, so the hook's own check
+    subsync.windows() with the samples the language check kept, as the hook picks them, so the hook's own check
     later finds the words in the cache. Returns [{"index", "starts"} or {"index", "error"}]."""
-    import arr_subsync
+    from . import subsync
     out = []
     with open(spec) as f:
         todo = json.load(f)
     for j in todo:
         try:
-            stop = arr_subsync.arr_decide.STOPWORDS.get(code(j["lang"]), frozenset())
-            first = arr_subsync.windows(j["cues"], j["duration"], stop, kept_pcm(cache, path, j["index"]))
+            stop = subsync.decide.STOPWORDS.get(code(j["lang"]), frozenset())
+            first = subsync.windows(j["cues"], j["duration"], stop, kept_pcm(cache, path, j["index"]))
             if first:
-                more = arr_subsync.windows(j["cues"], j["duration"], stop, secs=THIRD_SECS, taken=first)
+                more = subsync.windows(j["cues"], j["duration"], stop, secs=THIRD_SECS, taken=first)
                 listen(path, j["index"], first, j["lang"], cache=cache, model=model, model_dir=model_dir, more=more)
             out.append({"index": j["index"], "starts": first})
         except Exception as e:   # the hook's own check tries again
@@ -528,7 +525,7 @@ def main(argv=None):
     ap.add_argument("--more", nargs="+", help="a second window per --words START, - for none, heard when its window hears too little")
     ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the sweep, see sweep()")
     ap.add_argument("--yield-gate", help="the sweep yields while another hearing holds this gate file, see waits()")
-    ap.add_argument("--yield-queue", help="the sweep yields while a job file waits in this directory, see waits()")
+    ap.add_argument("--yield-queue", help="the sweep yields while an import job waits in this state store, see waits()")
     ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
     a = ap.parse_args(argv)
     if a.fetch:
@@ -557,5 +554,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Run by path in the venv. The folder above the package takes the place of the package folder on sys.path, so jobs()
+    # imports the package's subsync, and no module of the package hides a module of the venv.
+    sys.path[0] = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    __package__ = "arr_media_guard"
     lower_priority(WORD_THREADS if "--words" in sys.argv or "--then-words" in sys.argv else THREADS)
     sys.exit(main())

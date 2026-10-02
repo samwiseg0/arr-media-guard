@@ -1,18 +1,5 @@
-# arr-media-guard, a Sonarr and Radarr import hook that sets default tracks and catches broken files.
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Metadata checks for arr-media-guard. They decide whether a language or runtime alert can be trusted, and
 whether the file is wrong enough to re-grab. The rule is that a correct file is never deleted.
 
@@ -23,17 +10,17 @@ whether the file is wrong enough to re-grab. The rule is that a correct file is 
 - episode_title_verdict() finds a release whose episode title names another episode of the series. It alerts only.
 - wrong_content_evidence() adds the signals up. A re-grab needs REGRAB_POINTS.
 
-Network failure is "unknown", never "wrong". The only I/O is TMDB, the cache file and ffprobe in last_packet().
-No handler here catches OutOfTime, the exception the hook's time limit must raise.
+Network failure is "unknown", never "wrong". The only I/O is TMDB, its cache in the state store and ffprobe in last_packet().
+DEADLINE is the hook job's time limit. Its waits here end at it, and no handler here catches its OutOfTime.
 docs/design.md, "Metadata checks", has the rules and the reasons behind them.
 """
-import contextlib, difflib, fcntl, functools, http.client, json, os, re, subprocess, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import contextlib, difflib, fcntl, functools, http.client, json, math, re, select, sqlite3, subprocess, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-import arr_decide
+from . import decide
 
 TMDB = "https://api.themoviedb.org/3"
-CACHE = "/var/lib/arr-media-guard/tmdb.json"
 CACHE_DAYS = 30
+KINDS = {"radarr": ("movie", "imdb", "movie_results"), "sonarr": ("tv", "tvdb", "tv_results")}   # per app: TMDB's kind, the id /find takes, its list
 TMDB_RETRY = 600   # seconds after a failed TMDB call before the next try, so an outage costs one timeout per run
 # The last TMDB failure (its code and text), and "answered": the time of the last live HTTP answer from TMDB.
 DOWN = {"until": 0.0, "code": "", "why": "", "answered": 0.0}
@@ -84,8 +71,75 @@ YEAR = re.compile(r"(?<![0-9a-z])(?:19|20)[0-9]{2}(?![0-9])(?![._ -][01][0-9][._
 
 
 class OutOfTime(Exception):
-    """The hook's time limit. Its time_up() must raise this, never TimeoutError: a TimeoutError is an OSError, and
-    the network handlers here would swallow it and let the job run on with no alarm left."""
+    """The hook's time limit ran out, see Deadline. It is no TimeoutError: a TimeoutError is an OSError, and the network
+    handlers here would swallow it and let the job run on."""
+
+
+LOCK_POLL = 0.2   # seconds between two tries of a lock under a Deadline. fcntl.flock has no timeout.
+
+
+class Deadline:
+    """A time limit: a monotonic end time and the text of its OutOfTime. end is None while no limit runs. DEADLINE holds
+    the hook job's. A wait under it takes its bound from bound() or lock(), and a long loop calls check(). When the time
+    is up, each raises OutOfTime once and ends the limit. So a handler that swallows it lets the job run on with no
+    limit."""
+
+    def __init__(self, secs=None, why=None):
+        self.end = None
+        if secs is not None:
+            self.start(secs, why)
+
+    def start(self, secs, why=None):
+        self.end, self.why = time.monotonic() + secs, why or f"stopped after {secs} seconds"
+
+    def stop(self):
+        self.end = None
+
+    def left(self):
+        """The seconds left, None with no limit."""
+        if self.end is None:
+            return None
+        left = self.end - time.monotonic()
+        if left <= 0:
+            self.end = None
+            raise OutOfTime(self.why)
+        return left
+
+    def check(self):
+        self.left()
+
+    def bound(self, secs):
+        """secs, cut to the seconds left."""
+        left = self.left()
+        return secs if left is None else min(secs, left)
+
+    @contextlib.contextmanager
+    def paused(self):
+        """No limit inside the block, which gets the seconds left, None with no limit. After it the limit has them again,
+        so a wait with a limit of its own costs the job none of its time."""
+        left = self.left()
+        self.end = None
+        try:
+            yield left
+        finally:
+            if left is not None:
+                self.end = time.monotonic() + left
+
+    def lock(self, f, op):
+        """fcntl.flock(f, op). While a limit runs it tries with LOCK_NB every LOCK_POLL seconds, else it blocks. A limit
+        that ran out before the first try raises, as after a wait_turn() that waited it all."""
+        if self.end is None:
+            return fcntl.flock(f, op)
+        self.check()
+        while True:
+            try:
+                return fcntl.flock(f, op | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.check()
+                select.select([], [], [], LOCK_POLL)   # a real wait. The hook's tests fake time.sleep.
+
+
+DEADLINE = Deadline()   # the time limit of the hook job that runs in this process
 
 
 @functools.lru_cache(maxsize=1)
@@ -110,11 +164,13 @@ def _get(path, token, **params):
     url = f"{TMDB}{path}" + ("?" + urllib.parse.urlencode(params) if params else "")
     try:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": "arr-media-guard"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=DEADLINE.bound(10)) as r:
             body = json.loads(r.read())
+        DEADLINE.check()
         DOWN["answered"] = time.time()
         return body
     except (OSError, ValueError, http.client.HTTPException) as ex:   # a bad token raises UnicodeEncodeError, a ValueError
+        DEADLINE.check()   # the job's time ran out during the call: OutOfTime, and TMDB stays unpaused
         code = ex.code if isinstance(ex, urllib.error.HTTPError) else None
         if code: DOWN["answered"] = time.time()
         if code != 404:   # a token urllib cannot send (UnicodeEncodeError) is as broken as one TMDB refuses
@@ -130,25 +186,23 @@ def _down(code, why):
 def tmdb_state(expected):
     """(code, why) for the decision log and the Loki line. The code is found (TMDB returned the item's record),
     no_record, tmdb_unavailable (network, timeout, 5xx), tmdb_token_missing (no token) or tmdb_token_rejected (TMDB
-    answered 401 or 403). Decision lines from before 1.3.0 say ok for found."""
+    answered 401 or 403)."""
     if expected: return "found", ""
     if time.time() < DOWN["until"]: return DOWN["code"], DOWN["why"]
     return "no_record", "TMDB has no record for the item"
 
 
-def key_alert(code, state_dir, now=None):
+def key_alert(code, now=None):
     """(title, text) for one amber Discord embed when the TMDB key is missing or rejected, else None. At most one
-    per KEY_ALERT_EVERY per host: the stamp file tmdb-key-alert under state_dir holds the time of the last one."""
+    per KEY_ALERT_EVERY per host: the store holds the time of the last one."""
+    from . import store   # here, because store reads config, and config reads DEADLINE from this module as it loads
     if code not in KEY_BROKEN: return None
-    now, stamp = now or time.time(), os.path.join(state_dir, "tmdb-key-alert")
+    now = now or time.time()
     try:
-        with open(stamp + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)   # the hook's job processes run side by side, and one of them posts
-            with contextlib.suppress(OSError):
-                if now - os.path.getmtime(stamp) < KEY_ALERT_EVERY: return None
-            open(stamp, "w").close()
-            os.utime(stamp, (now, now))
-    except OSError:
+        with store.tx():   # the hook's job processes run side by side, and one of them posts
+            if now - store.get("mark", "tmdb-key-alert", -math.inf) < KEY_ALERT_EVERY: return None
+            store.put("mark", "tmdb-key-alert", now)
+    except (sqlite3.Error, OSError):
         return None   # no stamp means an alert per file, so none at all. The decision log still names the code.
     what = "TMDB rejected the key." if code == "tmdb_token_rejected" else "No TMDB key: TMDB_TOKEN is empty and Radarr's DLL gave none."
     return "TMDB key not working", (f"{what} The metadata checks run without TMDB, so no wrong-content re-grab relies on it. "
@@ -166,29 +220,18 @@ def tmdb_day_status(records):
 
 
 def _cached(cache, key, fetch, now):
-    """The value under key when younger than CACHE_DAYS, else fetch() and store it. None is never stored."""
-    try:
-        data = json.load(open(cache))
-    except (OSError, ValueError):
-        data = {}
-    data = data if isinstance(data, dict) else {}
-    # an entry without a numeric "at" or a "v" counts as stale, so a damaged entry is dropped at the next write
-    fresh = lambda e: isinstance(e, dict) and isinstance(e.get("at"), (int, float)) and "v" in e and now - e["at"] < CACHE_DAYS * 86400
-    if fresh(data.get(key)):
-        return data[key]["v"]
+    """The value under key in cache, a part of the store, when younger than CACHE_DAYS, else fetch() and store it. None
+    is never stored. A write drops the stale values."""
+    from . import store   # here, as in key_alert()
+    v = store.get(cache, key, newer=now - CACHE_DAYS * 86400)
+    if v is not None:
+        return v
     v = fetch()
     if v is None:
         return None
-    data = {k: e for k, e in data.items() if fresh(e)}
-    data[key] = {"at": now, "v": v}
-    try:   # a lost write costs one more request later. The rename keeps a concurrent reader off a half file.
-        tmp = f"{cache}.{os.getpid()}.{threading.get_ident()}.tmp"   # the workers of a dry run and of a conversion backfill are threads
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, cache)
-    except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
+    with contextlib.suppress(sqlite3.Error, OSError), store.tx():   # a lost write costs one more request later
+        store.drop(cache, older=now - CACHE_DAYS * 86400)
+        store.put(cache, key, v, now)
     return v
 
 
@@ -216,25 +259,23 @@ def _find(source, xid, kind, token, cache, now):
     return (got or {}).get("id")
 
 
-def expected_languages(app, ids, token=None, cache=CACHE, now=None):
+def expected_languages(app, ids, token=None, cache="tmdb", now=None):
     """What TMDB says about the item, or None when it cannot be known. None means unknown to every caller, never wrong.
 
     ids: {"tmdb", "imdb"} for a Radarr movie, {"tmdb", "tvdb"} for a Sonarr series. The app's tmdb id comes first,
     /find by imdb or tvdb id is the fallback. token: TMDB_TOKEN from the env file, else radarr_token().
     Returns {"original": 639-2/B code, "spoken": [codes], "source", "fetched", "runtime" (movie
     minutes, 0 for a series), "title", "year", "special" (a TV movie or stand-up), "unmapped": TMDB codes with no
-    639-2 code}. The result is cached for CACHE_DAYS in the cache file.
+    639-2 code}. The result is cached for CACHE_DAYS in cache, a part of the state store.
     """
     token, now = token or radarr_token(), now or time.time()
     if not token:
         _down("tmdb_token_missing", "TMDB_TOKEN is empty and Radarr's DLL gave no token")
         return None
     try:
-        if app == "radarr":
-            tid = ids.get("tmdb") or _find("imdb_id", ids.get("imdb"), "movie_results", token, cache, now)
-            return _facts("movie", tid, token, cache, now) if tid else None
-        tid = ids.get("tmdb") or _find("tvdb_id", ids.get("tvdb"), "tv_results", token, cache, now)
-        return _facts("tv", tid, token, cache, now) if tid else None
+        kind, other, found = KINDS.get(app, KINDS["sonarr"])
+        tid = ids.get("tmdb") or _find(f"{other}_id", ids.get(other), found, token, cache, now)
+        return _facts(kind, tid, token, cache, now) if tid else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException):   # urllib errors are OSErrors
         return None
 
@@ -245,11 +286,13 @@ def last_packet(path, timeout=30):
     A file without an index would be read whole, so the timeout ends it."""
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", "v:0", "-show_entries", "packet=pts_time:format=start_time",
-                            "-read_intervals", "999999999%", path], capture_output=True, text=True, errors="replace", timeout=timeout)
+                            "-read_intervals", "999999999%", path], capture_output=True, text=True, errors="replace",
+                           timeout=DEADLINE.bound(timeout))
         d = json.loads(r.stdout or "{}")
         pts = [float(p["pts_time"]) for p in d.get("packets") or [] if p.get("pts_time") not in (None, "N/A")]
         return round(max(pts) - float((d.get("format") or {}).get("start_time") or 0), 3) if pts else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
+        DEADLINE.check()   # a read the job's time limit cut raises OutOfTime
         return None
 
 
@@ -270,9 +313,9 @@ def trusted_duration(probe, size, last_packet=None):
     props = [t.get("properties") or {} for t in probe.get("tracks") or []]
     av = [t.get("properties") or {} for t in probe.get("tracks") or [] if t.get("type") in ("audio", "video")]
     fresh = lambda p: app.startswith("mkvmerge") and p.get("tag__statistics_writing_app", app) == app
-    src = {"header": arr_decide.duration(probe)}
+    src = {"header": decide.duration(probe)}
     if av and all(fresh(p) and p.get("tag_duration") for p in av):
-        src["streams"] = max(arr_decide.tag_seconds(p["tag_duration"]) for p in av)
+        src["streams"] = max(decide.tag_seconds(p["tag_duration"]) for p in av)
     if av and all(fresh(p) and str(p.get("tag_bps", "")).isdigit() for p in av):   # subtitles count when tagged
         bps = sum(int(p["tag_bps"]) for p in props if fresh(p) and str(p.get("tag_bps", "")).isdigit())
         src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])) * 8 / bps if bps else 0
@@ -349,7 +392,7 @@ def matches(minutes, seconds):
     return bool(minutes and seconds) and abs(seconds / 60 - minutes) <= max(MATCH_SLACK, MATCH_TOLERANCE * minutes)
 
 
-def other_film(release_name, item_tmdb, seconds, token=None, cache=CACHE, now=None):
+def other_film(release_name, item_tmdb, seconds, token=None, cache="tmdb", now=None):
     """The TMDB film that the release name's title and year name, when it is not the item and its runtime matches the
     file. Only the top 5 search results within 1 year of the release year count, because TMDB's year matches any
     release date, so a search for a remake may return the older film first. A release with an edition word is skipped,
@@ -371,7 +414,7 @@ def other_film(release_name, item_tmdb, seconds, token=None, cache=CACHE, now=No
 
 
 def language_verdict(tracks, original, expected):
-    """("ok" | "wrong" | "unknown", why) for the main audio of arr_decide.classify() tracks.
+    """("ok" | "wrong" | "unknown", why) for the main audio of decide.classify() tracks.
 
     The item's languages are English, the app's original, TMDB's original, and TMDB's spoken languages when TMDB's
     original is not English. English is always allowed, as in decide(): a foreign original may play its English dub
@@ -379,16 +422,16 @@ def language_verdict(tracks, original, expected):
     unknown, never wrong. Unknown without TMDB, with untagged main audio, or with an unmapped code.
     """
     main = [t for t in tracks if t["kind"] == "a" and t["role"] == "main"]
-    if not main or any(t["lang"] in arr_decide.UNTAGGED for t in main):
+    if not main or any(t["lang"] in decide.UNTAGGED for t in main):
         return "unknown", "the main audio is untagged or missing"
     if not expected or expected.get("unmapped"):
         return "unknown", "TMDB gave no usable languages"
     want = {expected["original"]} | (set(expected["spoken"]) if expected["original"] != "eng" else set())
-    allowed = arr_decide.codes(original).union({"eng"}, *(arr_decide.codes(c) for c in want if c))
+    allowed = decide.codes(original).union({"eng"}, *(decide.codes(c) for c in want if c))
     have = sorted({t["lang"] for t in main})
     if any(lang in allowed for lang in have):
         return "ok", f"the audio is {', '.join(have)}, one of the item's languages"
-    if expected["original"] == "eng" and set(have) & set().union(*(arr_decide.codes(c) for c in expected["spoken"])):
+    if expected["original"] == "eng" and set(have) & set().union(*(decide.codes(c) for c in expected["spoken"])):
         return "unknown", f"the audio is {', '.join(have)}, which TMDB lists as spoken in this English original"
     return "wrong", f"the audio is {', '.join(have)}, the item's languages are {', '.join(sorted(allowed))}"
 
@@ -396,7 +439,7 @@ def language_verdict(tracks, original, expected):
 def release_languages(release_name):
     """639-2 codes of the language words outside the title position of a release name: "[Arabic]", "GERMAN"."""
     rest = split_release(release_name)[2].lower()
-    return {c for w, c in arr_decide.LANGWORDS.items() if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", rest)}
+    return {c for w, c in decide.LANGWORDS.items() if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", rest)}
 
 
 # The episode tag of a release name: S04E15, S04E15a (one segment of a DVD order), S21.E13, S01E01E02, S01E01-02,
@@ -424,7 +467,7 @@ def release_episode_title(name):
     rest = name[tag.end():].split("[")[0]
     end = QUALITY.search(rest)
     words = [w for w in re.split(r"[ ._]+", rest[:end.start()] if end else re.sub(r"-[^-.\s]*$", "", rest)) if w]
-    flag = lambda w: (w.lower().strip("-") in TITLE_END and not w.istitle()) or (w.isupper() and w.lower() in arr_decide.LANGWORDS)
+    flag = lambda w: (w.lower().strip("-") in TITLE_END and not w.istitle()) or (w.isupper() and w.lower() in decide.LANGWORDS)
     if "".join(words).isupper():
         while words and flag(words[-1]):
             words.pop()
@@ -563,7 +606,7 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
                            alt_titles_years=(), other=None, episode=None):
     """Each signal that the file holds the wrong content, its points, and whether they justify a re-grab.
 
-    tracks: arr_decide.classify() of the file. original: the app's original language. expected: expected_languages().
+    tracks: decide.classify() of the file. original: the app's original language. expected: expected_languages().
     trusted: trusted_duration(). listed_minutes, release_name, item_type: see runtime_verdict(). item_year and
     alt_titles_years: see year_verdict(). other: other_film() for a movie. episode: episode_title_verdict() for an
     episode whose release names a title.
