@@ -14,7 +14,11 @@ from . import cli, config, content, decide, logs, regrab, subsync
 TENSES = ("planned", "done")
 B, E = "\x02", "\x03"   # the ends of a bold span in the text of a template, see bold()
 MARKDOWN = re.compile(r"([\\*_~`|])")   # the characters Discord reads as markdown, escaped in every embed
-SENTENCE_END = re.compile(f"{B}[^{E}]*{E}|(?<=[.!?])[ \n]+(?=[A-Z\"{B}])")   # a bold span, which never breaks, or the space after a sentence
+L, M, R = "\x05", "\x06", "\x07"   # the start, the middle and the end of a link span, see link()
+LINK_TEXT = re.compile(r"([\\*_~`|\[\]])")   # the characters escaped in the text of a link: MARKDOWN and the brackets
+SPAN = re.compile(f"{L}([^{M}]*){M}([^{R}]*){R}|{MARKDOWN.pattern}")   # a link span, or one markdown character, see escaped()
+# a bold span or a link span, which never breaks, or the space after a sentence
+SENTENCE_END = re.compile(f"{B}[^{E}]*{E}|{L}[^{R}]*{R}|(?<=[.!?])[ \n]+(?=[A-Z\"{B}{L}])")
 GLUE = "\x04"   # a space after a full stop inside a fact, as in the name "PJ Robot Vs. Romeo". markdown() never breaks a line there.
 
 
@@ -48,15 +52,33 @@ def glued(v):
     return [glued(x) for x in v] if isinstance(v, list) else v
 
 
+def link(text, url):
+    """text as a link to url in a Discord embed, see escaped(). No url gives text alone. So does a text whose brackets
+    do not pair, because Discord then ends the link early, escaped or not. Only the text of an embed holds a link, so the
+    decision log, the CLI and Loki stay plain."""
+    return f"{L}{text}{M}{url}{R}" if url and paired(text) else text
+
+
+def paired(text):
+    """Whether each "[" of text has its own "]" after it."""
+    depth = 0
+    for c in text:
+        depth += (c == "[") - (c == "]")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
 def escaped(text):
-    """text with every Discord markdown character escaped, so a name never breaks the format."""
-    return MARKDOWN.sub(r"\\\1", text)
+    """text with every Discord markdown character escaped, so a name never breaks the format. A link span of link()
+    becomes [text](url). Its text has the brackets escaped too, and its URL stays as it is."""
+    return SPAN.sub(lambda m: "\\" + m[3] if m[3] else "[" + LINK_TEXT.sub(r"\\\1", m[1]) + f"]({m[2]})", text)
 
 
 def markdown(text):
     """The text of a template for a Discord embed, see logs.embed(). Every markdown character is escaped, and each bold
     span is in **. A text of more than two sentences gets one sentence a line."""
-    lines = SENTENCE_END.sub(lambda m: m[0] if m[0].startswith(B) else "\n", text)
+    lines = SENTENCE_END.sub(lambda m: m[0] if m[0][0] in (B, L) else "\n", text)
     text = lines if lines.count("\n") > 1 else text
     return escaped(text).replace(B, "**").replace(E, "**").replace(GLUE, " ")
 
@@ -466,11 +488,15 @@ TMDB_SKIPPED = {"no_record": "TMDB has no record of this item", "tmdb_unavailabl
 def alert_embed(rec, f, t):
     """The Discord embed of finding f of rec: the problem and what the hook did, one field with the title and the file,
     and the footer with the host. A language or content alert names a TMDB failure there, because TMDB's language check
-    did not run."""
+    did not run. When the item has a page in its app, the field shows the item's name as a link to it, on its own line
+    above the file. The field name is then blank, because Discord shows no link in a field name. With no link, the field
+    name is the item's name, as before."""
     (text, act), (head, color) = texts(f, t, track_langs(rec), marked=True), title(f)
     note = f'{TMDB_SKIPPED[rec["tmdb"]]}, so its language check was skipped' if f["kind"] in ("language", "content") \
         and rec.get("tmdb") in TMDB_SKIPPED else None
-    return logs.embed(rec["app"], head, f"{text}\n{act}" if act else text, color, [(rec["label"], os.path.basename(rec["path"]))],
+    shown, file = link(rec["label"], logs.page(rec)), os.path.basename(rec["path"])
+    item = (rec["label"], file) if shown == rec["label"] else ("\u200b", f"{shown}\n{file}")   # U+200B, a zero-width space
+    return logs.embed(rec["app"], head, f"{text}\n{act}" if act else text, color, [item],
                       " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
 
 

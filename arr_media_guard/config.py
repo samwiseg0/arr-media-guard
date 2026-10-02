@@ -101,12 +101,14 @@ def program(app):
 
 @dataclasses.dataclass(frozen=True)
 class AppSettings:
-    """The settings of one instance: <KEY>_URL, <KEY>_API_KEY, <KEY>_DIR and the pairs of <KEY>_PATH_MAP, see env_key()."""
+    """The settings of one instance: <KEY>_URL, <KEY>_API_KEY, <KEY>_DIR, the pairs of <KEY>_PATH_MAP and <KEY>_LINK, see
+    env_key()."""
     url: str
     api_key: str    # empty: the key in config.xml, see api_key()
     dir: str        # the app's own folder
     path_map: list
     program: str    # radarr or sonarr, the program the instance runs
+    link: str = ""   # the address a browser opens for the app, for the link in each alert. Empty: no link, see apps.App.page().
 
 
 @dataclasses.dataclass(frozen=True)
@@ -266,7 +268,8 @@ def settings(path, environ=os.environ):
     subtitles = level("SUBTITLES", "fix", SUBTITLES_LEVELS, "check", "the subtitle check of an import runs as check")
     maps = {key: path_map(key, env.get(key, "")) for key in ("PATH_MAP", *MAP_KEYS.values())}   # {key: (pairs, error)}
     apps = {app: AppSettings(env.get(f"{app.upper()}_URL", f"http://127.0.0.1:{port}"), api_key(f"{app.upper()}_API_KEY"),
-                             env.get(f"{app.upper()}_DIR") or f"/var/lib/{app}", maps[f"{app.upper()}_PATH_MAP"][0], app) for app, port in APPS.items()}
+                             env.get(f"{app.upper()}_DIR") or f"/var/lib/{app}", maps[f"{app.upper()}_PATH_MAP"][0], app,
+                             env.get(f"{app.upper()}_LINK", "")) for app, port in APPS.items()}
     # APP_INSTANCES='sonarr-4k:sonarr,radarr-4k:radarr' adds instances. A bad entry is left out, so no event reaches it.
     for entry in (e.strip() for e in env.get("APP_INSTANCES", "").split(",") if e.strip()):
         app, sep, prog = (x.strip() for x in entry.partition(":"))
@@ -282,7 +285,7 @@ def settings(path, environ=os.environ):
             continue
         maps[f"{key}_PATH_MAP"] = path_map(f"{key}_PATH_MAP", env.get(f"{key}_PATH_MAP", ""))
         apps[app] = AppSettings(env[f"{key}_URL"], api_key(f"{key}_API_KEY"), env.get(f"{key}_DIR") or f"/var/lib/{app}",
-                                maps[f"{key}_PATH_MAP"][0], prog)
+                                maps[f"{key}_PATH_MAP"][0], prog, env.get(f"{key}_LINK", ""))
     map_errors = [e for _, e in maps.values() if e]
     errors += map_errors
     whole = "is not a whole number of 1 or more, so it counts as {}."

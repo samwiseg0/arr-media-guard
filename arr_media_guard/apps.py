@@ -180,6 +180,28 @@ class App:
         """Monitor the movies or episodes items again. A delete through the API may unmonitor them."""
         arr_write(self.app, self.monitor, "PUT", {self.ids_key: items, "monitored": True})
 
+    def page(self, slug):
+        """The URL of the item slug in the app's web UI, or None. The base is <KEY>_LINK alone, because the address a
+        browser opens often differs from <KEY>_URL behind a reverse proxy or in Docker. An empty <KEY>_LINK, no slug or a
+        base that does not read gives None. The URL keeps only the scheme, host, port and path of the base, so it never
+        holds a user, a password or a query. A base whose "@" urlsplit does not place in the host part may hide a
+        password in its path or fragment, so it gives None too. The slug is the titleSlug of the movie or series record.
+        Sonarr routes /series/:titleSlug and Radarr /movie/:titleSlug, the names in kind (frontend/src/App/AppRoutes.tsx,
+        line 69 in Sonarr v4.0.20.3014, line 70 in Radarr v5.28.0.10274 and v6.4.4.10685). Radarr's titleSlug is the TMDB
+        id (src/Radarr.Api.V3/Movies/MovieResource.cs:151 at both tags)."""
+        base = config.CFG.apps[self.app].link
+        try:
+            u = urllib.parse.urlsplit(base)
+            host, port = u.hostname or "", u.port
+        except ValueError:   # a bad IPv6 address or port
+            return None
+        if not slug or u.scheme not in ("http", "https") or base.count("@") != u.netloc.count("@") or \
+                not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:.]+", host):
+            return None
+        host = f"[{host}]" if ":" in host else host
+        path = urllib.parse.quote(u.path.rstrip("/"), safe="/%")
+        return f'{u.scheme}://{host}{f":{port}" if port else ""}{path}/{self.kind}/{urllib.parse.quote(str(slug), safe="")}'
+
 
 class Radarr(App):
     kind, file_kind, owner_key, ids_key, film = "movie", "moviefile", "movieId", "movieIds", True
@@ -463,12 +485,13 @@ def titles(x):
 
 def movie_item(m, kids_profiles_by_id=None):
     """(label, original language, listed runtime, Plex lookup, kids, ctx) for a Radarr movie. ctx is the metadata
-    context of content.py: the ids, the year, the listed minutes, and the titles with the other years of the movie."""
+    context of content.py: the ids, the year, the listed minutes, and the titles with the other years of the movie. Its
+    slug names the movie's page in Radarr, see App.page()."""
     profile = (kids_profiles_by_id or {}).get(m.get("qualityProfileId"))
     years = [m.get("secondaryYear")] + [int(d[:4]) for d in (m.get(k) or "" for k in ("inCinemas", "digitalRelease", "physicalRelease"))
                                          if d[:4].isdigit()]
     ctx = {"ids": {"tmdb": m.get("tmdbId"), "imdb": m.get("imdbId")}, "year": m.get("year"), "listed": m.get("runtime") or 0,
-           "titles": titles(m) + [(None, y) for y in years if y]}
+           "titles": titles(m) + [(None, y) for y in years if y], "slug": m.get("titleSlug")}
     return (f'{m["title"]} ({m.get("year")})', (m.get("originalLanguage") or {}).get("name"), m.get("runtime") or 0,
             {"guids": guids(m, ("tmdb", "imdb")), "title": m["title"], "show": False},
             decide.kids_title("radarr", m.get("genres"), profile, m.get("studio")), ctx)
@@ -483,7 +506,7 @@ def episode_item(s, eps, series_eps=None):
     want = {"guids": guids(s, ("tvdb", "tmdb", "imdb")), "title": s["title"], "show": True}
     ctx = {"ids": {"tmdb": s.get("tmdbId"), "tvdb": s.get("tvdbId")}, "year": s.get("year"),
            "listed": [e.get("runtime") or 0 for e in eps], "titles": titles(s), "series_id": s.get("id"), "episode_ids": [e["id"] for e in eps if "id" in e],
-           "anime": s.get("seriesType") == "anime",
+           "anime": s.get("seriesType") == "anime", "slug": s.get("titleSlug"),
            **({"episodes": series_eps} if series_eps else {})}
     return (label, (s.get("originalLanguage") or {}).get("name"), episode_runtime(eps), want, decide.kids_title("sonarr", s.get("genres")),
             ctx)

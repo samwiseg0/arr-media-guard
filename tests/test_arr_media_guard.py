@@ -1002,6 +1002,23 @@ def test_sonarr_alerts_go_to_the_same_webhook_as_sonarr(env, monkeypatch):
     assert post["username"] == f"Sonarr {hook.CFG.instance}" and post["embeds"][0]["fields"][0]["name"] == "Show S01E02"
 
 
+@pytest.mark.parametrize("app", ["radarr", "sonarr"])
+def test_an_import_alert_links_the_item_from_the_record_the_job_read(env, monkeypatch, settings, app):
+    """The slug comes from the movie or series record the job reads anyway, so the link costs no API call. The fake
+    Sonarr answers only the two reads of an import. The decision line keeps the slug in its ids for the nightly audit."""
+    settings(radarr={"link": "https://movies.watch-tower.net"}, sonarr={"link": "https://tv.watch-tower.net"})
+    env["probe"] = copy.deepcopy(NO_ENGLISH)
+    env["movies"]["movie/7"]["titleSlug"] = "90001"
+    if app == "sonarr":
+        as_sonarr(monkeypatch, env, {"title": "Show", "titleSlug": "show", "originalLanguage": {"name": "English"}},
+                  [{"seasonNumber": 1, "episodeNumber": 2, "runtime": 44}])
+    hook.main([])
+    (post,) = [b for m, u, b in env["http"] if m == "POST"]
+    link = {"radarr": "[Film A (1979)](https://movies.watch-tower.net/movie/90001)", "sonarr": "[Show S01E02](https://tv.watch-tower.net/series/show)"}[app]
+    assert post["embeds"][0]["fields"] == [{"name": "\u200b", "value": f"{link}\nFilm A (1979) WEBDL-1080p.mkv", "inline": False}]
+    assert [r["ids"]["slug"] for r in log_lines(env) if r.get("findings")] == [{"radarr": "90001", "sonarr": "show"}[app]]
+
+
 # --- the queue and its one worker ----------------------------------------------------------------
 
 def test_200_events_start_at_most_one_worker(env):
@@ -8565,6 +8582,43 @@ def test_the_audit_lists_every_file_with_the_problems_first(env):
     assert body[-1] == f"and {122 - (len(body) - 1)} more OK" and len(e["description"]) <= 2000, body[-3:]
     assert e["footer"]["text"] == f"TMDB didn't answer 1 time · arr-media-guard on {host}"
     assert "invariant" not in e["description"] and "undecided" not in e["description"]
+
+
+OFF = {"recheck": {"edits": 0, "invariants": ["inv_only_english_subtitle_off"]}}   # a track problem after the change
+
+
+def test_the_audit_links_each_problem_to_its_item(env, settings):
+    """A problem line links its item to its page in the app, from the slug its decision line keeps. A line with no slug
+    and an OK line stay bold."""
+    settings(sonarr={"link": "https://tv.watch-tower.net"})
+    lines = [dict(audit_line("Show K", 1, ENGLISH_FIRST), ids={"slug": "show-k"}, **OFF),
+             dict(audit_line("Show J", 1, []), outcome="undecided", result="undecided", abstain="original_missing_bare_tag"),
+             dict(audit_line("Show H", 1, ENGLISH_FIRST), ids={"slug": "show-h"})]
+    body = post_audit(env, lines)["embeds"][0]["description"].split("\n")
+    assert body == ["**Show J S01E01**: couldn't decide which audio should play first, because no track is in the original language",
+                    "[Show K S01E01](https://tv.watch-tower.net/series/show-k): after the change, the only English subtitles are off",
+                    "**Show H S01E01**: OK"]
+
+
+def test_the_audit_links_a_problem_whose_first_line_of_the_day_has_no_slug(env, settings):
+    """On the upgrade day a line of 2.1.1, with no slug, may come before a line of 2.2.0 for the same file. The later
+    line's slug still links the problem."""
+    settings(sonarr={"link": "https://tv.watch-tower.net"})
+    old = audit_line("Show K", 1, ENGLISH_FIRST)
+    new = dict(audit_line("Show K", 1, ENGLISH_FIRST), ids={"slug": "show-k"}, **OFF)
+    body = post_audit(env, [old, new])["embeds"][0]["description"].split("\n")
+    assert body == ["[Show K S01E01](https://tv.watch-tower.net/series/show-k): after the change, the only English subtitles are off"]
+
+
+def test_the_audit_with_long_links_still_ends_in_and_n_more(env, settings):
+    """The links count toward the cap of the file list, so the post stays under Discord's limit and no link is cut."""
+    settings(sonarr={"link": "https://tv.watch-tower.net"})
+    lines = [dict(audit_line(f"Show {k:03d}", 1, ENGLISH_FIRST), ids={"slug": f"show-{k:03d}-" + "x" * 80}, **OFF) for k in range(60)]
+    e = post_audit(env, lines)["embeds"][0]
+    body = e["description"].split("\n")
+    assert len(e["description"]) <= 2000 and body[-1] == f"and {60 - (len(body) - 1)} more", body[-2:]
+    assert body[:-1] == [f"[Show {k:03d} S01E01](https://tv.watch-tower.net/series/show-{k:03d}-{'x' * 80}): after the change, the only English "
+                         "subtitles are off" for k in range(len(body) - 1)]
 
 
 def test_the_terminal_audit_names_each_problem_in_plain_words(env, capsys):

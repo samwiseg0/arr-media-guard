@@ -355,6 +355,21 @@ def test_instances_add_named_apps_that_read_their_own_keys(tmp_path):
     assert (m.program("sonarr-4k"), m.program("Radarr-UHD"), m.program(None)) == ("sonarr", "radarr", None)
 
 
+def test_each_instance_links_its_alerts_to_its_own_link_setting(tmp_path):
+    """<KEY>_LINK is the address a browser opens for the app. Empty or missing: no link, whatever <KEY>_URL holds. An
+    instance named with -link keeps its keys apart from the link key of another instance, as radarr-link reads
+    RADARR_LINK_URL and radarr reads RADARR_LINK."""
+    m = load(tmp_path, "APP_INSTANCES='sonarr-4k:sonarr,radarr-4k:radarr,radarr-link:radarr'\nSONARR_4K_URL='http://sonarr-4k:8989'\n"
+                       "SONARR_4K_LINK='https://tv4k.watch-tower.net'\nRADARR_4K_URL='http://radarr-4k:7878'\nRADARR_4K_LINK=''\n"
+                       "SONARR_URL='http://sonarr:8989'\nSONARR_LINK='https://tv.watch-tower.net/'\n"
+                       "RADARR_LINK='https://movies.watch-tower.net'\nRADARR_LINK_URL='http://radarr-link:7878'\n")
+    assert m.CFG.errors == [] and [(a.url, a.link) for a in m.CFG.apps.values()] == [
+        ("http://127.0.0.1:7878", "https://movies.watch-tower.net"), ("http://sonarr:8989", "https://tv.watch-tower.net/"),
+        ("http://sonarr-4k:8989", "https://tv4k.watch-tower.net"), ("http://radarr-4k:7878", ""), ("http://radarr-link:7878", "")]
+    assert [m.ARR[a].page("x-1") for a in m.CFG.apps] == ["https://movies.watch-tower.net/movie/x-1", "https://tv.watch-tower.net/series/x-1",
+                                                          "https://tv4k.watch-tower.net/series/x-1", None, None]
+
+
 @pytest.mark.parametrize("text, why", [
     ("APP_INSTANCES='sonarr-4k'\n", "is no name:program pair"),
     ("APP_INSTANCES='sonarr 4k:sonarr'\nSONARR 4K_URL='http://x.invalid'\n", "has other characters than letters, digits and '-' in its name"),
@@ -527,6 +542,10 @@ def test_the_compose_file_runs_the_latest_image_once_each_placeholder_is_filled(
         "ghcr.io/samwiseg0/arr-media-guard:latest", ["8484:8484"], "unless-stopped", "1m")
     assert svc["volumes"] == ["./arr-media-guard:/config", "amg-state:/config/state", "CHANGE_ME:/data"]
     assert opt["volumes"] == svc["volumes"] + ["/dev/log:/dev/log"]
+    links = {"RADARR_LINK", "SONARR_LINK", "SONARR_4K_LINK", "RADARR_4K_LINK"}   # the owner asked to show them beside each app's URL
+    assert links <= set(opt["environment"]) and not links & set(svc["environment"])
+    assert {"      # RADARR_LINK: https://movies.example.com   # the address your browser opens, for the link in each alert",
+            "      # SONARR_LINK: https://tv.example.com"} <= set(open(os.path.join(FILES, "docs", "docker.md")).read().splitlines())
     assert {k for k, v in svc["environment"].items() if "CHANGE_ME" in v} == {"RADARR_URL", "SONARR_URL", "RADARR_API_KEY", "SONARR_API_KEY"}
     assert set(svc["environment"]) - {"RADARR_URL", "SONARR_URL", "RADARR_API_KEY", "SONARR_API_KEY"} == {"PUID", "PGID", "TZ"}
     environ = {k: v.replace("CHANGE_ME", "filled-0123456789") for k, v in opt["environment"].items()}

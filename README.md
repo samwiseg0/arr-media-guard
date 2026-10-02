@@ -159,7 +159,7 @@ RADARR_4K_API_KEY='the key from Settings > General of that Radarr'
 - On a host, a Sonarr instance name starts or ends with `sonarr`, and a Radarr instance name holds `radarr`. The
   Instance Name of each app must match its instance name, and the apps refuse other names.
 - The keys of an instance start with its name in upper case, with `-` as `_`. `sonarr-4k` reads `SONARR_4K_URL`,
-  `SONARR_4K_API_KEY`, `SONARR_4K_DIR` and `SONARR_4K_PATH_MAP`.
+  `SONARR_4K_API_KEY`, `SONARR_4K_DIR`, `SONARR_4K_PATH_MAP` and `SONARR_4K_LINK`.
 - The URL is required. The folder defaults to `/var/lib/<name>`. An empty map takes `PATH_MAP`.
 - A bad entry is left out, and `--selftest` names it.
 
@@ -277,8 +277,9 @@ resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another fold
 | `RADARR_URL`, `SONARR_URL` | `http://127.0.0.1:7878`, `http://127.0.0.1:8989`, in Docker `http://radarr:7878`, `http://sonarr:8989` | The app APIs as this host or container reaches them, see [docs/commands.md](docs/commands.md#connect-to-the-apps). |
 | `RADARR_DIR`, `SONARR_DIR` | `/var/lib/radarr`, `/var/lib/sonarr` | The app's own folder, which holds `config.xml`. |
 | `RADARR_API_KEY`, `SONARR_API_KEY` | empty | The API key of an app whose folder this host does not see, as in Docker. Empty: the key in `config.xml`. |
+| `RADARR_LINK`, `SONARR_LINK` | empty | The address your browser opens for the app, as `https://movies.example.com`. Each alert then links to the item there. Empty: no link. |
 | `APP_INSTANCES` | empty | More instances, as `name:program` pairs joined by `,`. See [Several instances](#several-sonarr-or-radarr-instances). |
-| `SONARR_4K_URL`, `SONARR_4K_API_KEY`, `SONARR_4K_DIR`, `SONARR_4K_PATH_MAP` | empty, `/var/lib/sonarr-4k` for the folder | The keys of the instance `sonarr-4k`. The keys of each instance start with its name in upper case, with `-` as `_`. The URL is required. |
+| `SONARR_4K_URL`, `SONARR_4K_API_KEY`, `SONARR_4K_DIR`, `SONARR_4K_PATH_MAP`, `SONARR_4K_LINK` | empty, `/var/lib/sonarr-4k` for the folder | The keys of the instance `sonarr-4k`. The keys of each instance start with its name in upper case, with `-` as `_`. The URL is required. |
 
 ### Plex, Discord and TMDB
 

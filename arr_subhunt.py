@@ -28,7 +28,7 @@ It handles Radarr only. An episode needs its own search.
 """
 import argparse, datetime, email.utils, os, re, shutil, signal, sys, time, urllib.parse, uuid
 
-from arr_media_guard import apps, checks, config, decide, logs, runner, store
+from arr_media_guard import apps, checks, config, decide, logs, report, runner, store
 
 CAP = 3                      # rejected candidates per movie. Then the movie is no_subbed_release until --force.
 GRAB_WAIT = 120              # seconds SABnzbd may take to fetch the NZBs. It retries a dead link without pause.
@@ -402,8 +402,10 @@ def hunt(app, mid, a, cred, ctx):
     def save():
         store.put(f"subhunt-{app}", str(mid), item)
 
+    shown = report.link(label, apps.ARR[app].page(m.get("titleSlug")))   # the movie's name, a link to its page in Radarr
+
     def post(title, text, color, release):
-        return logs.post(app, logs.embed(app, title, text, color, [("Title", label), ("Release", release), ("App", logs.app_name(app))]))
+        return logs.post(app, logs.embed(app, title, text, color, [("Title", shown), ("Release", release), ("App", logs.app_name(app))]))
 
     if item.get("keep") and os.path.exists(item["keep"]):   # an earlier run left the old file linked. Never go past it.
         text = (f'An earlier run left a copy of the old file of {label} at {item["keep"]}. Radarr may list the new file, the old '
@@ -512,7 +514,7 @@ def hunt(app, mid, a, cred, ctx):
         text = (f"No release of {label} passed the check, so the current file stays. Later searches for English subtitles skip "
                 "this movie.")
         sent = logs.post(app, logs.embed(app, "No release with English subtitles", text, "amber",
-                                   [("Title", label), ("Tried", tried), ("App", logs.app_name(app))]))
+                                   [("Title", shown), ("Tried", tried), ("App", logs.app_name(app))]))
         return note("no_subbed_release", f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])
     finally:   # the paused jobs a pass never reached, and every job of a run that broke off, SIGTERM included
         for c, nzo in jobs:

@@ -101,6 +101,12 @@ def app_name(app):
     return f'{apps.ARR[app].name} {config.CFG.instance}'
 
 
+def page(rec):
+    """The URL of the item of the decision line rec in its app, from the slug in its ids, or None, see apps.App.page()."""
+    a = apps.ARR.get(rec.get("app"))
+    return a.page((rec.get("ids") or {}).get("slug")) if a else None
+
+
 EMBED_MAX = 5900   # Discord refuses an embed whose texts add up to more than 6000 characters
 
 
@@ -207,18 +213,22 @@ def audit_problem(what, r):
 
 def audit_embed(app, seen, tmdb):
     """The nightly audit post, which cli.audit() sends only when a file has a problem. seen holds (the problem code or
-    "changed", its decision line). One line per file, "<label>: OK" or its problems, the problems first. The lines past
+    "changed", its decision line). One line per file, "<label>: OK" or its problems, the problems first. The label of a
+    problem links to the item's page in the app when its decision line holds the slug, see page(). The lines past
     AUDIT_CHARS become "and N more". The footer names the host, and TMDB only when it had trouble that day, see
     content.tmdb_day_status()."""
     files = {}
     for what, r in seen:
-        f = files.setdefault(r.get("path"), {"label": r.get("label") or "?", "problems": []})
+        f = files.setdefault(r.get("path"), {"label": r.get("label") or "?", "url": None, "problems": []})
+        f["url"] = f["url"] or page(r)   # a line of 2.1.1 holds no slug, and a later line of the file may
         if what != "changed":
             f["problems"].append(audit_problem(what, r))
-    lines = sorted((not f["problems"], f["label"], report.and_list(dict.fromkeys(f["problems"])) or "OK") for f in files.values())
-    body, n = [], sum(not ok for ok, _, _ in lines)
-    for k, (ok, label, text) in enumerate(lines):
-        line = f"{report.bold(label)}: {text}"
+    lines = sorted(((not f["problems"], f["label"], report.and_list(dict.fromkeys(f["problems"])) or "OK", f["url"]) for f in files.values()),
+                   key=lambda x: x[:3])
+    body, n = [], sum(not x[0] for x in lines)
+    for k, (ok, label, text, url) in enumerate(lines):
+        shown = report.link(label, None if ok else url)
+        line = f"{report.bold(label) if shown == label else shown}: {text}"
         if sum(len(report.markdown(x)) + 1 for x in body + [line]) > AUDIT_CHARS:
             body.append(f"and {len(lines) - k} more" + (" OK" if all(x[0] for x in lines[k:]) else ""))
             break

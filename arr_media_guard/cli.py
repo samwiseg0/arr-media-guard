@@ -59,7 +59,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     then, whatever its tracks."""
     label, original, runtime, want, kids, ctx = info
     started, path = time.time(), f["path"]
-    ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": (want or {}).get("guids", [])}   # --sub-time may name no item
+    ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": (want or {}).get("guids", []),
+           "slug": (ctx or {}).get("slug")}   # --sub-time may name no item. The slug links the audit post to the item.
     mode = "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
     run = lambda lock, shared, pool: process.process(process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=False, kids=kids,
                                                                  release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock,

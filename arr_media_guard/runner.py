@@ -1138,7 +1138,8 @@ def run_job(name, pending, shared=False, claimed=False):
                 else:
                     config.DEADLINE.start(config.BUDGET)
                     label, original, runtime, want, kids, ctx = apps.ARR[app].item(int(job["owner"]), fid)
-                    ids = {"app_id": job.get("owner"), "file_id": job.get("file_id"), "episode_ids": job.get("episode_ids"), "guids": want["guids"]}
+                    ids = {"app_id": job.get("owner"), "file_id": job.get("file_id"), "episode_ids": job.get("episode_ids"), "guids": want["guids"],
+                           "slug": ctx.get("slug")}   # the slug links the alerts to the item, see apps.App.page()
                     rec = process.process(process.Ctx(
                         app, path, label, original, runtime, job=job, audio=not (handled and kind == "audio"), video=not (handled and kind == "video"),
                         kids=kids, release=job.get("release") or "", ids=ids, item=ctx, lock=lock,

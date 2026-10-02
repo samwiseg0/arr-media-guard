@@ -10,7 +10,9 @@ services:
       PGID: 1000
       TZ: Etc/UTC                          # your time zone, for the nightly audit and the log times
       RADARR_URL: http://CHANGE_ME:7878    # each app as this container reaches it: a host address, or a service name on a shared network
+      # RADARR_LINK: https://movies.example.com   # the address your browser opens, for the link in each alert
       SONARR_URL: http://CHANGE_ME:8989
+      # SONARR_LINK: https://tv.example.com
       RADARR_API_KEY: CHANGE_ME            # Settings > General in Radarr
       SONARR_API_KEY: CHANGE_ME            # Settings > General in Sonarr
       # PLEX_URL: http://CHANGE_ME:32400   # Plex re-analyzes each edited item
@@ -18,8 +20,10 @@ services:
       # DISCORD_WEBHOOK: CHANGE_ME         # alerts and scan summaries
       # APP_INSTANCES: sonarr-4k:sonarr,radarr-4k:radarr   # more instances, each with the Webhook URL http://<this host>:8484/<name>
       # SONARR_4K_URL: http://CHANGE_ME:8989
+      # SONARR_4K_LINK: https://tv4k.example.com
       # SONARR_4K_API_KEY: CHANGE_ME       # Settings > General in the 4K Sonarr
       # RADARR_4K_URL: http://CHANGE_ME:7878
+      # RADARR_4K_LINK: https://movies4k.example.com
       # RADARR_4K_API_KEY: CHANGE_ME       # Settings > General in the 4K Radarr
     volumes:
       - ./arr-media-guard:/config          # the env file, the policy and the decision log

@@ -511,6 +511,86 @@ def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
                                               "English audio (track 1)."]
 
 
+CLONE_HIGH = {"kind": "episode", "imported": [["S01E02", "Sleepover"]], "said": "the release name", "title": "Anxious Times at Clone High",
+              "names": "S01E03"}
+CLONE_FILE = "Clone High (2023) - s01e02 - Sleepover - WEBDL-720p.mkv"
+TV, MOVIES = "https://tv.watch-tower.net", "https://movies.watch-tower.net"   # the owner's bases, an https proxy per app
+
+
+def clone_high(**kw):
+    return decision(app="sonarr", label="Clone High (2023) S01E02", path=f"/media/{CLONE_FILE}", ids={"slug": "clone-high-2023"},
+                    findings=[CLONE_HIGH], **kw)
+
+
+PLAIN_FIELD = [{"name": "Clone High (2023) S01E02", "value": CLONE_FILE, "inline": False}]   # the field with no link
+
+
+@pytest.mark.parametrize("app, label, slug, finding, base, url", [
+    ("sonarr", "Clone High (2023) S01E02", "clone-high-2023", CLONE_HIGH, TV, f"{TV}/series/clone-high-2023"),
+    ("radarr", "Film A (1979)", "90001", {"kind": "language", "want": "English", "has": ["por"]}, MOVIES + "/", f"{MOVIES}/movie/90001")])
+def test_an_alert_links_the_item_to_its_page_in_the_app(settings, app, label, slug, finding, base, url):
+    """The owner asked for a link to the item in its app. The field shows the item's name as a link above the file,
+    with a blank name, because Discord shows no link in a field name. The decision line, the logfmt line and the CLI
+    line stay plain."""
+    settings(**{app: {"link": base}})
+    rec = decision(app=app, label=label, path=f"/media/{CLONE_FILE}", ids={"slug": slug}, findings=[finding])
+    (e,) = h.render(rec, "embed")
+    assert e["fields"] == [{"name": "​", "value": f"[{label}]({url})\n{CLONE_FILE}", "inline": False}]
+    plain = json.dumps(h.render(rec, "log")["alerts"]) + h.render(rec, "logfmt") + h.render(rec, "cli")
+    assert "](" not in plain and "http" not in plain
+
+
+def test_an_empty_link_setting_gives_no_link_whatever_the_app_url(settings):
+    """Owner: the connection URL may not be the address a browser opens, as behind a reverse proxy or in Docker. So
+    only <KEY>_LINK makes a link."""
+    settings(sonarr={"url": TV, "link": ""})
+    assert h.render(clone_high(), "embed")[0]["fields"] == PLAIN_FIELD
+
+
+@pytest.mark.parametrize("base, url", [
+    ("http://admin:pa55-0123456789@sonarr.lan:8989/base/?apikey=k3y-0123456789#top", "http://sonarr.lan:8989/base/series/clone-high-2023"),
+    ("http://[FE80::1]:8989", "http://[fe80::1]:8989/series/clone-high-2023"),
+    ("https://TV.watch-tower.net/a b(1)", "https://tv.watch-tower.net/a%20b%281%29/series/clone-high-2023"),
+    ("sonarr.lan:8989", None), ("ftp://sonarr.lan/", None), ("http://[sonarr", None), ("http://admin@:8989", None),
+    ("http://host:99999/", None), ("http://ho)st/", None), ("http://ho st/", None),
+    ("http://admin:8989/pa55@sonarr.lan/", None), ("http://admin:pa#55@sonarr.lan/", None), ("http://admin:pa?55@sonarr.lan/", None)])
+def test_a_link_keeps_only_a_clean_host_port_and_path(settings, base, url):
+    """The link never holds a user, a password, a query or a fragment. A password with a "/", "#" or "?" moves the "@"
+    out of the host part, and such a base gives no link. A host with other characters gives no link. A base that gives no
+    link leaves the field as before, and the alert still renders."""
+    settings(sonarr={"link": base})
+    (e,) = h.render(clone_high(), "embed")
+    assert e["fields"] == ([{"name": "​", "value": f"[Clone High (2023) S01E02]({url})\n{CLONE_FILE}", "inline": False}] if url else PLAIN_FIELD)
+    assert not [x for x in ("admin", "pa55", "k3y", "apikey", "top") if x in json.dumps(e)]
+
+
+def test_an_item_with_no_slug_alerts_as_before(monkeypatch, settings):
+    """An error record, or an item whose app lookup failed, has no slug. Its alert has no link and still posts."""
+    settings(radarr={"link": MOVIES})
+    sent = []
+    monkeypatch.setattr(h, "post", lambda app, emb: sent.append(emb) or "sent")
+    monkeypatch.setattr(h.store, "add", lambda *a: True)
+    for ids in (None, {}, {"slug": None}, {"slug": ""}):
+        rec = decision(**({} if ids is None else {"ids": ids}), findings=[{"kind": "language", "want": "English", "has": ["por"]}])
+        assert h.alert_findings(rec, 1) == ["sent"]
+        assert sent.pop()["fields"] == [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}]
+
+
+def test_a_title_with_markdown_and_brackets_keeps_its_link_whole(settings):
+    """A ")" or "]" in a title never ends the link early, and a "*" never starts a bold span. The slug is percent-encoded.
+    A title whose brackets do not pair gets no link, because Discord would end the link at the lone bracket."""
+    settings(radarr={"link": MOVIES})
+    label = "Who Framed *Roger* [Rabbit] (1988) :)"
+    e = h.render(decision(label=label, path="/m/Roger_Rabbit.mkv", ids={"slug": "roger (1988) [x]/y"}), "embed")[0]
+    assert e["fields"] == [{"name": "​", "value": f"[Who Framed \\*Roger\\* \\[Rabbit\\] (1988) :)]({MOVIES}/movie/"
+                                                       "roger%20%281988%29%20%5Bx%5D%2Fy)\nRoger\\_Rabbit.mkv", "inline": False}]
+    for label in ("Foo [ Bar (2001)", "Foo ] Bar [ (2001)", "Foo [[ Bar ] (2001)"):
+        e = h.render(decision(label=label, path="/m/Foo.mkv", ids={"slug": "1"}), "embed")[0]
+        assert e["fields"] == [{"name": label, "value": "Foo.mkv", "inline": False}]
+    assert h.markdown(f'Two. Lines. {h.link("Mr. Robot S01E01", "http://h/series/mr-robot")}: OK') == \
+        "Two.\nLines.\n[Mr. Robot S01E01](http://h/series/mr-robot): OK"   # a link span never breaks at a full stop
+
+
 def test_an_edit_error_keeps_its_reason_after_a_long_path():
     """hd record 44: the path pushed the reason of mkvpropedit past the cut at 150 characters. The path becomes the
     file's name, cut as far as needed."""

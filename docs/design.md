@@ -192,6 +192,16 @@ them, and the decision log, the CLI and Loki show plain text. `logs.embed()` esc
 (`\`, `*`, `_`, `~`, a backquote and `|`), so a name never breaks the format. A text of more than two sentences gets one
 sentence a line.
 
+**Link.** The embed's one field shows the item's name as a link to its page in the app, above the file name. Discord
+shows no link in a field name, so the field name is then blank. The page is `/series/<titleSlug>` in Sonarr and
+`/movie/<titleSlug>` in Radarr, see `apps.App.page()`. The job takes the slug from the series or movie record it reads
+anyway, and the decision line keeps it in `ids.slug`. The base is `<KEY>_LINK` alone, because behind a reverse proxy
+or in Docker the address a browser opens differs from `<KEY>_URL`. An empty `<KEY>_LINK` gives no link. The link keeps
+only the scheme, host, port and path of the base, so it never holds a user, a password or a query. A record with no
+slug, as an error, gets the field of before: the name, then the file. So does a name whose brackets do not pair,
+because Discord ends a link at a lone bracket. `report.link()` marks the link, and only an embed shows it. The subtitle
+hunter links the movie in the Title field of its posts.
+
 | Kind | Fires when |
 | --- | --- |
 | `language` | No main audio track is English, the original language or a language TMDB lists. |
@@ -600,7 +610,8 @@ without one.
 Schedule `arr-media-guard --audit <app> --since 24h --post` each night for each app, with a systemd
 timer or cron. It posts only when a file of the day has a problem: a re-check that still plans an edit,
 an undecided or dropped plan, a broken invariant, a failed or skipped repair or conversion, or a probe that
-failed. The post lists each file, its problems in plain words first, then the files that are OK. Its footer
+failed. The post lists each file, its problems in plain words first, then the files that are OK. The name of a file
+with a problem links to its page in the app, as in an alert. Its footer
 names TMDB only when TMDB had trouble that day. The syslog summary line goes out every night. The audit also
 removes kept originals past their age and writes the policy status, see "Status file".
 

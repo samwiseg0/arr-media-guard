@@ -29,7 +29,9 @@ services:
       PGID: 1000
       TZ: Etc/UTC                  # your time zone, for AUDIT_TIME and the log times
       RADARR_API_KEY: CHANGE_ME    # Settings > General in Radarr
+      # RADARR_LINK: https://movies.example.com   # the address your browser opens, for the link in each alert
       SONARR_API_KEY: CHANGE_ME    # Settings > General in Sonarr
+      # SONARR_LINK: https://tv.example.com
     volumes:
       - ./arr-media-guard:/config
       - amg-state:/config/state
@@ -107,7 +109,9 @@ services:
       PGID: 1000
       TZ: Europe/Berlin
       RADARR_URL: http://radarr:7878
+      # RADARR_LINK: https://movies.example.com   # the address your browser opens, for the link in each alert
       SONARR_URL: http://sonarr:8989
+      # SONARR_LINK: https://tv.example.com
       REGRAB: audio,video,content
     env_file: ./secrets.env   # the keys and tokens, mode 0600
     volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
