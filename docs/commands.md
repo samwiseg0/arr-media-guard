@@ -103,7 +103,8 @@ stays right. This needs no logged refusal.
 ## The audit
 
 `--audit` reviews edits. With `--plan-from` it groups a dry run's plans by rule. With `--since` it reads the hook's
-edits from the state store, which keeps the decision lines of 14 days. `--post` sends the summary to Discord.
+edits from the state store, which keeps the decision lines of 14 days. `--post` sends the summary to Discord when the
+audit found a problem.
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 
@@ -126,22 +127,26 @@ Every command of a host install runs in the image, as a one-off container or wit
   shares the state store.
 - Run a long command, such as a backfill, a conversion or a scan, as a one-off container. A restart of the service, as
   an image update does, ends every `docker exec` process in it.
-- `docker compose run --rm arr-media-guard ARGS` gives the same one-off container as `$RUN ARGS` below, with the mounts
-  of the compose file.
+- With the compose install, `$RUN` is `docker compose run`. Run it in the folder of the compose file. It takes the
+  environment and the mounts of the compose file.
+- With a `docker run` install, `$RUN` needs every `-e` key and mount of your `docker run` command. Without the API
+  keys, a one-off command reads an empty key.
 
 ```
-RUN="docker run --rm --network media_default -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+RUN="docker compose run --rm arr-media-guard"   # the compose install
+RUN="docker run --rm -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+  -e RADARR_URL=http://CHANGE_ME:7878 -e RADARR_API_KEY=CHANGE_ME \
+  -e SONARR_URL=http://CHANGE_ME:8989 -e SONARR_API_KEY=CHANGE_ME \
   -v $PWD/arr-media-guard:/config -v amg-state:/config/state -v /srv/media:/data \
-  ghcr.io/samwiseg0/arr-media-guard:latest"
+  ghcr.io/samwiseg0/arr-media-guard:latest"   # a docker run install, with the values of your command
 EXEC="docker exec -it arr-media-guard arr-media-guard"
 ```
 
-`media_default` is the compose network, named after the folder of the compose file. Keep `-it` on `docker exec`, so
-Ctrl+C reaches the command, and leave it out in a script.
+Keep `-it` on `docker exec`, so Ctrl+C reaches the command, and leave it out in a script.
 
 A one-off container writes its logfmt lines to syslog only, and the image runs no syslog. To keep them, as for Loki,
-add `-v /dev/log:/dev/log` to `$RUN`. They then go to the host's syslog. The `/dev/log` line of the compose file does the
-same for `docker exec`.
+mount `/dev/log`. The `/dev/log` line of the compose file does it for `docker compose run` and `docker exec`. With
+`docker run`, add `-v /dev/log:/dev/log` to `$RUN` and to the service.
 
 Each command needs `/config`. The last column of the table names what else it needs:
 

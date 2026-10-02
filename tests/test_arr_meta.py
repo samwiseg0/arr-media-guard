@@ -291,8 +291,18 @@ def test_expected_languages_cache_and_failure(tmp_path, monkeypatch):
     assert len(fake.calls) == 2                                                             # 30 days later it asks again
     monkeypatch.setattr(M, "_get", FakeTMDB({}, fail=True))
     assert M.expected_languages("radarr", {"tmdb": 8008}, "t", cache, now=1000) is None   # a network failure is unknown
+
+
+def test_no_token_and_no_dll_take_the_copy_of_radarrs_token(monkeypatch):
+    """Docker has no Radarr DLL and often no TMDB_TOKEN. TMDB then gets the copy of Radarr's token in the code."""
+    sent = []
+    monkeypatch.setattr(M, "_get", lambda path, token, **q: sent.append(token) or (FILM_M if path.startswith("/movie") else {"results": [{"id": 9}]}))
     monkeypatch.setattr(M, "radarr_token", lambda: None)
-    assert M.expected_languages("radarr", {"tmdb": 8011}, None, cache, now=1000) is None   # no token, no answer
+    assert M.expected_languages("radarr", {"tmdb": 8011}, None, "c", now=1000)["title"] == "Film M"
+    assert M.other_film("Film.M.2019.1080p", 8011, 92 * 60, None, "c", now=1000)["tmdb"] == 9
+    monkeypatch.setattr(M, "radarr_token", lambda: "eyJdll.eyJdll.dll")   # a host follows its Radarr install
+    M.expected_languages("radarr", {"tmdb": 8012}, None, "c", now=1000)
+    assert sent == [M.RADARR_TOKEN] * 3 + ["eyJdll.eyJdll.dll"] and M.RADARR_TOKEN.startswith("eyJ0eXAiOiJKV1Qi"), sent
 
 
 def test_expected_languages_series_by_tvdb(tmp_path, monkeypatch):
@@ -410,8 +420,8 @@ def test_special_never_scores_two_on_runtime():
 def test_header_alert():
     t = lambda label: M.trusted_duration(*PROBES[label])
     assert M.header_alert(t("Film D")) == \
-        "The container says 15:43:13, but the file suggests 1:55:43. Neither can be trusted."
-    assert M.header_alert(t("Film L")) == "The container says 3:05:08, but the streams run 2:03:26."
+        "The file says it runs 15:43:13, but the video and audio stop at 1:55:43. The runtime check was skipped."
+    assert M.header_alert(t("Film L")) == "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong length."
     assert M.header_alert(t("Film E")) is None
     probe, size, _ = PROBES["Film D"]
     assert M.header_alert(M.trusted_duration(probe, size)) is None   # a header alone says nothing
@@ -449,11 +459,7 @@ def test_tmdb_404_is_an_answer(tmp_path, monkeypatch):
     assert M.tmdb_state(None)[0] == "no_record" and M.tmdb_state(tmdb("eng", ["eng"], 90))[0] == "found"
 
 
-def test_tmdb_token_missing_and_unsendable(tmp_path, monkeypatch):
-    monkeypatch.setattr(M, "radarr_token", lambda: None)
-    assert M.expected_languages("radarr", {"tmdb": 1}, "", "c") is None
-    assert M.tmdb_state(None)[0] == "tmdb_token_missing"
-    M.DOWN.update(until=0.0)
+def test_tmdb_token_unsendable(tmp_path, monkeypatch):
     # the token with "\u5100Cannot" on its end, as the unfixed regex read it: urllib cannot put it in a header
     assert M.expected_languages("radarr", {"tmdb": 1}, "eyJx.eyJy.z\u5100Cannot", "c") is None
     assert M.tmdb_state(None)[0] == "tmdb_token_rejected"
@@ -566,14 +572,27 @@ def test_a_lock_under_a_deadline_gives_up_and_one_with_none_waits(tmp_path):
     assert M.key_alert("tmdb_token_rejected", now=1000)
 
 
+def test_the_key_alert_names_the_key_that_failed(monkeypatch):
+    """TMDB gets TMDB_TOKEN, else Radarr's key from its DLL, else the copy of it in the code. The alert names that one."""
+    assert M.key_name("tmdb-0123456789") == "the key in TMDB_TOKEN"
+    monkeypatch.setattr(M, "radarr_token", lambda: "eyJ.eyJ.x")
+    assert M.key_name() == "Radarr's key in /opt/Radarr/Radarr.Common.dll"
+    monkeypatch.setattr(M, "radarr_token", lambda: None)
+    assert M.key_name("") == "the built-in copy of Radarr's key"
+    assert M.key_alert("tmdb_token_rejected", now=1000, token="tmdb-0123456789", mark=lambda s: f"<{s}>")[1].startswith(
+        "TMDB rejected <the key in TMDB_TOKEN>. Until it's fixed")
+
+
 def test_key_alert_once_a_day(monkeypatch):
     assert M.key_alert("tmdb_unavailable", now=1000) is None      # an outage is no key problem
     title, text = M.key_alert("tmdb_token_rejected", now=1000)
-    assert title == "TMDB key not working" and "rejected" in text and "TMDB_TOKEN" in text and "re-grab" in text
-    assert M.key_alert("tmdb_token_missing", now=1000 + 86399) is None
-    assert "No TMDB key" in M.key_alert("tmdb_token_missing", now=1000 + 86400)[1]
+    assert (title, text) == ("TMDB key not working", f"TMDB rejected {M.key_name()}. Until it's fixed, the checks for wrong content run without TMDB, "
+                                                     "and no re-grab relies on it.")
+    assert M.key_alert("tmdb_token_rejected", now=1000 + 86399) is None
+    assert M.key_alert("tmdb_token_missing", now=1000 + 86400) is None   # only an older release had no key
+    assert "rejected" in M.key_alert("tmdb_token_rejected", now=1000 + 86400)[1]
     monkeypatch.setattr(store, "put", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
-    assert M.key_alert("tmdb_token_missing", now=1000 + 2 * 86400) is None   # no stamp, no alert per file
+    assert M.key_alert("tmdb_token_rejected", now=1000 + 2 * 86400) is None   # no stamp, no alert per file
 
 
 def test_tmdb_day_status():
@@ -699,15 +718,20 @@ def test_two_parts_of_one_story_never_name_each_other(title, own):
 
 def test_the_verdict_names_both_orders_and_the_absolute_number():
     v = M.episode_title_verdict("Ship Voyage", SERIES, [1], "Show.A.S04E15.1080p", said="the release's NFO")
-    assert v["why"] == "the release's NFO says Ship Voyage, which Sonarr lists as S04E21. It was imported as S04E15", v
+    assert v["why"] == 'imported as S04E15 "A Rainy Day". The release\'s NFO calls it "Ship Voyage", which is S04E21', v
+    assert (v["imported"], v["said"], v["title"]) == ([["S04E15", "A Rainy Day"]], "the release's NFO", "Ship Voyage"), v
     v = M.episode_title_verdict("Ship Voyage/No Lady Here", SERIES, [1], "Show.A.S04E15.1080p")
-    assert v["names"] == "S04E21 and S04E22" and v["why"].startswith("the release's title says"), v   # the advice names both
+    assert v["names"] == "S04E21 and S04E22" and v["why"].endswith('The release name calls it "Ship Voyage/No Lady Here", which is S04E21 and '
+                                                                   'S04E22'), v   # the alert names both
+    v = M.episode_title_verdict("Ship Voyage", [dict(SERIES[0], title=None), SERIES[1]], [1], "Show.A.S04E15.1080p")
+    assert v["why"] == 'imported as S04E15. The release name calls it "Ship Voyage", which is S04E21', v   # Sonarr has no title for S04E15
     v = M.episode_title_verdict("Ship Voyage/No Lady Here/Robot Rescue", SERIES, [1], "Show.A.S04E15.1080p")
     assert v["names"] == "S03E25, S04E21 and S04E22", v
     assert M.episode_title_verdict("Ship Voyage", SERIES, [], "Show.A.S04E15.1080p") is None   # no episode points to the file
     anime = [ep(1, 5, 10, "First Light", 120), ep(2, 5, 20, "Last Light", 130)]
     v = M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p", anime=True)   # an absolute number
-    assert v["verdict"] == "other" and v["why"].endswith("lists as S05E20 (absolute 130). It was imported as S05E10 (absolute 120)"), v
+    assert v["verdict"] == "other" and v["why"] == ('imported as S05E10 (absolute 120) "First Light". The release name calls it "Last Light", '
+                                                    'which is S05E20 (absolute 130)'), v
     assert M.episode_title_verdict("Last Light", anime, [1], "Show.B.E125.Last.Light.720p")["verdict"] == "mapped"
     assert "absolute" not in M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p")["why"]   # a standard series
 

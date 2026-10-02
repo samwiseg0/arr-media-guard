@@ -30,10 +30,11 @@ def api_key(app):
         re.search(r"<ApiKey>([^<]+)</ApiKey>", open(os.path.join(app_dir(app), "config.xml")).read()).group(1)
 
 
-# The app URLs that examples/arr-media-guard.env and docker/arr-media-guard.env hold. A URL the user left as shipped
-# sets up no app by itself, see no_key(). The image writes both files into a new env file, so a one-off container with
-# no app has both URLs.
-SHIPPED_URLS = {"radarr": ("http://127.0.0.1:7878", "http://radarr:7878"), "sonarr": ("http://127.0.0.1:8989", "http://sonarr:8989")}
+# The app URLs that examples/arr-media-guard.env, docker/arr-media-guard.env and docker/compose.yml hold. A URL the user
+# left as shipped sets up no app by itself, see no_key(). The image writes both env files into a new env file, so a
+# one-off container with no app has both URLs. A Radarr-only user may leave the Sonarr lines of compose.yml as shipped.
+SHIPPED_URLS = {"radarr": ("http://127.0.0.1:7878", "http://radarr:7878", "http://CHANGE_ME:7878"),
+                "sonarr": ("http://127.0.0.1:8989", "http://sonarr:8989", "http://CHANGE_ME:8989")}
 
 
 def no_key(app, ex):

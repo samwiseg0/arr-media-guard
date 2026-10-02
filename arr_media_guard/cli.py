@@ -371,13 +371,27 @@ def sweep_far(w):
     return w["off"] is not None and w["cues"] >= subsync.MIN_CUES and abs(w["off"]) >= config.STEP_ALERT
 
 
+def sweep_trusted(rows):
+    """The sweep rows to trust: each gave an offset from MIN_CUES cues or more."""
+    return [w for w in rows if w["off"] is not None and w["cues"] >= subsync.MIN_CUES]
+
+
 def sweep_steps(rows):
-    """The ids of the sweep rows that alert: a far row, see sweep_far(), whose neighbour among the rows to trust is far
+    """The ids of the sweep rows in a step: a far row, see sweep_far(), whose neighbour among the rows to trust is far
     the same way. A part of the file that is off holds such windows in a row. One window alone is often a slip of
     Whisper's word times, such as a word heard with the line before it, so it goes to the log only."""
-    ok = [w for w in rows if w["off"] is not None and w["cues"] >= subsync.MIN_CUES]
+    ok = sweep_trusted(rows)
     far = lambda k: 0 <= k < len(ok) and sweep_far(ok[k])
     return {id(w) for k, w in enumerate(ok) if far(k) and any(far(n) and ok[n]["off"] * w["off"] > 0 for n in (k - 1, k + 1))}
+
+
+def sweep_alerts(rows):
+    """The ids of the sweep rows that alert: the steps of sweep_steps(), when they hold 3 rows or more, or every row to
+    trust, and at least a quarter of the rows to trust. A part of the file is then off, and nothing fixed it. Other steps
+    go to the log only, such as two windows near the end, or two stray windows of a sparse sweep. Nothing failed there,
+    and nothing can be done."""
+    steps, trusted = sweep_steps(rows), len(sweep_trusted(rows))
+    return steps if len(steps) >= min(3, trusted) and 4 * len(steps) >= trusted else set()
 
 
 def rescan_item(app, owner, keys):
@@ -501,9 +515,9 @@ def audit(argv):
         title = f"Plan audit: {logs.app_name(app)}"
         text = (f"{sum(map(len, classes.values()))} of {len(rows)} files would change, in {len(classes)} classes. "
                 f"{sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} dropped by an invariant.")
-        worth = True
+        worth = bool(undecided or dropped or skipped or broken)   # a plan that only changes files posts nothing
     else:
-        start, last, day, seen = since_time(a.since), {}, [], []   # seen: (the change or a problem, its decision line), for layout B
+        start, last, day, seen = since_time(a.since), {}, [], []   # seen: ("changed" or a problem code, its decision line), see logs.audit_embed()
         for raw, in store.read("SELECT rec FROM decisions WHERE app = ? AND at >= ? ORDER BY rowid", app, start.timestamp()):
             r = json.loads(raw)   # a decision line of this app and window, as logs.decision() keeps it
             day.append(r)   # every source, for the TMDB status
@@ -517,13 +531,13 @@ def audit(argv):
                 add(headers, {"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "subtitles removed",
                               "tail_removed": "tail removed"}[code], r.get("label")); seen.append(("changed", r))
             elif code in ("header_repair_failed", "header_repair_skipped"):
-                add(skipped, code.replace("_", " "), r.get("label")); seen.append(("skipped", r))
+                add(skipped, code.replace("_", " "), r.get("label")); seen.append(("repair", r))
             if r["outcome"] == "undecided":
                 add(undecided, r.get("abstain") or r.get("undecided"), r.get("label")); seen.append(("undecided", r))
             elif r["outcome"] == "dropped":
-                add(dropped, ",".join(r.get("invariants") or []) or r.get("result"), r.get("label")); seen.append(("dropped by a rule", r))
+                add(dropped, ",".join(r.get("invariants") or []) or r.get("result"), r.get("label")); seen.append(("dropped", r))
             elif r["outcome"] == "not_matroska" or r["outcome"].startswith("repack_"):   # a repack that failed or was skipped
-                add(skipped, f'not Matroska: {r.get("container")}, {r["outcome"]}', r.get("label")); seen.append(("skipped", r))
+                add(skipped, f'not Matroska: {r.get("container")}, {r["outcome"]}', r.get("label")); seen.append(("convert", r))
             elif "edited" in (r["outcome"], r.get("edit_result")):   # an edit before a wrong-content verdict too
                 last[r["path"]] = r; seen.append(("changed", r))
         for path, r in sorted(last.items()):   # the state each edited file was left in, from the check right after the edit
@@ -537,16 +551,16 @@ def audit(argv):
                         heard = {k: v["lang"] for k, v in (r.get("heard") or {}).items() if v.get("lang")}
                         d = decide.decide(checks.mkvmerge(path), r.get("original"), r.get("kids", False), r.get("release") or "", heard)
                 except Exception as ex:
-                    add(further, config.mask(f"the re-probe failed: {type(ex).__name__}")[:100], r.get("label")); seen.append(("needs another look", r)); continue
+                    add(further, config.mask(f"the re-probe failed: {type(ex).__name__}")[:100], r.get("label")); seen.append(("reprobe", r)); continue
                 check = {"edits": len(d["edits"]), "invariants": [c for c, _ in decide.invariants(d["tracks"], [], d["cls"], set(d["orig"]))]}
                 logs.decision(dict(id=uuid.uuid4().hex[:12], app=app, source="audit", apply=False, ids=r.get("ids", {}), label=r.get("label"),
                               path=path, result="no change" if not d["edits"] else "dry run", outcome="dry_run" if d["edits"] else "no_change",
                               edits=d["edits"], reasons=d["reasons"],
                               tracks=logs.track_log(d["tracks"]), recheck=check, **{"class": decide.plan_class(d)}), started)
             if check["edits"]:
-                add(further, f'{check["edits"]} further edits', r.get("label")); seen.append(("needs another edit", r))
+                add(further, f'{check["edits"]} further edits', r.get("label")); seen.append(("further", r))
             for code in check.get("invariants", []):
-                add(broken, code, r.get("label")); seen.append(("breaks a rule", r))
+                add(broken, code, r.get("label")); seen.append((f"broken:{code}", r))
         tmdb = content.tmdb_day_status(day)
         # The nightly run drops the originals a repack kept, and the grab links, older than keep_days. At 0 it drops every
         # grab link and leaves the originals.
@@ -569,7 +583,7 @@ def audit(argv):
         title = f"Edit audit: {logs.app_name(app)}"
         text = (f"{len(last)} files edited since {start.isoformat(timespec='minutes')}, {sum(map(len, further.values()))} of them "
                 f"plan a further edit. {sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} dropped by an invariant.")
-        worth = bool(last or undecided or dropped or skipped or repacked or headers)
+        worth = any(what != "changed" for what, _ in seen)   # the post goes out only for a problem, the syslog line every night
     n_broken, n_skipped, n_repacked, n_headers = (sum(map(len, x.values())) for x in (broken, skipped, repacked, headers))
     text += f" {n_broken} break an invariant on re-check." if n_broken else " Every plan keeps the invariants."
     text += f" {n_repacked} {'would be ' if a.plan_from else ''}repacked into Matroska." if n_repacked else ""
@@ -583,8 +597,7 @@ def audit(argv):
     print(title); print(text)
     for name, value in fields: print(f"\n{name}:\n{value}")
     if a.post and worth:
-        color = "amber" if undecided or dropped or further or broken or skipped else "green"
-        print("post:", logs.post(app, logs.embed(app, title, text, color, fields[:24] + [("App", logs.app_name(app))]) if a.plan_from else logs.layout_b(app, start, seen, tmdb)))
+        print("post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))]) if a.plan_from else logs.audit_embed(app, seen, tmdb)))
 
 
 def library(app, ids):
@@ -659,11 +672,11 @@ def scan_text(r):
 
 
 def scan(app, a, kind):
-    """Scan the library for broken audio or corrupt video (kind), a.workers files at a time. Resumable, read-only, one
-    Discord summary per run. The video scan has no time limit, so every stage runs, and it reads the duration from
-    ffprobe. The main thread writes every line and the state, so no two writes interleave. SIGTERM or Ctrl+C starts no
-    new file, drops the files in flight, kills their processes and still posts the summary. A restart checks the
-    dropped files again."""
+    """Scan the library for broken audio or corrupt video (kind), a.workers files at a time. Resumable and read-only. A
+    run that finds a problem posts one Discord summary. A clean run prints its summary only. The video scan has no time
+    limit, so every stage runs, and it reads the duration from ffprobe. The main thread writes every line and the state,
+    so no two writes interleave. SIGTERM or Ctrl+C starts no new file, drops the files in flight, kills their processes
+    and still ends with the summary. A restart checks the dropped files again."""
     # An --ids run keeps its own state and list, so it never moves the full pass or truncates its list. The store holds
     # where the pass stands and the problems it found. base.txt lists them for a person.
     name = f"{kind}-scan-{app}" + ("-ids" if a.ids else "")
@@ -721,9 +734,9 @@ def scan(app, a, kind):
         f.writelines(f'{scan_class(r)}\t{r["label"]}\t{scan_text(r)}\t{r["path"]}\n' for r in rows)
     text = f"{checked} files checked this run, {state['checked']} of {len(work)} in this pass." + (" The run was stopped." if stop.is_set() else "") \
         + (f" Files that left the library during their check: {gone}." if gone else "")
-    emb = logs.embed(app, f"{kind.capitalize()} scan: {logs.app_name(app)}", text, "amber" if rows else "green",
+    emb = logs.embed(app, f"{kind.capitalize()} scan: {logs.app_name(app)}", text, "amber",
                 [("Problems this run", str(found)), ("Problems in this pass", str(len(rows))), ("List", f"{base}.txt"), ("App", logs.app_name(app))])
-    print(f"{text} {found} with a problem this run, {len(rows)} in this pass. The list is in {base}.txt.", logs.post(app, emb))
+    print(f"{text} {found} with a problem this run, {len(rows)} in this pass. The list is in {base}.txt.", logs.post(app, emb) if found else "")
 
 
 HELP = """arr-media-guard: set the default audio and subtitle tracks of an imported mkv, and flag broken files.
@@ -757,6 +770,7 @@ def main(argv):
     if mode in (["--selftest"], ["--backfill"], ["--audit"], ["--sub-time"]) and armed:
         logs.status("policy", "failed" if decide.POLICY is None else "ok", config.POLICY_ERROR or "", touch=mode != ["--selftest"])
     if mode == ["--selftest"]:
+        print(f"keys from the environment: {', '.join(config.CFG.from_env) or 'none'}")   # the names only, as a value may be a secret
         if config.CFG.errors:
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:

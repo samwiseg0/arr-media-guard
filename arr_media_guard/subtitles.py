@@ -415,22 +415,27 @@ def sub_groups(items):
     return {idx: (lang, sorted(cues)) for idx, (lang, cues) in out.items()}
 
 
-def sub_verdicts(path, j, items, starts=None, line=True, deep=False):
+def sub_verdicts(path, j, items, starts=None, line=True, deep=False, streams=None):
     """{key: result} of the subtitle match check (docs/design.md, "Subtitle match") for items {key: (language, ffmpeg
     audio index, [(start, end, text)] in seconds)}. The items of one audio track share its windows, picked from all
     their cues by subsync.windows(), and one hearing. When a window hears under subsync.MIN_WORDS words and
     the other does not, lid.py hears a longer window in the same part of the file, in the same process. Later
     hearings follow what the check asks for: windows where a far drift puts the speech when too few windows heard
-    enough, a longer window around a window with too few matched cues for a fix, and a middle window to confirm a
-    ratio. Only the first hearing names a mismatch. A file whose windows hear enough pays for one hearing. result is subsync.check() with "audio", "starts" ([window starts, seconds] of each hearing) and the
-    hearings' facts: "cached", "reused", "cpu", "took", "profile". starts {audio index: that list} forces the hearings
-    of an earlier check, so a check after a conversion reads the words carried over. A missing install, too little
-    time, a timeout or an error gives unknown and never fails the job. The job's time limit passes.
+    enough, then windows where a matched window's offset puts the speech of a late track that runs past the end, a
+    longer window around a window with too few matched cues for a fix, and a middle window to confirm a ratio. Only the
+    first hearing names a mismatch. A file whose windows hear enough pays for one hearing. result is subsync.check()
+    with "audio", "starts" ([window starts, seconds] of each hearing) and the hearings' facts: "cached", "reused",
+    "cpu", "took", "profile". starts {audio index: that list} forces the hearings of an earlier check, so a check after
+    a conversion reads the words carried over. A missing install, too little time, a timeout or an error gives unknown
+    and never fails the job. The job's time limit passes.
 
     With line, a fix that subsync.needs_line() names needs one more hearing: a window at a third and one at two
     thirds of the file, which must both sit on the fitted line, see subsync.on_line(). Else the times stay, and
     with deep, an import that queues a deep analysis, the deep analysis judges the fix with its sweep. Those windows never change the verdict. --sub-time and the
-    deep analysis pass line False, as their sweep confirms a fix, see sweep_confirms()."""
+    deep analysis pass line False, as their sweep confirms a fix, see sweep_confirms().
+
+    streams is where the video and the audio end, from the header probe of the caller. Without it, the hearing at a
+    matched window's offset probes the header again, see checks.header_of()."""
     dur, out = decide.duration(j), {}
     left = config.DEADLINE.left()   # None when no time limit runs, as in a backfill
     budget, spent = (min(config.SUB_TIMEOUT, left - config.LID_RESERVE) if left else config.SUB_TIMEOUT), [0.0]
@@ -458,7 +463,7 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False):
             if p[3:] != ["line"]:   # the windows on the line never join the fit, and the same fix picks them again below
                 listen(*p[:3])
                 res = check()
-        for _ in range(4) if not (why or plan) else ():
+        for _ in range(5) if not (why or plan) else ():   # ext, drift, hint and ext leave a fifth for the middle window
             ts = [r.get("timing") or {} for r in res.values()]
             poor = {a for t in ts for a in t.get("few", ())}   # windows with too few cues whose first words matched
             seen = max((r["windows"] for r in res.values()), key=len, default=[])   # the windows the check took
@@ -477,6 +482,25 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False):
                             if w["offset"] is not None), default=(0,))
                 ws = [a for a in subsync.drift([s for s in first if (s < dur / 2) not in halves], hint[1:] if hint[0] >= 3 else None)
                       if all(abs(a - w["at"]) >= subsync.WINDOW / 2 for w in heard)]
+                step = (ws, subsync.WINDOW, None)
+            elif len(halves) < 2 and "hint" not in done and (hint := max(
+                    ((w["overlap"] * w["words"], w["at"] + subsync.WINDOW / 2, w["offset"]) for w in seen
+                     if w["words"] >= subsync.MIN_WORDS and w["overlap"] >= subsync.MATCH), default=None)) \
+                    and hint[2] > 0 and max(c[1] for c in cues) > (end := streams or (checks.header_of(path, j) or {}).get("streams")
+                                                                   or checks.audio_span(path, j, idx)):
+                # A window that counts toward a match says where the cues sit, and the other half still has no window.
+                # Subtitles of another cut can sit minutes late at ratio 1, where no far ratio puts a window. Such a
+                # track runs past the end of the audio and the video. The header probe reads where they end in the
+                # last clusters. The late track sets the header duration, and a file that ffmpeg wrote has no DURATION
+                # tag, so audio_span() gives the header duration there. On such a file the probe reads every subtitle
+                # event, see subtitle_ends(). So the caller passes the end it read, and the probe runs again here only
+                # without it. A late track whose tail is in time ends before the video and the audio end. A fix through
+                # this window would move that tail early, so that track gets no hearing here.
+                # Hear where the offset puts the speech of that half's densest cues, at ratio 1 and at each far
+                # ratio, before the audio ends. One such hearing at most.
+                done.add("hint")
+                ws = [a for a in subsync.drift([s for s in first if (s < dur / 2) not in halves], hint[1:], ((1,),) + subsync.FAR)
+                      if a + subsync.WINDOW <= end and all(abs(a - w["at"]) >= subsync.WINDOW / 2 for w in heard)]
                 step = (ws, subsync.WINDOW, None)
             elif (fix := next((t["confirm"] for t in ts if t.get("confirm")), None)) and "middle" not in done:
                 # A ratio waits for a middle window near the centre between the others, see subsync.middle(). Its
@@ -588,17 +612,18 @@ def sub_jobs(path, j, d, sides):
     return name
 
 
-def sub_match(path, j, d, starts=None, sides=None, known=(), items=None, full=False, line=True, deep=False):
+def sub_match(path, j, d, starts=None, sides=None, known=(), items=None, full=False, line=True, deep=False, streams=None):
     """{subtitle position or sidecar name: sub_verdicts() result} for the tracks of sub_targets(), with their cues read
     by subtitle_cues(), and the sidecars sides of mkv_sidecars(). {} when nothing qualifies or the file runs under
     SUB_MIN_SECONDS. So a file with no such track or sidecar costs nothing. known holds the item's original languages,
     and a mismatch that sub_hold() rules out is unknown. items is sub_items() when the caller read them already, and
-    full reads a track the Cues do not index, see full_read()."""
+    full reads a track the Cues do not index, see full_read(). streams is the stream end of the header probe, see
+    sub_verdicts()."""
     sides = sides or {}
     if not (sub_targets(j, d) or sides) or decide.duration(j) < config.SUB_MIN_SECONDS or not checks.lid_ready():
         return {}
     items = items or sub_items(path, j, d, sides, full)
-    return sub_held(sub_verdicts(path, j, items, starts, line, deep), items, d["tracks"], known)
+    return sub_held(sub_verdicts(path, j, items, starts, line, deep, streams), items, d["tracks"], known)
 
 
 def ref_sidecars(path, d):
@@ -771,7 +796,7 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None):
              "why": r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan)) if x)}
         out.append(e)
         if not apply or not sub_fixes(source):
-            e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is check, so the file stays as it is")
+            e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is set to check")
             continue
         tmp = remux.repack_tmp(s["path"])
         try:
@@ -829,7 +854,7 @@ def sub_findings(rec, sync, unmatched):
         if e["action"] == "move":
             wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left")})
         elif e["result"] == "left":
-            late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"]})
+            late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]})
     for e in rp.get("sidecars_unmatched", []):
         wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left")})
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
@@ -837,14 +862,15 @@ def sub_findings(rec, sync, unmatched):
     for p, r in sorted(sync.items()):
         t = r.get("timing") or {}
         if (t.get("piecewise") and round(max(t["offsets"]) - min(t["offsets"]), 2) >= config.STEP_ALERT) or "unfixed" in t:
-            late.append({"code": "off", "track": p, "ref": r.get("reference"), "why": t["why"]})
+            late.append({"code": "off", "track": p, "ref": r.get("reference"), "why": t["why"], "offsets": t.get("offsets"), "unfixed": t.get("unfixed")})
     if (rm.get("fixed") or rm.get("ended")) and not rm.get("done"):
         late.append({"code": "not_retimed", "tracks": sorted({*(rm.get("fixed") or []), *(rm.get("ended") or [])}), "result": rm.get("result"),
                      "block": plan.get("block")})
     if not flags_off:
-        late += [{"code": "check_times", "track": p, "why": r["timing"]["why"]} for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
+        late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"]} for p, r in sorted(sync.items())
+                 if (r.get("timing") or {}).get("fix")]
         late += [{"code": "check_flash", "track": p, "median": f["median"]} for p, f in sorted((rec.get("flash") or {}).items())]
-    far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) for w in rows if id(w) in cli.sweep_steps(rows)]
+    far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) for w in rows if id(w) in cli.sweep_alerts(rows)]
     if far:
         late.append({"code": "sweep", "far": far})
     return ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])

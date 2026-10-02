@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
-import collections, contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error
+import contextlib, datetime, hashlib, json, os, sqlite3, syslog, time, urllib.error
 
 from . import apps, checks, config, content, decide, health, report, store
 
@@ -105,10 +105,12 @@ EMBED_MAX = 5900   # Discord refuses an embed whose texts add up to more than 60
 
 
 def embed(app, title, description, color, fields, footer=None):
-    """A Discord embed: title, one or two sentences, the fields that have a value, a footer and a timestamp.
-    The longest field values are cut until all texts fit under Discord's 6000-character limit."""
-    e = {"title": title[:256], "description": description[:2000], "color": config.COLORS[color],
-         "fields": [{"name": str(k)[:256], "value": str(v)[:1024], "inline": False} for k, v in fields if v],
+    """A Discord embed: title, one or two sentences, the fields that have a value, a footer and a timestamp. The
+    description is in Discord markdown, with its bold spans and its lines, see report.markdown(). The field names and
+    values have their markdown escaped too. The longest field values are cut until all texts fit under Discord's
+    6000-character limit."""
+    e = {"title": title[:256], "description": report.markdown(description)[:2000], "color": config.COLORS[color],
+         "fields": [{"name": report.escaped(str(k))[:256], "value": report.escaped(str(v))[:1024], "inline": False} for k, v in fields if v],
          "footer": {"text": footer or f"{config.CFG.name} on {config.CFG.instance}, {app_name(app).split()[0]}"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
     size = lambda: len(e["title"]) + len(e["description"]) + len(e["footer"]["text"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])
@@ -135,17 +137,11 @@ def post(app, emb):
         return config.mask(f"failed: {type(ex).__name__}: {ex}")[:200]
 
 
-def footer_b(tmdb=None):
-    """The footer of layout B: "TMDB ok · arr-media-guard on <INSTANCE>". tmdb is a decision line's TMDB
-    code or content.tmdb_day_status(). Without it the footer names the host only."""
-    words = {"found": "found the item", "no_record": "has no record", "tmdb_unavailable": "unavailable", "tmdb_token_missing": "key missing",
-             "tmdb_token_rejected": "key rejected", "no checks": "not asked"}
-    return " · ".join(([f"TMDB {words.get(tmdb, tmdb)}"] if tmdb else []) + [f"{config.CFG.name} on {config.CFG.instance}"])
-
-
 def alert_findings(rec, size):
-    """Post the findings of rec, one embed each, see report.alert_embed() and alert(). Returns what each post gave."""
-    return [alert(rec["app"], f["kind"], rec["path"], size, e) for f, e in zip(rec["findings"], report.render(rec, "embed"))]
+    """Post the findings of rec that report.posts() passes, one embed each, see report.alert_embed() and alert(). This is
+    the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log."""
+    return [alert(rec["app"], f["kind"], rec["path"], size, e) if report.posts(f, rec) else "log only"
+            for f, e in zip(rec["findings"], report.render(rec, "embed"))]
 
 
 def alert(app, kind, path, size, emb):
@@ -166,85 +162,68 @@ def alert(app, kind, path, size, emb):
     return sent
 
 
-LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "German", "ita": "Italian", "por": "Portuguese", "jpn": "Japanese",
-              "kor": "Korean", "chi": "Chinese", "rus": "Russian", "hin": "Hindi", "tur": "Turkish", "dut": "Dutch", "swe": "Swedish",
-              "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "pol": "Polish", "ara": "Arabic", "heb": "Hebrew", "tha": "Thai",
-              "ind": "Indonesian", "vie": "Vietnamese", "gre": "Greek", "cze": "Czech", "hun": "Hungarian", "rum": "Romanian", "ukr": "Ukrainian",
-              "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "und": "untagged"}
-
-
 def forced_note(repack):
     """What a person forced in a conversion: ", forced" for a proof refusal, ", name forced" for Sonarr's name check."""
     return (", forced" if repack.get("forced") else "") + (", name forced" if repack.get("forced_name") else "")
 
 
-def change_phrases(r):
-    """The changes one decision line records, as (phrase, role) in the plain words of layout B: "English audio first",
-    "English subs on" with the role of the subtitle turned on, "English subs off", "foreign subs off", "fake forced
-    subs off", "audio default flag fixed", "converted to MKV from AVI" (with forced_note()), "header
-    repaired". Each phrase once."""
-    out, before = [], {t["sel"]: t for t in r.get("before") or []}
-    words = {"audio default flag fixed": "audio default flag fixed", "English subtitle off": "English subs off",
-             "foreign subtitle off": "foreign subs off", "forced flag cleared": "fake forced subs off"}
-    for e, rule in zip(r.get("edits") or [], r.get("edit_rules") or []):
-        lang = (before.get(e[0]) or {}).get("lang") or "und"
-        if rule == "audio switched" and e[1]:
-            out.append((f"{LANG_NAMES.get(lang, lang)} audio first", None))
-        elif rule.endswith("English subtitle on"):
-            out.append(("English subs on", {"sdh": "SDH"}.get(rule.split()[0], rule.split()[0])))
-        elif rule in words:
-            out.append((words[rule], None))
-    if (r.get("repack") or {}).get("new_size"):
-        out.append((f"converted to MKV from {r.get('container')}" + forced_note(r["repack"]), None))
-    code = (r.get("header_repair") or {}).get("code")
-    if code in config.REPAIRED:
-        out.append(({"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "a subtitle track removed"}[code],
-                    None))
-    return list(dict.fromkeys(out))
+# The nightly audit's problems in plain words, per code of cli.audit()
+UNDECIDED = {"untagged_may_be_original": "couldn't decide which audio should play first, because an untagged track may be the original language",
+             "original_missing_bare_tag": "couldn't decide which audio should play first, because no track is in the original language",
+             "sparse_full_title": "couldn't decide which subtitles should be on",
+             "dense_forced_flag_english_only": "couldn't decide whether the forced English subtitles should be on"}
+DROPPED = {"inv_audio_not_policy_target": "the wrong audio language would play first",
+           "inv_audio_default_count": "the wrong number of audio tracks would play by default",
+           "inv_extra_default": "a commentary or extra track would play by default",
+           "inv_full_english_subtitle_on": "full English subtitles would stay on under English audio",
+           "inv_only_english_subtitle_off": "the only English subtitles would be off"}
+BROKEN = {"inv_audio_not_policy_target": "the wrong audio language plays first",
+          "inv_audio_default_count": "the wrong number of audio tracks plays by default",
+          "inv_extra_default": "a commentary or extra track plays by default",
+          "inv_full_english_subtitle_on": "full English subtitles stay on under English audio",
+          "inv_only_english_subtitle_off": "the only English subtitles are off"}
+SKIPPED = {"header_repair_failed": "the file repair failed", "header_repair_skipped": "the file repair was skipped",
+           "repack_failed": "the conversion to MKV failed", "repack_source_changed": "the app changed the file during the conversion to MKV",
+           "repack_hardlinked": "the conversion to MKV was skipped, because the file has another hard link",
+           "not_matroska": "the file isn't MKV, so its tracks weren't changed"}
+AUDIT_CHARS = 1950   # the characters of the file list, under the 2000 that embed() keeps of a description
 
 
-def counted(word, k):
-    """A problem with its file count: "1 needs another edit", "2 need another edit"."""
-    return f"{k} {word if k == 1 else word.replace('needs ', 'need ').replace('breaks ', 'break ')}"
+def audit_problem(what, r):
+    """A problem that the nightly audit found in the decision line r, in plain words. what is its code, see cli.audit()."""
+    code = what.partition(":")[2]
+    if what == "undecided":
+        return UNDECIDED.get(r.get("abstain"), "couldn't decide which tracks should play first")
+    if what == "dropped":
+        return "a planned track change wasn't made, because then " + report.and_list(DROPPED.get(c, c) for c in r.get("invariants") or [code])
+    if what.startswith("broken:"):
+        return f"after the change, {BROKEN.get(code, code)}"
+    if what == "repair":
+        return SKIPPED.get((r.get("header_repair") or {}).get("code"), "the file repair failed")
+    if what == "convert":
+        return SKIPPED.get(r.get("outcome"), "the conversion to MKV was skipped")
+    return {"reprobe": "the file couldn't be read again for the check", "further": "a check after the change still finds tracks to change"}[what]
 
 
-def show_value(files, problems, n):
-    """The plain sentence of one show's changes for layout B. files maps a path to its change_phrases(), problems maps a
-    problem to its file count, and n is the show's file count. A phrase that not every file shares gets its count. The
-    English subs turned on get their roles when the roles differ: "English subs on (16 full, 3 forced)"."""
-    count, roles = collections.Counter(), {}
-    for phrases in files.values():
-        for phrase, role in phrases:
-            count[phrase] += 1
-            if role:
-                roles.setdefault(phrase, collections.Counter())[role] += 1
-    parts = [f"{p} ({', '.join(f'{v} {r}' for r, v in roles[p].most_common())})" if len(roles.get(p) or {}) > 1 else p + ("" if k == n else f" ({k})")
-             for p, k in count.items()]
-    parts += [counted(w, k) for w, k in problems.items()]
-    text = ", ".join(parts) or "no change"
-    return text[:1].upper() + text[1:]
-
-
-def layout_b(app, start, seen, tmdb):
-    """The nightly audit embed, layout B. The description says "All clean" or what needs a look, then
-    the file count and the start of the window. One field per show or film, "<show> · <count>" with show_value(), the
-    10 largest, then "and N more". footer_b() names the day's TMDB state and the host. No emoji and no check mark."""
-    shows = {}
+def audit_embed(app, seen, tmdb):
+    """The nightly audit post, which cli.audit() sends only when a file has a problem. seen holds (the problem code or
+    "changed", its decision line). One line per file, "<label>: OK" or its problems, the problems first. The lines past
+    AUDIT_CHARS become "and N more". The footer names the host, and TMDB only when it had trouble that day, see
+    content.tmdb_day_status()."""
+    files = {}
     for what, r in seen:
-        g = shows.setdefault(re.sub(r" S\d+(E\d+)+$", "", r.get("label") or "?"), {"files": {}, "problems": {}, "paths": set()})
-        g["paths"].add(r.get("path"))
-        if what == "changed":
-            g["files"][r.get("path")] = list(dict.fromkeys(g["files"].get(r.get("path"), []) + change_phrases(r)))
-        else:
-            g["problems"].setdefault(what, set()).add(r.get("path"))
-    rows = sorted(((name, len(g["paths"]), show_value(g["files"], {w: len(p) for w, p in g["problems"].items()}, len(g["paths"])))
-                   for name, g in shows.items()), key=lambda x: (-x[1], x[0]))
-    trouble = collections.Counter(w for w, _ in {(w, r.get("path")) for w, r in seen if w != "changed"})
-    head = ("**All clean.** Nothing needs another edit, nothing undecided, no rule broken." if not trouble else
-            "**Needs a look.** " + ", ".join(counted(w, k) for w, k in sorted(trouble.items())) + ".")
-    n = sum(x[1] for x in rows)
-    fields = [(f"{name} · {k}", value) for name, k, value in rows[:10]]
-    if len(rows) > 10:
-        fields.append((f"and {len(rows) - 10} more", ", ".join(f"{name} · {k}" for name, k, _ in rows[10:])[:1000]))
-    return embed(app, f"Edit audit · {app_name(app)}", f"{head}\n**{n} file{'' if n == 1 else 's'}** since {start:%a %d %b %H:%M}",
-                 "amber" if trouble else "green", fields, footer_b(tmdb))
+        f = files.setdefault(r.get("path"), {"label": r.get("label") or "?", "problems": []})
+        if what != "changed":
+            f["problems"].append(audit_problem(what, r))
+    lines = sorted((not f["problems"], f["label"], report.and_list(dict.fromkeys(f["problems"])) or "OK") for f in files.values())
+    body, n = [], sum(not ok for ok, _, _ in lines)
+    for k, (ok, label, text) in enumerate(lines):
+        line = f"{report.bold(label)}: {text}"
+        if sum(len(report.markdown(x)) + 1 for x in body + [line]) > AUDIT_CHARS:
+            body.append(f"and {len(lines) - k} more" + (" OK" if all(x[0] for x in lines[k:]) else ""))
+            break
+        body.append(line)
+    trouble = "TMDB rejected the key" if tmdb == "key broken" else f"TMDB didn't answer {tmdb.removeprefix('unavailable ')}" \
+        if tmdb.startswith("unavailable") else None
+    return embed(app, f"Audit check: {n} problem{'' if n == 1 else 's'} · {app_name(app)}", "\n".join(body), "amber", [],
+                 " · ".join(x for x in (trouble, f"{config.CFG.name} on {config.CFG.instance}") if x))

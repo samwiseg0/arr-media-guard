@@ -52,14 +52,14 @@ def check_audio_ffprobe(path, runtime=0):
         return None, [f"ffprobe did not run: {type(ex).__name__}"], []
     dur = ffprobe_duration(path) or 0
     if seen is None and not known_start(path):   # a broken file can start with random bytes
-        return "neither mkvmerge nor ffprobe can read the file, and it starts with no known media signature", [], []
+        return "no tool can read the file, and it does not start like any known video format", [], []
     if not seen:
-        return None, ["mkvmerge cannot read the container, and ffprobe " + ("finds no audio track" if seen == [] else "failed")], []
+        return None, ["the file cannot be read properly, and " + ("no audio track was found" if seen == [] else "a second tool failed too")], []
     if dur < 60:
         return None, [], []
     samples = [sample(path, dur * f, 0, min(decide.SAMPLE_SECS, dur * (1 - f))) for f in decide.SAMPLE_AT]
     certain, doubts = decide.audio_verdict({}, 0, samples, runtime)
-    return None, doubts + ([f"{certain}, but unconfirmed: mkvmerge cannot read the container"] if certain else []), samples
+    return None, doubts + ([f"{certain}, but this is unconfirmed, because the file cannot be read properly"] if certain else []), samples
 
 
 def check_audio(path, j, edits, runtime=0):
@@ -78,7 +78,7 @@ def check_audio(path, j, edits, runtime=0):
         seen = ffprobe_audio(path)
         if seen == []:
             return decide.audio_verdict(j, None, []) + ([],)
-        return None, ["mkvmerge lists no audio track, but ffprobe " + ("finds one" if seen else "failed")], []
+        return None, ["one tool finds no audio track, but " + ("another finds one" if seen else "a second tool failed")], []
     a = decide.default_audio(ts, edits); index = next(i for i, t in enumerate(au) if t is a)
     dur = audio_span(path, j, index)
     if dur < 60:   # too short for three samples. audio_more() decodes the whole track.
@@ -90,8 +90,8 @@ def check_audio(path, j, edits, runtime=0):
     if certain:
         seen = ffprobe_audio(path)
         if seen is None or len(seen) != len(au):
-            return None, doubts + [f"{certain}, but unconfirmed: ffprobe sees {'no count' if seen is None else len(seen)} audio streams "
-                                   f"and mkvmerge {len(au)}, so the sampled track may not be the one that plays"], samples
+            return None, doubts + [f"{certain}, but this is unconfirmed, because two tools count {'no' if seen is None else len(seen)} and "
+                                   f"{len(au)} audio tracks, so the track checked may not be the one that plays"], samples
     return certain, doubts, samples
 
 
@@ -261,11 +261,11 @@ def audio_more(path, j, index, samples, certain, doubts, span):
         (h0, h1), w = pk["hole"], decide.SAMPLE_SECS
         samples.append(dict(sample(path, h0 + (h1 - h0 - w) / 2, index, w), kind="hole"))
         if decide.empty(samples[-1]):
-            certain, doubt = f"{doubt}, and a sample in its {h1 - h0:.0f} s hole at {decide.clock(h0)} decoded nothing", None
+            certain, doubt = f"{doubt}, and its {h1 - h0:.0f} s gap at {decide.clock(h0)} plays nothing", None
     doubts += [doubt] if doubt else []
     last = None if certain or not rule1 else decide.credits_silence(three, pk["subs"], span)
     if last is not None:   # the doubt audio_verdict() gave the lone silent sample
-        doubts = [d for d in doubts if d != "1 of 3 audio samples are digital silence"]
+        doubts = [d for d in doubts if d != "the audio is silent at 1 of 3 places checked"]
         samples[2] = dict(samples[2], credits=round(last, 1))
     return certain, doubts, samples
 
@@ -383,8 +383,8 @@ def header_probe(path, j):
     if out["video"] and out["audio"] and abs(out["video"] - out["audio"]) > decide.AV_APART:
         out["blocked"].append(f"the video ends at {content.hms(out['video'])} and the audio at {content.hms(out['audio'])}")
     if out["tail"] and any(off(dur, x) for x in (out["video"], out["audio"]) if x):   # the Segment itself may be cut. check_video() alerts.
-        out["not_whole"] = (f"the file holds {out['tail']} bytes past its Matroska Segment, and the video and the audio do not reach the "
-                            f"header duration {content.hms(dur)}, so the Segment may be cut")
+        out["not_whole"] = (f"the file has {out['tail']} bytes of extra data at its end, and the video and audio stop before its stated "
+                            f"length of {content.hms(dur)}, so the file may be cut off")
         out["blocked"].append(out["not_whole"])
     subs = [t for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
     if subs and (off(dur, out["end"]) or off(out["end"], streams)):   # a subtitle event that starts earlier may set the duration too
@@ -402,10 +402,12 @@ def header_probe(path, j):
         out["issue"].append(f"a subtitle event runs to {content.hms(out['end'])}, past the video and the audio at {content.hms(streams)}")
         late = {i: e for i, e in (out.get("subtitles") or {}).items() if e > streams + decide.REPAIR_END}
         codec = {t["id"]: (t.get("properties") or {}).get("codec_id") or t.get("codec") for t in subs}
-        bad = [f"{i} ({codec[i]})" for i, e in late.items() if codec[i] not in decide.TEXT_SUBS and off(e, streams)]
+        bad = [i for i, e in late.items() if codec[i] not in decide.TEXT_SUBS and off(e, streams)]
         if bad:   # a bitmap subtitle cannot be cut without a new encode
-            out["unfixable"] = bad
-            out["blocked"].append(f"subtitle track {', '.join(bad)} runs past the end, and only a SubRip track can be trimmed")
+            place = {t["id"]: f"s{n}" for n, t in enumerate(subs, 1)}   # the place decide.classify() gives it
+            out["unfixable"] = [{"track": place[i], "codec": codec[i], "end": late[i], "streams": streams} for i in bad]
+            out["blocked"].append(f"subtitle track {', '.join(f'{i} ({codec[i]})' for i in bad)} runs past the end, and only a SubRip track can "
+                                  "be trimmed")
         elif late:   # cut every line that runs past the real end to that end, and remove a track
             text = [i for i in late if codec[i] in decide.TEXT_SUBS]   # timed for another cut
             n = lambda i: out["sublines"].get(i) or [0, 0]
@@ -501,7 +503,7 @@ def stream_gap(path, video):
             return None
     whole = ffprobe_duration(path)
     if video and whole and whole - video > decide.AV_APART:
-        return f"the streams run to {content.hms(whole)}, but the video ends at {content.hms(video)}, so another stream may be broken"
+        return f"the file's tracks run to {content.hms(whole)}, but the video stops at {content.hms(video)}, so another track may be broken"
     return None
 
 
@@ -630,10 +632,9 @@ def video_stages(path, dur, again, hp):
         short, failed = hp["short"], hp["failed_edit"]
         fields["header"] = dict(hp, issue=list(hp["issue"]), blocked=list(hp["blocked"]))
     if short is not None and short >= decide.SHORT_CERTAIN and not failed:
-        return f"the file is {short} bytes shorter than its Matroska header says", [], dict(fields, fault="truncated")
+        return f"the file is {short / 1e6:.1f} MB smaller than it should be, so the download is incomplete", [], dict(fields, fault="truncated")
     if short and short > 0 and not (hp and failed and short < decide.SHORT_CERTAIN):   # with hp, a header issue instead
-        doubts.append(f"the Matroska header promises {short} bytes past the end of the file"
-                      + (", and the hook's own last edit of it failed" if failed else ""))
+        doubts.append(f"the file may be missing {short} bytes at its end" + (", after its last flag edit failed" if failed else ""))
     if hp and hp.get("not_whole"):   # the blocked repair alone posts nothing
         doubts.append(hp["not_whole"])
     if hp is None and short is None and (gap := stream_gap(path, dur)):

@@ -30,7 +30,7 @@ flowchart TD
     fault -->|"no"| edit["mkvpropedit, after the editing line with its undo"]
     regrab --> meta["Metadata checks, wrong-content re-grab"]
     edit --> meta
-    meta --> discord["Discord, one alert per finding"]
+    meta --> discord["Discord, one alert per unresolved finding"]
     discord --> decision["Decision line in LOG, logfmt line in syslog"]
     decision --> plex["Plex analyze after two idle checks"]
     decision --> deep["Deep analysis job, with SUBTITLES=deep, runs while no import waits"]
@@ -122,7 +122,7 @@ A certain audio or video fault replaces the flag edit with a re-grab. Else the p
   again. The old file of a broken upgrade comes back from the recycle bin, or from the hook's own copy, before the app
   searches. `REGRAB_CAP` limits the re-grabs of each instance in 24 hours. See [regrabs.md](regrabs.md).
 - **Wrong content.** The content checks add up points, and two points make a re-grab. It runs only when `REGRAB` lists
-  `content`. Else the alert says "would re-grab". See [design.md](design.md#metadata-checks).
+  `content`. Else the alert title ends "re-grab is off". See [design.md](design.md#metadata-checks).
 - **Sidecars.** An `.srt` file beside the video that holds another episode moves to the kept originals. One that runs
   late is written again with new times. See [subtitles.md](subtitles.md).
 - **Kept files.** A repair keeps the file it replaced for `KEEP_ORIGINALS_DAYS`, as a hard link in `.<NAME>-originals`
@@ -141,8 +141,9 @@ the worker until Plex is ready.
   [monitoring.md](monitoring.md#the-decision-log).
 - **Syslog.** One logfmt summary of the same line, tagged with `NAME`. In Docker it also goes to the container log. See
   [monitoring.md](monitoring.md#syslog).
-- **Discord.** One embed per finding to `DISCORD_WEBHOOK`. A marker in the state store stops a repeat for the same
-  file, kind and size. See [design.md](design.md#alerts).
+- **Discord.** One embed per finding that the hook left unresolved, to `DISCORD_WEBHOOK`. A problem it fixed, such as
+  a re-grab or removed subtitles, goes to the decision log only. A marker in the state store stops a repeat for the
+  same file, kind and size. See [design.md](design.md#alerts).
 - **Plex.** After a change, the worker asks Plex to analyze the one item, so Plex reads the new flags. A new import is
   often not in Plex yet, so the worker looks for it again for 10 minutes. Before each analyze, the item's library
   section must be idle on two checks 15 seconds apart. An analyze during a scan can crash Plex. A renamed file gets a
@@ -175,7 +176,7 @@ The nightly job audits the day's edits, prunes the kept files and rotates the de
 
 | Job | What it does | On a host | In Docker |
 | --- | --- | --- | --- |
-| Audit | `--audit <instance> --since 24h --post` reviews the day's edits from the state store, and probes an edit logged without its recheck. It posts one summary when the day had something to report. It writes one syslog line every night, and it records the policy status. | A systemd timer or cron, one line per instance. | The listener at `AUDIT_TIME`, for each instance whose API key reads. |
+| Audit | `--audit <instance> --since 24h --post` reviews the day's edits from the state store, and probes an edit logged without its recheck. It posts a list of the day's files when one of them has a problem. It writes one syslog line every night, and it records the policy status. | A systemd timer or cron, one line per instance. | The listener at `AUDIT_TIME`, for each instance whose API key reads. |
 | Prune | Removes the kept originals and the grab links older than `KEEP_ORIGINALS_DAYS`. | The audit, and the worker once a day. | The same. |
 | Log rotation | Rotates the decision log weekly, with compression. | logrotate. | The listener, after the audits. |
 
@@ -195,8 +196,8 @@ The hook sees only new imports. Commands run the same code over the library, dry
   runs the full subtitle check on single files.
 - `--check-audio` and `--check-video` scan every file the way the worker checks an import. A scan only reads. It
   keeps its place in the state store, so it resumes over days. It lists what it finds in
-  `STATE_DIR/<kind>-scan-<instance>.txt`, or `<kind>-scan-<instance>-ids.txt` for a run with `--ids`, and posts one
-  summary.
+  `STATE_DIR/<kind>-scan-<instance>.txt`, or `<kind>-scan-<instance>-ids.txt` for a run with `--ids`. A run that
+  finds a problem posts one summary.
 
 Run a large backfill as a dry run, an audit of the plans, a canary and then the rest. See
 [commands.md](commands.md#dry-runs-and-the-backfill) and [design.md](design.md#backfill).
@@ -243,7 +244,7 @@ An import always applies. Some settings make parts of it report only.
 
 - `SUBTITLES=check` reads the subtitles and alerts, and changes no subtitle.
 - `HEADER_REPAIR=false` reports a wrong header and leaves the file as it is.
-- A fault kind that `REGRAB` leaves out still gets its second check. The alert then says "would re-grab", and nothing
+- A fault kind that `REGRAB` leaves out still gets its second check. The alert title then ends "re-grab is off", and nothing
   is deleted.
 
 A command is dry unless `--apply` is given. A dry run reads and decides as an apply would, and changes no file. Its

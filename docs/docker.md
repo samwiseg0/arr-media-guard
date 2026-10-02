@@ -24,7 +24,12 @@ services:
   arr-media-guard:
     image: ghcr.io/samwiseg0/arr-media-guard:latest
     container_name: arr-media-guard
-    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # TZ: your time zone, for AUDIT_TIME and the log times
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC                  # your time zone, for AUDIT_TIME and the log times
+      RADARR_API_KEY: CHANGE_ME    # Settings > General in Radarr
+      SONARR_API_KEY: CHANGE_ME    # Settings > General in Sonarr
     volumes:
       - ./arr-media-guard:/config
       - amg-state:/config/state
@@ -37,8 +42,9 @@ volumes:
     name: amg-state   # the same name in a docker run, so a one-off container shares the store
 ```
 
-The compose file publishes no port of arr-media-guard on purpose. Only the apps on the compose network reach it.
-[Mounts](#mounts) says what each mount holds.
+This compose file publishes no port of arr-media-guard. Only the apps on the compose network reach it, at
+`http://arr-media-guard:8484`. [docker/compose.yml](../docker/compose.yml) publishes port 8484, for apps on another
+network or host. [Mounts](#mounts) says what each mount holds.
 
 ## Apps on other hosts
 
@@ -54,7 +60,8 @@ this way:
 4. For the subtitle hunter, mount SABnzbd's download folder too, at SABnzbd's path or in a `RADARR_PATH_MAP` pair.
    Set `SABNZBD_URL` and `NEWZNAB_URL` when the addresses Radarr has saved do not resolve from this container.
 
-Every Docker install sets `SONARR_API_KEY`, `RADARR_API_KEY` and `TMDB_TOKEN` in the env file, see the README.
+Every Docker install sets `SONARR_API_KEY` and `RADARR_API_KEY`, in the environment or the env file, as
+[docker/compose.yml](../docker/compose.yml) does. See the README.
 
 ## Mounts
 
@@ -77,11 +84,52 @@ start, so add by hand the keys a new release names. Each start writes the image'
 each app takes the same pair as its Username and Password. Each takes any printable ASCII, and the user takes no `:`.
 The env file starts with the user `arr-admin` and an empty password. When the password is empty, the listener generates
 a random one at its start and writes it into the env file. The container log then names the file, and never shows the
-password. Without a user, the listener does not start.
+password. Without a user, the listener does not start. A `WEBHOOK_PASSWORD` or `WEBHOOK_USER` from the environment never
+goes into the env file, see [Settings in the environment](#settings-in-the-environment).
 
 The env file holds the Docker values in place of the host values, as the paths under `/config`. The Docker section at
 its end holds the Docker keys in the README's settings. Every other key works as on a host. The listener reads the env
 file and the policy when it starts. Restart the container after you change either.
+
+## Settings in the environment
+
+Each setting may also come from an environment variable of the same name, and the environment wins over the env file.
+The README's [Settings](../README.md#settings) has the rules. This compose file keeps the plain settings in
+`environment:` and the keys and tokens in a file of their own, which compose loads as environment variables too:
+
+```yaml
+services:
+  arr-media-guard:
+    image: ghcr.io/samwiseg0/arr-media-guard:latest
+    container_name: arr-media-guard
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Europe/Berlin
+      RADARR_URL: http://radarr:7878
+      SONARR_URL: http://sonarr:8989
+      REGRAB: audio,video,content
+    env_file: ./secrets.env   # the keys and tokens, mode 0600
+    volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
+    stop_grace_period: 1m
+    restart: unless-stopped
+volumes:
+  amg-state: {name: amg-state}
+```
+
+```
+# secrets.env, one KEY=value per line
+RADARR_API_KEY=CHANGE_ME
+SONARR_API_KEY=CHANGE_ME
+```
+
+- A `WEBHOOK_PASSWORD` from the environment is never generated and never written. An empty one stops the listener. So
+  set a password there, or leave the key out and let the listener generate one into the env file.
+- A `WEBHOOK_USER` from the environment never goes into the env file either.
+- A key the environment does not set keeps its value in `/config/arr-media-guard.env`. An install that sets every key
+  in that file works as before.
+- Run `docker compose up -d` after a change. A restart keeps the old environment.
+- `docker exec arr-media-guard arr-media-guard --selftest` names the keys it took from the environment.
 
 ## User and group
 
@@ -191,7 +239,8 @@ again when a job waits.
 ## Move from a host install
 
 1. Remove the Custom Script connection in each app, and add the Webhook.
-2. Copy the keys you changed from `/etc/arr-media-guard.env` into the Docker env file. Keep the Docker file's paths.
+2. Copy the keys you changed from `/etc/arr-media-guard.env` into the Docker env file or the environment. Keep the Docker
+   file's paths.
 3. Mount the media at the paths the apps use, so the container sees each file at the path the apps give.
 
 ## Build the image yourself

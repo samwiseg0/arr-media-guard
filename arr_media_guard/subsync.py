@@ -340,15 +340,15 @@ def middle(confirm, duration):
 FAR = (tuple(r for r in RATES if r > 1.01), tuple(r for r in RATES if r < 0.99))   # the ratios far from 1: faster, slower
 
 
-def drift(starts, hint=None):
+def drift(starts, hint=None, groups=FAR):
     """[window start] of the windows that hear the speech of dense cues when the track drifts far from 1. starts are the
     cue times where the windows of the first hearing start. At 25/23.976 the speech of a cue at 20 minutes is 50 seconds
-    earlier in the audio, so a window at cue time can hear silence. For each start and each group of FAR, the window
+    earlier in the audio, so a window at cue time can hear silence. For each start and each group of groups, the window
     lies where that ratio puts the speech. hint is (audio time, offset) of a window whose words matched, the offset cue
     time minus audio time, so the fix goes through it. Else the cues start with the audio. The ratios of a group lie
     within 0.1 percent of each other, so one window hears them all."""
     t, d = hint or (0.0, 0.0)
-    return [round(max(0.0, statistics.fmean(t + (s - t - d) / float(r) for r in g)), 1) for s in starts for g in FAR]
+    return [round(max(0.0, statistics.fmean(t + (s - t - d) / float(r) for r in g)), 1) for s in starts for g in groups]
 
 
 def moved(ms, fix):

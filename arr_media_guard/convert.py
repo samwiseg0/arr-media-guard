@@ -515,11 +515,15 @@ def settle_extras(app, owner, keys):
     return out
 
 
+# Where a conversion stopped, per state of its pending entry, see convert()
+STOPPED = {"swapping": ", before it hid the original", "held": ", after it hid the original", "stranded": ", and putting the original back failed"}
+
+
 def pending_recover(app, settle_them):
     """The pending conversions of app that no running process owns, see pending_edit(). A converted one gets the
     settle() a kill cut short, when settle_them. Any other stopped between the swap and the import: its original may
-    still hide under held_name(), and its extras in hide_dir. Those are printed and logged for a person, once a day
-    posted, and nothing moves. Returns the entries it reported.
+    still hide under held_name(), and its extras in hide_dir. Those are printed and logged for a person, posted once per
+    pending entry, and nothing moves. Returns the entries it reported.
 
     G5: the pid of an entry of another pid namespace, as of a container beside the host, means nothing here. So such
     an entry counts as owned while it is younger than JOB_MAX_AGE, and as stopped after that. A restart of a container
@@ -545,15 +549,15 @@ def pending_recover(app, settle_them):
         logs.log(dict(app=app, source="backfill", ids={"app_id": owner}, result="settle", settle=out, note="left by a stopped run"))
     stranded = {k: e for k, e in rest.items() if k not in {x for v in done.values() for x in v}}
     for k, e in stranded.items():
-        note = (f"a conversion is done, and its {len(e.get('extras') or [])} extras wait in {config.CFG.hide_dir} for the next --convert run to "
-                f"settle them" if e.get("state") == "converted" else
-                f"a conversion stopped in state {e.get('state')}: the original may hide as {e.get('held')}, the new file is "
-                f"{e.get('new')}, {len(e.get('extras') or [])} extras may hide in {config.CFG.hide_dir}")
+        note = (f"a conversion to MKV finished, and its {len(e.get('extras') or [])} extras wait in {config.CFG.hide_dir} for the next "
+                "--convert run" if e.get("state") == "converted" else
+                f"a conversion to MKV stopped partway{STOPPED.get(e.get('state'), '')}. The original may be hidden as {e.get('held')}, the "
+                f"new file is {e.get('new')}, and {len(e.get('extras') or [])} extras may be hidden in {config.CFG.hide_dir}")
         print(f"STRANDED {e.get('path')}: {note}", flush=True)
         logs.log(dict(app=app, source="backfill", result="warning", path=e.get("path"), note=note))
         with contextlib.suppress(Exception):
             logs.alert_findings(dict(app=app, label=os.path.basename(e.get("path") or k), path=e.get("path") or k,
-                             findings=[{"kind": "repack", "state": e.get("state"), "note": note}]), time.strftime("%Y-%m-%d"))
+                             findings=[{"kind": "repack", "state": e.get("state"), "note": note}]), k)   # one post per pending entry
     return stranded
 
 

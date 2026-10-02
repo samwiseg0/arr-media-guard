@@ -168,18 +168,37 @@ An analyze waits while a folder scan of its section is pending.
 ## Alerts
 
 Every alert is a Discord embed to `DISCORD_WEBHOOK`, one per file and problem. The username names
-the app and `INSTANCE`. The embed says the problem and what the hook did, and the footer shows the
-TMDB state. Red is broken audio, corrupt video, wrong content or a damaged source. Amber is every
-other alert. Green is a clean scan summary. Mentions are off, and the secrets are masked. A marker in
+the app and `INSTANCE`. The embed says what is wrong and what the hook did, in a viewer's words, and
+gives no advice. The footer names the host. On a language or content alert it also names a TMDB failure,
+because TMDB's language check then did not run. Red is broken audio, corrupt video, wrong content or a damaged source. Amber is every
+other alert. Mentions are off, and the secrets are masked. A marker in
 the state store stops a repeat, and an upgrade to a file of another size alerts again.
+
+**What posts.** `report.posts()` is the one gate, and `logs.alert_findings()` asks it for every finding. A problem the
+hook left unresolved posts. That is a failed fix, a fix that a setting turns off, a fix that cannot run, or a doubt. A
+problem it fixed goes to the decision log only, see `report.fixed()`. That is a fault with the action `regrabbed`, `restored`
+or `searched`, and a subtitle sentence `removed` or `converted_track`, or a `sidecar` or `converted_sidecar` that moved.
+A restore that put back no old file of its own failed, and so did one whose old files the app did not pick up. Both
+post. A subtitle finding posts when one of its sentences does. One cause posts once. When the hook deleted the file, its
+other findings are log only. A `content` finding names each signal that scored, and lists their kinds in `scored`. A
+`language` or `runtime` finding beside it is log only when `scored` names that signal. The episode signal scores no
+points, so the `episode` finding posts. A `duration` finding is log only when the header repair fixed the file, or
+when a `header`, `cut` or `subtitle` finding of the file posts its cause. It posts when no repair ran, as with
+`HEADER_REPAIR` off or a repair that another fault blocked. The decision line keeps every finding, and its
+`alert_result` says `log only` for each one that did not post.
+
+**Format.** A template marks the names to look for and the key fact of an alert, see `report.bold()`. The embed bolds
+them, and the decision log, the CLI and Loki show plain text. `logs.embed()` escapes each Discord markdown character
+(`\`, `*`, `_`, `~`, a backquote and `|`), so a name never breaks the format. A text of more than two sentences gets one
+sentence a line.
 
 | Kind | Fires when |
 | --- | --- |
 | `language` | No main audio track is English, the original language or a language TMDB lists. |
 | `runtime` | The trusted duration is far off the listed runtime, see "Metadata checks". |
 | `duration` | The header duration disagrees with the size or the other duration sources. The size check trusts BPS tags only from mkvmerge, because ffmpeg copies stale tags. Else it allows 50 Mbit/s up to 1080p and 150 above. |
-| `episode` | The release names another episode than the one Sonarr imported it as. |
-| `content` | The evidence adds up to a re-grab. The title says "would re-grab" when `REGRAB` does not list `content`. |
+| `episode` | The release names another episode than the one Sonarr imported it as. The alert leads with the imported episode and its title. |
+| `content` | The evidence adds up to a re-grab. The title ends "re-grab is off" when `REGRAB` does not list `content`. |
 | `audio`, `video` | See "Broken audio" and "Corrupt video". |
 | `edit` | mkvpropedit failed, or the second probe shows the old flags. |
 | `damage` | The conversion of an import shows a damaged source, see "Damaged source". |
@@ -189,8 +208,9 @@ the state store stops a repeat, and an upgrade to a file of another size alerts 
 | `submatch`, `subtiming` | A subtitle does not match the audio, or its times are off and stay, see "Subtitle match". |
 | `policy` | The policy file is missing or does not load. |
 
-A fault that the second check did not find again is amber, "not confirmed". A missing or rejected
-TMDB key posts one embed a day. A 429 from Discord waits `retry_after` and retries once. A state store that the
+A fault that the second check did not find again is amber, "not confirmed". A rejected TMDB key
+posts one embed a day. It names the key that failed, which is `TMDB_TOKEN`, Radarr's key in its DLL, or the built-in
+copy of Radarr's key. A 429 from Discord waits `retry_after` and retries once. A state store that the
 worker moved aside posts one embed a day too, see "State".
 
 **One output model.** The checks and the steps keep codes and facts. A finding is `{"kind": <kind>, ...facts}`, and its
@@ -266,7 +286,7 @@ a day, and a season pack counts once. Broken audio, wrong content, a damaged sou
 share that one count, and 0 turns every re-grab off. The count and its check run in one transaction. Past the cap, or with no grab
 record, the worker only alerts. `REGRAB` lists the kinds that re-grab, `audio,video` by default. A
 kind it does not list still gets the grab record, the cap and the second check. The worker then logs
-`would_regrab` for wrong content, posts "would re-grab" and deletes nothing.
+`would_regrab` for wrong content, posts "re-grab is off" and deletes nothing.
 
 ## Corrupt video
 
@@ -302,7 +322,7 @@ goes ahead.
 
 A certain fault re-grabs like broken audio. The second check moves its zero reads by half a step and
 its windows to 30, 70 and 95 percent, and it must find the same fault class. So a local fault may
-stay an amber "Corrupt video, not confirmed". It counts against the same `REGRAB_CAP` as broken audio.
+stay an amber "Broken video, not confirmed". It counts against the same `REGRAB_CAP` as broken audio.
 Decode each certain file and each doubt of a `--check-video` scan in
 full before you act on it.
 
@@ -557,7 +577,7 @@ plans, a canary, and then the rest.
 
 ```
 arr-media-guard --backfill radarr --plan-out /root/radarr-plans.jsonl                      # dry run
-arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl --post                 # one summary
+arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl --post                 # one summary of the problems
 arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20 # a sample
 arr-media-guard --audit radarr --since 2026-01-01T10:00 --post                             # the canary's edits
 arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl             # the rest
@@ -570,21 +590,25 @@ probe of the whole library.
 
 ## Audit
 
-`--audit` never edits. It prints one summary and, with `--post`, sends it as one embed. With
+`--audit` never edits. It prints one summary and, with `--post`, sends it as one embed when it found a problem. With
 `--plan-from` it groups a dry run's plans by policy path and rule, counts the undecided and dropped
-plans, and checks the invariants again. With `--since 24h` or `--since <ISO date>` it reads the
+plans, and checks the invariants again. A plan with no undecided, dropped or skipped file and no broken invariant
+posts nothing. With `--since 24h` or `--since <ISO date>` it reads the
 decision log. It expects no further edit in each edit's `recheck`, and it probes an edit logged
 without one.
 
 Schedule `arr-media-guard --audit <app> --since 24h --post` each night for each app, with a systemd
-timer or cron. It posts only when the day had an edit, an undecided or dropped plan, a conversion or
-a file that is not Matroska. The summary carries the day's TMDB status. The audit also removes kept
-originals past their age and writes the policy status, see "Status file".
+timer or cron. It posts only when a file of the day has a problem: a re-check that still plans an edit,
+an undecided or dropped plan, a broken invariant, a failed or skipped repair or conversion, or a probe that
+failed. The post lists each file, its problems in plain words first, then the files that are OK. Its footer
+names TMDB only when TMDB had trouble that day. The syslog summary line goes out every night. The audit also
+removes kept originals past their age and writes the policy status, see "Status file".
 
 `--check-audio` and `--check-video` scan every file of the app the way the worker checks an import.
 A scan never deletes, edits or re-grabs. It checks `SCAN_WORKERS` files at a time, and each worker
 pauses 2 seconds before a file. It keeps its place in the state store, so it resumes over days, and
-`--restart` starts a new pass. Problems go to a list file, `STATE_DIR/<kind>-scan-<app>.txt`, and one summary embed. On NFS, idle I/O
+`--restart` starts a new pass. Problems go to a list file, `STATE_DIR/<kind>-scan-<app>.txt`. A run that finds a problem
+posts one summary embed, and a clean run posts none. On NFS, idle I/O
 priority has no effect on the file server, so the worker count and the pause are the throttles.
 
 ## Reverse an edit
@@ -761,7 +785,7 @@ re-grabs the import. Only these signs count:
 A proof refusal alone, over an edit list, the times, the cues or a packet count, is no damage. So is a
 warning alone, or a warning with a refusal of another stream. A skip near an end is often junk, such as
 zero bytes after the last audio frame, and a clean proof converts that file. Each of these stays a
-refusal with its "Repack failed" alert, and the original stays.
+refusal with its "Conversion to MKV failed" alert, and the original stays.
 
 The re-grab uses the steps and safeguards of "Broken audio". They are the grab record, `REGRAB_CAP`,
 the download as one unit, the second check and "Restore after a bad upgrade". The second check runs
@@ -771,13 +795,13 @@ proof's filters, and ffprobe probes it. The proof does not run again, and its re
 re-grab judges only the job's own file. Another file of the download shows its damage in its own
 conversion, and joins the unit then. A re-grab that deletes the file ends the job. Otherwise the
 original stays and gets the import's audio and video checks. The decision line has the outcome
-`damaged_source`, the `regrab` code and `repack.damage`. One red "Damaged source" embed says what the
+`damaged_source`, the `regrab` code and `repack.damage`. One red "Damaged file" embed says what the
 hook did.
 
 Only a hook job re-grabs. A library backfill with `--convert` lists a damaged file in
 `convert-<app>.txt`, and it never re-grabs. The re-grab needs `damage` in `REGRAB`, which is off by
-default. Without it the hook checks the original again and posts "Damaged source, would re-grab". A
-file ffprobe cannot read is skipped and listed, with no "Repack failed" alert.
+default. Without it the hook checks the original again and posts "Damaged file, re-grab is off". A
+file ffprobe cannot read is skipped and listed, with no "Conversion to MKV failed" alert.
 
 ## Header repair
 
@@ -814,7 +838,7 @@ stays.
 
 **A cut file keeps its subtitles.** A cut file's subtitles run to the full length and would meet the
 removal rule. So nothing changes when the video and the audio end under `CUT_END` (0.95) of the
-listed runtime, or when no runtime is listed. One amber "File may be cut" embed goes out instead. It
+listed runtime, or when no runtime is listed. One amber "File may be cut short" embed goes out instead. It
 also covers a track from another episode, so check the last frames by hand.
 
 **The tail.** A download can write a shorter copy over an old file and leave the old bytes past the
@@ -888,7 +912,8 @@ Its main audio must be in the original language and decode in three samples.
 **Import.** The hunter stops when Radarr changed the movie's file meanwhile. It hard-links the
 current file to a hidden keep name, and the state store records the link first. The import is a
 ManualImport in copy mode, because a move can fail on a network share after Radarr deleted the old
-file. When the new file landed, the hunter removes the link and the download. Else the link goes
+file. When the new file landed, the hunter removes the link and the download, and logs the import with no post. A
+keep link it cannot remove then posts one amber embed. Else the link goes
 back, the movie is marked `import_failed`, and a red embed asks for a rescan. A keep link that still
 exists stops every later run for that movie.
 
@@ -910,9 +935,11 @@ checks after the flag edit.
   spoken language counts as unknown.
 - **TMDB.** Each answer is cached for 30 days. A failed call pauses TMDB for 10 minutes, so an
   outage costs one timeout per run, and a failure reads as unknown. By default the module reads
-  Radarr's bundled TMDB key from `/opt/Radarr/Radarr.Common.dll`. `TMDB_TOKEN` overrides it. The
-  `tmdb` code of a record is `found` (TMDB returned the item's record), `no_record`,
-  `tmdb_unavailable`, `tmdb_token_missing` or `tmdb_token_rejected`. The syslog line says `not_asked` when the run asked
+  Radarr's bundled TMDB key from `/opt/Radarr/Radarr.Common.dll`, so a host follows a Radarr update.
+  Without that file, as in Docker, it takes a copy of the key from Radarr's source. `TMDB_TOKEN`
+  overrides both. The `tmdb` code of a record is `found` (TMDB returned the item's record),
+  `no_record`, `tmdb_unavailable` or `tmdb_token_rejected`. A record of an older release can hold
+  `tmdb_token_missing`. The syslog line says `not_asked` when the run asked
   TMDB nothing, as in a conversion backfill. `status.json` and the nightly audit keep `ok` for a day
   or a check where TMDB works. A cached answer never counts as live, so it never hides a dead key.
 - **Duration.** A duration is trusted when two sources agree within 30 seconds or 2 percent. The
@@ -939,7 +966,7 @@ checks after the flag edit.
   its Import Extra Files setting lists `nfo`. It names it `<name>.nfo`, or `<name>.nfo-orig` when a
   metadata writer such as Kodi writes its own `<name>.nfo`. A Kodi `.nfo` is skipped. A backfill and
   `--sub-time` read it the same way. A file with no scene name
-  gives the title of Sonarr's own file name, and the alert says "the file name's title", because
+  gives the title of Sonarr's own file name, and the alert says "the file name", because
   Sonarr wrote that name in the order it had at the import. The check then reads the series'
   episodes, one call per file, and one per series in a backfill. A file that no episode points to
   gets no verdict.
@@ -954,10 +981,10 @@ checks after the flag edit.
   title that leaves out "Part Two". So does a title that holds the words of the file's own in a row,
   or whose words the file's own holds. Neither rule joins two parts of one story, such as "Versus the
   Ring" and "Versus the Ring Part 2", so a swap of two parts shows. A title that drops its part
-  number then alerts, and the alert asks to check the order. When Sonarr imported the release to other numbers than its tag,
+  number then alerts. When Sonarr imported the release to other numbers than its tag,
   its scene numbering already maps the release's order, and the title says nothing. The alert names
-  the episode in Sonarr's order, and its absolute number for anime. It asks to check the episode
-  order, or to import the file to the episodes it names by hand.
+  the imported episode with Sonarr's title, then the episode the release's title belongs to, in
+  Sonarr's order, with its absolute number for anime.
 
 **The re-grab rule.** A re-grab needs two points. The wrong language scores one. So does a release
 name that names that language, for movies only. A short or long runtime scores one, and so does a
@@ -966,12 +993,12 @@ file, scores one. A release with an edition word never searches, because TMDB li
 films of their own. A movie under half its listing scores two on runtime, when a second source and
 TMDB agree. A special never does, because its listing may count the broadcast slot. A series never
 gets the release-language point, because a docuseries changes language per episode. The episode
-title scores `EPISODE_TITLE_POINTS`, 0, so it alerts "Wrong episode" and never re-grabs. A re-grab on
+title scores `EPISODE_TITLE_POINTS`, 0, so it alerts "Maybe the wrong episode" and never re-grabs. A re-grab on
 it would raise that constant.
 
 **The switch.** `REGRAB` leaves out `content` by default. Then the hook still checks the grab
-record, the cap and a second check. It then logs `would_regrab`, posts "Wrong content, would
-re-grab" and deletes nothing. Read those posts for a while before you turn it on. A verdict judges
+record, the cap and a second check. It then logs `would_regrab`, posts "Wrong content, re-grab
+is off" and deletes nothing. Read those posts for a while before you turn it on. A verdict judges
 only files of the job's own item. The second check probes the file again, hears the audio past the
 cache, and asks TMDB through an empty cache.
 
@@ -1107,6 +1134,18 @@ ratios, 25/23.976 and 25/24, put the speech of that part's densest cues, and one
 window whose words matched says where the cues sit, and the drift windows go through that point. Else the cues start
 with the audio. A drift window closer than 5 seconds to a window heard already is not heard.
 
+A release can mux the subtitle of another cut. Its cues then sit minutes late at a ratio of 1, where no far ratio
+puts a window, and the track runs past the end of the audio and the video. After the drift hearing, a part can still
+hold no window that heard enough. A window that heard 8 or more words, with at least 50 percent of them matched, counts
+toward a match. When such a window puts the cues late and the track runs past the end, its offset puts the speech of
+that part's densest cues at their start less the offset. One more hearing then takes a window there, and one where
+each far ratio through that window puts the speech. A window that ends after the audio and the video end is not heard.
+The header probe reads those ends from the last clusters. A file that ffmpeg wrote has no DURATION tag, and the late
+track sets its header duration.
+A window closer than 5 seconds to a window heard already is not heard either. A late track whose tail is in time ends
+inside the video, and a fix through one window would move that tail early. So that track gets no such hearing. A
+chance match of 8 or more words at a wrong offset still costs this hearing. It runs once at most.
+
 Only the first hearing names a mismatch. Its windows sit where the cues are dense, so a wrong track shows there. A
 later window can sit where the track holds no cue, as in a song or a scene the subtitle leaves out. A mismatch that
 only later windows show is unknown, and the track stays.
@@ -1199,7 +1238,7 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 
 **Actions.**
 
-- A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitle"
+- A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitles"
   alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
   both is remuxed once. The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
   extracted text, the proof's reads and the cover attachments, go into a folder under `STATE_DIR`, never the system
@@ -1207,12 +1246,13 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   work files there too. A worker that starts removes a work folder that a killed step left over a day ago. ffmpeg
   copies every
   kept stream with `-copyinkf`, and reads a retimed track from a second input of the same file with `-itsoffset` and
-  `-itsscale`. A cue that the fix moves before 0 starts at 0, through the `setts` filter. A negative time would make
-  ffmpeg move every stream. When the audio has a codec delay, as AAC, Opus, AC-3 or MP3 that ffmpeg wrote into Matroska
-  has, that start at 0 moves the later cues of the track by the delay. The proof then refuses the remux, the file stays
-  as it was, and the "subtiming" alert says the remux failed. A fix that moves no cue before 0 passes. mkvmerge moved
-  AAC lace times by 2 ms in a Matroska to Matroska remux, and the proof refused it, while ffmpeg keeps the times it
-  reads.
+  `-itsscale`. A cue that the fix moves before 0 starts at 0, through the `setts` filter. A cue that ends before 0
+  keeps a length of 1 ms, so it never shows. With a length of 0 the proof refused the remux, as when a recap of
+  several cues moves before the start. A negative time would make ffmpeg move every stream. When the audio has a
+  codec delay, as AAC, Opus, AC-3 or MP3 that ffmpeg wrote into Matroska has, that start at 0 moves the later cues of
+  the track by the delay. The proof then refuses the remux, the file stays as it was, and the "subtiming" alert says
+  the remux failed. A fix that moves no cue before 0 passes. mkvmerge moved AAC lace times by 2 ms in a Matroska to
+  Matroska remux, and the proof refused it, while ffmpeg keeps the times it reads.
 - mkvpropedit then puts back the Segment UID, and each kept track's UID, BCP 47 tag, name and flags. ffmpeg reads an
   image attachment, such as a cover, as a picture stream and would write it as a video track. So the map leaves it
   out, and mkvpropedit adds it back with its name, type and UID. The new file must
@@ -1241,8 +1281,10 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 **Cost.** The target is 15 CPU seconds per file with a track to check, the model load included, and nothing for a
 file without one. A third window costs one more Whisper run in the same process, only for a file whose window heard
 too little. A middle window costs one more hearing, only for a track that needs a ratio fix, and its window of 24
-seconds one more Whisper run in that hearing. A drift hearing and a longer window at too few cues cost one more
-hearing each, only when the check asks for them. A check makes at most four hearings after the first. More threads cost more CPU time than they save in wall time, so the
+seconds one more Whisper run in that hearing. A drift hearing, the hearing at a matched window's offset and a longer
+window at too few cues cost one more hearing each, only when the check asks for them. A check makes at most five
+hearings after the first, so a ratio from the hearing at an offset still gets its middle window. A hearing starts only
+when 10 seconds of the check's time are left. More threads cost more CPU time than they save in wall time, so the
 check runs one thread. A failure or a timeout gives unknown and never stops the import. The check shares the job's
 time limit, 90 seconds at most.
 
@@ -1324,10 +1366,13 @@ library would take weeks.
 - **The sweep.** `--sub-time` and the deep analysis hear one 10-second window a minute of each track the word check
   reads, at its densest cues. One lid.py process hears them with the model loaded once, two windows a Whisper run,
   and each pair is cached like the other hearings. Each row gives the heard words, the overlap, the cues whose first
-  word matched and their offset. A row with 3 such cues and 1 second or more off the fitted line alerts when its
-  neighbour among such rows is off 1 second or more the same way. A part of the file that is off holds such windows in
-  a row. One window alone goes to the log only, because Whisper can hear a word with the line before it and move one
-  window's offset by a second. The sweep never changes a time.
+  word matched and their offset. A row with 3 such cues and 1 second or more off the fitted line is in a step when
+  its neighbour among such rows is off 1 second or more the same way. A part of the file that is off holds such
+  windows in a row. The steps alert when they hold 3 rows or more, or every such row, and at least a quarter of such
+  rows. A part of the file is then off, and nothing fixed it. Other steps go to the log only, such as two windows near
+  the end, or two stray windows of a sparse sweep. So does one window alone, because Whisper can hear a word with the
+  line before it and move one window's offset by a second.
+  The sweep never changes a time.
 - **A clean sweep.** A match with too few anchors for a fix is a reference when its sweep is clean: in each half of the
   file 3 windows or more heard 8 words and gave an offset, every window that heard 8 words matched at 50 percent or
   more, and every such offset lies under 0.75 seconds.
@@ -1370,7 +1415,8 @@ with JSONPath preprocessing is one way. `health.py` writes the file.
             "policy": {"status": "ok", "since": 1789000000, "checked": 1790000000, "...": "..."}}}
 ```
 
-The tmdb status is `ok`, `unavailable`, `token_missing` or `token_rejected`. A file's `found` and
+The tmdb status is `ok`, `unavailable` or `token_rejected`. `token_missing` comes only from an older release, as
+the code always has a key now. A file's `found` and
 `no_record` both record `ok`, because TMDB answered. The policy status is
 `ok` or `failed`. A check never recorded reads `unknown`. `since` is when the status last changed,
 and `checked` is the last check. `error` keeps the last error text after a recovery, cut to 200
@@ -1387,7 +1433,7 @@ and it never moves `last_hook_run`. So an install step can clear a policy proble
 never hides a stopped audit. The TMDB status goes in only after a live TMDB answer. Useful alerts
 are these:
 
-- The tmdb status is `token_missing` or `token_rejected` for an hour.
+- The tmdb status is `token_rejected` for an hour.
 - TMDB stays unavailable for several hours, from the first failure to the last check. A single
   failure before a quiet night then never fires.
 - The policy status is `failed`.
@@ -1479,8 +1525,16 @@ each warns once. Each API call of the Test checks waits at most 10 seconds, so a
 Test fast.
 
 The image reads the apps only through their APIs, so it needs no app config folder, and the env file
-holds each API key. No feature reads an app's database. A database shared between hosts is not safe,
+or the environment holds each API key. No feature reads an app's database. A database shared between hosts is not safe,
 and a container on another host keeps every feature.
+
+**Settings in the environment.** Compose passes settings as environment variables, so each setting
+may come from one, and the environment wins over the env file. `config.settings()` reads only the keys
+of the settings, so another variable, as a systemd `STATE_DIRECTORY` or an app's `sonarr_*`, never
+changes one. An empty variable counts as set, so a user can blank a key the file sets. The listener
+never writes a `WEBHOOK_PASSWORD` or `WEBHOOK_USER` that came from the environment, because the
+environment would win over the written value at the next start. The worker and the nightly jobs
+inherit the listener's environment, so every program reads the same settings.
 
 **Requests.** The listener serves 32 requests at once on a pool of threads. Each request has 10
 seconds for its headers and body together, so a client that sends one byte at a time loses its

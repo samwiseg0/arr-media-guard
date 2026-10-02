@@ -40,6 +40,12 @@ LANGWORDS = {"english": "eng", "anglais": "eng", "ingles": "eng", "inglés": "en
              "cantonese": "chi", "国语": "chi", "普通话": "chi", "粤语": "chi", "國語": "chi", "粵語": "chi", "chinese": "chi", "tamil": "tam",
              "telugu": "tel", "thai": "tha", "arabic": "ara", "hebrew": "heb", "dutch": "dut", "swedish": "swe", "danish": "dan", "norwegian": "nor",
              "vietnamese": "vie", "czech": "cze", "hungarian": "hun", "romanian": "rum", "greek": "gre", "ukrainian": "ukr", "persian": "per"}
+# The English names of 639-2 codes for alert texts, see lang_name(). ALIAS names the rest.
+LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "German", "ita": "Italian", "por": "Portuguese", "jpn": "Japanese",
+              "kor": "Korean", "chi": "Chinese", "rus": "Russian", "hin": "Hindi", "tur": "Turkish", "dut": "Dutch", "swe": "Swedish",
+              "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "pol": "Polish", "ara": "Arabic", "heb": "Hebrew", "tha": "Thai",
+              "ind": "Indonesian", "vie": "Vietnamese", "gre": "Greek", "cze": "Czech", "hun": "Hungarian", "rum": "Romanian", "ukr": "Ukrainian",
+              "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "bel": "Belarusian", "und": "untagged"}
 NOT_SPEECH = re.compile(r"\w+\s+(score|sub\w*|dub\w*)", re.I)   # audio titles: "UK Dub / Japanese Score"
 NOT_SUB_SPEECH = re.compile(r"\w+\s+dub\w*", re.I)                 # subtitle titles keep "English Subtitles"
 # Subtitle titles. "English Signs", "Alien Only", "For Foreign Parts Only" and "Titles Only" are forced. "Songs SDH"
@@ -79,6 +85,20 @@ def codes(lang):
     n = ((lang or "").lower().split() or [""])[0]
     if n in UNTAGGED or n == "unknown": return set()
     return next(({c for c in s if len(c) == 3} for s in ALIAS if n in s), {n[:3]})
+
+
+def lang_name(code):
+    """The English name of a 639-2 code: "fre" -> "French". A code in ALIAS takes the name of its set, or its word,
+    as "gle" takes "Irish". An unknown code stays as it is."""
+    same = next((s for s in ALIAS if code in s), {code or "und"})
+    known = [LANG_NAMES[c] for c in sorted(same) if c in LANG_NAMES]
+    return known[0] if known else next((w.title() for w in same if len(w) > 3), code)
+
+
+def lang_names(langs, joint="and"):
+    """The names of 639-2 codes, each once, as a person lists them: "English", "English or Japanese"."""
+    names = sorted({lang_name(c) for c in langs})
+    return f"{', '.join(names[:-1])} {joint} {names[-1]}" if len(names) > 1 else "".join(names)
 
 
 def kids_title(app, genres, profile_name=None, studio=None):
@@ -534,7 +554,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
             code = rule.replace(" ", "_")
             out["reasons"] += [] if code in out["reasons"] else [code]
         if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in readable and key(out["set"].get(pos, tag)) != key(h):
-            out["mismatch"].append(f"{pos} is tagged {tag}, but its text reads as {h}")
+            out["mismatch"].append(f"subtitle track {pos[1:]} is tagged {lang_name(tag)}, but its text reads as {lang_name(h)}")
             out["wrong"][pos] = h
             out["reasons"] += [] if "subtitle_text_mismatch" in out["reasons"] else ["subtitle_text_mismatch"]
     return out
@@ -741,13 +761,15 @@ def checks(j, size, runtime, shorter_only=False):
     if bps:
         est = size * 8 / bps
         if abs(dur - est) > 0.4 * est:
-            out.append(("duration", {"why": f"The container says {mmss}, but {size / 1e9:.1f} GB at its own bitrate is about {est / 60:.0f} minutes."}))
+            out.append(("duration", {"why": f"The file says it runs {mmss}, but at its own bitrate {size / 1e9:.1f} GB lasts about {est / 60:.0f} "
+                                            "minutes."}))
     else:
         dims = [(t.get("properties") or {}).get("pixel_dimensions") or f'{t.get("width", 0)}x{t.get("height", 0)}'
                 for t in items if t.get("type") == "video" or t.get("codec_type") == "video"]
         height = max([int(d.split("x")[1]) for d in dims if "x" in d] or [0])
         if size * 8 / dur > (150e6 if height > 1080 else 50e6):
-            out.append(("duration", {"why": f"The container says {mmss}, which means {size * 8 / dur / 1e6:.0f} Mbit/s for {size / 1e9:.1f} GB."}))
+            out.append(("duration", {"why": f"The file says it runs {mmss}, but that would mean {size * 8 / dur / 1e6:.0f} Mbit/s for "
+                                            f"{size / 1e9:.1f} GB, far more than a real video."}))
     off = dur / 60 < 0.6 * runtime if shorter_only else abs(dur / 60 - runtime) > 0.4 * runtime
     if runtime >= 10 and not out and off:
         out.append(("runtime", {"runs": mmss, "listed": runtime}))   # report.FINDINGS words it
@@ -816,31 +838,31 @@ def audio_verdict(j, a_index, samples, runtime=0):
     if a_index is None: return "the file has no audio track", []
     n = len(samples)
     if not all(s.get("ran", True) for s in samples):
-        return None, [f"{sum(not s.get('ran', True) for s in samples)} of {n} audio samples could not run"]
+        return None, [f"the audio check could not run at {sum(not s.get('ran', True) for s in samples)} of {n} places"]
     ratio = [s["n"] / (s["rate"] * s["ch"] * s["window"]) if s.get("rate") and s.get("ch") and s.get("window") else 1.0 for s in samples]
     silent = [s["n"] > 0 and s["max"] is not None and s["max"] <= SILENT_DB for s in samples]
     broken = [s["errors"] > 0 and r < LOSS for s, r in zip(samples, ratio)]
-    if all(silent): return f"all {n} audio samples are digital silence", []
-    if all(broken): return f"all {n} audio samples fail to decode", []
+    if all(silent): return f"the audio is silent at all {n} places checked", []
+    if all(broken): return f"the audio fails to play at all {n} places checked", []
     # A cut counts only when the late sample decoded nothing. A cut inside the late window may be a lost tail
     # under a long duration header, which reads as lost audio, so it only alerts.
     late = samples[-1]
     if late.get("cut") and late["n"] == 0 and runtime > 0 and late.get("at", 0) < 0.95 * runtime * 60:
-        return "the file is cut off before the late audio sample", []
-    doubts = ["the file ends early, inside or after the late audio sample"] if late.get("cut") else []
-    if any(silent): doubts.append(f"{sum(silent)} of {n} audio samples are digital silence")
-    if any(broken): doubts.append(f"{sum(broken)} of {n} audio samples fail to decode")
-    if samples[-1]["n"] == 0: doubts.append("the late audio sample decoded nothing, maybe a long duration header")
-    if any(s["n"] == 0 for s in samples[:-1]): doubts.append("an early audio sample decoded nothing")
+        return "the file is cut off before the last place checked", []
+    doubts = ["the file may end early, near the last place checked"] if late.get("cut") else []
+    if any(silent): doubts.append(f"the audio is silent at {sum(silent)} of {n} places checked")
+    if any(broken): doubts.append(f"the audio fails to play at {sum(broken)} of {n} places checked")
+    if samples[-1]["n"] == 0: doubts.append("no audio plays at the last place checked, maybe because the file says it runs longer than it does")
+    if any(s["n"] == 0 for s in samples[:-1]): doubts.append("no audio plays at an earlier place checked")
     lost = [f"{r:.0%}" for s, r, b in zip(samples, ratio, broken) if s["n"] and r < LOSS and not b]
-    if lost: doubts.append(f"an audio sample decoded only {', '.join(lost)} of its length")
+    if lost: doubts.append(f"part of the audio is missing, and only {', '.join(lost)} of it plays where it was checked")
     items = j.get("tracks") or []
     app = ((j.get("container") or {}).get("properties") or {}).get("writing_application") or ""
     au = [t for t in items if t.get("type") == "audio"]; vi = [t for t in items if t.get("type") == "video"]
     if app.startswith("mkvmerge") and vi and a_index < len(au):
         a, v = (tag_seconds((x.get("properties") or {}).get("tag_duration")) for x in (au[a_index], vi[0]))
         if a and v and a < SHORT_AUDIO * v:
-            doubts.append(f"the audio ends at {a / 60:.0f} minutes, the video at {v / 60:.0f}")
+            doubts.append(f"the audio stops at {clock(a)}, but the video runs to {clock(v)}")
     return None, doubts
 
 
@@ -869,8 +891,9 @@ SIGNATURES = ((0, b"\x1a\x45\xdf\xa3"), (4, b"ftyp"), (4, b"moov"), (4, b"mdat")
 
 
 def clock(seconds):
-    """Seconds as m:ss, the minutes unbounded, for the audio texts."""
-    return f"{round(seconds) // 60}:{round(seconds) % 60:02d}"
+    """Seconds as a player shows them, cut to the second: 4:17, 1:02:05."""
+    h, m, s = int(seconds // 3600), int(seconds % 3600 // 60), int(seconds % 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def media_signature(b):
@@ -934,7 +957,7 @@ def stops_early(samples, pk):
     from the file start."""
     if len(samples) == 3 and pk.get("audio") is not None and pk.get("video") and pk["video_gap"] <= VIDEO_GAP \
             and all(s.get("ran", True) and s["n"] == 0 for s in samples) and pk["audio"] < samples[0]["at"] and pk["video"] > samples[-1]["at"]:
-        return f"the audio stops at {clock(pk['audio'])}, and the video runs to {clock(pk['video'])}"
+        return f"the audio stops at {clock(pk['audio'])}, but the video runs to {clock(pk['video'])}"
     return None
 
 
@@ -946,7 +969,7 @@ def held(pk):
     if pk.get("codec") not in CBR or "HD" in profile or "Express" in profile or pk.get("held") is None or not pk.get("video") \
             or pk["video_gap"] > VIDEO_GAP or pk["held"] >= HELD_SHARE * pk["video"]:
         return None
-    return f"the audio track holds {clock(pk['held'])} of audio for {clock(pk['video'])} of video"
+    return f"the audio track holds only {clock(pk['held'])} of sound for {clock(pk['video'])} of video"
 
 
 def full_verdict(full):
@@ -955,8 +978,8 @@ def full_verdict(full):
     errors is certain, without errors a doubt."""
     if not full.get("ran") or not full.get("end") or full["decoded"] >= FULL_SHARE * full["end"]:
         return None, None
-    text = f"the whole audio track decodes {clock(full['decoded'])} of its {clock(full['end'])}"
-    return (f"{text}, with {full['errors']} decode errors", None) if full["errors"] else (None, text)
+    text = f"only {clock(full['decoded'])} of the {clock(full['end'])} audio track plays"
+    return (f"{text}, with {full['errors']} errors", None) if full["errors"] else (None, text)
 
 
 def lone_late_silence(samples):
@@ -1034,9 +1057,9 @@ def bad_window(w):
     """Why one window that ran is bad, or None. An empty window with no error is a doubt, see video_verdict(). An empty
     window with errors is bad in a cut file too. A file that lost bytes early fails every later packet."""
     if w["late"] or w["noisy"]:
-        return "no video where the window starts"
+        return "no video"
     if w["errors"]:
-        return f"{w['errors']} decode error" + ("s" if w["errors"] > 1 else "")
+        return f"{w['errors']} playback error" + ("s" if w["errors"] > 1 else "")
     if w["gap"] > GAP:
         return f"{w['gap']:.0f} s of video missing"
     return None
@@ -1044,7 +1067,7 @@ def bad_window(w):
 
 def stopped_doubt(w):
     """The doubt of a window that the read cap or the time cap stopped."""
-    return f"the video window at {w['at']} s {w['stopped']}, the file may have no usable index"
+    return f"the video check at {clock(w['at'])} {w['stopped']}, so the file may have no usable index"
 
 
 def read_capped(w):
@@ -1063,26 +1086,26 @@ def video_verdict(zero_hits, windows):
     Matroska, or    a window past the end of the video. A window that the read cap stopped with no error is only logged.
     """
     if len(zero_hits) >= 2:
-        return f"zero-filled regions at {len(zero_hits)} of {ZERO_READS} offsets, an incomplete download", []
+        return f"the file has blank gaps at {len(zero_hits)} of {ZERO_READS} places checked, so the download is incomplete", []
     nodecoder = sum(bool(w.get("nodecoder") and w.get("encrypted")) for w in windows)
     if nodecoder >= 2:
-        return f"the video track is encrypted, and ffmpeg found no decoder for it in {nodecoder} of {len(windows)} windows", []
-    doubts = [f"a zero-filled region at {zero_hits[0]:.0%} of the file"] if zero_hits else []
+        return f"the video is encrypted and cannot play at {nodecoder} of {len(windows)} places checked", []
+    doubts = [f"the file has a blank gap at {zero_hits[0]:.0%} of its length"] if zero_hits else []
     bads = []
     for w in windows:
         why = bad_window(w) if w["ran"] else None
         if why:
-            bads.append(f"{why} at {w['at']} s")
+            bads.append(f"{why} at {clock(w['at'])}")
         elif read_capped(w):
             continue
         elif w.get("stopped"):
             doubts.append(stopped_doubt(w))
         elif not w["ran"]:
-            doubts.append(f"the video window at {w['at']} s could not run")
+            doubts.append(f"the video at {clock(w['at'])} could not be checked")
         elif w["empty"]:
-            doubts.append(f"no video frame at {w['at']} s" + (", the file is cut" if w["cut"] else ""))
+            doubts.append(f"no video at {clock(w['at'])}" + (", where the file is cut off" if w["cut"] else ""))
     if len(bads) >= 2:
-        return f"{len(bads)} of {len(windows)} video windows are bad, with " + ", ".join(bads[:-1]) + " and " + bads[-1], doubts
+        return f"the video is broken at {len(bads)} of {len(windows)} places checked: " + ", ".join(bads[:-1]) + " and " + bads[-1], doubts
     return None, doubts + bads
 
 
@@ -1335,12 +1358,12 @@ def subtitle_plan(trim, remove, ends, streams, listed):
     So is a file with no runtime. Otherwise a planned removal stands only for a track that ends past
     REMOVE_END, and the others are trimmed."""
     if not listed:
-        return [], [], "no runtime is listed, so a cut file cannot be told from a runaway subtitle"
+        return [], [], "the subtitles run far past the video and audio, and no runtime is listed to tell whether the file is cut short"
     late, limit = sorted(set(trim) | set(remove)), listed * 60
     if streams < CUT_END * limit:
         i = min(late, key=ends.get)
-        return [], [], (f"the video and the audio end at {streams / 60:.1f} minutes of a listed {listed:g}, and subtitle track "
-                        f"{i} ends at {ends[i] / 60:.1f}")
+        return [], [], (f"the video and audio stop at {clock(streams)}, but the listed runtime is {listed:g} minutes, and the subtitles run to "
+                        f"{clock(ends[i])}")
     remove = sorted(i for i in remove if ends[i] > REMOVE_END * limit)
     return sorted(set(late) - set(remove)), remove, None
 

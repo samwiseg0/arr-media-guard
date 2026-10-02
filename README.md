@@ -1,8 +1,9 @@
 # arr-media-guard
 
 arr-media-guard checks every file that Sonarr or Radarr imports or upgrades. It makes the right audio track play
-first and sets the subtitle defaults to match. It re-grabs a file that is certainly broken, and posts one Discord alert
-for each problem it finds. It edits the track flags in place with `mkvpropedit`, and never re-encodes.
+first and sets the subtitle defaults to match. It re-grabs a file that is certainly broken. It posts a Discord alert
+for each problem it leaves unresolved, and logs the problems it fixed. It edits the track flags in place with
+`mkvpropedit`, and never re-encodes.
 
 - **Default tracks.** It picks the audio and the subtitles that play first, from a policy file.
 - **Language detection.** An optional Whisper model hears a track whose language is in doubt.
@@ -35,43 +36,43 @@ On a host, it needs these instead of Docker:
 
 Docker is the recommended way. The image works wherever Sonarr and Radarr run. It needs each app's API at a URL it
 can reach, and the media at the apps' paths or through [path maps](docs/docker.md#path-maps). The apps reach it
-through a **Webhook** connection, so nothing goes into their containers.
+through a **Webhook** connection, so nothing goes into their containers. No feature reads an app's database, so the
+apps may run on other hosts too.
 
-These steps run it next to the apps, on one compose network. For apps on other hosts, see
-[docs/docker.md](docs/docker.md#apps-on-other-hosts). No feature reads an app's database, so every feature works there too.
-
-1. Add the service and its volume to the compose file of your apps:
-   ```yaml
-   services:
-     arr-media-guard:
-       image: ghcr.io/samwiseg0/arr-media-guard:latest
-       container_name: arr-media-guard
-       environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # the apps' user and group, and your time zone
-       volumes:
-         - ./arr-media-guard:/config   # the env file, the policy and the decision log
-         - amg-state:/config/state     # the state store
-         - /srv/media:/data            # the media, at the same path as in the apps
-         # - /dev/log:/dev/log         # optional, for Loki
-       stop_grace_period: 1m
-       restart: unless-stopped
-   volumes:
-     amg-state:
-       name: amg-state
+1. Download [docker/compose.yml](docker/compose.yml) into a new folder:
    ```
-   The state store is SQLite in WAL mode and needs a local disk, so it gets a volume of its own. To ship syslog to
-   Loki, also mount `/dev/log`. Each command in the container then writes its logfmt lines to the host's syslog.
-2. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `/config`.
-   `WEBHOOK_USER` and `WEBHOOK_PASSWORD` in the env file are the user and password of the Webhook connection. The user
-   is `arr-admin`. The listener generates a random password at its first start and writes it into the env file. You can
-   set your own pair instead. Each takes any printable ASCII, and the user takes no `:`.
-3. Open `./arr-media-guard/arr-media-guard.env`. Copy `WEBHOOK_USER` and `WEBHOOK_PASSWORD` into the Username and
-   Password of each app's Webhook connection, see [Add it to Sonarr and Radarr](#add-it-to-sonarr-and-radarr). Every app
-   takes the same pair. Set `SONARR_API_KEY` and `RADARR_API_KEY` to the keys in each app's Settings > General. Set
-   `TMDB_TOKEN` too, because the image has no Radarr install to read the bundled key from.
-4. Run `docker compose restart arr-media-guard`, so the listener reads the keys.
+   mkdir amg && cd amg
+   curl -fsSLO https://raw.githubusercontent.com/samwiseg0/arr-media-guard/main/docker/compose.yml
+   ```
+   To run it in the compose file of your apps, copy its service and its volume there instead.
+2. Replace each `CHANGE_ME` in the file. Each app needs its URL as this container reaches it, and its API key from
+   Settings > General. The media folder of the host goes at the path the apps use. Set `PUID`, `PGID` and `TZ` to the
+   apps' user and group and your time zone. To turn on an optional line, remove its `#` and replace its `CHANGE_ME`.
+3. Run `docker compose up -d`. The first start writes `arr-media-guard.env` and `policy.json` into `./arr-media-guard`.
+   The listener generates a random Webhook password and writes it into that env file as `WEBHOOK_PASSWORD`.
+4. Copy `WEBHOOK_USER` and `WEBHOOK_PASSWORD` from `./arr-media-guard/arr-media-guard.env` into the Username and
+   Password of each app's Webhook connection, see [Add it to Sonarr and Radarr](#add-it-to-sonarr-and-radarr). The
+   user is `arr-admin`, and every app takes the same pair. The file has mode 0640 and belongs to `PUID:PGID`. When
+   your login user is not `PUID`, read it with `sudo cat`.
 
-[docs/docker.md](docs/docker.md) has a full compose file, the mounts, path maps for other media paths, and the
-listener.
+To run it without compose, replace each `CHANGE_ME` in this command as in step 2, and run it in the folder that
+will hold `arr-media-guard`:
+
+```
+docker run -d --name arr-media-guard --restart unless-stopped --stop-timeout 60 -p 8484:8484 \
+  -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+  -e RADARR_URL=http://CHANGE_ME:7878 -e RADARR_API_KEY=CHANGE_ME \
+  -e SONARR_URL=http://CHANGE_ME:8989 -e SONARR_API_KEY=CHANGE_ME \
+  -v "$PWD/arr-media-guard:/config" -v amg-state:/config/state --mount type=bind,source=CHANGE_ME,target=/data \
+  ghcr.io/samwiseg0/arr-media-guard:latest
+```
+
+Then do step 4. The state store is SQLite in WAL mode and needs a local disk, so it gets the volume `amg-state` of its
+own. To ship syslog to Loki, also mount `/dev/log`. Each command in the container then writes its logfmt lines to the
+host's syslog.
+
+[docs/docker.md](docs/docker.md) has a compose file with the apps, the mounts, path maps for other media paths,
+secrets in a file of their own, and the listener.
 
 ## Install on a host
 
@@ -102,6 +103,10 @@ Use this way when Sonarr and Radarr run on the host. Each app runs the script as
    timer or cron. The audit reviews the hook's own edits, and removes old kept originals and grab links.
 7. Run `arr-media-guard --selftest`.
 
+The hook also reads its settings from the app's environment, and the environment wins over the env file. So a generic
+variable there, such as `NAME`, `LOG`, `INSTANCE` or `STATE_DIR`, changes the hook's settings. The worker names each key
+it took from the environment in a warning line of the decision log at its start.
+
 To turn on language detection, also run:
 
 ```
@@ -125,10 +130,12 @@ host.
 | --- | --- | --- |
 | Name | `arr-media-guard` | `arr-media-guard` |
 | Triggers | **On File Import** and **On File Upgrade** | **On File Import** and **On File Upgrade** |
-| URL or Path | `http://arr-media-guard:8484/sonarr` in Sonarr, `http://arr-media-guard:8484/radarr` in Radarr | `/usr/local/bin/arr-media-guard` |
+| URL or Path | `http://<docker host>:8484/sonarr` in Sonarr, `http://<docker host>:8484/radarr` in Radarr. On one compose network, `http://arr-media-guard:8484/sonarr` and so on. | `/usr/local/bin/arr-media-guard` |
 | Method | `POST` | |
 | Username and Password | `WEBHOOK_USER` and `WEBHOOK_PASSWORD` | |
 | Arguments | | empty |
+
+An app in a container never reaches the listener at `localhost`, because that name points at the app's own container.
 
 With `KEEP_REPLACED=true`, also turn on **On Grab**.
 
@@ -168,7 +175,14 @@ Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in th
     volumes: [./sonarr-4k:/config, /srv/media:/data]   # Webhook URL http://arr-media-guard:8484/sonarr-4k
   arr-media-guard:
     image: ghcr.io/samwiseg0/arr-media-guard:latest
-    environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      SONARR_API_KEY: CHANGE_ME              # Settings > General in Sonarr
+      APP_INSTANCES: sonarr-4k:sonarr
+      SONARR_4K_URL: http://sonarr-4k:8989
+      SONARR_4K_API_KEY: CHANGE_ME           # Settings > General in the 4K Sonarr
     volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
     stop_grace_period: 1m
     restart: unless-stopped
@@ -209,14 +223,27 @@ To try the subtitle check on one file with no app, see [docs/subtitles.md](docs/
 
 ## Settings
 
-The env file holds one `KEY='value'` per line. A comment needs its own line, because the value runs to the end of the
-line. Every key is optional. A value the script cannot read takes the safest reading, and `--selftest` fails on it.
+Settings come from the env file or from environment variables of the same names. The environment wins over the env
+file. Every key is optional. A value the script cannot read takes the safest reading, and `--selftest` fails on it.
 The worker logs it at each start.
+
+The env file holds one `KEY='value'` per line. A comment needs its own line, because the value runs to the end of the
+line.
 
 - In Docker the file is `./arr-media-guard/arr-media-guard.env`. Restart the container after you change it.
 - On a host it is `/etc/arr-media-guard.env`. Set the environment variable `ARR_MEDIA_GUARD_ENV` to use another file.
 - [examples/arr-media-guard.env](examples/arr-media-guard.env) lists every key with its default.
   [docker/arr-media-guard.env](docker/arr-media-guard.env) holds the Docker values and the Docker keys.
+
+A setting from the environment follows these rules.
+
+- An empty variable counts as set, so it blanks the key.
+- A value from the environment takes the same reading and the same checks as one from the file.
+- Any other variable is ignored. `--selftest` names the keys it took from the environment, and never their values.
+- In Docker, set them in `environment:` of the compose file, as [docker/compose.yml](docker/compose.yml) does. Run
+  `docker compose up -d` after you change them. A restart keeps the old environment.
+- On a host, each command reads the environment it runs in. The hook reads the app's environment, and the nightly
+  audit its timer's. So keep host settings in the env file.
 
 The command `arr-media-guard` is a launcher. It runs the package `arr_media_guard/` in its own folder, symlinks
 resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another folder.
@@ -248,7 +275,7 @@ resolved. Set the environment variable `ARR_MEDIA_GUARD_LIB` to use another fold
 | --- | --- | --- |
 | `PLEX_URL`, `PLEX_TOKEN` | empty | Plex re-analyzes an edited item. An empty `PLEX_URL` turns every Plex call off. |
 | `DISCORD_WEBHOOK` | empty | Alerts and scan summaries go here. Empty: nothing is posted. |
-| `TMDB_TOKEN` | empty | A TMDB API read token. Empty: Radarr's bundled key, read from `/opt/Radarr/Radarr.Common.dll`. |
+| `TMDB_TOKEN` | empty | A TMDB API read token of your own. Empty: Radarr's key, read from `/opt/Radarr/Radarr.Common.dll`, else a copy of it in the code, as in Docker. |
 
 ### Path maps
 
@@ -307,13 +334,20 @@ at its end holds these keys.
 
 | Key | Default in Docker | What it does |
 | --- | --- | --- |
-| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | `arr-admin`, empty | The user and password of the Webhook connection of each app, in printable ASCII. The user takes no `:`. An empty password gets a random one at the listener's start, in the env file. Without a user, the listener does not start. |
+| `WEBHOOK_USER`, `WEBHOOK_PASSWORD` | `arr-admin`, empty | The user and password of the Webhook connection of each app, in printable ASCII. The user takes no `:`. An empty password gets a random one at the listener's start, in the env file. A password from the environment never does, and an empty one stops the listener. Without a user, the listener does not start. |
 | `AUDIT_TIME` | `07:30` | The local time of the nightly audit and the weekly log rotation. Empty: neither runs. |
 
 ## Update
 
-1. In Docker, run `docker compose pull arr-media-guard` and `docker compose up -d arr-media-guard`. The image tag
-   `latest` always holds the newest release. On a host, run `sudo git -C /opt/arr-media-guard pull`.
+1. With compose, run `docker compose pull arr-media-guard` and `docker compose up -d arr-media-guard`. The image tag
+   `latest` always holds the newest release. Without compose, run these commands. `docker stop` gives a running edit
+   60 seconds to finish.
+   ```
+   docker pull ghcr.io/samwiseg0/arr-media-guard:latest
+   docker stop arr-media-guard && docker rm arr-media-guard
+   ```
+   Then run the `docker run` command of [Install in Docker](#install-in-docker) again. On a host, run
+   `sudo git -C /opt/arr-media-guard pull`.
 2. Add the keys a new release names to your env file. An update never changes that file. In Docker, each start writes
    the image's env file to `arr-media-guard.env.example` beside yours, so you can compare the two.
 3. Run the selftest.
@@ -330,7 +364,8 @@ and the caches.
    python3 -c 'import sqlite3; print(sqlite3.connect("/var/lib/arr-media-guard/state.sqlite").execute("SELECT count(*) FROM jobs").fetchone()[0])'
    ```
 3. In Docker, remove the service and the volume from the compose file, and run `docker compose up -d --remove-orphans`.
-   Then run `docker volume rm amg-state`, and remove the `./arr-media-guard` folder.
+   Without compose, run `docker stop arr-media-guard && docker rm arr-media-guard`. Then run `docker volume rm amg-state`,
+   and remove the `./arr-media-guard` folder.
 4. On a host, remove `/opt/arr-media-guard`, `/opt/arr-media-guard-lid`, `/usr/local/bin/arr-media-guard`,
    `/usr/local/bin/arr-media-guard-subhunt`, the two files in `/etc`, `STATE_DIR`, `LOG`, the logrotate file and the
    audit timer.

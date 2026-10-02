@@ -792,6 +792,8 @@ def worker(lock):
             convert.pending_recover(app, False)
     for why in config.CFG.errors:
         logs.log(dict(source="hook", result="warning", note=why[:300]))
+    if config.CFG.from_env and not config.SERVE:   # a host hook reads the app's environment, where a stray key such as LOG wins
+        logs.log(dict(source="hook", result="warning", note=f"keys from the environment win over the env file: {', '.join(config.CFG.from_env)}"))
     pending = plex.load_plex()   # plex_job() dicts, the analyze of each edited file, with those a stopped worker kept
     if config.CFG.hook_workers > 1:
         return coordinate(lock, config.CFG.hook_workers, pending)

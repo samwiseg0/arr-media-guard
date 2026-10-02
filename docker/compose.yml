@@ -1,0 +1,35 @@
+# arr-media-guard in Docker. Replace each CHANGE_ME, then run: docker compose up -d
+# The first start generates the Webhook password. Read WEBHOOK_PASSWORD in ./arr-media-guard/arr-media-guard.env.
+# The README has the steps, and docs/docker.md has the detail.
+services:
+  arr-media-guard:
+    image: ghcr.io/samwiseg0/arr-media-guard:latest
+    container_name: arr-media-guard
+    environment:
+      PUID: 1000                           # the user and group the apps run as
+      PGID: 1000
+      TZ: Etc/UTC                          # your time zone, for the nightly audit and the log times
+      RADARR_URL: http://CHANGE_ME:7878    # each app as this container reaches it: a host address, or a service name on a shared network
+      SONARR_URL: http://CHANGE_ME:8989
+      RADARR_API_KEY: CHANGE_ME            # Settings > General in Radarr
+      SONARR_API_KEY: CHANGE_ME            # Settings > General in Sonarr
+      # PLEX_URL: http://CHANGE_ME:32400   # Plex re-analyzes each edited item
+      # PLEX_TOKEN: CHANGE_ME
+      # DISCORD_WEBHOOK: CHANGE_ME         # alerts and scan summaries
+      # APP_INSTANCES: sonarr-4k:sonarr    # a second instance, with the Webhook URL http://<this host>:8484/sonarr-4k
+      # SONARR_4K_URL: http://CHANGE_ME:8989
+      # SONARR_4K_API_KEY: CHANGE_ME
+    volumes:
+      - ./arr-media-guard:/config          # the env file, the policy and the decision log
+      - amg-state:/config/state            # the state store, which needs a local disk
+      - CHANGE_ME:/data                    # the media folder of the host, at the path the apps use
+                                           # when the apps use another path, change /data to it, or set PATH_MAP
+      # - /dev/log:/dev/log                # the host's syslog, for Loki
+    ports:
+      - "8484:8484"                        # the Webhook listener. Docker publishes a port past ufw. To bind it to
+                                           # one address of the host, write "192.168.1.10:8484:8484".
+    stop_grace_period: 1m
+    restart: unless-stopped
+volumes:
+  amg-state:
+    name: amg-state

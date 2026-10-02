@@ -366,13 +366,14 @@ def props_fault(j, new, drop=()):
 
 
 def srt_moved(text, fix):
-    """SubRip text with each time line moved by fix, see subsync.moved(). A time before 0 becomes 0. The rest of the
-    text stays as it is."""
+    """SubRip text with each time line moved by fix, see subsync.moved(). A start before 0 becomes 0. An end at or
+    before 0 becomes 1 ms, so the cue never shows. mkvmerge drops a cue of length 0, and the proof of a conversion
+    then refuses the new file. The rest of the text stays as it is."""
     ms = lambda h, m, sec, f: int(h) * 3600000 + int(m) * 60000 + int(sec) * 1000 + int(f.ljust(3, "0")[:3])
-    at = lambda x: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(max(0, subsync.moved(x, fix)))
+    at = lambda x, lo=0: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(max(lo, subsync.moved(x, fix)))
     def line(m):
         g = m.groups()
-        return f"{at(ms(*g[:4]))} --> {at(ms(*g[4:8]))}{g[8]}"
+        return f"{at(ms(*g[:4]))} --> {at(ms(*g[4:8]), 1)}{g[8]}"
     return "\n".join(decide.SRT_TIME.sub(line, x) for x in text.replace("\r\n", "\n").split("\n"))
 
 
@@ -515,8 +516,9 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None):
         source, kept = {x: n for n, x in enumerate(own, 1)}, [x["index"] for x in streams if x["index"] not in gone and x not in pics]
         argv += [a for x in kept for a in ("-map", f"{source.get(x, 0)}:{0 if x in ended else x}")]
         # A cue the fix moves before 0 starts at 0, as srt_moved() does. A negative time would make ffmpeg move every stream.
+        # A cue that ends before 0 keeps 1 ms, as in srt_moved(). With a length of 0 the proof refused the remux.
         # -itsscale scales the times and leaves each duration, so the filter scales it too, and a cue ends where the fix moves its end.
-        clamp = lambda k: (f"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(0\\,PTS+DURATION*{k})\\,DURATION*{k})")
+        clamp = lambda k: (f"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(1\\,PTS+DURATION*{k})\\,DURATION*{k})")
         argv += [a for n, x in enumerate(kept) if x in moved for a in (f"-bsf:{n}", clamp(repr(1 / float(fractions.Fraction(moved[x]["rate"])))))]
         argv += ["-c", "copy", "-copyinkf", "-default_mode", "passthrough", "-f", "matroska", tmp]
         new_tmp(tmp)

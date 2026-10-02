@@ -7,9 +7,10 @@ is installed in their containers.
   arr-media-guard --serve
 
 It listens on port PORT. Each instance posts to /<its name>, Radarr to /radarr and Sonarr to /sonarr, with HTTP basic
-auth. The user and password are WEBHOOK_USER and WEBHOOK_PASSWORD in the env file. When the password is empty, the
-listener writes a new one at its start, see new_password(). Without a user, the listener does not start. The body gives
-the same runner.Event that hook() reads from the Custom Script variables, with the checks of runner.Event.from_webhook().
+auth. The user and password are WEBHOOK_USER and WEBHOOK_PASSWORD, from the env file or the environment. When the
+password is empty in the env file, the listener writes a new one at its start, see new_password(). Without a user, the
+listener does not start. The body gives the same runner.Event that hook() reads from the Custom Script variables, with
+the checks of runner.Event.from_webhook().
 A Download event (an import or an upgrade) becomes its job through queue_job(), so the worker and the queue stay one
 code path. A Test event runs runner.app_check(), as the hook's Test does. With KEEP_REPLACED on, a Grab event
 hard-links the files the grab may replace, see grab(). The listener refuses a body that fails a check with a log line.
@@ -397,20 +398,21 @@ def new_password(user):
     except OSError as ex:
         sys.exit(f"arr-media-guard --serve: WEBHOOK_PASSWORD is empty, and the listener did not write a new one to {path}: {ex}. "
                  "Set WEBHOOK_USER and WEBHOOK_PASSWORD in it")
-    print(f"arr-media-guard: generated a Webhook password and wrote it to {path} as WEBHOOK_PASSWORD. In the README's compose file, "
+    print(f"arr-media-guard: generated a Webhook password and wrote it to {path} as WEBHOOK_PASSWORD. With docker/compose.yml, "
           "that is ./arr-media-guard/arr-media-guard.env on the host. In the Webhook connection of each app, set Username to "
-          "WEBHOOK_USER and Password to WEBHOOK_PASSWORD from that file.", flush=True)
-    return user or USER, keys["WEBHOOK_PASSWORD"]
+          f"WEBHOOK_USER{' from the environment' if 'WEBHOOK_USER' in config.CFG.from_env else ''} and Password to WEBHOOK_PASSWORD "
+          "from that file.", flush=True)
+    return keys.get("WEBHOOK_USER", user), keys["WEBHOOK_PASSWORD"]
 
 
 def listen_config():
-    """(Authorization header value, AUDIT_TIME) from the env file, or exit with what to fix. An empty password gets a new
-    one, see new_password()."""
+    """(Authorization header value, AUDIT_TIME) from the settings, or exit with what to fix. An empty password gets a new
+    one, see new_password(). A password from the environment never does, because the environment wins over the file."""
     user, pw = config.CFG.webhook_user, config.CFG.webhook_password
-    if not pw:
-        user, pw = new_password(user)
+    if not pw and "WEBHOOK_PASSWORD" not in config.CFG.from_env and (user or "WEBHOOK_USER" not in config.CFG.from_env):
+        user, pw = new_password(user)   # an empty user from the environment stops the start below, so nothing is written
     if not user or not pw:
-        sys.exit(f"arr-media-guard --serve: set WEBHOOK_USER and WEBHOOK_PASSWORD in {config.ENV_FILE}. The Webhook connection of each app "
+        sys.exit(f"arr-media-guard --serve: set WEBHOOK_USER and WEBHOOK_PASSWORD in {config.ENV_FILE} or the environment. The Webhook connection of each app "
                  "uses the same two")
     if ":" in user or not all(c.isascii() and c.isprintable() for c in user + pw):   # the apps send them as ISO-8859-1
         sys.exit("arr-media-guard --serve: WEBHOOK_USER and WEBHOOK_PASSWORD take printable ASCII only, and the user takes no ':'")

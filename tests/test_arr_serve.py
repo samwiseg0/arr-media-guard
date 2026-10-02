@@ -419,6 +419,46 @@ def test_a_failed_write_leaves_the_env_file_whole_and_stops_with_why(tmp_path, m
     assert env.read_text() == text and [p.name for p in tmp_path.iterdir()] == [env.name] and "generated" not in capsys.readouterr().out
 
 
+def env_settings(tmp_path, monkeypatch, text, environ):
+    """An env file that holds text, as the listener's env file, and CFG read from it under environ."""
+    env = tmp_path / "arr-media-guard.env"
+    env.write_text(text)
+    monkeypatch.setattr(arr_serve.config, "ENV_FILE", str(env))
+    monkeypatch.setattr(arr_serve.config, "CFG", h.settings(str(env), environ))
+    return env
+
+
+@pytest.mark.parametrize("environ", [{"WEBHOOK_PASSWORD": ""}, {"WEBHOOK_USER": "guard", "WEBHOOK_PASSWORD": "s3cret-pass"}])
+def test_a_password_from_the_environment_is_never_generated_or_written(tmp_path, monkeypatch, capsys, environ):
+    """The environment wins over the env file, so a password written there would never take effect. An empty one
+    stops the listener with what to set."""
+    text = "WEBHOOK_USER='arr-admin'\nWEBHOOK_PASSWORD=''\n"
+    env = env_settings(tmp_path, monkeypatch, text, environ)
+    if environ["WEBHOOK_PASSWORD"]:
+        assert arr_serve.listen_config()[0] == AUTH.encode()
+    else:
+        with pytest.raises(SystemExit, match=f"set WEBHOOK_USER and WEBHOOK_PASSWORD in {re.escape(str(env))} or the environment"):
+            arr_serve.listen_config()
+    assert env.read_text() == text and [p.name for p in tmp_path.iterdir()] == [env.name] and "generated" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("user", ["", "guard"])
+def test_a_user_from_the_environment_is_never_written(tmp_path, monkeypatch, capsys, user):
+    """The listener still writes a new password into the env file, and says the user comes from the environment. An
+    empty user from the environment stops it, and the file stays as it was."""
+    env = env_settings(tmp_path, monkeypatch, "WEBHOOK_PASSWORD=''\n", {"WEBHOOK_USER": user})
+    if not user:
+        with pytest.raises(SystemExit, match="set WEBHOOK_USER and WEBHOOK_PASSWORD in "):
+            arr_serve.listen_config()
+        assert env.read_text() == "WEBHOOK_PASSWORD=''\n" and "generated" not in capsys.readouterr().out
+        return
+    auth = arr_serve.listen_config()[0]
+    pw = h.env_file(str(env))["WEBHOOK_PASSWORD"]
+    assert env.read_text() == f"WEBHOOK_PASSWORD='{pw}'\n" and len(pw) == 32
+    assert auth == b"Basic " + base64.b64encode(f"guard:{pw}".encode())
+    assert "set Username to WEBHOOK_USER from the environment and Password to WEBHOOK_PASSWORD from that file." in capsys.readouterr().out
+
+
 def test_plex_takes_path_map_while_plex_path_map_is_unset(monkeypatch, settings):
     settings(path_map=[("/data", "/mnt/data")])
     item = {"ratingKey": "7101", "Guid": [{"id": "tmdb://1"}], "Media": [{"Part": [{"file": "/data/movies/A/a.mkv"}]}]}

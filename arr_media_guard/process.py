@@ -37,7 +37,7 @@ def episode_title(app, item, nfo, release, path):
     and the alert says so, because Sonarr wrote that name in the order it had at the import."""
     name = release or os.path.basename(path)
     said, title = ("the release's NFO", nfo) if nfo else \
-        ("the release's title" if release else "the file name's title", content.release_episode_title(name))
+        ("the release name" if release else "the file name", content.release_episode_title(name))
     if not title or not item.get("series_id"):
         return None
     try:
@@ -93,7 +93,7 @@ def nfo_title(path):
 
 def tmdb_key_alert(app, code):
     """The ops embed "TMDB key not working", at most once a day per host, or None."""
-    k = content.key_alert(code)
+    k = content.key_alert(code, token=config.CFG.tmdb_token, mark=report.bold)
     return logs.post(app, logs.embed(app, k[0], k[1], "amber", [("App", logs.app_name(app))])) if k else None
 
 
@@ -362,7 +362,8 @@ def subtitle_checks(ctx):
                 fcntl.flock(ctx.lock, fcntl.LOCK_UN)
             before = (rec.get("repack") or {}).get("subcheck") or {}   # a conversion checked the tracks already: the same windows
             sync = subtitles.sub_match(path, j, d, {r["audio"]: r["starts"] for r in before.values() if r.get("starts")} or None, sides, ctx.known,
-                                       items, full, line=not timing, deep=ctx.mode == "import" and config.CFG.subtitles == "deep")
+                                       items, full, line=not timing, deep=ctx.mode == "import" and config.CFG.subtitles == "deep",
+                                       streams=(ctx.hp or {}).get("streams"))
             if timing and sync:
                 rec["sweep"], rec["sweep_facts"] = subtitles.sub_sweep(path, j, items, sync, deep=ctx.mode == "deep")
                 for k, r in sync.items():   # a fix stands only when the sweep confirms it
@@ -418,6 +419,8 @@ def subtitle_checks(ctx):
             logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
             checks.lid_carry(path, st)   # the proof shows the same audio
             refresh(ctx, duration=False)
+            if ctx.hp and ctx.hp["issue"]:   # ffmpeg wrote a new header, and a retime can end a subtitle overrun, see faults()
+                ctx.hp = checks.header_of(path, ctx.j) or ctx.hp
             gone = set(remove)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
             ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
             unmatched = set(subtitles.renumber(dict.fromkeys(unmatched), gone))
@@ -479,12 +482,13 @@ def faults(ctx):
         rest.append(ctx.unconverted[1])
     if ctx.tags and ctx.tags["mismatch"]:
         rest.append({"kind": "sublang", "mismatch": ctx.tags["mismatch"], "muted": [n for n in d["notes"] if " loses its default and forced flags, " in n]})
-    code = rec.get("header_repair", {}).get("code")
+    code = rec.get("header_repair", {}).get("code") if hp and hp["issue"] else None   # a subtitle remux can end the issue
     if code in ("header_repair_failed", "subtitle_file_may_be_cut"):
         why = rec["header_repair"]["result"].partition(": ")[2]
         rest.append({"kind": "header", "why": why[:200]} if code == "header_repair_failed" else {"kind": "cut", "why": why})
-    if code == "subtitle_overrun_unfixable":
-        rest.append({"kind": "subtitle", "issue": hp["issue"], "tracks": hp["unfixable"]})
+    if code == "subtitle_overrun_unfixable" and hp.get("unfixable"):   # the alerts name the places before a removal, see report.track_langs()
+        gone = (rec.get("subremux") or {}).get("removed") or []
+        rest.append({"kind": "subtitle", "issue": hp["issue"], "tracks": [dict(x, track=place_before(x["track"], gone)) for x in hp["unfixable"]]})
     if ctx.mode == "import" and ctx.audio:
         ctx.certain, doubts, samples = checks.check_audio(ctx.path, ctx.j, d["edits"], ctx.runtime)
         rec["audio"] = logs.audio_summary(ctx.certain, doubts, samples)
@@ -497,6 +501,16 @@ def faults(ctx):
             rec["reasons"] = rec["reasons"] + [ctx.vfields["code"]]
         if doubts:
             rest.append({"kind": "video", "doubts": doubts})
+
+
+def place_before(p, gone):
+    """The place before a subtitle remux of the track at place p after it. gone holds the places the remux removed.
+    This is the reverse of subtitles.renumber()."""
+    n, k = int(p[1:]), 0
+    while n:
+        k += 1
+        n -= f"s{k}" not in gone
+    return f"s{k}"
 
 
 def act(ctx):
@@ -565,13 +579,22 @@ def after_edit(ctx):
         subtitles.sub_cache(ctx.path, {p: r["verdict"] for p, r in ctx.sync.items()},
                             (bool(planned or ctx.acts) or any(e[0] in muted for e in d["edits"])) and not done)
     if rec["outcome"] in ("verify_failed", "edit_failed"):
-        ctx.rest.append({"kind": "edit", "error": rec["result"][:150], "unread": rec.get("after_error"),
+        ctx.rest.append({"kind": "edit", "error": short_error(rec["result"], rec["path"]), "unread": rec.get("after_error"),
                          "on": None if "after" not in rec else [f'{t["pos"]} {t["lang"]}' for t in rec["after"] if t["default"]]})
     if ctx.lock is not None:   # the edit is done, and the checks below only read the file
         fcntl.flock(ctx.lock, fcntl.LOCK_UN)
     if (rec.get("repack") or {}).get("pending") and ctx.mode in ("import", "deep"):   # two waited rescans, see settle()
         config.DEADLINE.stop()
         rec["repack"]["settle"] = convert.settle_extras(ctx.app, (ctx.ids or {}).get("app_id"), [rec["repack"]["pending"]])
+
+
+def short_error(text, path, limit=150):
+    """text cut to limit characters. The file's path in it becomes its name first, cut as far as the limit needs, so the
+    reason after the name stays."""
+    name, room = os.path.basename(path), limit - len(text) + len(path)
+    if path and path in text and room > 1:
+        text = text.replace(path, name if len(name) <= room else name[:room - 1] + "…")
+    return text[:limit]
 
 
 def content_checks(ctx):
@@ -633,8 +656,10 @@ STEPS = (start, conversion, header, languages, subtitle_checks, deep_drop, decis
 
 
 def content_finding(ev):
-    """The wrong-content finding: the reason of each signal that scored, and the points."""
-    return {"kind": "content", "signals": [s["why"] for s in ev["signals"] if s["points"]], "points": ev["points"]}
+    """The wrong-content finding: the reason and the kind of each signal that scored, and the points. report.posts()
+    reads the kinds."""
+    scored = [s for s in ev["signals"] if s["points"]]
+    return {"kind": "content", "signals": [s["why"] for s in scored], "scored": [s["kind"] for s in scored], "points": ev["points"]}
 
 
 def file_alerts(d, file_checks, meta, original, item):
@@ -655,7 +680,7 @@ def file_alerts(d, file_checks, meta, original, item):
     elif verdict.get("runtime") in ("short", "long"):
         listed = item.get("listed") or 0
         out.append({"kind": "runtime", "runs": content.hms(meta["trusted"]["seconds"]), "listed": max(listed) if isinstance(listed, list) else listed})
-    out += [{"kind": "episode", "why": s["why"], "names": s["names"]} for s in (ev or {}).get("signals", [])
+    out += [{"kind": "episode", **{k: s[k] for k in ("imported", "said", "title", "names")}} for s in (ev or {}).get("signals", [])
             if s["kind"] == "episode_title" and s["verdict"] == "other"]
     return out
 

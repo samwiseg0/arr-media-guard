@@ -90,8 +90,11 @@ Each subtitle gets one line. The columns are:
 - A `flash` line names a text track whose cues show for a tenth of a second, and the new ends of its first cues.
 - The sweep table has one row per heard window. A row holds the window's time, the heard words, the share that matched
   the cues, the cues whose first word matched, and their offset.
-- `ALERT` marks two neighbouring windows 1 second or more off the fitted line the same way. One such window alone is
-  marked "one window alone" and does not alert.
+- `ALERT` marks the windows of a step, two neighbouring windows 1 second or more off the fitted line the same way, when
+  the steps hold 3 rows or more, or every row that heard 3 cues, and at least a quarter of those rows. A part of the
+  file is then off.
+  A step that does not alert gives its share, such as "in a step of 2 of the 35 windows that heard 3 cues". One such
+  window alone is marked "one window alone". Neither alerts.
 - The decision log holds the results under `subcheck`, `subtime`, `flash` and `sweep`.
 
 ### Apply the changes

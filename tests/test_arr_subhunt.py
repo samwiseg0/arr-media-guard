@@ -310,7 +310,7 @@ def test_a_release_without_english_subtitles_is_deleted_and_the_next_one_importe
     assert st["status"] == "imported" and st["release"] == NF and [t["title"] for t in st["tried"]] == [SUBS]
     assert st["tried"][0]["why"] == "no full English subtitle (subtitles: por full)" and st["tried"][0]["final"] is True
     assert [r["outcome"] for r in lines(env)] == ["subhunt_queued", "subhunt_rejected", "subhunt_imported"]
-    assert [p["title"] for p in env["posts"]] == ["English subtitles found"]
+    assert env["posts"] == [] and lines(env)[-1]["alert_result"] == ["log only"]   # a fix that worked logs only
 
 
 def test_three_failures_keep_the_file_alert_once_and_block_until_forced(env, monkeypatch):
@@ -322,7 +322,7 @@ def test_three_failures_keep_the_file_alert_once_and_block_until_forced(env, mon
     assert [t["why"] for t in st["tried"]] == ["no full English subtitle (subtitles: por full)", "SABnzbd failed the download (not enough repair blocks)",
                                                "no full English subtitle (subtitles: eng forced)"]
     (alert,) = env["posts"]
-    assert alert["title"] == "No release with English subtitles" and "Bazarr or OpenSubtitles" in alert["description"]
+    assert alert["title"] == "No release with English subtitles" and "Later searches for English subtitles skip" in alert["description"]
     assert "not enough repair blocks" in next(f["value"] for f in alert["fields"] if f["name"] == "Tried")
     assert lines(env)[-1]["outcome"] == "no_subbed_release"
 
@@ -351,8 +351,8 @@ def test_an_import_that_does_not_land_restores_the_file_keeps_the_download_and_a
     assert state(env)["status"] == "import_failed" and (env["tmp"] / "downloads" / NF / (NF + ".mkv")).exists()
     assert "nzo1" not in fake.deleted()
     (alert,) = env["posts"]
-    assert alert["title"] == "Subtitle hunter import failed" and alert["color"] == hook.COLORS["red"]
-    assert "Radarr lists file id 7302" in alert["description"] and "put the current file back" in alert["description"]
+    assert alert["title"] == "Release with English subtitles not imported" and alert["color"] == hook.COLORS["red"]
+    assert "Radarr lists file id 7302" in alert["description"] and "The current file is back at" in alert["description"]
     assert lines(env)[-1]["outcome"] == "subhunt_import_failed"
 
     run(env, monkeypatch, "--apply")   # skipped until forced: no query, no second download, no second alert
@@ -369,7 +369,7 @@ def test_a_failed_keep_link_blocks_the_import(env, monkeypatch):
     monkeypatch.setattr(sh.os, "link", refuse)
     run(env, monkeypatch, "--apply")
     assert env["imports"] == [] and open(env["old"], "rb").read() == b"old" and state(env)["status"] == "import_failed"
-    assert "did not import" in env["posts"][0]["description"]
+    assert "wasn't imported" in env["posts"][0]["description"]
 
 
 def test_a_file_changed_during_the_download_is_never_replaced(env, monkeypatch):
@@ -451,7 +451,7 @@ def test_a_missing_key_stops_the_hunter_with_one_line(env, monkeypatch, settings
     settings(sabnzbd_api_key=keys.get("SABNZBD_API_KEY", ""), newznab_api_key=keys.get("NEWZNAB_API_KEY", ""))
     with pytest.raises(SystemExit) as ex:
         REAL_CREDS("radarr")
-    assert str(ex.value) == f"Set {missing} in the env file. Radarr's API hides the keys of its download clients and indexers."
+    assert str(ex.value) == f"Set {missing} in the env file or the environment. Radarr's API hides the keys of its download clients and indexers."
 
 
 # --- failure paths -------------------------------------------------------------------------------
@@ -607,7 +607,8 @@ def test_a_kill_after_the_post_leaves_a_recorded_keep_and_the_next_run_stops_red
     run(env, monkeypatch, "--apply")
     assert len(env["hydra"]) == 1 and lines(env)[-1]["outcome"] == "subhunt_stopped" and env["keep"] in lines(env)[-1]["result"]
     (alert,) = env["posts"]
-    assert alert["color"] == hook.COLORS["red"] and env["keep"] in alert["description"]
+    assert alert["title"] == "Old file left by an earlier run" and alert["color"] == hook.COLORS["red"]
+    assert hook.markdown(env["keep"]) in alert["description"]
 
 
 def test_an_import_timeout_keeps_the_link_because_radarr_may_still_land_the_copy(env, monkeypatch):
@@ -620,7 +621,7 @@ def test_an_import_timeout_keeps_the_link_because_radarr_may_still_land_the_copy
     assert os.path.exists(env["keep"]) and not os.path.exists(env["old"])   # nothing moved back under a running import
     assert state(env)["status"] == "import_failed" and state(env)["keep"] == env["keep"]
     (alert,) = env["posts"]
-    assert "still importing" in alert["description"] and env["keep"] in alert["description"]
+    assert "still importing" in alert["description"] and hook.markdown(env["keep"]) in alert["description"]
 
 
 def test_a_failed_remove_after_the_landing_never_moves_the_old_file_back(env, monkeypatch):
@@ -633,7 +634,8 @@ def test_a_failed_remove_after_the_landing_never_moves_the_old_file_back(env, mo
     monkeypatch.setattr(sh.os, "remove", stuck)
     run(env, monkeypatch, "--apply")
     assert state(env)["status"] == "imported" and state(env)["keep"] == env["keep"] and not os.path.exists(env["old"])
-    assert "could not be removed" in env["posts"][0]["description"]
+    (post,) = env["posts"]
+    assert "because its removal failed" in post["description"] and post["color"] == hook.COLORS["amber"]
 
 
 def test_a_file_renamed_during_the_download_is_linked_at_its_new_path(env, monkeypatch):
@@ -658,7 +660,7 @@ def test_a_timed_out_import_post_keeps_the_link(env, monkeypatch):
     run(env, monkeypatch, "--apply")
     assert os.path.samefile(env["keep"], env["old"]) and state(env)["keep"] == env["keep"] and state(env)["status"] == "import_failed"
     (alert,) = env["posts"]
-    assert alert["color"] == hook.COLORS["red"] and "timed out" in alert["description"] and env["keep"] in alert["description"]
+    assert alert["color"] == hook.COLORS["red"] and "timed out" in alert["description"] and hook.markdown(env["keep"]) in alert["description"]
 
 
 def test_a_failed_size_read_records_no_link(env, monkeypatch):
@@ -691,4 +693,4 @@ def test_an_import_command_that_ended_another_way_puts_the_old_file_back(env, mo
     run(env, monkeypatch, "--apply")
     assert open(env["old"], "rb").read() == b"old" and not os.path.exists(env["keep"]) and state(env)["status"] == "import_failed"
     (alert,) = env["posts"]
-    assert f"The import command ended {status}." in alert["description"] and "put the current file back" in alert["description"]
+    assert f"The import command ended {status}." in alert["description"] and "The current file is back at" in alert["description"]

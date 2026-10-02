@@ -225,27 +225,27 @@ def test_the_decision_rules(monkeypatch):
     none = {}
     assert decide.audio_verdict(none, 0, [ok, ok, ok]) == (None, [])
     assert decide.audio_verdict(none, 0, [seek, seek, seek]) == (None, [])   # an error at the seek, nothing lost
-    assert decide.audio_verdict(none, 0, [quiet, quiet, quiet])[0] == "all 3 audio samples are digital silence"
-    assert decide.audio_verdict(none, 0, [quiet, ok, ok]) == (None, ["1 of 3 audio samples are digital silence"])
-    assert decide.audio_verdict(none, 0, [lossy, lossy, lossy])[0] == "all 3 audio samples fail to decode"
+    assert decide.audio_verdict(none, 0, [quiet, quiet, quiet])[0] == "the audio is silent at all 3 places checked"
+    assert decide.audio_verdict(none, 0, [quiet, ok, ok]) == (None, ["the audio is silent at 1 of 3 places checked"])
+    assert decide.audio_verdict(none, 0, [lossy, lossy, lossy])[0] == "the audio fails to play at all 3 places checked"
     cut = dict(empty, cut=True, errors=1, at=6120)   # the late sample of a 120-minute film starts at 102 minutes
-    assert decide.audio_verdict(none, 0, [ok, ok, cut], runtime=120)[0] == "the file is cut off before the late audio sample"
+    assert decide.audio_verdict(none, 0, [ok, ok, cut], runtime=120)[0] == "the file is cut off before the last place checked"
     assert decide.audio_verdict(none, 0, [ok, ok, cut])[0] is None                  # no listed runtime, no cross-check
     assert decide.audio_verdict(none, 0, [ok, ok, cut], runtime=100)[0] is None     # the late sample starts past 95 percent of it
-    tail = ["the file ends early, inside or after the late audio sample"]
+    tail = ["the file may end early, near the last place checked"]
     assert decide.audio_verdict(none, 0, [ok, ok, dict(ok, n=1899000, cut=True, errors=1)]) == (None, tail)
     assert decide.audio_verdict(none, 0, [ok, ok, dict(ok, n=1286000, cut=True, errors=1)])[0] is None   # 67 percent, still only a doubt
-    assert decide.audio_verdict(none, 0, [ok, ok, empty]) == (None, ["the late audio sample decoded nothing, maybe a long duration header"])
-    assert decide.audio_verdict(none, 0, [failed, failed, failed]) == (None, ["3 of 3 audio samples could not run"])   # EACCES, bad map
-    assert decide.audio_verdict(none, 0, [quiet, quiet, failed]) == (None, ["1 of 3 audio samples could not run"])
+    assert decide.audio_verdict(none, 0, [ok, ok, empty]) == (None, ["no audio plays at the last place checked, maybe because the file says it runs longer than it does"])
+    assert decide.audio_verdict(none, 0, [failed, failed, failed]) == (None, ["the audio check could not run at 3 of 3 places"])   # EACCES, bad map
+    assert decide.audio_verdict(none, 0, [quiet, quiet, failed]) == (None, ["the audio check could not run at 1 of 3 places"])
     assert decide.audio_verdict(none, None, []) == ("the file has no audio track", [])
-    assert decide.audio_verdict(none, 0, [ok, dict(ok, n=960000), ok]) == (None, ["an audio sample decoded only 50% of its length"])
+    assert decide.audio_verdict(none, 0, [ok, dict(ok, n=960000), ok]) == (None, ["part of the audio is missing, and only 50% of it plays where it was checked"])
     # a track the container calls 6 channels decodes 2: the ratio uses ffmpeg's 2, so seek errors lose nothing
     assert decide.audio_verdict({"tracks": [{"type": "audio", "properties": {"audio_channels": 6}}]}, 0, [seek, seek, seek]) == (None, [])
     tagged = {"container": {"properties": {"writing_application": "mkvmerge v92.0"}},
               "tracks": [{"type": "video", "properties": {"tag_duration": "01:30:00.000000000"}},
                          {"type": "audio", "properties": {"tag_duration": "01:00:00.000000000"}}]}
-    assert decide.audio_verdict(tagged, 0, [ok, ok, ok]) == (None, ["the audio ends at 60 minutes, the video at 90"])
+    assert decide.audio_verdict(tagged, 0, [ok, ok, ok]) == (None, ["the audio stops at 1:00:00, but the video runs to 1:30:00"])
     got = decide.parse_sample("[x] [info] n_samples: 0\n[aac] [error] bad\n[m] [error] File is broken, keyframes not correctly marked!\n"
                        "[info] Output #0, null, to 'pipe:':\n[info]   Stream #0:0: Audio: pcm_s16le, 48000 Hz, 5.1(side), s16, 4608 kb/s\n"
                        "[x] [info] n_samples: 20\n[x] [info] max_volume: -91.0 dB")
@@ -306,7 +306,7 @@ def test_the_decision_rules(monkeypatch):
     assert decide.text_language(en)[0] == "eng" and decide.text_language(en[:2])[0] is None
     st = tagged(("audio", "eng", None, "", True, 1), ("subtitles", "eng", None, "", True, 2), ("subtitles", "eng", None, "French", False, 3))
     r = decide.retag(st, table=table, read={"s1": "rum", "s2": "fre"})
-    assert r["mismatch"] == ["s1 is tagged eng, but its text reads as rum"] and r["set"] == {"s2": "fre"} and decide.retag(st, table=table)["to_read"] == {"s2"}, r
+    assert r["mismatch"] == ["subtitle track 1 is tagged English, but its text reads as Romanian"] and r["set"] == {"s2": "fre"} and decide.retag(st, table=table)["to_read"] == {"s2"}, r
     assert decide.sidecar_language("eng", ("rum", 1.0, ""), {"eng"})[:2] == ("rum", False) and decide.sidecar_language("eng", ("eng", 1.0, ""), {"eng"}) is None
     assert decide.retag(st, table=table, read={"s1": "rum"})["wrong"] == {"s1": "rum"}   # a lone wrong language loses the default it has
     signs = tagged(("audio", "eng", None, "", True, 1), ("subtitles", "eng", None, "Forced", True, 2))   # a forced English track stays on
@@ -328,14 +328,14 @@ def test_the_decision_rules(monkeypatch):
     w = decide.parse_window(seek + frames(120))
     assert (w["frames"], w["errors"], w["late"], w["empty"]) == (120, 0, False, False) and decide.bad_window(w) is None, w
     dmg = decide.parse_window(frames(120) + "\n[h264 @ 0x2] [error] error while decoding MB 4 12, bytestream 33215")
-    assert dmg["errors"] == 1 and decide.bad_window(dmg) == "1 decode error"
+    assert dmg["errors"] == 1 and decide.bad_window(dmg) == "1 playback error"
     assert decide.bad_window(decide.parse_window(frames(120) + "\n[matroska,webm @ 0x3] [error] 0x00 at pos 12 (0xc) invalid as first byte of an EBML number"))
     assert decide.parse_window(frames(120) + "\n[vist#0:0/h264 @ 0x4] [dec:h264 @ 0x5] [warning] corrupt decoded frame")["errors"] == 1
     assert decide.parse_window(frames(120) + "\n[null @ 0x4] [error] Application provided invalid, non monotonically increasing dts to muxer")["errors"] == 0
     gap = decide.parse_window(frames(30) + "\n" + frames(30, 3.0))
     assert gap["gap"] > decide.GAP and decide.bad_window(gap).endswith("missing")
     late = decide.parse_window(frames(50, 612.4))   # the seek landed in zeros, and video came back 612 s on
-    assert decide.bad_window(late) == "no video where the window starts" and decide.bad_window(decide.parse_window(frames(120, 7.3))) is None   # a TS seek
+    assert decide.bad_window(late) == "no video" and decide.bad_window(decide.parse_window(frames(120, 7.3))) is None   # a TS seek
     empty = decide.parse_window("[out#0/null @ 0x6] [warning] Output file is empty, nothing was encoded")
     assert empty["empty"] and not empty["noisy"] and decide.bad_window(empty) is None
     cut = decide.parse_window("[matroska,webm @ 0x3] [error] File ended prematurely")
@@ -346,24 +346,24 @@ def test_the_decision_rules(monkeypatch):
     at = lambda w, s, **k: dict(w, at=s, **k)
     ok = at(w, 300)
     assert decide.video_verdict([], [ok, ok, ok]) == (None, [])
-    assert decide.video_verdict([], [at(dmg, 150), ok, ok]) == (None, ["1 decode error at 150 s"])
+    assert decide.video_verdict([], [at(dmg, 150), ok, ok]) == (None, ["1 playback error at 2:30"])
     assert decide.video_verdict([], [at(dmg, 150), ok, at(late, 2550)])[0] == (
-        "2 of 3 video windows are bad, with 1 decode error at 150 s and no video where the window starts at 2550 s")
-    assert decide.video_verdict([], [ok, ok, at(empty, 2550)]) == (None, ["no video frame at 2550 s"])
-    assert decide.video_verdict([0.3, 0.5], [])[0].startswith("zero-filled regions at 2 of 256")
-    assert decide.video_verdict([0.3], [ok, ok, ok]) == (None, ["a zero-filled region at 30% of the file"])
-    assert decide.video_verdict([], [ok, ok, at(cut, 2550)]) == (None, ["no video frame at 2550 s, the file is cut"])
+        "the video is broken at 2 of 3 places checked: 1 playback error at 2:30 and no video at 42:30")
+    assert decide.video_verdict([], [ok, ok, at(empty, 2550)]) == (None, ["no video at 42:30"])
+    assert decide.video_verdict([0.3, 0.5], [])[0].startswith("the file has blank gaps at 2 of 256")
+    assert decide.video_verdict([0.3], [ok, ok, ok]) == (None, ["the file has a blank gap at 30% of its length"])
+    assert decide.video_verdict([], [ok, ok, at(cut, 2550)]) == (None, ["no video at 42:30, where the file is cut off"])
     capped = at(decide.parse_window(frames(3), rc=1), 1502, stopped="read over 512 MiB")   # a killed window never counts as bad
     assert decide.video_verdict([], [capped, capped, ok]) == (None, [])   # the read cap alone is no doubt
     slow = dict(capped, stopped="ran over 60 s")
-    assert decide.video_verdict([], [slow, ok, ok]) == (None, ["the video window at 1502 s ran over 60 s, the file may have no usable index"])
-    assert decide.bad_window(dict(empty, noisy=True, cut=True)) == "no video where the window starts"
+    assert decide.video_verdict([], [slow, ok, ok]) == (None, ["the video check at 25:02 ran over 60 s, so the file may have no usable index"])
+    assert decide.bad_window(dict(empty, noisy=True, cut=True)) == "no video"
     assert decide.parse_window("[mpeg4 @ 0x7] [error] low_delay flag set incorrectly, clearing it\n" + frames(120))["errors"] == 0
     unknown = decide.parse_window("[vist#0:0/none @ 0x8] [error] Decoding requested, but no decoder found for: none\n[fatal] Error opening output files", 234)
     assert unknown["nodecoder"] and not unknown["encrypted"] and decide.video_verdict([], [at(unknown, 263), at(unknown, 1316), ok])[0] is None
     enc = decide.parse_window("[matroska,webm @ 0x9] [error] mov FourCC not found encv.\n" + "[vist#0:0/none @ 0x8] [error] Decoding requested, but no "
                        "decoder found for: none\n[fatal] Error opening output files", 234)
-    assert enc["encrypted"] and decide.video_verdict([], [at(enc, 263), at(enc, 1316), ok])[0].startswith("the video track is encrypted")
+    assert enc["encrypted"] and decide.video_verdict([], [at(enc, 263), at(enc, 1316), ok])[0].startswith("the video is encrypted")
     # the header check's parser: a Cluster at 1000 ms with a video block and a laced audio block of 3 frames, then Cues
     el = lambda i, data: i.to_bytes((i.bit_length() + 7) // 8, "big") + bytes([0x80 | len(data)]) + data
     block = lambda track, rel, lace=b"": bytes([0x80 | track]) + rel.to_bytes(2, "big") + (b"\x02" + lace if lace else b"\x00") + b"data"
@@ -375,11 +375,11 @@ def test_the_decision_rules(monkeypatch):
     assert (decide.remove_track(24, 21), decide.remove_track(6, 3), decide.remove_track(6, 1), decide.remove_track(502, 1)) == (True, True, False, False)
     assert decide.subtitle_plan([], [15], {15: 10033}, 6737, 112) == ([], [15], None)   # a track timed for another cut
     assert decide.subtitle_plan([2], [], {2: 3471}, 1172, 20) == ([2], [], None)   # one runaway line
-    assert decide.subtitle_plan([], [2], {2: 1391}, 1187, 24) == ([], [], "the video and the audio end at 19.8 minutes of a listed 24, and "
-                                                                   "subtitle track 2 ends at 23.2")   # a cut file
+    assert decide.subtitle_plan([], [2], {2: 1391}, 1187, 24) == ([], [], "the video and audio stop at 19:47, but the listed runtime is 24 "
+                                                                   "minutes, and the subtitles run to 23:11")   # a cut file
     assert decide.subtitle_plan([], [2], {2: 125}, 118, 2) == ([2], [], None)   # complete, many late lines ending near the end: a trim
-    assert decide.subtitle_plan([2], [], {2: 900}, 700, 0)[2].startswith("no runtime is listed")
-    assert decide.subtitle_plan([], [2], {2: 3600}, 600, 12)[2].startswith("the video and the audio end at 10.0")   # a cut plus one runaway line
+    assert decide.subtitle_plan([2], [], {2: 900}, 700, 0)[2].endswith("no runtime is listed to tell whether the file is cut short")
+    assert decide.subtitle_plan([], [2], {2: 3600}, 600, 12)[2].startswith("the video and audio stop at 10:00")   # a cut plus one runaway line
     srt = "1\n00:00:01,000 --> 00:00:02,500\nkept\n\n2\n00:01:50,000 --> 13:30:00,000\ncut\ntwo lines\n\n3\n00:02:10,000 --> 00:02:11,000\ngone\n"
     assert decide.trim_srt(srt, 120.023) == ("1\n00:00:01,000 --> 00:00:02,500\nkept\n\n2\n00:01:50,000 --> 00:02:00,023\ncut\ntwo lines\n",
                                       {"events": 3, "cut": 1, "dropped": 1})

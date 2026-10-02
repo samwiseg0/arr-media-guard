@@ -16,6 +16,8 @@ A line holds:
 - an `outcome` code, and `result`, the same in a sentence
 - `findings`, each with its kind, its facts and the action the hook took, and `alert_kinds`, the kinds alone
 - `alerts`, the text of each finding
+- `alert_result`, what the post of each finding gave. That is `sent`, `already sent`, `log only` for a problem the hook
+  fixed, or the failure.
 
 Query the codes, never the sentences. The kinds and the action codes are listed in
 [design.md](design.md#alerts), and the words of a sentence may change. A dry run words its alerts as what `--apply`
@@ -36,8 +38,9 @@ log. Loki reads these keys, so they stay.
 | `reasons` | the reason codes, comma-separated |
 | `alerts` | the alert kinds, comma-separated |
 | `tmdb` | the TMDB code, or `not_asked` |
-| `label` | the item |
+| `label` | the item, else the file name, else the job file |
 | `id` | the id of the decision line |
+| `error` | the result of an `error` line, cut to 150 characters. Other lines have no `error` key. |
 
 The nightly audit writes one more line a day, with `source=audit outcome=summary` and its counts.
 

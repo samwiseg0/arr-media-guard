@@ -58,7 +58,7 @@ with no usable recycle bin. See [regrabs.md](regrabs.md).
 The hook checks the file against TMDB and its own duration. It alerts, and it re-grabs only when you turn that on.
 
 For an episode, it also reads the episode title from the release's NFO or name. When that title belongs to another
-episode of the series, it alerts "Wrong episode" and names both episodes. That alert never re-grabs.
+episode of the series, it alerts "Maybe the wrong episode" and names both episodes. That alert never re-grabs.
 
 ## Header repair
 
@@ -93,4 +93,15 @@ the [settings](../README.md#subtitle-hunter). [design.md](design.md#subtitle-hun
 
 ## Alerts
 
-The hook posts one Discord alert for each problem it finds. Set `DISCORD_WEBHOOK` to turn the alerts on.
+The hook posts one Discord alert for each problem it leaves unresolved. Set `DISCORD_WEBHOOK` to turn the alerts on.
+
+- **Posts.** A problem posts when its fix failed, a setting turns the fix off, the fix cannot run, or the hook is
+  unsure, as in "Audio may be broken" or "Maybe the wrong episode".
+- **Log only.** A problem that the hook fixed goes to the decision log and Loki only. That is a re-grab, an old file
+  put back that the app picked up again, a repaired file, removed or retimed subtitles, or a moved subtitle file. The
+  other alerts of a file the hook deleted go to the log only too. A "Wrong content" alert names each signal that
+  scored. A wrong language or runtime alert beside it goes to the log only when the "Wrong content" alert names that
+  signal. The decision log keeps every finding.
+
+An alert bolds the names to look for and its key fact, such as **English subtitles (track 2)** or
+**about 2 min 19 s late**. An alert of more than two sentences puts each one on its own line.

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-"""The settings of arr-media-guard: the env file, read once into CFG, the policy, the tuning constants and mask()."""
-import dataclasses, hashlib, json, os, re
+"""The settings of arr-media-guard: the env file and the environment, read once into CFG, the policy, the tuning
+constants and mask()."""
+import collections, dataclasses, hashlib, json, os, re
 
 from . import content, decide
 
@@ -16,7 +17,7 @@ HOME = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the fold
 SCRIPT = os.path.join(HOME, "arr-media-guard")   # the launcher, the path a Custom Script connection runs
 LIB = tuple(f"arr_media_guard/{n}" for n in sorted(os.listdir(os.path.join(HOME, "arr_media_guard"))) if n.endswith(".py")) + \
     ("arr-media-guard-subhunt", "arr_subhunt.py")   # the code files besides the launcher, relative to HOME
-COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x2ECC71}   # red: a re-grab fault. amber: other alerts. green: a clean scan.
+COLORS = {"red": 0xD64541, "amber": 0xF0A020}   # red: a re-grab fault. amber: other alerts.
 # The outcome code of a wrong-content verdict per regrab() code, so the outcome says what happened: would_regrab only when
 # the grab record, the cap and the second check all passed. report.VERDICTS words each one.
 CONTENT_CODES = {"regrabbed": "wrong_content", "would_regrab": "would_regrab", "unconfirmed": "wrong_content_unconfirmed", "capped": "regrab_capped",
@@ -104,7 +105,7 @@ class AppSettings:
 
 @dataclasses.dataclass(frozen=True)
 class Settings:
-    """The env file, read once by settings(). A field holds the key of its name in upper case, or the key its comment
+    """The env file and the environment, read once by settings(). A field holds the key of its name in upper case, or the key its comment
     names. errors holds one sentence for each value the script cannot read. Such a value takes the safest reading.
     --selftest fails on errors, and the worker logs them."""
     instance: str            # the name of this host in logs and alerts
@@ -142,6 +143,7 @@ class Settings:
     hook_workers: int        # job processes of the worker. 1 runs each job in the worker itself.
     apps: dict               # instance name: AppSettings. The default instances radarr and sonarr come first, then APP_INSTANCES.
     errors: list
+    from_env: tuple          # the keys the environment gave, sorted. --selftest names them.
     keep_dir = property(lambda s: f".{s.name}-originals")   # hidden, so the apps and Plex never scan it
     recycle_dir = property(lambda s: f".{s.name}-recycle")   # hidden too, see replaced_root()
     hide_dir = property(lambda s: f".{s.name}-convert")   # beside an extra, which waits there while the app drops the old record
@@ -156,8 +158,10 @@ class Settings:
 
     def secrets(self):
         """{key: value} of each secret setting that a URL, an error text or a log line may hold, for mask(). mask() skips
-        a value under MASK_MIN characters, so a short WEBHOOK_PASSWORD never breaks a path."""
+        a value under MASK_MIN characters, so a short WEBHOOK_PASSWORD never breaks a path. Radarr's TMDB key, from its DLL
+        or the built-in copy, is a secret too, see content.expected_languages()."""
         return {"PLEX_TOKEN": self.plex_token, "DISCORD_WEBHOOK": self.discord_webhook, "TMDB_TOKEN": self.tmdb_token,
+                "RADARR_TMDB_TOKEN": content.RADARR_TOKEN, "RADARR_DLL_TOKEN": content.radarr_token() or "",
                 "WEBHOOK_PASSWORD": self.webhook_password,
                 **{f"{env_key(app)}_API_KEY": a.api_key for app, a in self.apps.items()},
                 "SABNZBD_API_KEY": self.sabnzbd_api_key, "NEWZNAB_API_KEY": self.newznab_api_key}
@@ -185,9 +189,18 @@ def path_map(key, value):
         f"{key} takes pairs {side}:LOCAL_PATH of absolute paths, joined by '|'. A pair that is not one is left out."
 
 
-def settings(path):
-    """The Settings of the env file at path. A missing key takes its default."""
-    env, errors = env_file(path), []
+class Lookup(collections.ChainMap):
+    """The environment over the env file. A read of a key that the environment holds adds it to taken."""
+    def __getitem__(self, key):
+        if key in self.maps[0]: self.taken.add(key)
+        return super().__getitem__(key)
+
+
+def settings(path, environ=os.environ):
+    """The Settings of the env file at path. A key in environ wins over the file, an empty one too. settings() reads
+    only the keys of the settings, so any other variable of environ is ignored. A missing key takes its default."""
+    env, errors = Lookup(environ, env_file(path)), []
+    env.taken = set()
 
     def number(key, default, bad, why, least=None, cast=int):
         """key by cast, default when missing or empty. A bad value is bad, one under least is least, and why says so."""
@@ -216,6 +229,11 @@ def settings(path):
             errors.append(f"{key} {raw!r} is no level, so {why}. The levels are {', '.join(levels)}.")
         return raw if raw in levels else bad
 
+    def api_key(key):
+        """key as an API key. The placeholder CHANGE_ME of docker/compose.yml counts as empty, so that app is not set up."""
+        raw = env.get(key, "")
+        return "" if raw == "CHANGE_ME" else raw
+
     def kinds(key, default, known):
         """The kinds of known that key lists by commas. 'none' lists none. An empty list or an unknown kind is an error,
         and an unknown kind is left out, so it never re-grabs."""
@@ -241,7 +259,7 @@ def settings(path):
     repack_max = number("REPACK_MAX_GB", 30, 0, "is no number, so the cap is {} GB and every remux is skipped.", cast=float) * 1e9
     subtitles = level("SUBTITLES", "fix", SUBTITLES_LEVELS, "check", "the subtitle check of an import runs as check")
     maps = {key: path_map(key, env.get(key, "")) for key in ("PATH_MAP", *MAP_KEYS.values())}   # {key: (pairs, error)}
-    apps = {app: AppSettings(env.get(f"{app.upper()}_URL", f"http://127.0.0.1:{port}"), env.get(f"{app.upper()}_API_KEY", ""),
+    apps = {app: AppSettings(env.get(f"{app.upper()}_URL", f"http://127.0.0.1:{port}"), api_key(f"{app.upper()}_API_KEY"),
                              env.get(f"{app.upper()}_DIR") or f"/var/lib/{app}", maps[f"{app.upper()}_PATH_MAP"][0], app) for app, port in APPS.items()}
     # APP_INSTANCES='sonarr-4k:sonarr,radarr-4k:radarr' adds instances. A bad entry is left out, so no event reaches it.
     for entry in (e.strip() for e in env.get("APP_INSTANCES", "").split(",") if e.strip()):
@@ -257,7 +275,7 @@ def settings(path):
             errors.append(f"The APP_INSTANCES entry {entry!r} {why}, so it is left out.")
             continue
         maps[f"{key}_PATH_MAP"] = path_map(f"{key}_PATH_MAP", env.get(f"{key}_PATH_MAP", ""))
-        apps[app] = AppSettings(env[f"{key}_URL"], env.get(f"{key}_API_KEY", ""), env.get(f"{key}_DIR") or f"/var/lib/{app}",
+        apps[app] = AppSettings(env[f"{key}_URL"], api_key(f"{key}_API_KEY"), env.get(f"{key}_DIR") or f"/var/lib/{app}",
                                 maps[f"{key}_PATH_MAP"][0], prog)
     map_errors = [e for _, e in maps.values() if e]
     errors += map_errors
@@ -275,11 +293,10 @@ def settings(path):
         restore=switch("RESTORE", True, "a re-grab of a broken upgrade puts the old file back"),
         header_repair=switch("HEADER_REPAIR", True, "the hook repairs a broken header"),
         convert=switch("CONVERT", False, "the hook converts no import"),
-        keep_days=number("KEEP_ORIGINALS_DAYS", 0 if "KEEP_ORIGINALS_DAYS" in env else 7, 7,   # an empty value keeps nothing
-                         "is not a whole number of 0 or more, so it counts as {}.", least=0),
+        keep_days=number("KEEP_ORIGINALS_DAYS", 7, 7, "is not a whole number of 0 or more, so it counts as {}.", least=0),
         repack_max=repack_max, subtitles=subtitles, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),
-        hook_workers=hook_workers, errors=errors, apps=apps)
+        hook_workers=hook_workers, errors=errors, apps=apps, from_env=tuple(sorted(env.taken)))
 
 
 CFG = settings(ENV_FILE)

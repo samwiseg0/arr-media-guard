@@ -9,9 +9,13 @@ alert kind. A finding the hook acted on holds the action, {"code": its code, **f
 finding code, ACTIONS one per action code, and SUB_LINES one per sentence of a subtitle alert."""
 import json, os, re
 
-from . import cli, config, content, logs, regrab, subsync
+from . import cli, config, content, decide, logs, regrab, subsync
 
 TENSES = ("planned", "done")
+B, E = "\x02", "\x03"   # the ends of a bold span in the text of a template, see bold()
+MARKDOWN = re.compile(r"([\\*_~`|])")   # the characters Discord reads as markdown, escaped in every embed
+SENTENCE_END = re.compile(f"{B}[^{E}]*{E}|(?<=[.!?])[ \n]+(?=[A-Z\"{B}])")   # a bold span, which never breaks, or the space after a sentence
+GLUE = "\x04"   # a space after a full stop inside a fact, as in the name "PJ Robot Vs. Romeo". markdown() never breaks a line there.
 
 
 def tense_of(rec):
@@ -20,7 +24,41 @@ def tense_of(rec):
 
 
 def cap(s):
-    return s[:1].upper() + s[1:]
+    i = int(s[:1] == B)
+    return s[:i] + s[i:i + 1].upper() + s[i + 1:]
+
+
+def bold(s):
+    """s as a name or the key fact of an alert. The Discord embed bolds it, and every other output shows it plain."""
+    return f"{B}{s}{E}"
+
+
+def unmarked(text):
+    """The text of a template for the decision log, the CLI and Loki: no bold."""
+    return text.replace(B, "").replace(E, "").replace(GLUE, " ")
+
+
+def glued(v):
+    """The facts v with each space after a full stop in their text glued, see GLUE. So an embed breaks its lines only at
+    the sentence ends of the template."""
+    if isinstance(v, str):
+        return re.sub(r"(?<=[.!?]) ", GLUE, v)
+    if isinstance(v, dict):
+        return {k: glued(x) for k, x in v.items()}
+    return [glued(x) for x in v] if isinstance(v, list) else v
+
+
+def escaped(text):
+    """text with every Discord markdown character escaped, so a name never breaks the format."""
+    return MARKDOWN.sub(r"\\\1", text)
+
+
+def markdown(text):
+    """The text of a template for a Discord embed, see logs.embed(). Every markdown character is escaped, and each bold
+    span is in **. A text of more than two sentences gets one sentence a line."""
+    lines = SENTENCE_END.sub(lambda m: m[0] if m[0].startswith(B) else "\n", text)
+    text = lines if lines.count("\n") > 1 else text
+    return escaped(text).replace(B, "**").replace(E, "**").replace(GLUE, " ")
 
 
 def sentences(xs):
@@ -28,53 +66,129 @@ def sentences(xs):
     return " ".join(f"{cap(x)}." for x in xs)
 
 
+def and_list(xs):
+    """Words as a person lists them, see content.and_join()."""
+    return content.and_join(list(xs))
+
+
+def amount(secs):
+    """Seconds as a person says them: "1.7 s", "2 min 19 s"."""
+    m, s = divmod(round(abs(secs)), 60)
+    return f"{abs(secs):.1f} s" if abs(secs) < 60 else f"{m} min {s} s" if s else f"{m} min"
+
+
+def late_by(offs):
+    """The offsets of a subtitle from the audio, positive when it shows late: "2.5 s late", "1.2 s and 2.5 s late"."""
+    if all(o > 0 for o in offs) or all(o <= 0 for o in offs):
+        return f'{and_list(amount(o) for o in offs)} {"late" if offs[0] > 0 else "early"}'
+    return and_list(late_by([o]) for o in offs)
+
+
+def lang_word(code):
+    """The language of a track as a player names it, "" for an untagged track."""
+    return "" if code is None or code in decide.UNTAGGED else decide.lang_name(code)
+
+
+def track_langs(rec):
+    """{place: language} of the tracks of rec, by their place before any remux. The subtitle sentences name those places."""
+    return {x["i"]: x["lang"] for x in (rec.get("subremux") or {}).get("tracks_before") or rec.get("tracks") or []}
+
+
+def sub_name(p, langs):
+    """A subtitle as a player shows it: "the English subtitles (track 2)". A sidecar goes by its file name."""
+    if not re.fullmatch(r"s\d+", p):
+        return f"the subtitles in {bold(p)}"
+    word = lang_word(langs.get(p))
+    return "the " + bold(f'{word + " " if word else ""}subtitles (track {p[1:]})')
+
+
+def subs_name(ps, langs):
+    """Subtitles as one subject: "subtitle tracks 1 and 2 (English)" for tracks of one language."""
+    words = {lang_word(langs.get(p)) for p in ps}
+    if len(ps) > 1 and len(words) == 1 and all(re.fullmatch(r"s\d+", p) for p in ps):
+        word = words.pop()
+        return bold(f"subtitle tracks {and_list(p[1:] for p in ps)}" + (f" ({word})" if word else ""))
+    return and_list(sub_name(p, langs) for p in ps)
+
+
+def default_track(x):
+    """A default track after a failed flag edit, "a1 eng" (see process.after_edit()), as a player shows it."""
+    pos, _, code = x.partition(" ")
+    word = lang_word(code)
+    return "the " + bold(f'{word + " " if word else ""}{"audio" if pos[:1] == "a" else "subtitles"} (track {pos[1:]})')
+
+
 def after(f):
-    """The file after a failed flag edit: does it still read, and which tracks are default now."""
+    """The file after a failed flag edit: does it still open, and which tracks play by default now."""
     if f.get("unread"):
-        return f'The file no longer reads: {f["unread"][:120]}'
+        return f'The file no longer opens. {cap(f["unread"][:120])}'
     if f.get("on") is None:
         return ""
-    return f'The file still reads, and its default tracks are {", ".join(f["on"]) or "none"}.'
+    on = and_list(default_track(x) for x in f["on"])
+    return f"The file still opens, and its default tracks are {on}." if on else "The file still opens, and no track plays by default."
 
 
 def failed_repack(f, t):
     if f.get("note"):   # a conversion that a stopped run left, see convert.pending_recover()
-        return f'{cap(f["note"])}.' + ("" if f["state"] == "converted" else " Check these files by hand.")
-    return f'The repack into Matroska failed, so the original {f["container"]} file stays. {cap(f["why"])}.'
+        return f'{cap(f["note"])}.'
+    return f'Couldn\'t convert the {f["container"]} file to MKV, so the original was kept. {cap(f["why"])}.'
 
 
 def damage(f, t):
-    refused = f' The proof refused the new file, because {f["refusal"]}.' if f.get("refusal") else ""
-    return f'The conversion found a damaged source, because {f["fault"]}. {f["line"].rstrip(".")}.{refused}'
+    refused = f' The new MKV did not match the original, because {f["refusal"]}.' if f.get("refusal") else ""
+    return f'Converting the file to MKV showed that it\'s damaged, because {bold(f["fault"])}. {f["line"].rstrip(".")}.{refused}'
 
 
+# The subtitle formats a trim cannot cut, by their Matroska codec
+CODEC_NAMES = {"S_TEXT/ASS": "ASS", "S_TEXT/SSA": "SSA", "S_HDMV/PGS": "PGS", "S_VOBSUB": "VobSub", "S_DVBSUB": "DVB", "S_TEXT/WEBVTT": "WebVTT"}
+
+
+def overrun(f, t):
+    """The subtitles of another format than SubRip that run past the end, see checks.header_probe(). A codec that
+    CODEC_NAMES lacks is "a format"."""
+    fmt = lambda c: f"{CODEC_NAMES[c]} format, which" if c in CODEC_NAMES else "a format that"
+    return " ".join(f'{cap(sub_name(x["track"], f["langs"]))} keep going until {bold(content.hms(x["end"]))}, but the video and audio end at '
+                    f'{content.hms(x["streams"])}. They\'re in {fmt(x["codec"])} can\'t be trimmed automatically, so they were left as they '
+                    "are." for x in f["tracks"])
+
+
+def sublang(f, t):
+    n, muted = len(f["mismatch"]), len(f["muted"])
+    return (f'{sentences(f["mismatch"])} Nothing else confirms another language, so the tag{"s were" if n > 1 else " was"} kept.'
+            + ("" if not muted else f' Turned off {"their" if muted > 1 else "its"} default and forced flags.'))
+
+
+def quote(title):
+    """An episode title in quotes, in bold in the embed, see content.episode_why()."""
+    return bold(f'"{title}"')
+
+
+# The plain words of an edit result that a failed flag edit names, see process.edit()
+EDIT_ERRORS = {"VERIFY FAILED, flags did not change": "the edit ran, but the flags did not change"}
 # Per finding code: the alert title and the text. A fault with an action takes its title from FAULT_TITLES instead.
 FINDINGS = {
-    "language": ("Wrong language", lambda f, t: f'No audio track is {f["want"]}. The file has {", ".join(f["has"])}.'),
-    "runtime": ("Wrong runtime", lambda f, t: f'It runs {f["runs"]}, but the listed runtime is {f["listed"]} minutes.'),
-    "duration": ("Broken duration header", lambda f, t: f["why"]),
-    "episode": ("Wrong episode", lambda f, t: f'{cap(f["why"])}. Check the series\' episode order in Sonarr, or import the file to {f["names"]} by hand.'),
-    "content": ("Wrong content", lambda f, t: " ".join(f"{cap(w)}." for w in f["signals"])
-                + f' That is {f["points"]} points, and a re-grab needs {content.REGRAB_POINTS}.'),
-    "audio": ("Audio check uncertain", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
-    "video": ("Video check uncertain", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
-    "damage": ("Damaged source", damage),
-    "repack": ("Repack failed", failed_repack),
-    "header": ("Header repair failed", lambda f, t: f'The header repair failed, so the file stays as it was. {cap(f["why"])}.'),
-    "cut": ("File may be cut", lambda f, t: f'A subtitle runs far past the video and the audio, but {f["why"]}. The file may be cut, or the subtitle '
-                                            "may belong to another episode or cut. It stays as it is, subtitles included. Check whether the video "
-                                            "ends on the credits."),
-    "subtitle": ("Subtitle runs past the end", lambda f, t: f'{sentences(f["issue"])} Subtitle track {", ".join(f["tracks"])} is not SubRip, so the '
-                                                            "hook cannot cut it."),
-    "sublang": ("Subtitle language", lambda f, t: f'{sentences(f["mismatch"])} Nothing else backs a new tag, so the tag stays. '
-                                                  f'{sentences(f["muted"])}'.rstrip() + " Check the track and fix its tag."),
-    "edit": ("Flag edit failed", lambda f, t: f'The flag edit failed. {f["error"]} {after(f)}'),
-    "policy": ("Policy did not load", lambda f, t: f'{f["file"]} did not load, so the hook edits nothing. {f["error"]}'),
-    "submatch": ("Wrong subtitle", lambda f, t: " ".join(sub_line(x, t) for x in f["lines"])),
-    "subtiming": ("Subtitle timing", lambda f, t: " ".join(sub_line(x, t) for x in f["lines"])),
+    "language": ("Wrong audio language", lambda f, t: f'The audio is {bold(decide.lang_names(f["has"]) or "missing")}, but it should be {f["want"]}.'),
+    "runtime": ("Wrong runtime", lambda f, t: f'The file runs {bold(f["runs"])}, but the listed runtime is {bold(str(f["listed"]) + " minutes")}.'),
+    "duration": ("Wrong length in the file", lambda f, t: f["why"]),
+    "episode": ("Maybe the wrong episode", lambda f, t: f'{cap(content.episode_why(f["imported"], f["said"], f["title"], f["names"], quote))}.'),
+    "content": ("Wrong content", lambda f, t: sentences(f["signals"])),
+    "audio": ("Audio may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
+    "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
+    "damage": ("Damaged file", damage),
+    "repack": ("Conversion to MKV failed", failed_repack),
+    "header": ("File repair failed", lambda f, t: f'Couldn\'t repair the file, so it was left as it is. {cap(f["why"])}.'),
+    "cut": ("File may be cut short", lambda f, t: f'{cap(f["why"])}. The file may be cut short, or the subtitles may belong to another version. '
+                                                 "Nothing was changed."),
+    "subtitle": ("Subtitles run past the end", overrun),
+    "sublang": ("Subtitle language may be wrong", sublang),
+    "edit": ("Track flag change failed", lambda f, t: f'Couldn\'t change which tracks play by default. '
+                                                  f'{cap(EDIT_ERRORS.get(f["error"], f["error"]).rstrip("."))}. {after(f)}'.rstrip()),
+    "policy": ("Policy file didn't load", lambda f, t: f'{bold(f["file"])} didn\'t load, so no tracks are changed until it\'s fixed. {f["error"]}'),
+    "submatch": ("Wrong subtitles", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
+    "subtiming": ("Subtitles out of sync", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
 }
 # The title of a certain fault the hook acted on. Its action code adds the end, see ACTIONS. Red, or amber when unconfirmed.
-FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Corrupt video", "damage": "Damaged source"}
+FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Broken video", "damage": "Damaged file"}
 # Per fault kind: the result of a faulty file, of a clean one, and the words for the files a re-grab deleted.
 FAULTS = {"audio": ("broken audio", "audio checked", "broken files"), "content": ("wrong content", "content checked", "files with the wrong content"),
           "video": ("corrupt video", "video checked", "corrupt files"), "damage": ("damaged source", "source checked", "damaged files")}
@@ -84,54 +198,59 @@ VERDICTS = {"wrong_content": "wrong content", "would_regrab": "would re-grab", "
 
 
 def regrabbed(a, t):
-    what = "the broken upgrade" if a.get("came") else "the file"
+    what = "the broken upgrade" if a.get("came") else "the broken file"
     if a.get("failed_before"):
-        return f"The hook deleted {what} and re-monitored it. The grab was already marked failed with the rest of its download."
+        return f'Deleted {what}. Its download was already marked as failed, so {a["name"]} is already searching for another copy.'
     if a["n"] == 1:
-        return f'The hook deleted {what}, re-monitored it and marked the grab failed, so {a["name"]} searches again.'
-    return (f'The hook deleted {a["n"]} {FAULTS[a["kind"]][2]} of this download, re-monitored them and marked the grab failed once, so '
-            f'{a["name"]} searches again.')
+        return f'Deleted {what} and marked the grab as failed, so {a["name"]} is searching for another copy.'
+    return (f'Deleted {a["n"]} {FAULTS[a["kind"]][2]} from this download and marked the grab as failed, so {a["name"]} is searching for '
+            "other copies.")
 
 
+# The faults each REGRAB kind re-grabs, for the text of a kind REGRAB leaves out
+REGRAB_WORDS = {"audio": "broken audio", "video": "broken video", "content": "wrong content", "damage": "damaged files"}
 # Per action code: the end of a fault's alert title, and the text. Every text ends with the restore, see restored().
 ACTIONS = {
     "regrabbed": (", re-grabbed", regrabbed),
-    "searched": (", re-grabbed", lambda a, t: f'The hook deleted the broken import and sent {a["name"]} a search for the item, because a manual '
-                                              "import has no grab to mark failed."),
-    "restored": (", old file restored", lambda a, t: "The hook deleted the broken import. It was a manual import, so no grab is marked failed "
-                                                     f'and {a["name"]} does not search.'),
-    "deleted": ("", lambda a, t: "The broken import is deleted. Its item was not monitored, so the hook sent no search."),
-    "would_regrab": (", would re-grab", lambda a, t: f'A re-grab would delete the file and search again. REGRAB does not list {a["kind"]}, so '
-                                                     "the file stays."),
-    "unconfirmed": (", not confirmed", lambda a, t: "A second check did not find the same fault, so the file stays."),
-    "capped": ("", lambda a, t: f'The cap of {a["cap"]} re-grabs a day is reached, so the file stays.'),
-    "no_grab": ("", lambda a, t: f'{a["name"]} has no grab record for it, so the file stays.'),
-    "failed": ("", lambda a, t: f'The {"restore" if a.get("manual") else "re-grab"} stopped at {a["step"]}: {a["error"]}'[:300]),
-    "dry_run": ("", lambda a, t: "Dry run."),
-    "no_policy": ("", lambda a, t: f'Skipped {a["file"]}. Fix the policy file.'),
+    "searched": (", re-grabbed", lambda a, t: f'Deleted the broken file and asked {a["name"]} to search for another copy. It was a manual import, '
+                                              "so there was no grab to mark as failed."),
+    "restored": (", old file restored", lambda a, t: "Deleted the broken file. It was a manual import, so there was no grab to mark as failed, "
+                                                     f'and {a["name"]} won\'t search for another copy.'),
+    "deleted": ("", lambda a, t: "Deleted the broken file. Its item isn't monitored, so no search was started."),
+    "would_regrab": (", re-grab is off", lambda a, t: f'Re-grabs for {REGRAB_WORDS[a["kind"]]} are off, so the file was kept.'),
+    "unconfirmed": (", not confirmed", lambda a, t: "A second check didn't find the same problem, so the file was kept."),
+    "capped": ("", lambda a, t: f'The limit of {a["cap"]} re-grabs a day was reached, so the file was kept.'),
+    "no_grab": ("", lambda a, t: f'{a["name"]} has no record of grabbing it, so the file was kept.'),
+    "failed": ("", lambda a, t: f'The {"restore" if a.get("manual") else "re-grab"} failed during {a["step"]}. {a["error"]}'[:300]),
+    "dry_run": ("", lambda a, t: "Dry run, so nothing was changed."),
+    "no_policy": ("", lambda a, t: f'Skipped {bold(a["file"])}.'),
 }
 
 
 def restored(a, text):
-    """text with the restore of a re-grab around it, see regrab.restore_facts(): the job's own old file in front, then
-    the other files of the download, then why the job's own old file stayed out."""
+    """text with the restore of a re-grab after it, see regrab.restore_facts(): the job's own old file, then the other
+    files of the download, then why the job's own old file stayed out."""
     came = a.get("came") or []
     if came:
-        it = "it" if len(came) == 1 else "them"
-        text = (f'The hook put back the old file{"s" if len(came) > 1 else ""} from {"its own copy" if a["own_copy"] else "the recycle bin"}: '
-                f'{", ".join(came)}. '
-                + (f'{a["name"]} links {it} again. ' if a["linked"]
-                   else f'{a["name"]} did not link {it} within {regrab.RESTORE_WAIT} seconds, so rescan the item by hand. ') + text)
+        them = "it" if len(came) == 1 else "them"
+        text += (f' Put back the old file{"s" if len(came) > 1 else ""} from '
+                 f'{("the kept cop" + ("ies" if len(came) > 1 else "y")) if a["own_copy"] else "the recycle bin"}: {", ".join(map(bold, came))}. '
+                 + (f'{a["name"]} picked {them} up again.' if a["linked"]
+                    else f'{a["name"]} didn\'t pick {them} up within {regrab.RESTORE_WAIT} seconds.'))
     if a.get("others"):
-        text += f' The old file of {a["others"]} more broken file{"s" if a["others"] > 1 else ""} of this download came back too.'
+        s = "s" if a["others"] > 1 else ""
+        text += f' Also put back the old file{s} of {a["others"]} more broken file{s} from this download.'
     if a.get("stayed") and not came:
-        text += f' The old file did not come back: {a["stayed"]}.'
+        text += f' The old file wasn\'t put back, because {a["stayed"]}.'
     return text
 
 
 def action_code(a):
-    """The code that ends a fault's alert title: restored when a re-grab put the job's own old file back."""
-    return "restored" if a["code"] == "regrabbed" and a.get("came") else a["code"]
+    """The code that ends a fault's alert title: restored when a re-grab or a restore put the job's own old file back,
+    deleted when a restore put none back."""
+    if a["code"] in ("regrabbed", "restored") and a.get("came"):
+        return "restored"
+    return "deleted" if a["code"] == "restored" else a["code"]
 
 
 def title(f):
@@ -144,12 +263,58 @@ def title(f):
     return FINDINGS[f["kind"]][0], "amber"
 
 
-def texts(f, t):
-    """(text, action text or None) of finding f. A template that fails gives a line that says so, because an alert text
-    must never cost the decision line or the post."""
+# The fixes that go to the decision log only, see posts(). The action codes of a fault the program re-grabbed or whose
+# old file it put back, and the sentence codes of a subtitle it removed or left out of a conversion.
+LOGGED_ACTIONS = ("regrabbed", "restored", "searched")
+LOGGED_LINES = ("removed", "converted_track")
+COVERS_LENGTH = ("header", "cut", "subtitle")   # the findings whose alert names the cause of a wrong length in the file
+DELETED = LOGGED_ACTIONS + ("deleted",)   # the action codes of a fault whose file the program deleted
+CONTENT_SIGNALS = ("language", "runtime")   # the findings that share their kind with a signal of the wrong-content evidence
+
+
+def fixed(a):
+    """Whether the action a fixed its fault, see LOGGED_ACTIONS. A re-grab or a search fixes it also when its own old
+    file stayed out, because the app searches for another copy. A restore of a manual import fixes it only when its own
+    old file came back. An old file that came back counts only when the app picked it up, see regrab.restore_facts()."""
+    came = a.get("came") or []
+    if a.get("code") not in LOGGED_ACTIONS or (a["code"] == "restored" and not came):
+        return False
+    return not came or bool(a.get("linked"))
+
+
+def posts(f, rec=None):
+    """Whether the alert of finding f of the record rec goes to Discord, see logs.alert_findings(). A problem the program
+    left unresolved posts: a failed fix, a fix a setting turned off, a fix that cannot run, and a doubt. A problem it
+    fixed goes to the decision log only, see fixed(). A subtitle finding posts when one of its sentences does. A moved
+    sidecar counts as fixed.
+
+    One cause posts once. When the program deleted the file, its other findings log only. A wrong-content finding names
+    each signal that scored, see process.content_finding(). A language or runtime finding logs only beside it when it
+    names that signal. The episode signal scores no points, so the episode finding posts. A wrong length in the file
+    posts only when no repair fixed it and no alert of COVERS_LENGTH names its cause."""
+    found = (rec or {}).get("findings") or []
+    if f.get("action"):
+        return not fixed(f["action"])
+    if any((x.get("action") or {}).get("code") in DELETED for x in found):
+        return False
+    if f["kind"] in CONTENT_SIGNALS and any(x["kind"] == "content" and f["kind"] in x.get("scored", ()) for x in found):
+        return False
+    if f["kind"] == "duration":
+        return ((rec or {}).get("header_repair") or {}).get("code") not in config.REPAIRED and not any(x["kind"] in COVERS_LENGTH for x in found)
+    if "lines" in f:
+        return any(x["code"] not in LOGGED_LINES and not (x["code"] in ("sidecar", "converted_sidecar") and x.get("kept")) for x in f["lines"])
+    return True
+
+
+def texts(f, t, langs=None, marked=False):
+    """(text, action text or None) of finding f. langs names the language of each track, see track_langs(). The texts
+    are plain, or with their bold spans when marked, for the embed, see markdown(). A template that fails gives a line
+    that says so, because an alert text must never cost the decision line or the post."""
     try:
+        f = glued(f) if marked else f
         a = f.get("action")
-        return FINDINGS[f["kind"]][1](f, t), restored(a, ACTIONS[a["code"]][1](a, t)) if a else None
+        text, act = FINDINGS[f["kind"]][1](dict(f, langs=langs or {}), t), restored(a, ACTIONS[a["code"]][1](a, t)) if a else None
+        return (text, act) if marked else (unmarked(text), act and unmarked(act))
     except Exception as ex:
         return config.mask(f"no text: {type(ex).__name__}: {ex}")[:200], None
 
@@ -175,72 +340,138 @@ def block(b):
 
 
 # Why a track that does not match stays in the file, per kept_back code of process.subtitle_checks()
-KEPT_BACK = {"check": "SUBTITLES is check, so the file stays as it is", "keep_days": "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"}
+KEPT_BACK = {"check": "SUBTITLES is set to check",
+             "keep_days": "KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original"}
+
+
+def remux_why(result):
+    """The plain reason of a subtitle remux that was skipped or failed, from its result, see remux.resub(). Another
+    text stays as it is."""
+    skip = (result or "").removeprefix("subtitle remux skipped, ")
+    if skip.startswith("hardlinked"):
+        return "the file has another hard link, such as the download client's copy"
+    if m := re.match(r"over the (\d+) GB", skip):
+        return f"the file is over the {m[1]} GB limit of REPACK_MAX_GB"
+    if m := re.match(r"low space: ([\d.]+) GB free for ([\d.]+) GB", skip):
+        return f"{bold(f'only {m[1]} GB is free')} for the {m[2]} GB file"
+    if skip.startswith("the original cannot be kept"):
+        return "no copy of the original could be kept"
+    if skip.startswith("subtitle remux failed, the original changed"):
+        return "the app replaced or renamed the file at the same time"
+    if skip.startswith("subtitle remux failed: "):
+        return f'rewriting the file failed ({skip.removeprefix("subtitle remux failed: ")})'
+    return skip
 
 
 def stays(x, t):
     """The end of the sentence of a track that does not match and stays in the file."""
     planned = t == "planned"
-    flags = ("--apply would turn its default and forced flags off." if planned else "It loses its default and forced flags.") if x["flags_off"] \
-        else "Its flags stay."
+    flags = ("--apply would turn their default and forced flags off." if planned else "Turned off their default and forced flags.") \
+        if x["flags_off"] else "Their flags were left as they are."
     if planned and x.get("hardlinked"):   # edit() and the remux both leave a hardlinked file as it is
         return block({"code": "hardlinked"})
     if planned and not x["gone"] and x.get("kept_back") == "keep_days":
-        return ("The track would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set "
-                f"KEEP_ORIGINALS_DAYS above 0 to remove it. {flags}")
+        return ("They would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set "
+                f"KEEP_ORIGINALS_DAYS above 0 to remove them. {flags}")
     if planned and x["gone"] and x.get("block"):
-        return "--apply would remove it." if x["block"]["code"] == "remux" else f'{block(x["block"])} The track would stay in the file. {flags}'
-    why = x["result"] if x["gone"] else KEPT_BACK.get(x.get("kept_back"), "the file was not remuxed")
-    return f"It stays in the file, because {why}. {flags}"
+        return "--apply would remove them." if x["block"]["code"] == "remux" else f'{block(x["block"])} They would stay in the file. {flags}'
+    why = remux_why(x["result"]) if x["gone"] else KEPT_BACK.get(x.get("kept_back"), "the run could not remove them")
+    return f"They're still in the file, because {why}. {flags}"
 
 
 def where(x):
-    return f'It moved to {x["kept"]}.' if x.get("kept") else f'It stays beside the file: {x.get("left") or "a dry run"}.'
+    return f'Moved the file to {x["kept"]}.' if x.get("kept") else f'The file was left beside the video, because {x.get("left") or "this is a dry run"}.'
 
 
-def track(p):
-    """A subtitle place as "track s2", a sidecar by its name."""
-    return f"track {p}" if re.fullmatch(r"s\d+", p) else p
+def off_line(x, t):
+    """A subtitle whose times are off and stay: off by different amounts in parts of the file, or by an offset that no
+    fix lines up, see subsync.fit()."""
+    vs = f' compared with {sub_name(x["ref"], x["langs"])}' if x.get("ref") else ""
+    name = cap(sub_name(x["track"], x["langs"]))
+    if x.get("offsets"):
+        return (f'{name} are out of sync{vs} by different amounts in different parts of the file: {bold(late_by(x["offsets"]))}. One shift can\'t '
+                "fix that, so they were left as they are.")
+    seem = f' seem {bold("about " + late_by([x["unfixed"]]))}{vs}' if x.get("unfixed") is not None else f" are out of sync{vs}"
+    return f"{name}{seem}, but no fix lined them up well enough, so they were left as they are."
 
 
-# Per sentence code of a subtitle alert, its text. subtitles.sub_findings() gives the codes and the facts.
+def check_times(x, t):
+    """A subtitle whose times need a fix that SUBTITLES check leaves out."""
+    fix = x.get("fix")
+    off = (f'are {bold("about " + late_by([fix["offset"]]))}' + ("" if fix["rate"] == "1/1" else " at the start and drift over time")) if fix else "are out of sync"
+    return f'{cap(sub_name(x["track"], x["langs"]))} {off}. SUBTITLES is set to check, so they were left as they are.'
+
+
+def sweep_line(x, t):
+    """The parts of the file where the sweep heard a subtitle far off its fitted line. Tracks off at the same parts share
+    one sentence. Offsets that agree give one mean."""
+    rows, groups = {}, {}
+    for k, at, off in x["far"]:
+        rows.setdefault(k, []).append((at, off))
+    for k, r in rows.items():
+        groups.setdefault(tuple(r), []).append(k)
+    out = []
+    for r, ks in groups.items():
+        offs, name = [o for _, o in r], cap(subs_name(ks, x["langs"]))
+        mean = sum(offs) / len(offs)
+        if max(offs) - min(offs) <= max(0.5, 0.05 * abs(mean)) and all(o * mean > 0 for o in offs):
+            out.append(f'{name} are {bold("about " + late_by([mean]))} at {and_list(content.hms(a) for a, _ in r)}.')
+        elif all(o * mean > 0 for o in offs):
+            out.append(f'{name} are {"late" if mean > 0 else "early"} by {and_list(f"{amount(o)} at {content.hms(a)}" for a, o in r)}.')
+        else:
+            out.append(f'{name} are out of sync: {and_list(f"{late_by([o])} at {content.hms(a)}" for a, o in r)}.')
+    return " ".join(out) + " They were left as they are."
+
+
+NO_MATCH = "don't match what's said in the audio"
+# How a sidecar that stays as it is needs new times, per action of subtitles.sidecar_fix()
+SIDECAR_NEEDS = {"retime": "are out of sync", "lengthen": "flash by too fast to read"}
+# Per sentence code of a subtitle alert, its text. subtitles.sub_findings() gives the codes and the facts, and sub_line() the track languages.
 SUB_LINES = {
-    "removed": lambda x, t: f'Subtitle track {x["track"]} does not match the audio, {x["why"]}. {"The hook" if x["by"] == "hook" else "This run"} '
-                            f'removed it, and the original file is kept at {x["kept"]}.',
-    "stays": lambda x, t: f'Subtitle track {x["track"]} does not match the audio, {x["why"]}. {stays(x, t)}',
-    "sidecar": lambda x, t: f'The sidecar {x["name"]} does not match the audio, {x["why"]}. {where(x)} A program such as Bazarr can download it again.',
-    "converted_sidecar": lambda x, t: f'The sidecar {x["name"]} does not match the audio, {x["why"]}. The conversion left it out. {where(x)}',
-    "converted_track": lambda x, t: f'Subtitle track {x["track"]} does not match the audio, {x["why"]}. The conversion left it out, and the '
-                                    f'original file is kept at {x["kept"]}.',
-    "sidecar_left": lambda x, t: f'The sidecar {x["name"]} needs new times, {x["why"]}, but it stays as it was: {x["left"]}.',
-    "off": lambda x, t: f'Subtitle {track(x["track"])} ' + (f'disagrees with the reference {track(x["ref"]) if x["ref"][1:].isdigit() else "sidecar " + x["ref"]}'
-                                                            if x.get("ref") else "is off the audio") + f': {x["why"]}. Its times stay.',
-    "not_retimed": lambda x, t: f'Subtitle track {", ".join(x["tracks"])} needs new times'
-                                + (f'. {block(x["block"])}' if t == "planned" else f', but {x["result"]}. The file stays as it was.'),
-    "check_times": lambda x, t: f'Subtitle {x["track"]} needs new times: {x["why"]}. SUBTITLES is check, so its times stay.',
-    "check_flash": lambda x, t: f'Subtitle {x["track"]} flashes its cues: its median cue shows {x["median"]:.2f} s. SUBTITLES is check, so its '
-                                "ends stay.",
-    "sweep": lambda x, t: "The sweep heard parts of the file off the fitted line: "
-                          + ", ".join(f"{k} at {content.hms(at)} by {off:+.2f} s" for k, at, off in x["far"]) + ". The times stay as the check decided.",
+    "removed": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {NO_MATCH}. Removed them and kept the original file at {x["kept"]}.',
+    "stays": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {NO_MATCH}. {stays(x, t)}',
+    "sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {NO_MATCH}. {where(x)}',
+    "converted_sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {NO_MATCH}, so the conversion to MKV left them out. {where(x)}',
+    "converted_track": lambda x, t: f'Subtitle track {x["track"][1:]} of the original file doesn\'t match what\'s said in the audio, so the '
+                                    f'conversion to MKV left it out. The original file is kept at {x["kept"]}.',
+    "sidecar_left": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {SIDECAR_NEEDS.get(x.get("action"), "need new times")}, but the file '
+                                 f'was left as it is, because {x["left"]}.',
+    "off": off_line,
+    "not_retimed": lambda x, t: f'{cap(subs_name(x["tracks"], x["langs"]))} need new times'
+                                + (f'. {block(x["block"])}' if t == "planned" else
+                                   f', but the fix failed, because {remux_why(x["result"])}. The file was left as it is.'),
+    "check_times": check_times,
+    "check_flash": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} flash by too fast to read. Half the lines show for {x["median"]:.2f} s '
+                                "or less. SUBTITLES is set to check, so they were left as they are.",
+    "sweep": sweep_line,
 }
 
 
-def sub_line(x, t):
-    return SUB_LINES[x["code"]](x, t)
+def sub_line(x, t, langs=None):
+    """One sentence of a subtitle alert. langs names the language of each track, see track_langs()."""
+    return SUB_LINES[x["code"]](dict(x, langs=langs or {}), t)
 
 
-def alert_line(f, t):
+def alert_line(f, t, langs=None):
     """One alert of the decision log and the CLI: "kind: text action"."""
-    text, act = texts(f, t)
+    text, act = texts(f, t, langs)
     return f'{f["kind"]}: {text}' + (f" {act}" if act else "")
+
+
+# What a failed TMDB answer means for the language check, for the footer of the alerts it bears on
+TMDB_SKIPPED = {"no_record": "TMDB has no record of this item", "tmdb_unavailable": "TMDB didn't answer", "tmdb_token_missing": "No TMDB key is set",
+                "tmdb_token_rejected": "TMDB rejected the key"}
 
 
 def alert_embed(rec, f, t):
     """The Discord embed of finding f of rec: the problem and what the hook did, one field with the title and the file,
-    and the footer with the file's TMDB state, see logs.footer_b()."""
-    (text, act), (head, color) = texts(f, t), title(f)
+    and the footer with the host. A language or content alert names a TMDB failure there, because TMDB's language check
+    did not run."""
+    (text, act), (head, color) = texts(f, t, track_langs(rec), marked=True), title(f)
+    note = f'{TMDB_SKIPPED[rec["tmdb"]]}, so its language check was skipped' if f["kind"] in ("language", "content") \
+        and rec.get("tmdb") in TMDB_SKIPPED else None
     return logs.embed(rec["app"], head, f"{text}\n{act}" if act else text, color, [(rec["label"], os.path.basename(rec["path"]))],
-                      logs.footer_b(rec.get("tmdb")))
+                      " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
 
 
 def logfmt(pairs):
@@ -258,7 +489,8 @@ def render(rec, target, tense=None):
 
     log: the decision line, with the schema, the script and policy versions, the outcome code (other when rec has
     none), the seconds it took from rec["took"], and the text of each finding in alerts.
-    logfmt: its one-line summary for syslog. Loki reads its keys, so they stay.
+    logfmt: its one-line summary for syslog. Loki reads its keys, so they stay. An error line ends with error, its
+    result cut to 150 characters.
     embed: one Discord embed per finding.
     cli: the line of a backfill."""
     t = tense or tense_of(rec)
@@ -268,13 +500,15 @@ def render(rec, target, tense=None):
         out = dict({k: v for k, v in rec.items() if k not in ("outcome", "took")}, schema=config.SCHEMA, version=config.VERSION,
                    policy=logs.policy_hash(), host=config.HOST, outcome=rec.get("outcome", "other"), took=rec.get("took"))
         if "findings" in rec:
-            out["alerts"] = [alert_line(f, t) for f in rec["findings"]]
+            out["alerts"] = [alert_line(f, t, track_langs(rec)) for f in rec["findings"]]
         return out
-    if target == "logfmt":
+    if target == "logfmt":   # an error adds its result, and a line with no label names its file or its job
+        label = rec.get("label") or (os.path.basename(rec["path"]) if rec.get("path") else rec.get("job"))
+        error = [("error", config.mask(rec.get("result") or "")[:150])] if rec.get("outcome") == "error" else []
         return config.mask(logfmt([("arr", rec.get("app")), ("source", rec.get("source")), ("outcome", rec.get("outcome", "other")),
                                    ("class", rec.get("class")), ("edits", len(rec.get("edits") or [])), ("reasons", ",".join(rec.get("reasons") or [])),
                                    ("alerts", ",".join(rec.get("alert_kinds") or [])), ("tmdb", rec.get("tmdb") or "not_asked"),
-                                   ("label", rec.get("label")), ("id", rec.get("id"))]))
+                                   ("label", label), ("id", rec.get("id"))] + error))
     if target == "embed":
         return [alert_embed(rec, f, t) for f in rec.get("findings") or []]
     if target == "cli":
@@ -326,7 +560,7 @@ def cli_line(rec, t):
             + (" | not forced: " + rp["not_forced"][:150] if rp.get("not_forced") else "")
             + (" | name forced: " + rp["forced_name"][:150] if rp.get("forced_name") else "")
             + (" | " + "; ".join(rec["notes"]) if rec.get("notes") else "")
-            + (" | ALERT " + "; ".join(alert_line(f, t) for f in rec["findings"]) if rec.get("findings") else ""))
+            + (" | ALERT " + "; ".join(alert_line(f, t, track_langs(rec)) for f in rec["findings"]) if rec.get("findings") else ""))
 
 
 def sub_time_report(rec, t):
@@ -368,10 +602,12 @@ def sub_time_report(rec, t):
                    + ", ".join(f"{a:.3f} {o:.3f}->{n:.3f}" for a, o, n in f["first"]))
     for k, rows in sorted((rec.get("sweep") or {}).items()):
         out.append(f"  sweep of {k}: {len(rows)} windows, {sum(w['overlap'] >= subsync.MATCH for w in rows)} match")
-        steps = cli.sweep_steps(rows)
+        steps, alerts = cli.sweep_steps(rows), cli.sweep_alerts(rows)
+        share = f"in a step of {len(steps)} of the {len(cli.sweep_trusted(rows))} windows that heard {subsync.MIN_CUES} cues"
         out += [f'    {content.hms(w["at"])} words {w["words"]} overlap {w["overlap"]:.0%} cues {w["cues"]} offset '
                 + ("-" if w["offset"] is None else f'{w["offset"]:+.2f} s')
-                + (f' ALERT {w["off"]:+.2f} s off the fitted line' if id(w) in steps else f' {w["off"]:+.2f} s off the fitted line, one window alone'
+                + (f' ALERT {w["off"]:+.2f} s off the fitted line' if id(w) in alerts else
+                   f' {w["off"]:+.2f} s off the fitted line, ' + (share if id(w) in steps else "one window alone")
                    if cli.sweep_far(w) else "") for w in rows]
     if rec.get("full_read"):
         f = rec["full_read"]
@@ -382,7 +618,7 @@ def sub_time_report(rec, t):
         f = rec["sweep_facts"]
         cost = "sweep: words from the cache" if f.get("runs") and f.get("cached") == f["runs"] else f'sweep cost: {f["cpu"]} CPU s, {f["took"]} s'
         out.append(f'  {cost}' + "".join(f"; no words from {x}" for x in f["failed"]))
-    out += [f"  ALERT {alert_line(f, t)}" for f in rec.get("findings") or []]
+    out += [f"  ALERT {alert_line(f, t, track_langs(rec))}" for f in rec.get("findings") or []]
     return "\n".join(out)
 
 

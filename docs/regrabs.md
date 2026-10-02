@@ -15,13 +15,17 @@ back the old file of a bad upgrade. The hook keeps the files it replaces, so you
 | `content` | Wrong content, from the TMDB and duration checks. |
 | `damage` | A damaged source that a conversion shows. |
 
-- A kind that is not listed gets the second check, and then only alerts "would re-grab".
+- A kind that is not listed gets the second check, and then only alerts "re-grab is off".
 - `none` turns every re-grab off.
 - An unknown kind is left out, and a blank value re-grabs nothing. `--selftest` fails on both.
-- The "Wrong episode" alert never re-grabs.
+- The "Maybe the wrong episode" alert never re-grabs.
 
 `REGRAB_CAP` limits the re-grabs per instance in 24 hours, 30 by default. Then the hook alerts only. Every kind shares the
 one count. `0` turns every re-grab off.
+
+A re-grab goes to the decision log only. So does a restored old file that the app picked up again. The other alerts of
+the file the hook deleted go to the log only too. A fault the hook did not re-grab posts an alert. A restore that put
+back no old file, or old files the app did not pick up, posts too.
 
 ## Restore after a bad upgrade
 

@@ -26,9 +26,10 @@ TMDB_RETRY = 600   # seconds after a failed TMDB call before the next try, so an
 DOWN = {"until": 0.0, "code": "", "why": "", "answered": 0.0}
 KEY_BROKEN = ("tmdb_token_missing", "tmdb_token_rejected")
 KEY_ALERT_EVERY = 86400   # seconds between two "TMDB key not working" alerts of one host
-# The default token is Radarr's bundled one, read from its DLL. TMDB_TOKEN in the env file overrides it with a key
-# of your own.
+# The default token is Radarr's bundled one, read from its DLL, else the copy below. TMDB_TOKEN overrides it with a
+# key of your own.
 RADARR_DLL = "/opt/Radarr/Radarr.Common.dll"
+RADARR_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIxYTczNzMzMDE5NjFkMDNmOTdmODUzYTg3NmRkMTIxMiIsInN1YiI6IjU4NjRmNTkyYzNhMzY4MGFiNjAxNzUzNCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.gh1BwogCCKOda6xj9FRMgAAj_RYKMMPC3oNlcBtlmwk"   # AuthToken in src/NzbDrone.Common/Cloud/RadarrCloudRequestBuilder.cs of Radarr
 # ISO 639-1 (TMDB) to ISO 639-2/B (Matroska tags), from Debian's iso-codes. TMDB also uses cn for Cantonese and sh.
 ISO1 = dict(p.split(":") for p in (
     "aa:aar ab:abk ae:ave af:afr ak:aka am:amh an:arg ar:ara as:asm av:ava ay:aym az:aze ba:bak be:bel bg:bul bh:bih "
@@ -185,18 +186,25 @@ def _down(code, why):
 
 def tmdb_state(expected):
     """(code, why) for the decision log and the Loki line. The code is found (TMDB returned the item's record),
-    no_record, tmdb_unavailable (network, timeout, 5xx), tmdb_token_missing (no token) or tmdb_token_rejected (TMDB
-    answered 401 or 403)."""
+    no_record, tmdb_unavailable (network, timeout, 5xx) or tmdb_token_rejected (TMDB answered 401 or 403). Older
+    records may hold tmdb_token_missing, from before RADARR_TOKEN."""
     if expected: return "found", ""
     if time.time() < DOWN["until"]: return DOWN["code"], DOWN["why"]
     return "no_record", "TMDB has no record for the item"
 
 
-def key_alert(code, now=None):
-    """(title, text) for one amber Discord embed when the TMDB key is missing or rejected, else None. At most one
+def key_name(token=None):
+    """The TMDB key a call sends, as the key alert names it. token is TMDB_TOKEN, then Radarr's key from its DLL, then
+    the copy of it in this file, in the order of expected_languages()."""
+    return "the key in TMDB_TOKEN" if token else f"Radarr's key in {RADARR_DLL}" if radarr_token() else "the built-in copy of Radarr's key"
+
+
+def key_alert(code, now=None, token=None, mark=str):
+    """(title, text) for one amber Discord embed when TMDB rejects the key, else None. token is TMDB_TOKEN, and the text
+    names the key that failed, see key_name(). mark marks that name, as report.bold() does for the embed. At most one
     per KEY_ALERT_EVERY per host: the store holds the time of the last one."""
     from . import store   # here, because store reads config, and config reads DEADLINE from this module as it loads
-    if code not in KEY_BROKEN: return None
+    if code != "tmdb_token_rejected": return None
     now = now or time.time()
     try:
         with store.tx():   # the hook's job processes run side by side, and one of them posts
@@ -204,9 +212,8 @@ def key_alert(code, now=None):
             store.put("mark", "tmdb-key-alert", now)
     except (sqlite3.Error, OSError):
         return None   # no stamp means an alert per file, so none at all. The decision log still names the code.
-    what = "TMDB rejected the key." if code == "tmdb_token_rejected" else "No TMDB key: TMDB_TOKEN is empty and Radarr's DLL gave none."
-    return "TMDB key not working", (f"{what} The metadata checks run without TMDB, so no wrong-content re-grab relies on it. "
-                                    "Set TMDB_TOKEN in the env file, or check Radarr's install.")
+    return "TMDB key not working", (f"TMDB rejected {mark(key_name(token))}. Until it's fixed, the checks for wrong content run without TMDB, "
+                                    "and no re-grab relies on it.")
 
 
 def tmdb_day_status(records):
@@ -263,15 +270,12 @@ def expected_languages(app, ids, token=None, cache="tmdb", now=None):
     """What TMDB says about the item, or None when it cannot be known. None means unknown to every caller, never wrong.
 
     ids: {"tmdb", "imdb"} for a Radarr movie, {"tmdb", "tvdb"} for a Sonarr series. The app's tmdb id comes first,
-    /find by imdb or tvdb id is the fallback. token: TMDB_TOKEN from the env file, else radarr_token().
+    /find by imdb or tvdb id is the fallback. token: TMDB_TOKEN, else radarr_token(), else RADARR_TOKEN.
     Returns {"original": 639-2/B code, "spoken": [codes], "source", "fetched", "runtime" (movie
     minutes, 0 for a series), "title", "year", "special" (a TV movie or stand-up), "unmapped": TMDB codes with no
     639-2 code}. The result is cached for CACHE_DAYS in cache, a part of the state store.
     """
-    token, now = token or radarr_token(), now or time.time()
-    if not token:
-        _down("tmdb_token_missing", "TMDB_TOKEN is empty and Radarr's DLL gave no token")
-        return None
+    token, now = token or radarr_token() or RADARR_TOKEN, now or time.time()
     try:
         kind, other, found = KINDS.get(app, KINDS["sonarr"])
         tid = ids.get("tmdb") or _find(f"{other}_id", ids.get(other), found, token, cache, now)
@@ -399,8 +403,8 @@ def other_film(release_name, item_tmdb, seconds, token=None, cache="tmdb", now=N
     because TMDB lists some cuts as films of their own. Returns the _facts() record plus "tmdb", or None.
     Network failure is None."""
     title, year, _ = split_release(release_name)
-    token, now = token or radarr_token(), now or time.time()
-    if not (title and year and seconds and token) or EDITION.search(release_name): return None
+    token, now = token or radarr_token() or RADARR_TOKEN, now or time.time()
+    if not (title and year and seconds) or EDITION.search(release_name): return None
     try:
         ids = _cached(cache, f"search/{title.lower()}/{year}",
                       lambda: [r["id"] for r in (_get("/search/movie", token, query=title, year=year).get("results") or [])[:5]], now)
@@ -433,7 +437,7 @@ def language_verdict(tracks, original, expected):
         return "ok", f"the audio is {', '.join(have)}, one of the item's languages"
     if expected["original"] == "eng" and set(have) & set().union(*(decide.codes(c) for c in expected["spoken"])):
         return "unknown", f"the audio is {', '.join(have)}, which TMDB lists as spoken in this English original"
-    return "wrong", f"the audio is {', '.join(have)}, the item's languages are {', '.join(sorted(allowed))}"
+    return "wrong", f"the audio is {decide.lang_names(have)}, but it should be {decide.lang_names(allowed, 'or')}"
 
 
 def release_languages(release_name):
@@ -550,7 +554,7 @@ def parts(a, b):
     return base_a == base_b and part_a != part_b
 
 
-def episode_title_verdict(title, episodes, imported, release_name="", series_titles=(), said="the release's title", anime=False):
+def episode_title_verdict(title, episodes, imported, release_name="", series_titles=(), said="the release name", anime=False):
     """Whether the episode title of a release names another episode of the series than the file was imported as.
 
     title: release_episode_title() or nfo_episode_title(). episodes: Sonarr's episodes of the series. imported: the
@@ -565,8 +569,9 @@ def episode_title_verdict(title, episodes, imported, release_name="", series_tit
       only for a special, because a special often repeats the title of a regular episode.
     - "none": no episode matches.
     said names where the title comes from, such as "the release's NFO". anime adds each episode's absolute number.
-    Returns a signal of wrong_content_evidence(): {"kind", "verdict", "points", "why", "episodes", "names"}. names holds
-    the matched episodes as the alert names them. None when no episode points to the file, because the check then has
+    Returns a signal of wrong_content_evidence(): {"kind", "verdict", "points", "why", "episodes", "names", "imported",
+    "said", "title"}. names holds the matched episodes as the alert names them, imported the [number, Sonarr's title] of
+    each imported episode, see episode_why(). None when no episode points to the file, because the check then has
     nothing to compare.
     """
     series = {title_key(t) for t in series_titles if t}
@@ -590,10 +595,23 @@ def episode_title_verdict(title, episodes, imported, release_name="", series_tit
         found = sorted((e for e in episodes if e["id"] in ids and (e.get("seasonNumber") or special)),
                        key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
         verdict = "other" if found else "none"
-    name, listed = lambda es: ", ".join(episode_name(e, anime) for e in es), [episode_name(e, anime) for e in found]
-    why = f"{said} says {title}" + (f", which Sonarr lists as {name(found)}. It was imported as {name(mine)}" if found else "")
+    names, ours = and_join([episode_name(e, anime) for e in found]), [[episode_name(e, anime), e.get("title") or None] for e in mine]
     return {"kind": "episode_title", "verdict": verdict, "points": EPISODE_TITLE_POINTS if found else 0, "episodes": [e["id"] for e in found],
-            "names": f"{', '.join(listed[:-1])} and {listed[-1]}" if len(listed) > 1 else "".join(listed), "why": why}
+            "names": names, "imported": ours, "said": said, "title": title,
+            "why": episode_why(ours, said, title, names) if found else f'{said} calls it "{title}"'}
+
+
+def and_join(xs):
+    """Words as a person lists them: "a", "a and b", "a, b and c"."""
+    return f"{', '.join(xs[:-1])} and {xs[-1]}" if len(xs) > 1 else "".join(xs)
+
+
+def episode_why(imported, said, title, names, quote=lambda s: f'"{s}"'):
+    """The words of an episode title that names another episode, as in: imported as S01E02 "Sleepover". The release
+    name calls it "Anxious Times at Clone High", which is S01E03. imported holds the [number, Sonarr's title or None] of
+    each imported episode. quote marks a title. The Discord embed bolds the titles with it, see report.quote()."""
+    ours = and_join([n + (f" {quote(t)}" if t else "") for n, t in imported])
+    return f"imported as {ours}. {said[:1].upper()}{said[1:]} calls it {quote(title)}, which is {names}"
 
 
 def episode_name(e, anime=False):
@@ -624,12 +642,12 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
     add("language", lv, int(lv == "wrong"), why)
     named = release_languages(release_name) & {t["lang"] for t in tracks if t["kind"] == "a" and t["role"] == "main"}
     if lv == "wrong" and movie and named:   # the uploader's label confirms the tag. A series may speak another language in some episodes.
-        add("release_language", "wrong", 1, f"the release name says {', '.join(sorted(named))}")
+        add("release_language", "wrong", 1, f"the release name says {decide.lang_names(named)}")
     rv, secs = runtime_verdict(trusted, listed_minutes, release_name, item_type), (trusted or {}).get("seconds")
     shown = max(listed_minutes or [0]) if isinstance(listed_minutes, (list, tuple)) else listed_minutes
     tmdb_rt = (expected or {}).get("runtime") if movie else 0
     points = int(rv in ("short", "long"))
-    why = f'it runs {secs / 60:.0f} minutes ({trusted["trust"]}), the listing says {shown}' if secs else \
+    why = f'it runs {secs / 60:.0f} minutes, but the listed runtime is {shown} minutes' if secs else \
         f'the duration is not trusted ({(trusted or {}).get("trust")})'
     if points and tmdb_rt and runtime_verdict(trusted, tmdb_rt, release_name, item_type) != rv:
         rv, points, why = "unknown", 0, f"the app lists {listed_minutes} minutes and TMDB {tmdb_rt}, so the listing is in doubt"
@@ -638,11 +656,12 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
         points = 2
     add("runtime", rv, points, why)
     yv = year_verdict(release_name, item_year, alt_titles_years)
-    add("year", yv, int(yv == "mismatch"), f"the release name's year is {split_release(release_name, [t for t, _ in alt_titles_years])[1]}"
-                                           f", the item's {item_year}")
+    add("year", yv, int(yv == "mismatch"), f"the release name says {split_release(release_name, [t for t, _ in alt_titles_years])[1]}"
+                                           f", but the listed year is {item_year}")
     own = [m for m in ((listed_minutes, tmdb_rt) if movie else ()) if m]
     if other and movie and secs and own and not any(matches(m, secs) for m in own):
-        add("other_film", "match", 1, f'the file runs like {other["title"]} ({other["year"]}), {other["source"]}, {other["runtime"]} minutes')
+        add("other_film", "match", 1, f'the release name matches {other["title"]} ({other["year"]}), and the file runs as long as its '
+                                      f'{other["runtime"]} minutes')
     sig += [episode] if episode else []
     total, (code, reason) = sum(s["points"] for s in sig), tmdb_state(expected)
     return {"signals": sig, "points": total, "regrab": total >= REGRAB_POINTS, "why": "; ".join(s["why"] for s in sig if s["points"]),
@@ -650,7 +669,8 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
 
 
 def hms(seconds):
-    return f"{int(seconds // 3600)}:{int(seconds % 3600 // 60):02d}:{int(seconds % 60):02d}"
+    """Seconds as a player shows them, see decide.clock()."""
+    return decide.clock(seconds)
 
 
 def header_alert(trusted):
@@ -660,6 +680,7 @@ def header_alert(trusted):
     if not s.get("header") or (trusted.get("header_ok") is not False and trusted.get("trust") != "conflict"):
         return None
     if trusted.get("seconds"):
-        return f'The container says {hms(s["header"])}, but the streams run {hms(trusted["seconds"])}.'
-    other = next((s[k] for k in ("last_packet", "streams", "bitrate") if s.get(k)), None)
-    return f'The container says {hms(s["header"])}, but the file suggests {hms(other)}. Neither can be trusted.' if other else None
+        return f'The file says it runs {hms(s["header"])}, but the video and audio stop at {hms(trusted["seconds"])}. Players may show the wrong length.'
+    k = next((k for k in ("last_packet", "streams", "bitrate") if s.get(k)), None)
+    real = "its size and bitrate point to" if k == "bitrate" else "the video and audio stop at"
+    return f'The file says it runs {hms(s["header"])}, but {real} {hms(s[k])}. The runtime check was skipped.' if k else None

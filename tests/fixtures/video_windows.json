@@ -51,7 +51,7 @@
     "frames": 50,
     "fps": 23.976,
     "after": [],
-    "bad": "no video where the window starts"
+    "bad": "no video"
   },
   {
     "name": "Decode errors after the first frame, the shape of a glitch in a full decode",
@@ -64,7 +64,7 @@
       "[h264 @ 0x5602] [error] error while decoding MB 52 30, bytestream -7",
       "[vist#0:0/h264 @ 0x5603] [dec:h264 @ 0x5604] [warning] corrupt decoded frame"
     ],
-    "bad": "2 decode errors"
+    "bad": "2 playback errors"
   },
   {
     "name": "Malformed SEI, Film D in an MP4 at 796 s",
@@ -94,7 +94,7 @@
     "frames": 0,
     "fps": 23.976,
     "after": [],
-    "bad": "no video where the window starts"
+    "bad": "no video"
   },
   {
     "name": "Seek into packed B-frames, Show A S01E01 in an AVI at 452 s",
@@ -131,6 +131,6 @@
     "frames": 0,
     "fps": 29.97,
     "after": [],
-    "bad": "no video where the window starts"
+    "bad": "no video"
   }
 ]

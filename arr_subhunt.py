@@ -69,8 +69,8 @@ def creds(app):
     keys = {"SABNZBD_API_KEY": config.CFG.sabnzbd_api_key, "NEWZNAB_API_KEY": config.CFG.newznab_api_key}
     missing = [k for k, v in keys.items() if not v]
     if missing:
-        sys.exit(f"Set {' and '.join(missing)} in the env file. {app.capitalize()}'s API hides the keys of its download clients "
-                 "and indexers.")
+        sys.exit(f"Set {' and '.join(missing)} in the env file or the environment. {app.capitalize()}'s API hides the keys of its download "
+                 "clients and indexers.")
     first = lambda kind, impl: min((p for p in apps.arr(app, kind) if p.get("implementation") == impl), key=lambda p: p["id"], default=None)
     sab, hyd = first("downloadclient", "Sabnzbd"), first("indexer", "Newznab")
     if not (sab and hyd):
@@ -322,21 +322,20 @@ def replace(app, m, video, remember):
     old = apps.movie_file(m, app)
     now = apps.movie_file(apps.arr(app, f"movie/{m['id']}"), app)
     if now.get("id") != old["id"]:   # an upgrade during a long download. Never replace a file nobody checked.
-        return "Radarr changed the movie file during the download, so the hunter did not import."
+        return "Radarr changed the movie file during the download, so the new release wasn't imported."
     items = apps.arr(app, "manualimport?" + urllib.parse.urlencode({"folder": os.path.dirname(video), "filterExistingFiles": "false"}))
     it = next((i for i in items if i.get("path") == video), None)
     if not it:
         return "Radarr does not list the file for import."
     path = now["path"]   # the path now, in case Radarr renamed the file during the download
     keep = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.subhunt-keep")
-    unsure = (f"The old file stays linked at {keep}. Check the movie in Radarr. Then delete the link, or move it back "
-              "when the new file is missing.")
+    unsure = f"A copy of the old file stays at {keep}."
     size = os.path.getsize(video)   # before the record, so a failed read never leaves a link that blocks the movie
     remember(keep)
     try:
         os.link(path, keep)
     except OSError as ex:
-        return f"The keep link {keep} failed with {type(ex).__name__}, so the hunter did not import."
+        return f"Couldn't keep a copy of the old file at {keep} ({type(ex).__name__}), so the new release wasn't imported."
     try:
         cmd = apps.arr_write(app, "command", "POST", {"name": "ManualImport", "importMode": "copy", "files": [
             {"path": video, "movieId": m["id"], "quality": it.get("quality"), "languages": [m["originalLanguage"]],
@@ -370,11 +369,11 @@ def restore(path, keep):
             os.remove(keep)
             return f"The current file is untouched at {path}."
         if os.path.exists(path):
-            return f"Another file now sits at {path}. The old file is kept at {keep}."
+            return f"Another file now sits at {path}. A copy of the old file stays at {keep}."
         os.rename(keep, path)
-        return f"The hunter put the current file back at {path}. Rescan the movie in Radarr."
+        return f"The current file is back at {path}. Radarr may not list it until its next rescan of the movie."
     except OSError as ex:
-        return f"The old file is kept at {keep}. Moving it back failed with {type(ex).__name__}."
+        return f"A copy of the old file stays at {keep}. Moving it back failed with {type(ex).__name__}."
 
 
 def show(label, f, ts, results, cands, picks, skipped):
@@ -407,10 +406,10 @@ def hunt(app, mid, a, cred, ctx):
         return logs.post(app, logs.embed(app, title, text, color, [("Title", label), ("Release", release), ("App", logs.app_name(app))]))
 
     if item.get("keep") and os.path.exists(item["keep"]):   # an earlier run left the old file linked. Never go past it.
-        text = (f'A keep link from an earlier run still holds the old file of {label} at {item["keep"]}. Check the movie in '
-                "Radarr. Then delete the link, or move it back when the movie has no file. The hunter skips this movie until then.")
+        text = (f'An earlier run left a copy of the old file of {label} at {item["keep"]}. Radarr may list the new file, the old '
+                "file or no file. The search for English subtitles skips this movie while the copy is there.")
         return note("subhunt_stopped", f'subhunt stopped, the keep link {item["keep"]} from an earlier run is unresolved.',
-                    alert_result=[post("Subtitle hunter keep link unresolved", text, "red", item.get("release") or "")] if a.apply else [])
+                    alert_result=[post("Old file left by an earlier run", text, "red", item.get("release") or "")] if a.apply else [])
     item.pop("keep", None)   # recorded, but the link is gone
     if not f:
         return note("subhunt_skipped", "subhunt skipped, the movie has no file to replace.")
@@ -490,14 +489,15 @@ def hunt(app, mid, a, cred, ctx):
                         save()
                         text = f"Radarr did not replace the file of {label} with a checked release. {err} The download stays in {storage}."
                         return note("subhunt_import_failed", f"subhunt import failed: {err}", t0, candidate=brief(c), tracks=logs.track_log(ts),
-                                    alert_result=[post("Subtitle hunter import failed", text, "red", c["title"])])
+                                    alert_result=[post("Release with English subtitles not imported", text, "red", c["title"])])
                     item.update(status="imported", release=c["title"], time=int(time.time()))
                     save()
-                    text = f"The hunter replaced the file of {label} with a release that has a full English subtitle."
-                    if item.get("keep"):
-                        text += f' The keep link {item["keep"]} could not be removed. Delete it by hand.'
+                    text = (f"Replaced the file of {label} with a release that has full English subtitles. A copy of the old file "
+                            f'stays at {item.get("keep")}, because its removal failed.')
+                    # a fix that worked goes to the decision log only. A keep link left behind posts.
                     return note("subhunt_imported", f'subhunt imported {c["title"]}', t0, candidate=brief(c), tracks=logs.track_log(ts), cleanup=gone,
-                                alert_result=[post("English subtitles found", text, "green", c["title"])])
+                                alert_result=[post("English subtitles found, old file left", text, "amber", c["title"]) if item.get("keep")
+                                              else "log only"])
                 why, final = ". ".join(reasons), True
             gone = cleanup(cred, nzo, storage, c["title"], ctx["roots"])
             done.add(nzo)
@@ -509,8 +509,8 @@ def hunt(app, mid, a, cred, ctx):
         item.update(status="no_subbed_release", time=int(time.time()))
         save()
         tried = "\n".join(f'{t["title"]}, {t["why"]}' for t in item["tried"])
-        text = (f"No release of {label} passed the check, so the current file stays. The hunter skips this movie until a "
-                "run with --force. An external .srt from Bazarr or OpenSubtitles is the remaining option.")
+        text = (f"No release of {label} passed the check, so the current file stays. Later searches for English subtitles skip "
+                "this movie.")
         sent = logs.post(app, logs.embed(app, "No release with English subtitles", text, "amber",
                                    [("Title", label), ("Tried", tried), ("App", logs.app_name(app))]))
         return note("no_subbed_release", f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])

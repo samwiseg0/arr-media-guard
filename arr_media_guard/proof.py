@@ -411,9 +411,9 @@ def proof_bsf(fam, codec):
 # check can compare it. A proof refusal alone (an edit list, the times, the cues, a packet count) stays a refusal, and
 # the original stays. So does a warning alone, see invalid_audio(). ffprobe reads no stream in a file it cannot open
 # either, so its message must name a data error.
-DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes of invalid data which were skipped", "mkvmerge skipped invalid audio data"),
-          "ffmpeg": (r"NAL unit size|Invalid data found|partial file", "ffmpeg did not read the file cleanly"),
-          "ffprobe": (r"ffprobe read no stream: .*?(?:Invalid data found|moov atom not found|partial file)", "ffprobe read no stream in the file")}
+DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes of invalid data which were skipped", "part of the audio cannot be read"),
+          "ffmpeg": (r"NAL unit size|Invalid data found|partial file", "parts of the file cannot be read"),
+          "ffprobe": (r"ffprobe read no stream: .*?(?:Invalid data found|moov atom not found|partial file)", "no track of the file can be read")}
 SKIP_EDGE = 5   # seconds from either end of the file where an mkvmerge skip is end junk, such as zero bytes after the last frame
 
 

@@ -18,6 +18,7 @@ cannot read. Each test loads its own copy of the package with its own env file, 
 
 Run: pytest tests/test_settings.py
 """
+import dataclasses
 import itertools
 import os
 import re
@@ -289,15 +290,15 @@ FIELDS = ("keep_days", "hook_workers", "convert_max", "scan_workers", "convert_w
 
 
 def test_a_missing_key_takes_its_default_and_an_empty_one_its_empty_reading(tmp_path):
-    """An empty KEEP_ORIGINALS_DAYS keeps nothing, an empty AUDIT_TIME runs no nightly audit, and every other empty key
-    in FIELDS takes its default."""
+    """An empty AUDIT_TIME runs no nightly audit. Every other empty key in FIELDS takes its default, KEEP_ORIGINALS_DAYS
+    too. So an unset ${VAR} in compose never drops the kept originals at once."""
     defaults = (7, 1, 200, 1, 1, 30, 30e9, True, True, False, False, "07:30", POLICY)
     m = load(tmp_path)
     assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults and m.CFG.errors == []
     m = load(tmp_path, "".join(f"{k}=''\n" for k in ("KEEP_ORIGINALS_DAYS", "HOOK_WORKERS", "CONVERT_MAX_FILES", "SCAN_WORKERS", "CONVERT_WORKERS",
                                                      "REGRAB_CAP", "REPACK_MAX_GB", "HEADER_REPAIR", "RESTORE", "CONVERT", "KEEP_REPLACED",
                                                      "AUDIT_TIME")))
-    assert tuple(getattr(m.CFG, f) for f in FIELDS) == (0,) + defaults[1:11] + ("", POLICY) and m.CFG.errors == []
+    assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults[:11] + ("", POLICY) and m.CFG.errors == []
 
 
 def test_a_value_reads_with_spaces_and_in_any_case(tmp_path):
@@ -389,3 +390,165 @@ def test_no_instance_name_takes_the_keys_of_another_setting():
     starts = {k.rsplit(s, 1)[0] for k in re.findall(r'"([A-Z][A-Z0-9_]*)"', source) for s in ("_URL", "_API_KEY", "_DIR", "_PATH_MAP")
               if k.endswith(s)}
     assert starts and starts <= set(config.TAKEN) | {"SONARR", "RADARR"}, starts
+
+
+def test_an_environment_value_wins_over_the_env_file_and_an_empty_one_blanks_it(tmp_path, monkeypatch):
+    """Docker passes settings as environment variables. An empty one counts as set, so an empty KEEP_ORIGINALS_DAYS
+    takes its default 7 over the file's value, as an empty key in the file does. A key only the file holds keeps its
+    file value."""
+    for k, v in {"LOG": "/env.jsonl", "TMDB_TOKEN": "", "KEEP_ORIGINALS_DAYS": "", "REGRAB": "video,content"}.items():
+        monkeypatch.setenv(k, v)
+    m = load(tmp_path, "LOG='/file.jsonl'\nTMDB_TOKEN='file-0123456789'\nREGRAB_CAP='5'\nREGRAB='audio'\nKEEP_ORIGINALS_DAYS='3'\n")
+    assert (m.CFG.log, m.CFG.tmdb_token, m.CFG.keep_days, m.CFG.regrab, m.CFG.regrab_cap) == ("/env.jsonl", "", 7, {"video", "content"}, 5)
+    assert m.CFG.from_env == ("KEEP_ORIGINALS_DAYS", "LOG", "REGRAB", "TMDB_TOKEN") and m.CFG.errors == []
+
+
+def test_an_environment_variable_that_is_no_setting_is_ignored(tmp_path):
+    """Only the keys of the settings count. A Custom Script runs with the app's variables in lower case, and the
+    environment of the app's service. An instance that APP_INSTANCES does not name reads no keys."""
+    environ = {"log": "/x", "sonarr_eventtype": "Download", "KEEP_DIR": ".kept", "SONARR_9K_URL": "http://x.invalid", "PATH": "/bin",
+               "STATE_DIRECTORY": "/var/lib/x", "LOGS_DIRECTORY": "/var/log/x", "INVOCATION_ID": "1"}
+    file = tmp_path / "env"
+    file.write_text("APP_INSTANCES='sonarr-4k:sonarr'\nSONARR_4K_URL='http://s4k.invalid'\n")
+    m = load(tmp_path)
+    got, plain = m.settings(str(file), environ), m.settings(str(file), {})
+    assert got == plain and got.from_env == () and list(got.apps) == ["radarr", "sonarr", "sonarr-4k"]
+
+
+@pytest.mark.parametrize("key, value", [("HEADER_REPAIR", "off"), ("HOOK_WORKERS", "0"), ("REPACK_MAX_GB", "lots"), ("SUBTITLES", ""),
+                                        ("REGRAB", "sound"), ("PLEX_PATH_MAP", "/a"), ("NAME", "a b"), ("APP_INSTANCES", "sonarr-4k")])
+def test_a_bad_value_from_the_environment_fails_the_selftest_as_in_the_env_file(tmp_path, monkeypatch, capsys, key, value):
+    """The same parsers read both, so the reading and the error are the same. The selftest line names the key."""
+    from_file = load(tmp_path, f"{key}='{value}'\n")
+    monkeypatch.setenv(key, value)
+    m = load(tmp_path, f"{key}='good'\n")
+    assert from_file.CFG.errors and dataclasses.asdict(m.CFG) == dict(dataclasses.asdict(from_file.CFG), from_env=(key,))
+    with pytest.raises(SystemExit) as ex:
+        m.main(["--selftest"])
+    assert str(ex.value) == "selftest failed: " + " ".join(from_file.CFG.errors)
+    assert capsys.readouterr().out == f"keys from the environment: {key}\n"
+
+
+@pytest.mark.parametrize("file_text, environ", [
+    ("APP_INSTANCES='sonarr-4k:sonarr'\n", {"SONARR_4K_URL": "http://s4k.invalid", "SONARR_4K_API_KEY": "k4k-0123456789",
+                                            "SONARR_4K_DIR": "/srv/s4k", "SONARR_4K_PATH_MAP": "/tv:/media/tv4k"}),
+    ("SONARR_4K_URL='http://s4k.invalid'\nSONARR_4K_API_KEY='k4k-0123456789'\nSONARR_4K_DIR='/srv/s4k'\nSONARR_4K_PATH_MAP='/tv:/media/tv4k'\n",
+     {"APP_INSTANCES": "sonarr-4k:sonarr"}),
+    ("APP_INSTANCES='sonarr-4k:sonarr'\nSONARR_4K_URL='http://file.invalid'\nSONARR_4K_API_KEY='file-0123456789'\n",
+     {"APP_INSTANCES": "sonarr-4k:sonarr", "SONARR_4K_URL": "http://s4k.invalid", "SONARR_4K_API_KEY": "k4k-0123456789",
+      "SONARR_4K_DIR": "/srv/s4k", "SONARR_4K_PATH_MAP": "/tv:/media/tv4k"})])
+def test_an_instance_reads_its_keys_from_the_environment_whichever_source_names_it(tmp_path, file_text, environ):
+    file = tmp_path / "env"
+    file.write_text(file_text)
+    cfg = load(tmp_path).settings(str(file), environ)
+    s = cfg.apps["sonarr-4k"]
+    assert (s.url, s.api_key, s.dir, s.path_map, s.program) == ("http://s4k.invalid", "k4k-0123456789", "/srv/s4k", [("/tv", "/media/tv4k")], "sonarr")
+    assert cfg.errors == [] and cfg.from_env == tuple(sorted(environ))
+
+
+def test_the_selftest_names_the_keys_from_the_environment_and_never_a_value(tmp_path, monkeypatch, capsys):
+    load(tmp_path).main(["--selftest"])
+    assert capsys.readouterr().out.splitlines()[0] == "keys from the environment: none"
+    for k, v in {"TMDB_TOKEN": "tmdb-0123456789", "WEBHOOK_PASSWORD": "pw-0123456789", "INSTANCE": "box-one"}.items():
+        monkeypatch.setenv(k, v)
+    load(tmp_path).main(["--selftest"])
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "keys from the environment: INSTANCE, TMDB_TOKEN, WEBHOOK_PASSWORD"
+    assert not {"tmdb-0123456789", "pw-0123456789", "box-one"} & set(re.split(r"[\s,]+", out)), out
+
+
+def test_mask_hides_each_secret_from_the_environment(tmp_path, monkeypatch):
+    environ = {"PLEX_TOKEN": "ptok-0123456789", "DISCORD_WEBHOOK": "https://d.invalid/hook", "WEBHOOK_PASSWORD": "a-long-password-1234",
+               "SABNZBD_API_KEY": "s4b-0123456789", "APP_INSTANCES": "sonarr-4k:sonarr", "SONARR_4K_URL": "http://s4k.invalid",
+               "SONARR_4K_API_KEY": "k4k-0123456789", "RADARR_API_KEY": "rkey-0123456789"}
+    for k, v in environ.items():
+        monkeypatch.setenv(k, v)
+    m = load(tmp_path, "PLEX_TOKEN='file-0123456789'\n")
+    assert m.mask(" ".join(environ.values())) == ("<PLEX_TOKEN> <DISCORD_WEBHOOK> <WEBHOOK_PASSWORD> <SABNZBD_API_KEY> sonarr-4k:sonarr "
+                                                  "http://s4k.invalid <SONARR_4K_API_KEY> <RADARR_API_KEY>")
+
+
+def test_mask_hides_radarrs_tmdb_key(tmp_path, monkeypatch):
+    """With no TMDB_TOKEN, a TMDB call sends Radarr's key from its DLL, else the built-in copy. An error text with
+    either key in its URL loses it."""
+    m = load(tmp_path)
+    monkeypatch.setattr(m.arr_meta, "radarr_token", lambda: "eyJdll.eyJtoken.0123456789")
+    assert m.mask(f"{m.arr_meta.RADARR_TOKEN} eyJdll.eyJtoken.0123456789") == "<RADARR_TMDB_TOKEN> <RADARR_DLL_TOKEN>"
+
+
+def yaml_lines(text):
+    """[(indent, text)] of the lines of a YAML file, less the comments and the blank lines."""
+    out = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+#.*|^\s*#.*", "", line).rstrip()
+        assert "\t" not in line, line
+        if line:
+            out.append((len(line) - len(line.lstrip(" ")), line.strip()))
+    return out
+
+
+def yaml_block(lines, i=0):
+    """(the block map or list that starts at lines[i], the index after it). It reads the subset of YAML that
+    docker/compose.yml uses, block maps and lists of plain or double-quoted scalars, and fails on any other line."""
+    indent, out = lines[i][0], None
+
+    def scalar(v):
+        assert v[:1] not in "[{&*!|>'%@`" and v.count('"') in (0, 2), v
+        return v[1:-1] if v[:1] == '"' == v[-1:] else v
+    while i < len(lines) and lines[i][0] >= indent:
+        assert lines[i][0] == indent, lines[i]
+        text = lines[i][1]
+        if text.startswith("- "):
+            out = [] if out is None else out
+            out.append(scalar(text[2:]))
+            i += 1
+            continue
+        key, sep, value = text.partition(":")
+        out = {} if out is None else out
+        assert sep and re.fullmatch(r"[\w.-]+", key) and key not in out and (not value or value[0] == " "), text
+        if value:
+            out[key], i = scalar(value.strip()), i + 1
+        else:
+            assert i + 1 < len(lines) and lines[i + 1][0] > indent, text
+            out[key], i = yaml_block(lines, i + 1)
+    return out, i
+
+
+def test_the_compose_file_runs_the_latest_image_once_each_placeholder_is_filled(tmp_path):
+    """docker/compose.yml is the default install. It is YAML, with its optional lines turned on too. Every key it sets
+    or offers is a setting. CHANGE_ME marks each value a user must fill, and the filled settings hold no error. Every
+    example of the image takes the tag latest."""
+    text = open(os.path.join(FILES, "docker", "compose.yml")).read()
+    full = re.sub(r"^( +)# (?=[A-Z][A-Z0-9_]*: |- /)", r"\1", text, flags=re.M)   # the optional lines turned on
+    (tree, end), (opt, _) = yaml_block(yaml_lines(text)), yaml_block(yaml_lines(full))
+    svc, opt = tree["services"]["arr-media-guard"], opt["services"]["arr-media-guard"]
+    assert end == len(yaml_lines(text)) and list(tree) == ["services", "volumes"] and tree["volumes"] == {"amg-state": {"name": "amg-state"}}
+    assert (svc["image"], svc["ports"], svc["restart"], svc["stop_grace_period"]) == (
+        "ghcr.io/samwiseg0/arr-media-guard:latest", ["8484:8484"], "unless-stopped", "1m")
+    assert svc["volumes"] == ["./arr-media-guard:/config", "amg-state:/config/state", "CHANGE_ME:/data"]
+    assert opt["volumes"] == svc["volumes"] + ["/dev/log:/dev/log"]
+    assert {k for k, v in svc["environment"].items() if "CHANGE_ME" in v} == {"RADARR_URL", "SONARR_URL", "RADARR_API_KEY", "SONARR_API_KEY"}
+    assert set(svc["environment"]) - {"RADARR_URL", "SONARR_URL", "RADARR_API_KEY", "SONARR_API_KEY"} == {"PUID", "PGID", "TZ"}
+    environ = {k: v.replace("CHANGE_ME", "filled-0123456789") for k, v in opt["environment"].items()}
+    cfg = load(tmp_path).settings("/nonexistent/arr-media-guard.env", environ)
+    assert cfg.errors == [] and cfg.from_env == tuple(sorted(set(environ) - {"PUID", "PGID", "TZ"})) and "sonarr-4k" in cfg.apps
+    docs = [os.path.join(FILES, n) for n in ["README.md", "docker/compose.yml"] + [f"docs/{d}" for d in os.listdir(os.path.join(FILES, "docs"))]]
+    tags = {t for n in docs for t in re.findall(r"ghcr\.io/samwiseg0/arr-media-guard(\S?[\w.-]*)", open(n).read())}
+    assert tags == {":latest"}, tags
+
+
+def test_an_api_key_left_as_change_me_sets_up_no_app(tmp_path):
+    """A Radarr-only user may leave the Sonarr lines of docker/compose.yml as shipped. CHANGE_ME then counts as no API
+    key, and the URL counts as shipped. So Sonarr is not set up, the start check says nothing of it, and the nightly
+    audit leaves it out. An instance with a URL of its own and the key CHANGE_ME warns to set the key."""
+    m = load(tmp_path, f"RADARR_URL='http://r.invalid:7878'\nRADARR_API_KEY='rkey-0123456789'\nSONARR_URL='http://CHANGE_ME:8989'\n"
+                       f"SONARR_API_KEY='CHANGE_ME'\nSONARR_DIR='{tmp_path}'\nAPP_INSTANCES='sonarr-4k:sonarr'\n"
+                       f"SONARR_4K_URL='http://s4k.invalid:8989'\nSONARR_4K_API_KEY='CHANGE_ME'\nSONARR_4K_DIR='{tmp_path}'\n")
+    assert [a.api_key for a in m.CFG.apps.values()] == ["rkey-0123456789", "", ""] and m.CFG.errors == []
+    assert m.arr_serve.apps_on() == ["radarr"]
+    with pytest.raises(FileNotFoundError) as ex:   # no key, and no config.xml in SONARR_DIR
+        m.api_key("sonarr")
+    assert m.no_key("sonarr", ex.value) is None
+    with pytest.raises(FileNotFoundError) as ex:
+        m.api_key("sonarr-4k")
+    assert m.no_key("sonarr-4k", ex.value).startswith("SONARR_4K_URL is set, but the Sonarr-4k API key does not read")

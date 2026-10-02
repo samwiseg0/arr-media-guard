@@ -19,6 +19,7 @@ test files assert codes and fields, so a reworded template changes this file onl
 
 Run: pytest tests/test_report.py
 """
+import ast
 import dataclasses
 import json
 import os
@@ -36,124 +37,156 @@ h = amg.load("arr_media_guard_report")
 h.CFG = dataclasses.replace(h.CFG, instance="host1", name="arr-media-guard")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SILENT = "all 3 audio samples are digital silence"
+SILENT = "the audio is silent at all 3 places checked"
 RESTORED = {"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None}
 NOTHING_BACK = {"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0, "stayed": "the recycle bin copy changed since its check"}
+LANGS = {"a1": "eng", "a2": "eng", "s1": "eng", "s2": "spa", "s3": "eng"}   # the language of each track place, see report.track_langs()
 
-# (finding, alert title, color, text in the done tense)
+# (finding, alert title, color, text in the done tense). LANGS names the track languages.
 FINDINGS = [
-    ({"kind": "language", "want": "English", "has": ["por"]}, "Wrong language", "amber", "No audio track is English. The file has por."),
-    ({"kind": "language", "want": "English or Spanish", "has": ["por", "fre"]}, "Wrong language", "amber",
-     "No audio track is English or Spanish. The file has por, fre."),
-    ({"kind": "runtime", "runs": "10:05", "listed": 62}, "Wrong runtime", "amber", "It runs 10:05, but the listed runtime is 62 minutes."),
-    ({"kind": "duration", "why": "The container says 3:05:08, but the streams run 2:03:26."}, "Broken duration header", "amber",
-     "The container says 3:05:08, but the streams run 2:03:26."),
-    ({"kind": "episode", "why": "the release's NFO says Squidtastic Voyage/That's No Lady, which Sonarr lists as S04E23, S04E27. It was imported "
-                                "as S04E15", "names": "S04E23 and S04E27"}, "Wrong episode", "amber",
-     "The release's NFO says Squidtastic Voyage/That's No Lady, which Sonarr lists as S04E23, S04E27. It was imported as S04E15. Check the "
-     "series' episode order in Sonarr, or import the file to S04E23 and S04E27 by hand."),
-    ({"kind": "content", "signals": ["the audio is por, the item's languages are eng", "the release name's year is 2017, the item's 1979"],
-      "points": 2}, "Wrong content", "amber",
-     "The audio is por, the item's languages are eng. The release name's year is 2017, the item's 1979. That is 2 points, and a re-grab needs 2."),
-    ({"kind": "audio", "doubts": ["1 of 3 audio samples are digital silence", "the late sample is empty"]}, "Audio check uncertain", "amber",
-     "1 of 3 audio samples are digital silence. The late sample is empty."),
-    ({"kind": "video", "doubts": ["1 of 3 video windows are bad"]}, "Video check uncertain", "amber", "1 of 3 video windows are bad."),
-    ({"kind": "audio", "certain": SILENT, "action": {"code": "dry_run"}}, "Broken audio", "red", "All 3 audio samples are digital silence."),
-    ({"kind": "video", "certain": "3 of 3 video windows are bad", "action": {"code": "unconfirmed"}}, "Corrupt video, not confirmed", "amber",
-     "3 of 3 video windows are bad."),
-    ({"kind": "damage", "fault": "the audio has invalid data", "line": "mkvmerge: invalid data.", "refusal": "the packets differ",
-      "action": {"code": "capped", "cap": 10}}, "Damaged source", "red",
-     "The conversion found a damaged source, because the audio has invalid data. mkvmerge: invalid data. The proof refused the new file, because "
-     "the packets differ."),
-    ({"kind": "damage", "fault": "the video has gaps", "line": "ffmpeg: gap", "refusal": None, "action": {"code": "would_regrab", "kind": "damage"}},
-     "Damaged source, would re-grab", "red", "The conversion found a damaged source, because the video has gaps. ffmpeg: gap."),
-    ({"kind": "repack", "container": "MP4/QuickTime", "why": "mkvmerge exited 2: x"}, "Repack failed", "amber",
-     "The repack into Matroska failed, so the original MP4/QuickTime file stays. Mkvmerge exited 2: x."),
-    ({"kind": "repack", "state": "converted", "note": "a conversion is done, and its 2 extras wait in .hide"}, "Stopped conversion", "amber",
-     "A conversion is done, and its 2 extras wait in .hide."),
-    ({"kind": "repack", "state": "remux", "note": "a conversion stopped in state remux"}, "Stopped conversion", "amber",
-     "A conversion stopped in state remux. Check these files by hand."),
-    ({"kind": "header", "why": "the size changed from 1000 to 2000 bytes"}, "Header repair failed", "amber",
-     "The header repair failed, so the file stays as it was. The size changed from 1000 to 2000 bytes."),
-    ({"kind": "cut", "why": "no runtime is listed, so a cut file cannot be told from a runaway subtitle"}, "File may be cut", "amber",
-     "A subtitle runs far past the video and the audio, but no runtime is listed, so a cut file cannot be told from a runaway subtitle. The file "
-     "may be cut, or the subtitle may belong to another episode or cut. It stays as it is, subtitles included. Check whether the video ends on "
-     "the credits."),
-    ({"kind": "subtitle", "issue": ["a subtitle event runs to 13:23:33, past the video and the audio at 1:54:33"], "tracks": ["7 (S_HDMV/PGS)"]},
-     "Subtitle runs past the end", "amber",
-     "A subtitle event runs to 13:23:33, past the video and the audio at 1:54:33. Subtitle track 7 (S_HDMV/PGS) is not SubRip, so the hook cannot cut it."),
-    ({"kind": "sublang", "mismatch": ["s1 is tagged eng, but its text reads as rum"], "muted": ["s1 loses its default and forced flags, x"]},
-     "Subtitle language", "amber",
-     "S1 is tagged eng, but its text reads as rum. Nothing else backs a new tag, so the tag stays. S1 loses its default and forced flags, x. Check "
-     "the track and fix its tag."),
-    ({"kind": "sublang", "mismatch": ["s1 is tagged eng, but its text reads as rum"], "muted": []}, "Subtitle language", "amber",
-     "S1 is tagged eng, but its text reads as rum. Nothing else backs a new tag, so the tag stays. Check the track and fix its tag."),
-    ({"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": ["a2 eng"]}, "Flag edit failed", "amber",
-     "The flag edit failed. VERIFY FAILED, flags did not change The file still reads, and its default tracks are a2 eng."),
-    ({"kind": "edit", "error": "mkvpropedit failed: x", "unread": "RuntimeError: mkvmerge: not a Matroska file", "on": None}, "Flag edit failed",
-     "amber", "The flag edit failed. mkvpropedit failed: x The file no longer reads: RuntimeError: mkvmerge: not a Matroska file"),
-    ({"kind": "edit", "error": "mkvpropedit failed: x", "unread": None, "on": None}, "Flag edit failed", "amber", "The flag edit failed. mkvpropedit failed: x "),
-    ({"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": []}, "Flag edit failed", "amber",
-     "The flag edit failed. VERIFY FAILED, flags did not change The file still reads, and its default tracks are none."),
-    ({"kind": "policy", "file": "/etc/arr-media-guard/policy.json", "error": "line 3: a comma is missing",
-      "action": {"code": "no_policy", "file": "Film A.mkv"}}, "Policy did not load", "amber",
-     "/etc/arr-media-guard/policy.json did not load, so the hook edits nothing. line 3: a comma is missing"),
+    ({"kind": "language", "want": "English", "has": ["por"]}, "Wrong audio language", "amber", "The audio is Portuguese, but it should be English."),
+    ({"kind": "language", "want": "English or Spanish", "has": ["por", "fre"]}, "Wrong audio language", "amber",
+     "The audio is French and Portuguese, but it should be English or Spanish."),
+    ({"kind": "runtime", "runs": "10:05", "listed": 62}, "Wrong runtime", "amber", "The file runs 10:05, but the listed runtime is 62 minutes."),
+    ({"kind": "duration", "why": "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong length."},
+     "Wrong length in the file", "amber", "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong "
+     "length."),
+    ({"kind": "episode", "imported": [["S04E15", "Ship Voyage"]], "said": "the release's NFO", "title": "Squidtastic Voyage/That's No Lady",
+      "names": "S04E23 and S04E27"}, "Maybe the wrong episode", "amber",
+     "Imported as S04E15 \"Ship Voyage\". The release's NFO calls it \"Squidtastic Voyage/That's No Lady\", which is S04E23 and S04E27."),
+    ({"kind": "episode", "imported": [["S01E02", "Sleepover"]], "said": "the release name", "title": "Anxious Times at Clone High",
+      "names": "S01E03"}, "Maybe the wrong episode", "amber",
+     "Imported as S01E02 \"Sleepover\". The release name calls it \"Anxious Times at Clone High\", which is S01E03."),
+    ({"kind": "episode", "imported": [["S01E05", None], ["S01E06", "Two"]], "said": "the file name", "title": "Three", "names": "S01E07"},
+     "Maybe the wrong episode", "amber", "Imported as S01E05 and S01E06 \"Two\". The file name calls it \"Three\", which is S01E07."),
+    ({"kind": "content", "signals": ["the audio is Portuguese, but it should be English",
+     "the release name says 2017, but the listed year is 1979"], "scored": ["language", "year"], "points": 2}, "Wrong content", "amber",
+     "The audio is Portuguese, but it should be English. The release name says 2017, but the listed year is 1979."),
+    ({"kind": "audio", "doubts": ["the audio is silent at 1 of 3 places checked", "no audio plays at an earlier place checked"]},
+     "Audio may be broken", "amber", "The audio is silent at 1 of 3 places checked. No audio plays at an earlier place checked."),
+    ({"kind": "video", "doubts": ["no video at 2:30"]}, "Video may be broken", "amber", "No video at 2:30."),
+    ({"kind": "audio", "certain": "the audio is silent at all 3 places checked", "action": {"code": "dry_run"}}, "Broken audio", "red",
+     "The audio is silent at all 3 places checked."),
+    ({"kind": "video", "certain": "the video is broken at 2 of 3 places checked: 2 playback errors at 6:10 and no video at 31:24",
+     "action": {"code": "unconfirmed"}}, "Broken video, not confirmed", "amber",
+     "The video is broken at 2 of 3 places checked: 2 playback errors at 6:10 and no video at 31:24."),
+    ({"kind": "damage", "fault": "part of the audio cannot be read",
+     "line": "This audio track contains 4096 bytes of invalid data which were skipped", "refusal": "the packet data of stream audio 1 (mp3) differ",
+     "action": {"code": "capped", "cap": 10}}, "Damaged file", "red",
+     "Converting the file to MKV showed that it's damaged, because part of the audio cannot be read. This "
+     "audio track contains 4096 bytes of invalid data which were skipped. The new MKV did not match the "
+     "original, because the packet data of stream audio 1 (mp3) differ."),
+    ({"kind": "damage", "fault": "parts of the file cannot be read", "line": "Invalid data found when processing input", "refusal": None,
+     "action": {"code": "would_regrab", "kind": "damage"}}, "Damaged file, re-grab is off", "red",
+     "Converting the file to MKV showed that it's damaged, because parts of the file cannot be read. Invalid data found when processing input."),
+    ({"kind": "repack", "container": "MP4/QuickTime", "why": "mkvmerge exited 2: x"}, "Conversion to MKV failed", "amber",
+     "Couldn't convert the MP4/QuickTime file to MKV, so the original was kept. Mkvmerge exited 2: x."),
+    ({"kind": "repack", "state": "converted", "note": "a conversion to MKV finished, and its 2 extras wait in .hide for the next --convert run"},
+     "Stopped conversion", "amber", "A conversion to MKV finished, and its 2 extras wait in .hide for the next --convert run."),
+    ({"kind": "repack", "state": "held",
+     "note": "a conversion to MKV stopped partway, after it hid the original. The original may be hidden as /m/.F.avi.held, "
+     "the new file is /m/F.mkv, and 0 extras may be hidden in .hide"}, "Stopped conversion", "amber",
+     "A conversion to MKV stopped partway, after it hid the original. The original may be hidden as /m/.F.avi.held, "
+     "the new file is /m/F.mkv, and 0 extras may be hidden in .hide."),
+    ({"kind": "header", "why": "the size changed from 1000 to 2000 bytes"}, "File repair failed", "amber",
+     "Couldn't repair the file, so it was left as it is. The size changed from 1000 to 2000 bytes."),
+    ({"kind": "cut", "why": "the video and audio stop at 21:11, but the listed runtime is 25 minutes, and the subtitles run to 23:05"},
+     "File may be cut short", "amber", "The video and audio stop at 21:11, but the listed runtime is 25 minutes, and the subtitles run to "
+     "23:05. The file may be cut short, or the subtitles may belong to another version. Nothing was changed."),
+    ({"kind": "subtitle", "issue": ["a subtitle event runs to 13:23:33, past the video and the audio at 1:54:33"], "tracks": [{"track": "s3",
+     "codec": "S_HDMV/PGS", "end": 48213.4, "streams": 6873.9}]}, "Subtitles run past the end", "amber",
+     "The English subtitles (track 3) keep going until 13:23:33, but the video and audio end at 1:54:33. "
+     "They're in PGS format, which can't be trimmed automatically, so they were left as they are."),
+    ({"kind": "sublang", "mismatch": ["subtitle track 1 is tagged English, but its text reads as Romanian"],
+     "muted": ["s1 loses its default and forced flags, x"]}, "Subtitle language may be wrong", "amber",
+     "Subtitle track 1 is tagged English, but its text reads as Romanian. Nothing else confirms another "
+     "language, so the tag was kept. Turned off its default and forced flags."),
+    ({"kind": "sublang", "mismatch": ["subtitle track 1 is tagged English, but its text reads as Romanian"], "muted": []},
+     "Subtitle language may be wrong", "amber", "Subtitle track 1 is tagged English, but its text reads as Romanian. Nothing else confirms another "
+     "language, so the tag was kept."),
+    ({"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": ["a2 eng", "s1 eng"]}, "Track flag change failed",
+     "amber", "Couldn't change which tracks play by default. The edit ran, but the flags did not change. The file "
+     "still opens, and its default tracks are the English audio (track 2) and the English subtitles (track 1)."),
+    ({"kind": "edit", "error": "mkvpropedit failed: x", "unread": "RuntimeError: mkvmerge: could not open the file", "on": None},
+     "Track flag change failed", "amber", "Couldn't change which tracks play by default. Mkvpropedit failed: x. The file no longer opens. "
+     "RuntimeError: mkvmerge: could not open the file"),
+    ({"kind": "edit", "error": "mkvpropedit failed: x", "unread": None, "on": None}, "Track flag change failed", "amber",
+     "Couldn't change which tracks play by default. Mkvpropedit failed: x."),
+    ({"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": []}, "Track flag change failed", "amber",
+     "Couldn't change which tracks play by default. The edit ran, but the flags did not change. The file "
+     "still opens, and no track plays by default."),
+    ({"kind": "policy", "file": "/etc/arr-media-guard/policy.json", "error": "line 3: a comma is missing", "action": {"code": "no_policy",
+     "file": "Film A.mkv"}}, "Policy file didn't load", "amber",
+     "/etc/arr-media-guard/policy.json didn't load, so no tracks are changed until it's fixed. line 3: a comma is missing"),
     ({"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "the words differ", "by": "hook", "kept": "/k/Film.mkv"}]},
-     "Wrong subtitle", "amber", "Subtitle track s1 does not match the audio, the words differ. The hook removed it, and the original file is kept at "
-                                "/k/Film.mkv."),
+     "Wrong subtitles", "amber", "The English subtitles (track 1) don't match what's said in the audio. Removed them and kept the "
+     "original file at /k/Film.mkv."),
     ({"kind": "subtiming", "lines": [{"code": "check_flash", "track": "s1", "median": 0.25}, {"code": "sweep", "far": [["s1", 3600, 1.5]]}]},
-     "Subtitle timing", "amber", "Subtitle s1 flashes its cues: its median cue shows 0.25 s. SUBTITLES is check, so its ends stay. The sweep heard "
-                                 "parts of the file off the fitted line: s1 at 1:00:00 by +1.50 s. The times stay as the check decided."),
+     "Subtitles out of sync", "amber", "The English subtitles (track 1) flash by too fast to read. Half the lines show for 0.25 s or less. "
+     "SUBTITLES is set to check, so they were left as they are. The English subtitles (track 1) are about "
+     "1.5 s late at 1:00:00. They were left as they are."),
+    ({"kind": "subtitle", "issue": ["a subtitle event runs to 26:01, past the video and the audio at 23:52"], "tracks": [{"track": "s2",
+     "codec": "S_TEXT/ASCII", "end": 1561.0, "streams": 1432.0}]}, "Subtitles run past the end", "amber",
+     "The Spanish subtitles (track 2) keep going until 26:01, but the video and audio end at 23:52. "
+     "They're in a format that can't be trimmed automatically, so they were left as they are."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
 ACTIONS = [
     ({"code": "regrabbed", "name": "Radarr", "kind": "audio", "n": 1}, ", re-grabbed",
-     "The hook deleted the file, re-monitored it and marked the grab failed, so Radarr searches again."),
-    (dict(RESTORED, code="regrabbed", kind="audio", n=1), ", old file restored",
-     "The hook put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr links it again. The hook deleted the broken "
-     "upgrade, re-monitored it and marked the grab failed, so Radarr searches again."),
-    (dict(RESTORED, code="regrabbed", kind="audio", n=1, failed_before=True), ", old file restored",
-     "The hook put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr links it again. The hook deleted the broken "
-     "upgrade and re-monitored it. The grab was already marked failed with the rest of its download."),
+     "Deleted the broken file and marked the grab as failed, so Radarr is searching for another copy."),
+    ({"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None,
+     "code": "regrabbed", "kind": "audio", "n": 1}, ", old file restored",
+     "Deleted the broken upgrade and marked the grab as failed, so Radarr is searching for another copy. "
+     "Put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr picked it up again."),
+    ({"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None,
+     "code": "regrabbed", "kind": "audio", "n": 1, "failed_before": True}, ", old file restored",
+     "Deleted the broken upgrade. Its download was already marked as failed, so Radarr is already "
+     "searching for another copy. Put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr picked it up again."),
     ({"code": "regrabbed", "name": "Radarr", "kind": "video", "n": 1, "failed_before": True}, ", re-grabbed",
-     "The hook deleted the file and re-monitored it. The grab was already marked failed with the rest of its download."),
+     "Deleted the broken file. Its download was already marked as failed, so Radarr is already searching for another copy."),
     ({"code": "regrabbed", "name": "Sonarr", "kind": "audio", "n": 3, "came": ["Show - s01e01 - HDTV-720p.mkv"], "linked": True, "own_copy": False,
-      "others": 1, "stayed": None}, ", old file restored",
-     "The hook put back the old file from the recycle bin: Show - s01e01 - HDTV-720p.mkv. Sonarr links it again. The hook deleted 3 broken files "
-     "of this download, re-monitored them and marked the grab failed once, so Sonarr searches again. The old file of 1 more broken file of this "
-     "download came back too."),
-    ({"code": "regrabbed", "name": "Sonarr", "kind": "content", "n": 2, "came": ["a.mkv", "b.mkv"], "linked": False, "own_copy": True,
-      "others": 2, "stayed": None}, ", old file restored",
-     "The hook put back the old files from its own copy: a.mkv, b.mkv. Sonarr did not link them within 120 seconds, so rescan the item by hand. "
-     "The hook deleted 2 files with the wrong content of this download, re-monitored them and marked the grab failed once, so Sonarr searches "
-     "again. The old file of 2 more broken files of this download came back too."),
-    (dict(NOTHING_BACK, code="regrabbed", kind="audio", n=1, stayed="the recycle bin no longer holds it"), ", re-grabbed",
-     "The hook deleted the file, re-monitored it and marked the grab failed, so Radarr searches again. The old file did not come back: the "
-     "recycle bin no longer holds it."),
-    (dict(NOTHING_BACK, code="searched"), ", re-grabbed",
-     "The hook deleted the broken import and sent Radarr a search for the item, because a manual import has no grab to mark failed. The old file "
-     "did not come back: the recycle bin copy changed since its check."),
-    (dict(NOTHING_BACK, code="deleted"), "",
-     "The broken import is deleted. Its item was not monitored, so the hook sent no search. The old file did not come back: the recycle bin copy "
-     "changed since its check."),
-    (dict(RESTORED, code="restored"), ", old file restored",
-     "The hook put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr links it again. The hook deleted the broken "
-     "import. It was a manual import, so no grab is marked failed and Radarr does not search."),
-    (dict(NOTHING_BACK, code="no_grab", stayed="its recycle bin copy or its path changed before the delete"), "",
-     "Radarr has no grab record for it, so the file stays. The old file did not come back: its recycle bin copy or its path changed before the "
-     "delete."),
-    ({"code": "no_grab", "name": "Radarr"}, "", "Radarr has no grab record for it, so the file stays."),
-    ({"code": "would_regrab", "kind": "audio"}, ", would re-grab",
-     "A re-grab would delete the file and search again. REGRAB does not list audio, so the file stays."),
-    ({"code": "unconfirmed"}, ", not confirmed", "A second check did not find the same fault, so the file stays."),
-    ({"code": "capped", "cap": 10}, "", "The cap of 10 re-grabs a day is reached, so the file stays."),
-    ({"code": "failed", "step": "the delete", "error": "HTTPError: 500"}, "", "The re-grab stopped at the delete: HTTPError: 500"),
+     "others": 1, "stayed": None}, ", old file restored",
+     "Deleted 3 broken files from this download and marked the grab as failed, so Sonarr is searching for "
+     "other copies. Put back the old file from the recycle bin: Show - s01e01 - HDTV-720p.mkv. Sonarr "
+     "picked it up again. Also put back the old file of 1 more broken file from this download."),
+    ({"code": "regrabbed", "name": "Sonarr", "kind": "content", "n": 2, "came": ["a.mkv", "b.mkv"], "linked": False, "own_copy": True, "others": 2,
+     "stayed": None}, ", old file restored", "Deleted 2 files with the wrong content from this download and marked the grab as failed, so Sonarr "
+     "is searching for other copies. Put back the old files from the kept copies: a.mkv, b.mkv. Sonarr "
+     "didn't pick them up within 120 seconds. Also put back the old files of 2 more broken files from this download."),
+    ({"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0, "stayed": "the recycle bin no longer holds it",
+     "code": "regrabbed", "kind": "audio", "n": 1}, ", re-grabbed",
+     "Deleted the broken file and marked the grab as failed, so Radarr is searching for another copy. The "
+     "old file wasn't put back, because the recycle bin no longer holds it."),
+    ({"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0, "stayed": "the recycle bin copy changed since its check",
+     "code": "searched"}, ", re-grabbed", "Deleted the broken file and asked Radarr to search for another copy. It was a manual import, so "
+     "there was no grab to mark as failed. The old file wasn't put back, because the recycle bin copy changed since its check."),
+    ({"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0, "stayed": "the recycle bin copy changed since its check",
+     "code": "deleted"}, "", "Deleted the broken file. Its item isn't monitored, so no search was started. The old file wasn't put "
+     "back, because the recycle bin copy changed since its check."),
+    ({"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None,
+     "code": "restored"}, ", old file restored",
+     "Deleted the broken file. It was a manual import, so there was no grab to mark as failed, and Radarr "
+     "won't search for another copy. Put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr picked it up again."),
+    ({"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0,
+     "stayed": "its recycle bin copy or its path changed before the delete", "code": "no_grab"}, "",
+     "Radarr has no record of grabbing it, so the file was kept. The old file wasn't put back, because its "
+     "recycle bin copy or its path changed before the delete."),
+    ({"code": "no_grab", "name": "Radarr"}, "", "Radarr has no record of grabbing it, so the file was kept."),
+    ({"code": "would_regrab", "kind": "audio"}, ", re-grab is off", "Re-grabs for broken audio are off, so the file was kept."),
+    ({"code": "unconfirmed"}, ", not confirmed", "A second check didn't find the same problem, so the file was kept."),
+    ({"code": "capped", "cap": 10}, "", "The limit of 10 re-grabs a day was reached, so the file was kept."),
+    ({"code": "failed", "step": "the delete", "error": "HTTPError: 500"}, "", "The re-grab failed during the delete. HTTPError: 500"),
     ({"code": "failed", "manual": True, "step": "reading which items are monitored", "error": "x" * 300}, "",
-     ("The restore stopped at reading which items are monitored: " + "x" * 300)[:300]),
-    ({"code": "dry_run"}, "", "Dry run."),
-    ({"code": "no_policy", "file": "Film A.mkv"}, "", "Skipped Film A.mkv. Fix the policy file."),
+     ("The restore failed during reading which items are monitored. " + "x" * 300)[:300]),
+    ({"code": "dry_run"}, "", "Dry run, so nothing was changed."),
+    ({"code": "no_policy", "file": "Film A.mkv"}, "", "Skipped Film A.mkv."),
+    ({"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 1, "stayed": "the recycle bin copy changed since its check",
+     "code": "restored"}, "", "Deleted the broken file. It was a manual import, so there was no grab to mark as failed, and Radarr won't search "
+     "for another copy. Also put back the old file of 1 more broken file from this download. The old file wasn't put back, because the recycle "
+     "bin copy changed since its check."),
 ]
+
 
 HARDLINKED = ("--apply would leave the file as it is, because it has another hard link, such as the download client's copy. Run --apply again "
               "after the other link is gone, for example after the download client removes its copy.")
@@ -179,56 +212,85 @@ STAYS = {"code": "stays", "track": "s1", "why": "the words differ", "gone": Fals
 # (sentence of a subtitle alert, its text when done, its text when planned)
 SUB_LINES = [
     ({"code": "removed", "track": "s2", "why": "the words differ", "by": "run", "kept": "/k/F.mkv"},
-     "Subtitle track s2 does not match the audio, the words differ. This run removed it, and the original file is kept at /k/F.mkv.", None),
-    (STAYS, "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because the file was not remuxed. It loses its "
-            "default and forced flags.",
-     "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because the file was not remuxed. --apply would turn "
-     "its default and forced flags off."),
-    (dict(STAYS, flags_off=False, kept_back="check"), "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because "
-                                                      "SUBTITLES is check, so the file stays as it is. Its flags stay.", None),
-    (dict(STAYS, kept_back="keep_days"), "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because "
-                                         "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept. It loses its default and forced flags.",
-     "Subtitle track s1 does not match the audio, the words differ. The track would stay in the file, because a removal keeps the original, and "
-     "KEEP_ORIGINALS_DAYS is 0. Set KEEP_ORIGINALS_DAYS above 0 to remove it. --apply would turn its default and forced flags off."),
-    (dict(STAYS, gone=True, result="subtitle remux failed: x", block={"code": "remux"}, hardlinked=False),
-     "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because subtitle remux failed: x. It loses its default "
-     "and forced flags.", "Subtitle track s1 does not match the audio, the words differ. --apply would remove it."),
-    (dict(STAYS, gone=True, result="subtitle remux skipped, x", block={"code": "cap", "why": "over the 30 GB repack cap"}, hardlinked=False),
-     "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because subtitle remux skipped, x. It loses its default "
-     "and forced flags.",
-     "Subtitle track s1 does not match the audio, the words differ. --apply would skip the remux, because the file is over the 30 GB repack cap. "
-     "Raise REPACK_MAX_GB to remux it. The track would stay in the file. --apply would turn its default and forced flags off."),
-    (dict(STAYS, gone=True, result="subtitle remux skipped, hardlinked", block={"code": "hardlinked", "why": "hardlinked"}, hardlinked=True),
-     "Subtitle track s1 does not match the audio, the words differ. It stays in the file, because subtitle remux skipped, hardlinked. It loses its "
-     "default and forced flags.", f"Subtitle track s1 does not match the audio, the words differ. {HARDLINKED}"),
+     "The Spanish subtitles (track 2) don't match what's said in the audio. Removed them and kept the original file at /k/F.mkv.", None),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": False, "result": None, "kept_back": None, "flags_off": True},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because the run could not remove them. Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because the run could not remove them. --apply would turn their default and forced flags off."),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": False, "result": None, "kept_back": "check", "flags_off": False},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because SUBTITLES is set to check. Their flags were left as they are.", None),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": False, "result": None, "kept_back": "keep_days", "flags_off": True},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original. Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. They would stay in the file, "
+     "because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set KEEP_ORIGINALS_DAYS above 0 "
+     "to remove them. --apply would turn their default and forced flags off."),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": True, "result": "subtitle remux failed: mkvmerge exited 2",
+     "kept_back": None, "flags_off": True, "block": {"code": "remux"}, "hardlinked": False},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because rewriting the file failed (mkvmerge exited 2). Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. --apply would remove them."),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": True,
+     "result": "subtitle remux skipped, over the 30 GB repack cap: remove track 3", "kept_back": None, "flags_off": True, "block": {"code": "cap",
+     "why": "over the 30 GB repack cap"}, "hardlinked": False},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because the file is over the 30 GB limit of REPACK_MAX_GB. Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. --apply would skip the remux, "
+     "because the file is over the 30 GB repack cap. Raise REPACK_MAX_GB to remux it. They would stay in "
+     "the file. --apply would turn their default and forced flags off."),
+    ({"code": "stays", "track": "s1", "why": "the words differ", "gone": True, "result": "subtitle remux skipped, hardlinked: remove track 3",
+     "kept_back": None, "flags_off": True, "block": {"code": "hardlinked", "why": "hardlinked"}, "hardlinked": True},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
+     "because the file has another hard link, such as the download client's copy. Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. --apply would leave the file "
+     "as it is, because it has another hard link, such as the download client's copy. Run --apply again "
+     "after the other link is gone, for example after the download client removes its copy."),
     ({"code": "sidecar", "name": "F.en.srt", "why": "the words differ", "kept": "/k/F.en.srt", "left": None},
-     "The sidecar F.en.srt does not match the audio, the words differ. It moved to /k/F.en.srt. A program such as Bazarr can download it again.", None),
+     "The subtitles in F.en.srt don't match what's said in the audio. Moved the file to /k/F.en.srt.", None),
     ({"code": "sidecar", "name": "F.en.srt", "why": "the words differ", "kept": None, "left": None},
-     "The sidecar F.en.srt does not match the audio, the words differ. It stays beside the file: a dry run. A program such as Bazarr can "
-     "download it again.", None),
+     "The subtitles in F.en.srt don't match what's said in the audio. The file was left beside the video, because this is a dry run.", None),
     ({"code": "converted_sidecar", "name": "F.fr.srt", "why": "the words differ", "kept": None, "left": "it does not read"},
-     "The sidecar F.fr.srt does not match the audio, the words differ. The conversion left it out. It stays beside the file: it does not read.", None),
+     "The subtitles in F.fr.srt don't match what's said in the audio, so the conversion to MKV left them "
+     "out. The file was left beside the video, because it does not read.", None),
     ({"code": "converted_track", "track": "s1", "why": "the words differ", "kept": "/k/F.mp4"},
-     "Subtitle track s1 does not match the audio, the words differ. The conversion left it out, and the original file is kept at /k/F.mp4.", None),
-    ({"code": "sidecar_left", "name": "F.en.srt", "why": "a fix of +2.00 s", "left": "SUBTITLES is check, so the file stays as it is"},
-     "The sidecar F.en.srt needs new times, a fix of +2.00 s, but it stays as it was: SUBTITLES is check, so the file stays as it is.", None),
-    ({"code": "off", "track": "s2", "ref": None, "why": "the cues are off"}, "Subtitle track s2 is off the audio: the cues are off. Its times stay.", None),
-    ({"code": "off", "track": "F.en.srt", "ref": "s1", "why": "the cues are off"},
-     "Subtitle F.en.srt disagrees with the reference track s1: the cues are off. Its times stay.", None),
+     "Subtitle track 1 of the original file doesn't match what's said in the audio, so the conversion to "
+     "MKV left it out. The original file is kept at /k/F.mp4.", None),
+    ({"code": "sidecar_left", "name": "F.en.srt", "why": "a fix of +2.00 s", "left": "SUBTITLES is set to check", "action": "retime"},
+     "The subtitles in F.en.srt are out of sync, but the file was left as it is, because SUBTITLES is set to check.", None),
+    ({"code": "off", "track": "s2", "ref": None, "why": "the cues are off", "offsets": [2.55, 5.28], "unfixed": None},
+     "The Spanish subtitles (track 2) are out of sync by different amounts in different parts of the file: "
+     "2.5 s and 5.3 s late. One shift can't fix that, so they were left as they are.", None),
+    ({"code": "off", "track": "F.en.srt", "ref": "s1", "why": "the cues are off", "offsets": None, "unfixed": -2.04},
+     "The subtitles in F.en.srt seem about 2.0 s early compared with the English subtitles (track 1), but "
+     "no fix lined them up well enough, so they were left as they are.", None),
     ({"code": "off", "track": "s2", "ref": "F.en.srt", "why": "the cues are off"},
-     "Subtitle track s2 disagrees with the reference sidecar F.en.srt: the cues are off. Its times stay.", None),
-    ({"code": "not_retimed", "tracks": ["s1", "s2"], "result": "subtitle remux skipped, low space", "block": {"code": "remux"}},
-     "Subtitle track s1, s2 needs new times, but subtitle remux skipped, low space. The file stays as it was.",
-     "Subtitle track s1, s2 needs new times. --apply would remux the file."),
-    ({"code": "check_times", "track": "s1", "why": "a fix of +2.00 s"}, "Subtitle s1 needs new times: a fix of +2.00 s. SUBTITLES is check, so its "
-                                                                        "times stay.", None),
-    ({"code": "check_flash", "track": "s1", "median": 0.254}, "Subtitle s1 flashes its cues: its median cue shows 0.25 s. SUBTITLES is check, so "
-                                                              "its ends stay.", None),
+     "The Spanish subtitles (track 2) are out of sync compared with the subtitles in F.en.srt, but no fix "
+     "lined them up well enough, so they were left as they are.", None),
+    ({"code": "not_retimed", "tracks": ["s1", "s3"], "result": "subtitle remux skipped, low space: 1.0 GB free for 8.0 GB: track 2: +2.000 s",
+     "block": {"code": "remux"}}, "Subtitle tracks 1 and 3 (English) need new times, but the fix failed, because only 1.0 GB is free "
+     "for the 8.0 GB file. The file was left as it is.", "Subtitle tracks 1 and 3 (English) need new times. --apply would remux the file."),
+    ({"code": "not_retimed", "tracks": ["s1"],
+     "result": "subtitle remux failed, the original changed: the app replaced or renamed the original during the subtitle remux",
+     "block": {"code": "remux"}}, "The English subtitles (track 1) need new times, but the fix failed, because the app replaced or "
+     "renamed the file at the same time. The file was left as it is.",
+     "The English subtitles (track 1) need new times. --apply would remux the file."),
+    ({"code": "check_times", "track": "s1", "why": "a fix of +2.00 s", "fix": {"offset": 2.0, "rate": "1/1"}},
+     "The English subtitles (track 1) are about 2.0 s late. SUBTITLES is set to check, so they were left as they are.", None),
+    ({"code": "check_times", "track": "s2", "why": "a fix of -1.25 s and the ratio 25/24", "fix": {"offset": -1.25, "rate": "25/24"}},
+     "The Spanish subtitles (track 2) are about 1.2 s early at the start and drift over time. SUBTITLES is "
+     "set to check, so they were left as they are.", None),
+    ({"code": "check_flash", "track": "s1", "median": 0.254},
+     "The English subtitles (track 1) flash by too fast to read. Half the lines show for 0.25 s or less. "
+     "SUBTITLES is set to check, so they were left as they are.", None),
     ({"code": "sweep", "far": [["s1", 3600.4, 1.5], ["s1", 3660.2, -1.25]]},
-     "The sweep heard parts of the file off the fitted line: s1 at 1:00:00 by +1.50 s, s1 at 1:01:00 by -1.25 s. The times stay as the check "
-     "decided.", None),
+     "The English subtitles (track 1) are out of sync: 1.5 s late at 1:00:00 and 1.2 s early at 1:01:00. They were left as they are.", None),
+    ({"code": "sweep", "far": [["s1", 257.8, 139.06], ["s1", 499.9, 138.87], ["s1", 725.2, 138.43], ["s1", 900.0, 138.68]]},
+     "The English subtitles (track 1) are about 2 min 19 s late at 4:17, 8:19, 12:05 and 15:00. They were left as they are.", None),
+    ({"code": "sweep", "far": [["s1", 1366.4, 2.54], ["s1", 1381.6, 1.66], ["s3", 1366.4, 2.54], ["s3", 1381.6, 1.66]]},
+     "Subtitle tracks 1 and 3 (English) are late by 2.5 s at 22:46 and 1.7 s at 23:01. They were left as they are.", None),
 ]
-
 
 def test_every_template_has_a_golden():
     assert {f["kind"] for f, *_ in FINDINGS} == set(h.FINDINGS)
@@ -240,14 +302,14 @@ def test_every_template_has_a_golden():
 @pytest.mark.parametrize("f, title, color, text", FINDINGS)
 def test_each_finding_has_its_title_color_and_text(f, title, color, text):
     assert h.title(f) == (title, color)
-    assert h.texts(f, "done")[0] == text
+    assert h.texts(f, "done", LANGS)[0] == text
 
 
 @pytest.mark.parametrize("a, end, text", ACTIONS)
 def test_each_action_has_its_title_and_text(a, end, text):
     f = {"kind": "audio", "certain": SILENT, "action": a}
     assert h.title(f) == ("Broken audio" + end, "amber" if a["code"] == "unconfirmed" else "red")
-    assert h.texts(f, "done") == ("All 3 audio samples are digital silence.", text)
+    assert h.texts(f, "done") == ("The audio is silent at all 3 places checked.", text)
     assert h.texts(f, "planned") == h.texts(f, "done")   # a re-grab runs only in an apply, so its words have one tense
 
 
@@ -258,14 +320,21 @@ def test_each_dry_run_block_says_what_apply_would_do(b, text):
 
 @pytest.mark.parametrize("x, done, planned", SUB_LINES)
 def test_each_subtitle_sentence_in_each_tense(x, done, planned):
-    assert h.sub_line(x, "done") == done
-    assert h.sub_line(x, "planned") == (planned or done)
+    assert h.unmarked(h.sub_line(x, "done", LANGS)) == done
+    assert h.unmarked(h.sub_line(x, "planned", LANGS)) == (planned or done)
+
+
+def test_a_language_has_its_english_name():
+    """A code in ALIAS takes the name of its set, an unknown code stays as it is."""
+    assert [h.arr_decide.lang_name(c) for c in ("fre", "gle", "zho", "per", "und", None, "xyz")] == \
+        ["French", "Irish", "Chinese", "Persian", "untagged", "untagged", "xyz"]
+    assert h.arr_decide.lang_names(["eng", "jpn", "jap"], "or") == "English or Japanese" and h.late_by([2.54, -1.25]) == "2.5 s late and 1.2 s early"
 
 
 def test_a_template_that_fails_costs_only_its_text():
     """A finding that lacks a fact gives a line that says so, and the decision line and the other alerts still go out."""
-    assert h.texts({"kind": "language"}, "done") == ("no text: KeyError: 'want'", None)
-    assert h.alert_line({"kind": "language"}, "done") == "language: no text: KeyError: 'want'"
+    assert h.texts({"kind": "language"}, "done") == ("no text: KeyError: 'has'", None)
+    assert h.alert_line({"kind": "language"}, "done") == "language: no text: KeyError: 'has'"
 
 
 def decision(**kw):
@@ -281,8 +350,8 @@ def test_the_log_target_is_the_decision_line(monkeypatch):
     rec = h.render(dict(decision(), took=1.5), "log")
     assert {k: rec[k] for k in ("schema", "version", "host", "outcome", "took")} == {"schema": h.SCHEMA, "version": "0123456789ab",
                                                                                       "host": h.HOST, "outcome": "edited", "took": 1.5}
-    assert rec["alerts"] == ["language: No audio track is English. The file has por.",
-                             "audio: All 3 audio samples are digital silence. The cap of 10 re-grabs a day is reached, so the file stays."]
+    assert rec["alerts"] == ["language: The audio is Portuguese, but it should be English.",
+                             "audio: The audio is silent at all 3 places checked. The limit of 10 re-grabs a day was reached, so the file was kept."]
     assert h.render({"app": "radarr", "result": "x"}, "log")["outcome"] == "other" and "alerts" not in h.render({}, "log")
     assert h.render(dict(decision(), findings=[]), "log")["alerts"] == []
 
@@ -294,13 +363,220 @@ def test_the_logfmt_target_keeps_every_key():
     assert h.render({}, "logfmt") == 'arr="" source="" outcome=other class="" edits=0 reasons="" alerts="" tmdb=not_asked label="" id=""'
 
 
+def test_a_job_error_names_its_error_and_its_job_in_the_logfmt_line():
+    """hd 2026-10-01: a store failure before the job read its file logged an error line with no app, label or path. The
+    syslog line keeps its keys in their order, takes the job file as the label, and ends with the error."""
+    rec = {"source": "hook", "job": "1790904088348071068-813305.json", "outcome": "error", "result": "error: OperationalError: disk I/O error"}
+    assert h.render(rec, "logfmt") == ('arr="" source=hook outcome=error class="" edits=0 reasons="" alerts="" tmdb=not_asked '
+                                       'label=1790904088348071068-813305.json id="" error="error: OperationalError: disk I/O error"')
+    rec = dict(rec, path="/tv/Show/Season 1/Show - s01e01.mkv", result="error: " + "x" * 300)
+    assert h.render(rec, "logfmt").endswith(f'label="Show - s01e01.mkv" id="" error="error: {"x" * 143}"')
+    assert "error=" not in h.render(decision(), "logfmt")
+
+
 def test_the_embed_target_is_one_embed_per_finding():
     language, audio = h.render(decision(), "embed")
     assert {k: v for k, v in language.items() if k != "timestamp"} == {
-        "title": "Wrong language", "description": "No audio track is English. The file has por.", "color": h.COLORS["amber"],
-        "fields": [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}], "footer": {"text": "TMDB found the item · arr-media-guard on host1"}}
+        "title": "Wrong audio language", "description": "The audio is **Portuguese**, but it should be English.", "color": h.COLORS["amber"],
+        "fields": [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}], "footer": {"text": "arr-media-guard on host1"}}
     assert (audio["title"], audio["color"], audio["description"]) == (
-        "Broken audio", h.COLORS["red"], "All 3 audio samples are digital silence.\nThe cap of 10 re-grabs a day is reached, so the file stays.")
+        "Broken audio", h.COLORS["red"], "The audio is silent at all 3 places checked.\nThe limit of 10 re-grabs a day was reached, so the file was "
+                                         "kept.")
+
+
+# The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
+# program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
+# track a conversion left out. Every other golden posts, a doubt and a failed restore too.
+LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10}}
+SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track")   # the sentences of a submatch finding
+
+
+def every_alert():
+    """(group, place, finding) of each golden: each finding, broken audio with each action, each subtitle sentence alone."""
+    return ([("findings", i, f) for i, (f, *_) in enumerate(FINDINGS)]
+            + [("actions", i, {"kind": "audio", "certain": SILENT, "action": a}) for i, (a, *_) in enumerate(ACTIONS)]
+            + [("sub_lines", i, {"kind": "submatch" if x["code"] in SUB_MATCH else "subtiming", "lines": [x]}) for i, (x, *_) in enumerate(SUB_LINES)])
+
+
+def post_all(monkeypatch):
+    """alert_findings() of each golden in a record of its own, with each post faked. A re-grab decides for the other
+    findings of its record, so each golden needs its own. Returns (what each finding gave, the titles posted)."""
+    sent = []
+    monkeypatch.setattr(h, "post", lambda app, emb: sent.append(emb["title"]) or "sent")
+    monkeypatch.setattr(h.store, "add", lambda *a: True)   # no marker from an earlier post
+    tracks = [{"i": k, "lang": v} for k, v in LANGS.items()]
+    return [h.alert_findings(dict(decision(), tracks=tracks, findings=[f]), 1)[0] for *_, f in every_alert()], sent
+
+
+def test_a_fixed_problem_logs_only_and_every_other_alert_posts(monkeypatch):
+    """The shared gate, report.posts(), decides for every alert kind, action and subtitle sentence. The decision line keeps
+    every finding, and its alert_result says "log only" for each one that did not post."""
+    got, sent = post_all(monkeypatch)
+    want = ["log only" if i in LOG_ONLY[g] else "sent" for g, i, _ in every_alert()]
+    assert got == want, [(g, i, h.title(f)[0], r) for (g, i, f), r, w in zip(every_alert(), got, want) if r != w]
+    assert sent == [h.title(f)[0] for (g, i, f), r in zip(every_alert(), got) if r == "sent"]
+
+
+def test_the_shared_gate_is_the_only_gate(monkeypatch):
+    """Mutation check: with report.posts() open every alert posts, and with it shut none does. So no other check in the
+    shared path holds an alert back or lets one through."""
+    monkeypatch.setattr(h, "posts", lambda f, rec=None: True)
+    got, sent = post_all(monkeypatch)
+    assert got == ["sent"] * len(every_alert()) and len(sent) == len(got)
+    monkeypatch.setattr(h, "posts", lambda f, rec=None: False)
+    got, sent = post_all(monkeypatch)
+    assert got == ["log only"] * len(every_alert()) and sent == []
+
+
+LENGTH = {"kind": "duration", "why": "The file says it runs 26:01, but the video and audio stop at 23:52. The runtime check was skipped."}
+REGRABBED = {"code": "regrabbed", "name": "Sonarr", "kind": "video", "n": 1}
+DOUBT = {"kind": "audio", "doubts": ["the audio fails to play at 1 of 3 places checked"]}
+LANGUAGE, RUNTIME, EPISODE, CONTENT = (FINDINGS[i][0] for i in (0, 2, 4, 7))
+
+
+@pytest.mark.parametrize("findings, want", [
+    ([{"kind": "video", "certain": "x", "action": REGRABBED}, DOUBT], ["log only", "log only"]),   # hd, Outlander S05E08
+    ([{"kind": "video", "certain": "x", "action": dict(REGRABBED, code="deleted")}, DOUBT, LANGUAGE], ["sent", "log only", "log only"]),
+    ([dict(CONTENT, action={"code": "regrabbed", "name": "Radarr", "kind": "content", "n": 1}), LANGUAGE, RUNTIME, LENGTH],
+     ["log only"] * 4),
+    ([dict(CONTENT, action={"code": "would_regrab", "kind": "content"}, scored=["language", "runtime"]), LANGUAGE, RUNTIME, EPISODE, LENGTH, DOUBT],
+     ["sent", "log only", "log only", "sent", "sent", "sent"]),
+    ([dict(CONTENT, action={"code": "would_regrab", "kind": "content"}), EPISODE], ["sent", "sent"]),   # the episode signal scores 0 points
+    ([dict(CONTENT, signals=["the release name says 2017, but the listed year is 1979", "it runs 10 minutes, but the listed runtime is 62 minutes"],
+           scored=["year", "runtime"]), LANGUAGE], ["sent", "sent"]),                              # TMDB couldn't tell, the tracks found it
+    ([CONTENT, LANGUAGE], ["sent", "log only"]),                                                   # a backfill finds it, nothing re-grabs
+    ([{"kind": "audio", "certain": SILENT, "action": dict(ACTIONS[19][0])}, DOUBT], ["sent", "log only"]),   # no old file of its own came back
+    ([{"kind": "audio", "certain": SILENT, "action": dict(ACTIONS[5][0])}], ["sent"]),            # the app didn't pick the old files up
+    ([{"kind": "audio", "certain": SILENT, "action": dict(ACTIONS[9][0])}, DOUBT], ["log only", "log only"]),
+])
+def test_a_fix_that_worked_logs_every_finding_of_its_file(monkeypatch, findings, want):
+    """One cause posts once. A re-grab or a restore that worked logs only, and so does every other finding of the file
+    it deleted. A restore that put back no old file of its own, or old files the app did not pick up, posts. A
+    wrong-content alert names each signal that scored. A language or runtime finding logs only beside it when it names
+    that signal. The episode signal scores no points, so the episode finding posts. A language finding that only the
+    track decision found posts too."""
+    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h.store, "add", lambda *a: True)
+    assert h.alert_findings(decision(findings=findings), 1) == want
+
+
+@pytest.mark.parametrize("code, others, want", [
+    ("header_repaired", [], ["log only"]),                                                   # the repair fixed it
+    ("header_repair_failed", [{"kind": "header", "why": "x"}], ["log only", "sent"]),        # "File repair failed" names the cause
+    ("subtitle_file_may_be_cut", [{"kind": "cut", "why": "x"}], ["log only", "sent"]),
+    ("subtitle_overrun_unfixable", [{"kind": "subtitle", "issue": [], "tracks": []}], ["log only", "sent"]),
+    (None, [], ["sent"]),                                                                    # HEADER_REPAIR off: no repair ran
+    ("header_not_repaired", [], ["sent"]),                                                   # a fault blocked the repair
+])
+def test_a_wrong_length_posts_once_and_only_when_no_repair_ran(monkeypatch, code, others, want):
+    """One cause posts once. A wrong length in the file logs only when the repair fixed it, or when the alert of a failed
+    repair, a cut file or a subtitle past the end already names its cause."""
+    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h.store, "add", lambda *a: True)
+    rec = decision(findings=[LENGTH, *others], **({"header_repair": {"code": code}} if code else {}))
+    assert h.alert_findings(rec, 1) == want
+
+
+def test_an_embed_bolds_the_names_and_escapes_their_markdown():
+    """The embed bolds the episode titles and the track names. A markdown character in a name is escaped, so it never
+    breaks the bold. The decision line and the CLI stay plain."""
+    f = {"kind": "episode", "imported": [["S01E02", "Sleep*over_"]], "said": "the release name", "title": "Anxious ~Times~ at `Clone` | High\\",
+         "names": "S01E03"}
+    (e,) = h.render(decision(findings=[f]), "embed")
+    assert e["description"] == ('Imported as S01E02 **"Sleep\\*over\\_"**. The release name calls it **"Anxious \\~Times\\~ at \\`Clone\\` '
+                                '\\| High\\\\"**, which is S01E03.')
+    assert h.render(decision(findings=[f]), "log")["alerts"] == ['episode: Imported as S01E02 "Sleep*over_". The release name calls it '
+                                                                 '"Anxious ~Times~ at `Clone` | High\\", which is S01E03.']
+    lines = [{"code": "check_times", "track": "s1", "why": "x", "fix": {"offset": 139.06, "rate": "1/1"}}, {"code": "removed", "track": "s2",
+             "why": "x", "kept": "/k/F_1.mkv"}]
+    (e,) = h.render(decision(findings=[{"kind": "subtiming", "lines": lines}], tracks=[{"i": "s1", "lang": "eng"}, {"i": "s2", "lang": "spa"}]), "embed")
+    assert e["description"] == ("The **English subtitles (track 1)** are **about 2 min 19 s late**.\nSUBTITLES is set to check, so they were left as "
+                                "they are.\nThe **Spanish subtitles (track 2)** don't match what's said in the audio.\nRemoved them and kept the "
+                                "original file at /k/F\\_1.mkv.")
+
+
+def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
+    """hd record 43: the file name in an edit error holds "PJ Robot Vs. Romeo", and the label of another show holds
+    markdown. The embed breaks no line inside a fact, and escapes the markdown of the field too. The decision line
+    keeps its plain text."""
+    f = {"kind": "edit", "error": "mkvpropedit failed: Error: The file 'PJ Robot Vs. Romeo.mkv' is not a Matroska file.", "unread": None,
+         "on": ["a1 eng"]}
+    rec = decision(findings=[f], label="M*A*S*H S01E01", path="/tv/M_A_S_H.mkv")
+    (e,) = h.render(rec, "embed")
+    assert e["description"] == ("Couldn't change which tracks play by default.\nMkvpropedit failed: Error: The file 'PJ Robot Vs. Romeo.mkv' is "
+                                "not a Matroska file.\nThe file still opens, and its default tracks are the **English audio (track 1)**.")
+    assert e["fields"] == [{"name": "M\\*A\\*S\\*H S01E01", "value": "M\\_A\\_S\\_H.mkv", "inline": False}]
+    assert h.render(rec, "log")["alerts"] == ["edit: Couldn't change which tracks play by default. Mkvpropedit failed: Error: The file 'PJ Robot "
+                                              "Vs. Romeo.mkv' is not a Matroska file. The file still opens, and its default tracks are the "
+                                              "English audio (track 1)."]
+
+
+def test_an_edit_error_keeps_its_reason_after_a_long_path():
+    """hd record 44: the path pushed the reason of mkvpropedit past the cut at 150 characters. The path becomes the
+    file's name, cut as far as needed."""
+    path = "/media-storage/all/tv/tv_req/PJ Masks/Season 3/PJ Masks - s03e51-e52 - Master of the Moat + PJ Robot Vs. Romeo - WEBDL-1080p.mkv"
+    got = h.short_error(f"mkvpropedit failed: Error: The file '{path}' is not a Matroska file or it could not be found.", path)
+    assert got == ("mkvpropedit failed: Error: The file 'PJ Masks - s03e51-e52 - Master of the Moat + PJ Robot Vs. Rome…' is not a Matroska "
+                   "file or it could not be found.") and len(got) == 150
+    assert h.short_error("mkvpropedit failed: x", path) == "mkvpropedit failed: x" and h.short_error("y" * 200, path) == "y" * 150
+
+
+def test_a_tmdb_failure_shows_in_the_footer_of_a_language_alert_only():
+    """The footer names TMDB only when its language check did not run, and only on the alerts that check bears on."""
+    language, audio = h.render(decision(tmdb="tmdb_unavailable"), "embed")
+    assert language["footer"]["text"] == "TMDB didn't answer, so its language check was skipped · arr-media-guard on host1"
+    assert audio["footer"]["text"] == "arr-media-guard on host1"
+    assert h.render(decision(tmdb="no_record"), "embed")[0]["footer"]["text"].startswith("TMDB has no record of this item, so")
+
+
+def test_a_subtitle_alert_names_each_track_by_its_language_before_any_remux():
+    """A removal moves the later tracks up one place. The sentences name the places the check saw, so the languages come
+    from the tracks before the remux."""
+    lines = [{"code": "removed", "track": "s1", "why": "x", "by": "hook", "kept": "/k/F.mkv"}]
+    rec = decision(findings=[{"kind": "submatch", "lines": lines}], tracks=[{"i": "s1", "lang": "eng"}],
+                   subremux={"tracks_before": [{"i": "s1", "lang": "spa"}, {"i": "s2", "lang": "eng"}]})
+    assert h.render(rec, "embed")[0]["description"].startswith("The **Spanish subtitles (track 1)** don't match")
+    assert h.render(dict(rec, subremux={}), "log")["alerts"][0].startswith("submatch: The English subtitles (track 1) don't match")
+
+
+# A sentence that tells the viewer what to do. The alerts say what is wrong and what the program did.
+INSTRUCTION = re.compile(r"(^|[.!?] )(Check|Fix|Set|Add|Replace|Raise|Rescan|Play|Import|Pick|Free|Make|Create|Run|Delete|Move)\b|\bby hand\b")
+# The words a viewer never needs: the program's own names for its steps, and the file's internals
+INTERNAL = re.compile(r"\b(hook|sweep|fitted line|header|container|events?|cues?|S_TEXT/\w+|SubRip|Matroska|[as]\d+|remux\w*|proof|points?|"
+                      r"hunter|keep link)\b|--force", re.I)
+
+
+def hunter_posts():
+    """The titles and sentences of the subtitle hunter's posts, read from arr_subhunt.py: each text that replace() and
+    restore() return, and each title and text that hunt() posts. A placeholder reads as {}, and a part of an f-string
+    counts in its whole."""
+    tree = ast.parse(open(os.path.join(ROOT, "arr_subhunt.py")).read())
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    text = lambda n: "".join(x.value if isinstance(x, ast.Constant) else "{}" for x in n.values) if isinstance(n, ast.JoinedStr) else n.value
+    words = lambda n: [text(x) for x in ast.walk(n) if isinstance(x, ast.JoinedStr) or isinstance(x, ast.Constant) and isinstance(x.value, str)]
+    out = []
+    for name in ("replace", "restore", "hunt"):
+        for n in ast.walk(funcs[name]):
+            if isinstance(n, ast.Return) and name != "hunt" or isinstance(n, (ast.Assign, ast.AugAssign)) and any(
+                    getattr(t, "id", None) in ("text", "unsure", "err") for t in getattr(n, "targets", [getattr(n, "target", None)])):
+                out += words(n.value)
+            elif isinstance(n, ast.Call) and (getattr(n.func, "id", None) == "post" or getattr(n.func, "attr", None) == "embed"):
+                out += words(n.args[0 if getattr(n.func, "id", None) == "post" else 1])
+    return [x for x in dict.fromkeys(out) if " " in x and not any(x != y and x in y for y in out)]
+
+
+def test_no_alert_says_an_internal_word_or_tells_the_viewer_what_to_do():
+    """Every Discord alert kind, title and text in the done tense, with every action and every subtitle sentence, says
+    what is wrong in a viewer's words, and what the program did. So does every post of the subtitle hunter. A tool's
+    error text passes through as it is."""
+    hunter = hunter_posts()
+    assert len(hunter) >= 20 and "Old file left by an earlier run" in hunter, hunter
+    said = hunter + [" ".join([h.title(f)[0], *(x for x in h.texts(f, "done", LANGS) if x)]) for f, *_ in FINDINGS]
+    said += [" ".join([h.title(dict(f, action=a))[0], h.texts(dict(f, action=a), "done")[1]]) for f in [{"kind": "audio", "certain": SILENT}]
+             for a, *_ in ACTIONS]
+    said += [h.unmarked(h.sub_line(x, "done", LANGS)) for x, *_ in SUB_LINES] + [h.unmarked(h.sub_line(x, "done")) for x, *_ in SUB_LINES]
+    assert {f["kind"] for f, *_ in FINDINGS} == set(h.FINDINGS) and not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)]
+    assert not [s for s in said if INSTRUCTION.search(s)]
 
 
 def test_the_cli_target_is_the_backfill_line():
@@ -308,7 +584,7 @@ def test_the_cli_target_is_the_backfill_line():
                    heard={"a1": {"lang": "eng"}, "a2": {"lang": None}}, notes=["a1 is the original"], findings=[{"kind": "language", "want": "English",
                                                                                                                   "has": ["por"]}])
     assert h.render(rec, "cli") == ("dry run      Film A (1979) | a1 1->0, track:=3 flag-forced 0->1 | heard a1 eng, a2 no answer | a1 is the "
-                                    "original | ALERT language: No audio track is English. The file has por.")
+                                    "original | ALERT language: The audio is Portuguese, but it should be English.")
     rec = {"result": "would repack: the container is MP4/QuickTime", "label": "Film B", "header_repair": {"result": "would repair header: x"},
            "subcheck": {"s1": {"verdict": "mismatch", "why": "the words differ", "windows": [{"overlap": 0.05}, {"overlap": 0.1}], "timing": None}},
            "flash": {"s2": {"lengthened": 3, "cues": 40}}, "sidecars": [{"name": "B.en.srt", "action": "move", "result": "dry run"}],
@@ -323,7 +599,7 @@ def test_the_cli_target_is_the_backfill_line():
 def test_the_tense_comes_from_the_apply_flag_and_a_dry_run_says_what_apply_would_do(tmp_path):
     """A dry run renders planned, an apply done. The CLI line and the decision line of a dry run say the same."""
     line = dict(STAYS, kept_back="keep_days")
-    rec = decision(apply=False, findings=[{"kind": "submatch", "lines": [line]}], alert_kinds=["submatch"])
+    rec = decision(apply=False, findings=[{"kind": "submatch", "lines": [line]}], alert_kinds=["submatch"], tracks=[{"i": "s1", "lang": "eng"}])
     planned = "submatch: " + SUB_LINES[3][2]
     assert h.render(rec, "log")["alerts"] == [planned] and h.render(rec, "cli").endswith(f" | ALERT {planned}")
     assert h.render(rec, "log", "done")["alerts"] == ["submatch: " + SUB_LINES[3][1]]
