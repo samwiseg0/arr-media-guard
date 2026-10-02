@@ -113,15 +113,15 @@ a change.
 Linux and macOS:
 
 ```
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:2.0.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:2.0.0 --sub-time "/media/Episode.mkv" --apply
+docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:latest --sub-time "/media/Episode.mkv"
+docker run --rm -it -e PUID=$(id -u) -e PGID=$(id -g) -v "$PWD:/media" ghcr.io/samwiseg0/arr-media-guard:latest --sub-time "/media/Episode.mkv" --apply
 ```
 
 Windows PowerShell:
 
 ```
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:2.0.0 --sub-time "/media/Episode.mkv"
-docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:2.0.0 --sub-time "/media/Episode.mkv" --apply
+docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:latest --sub-time "/media/Episode.mkv"
+docker run --rm -it -v "${PWD}:/media" ghcr.io/samwiseg0/arr-media-guard:latest --sub-time "/media/Episode.mkv" --apply
 ```
 
 The dry run prints one line for each subtitle, the flash check and the sweep of heard windows. It changes nothing.

@@ -132,7 +132,7 @@ Every command of a host install runs in the image, as a one-off container or wit
 ```
 RUN="docker run --rm --network media_default -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
   -v $PWD/arr-media-guard:/config -v amg-state:/config/state -v /srv/media:/data \
-  ghcr.io/samwiseg0/arr-media-guard:2.0.0"
+  ghcr.io/samwiseg0/arr-media-guard:latest"
 EXEC="docker exec -it arr-media-guard arr-media-guard"
 ```
 

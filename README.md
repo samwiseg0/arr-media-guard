@@ -44,7 +44,7 @@ These steps run it next to the apps, on one compose network. For apps on other h
    ```yaml
    services:
      arr-media-guard:
-       image: ghcr.io/samwiseg0/arr-media-guard:2.0.0
+       image: ghcr.io/samwiseg0/arr-media-guard:latest
        container_name: arr-media-guard
        environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # the apps' user and group, and your time zone
        volumes:
@@ -167,7 +167,7 @@ Sonarr is `http://arr-media-guard:8484/sonarr-4k`. The other fields are as in th
     image: lscr.io/linuxserver/sonarr:latest
     volumes: [./sonarr-4k:/config, /srv/media:/data]   # Webhook URL http://arr-media-guard:8484/sonarr-4k
   arr-media-guard:
-    image: ghcr.io/samwiseg0/arr-media-guard:2.0.0
+    image: ghcr.io/samwiseg0/arr-media-guard:latest
     environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]
     volumes: [./arr-media-guard:/config, amg-state:/config/state, /srv/media:/data]
     stop_grace_period: 1m
@@ -312,8 +312,8 @@ at its end holds these keys.
 
 ## Update
 
-1. In Docker, set the new version in `image:`, then run `docker compose pull arr-media-guard` and
-   `docker compose up -d arr-media-guard`. On a host, run `sudo git -C /opt/arr-media-guard pull`.
+1. In Docker, run `docker compose pull arr-media-guard` and `docker compose up -d arr-media-guard`. The image tag
+   `latest` always holds the newest release. On a host, run `sudo git -C /opt/arr-media-guard pull`.
 2. Add the keys a new release names to your env file. An update never changes that file. In Docker, each start writes
    the image's env file to `arr-media-guard.env.example` beside yours, so you can compare the two.
 3. Run the selftest.

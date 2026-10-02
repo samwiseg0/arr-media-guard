@@ -22,7 +22,7 @@ services:
     volumes: [./radarr:/config, /srv/media:/data]
     ports: ["7878:7878"]
   arr-media-guard:
-    image: ghcr.io/samwiseg0/arr-media-guard:2.0.0
+    image: ghcr.io/samwiseg0/arr-media-guard:latest
     container_name: arr-media-guard
     environment: [PUID=1000, PGID=1000, TZ=Etc/UTC]   # TZ: your time zone, for AUDIT_TIME and the log times
     volumes:
