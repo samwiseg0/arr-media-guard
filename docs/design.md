@@ -437,8 +437,13 @@ So a download ends the same way as with one worker. A conversion's swap does not
 app's import of the new file skips that file, and the conversion's job then checks the new file itself.
 
 **Deep analysis.** With `SUBTITLES=deep`, an import job queues one deep analysis job for its file in
-the state store, named by the path, so a newer import of the path replaces it. The worker runs one only when no
-import job waits, one at a time per host, and never drops one by age, only when its file is gone. The queue drains with
+the state store, named by the path, so a newer import of the path replaces it. The job holds the inode, size and mtime
+of the file the import left. The worker runs one only when no import job waits, one at a time per host, and never
+drops one by age. A job drops itself with one decision line when its file is gone or has another inode, as after an
+upgrade, whose import queues a job of its own. An edit in place keeps the inode, and the job goes on. It checks this
+when it starts, each time it takes the file lock, after its remux and after an error, because the app holds no lock. A
+change of its own never counts. A conversion of its own before a yield gives the job the new file's inode, size and
+mtime. The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
 two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
 job waits in the queue. It also stops for a waiting import job after the whole-file read, before each read and each fit

@@ -589,7 +589,7 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), config.CFG.hide_dir, os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False, source="backfill"):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (code,
     result, info, the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not
@@ -622,6 +622,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     parse_refuses() for its own new name, because the ManualImport names its episodes by id. info names the parse result
     in forced_name, and the original is kept too. Its extras still go back by a rescan, which links them by their parsed
     names, so each extra must still parse as the file's episodes. Every other check still runs.
+
+    source is the source of the decision log, hook, deep_analysis or backfill. The converting line carries it.
 
     info names a sign that the original is damaged in damage, see DAMAGE. process() then re-grabs an import.
 
@@ -755,7 +757,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
                              time=datetime.datetime.now().astimezone().isoformat(timespec="seconds"), state="swapping",
                              extras=[[os.path.join(os.path.dirname(x), config.CFG.hide_dir, os.path.basename(x)), x] for x in extras])
                 pending_edit(key, entry)   # before the first move, so a kill from here leaves a record, see pending_recover()
-                logs.log(dict(app=app, result="converting", path=path, new_path=new, held=held, extras=len(extras)))
+                logs.log(dict(app=app, source=source, outcome="converting", result="converting", path=path, new_path=new, held=held, extras=len(extras)))
                 hidden = hide_extras(extras)
                 info["extras_hidden"] = len(hidden)
                 os.link(tmp, new)   # fails when the name is taken meanwhile

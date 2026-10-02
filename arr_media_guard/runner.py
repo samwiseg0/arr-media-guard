@@ -229,15 +229,30 @@ def queue_deep_analysis(job, rec, inputs):
     SUBTITLES is deep, and the Matroska file holds a subtitle track or has an .srt beside it. The
     job carries inputs, the decision inputs of the import: its label, original language, runtime, Plex lookup, kids
     flag, metadata context and release name. So the deep analysis asks no app and decides as the import did. The job
-    is named by the path, so a newer import of the path replaces a queued one. Returns its name, or None."""
+    is named by the path, so a newer import of the path replaces a queued one. The job holds the file_key() of the
+    file the import left, see deep_replaced(). Returns its name, or None."""
     path, ids = rec.get("path"), rec.get("ids") or {}
     if not (config.CFG.subtitles == "deep" and path and path.lower().endswith(".mkv") and os.path.exists(path)) or \
             not (any(t["i"].startswith("s") for t in rec.get("tracks") or []) or subtitles.side_stats(path)):
         return None
     name = f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
     store.write("INSERT OR REPLACE INTO jobs (name, at, job) VALUES (?, ?, ?)", name, time.time(),
-                json.dumps(dict(app=job.get("app"), path=path, ids=ids, inputs=inputs, time=time.time())))
+                json.dumps(dict(app=job.get("app"), path=path, ids=ids, inputs=inputs, time=time.time(), key=file_key(os.stat(path)))))
     return name
+
+
+def deep_replaced(job):
+    """The outcome and result of a deep analysis job that drops itself, or None. It drops when the file at its path is
+    gone, or has another inode than its key names, as after an upgrade, whose import queues a deep analysis of its own.
+    An edit in place keeps the inode, and the job goes on, because no new import queues another one. A job queued
+    before jobs held a key checks only that the file is there."""
+    try:
+        now = os.stat(job["path"])
+    except FileNotFoundError:
+        return dict(outcome="file_gone", result="dropped, the file is gone")
+    if job.get("key") and job["key"][0] != now.st_ino:
+        return dict(outcome="file_replaced", result="dropped, another file replaced it since its import")
+    return None
 
 
 def deep_waits():
@@ -252,7 +267,9 @@ def deep_analysis(name, pending, claimed=False):
     --sub-time on the file of an import, with the proof, the kept originals, the subtitle alerts and the Plex analyze of
     an import. It decides with the import's inputs, which the job carries, and it asks no app. It keeps every flag
     the import set, after a remux of its own too, and only a subtitle verdict changes a flag, see process(). It has no
-    time limit, and it never drops by age, only when its file is gone.
+    time limit, and it never drops by age. It drops itself when its file is gone or replaced since its import, see
+    deep_replaced(). It checks that at its start, each time it takes the file lock, after its remux, see
+    process.deep_drop(), and after an error.
 
     It reads the whole file for the tracks the Cues do not index before it takes the file lock, since a film takes
     minutes. That read is kept by the file's size and mtime, so a file that changed is read again under the lock. It
@@ -260,14 +277,15 @@ def deep_analysis(name, pending, claimed=False):
     changed, as a backfill file does. When an import waits in the queue, it stops between two steps: after the
     whole-file read, between two groups of its sweep, before each read and each fit of a track, and before a remux.
     The job goes back to the deep analysis queue, and its next run finds the words heard so far in the cache, and the
-    whole-file read in the store."""
-    started, rec, want, job = time.time(), dict(source="deep_analysis", job=name), None, {}
+    whole-file read in the store. A conversion of its own before the stop changed the file, so the job then takes the
+    key of the new file."""
+    started, rec, want, job, ctx = time.time(), dict(source="deep_analysis", job=name), None, {}, None
     try:
         job = job_of(name, claimed)
         app, path, got = job["app"], job["path"], job.get("inputs") or {}
         rec.update(app=app, path=path)
-        if not os.path.exists(path):
-            rec.update(outcome="file_gone", result="dropped, the file is gone")
+        if drop := deep_replaced(job):
+            rec.update(drop)
         elif not got:
             rec.update(outcome="job_stale", result="dropped, the job holds no decision inputs of its import")
         else:
@@ -278,10 +296,15 @@ def deep_analysis(name, pending, claimed=False):
                 store.put("deep-read", name, {"key": [st.st_size, st.st_mtime_ns], "read": subtitles.full_read(path, checks.mkvmerge(path))})
             deep_waits()
             want = got.get("want")
-            run = lambda lock, shared: process.process(process.Ctx(app, path, got.get("label") or os.path.basename(path), got.get("original"),
-                                                                   got.get("runtime") or 0, mode="deep", kids=bool(got.get("kids")),
-                                                                   release=got.get("release") or "", ids=job.get("ids"), item=got.get("ctx"),
-                                                                   lock=lock, shared=shared))
+
+            def run(lock, shared):
+                nonlocal ctx
+                if drop := deep_replaced(job):   # the file went or was replaced while the job read it or waited for the lock
+                    return dict(rec, **drop)
+                ctx = process.Ctx(app, path, got.get("label") or os.path.basename(path), got.get("original"), got.get("runtime") or 0, mode="deep",
+                                  kids=bool(got.get("kids")), release=got.get("release") or "", ids=job.get("ids"), item=got.get("ctx"),
+                                  lock=lock, shared=shared)
+                return process.process(ctx)
             try:
                 with locked(shared=True) as lock:
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: cli.upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
@@ -292,12 +315,18 @@ def deep_analysis(name, pending, claimed=False):
             rec["job"] = name
     except subtitles.Yielded as ex:
         logs.log(dict(rec, result="yielded", note=str(ex)))
+        if getattr(ctx, "st", None) and list(file_key(ctx.st)) != job.get("key"):   # a step of the run changed the file, see process.refresh()
+            put_job(name, dict(job, key=file_key(ctx.st)), claimed)
         if claimed:   # back to the deep analysis queue, unless a newer import queued the path again meanwhile
             requeue(name)
         return
     except Exception as ex:   # record it and go on: a deep analysis job never stops the worker
-        rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500])
-        rec["trace"] = traceback.format_exc(limit=3)[-800:]
+        held = dict(job, key=file_key(ctx.st)) if getattr(ctx, "st", None) else job   # ctx.st follows the run's own changes
+        if job.get("path") and (drop := deep_replaced(held)):   # the app replaced or removed the file during the run
+            rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
+        else:
+            rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500])
+            rec["trace"] = traceback.format_exc(limit=3)[-800:]
     rec = logs.decision(rec, started)
     path = rec.get("path")
     if want and path and os.path.exists(path) and process.changed(rec):

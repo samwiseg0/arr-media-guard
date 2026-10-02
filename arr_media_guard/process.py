@@ -198,7 +198,7 @@ def conversion(ctx):
     was = ctx.path
     got, result, rec["repack"], ctx.path = convert.convert(ctx.app, ctx.path, j, st, ctx.apply, rec["ids"], ctx.lock, ctx.pool, ctx.force,
                                                            ctx.subs_on and subtitles.sub_fixes(ctx.source), decide.codes(ctx.original),
-                                                           shared=bool(ctx.shared or ctx.pool))
+                                                           shared=bool(ctx.shared or ctx.pool), source=ctx.source)
     path = ctx.path
     if ctx.shared and ctx.apply and not ctx.pool:   # a hook job converted under the shared lock. The rest of the job runs exclusive.
         if got == "repacked":   # a re-run would lose the new file's record, so the job goes on, after the older jobs of its download
@@ -435,6 +435,16 @@ def subtitle_checks(ctx):
     ctx.fixes, ctx.remove, ctx.ends, ctx.flashy = fixes, remove, ends, flashy
 
 
+def deep_drop(ctx):
+    """A deep analysis ends here when the app replaced or removed its file during the run. The app holds no file lock,
+    so this happens during a remux, which then fails with "the original changed". The record becomes the quiet drop
+    of deep_analysis(), so no stale edit, cache or alert follows. The reference is ctx.st, the run's own last stat,
+    so a change of its own never counts."""
+    if ctx.mode == "deep" and (drop := runner.deep_replaced({"path": ctx.path, "key": runner.file_key(ctx.st)})):
+        ctx.rec = dict(app=ctx.app, source=ctx.source, path=ctx.path, **drop)
+        return True
+
+
 def decision_fields(ctx):
     """The decision in the record, and the plan of a dry run, see plan_record()."""
     rec, d = ctx.rec, ctx.d
@@ -619,7 +629,7 @@ def alerts(ctx):
         rec["alert_result"] = logs.alert_findings(rec, ctx.size)
 
 
-STEPS = (start, conversion, header, languages, subtitle_checks, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
+STEPS = (start, conversion, header, languages, subtitle_checks, deep_drop, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
 
 
 def content_finding(ev):

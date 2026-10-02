@@ -4635,10 +4635,10 @@ def test_a_deep_analysis_that_yields_often_is_no_crash(pool, monkeypatch):
     assert len(traced("run")) == hook.CRASH_TRIES + 1 and hook.deep_analysis_queued() == [] and not claimed()
 
 
-@pytest.mark.parametrize("case", ["repack", "header", "resub"])
+@pytest.mark.parametrize("case", ["repack", "header", "resub", "convert"])
 def test_each_interim_result_line_carries_its_outcome_code(env, monkeypatch, tmp_path, case):
-    """A repack, a header repair and a subtitle remux each log a line before anything else runs. Each line carries the
-    code of its step, as a decision line does."""
+    """A repack, a header repair and a subtitle remux each log a line before anything else runs, and so does the swap
+    of a conversion to a new name. Each line carries the source and the code of its step, as a decision line does."""
     rescan = lambda app, p, method, body=None: env["writes"].append((method, p, body))
     if case == "repack":
         mp4_named_mkv(env)
@@ -4646,13 +4646,15 @@ def test_each_interim_result_line_carries_its_outcome_code(env, monkeypatch, tmp
     elif case == "header":
         header_issue(env, monkeypatch)
         monkeypatch.setattr(hook, "arr_write", rescan)
-    else:
+    elif case == "resub":
         removal_film(env, monkeypatch, tmp_path)
+    else:
+        mp4_import(env, monkeypatch)
     hook.main([])
     result, code = {"repack": ("repacked", "repacked"), "header": ("header repaired", "header_repaired"),
-                    "resub": ("subtitles remuxed", "subtitles_remuxed")}[case]
+                    "resub": ("subtitles remuxed", "subtitles_remuxed"), "convert": ("converting", "converting")}[case]
     (line,) = [r for r in log_lines(env) if r.get("result") == result and "schema" not in r]
-    assert line["outcome"] == code
+    assert (line["source"], line["outcome"]) == ("hook", code)
 
 
 def test_a_failed_fork_puts_the_job_back_and_the_next_pass_runs_it(pool, monkeypatch):
@@ -10510,8 +10512,8 @@ def test_the_conversion_checks_subtitles_only_where_it_may_fix(env, monkeypatch,
     settings(subtitles=level)
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     seen = []
-    monkeypatch.setattr(hook, "convert", lambda app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False:
-                        seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
+    monkeypatch.setattr(hook, "convert", lambda app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False,
+                        source=None: seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
     hook.main([])
     assert seen == [sub]
 
@@ -12807,6 +12809,124 @@ def test_a_deep_analysis_reads_the_whole_file_again_when_it_changed_before_the_l
     hook.deep_analysis(name, [])
     rec = decided(env)
     assert reads == [1000, 1001] and rec["full_read"]["tracks"] == ["s1"] and hook.deep_analysis_queued() == [], (reads, rec.get("full_read"))
+
+
+def change_file(path, how):
+    """Change the file at path as the app would. replaced puts another file of the same size and mtime there, so only
+    the inode differs. removed deletes it."""
+    if how == "replaced":
+        st = os.stat(path)
+        shutil.copy(path, path + ".new")
+        os.utime(path + ".new", ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(path + ".new", path)
+    else:
+        os.remove(path)
+
+
+def dropped(env, name, how, got):
+    """The deep analysis job name dropped itself after the change how, with one decision line and no error. It remuxed
+    nothing, posted no alert, and is gone from the queue."""
+    code, result = ("file_gone", "dropped, the file is gone") if how == "removed" else ("file_replaced", "dropped, another file replaced it since its import")
+    lines = [r for r in log_lines(env) if r.get("job") == name and r["result"] != "yielded"]
+    assert [(r.get("outcome"), r["result"]) for r in lines] == [(code, result)] and "trace" not in lines[0], lines
+    assert got == [] and not [u for m, u, b in env["http"] if m == "POST"] and hook.deep_analysis_queued() == []
+
+
+@pytest.mark.parametrize("how", ["replaced", "removed"])
+def test_a_deep_analysis_drops_itself_when_its_file_was_replaced_since_its_import(env, monkeypatch, settings, how):
+    """An upgrade replaced the file, or it went, after the import queued the deep analysis. The job drops itself and
+    reads nothing. A new import of the path queues its own deep analysis."""
+    settings(subtitles="deep")
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    name = queue_analysis(env, env["path"])
+    change_file(env["path"], how)
+    monkeypatch.setattr(hook, "full_read", lambda path, j: pytest.fail("a dropped job reads nothing"))
+    hook.deep_analysis(name, [])
+    dropped(env, name, how, got)
+
+
+@pytest.mark.parametrize("when, how", [("read", "replaced"), ("read", "removed"), ("sweep", "replaced"), ("sweep", "removed"),
+                                       ("yield", "replaced"), ("remux", "replaced"), ("remux", "removed"), ("error", "replaced"),
+                                       ("error", "removed")])
+def test_a_deep_analysis_drops_itself_when_its_file_is_replaced_during_the_run(env, monkeypatch, settings, when, how):
+    """The app replaces the file during the whole-file read, which holds no lock, and the job sees it when it takes the
+    lock. Or during the sweep, which runs without the lock, and the job sees it when it takes the lock exclusive, or
+    at the start of its next run when the sweep yielded. The app holds no lock, so it can also replace the file during
+    the remux, which then fails with "the original changed", or during a read that then raises. The job never checks
+    the new file, and logs no error and no alert."""
+    settings(subtitles="deep")
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    path, done = env["path"], []
+    once = lambda: done or done.append(change_file(path, how))
+    if when == "read":
+        monkeypatch.setattr(hook, "full_read", lambda p, j: once() or {"cues": {}, "tracks": [], "took": 0, "cpu": 0, "why": None})
+    elif when == "sweep":
+        monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: once() or ({}, {"cpu": 0, "took": 0, "failed": []}))
+    elif when == "yield":
+        monkeypatch.setattr(hook, "sub_sweep", lambda *a, **k: (_ for _ in ()).throw(hook.Yielded("an import waits")) if not once() else
+                            ({}, {"cpu": 0, "took": 0, "failed": []}))
+    else:
+        def resub(p, *a, **k):
+            change_file(p, how)
+            if when == "error":
+                raise FileNotFoundError(2, "No such file or directory", p)
+            return "subtitle_remux_failed", "subtitle remux failed, the original changed: the app replaced or renamed the original", {"warnings": None}
+        monkeypatch.setattr(hook, "resub", resub)
+    name = queue_analysis(env, path)
+    hook.deep_analysis(name, [])
+    if when == "yield":
+        hook.deep_analysis(name, [])
+    dropped(env, name, how, got)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_deep_analysis_goes_on_after_its_own_remux(env, monkeypatch, settings, fails):
+    """The remux of the deep analysis puts another file at the path. The run still logs the remux and queues the Plex
+    analyze, because the job compares the file with its own last stat. A step that fails after the remux is an error."""
+    settings(subtitles="deep")
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    fake = hook.resub
+    monkeypatch.setattr(hook, "resub", lambda p, *a, **k: change_file(p, "replaced") or fake(p, *a, **k))
+    if fails:
+        monkeypatch.setattr(hook, "sub_findings", lambda *a: 1 / 0)
+    pending = []
+    hook.deep_analysis(queue_analysis(env, env["path"], want={"guids": ["tmdb://90001"], "title": "Film A", "show": False}), pending)
+    rec = decided(env)
+    if fails:
+        assert (rec["outcome"], rec["result"], len(got), pending) == ("error", "error: ZeroDivisionError: division by zero", 1, []), rec
+    else:
+        assert (rec["outcome"], rec["reasons"], len(got), len(pending)) == ("no_change", ["subtitle_retimed"], 1, 1), rec
+
+
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_a_deep_analysis_that_converted_its_file_and_yielded_goes_on_with_the_new_file(env, monkeypatch, settings, upgrade):
+    """The import left a .mkv that holds MP4. The deep analysis converts it, which puts another file at the path, and
+    then yields to an import. The job takes the key of the new file, so its next run goes on and remuxes. When an
+    upgrade replaced the new file during the sweep, the next run drops the job."""
+    settings(subtitles="deep")
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    env["mkv_probe"] = dict(env["probe"], container=dict(env["probe"]["container"], type="Matroska"))   # the same tracks after the conversion
+    mp4_named_mkv(env)
+    monkeypatch.setattr(hook, "full_read", lambda p, j: {"cues": {}, "tracks": [], "took": 0, "cpu": 0, "why": None})
+    sweeps = []
+
+    def sweep(*a, **k):
+        sweeps.append(1)
+        if len(sweeps) == 1:
+            if upgrade:
+                change_file(env["path"], "replaced")
+            raise hook.Yielded("an import waits")
+        return {}, {"cpu": 0, "took": 0, "failed": []}
+    monkeypatch.setattr(hook, "sub_sweep", sweep)
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    assert len(env["repacks"]) == 1 and hook.deep_analysis_queued() == [name] and got == []
+    hook.deep_analysis(name, [])
+    if upgrade:
+        return dropped(env, name, "replaced", got)
+    rec = decided(env)
+    assert (rec["outcome"], rec["reasons"], len(got), len(env["repacks"])) == ("no_change", ["subtitle_retimed"], 1, 1), rec
+    assert hook.deep_analysis_queued() == []
 
 
 def test_a_deep_analysis_decides_with_the_inputs_of_its_import(env, monkeypatch, settings):
