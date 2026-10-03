@@ -767,6 +767,9 @@ ONSET_TWICE = 0.1   # seconds within which two onsets are one, found by two read
                     # silence counts it from its own start. Onsets that each end a silence of 0.3 s lie farther apart.
 ONSET_SHARE = 0.2   # the share of a block's cues with an onset where the block puts them, at least. Stray onsets, at 0.01
                     # to 0.09 a second on the bench, fill at most 6% of such places by chance.
+ONSET_CHANCE = 0.001  # the chance at most that the onsets within half of TOLERANCE of a block's cues are as many by chance,
+                      # from the same count at the NULL offsets. With real noise a right track that Whisper heard 0.8 s
+                      # early drew 4 such onsets of 13 cues, at a chance of 0.003.
 
 
 def tokens(text):
@@ -857,7 +860,7 @@ def split(sides, left):
     return e, sum(x != "line" for x in (sides[:e] if left else sides[e:]))
 
 
-def clock(onsets, at, inside, outside, shift):
+def clock(onsets, at, inside, outside, shift, read=None):
     """The speech onsets' judgement of a block: {"verdict", "inside", "original", "outside", "shift"}. onsets are sorted
     (time, seconds of the silence it ends), at maps a cue to its start in audio time, inside and outside are the cues
     of the block and the cues of its part around it, and shift is Whisper's. An onset counts only when it ends a silence
@@ -871,9 +874,12 @@ def clock(onsets, at, inside, outside, shift):
     "agree" when that many count where the block puts them, twice as many as where they sat, and the median of their
     cue start less the lead and onset lies within half of TOLERANCE of Whisper's shift and sits BLOCK_SHIFT off the same
     way. The search reaches twice that far, so onsets that cluster off Whisper's shift disagree. That many must also lie
-    within half of TOLERANCE of the place, or the onsets are too few: stray onsets scatter over the reach.
-    Cues an author set 0.4 s late are no block. It is "disagree" when that many count where they sat, at least as many
-    as where the block puts them, or when the onsets count clearly and put the block elsewhere. Else it is "few": under
+    within half of TOLERANCE of the place, or the onsets are too few: stray onsets scatter over the reach. And that
+    count must be rare by chance. The same count at the NULL offsets from those places, over the places within read,
+    (lo, hi) of the audio whose onsets were read, gives the mean count by chance, in "chance", and the rate of all
+    counted onsets in read gives at least as much. The chance of as many or more must be ONSET_CHANCE at most. Cues an
+    author set 0.4 s late are no block. It is "disagree" when that many count where they sat, at least as many as where
+    the block puts them, or when the onsets count clearly and put the block elsewhere. Else it is "few": under
     ONSET_MIN cues around the block have an onset, or too few cues count at either place. "inside", "original" and
     "outside" count those cues, and "shift" is the median of cue start less the lead and its onset over the cues that
     count where the block puts them, or None. "kept" is the set of cues of
@@ -903,12 +909,27 @@ def clock(onsets, at, inside, outside, shift):
     # Stray onsets scatter over the reach, and a block's own onsets cluster where it puts its cues. So that many must lie
     # within half of TOLERANCE of the place: on a right track Whisper heard 0.86 s early, 4 strays of 16 cues agreed.
     tight = sum(abs(d - shift) <= TOLERANCE / 2 for d in new)
-    agree = there and tight >= need and tight >= 2 * old
+    # Chance gives the same count at the NULL offsets from where the block puts its cues, as lift() takes it, over the
+    # places in read, the audio whose onsets were read. The count where the block puts them must be rare at that rate.
+    lo, hi = read or ((onsets[0][0], onsets[-1][0]) if onsets else (0.0, 0.0))
+    places = [p for k in inside for d in NULL if lo <= (p := at[k] - lead - shift + d) <= hi]
+    chance = len(inside) * sum(bool(span(p, TOLERANCE / 2)) for p in places) / len(places) if places else 0.0
+    # Where lines start on a regular pitch, the NULL offsets can all fall between their onsets and count none. Chance
+    # is then at least the rate of all counted onsets in read over those places.
+    if hi > lo:
+        chance = max(chance, len(inside) * TOLERANCE * sum(lo <= o[0] <= hi and o[1] >= ONSET_QUIET for o in onsets) / (hi - lo))
+    # The Poisson tail by a running term: chance ** i / i! overflows a float at i = 171.
+    term, below = math.exp(-chance), 0.0
+    for i in range(tight):
+        below, term = below + term, term * chance / (i + 1)
+    rare = 1 - below <= ONSET_CHANCE
+    out["chance"] = round(chance, 2)
+    agree = there and tight >= need and tight >= 2 * old and rare
     against = (clear and not there) or (old >= need and old >= len(new))   # the cues kept their onsets where they sat
     return dict(out, verdict="agree" if agree else "disagree" if against else "few")
 
 
-def evidence(late, hushed_late, words, onset_new, onset_old, on, at_block, hushed):
+def evidence(late, hushed_late, words, onset_new, onset_old, on, at_block, hushed, conflict=False):
     """"line", "block" or None: where a cue's own evidence puts it. late is its anchor, how late it sits, and hushed_late
     the anchor of a cue after a long silence, which only ever puts it on the line, see blocks(). words is placed() of its
     heard words, and the heard words of such a cue never put it in the block. onset_new tells that an onset lies where
@@ -916,10 +937,12 @@ def evidence(late, hushed_late, words, onset_new, onset_old, on, at_block, hushe
     anchor lies nearer the line than the block, and at the block's offset. Any evidence for the line wins. An onset
     puts a cue in the block only with its own heard words placed there, and only the cue after a long silence needs it.
     Beside a block, placed() reads a cue in time as unsure, and a lone onset where the block would put it is another
-    sound as often as the cue's speech."""
+    sound as often as the cue's speech. conflict tells that its anchor sits over TOLERANCE off the block, though nearer
+    it than the line. Its words then put it in the block only with an onset there: between two blocks, a cue in time
+    whose words read like the block once moved on them while its own anchor said otherwise."""
     if late is not None and on(late) or hushed_late is not None and on(hushed_late) or words == "line" or onset_old:
         return "line"
-    if late is not None and at_block(late) or words == "block" and (not hushed or onset_new):
+    if late is not None and at_block(late) or words == "block" and (not (hushed or conflict) or onset_new):
         return "block"
     return None
 
@@ -1005,7 +1028,12 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
     within TOLERANCE of it, where either sits or where the block puts it. Evidence of its own that puts a cue on the line
     cuts the block there. A cut inside the run sends each side back to be judged as a block of its own, and a cut nearer
     an edge moves that edge in past it. A cue with no evidence either way stays where it is: the block names its start
-    in "keep", and "unproved" counts such cues. A cue that starts with a cue that stays stays too.
+    in "keep", and "unproved" counts such cues. A cue that starts with a cue that stays stays too. A cue whose own anchor
+    sits over TOLERANCE off the block, though nearer it than the line, moves on its words only with an onset there.
+    Accepted residual: a cue in time between two blocks of one sign whose own anchor, words and both windows put it at
+    the block's offset, with no onset at either place, moves with the block. Nothing tells it from the block's own cues,
+    as nothing tells Whisper's error from a block on Whisper alone, see BLOCK_ALONE. So does such a cue with only its
+    words or only its anchor in the block: asking those for a second piece cost over 5% of the cues fixed.
     A cue whose move would put it at, past or on the same centisecond as a cue next to it that stays, stays too, see
     crossing(). So the order of cue starts never changes, and no two starts tie. On Whisper alone, a block with a cue
     that would pass a cue outside its edges is refused. Whisper can read a whole stretch off, the cues on the line
@@ -1131,7 +1159,7 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
             tol = spread(shift)
             first, last = bisect.bisect_left(starts, start), bisect.bisect_left(starts, end) - 1
             said = clock(ons, {k: audio(starts[k]) for k in range(len(starts))}, range(first, last + 1),
-                         [k for k in range(len(starts)) if not first <= k <= last and lo <= audio(starts[k]) <= hi], shift)
+                         [k for k in range(len(starts)) if not first <= k <= last and lo <= audio(starts[k]) <= hi], shift, (lo, hi))
             # A heard cue past the block, farther from the line, is no cue in time. With onsets that agree, such cues
             # leave the share that must agree: Whisper hears some cues of a block far off.
             near = sorted(abs(x - mid) for x in held if said["verdict"] != "agree" or (x - mid) * shift <= tol * abs(shift))
@@ -1218,7 +1246,7 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
                                       for d in (0.0, shift, -shift))
                 said_of = lambda k: evidence(late_of.get(k), audio(starts[k]) - at[k] - BLOCK_LEAD if k in hushed and k in at else None,
                                              words_say(k) if k in said_at else None, k in confirmed and alone(k), k in stayed and alone(k), on,
-                                             lambda x: abs(x - mid) <= tol and not on(x), k in hushed)
+                                             lambda x: abs(x - mid) <= tol and not on(x), k in hushed, k in late_of and abs(late_of[k] - mid) > TOLERANCE)
                 proof = {k: said_of(k) for k in range(first, last + 1)}
                 cuts = [k for k, v in proof.items() if v == "line"]
                 inside = [k for k in cuts if got[i][0] < k < got[j - 1][0]]

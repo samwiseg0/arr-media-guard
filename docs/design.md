@@ -1486,20 +1486,27 @@ library would take weeks.
   the cue's anchor at the block's offset, or its heard words placed in the block. The words of the first cue after a
   long silence read early, so that cue also needs an onset where the block puts it, with none where it sits. An onset
   never counts without the cue's own words. Beside a block, `placed()` reads a cue in time as unsure, and a lone onset
-  where the block would put it is another sound as often as the cue's speech. An onset counts as a cue's own only when
-  no cue next to it starts within 0.3 seconds of it, where either cue sits or where the block puts it. A cue whose own
-  evidence puts it on the line cuts the block there: its anchor nearer the line, the anchor of a cue after a long
-  silence, its heard words, or its own onset where it sits. A cut inside the run sends each side back to be judged as
-  a block of its own. A cut nearer an edge moves that edge in past it. A cue with no evidence either way stays where
-  it is. The block names it in `keep`, `unproved` counts it, and `remux.time_plan()` leaves it. `time_plan()` keeps a
-  start, not a cue, so a cue that starts with a cue that stays, as two lines shown at once, stays too. A cue whose
-  move would put it at, past or on the same centisecond as a cue next to it that stays, stays too. The test uses the
-  times `time_plan()` writes, in centiseconds. So the order of the cue starts never changes, and no two starts tie. On
-  Whisper alone, a block with a cue that would pass a cue outside its edges is refused. Whisper can read a whole
-  stretch off, the cues in time beside the block among them, and with no onsets the order is the only check left on
-  the shift. When the onsets agree, the shift is sure, and such a cue stays. A block needs 3 heard cues that move. Two
-  blocks of the same sign a few cues apart showed why. A run joined them, and the cues in time between them, most of
-  them unheard, moved with the run.
+  where the block would put it is another sound as often as the cue's speech. A cue whose own anchor sits over 0.3
+  seconds off the block, though nearer it than the line, moves on its words only with an onset there. Between two
+  blocks of one sign, a cue in time whose words read like the block once moved on them while its anchor said
+  otherwise. An onset counts as a cue's own only when no cue next to it starts within 0.3 seconds of it, where either
+  cue sits or where the block puts it. A cue whose own evidence puts it on the line cuts the block there: its anchor
+  nearer the line, the anchor of a cue after a long silence, its heard words, or its own onset where it sits. A cut
+  inside the run sends each side back to be judged as a block of its own. A cut nearer an edge moves that edge in past
+  it. A cue with no evidence either way stays where it is. The block names it in `keep`, `unproved` counts it, and
+  `remux.time_plan()` leaves it. `time_plan()` keeps a start, not a cue, so a cue that starts with a cue that stays,
+  as two lines shown at once, stays too. A cue whose move would put it at, past or on the same centisecond as a cue
+  next to it that stays, stays too. The test uses the times `time_plan()` writes, in centiseconds. So the order of the
+  cue starts never changes, and no two starts tie. On Whisper alone, a block with a cue that would pass a cue outside
+  its edges is refused. Whisper can read a whole stretch off, the cues in time beside the block among them, and with
+  no onsets the order is the only check left on the shift. When the onsets agree, the shift is sure, and such a cue
+  stays. A block needs 3 heard cues that move. Two blocks of the same sign a few cues apart showed why. A run joined
+  them, and the cues in time between them, most of them unheard, moved with the run. One residual is accepted. A cue
+  in time between two blocks of one sign can move with them when its own anchor, its words and both windows put it at
+  the block's offset and no onset lies at either place. Real noise draws such a cue now and then, and nothing tells it
+  from the block's own cues, as nothing tells Whisper's error from a block on Whisper alone. So can such a cue with
+  only its words or only its anchor in the block. Asking those for a second piece of evidence cost 5 to 47 percent of
+  the cues fixed.
 
   **Second clock.** Whisper's word times can run early or late over a whole stretch. On one right track they ran about
   0.4 seconds early for over a minute, and 6 cues in a row agreed at 0.34 seconds off. So the speech onsets, a clock
@@ -1519,10 +1526,15 @@ library would take weeks.
   - The onsets agree. 20 percent of the block's cues, and 3 at least, have an onset where the block puts them, and
     twice as many as where they sat. The median of those onsets puts the block within 0.15 seconds of Whisper's shift,
     0.5 seconds or more off the same way. As many of them lie within 0.15 seconds of where the block puts the cues,
-    because stray onsets scatter over the search and a block's own onsets cluster. The block moves. The search at each
-    place reaches 0.3 seconds, twice that bound, so onsets that cluster off Whisper's shift fail the test. In a fuzz
-    case of a right track that Whisper heard a second off, three stray onsets 0.11 to 0.21 seconds from Whisper's
-    shift agreed under a bound of 0.3 seconds.
+    because stray onsets scatter over the search and a block's own onsets cluster. That count must also be rare by
+    chance: the same count at the offsets of the reference fit's null, 7 to 53 seconds from those places within the
+    audio read, gives the mean count by chance, and as many or more must have a chance of 0.001 at most. Where lines
+    start on a regular pitch, those offsets can all fall between onsets and count none, so the rate of all onsets in
+    the audio read counts as well, whichever gives more. On real noise, 4 onsets of 13 cues on a right track that
+    Whisper heard 0.8 seconds early had a chance of 0.003. The block moves. The search at each place reaches 0.3
+    seconds, twice that bound, so onsets that cluster off Whisper's shift fail the test. In a fuzz case of a right
+    track that Whisper heard a second off, three stray onsets 0.11 to 0.21 seconds from Whisper's shift agreed under a
+    bound of 0.3 seconds.
   - Too few. Under 3 cues around the block have an onset, or too few cues count at either place. The block moves
     only at 1.0 seconds or more, on Whisper alone.
   - The onsets disagree. As many cues count where they sat as where the block puts them, and enough to judge, or the

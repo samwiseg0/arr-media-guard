@@ -143,19 +143,21 @@ cannot fix that. `--sub-time` and the deep analysis find such a part with the sw
 6. Every cue that moves needs evidence of its own: its own anchor at the block's offset, or its own heard words in
    the block. An onset counts only with the cue's own heard words. The first cue after a long silence needs both its
    words in the block and an onset where the block puts it, because its words alone read early. A cue that starts
-   with a cue that stays, as two lines shown at once, stays too. A cue whose own evidence puts it on the line splits
-   the block there, and each side is judged as a block of its own. A cue with no evidence either way stays where it
-   is, and the record of the block counts it as unproved. Each cue that moves takes the block's shift, measured
-   against the cues around it. No other cue moves, and a cue whose move would pass a cue that stays, or land on its
-   centisecond, stays too. On Whisper alone, a block whose move would pass a cue outside it is not moved, because the
-   order is the only check left on Whisper's shift.
+   with a cue that stays, as two lines shown at once, stays too. A cue whose own anchor sits over 0.3 seconds off the
+   block moves on its words only with an onset there. A cue whose own evidence puts it on the line splits the block
+   there, and each side is judged as a block of its own. A cue with no evidence either way stays where it is, and the
+   record of the block counts it as unproved. Each cue that moves takes the block's shift, measured against the cues
+   around it. No other cue moves, and a cue whose move would pass a cue that stays, or land on its centisecond, stays
+   too. On Whisper alone, a block whose move would pass a cue outside it is not moved, because the order is the only
+   check left on Whisper's shift.
 
 The speech onsets of step 4 give one of three outcomes.
 
 - They agree. 20 percent of the block's cues, and 3 at least, have an onset where the block puts them, and twice as
   many as where they sat. Those onsets put the block within 0.15 seconds of Whisper's shift. As many of them lie
   within 0.15 seconds of where the block puts the cues, because stray sounds scatter and the block's own speech does
-  not. The block moves when it sits 0.5 seconds or more off.
+  not. That many must also be rare by chance, against the same count 7 to 53 seconds away. The block moves when it
+  sits 0.5 seconds or more off.
 - There are too few. Whisper alone decides, and the block moves only when it sits 1.0 seconds or more off. A failed
   read of the onsets counts as too few.
 - They disagree. As many cues have an onset where they sat, or the onsets put the block elsewhere. Nothing moves,

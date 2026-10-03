@@ -1441,6 +1441,18 @@ def test_on_whisper_alone_a_cue_that_would_pass_an_unproved_cue_in_the_block_sta
     assert set(range(123, 132)) | set(range(138, 144)) <= lines and keeps_order(trk, got), sorted(lines)
 
 
+def test_a_cue_whose_anchor_sits_off_the_block_never_moves_on_its_words():
+    """Blocks 1.5 s late on lines 120 to 129 and 131 to 143. Line 130, in time between them, is heard 1.0 s early, so its
+    anchor sits 0.5 s off the block, over TOLERANCE, and its words read like the block. Its own anchor says otherwise,
+    so its words alone never move it."""
+    blk = set(range(120, 130)) | set(range(131, 144))
+    trk = track(late=lambda i: 1.5 if i in blk else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={130: -1.0}), trk, "eng", {"fix": None}, part)
+    lines = moved_lines(trk, got)
+    assert 130 not in lines and set(range(122, 128)) | set(range(133, 142)) <= lines, sorted(lines)
+
+
 def test_an_onset_needs_the_cue_s_own_words_in_the_block():
     """Blocks 1.5 s late on lines 120 to 139 and 141 to 164. Line 140, in time between them, has its first word
     misheard, so its words fit both sides, and no onset of its own. A lone onset lies where the block would put it.
@@ -2501,6 +2513,14 @@ def test_the_onsets_agree_only_near_whisper_s_shift(off, verdict):
     assert got["verdict"] == verdict and got["inside"] == 10, got
 
 
+def test_a_block_of_200_cues_with_onsets_agrees():
+    """Every cue of a block of 200 cues 1 s late has its onset. The chance sum takes 200 terms, and chance ** i / i!
+    overflows a float past i = 170."""
+    at = {k: 2.0 * k for k in range(240)}
+    ons = sorted((at[k] - (1.0 if 20 <= k < 220 else 0.0), 1.0) for k in at)
+    got = s.clock(ons, at, range(20, 220), [*range(20), *range(220, 240)], 1.0)
+    assert got["verdict"] == "agree" and got["inside"] == 200, got
+
 def test_onsets_scattered_over_the_reach_never_agree():
     """A right track that Whisper heard 0.98 s early reads as a block of 16 cues. Four stray onsets lie 0.1 to 0.27 s from
     where the block would put four cues, and one cue has its own onset. The strays meet the count, and their median lies
@@ -2510,6 +2530,32 @@ def test_onsets_scattered_over_the_reach_never_agree():
     ons = [(at[k], 1.0) for k in outside] + [(at[12], 1.0)] + [(at[k] - 0.98 - d, 1.0) for k, d in zip((14, 17, 20, 23), (-0.27, -0.1, 0.17, 0.24))]
     got = s.clock(sorted(ons), at, range(12, 28), outside, 0.98)
     assert got["verdict"] == "few" and got["inside"] == 4 and got["original"] == 1, got
+
+
+@pytest.mark.parametrize("hits, verdict", [(4, "few"), (13, "agree")])
+def test_onsets_where_the_block_puts_its_cues_must_beat_chance(hits, verdict):
+    """A block of 13 cues 0.82 s late among stray onsets at 0.25 a second. At the NULL offsets from where the block puts
+    its cues, chance gives about one onset within 0.15 s. Four onsets there are not rare enough, so the onsets are too
+    few. Thirteen agree."""
+    at = {k: 10.0 * k for k in range(40)}
+    inside, outside = range(12, 25), [*range(12), *range(25, 40)]
+    r = random.Random(1)
+    places = [at[k] - 0.82 for k in inside] + [at[k] for k in inside]
+    strays = [(x, 1.0) for x in (r.uniform(0, 400) for _ in range(100)) if all(abs(x - p) > 0.35 for p in places)]
+    ons = sorted([(at[k], 1.0) for k in outside] + [(at[k] - 0.82, 1.0) for k in list(inside)[:hits]] + strays)
+    got = s.clock(ons, at, inside, outside, 0.82)
+    assert got["verdict"] == verdict and got["chance"] >= 0.4, got
+
+
+def test_onsets_on_a_regular_pitch_still_count_chance():
+    """Lines start every 2.5 s, and each line outside a block of 13 cues 0.82 s late has its onset. Every NULL offset
+    from where the block puts a cue then lies between two onsets and counts none. The rate of all onsets still gives
+    about one by chance within 0.15 s of those places, so four onsets there are too few."""
+    at = {k: 2.5 * k for k in range(40)}
+    inside, outside = range(12, 25), [*range(12), *range(25, 40)]
+    ons = sorted([(at[k], 1.0) for k in outside] + [(at[k] - 0.82, 1.0) for k in (13, 16, 19, 22)])
+    got = s.clock(ons, at, inside, outside, 0.82)
+    assert got["verdict"] == "few" and got["chance"] >= 1.0, got
 
 
 def test_evidence_of_a_cue_of_its_own():
