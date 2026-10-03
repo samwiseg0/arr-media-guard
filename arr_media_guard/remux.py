@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import contextlib, fractions, os, re, shutil, signal, subprocess, threading, time
+import contextlib, fractions, os, re, shutil, signal, statistics, subprocess, threading, time
 
 from . import checks, config, decide, logs, proof, runner, subsync, vault
 
@@ -384,21 +384,74 @@ def flash_plan(cues, ass=False):
     return [(s, t, e, round(n, 2) if ass else n) for (s, e, t), n in zip(cues, ends)] if ends else None
 
 
+def time_plan(cues, fix, blocks, ends=None, ass=False):
+    """[(start, text, old end, new start, new end)] of cues [(start, end, text)] in their order, or None when no time
+    moves. fix is a fix of subsync.timing(), or None. blocks are the blocks of subsync.blocks(). A cue starts at
+    moved(start, fix) less the shift of the block whose [from, to) holds its start, unless the block keeps that start,
+    rounded to ms, in "keep": a cue with no evidence of its own stays. ends are the new ends of
+    flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does. A start
+    stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an ASS time
+    rounds to them, and an ASS end stays 1 cs after its start."""
+    step = 10 if ass else 1   # ms
+    at = lambda t, shift: round(((subsync.moved(t * 1000, fix) if fix else t * 1000) - shift * 1000) / step) * step
+    out = []
+    for k, (s, e, text) in enumerate(cues):
+        shift = next((b["shift"] for b in blocks or () if b["from"] <= s < b["to"] and round(s, 3) not in b.get("keep", ())), 0)
+        a = max(0, at(s, shift))
+        out.append((s, text, e, a / 1000, max(at(ends[k] if ends else e, shift), a + step) / 1000))
+    return out if any(abs(a - s) + abs(b - e) > 0.0005 for s, _, e, a, b in out) else None
+
+
+def blocks_moved(plan, fix=None):
+    """How the time_plan() plan moves its cues past fix, the whole-track fix it holds, as "14 cues of 1 block moved
+    -1.42 s", or None when it moves none. A block is a run of cues in start order that move by the same time, within
+    0.05 s. A move under 0.05 s is the rounding of ASS times."""
+    runs = []
+    for s, _, _, a, _ in sorted(plan, key=lambda p: p[0]):
+        d = a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
+        if abs(d) <= 0.05:
+            runs.append(None)
+        elif runs and runs[-1] and abs(d - runs[-1][-1]) <= 0.05:
+            runs[-1].append(d)
+        else:
+            runs.append([d])
+    runs = [r for r in runs if r]
+    if not runs:
+        return None
+    return (f"{sum(map(len, runs))} cues of {len(runs)} block{'s' if len(runs) > 1 else ''} moved "
+            + ", ".join(f"{statistics.median(r):+.2f} s" for r in runs))
+
+
 def set_ends(text, ass, plan):
-    """The text of a SubRip, ASS or SSA file with the new ends of plan [(start, text, old end, new end)] in their order.
-    A SubRip cue pairs with the plan by its place and must keep its start. An ASS event pairs by its start and text,
-    because mkvextract may write the events in another order. Raises when a cue finds no pair."""
+    """The text of a SubRip, ASS or SSA file with the new times of plan in their order. plan is a time_plan(), or a
+    flash_plan(), whose starts stay. A SubRip cue pairs with the plan by its place and must have the plan's old start.
+    An ASS event pairs by its start and text, because mkvextract may write the events in another order. A cue must
+    also have the plan's old end, within 2 ms. mkvextract cuts an ASS time to centiseconds, so an ASS end must be the
+    old end cut the same way. A start that does not move keeps its text. Raises when a cue finds no pair.
+
+    A block with no BlockDuration has no known end, and timed() makes one up for the plan. mkvextract then writes an
+    ASS event that ends at its start, and a SubRip cue that ends at the next cue's start. It leaves out such a SubRip
+    cue when it is the last one. Those cues find no pair, so no made-up end goes into the file. prove() refuses
+    the rest, see its timed and ended checks."""
+    plan = [p if len(p) == 5 else (*p[:3], p[0], p[3]) for p in plan]   # a flash_plan() keeps each start
     lines, fmt = text.split("\n"), lambda x: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(round(x * 1000))
     if ass:
         todo, clock = {}, lambda t: sum(float(x) * m for x, m in zip(t.split(":"), (3600, 60, 1)))
-        for s, t, _, e in plan:
-            todo.setdefault((round(s * 100), t), []).append(e)
+        cs = lambda x: (lambda v: f"{v // 360000}:{v // 6000 % 60:02d}:{v // 100 % 60:02d}.{v % 100:02d}")(round(x * 100))
+        for s, t, o, a, e in plan:
+            todo.setdefault((round(s * 100), t), []).append((o, a, e))
         for k, line in enumerate(lines):
-            m = re.match(r"(Dialogue:\s*[^,]*,([^,]*),)([^,]*)((?:,[^,]*){6},(.*))$", line.rstrip("\r"))
+            m = re.match(r"(Dialogue:\s*[^,]*,)([^,]*),([^,]*)((?:,[^,]*){6},(.*))$", line.rstrip("\r"))
             if m:
-                e = todo[(round(clock(m[2]) * 100), m[5])].pop(0)
-                cs = round(e * 100)
-                lines[k] = f"{m[1]}{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}{m[4]}" + ("\r" if line.endswith("\r") else "")
+                twins, end = todo[(round(clock(m[2]) * 100), m[5])], round(clock(m[3]) * 100)
+                n = next((n for n, (o, _, _) in enumerate(twins) if round(o * 1000) // 10 == end), None)
+                if n is None:
+                    raise RuntimeError(f"the ASS event at {clock(m[2]):.3f} s has no duration in the file, so its end is not known"
+                                       if m[2] == m[3] else f"the ASS event at {clock(m[2]):.3f} s ends at {end / 100:.2f} s in the extracted "
+                                       f"text, and the plan's at {twins[0][0]:.3f} s" if twins else "an ASS event of the extracted text is not in the plan")
+                _, a, e = twins.pop(n)
+                start = m[2] if round(a * 100) == round(clock(m[2]) * 100) else cs(a)
+                lines[k] = f"{m[1]}{start},{cs(e)}{m[4]}" + ("\r" if line.endswith("\r") else "")
         if any(todo.values()):
             raise RuntimeError("an ASS event of the plan is not in the extracted text")
         return "\n".join(lines)
@@ -410,7 +463,11 @@ def set_ends(text, ass, plan):
             start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3].ljust(3, "0")[:3]) / 1000
             if k >= len(plan) or abs(start - plan[k][0]) > 0.0015:
                 raise RuntimeError(f"cue {k + 1} of the extracted text starts at {start:.3f} s, and the plan's at {plan[k][0] if k < len(plan) else None}")
-            lines[i] = f"{line[:m.start(5)].rstrip().removesuffix('-->').rstrip()} --> {fmt(plan[k][3])}{g[8]}"
+            end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7].ljust(3, "0")[:3]) / 1000
+            if abs(end - plan[k][2]) > 0.002:
+                raise RuntimeError(f"cue {k + 1} of the extracted text ends at {end:.3f} s, and the plan's at {plan[k][2]:.3f} s, so its end is not known")
+            head = line[:m.start(5)].rstrip().removesuffix("-->").rstrip() if abs(plan[k][3] - start) < 0.0005 else fmt(plan[k][3])
+            lines[i] = f"{head} --> {fmt(plan[k][4])}{g[8]}"
             k += 1
     if k != len(plan):
         raise RuntimeError(f"the extracted text holds {k} cues, and the plan {len(plan)}")
@@ -418,10 +475,10 @@ def set_ends(text, ass, plan):
 
 
 def ended_track(path, j, tid, plan, folder):
-    """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new ends of plan.
-    mkvextract writes the track's text, set_ends() puts the ends in, and mkvmerge reads it back. That round trip keeps
-    the packets and the ASS header byte for byte. The language goes in here, as ffmpeg copies it. The flags and names
-    come back later with mkvpropedit, see resub()."""
+    """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new times of plan, a
+    time_plan() or a flash_plan(). mkvextract writes the track's text, set_ends() puts the times in, and mkvmerge reads
+    it back. That round trip keeps the packets and the ASS header byte for byte. The language goes in here, as ffmpeg
+    copies it. The flags and names come back later with mkvpropedit, see resub()."""
     p = next(t.get("properties") or {} for t in j.get("tracks") or [] if t.get("id") == tid)
     codec = p.get("codec_id")
     ext = {"S_TEXT/UTF8": "srt", "S_TEXT/ASS": "ass", "S_TEXT/SSA": "ssa"}[codec]
@@ -460,17 +517,22 @@ def cover_edits(path, j, pics, folder):
     return out
 
 
-def resub(path, j, st, apply, fixes, drop=(), ends=None):
+def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
     """Remux a Matroska file in place with new times for the subtitle tracks in fixes, {mkvmerge track id: fix of
-    subsync.timing()}, new cue ends for the text tracks in ends, {mkvmerge track id: the plan of flash_plan()}, and
-    without the subtitle track ids in drop, in one remux under the caller's exclusive file lock (docs/design.md,
-    "Subtitle match"). Returns (code, result, info). result is "subtitles remuxed", "would remux subtitles: ...", "subtitle
-    remux failed: ..." or "subtitle remux skipped, ...", and code subtitles_remuxed, would_remux_subtitles,
-    subtitle_remux_failed or subtitle_remux_skipped.
+    subsync.timing()}, new cue ends for the text tracks in ends, {mkvmerge track id: the plan of flash_plan()}, new
+    times for the text tracks in timed, {mkvmerge track id: time_plan()}, and without the subtitle track ids in drop,
+    in one remux under the caller's exclusive file lock (docs/design.md, "Subtitle match"). Returns (code, result,
+    info). result is "subtitles remuxed", "would remux subtitles: ...", "subtitle remux failed: ..." or "subtitle remux
+    skipped, ...", and code subtitles_remuxed, would_remux_subtitles, subtitle_remux_failed or subtitle_remux_skipped.
 
     A track with new ends comes from its own input: mkvextract writes its text, set_ends() puts each new end in, and
     mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, and the proof
     holds each end to the plan.
+
+    A track in timed comes from its own input the same way, with every start and end of its plan. Its plan holds its
+    fix and its flash ends, so it gets no -itsoffset or -itsscale. Its entries in fixes and ends only go to the log and
+    the what text, and the what text names the cues its blocks move past that fix, see blocks_moved(). The proof holds
+    each start and end to the plan. ended_track() takes SubRip, ASS and SSA only.
 
     ffmpeg copies every other stream with -copyinkf, and reads each retimed track from a second input of the same file
     with -itsoffset and -itsscale, so its cues move to (time - offset) / rate. mkvmerge moves the times of laced AAC
@@ -484,10 +546,12 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None):
     originals_root() for keep_days, and the temp file is renamed over it. A removal needs that kept original, so with
     KEEP_ORIGINALS_DAYS 0 the caller never asks for one. The extracted text, the proof's reads and the cover
     attachments go into a folder under STATE_DIR, never the system temp dir, which is often a small tmpfs."""
-    ends = ends or {}
-    info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()}}
+    ends, timed = ends or {}, timed or {}
+    info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()},
+            **({"timed": {str(i): len(plan) for i, plan in timed.items()}} if timed else {})}
     what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
                      + [f"track {i}: new ends for {sum(e != o for _, _, o, e in plan)} of {len(plan)} cues" for i, plan in ends.items()]
+                     + [f"track {i}: {blocks_moved(plan, fixes.get(i)) or f'new times for {len(plan)} cues'}" for i, plan in timed.items()]
                      + [f"remove track {i}" for i in drop])
     why = repack_skip(path, st)
     if why:
@@ -502,8 +566,8 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None):
         text = [x["index"] for x in streams if x.get("codec_type") == "subtitle"]
         if len(text) != len(subs):
             raise RuntimeError(f"ffprobe reads {len(text)} subtitle streams and mkvmerge {len(subs)}")
-        moved, gone = {text[subs.index(i)]: f for i, f in fixes.items()}, {text[subs.index(i)] for i in drop}
-        ended = {text[subs.index(i)]: ended_track(path, j, i, plan, folder) for i, plan in ends.items()}
+        moved, gone = {text[subs.index(i)]: f for i, f in fixes.items() if i not in timed}, {text[subs.index(i)] for i in drop}
+        ended = {text[subs.index(i)]: ended_track(path, j, i, plan, folder) for i, plan in {**ends, **timed}.items()}
         argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
         own = sorted(set(moved) | set(ended))
         for x in own:   # one input per track: -itsoffset holds for a whole input
@@ -541,8 +605,10 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None):
         fault = props_fault(j, new, drop)
         if not fault:
             kept = [i for i in subs if i not in drop]
-            refused, info["proof"] = proof.prove(path, tmp, [], folder, dropped=gone, retimed={kept.index(i): f for i, f in fixes.items()}, absolute=True,
-                                           ended={kept.index(i): [e for _, _, _, e in plan] for i, plan in ends.items()})
+            refused, info["proof"] = proof.prove(path, tmp, [], folder, dropped=gone, absolute=True,
+                                                 retimed={kept.index(i): f for i, f in fixes.items() if i not in timed},
+                                                 ended={kept.index(i): [e for _, _, _, e in plan] for i, plan in ends.items() if i not in timed},
+                                                 timed={kept.index(i): [(a, e) for _, _, _, a, e in plan] for i, plan in timed.items()})
             fault = refused and refused[1]
         if fault: raise RuntimeError(fault)
         size = sw.own()

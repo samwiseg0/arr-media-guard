@@ -591,7 +591,8 @@ def cli_line(rec, t):
 
 def sub_time_report(rec, t):
     """The report of --sub-time on one file: its result, then one line per subtitle with its place or sidecar name,
-    codec, language, role, method, verdict, offset and ratio, and action, then the rows of the sweep and the alerts."""
+    codec, language, role, method, verdict, offset and ratio, and action, then the rows of the sweep, the blocks of the
+    dense hearing and the parts it left, and the alerts."""
     rm, done = rec.get("subremux") or {}, {e["name"]: e for e in rec.get("sidecars") or []}
     pending = remux_column(rec, t)[:100]   # the action of a track the remux planned for
     tracks = {x["i"]: x for x in rm.get("tracks_before") or rec.get("tracks") or []}   # the places the check named
@@ -606,8 +607,8 @@ def sub_time_report(rec, t):
         when = f'{fix["offset"]:+.2f} s {fix["rate"]}' if fix else "in time" if x.get("why") == "in time" else "-"
         if p in done:
             act = f'sidecar {done[p]["result"]}' + (f': {done[p]["left"]}' if done[p].get("left") else "")
-        elif p in (rm.get("remove") or []) or p in (rm.get("fixed") or []):
-            act = ("removed" if p in (rm.get("remove") or []) else "retimed") if rm.get("done") else pending
+        elif p in (rm.get("remove") or []) or p in (rm.get("fixed") or []) or p in (rm.get("timed") or []):
+            act = ("removed" if p in (rm.get("remove") or []) else "retimed" if p in (rm.get("fixed") or []) else "blocks moved") if rm.get("done") else pending
         elif r["verdict"] == "mismatch":
             act = "flags off" if not r.get("held") else "none, held"
         elif r["verdict"] == "weak":
@@ -635,6 +636,14 @@ def sub_time_report(rec, t):
                 + (f' ALERT {w["off"]:+.2f} s off the fitted line' if id(w) in alerts else
                    f' {w["off"]:+.2f} s off the fitted line, ' + (share if id(w) in steps else "one window alone")
                    if cli.sweep_far(w) else "") for w in rows]
+    for k, b in sorted((rec.get("blocks") or {}).items()):   # a block moves in the remux or in the sidecar's rewrite, see process.subtitle_checks()
+        planned = k in (rm.get("timed") or []) or k in done
+        landed = (k in (rm.get("timed") or []) and rm.get("done")) or (done.get(k) or {}).get("result") == "retimed"
+        verb = "moved" if landed else "would move" if planned and t == "planned" else "not moved"
+        out += [f'  {k}: {x["cues"]} cues from {content.hms(x["from"])} to {content.hms(x["to"])} {verb} {-x["shift"]:+.2f} s, '
+                f'{subsync.AGREE:.0%} of {x["anchors"]} heard cues agree within {x["spread"]:.2f} s{onset_text(x.get("onsets"))}' for x in b["blocks"]]
+        out += [f'  {k}: no block from {content.hms(x["lo"])} to {content.hms(x["hi"])}, {why}' for x in b["parts"] if x.get("why")
+                for why in dict.fromkeys(x.get("whys") or [x["why"]])]   # every reason the part moved nothing, once each
     if rec.get("full_read"):
         f = rec["full_read"]
         out.append(f'  whole-file read of {", ".join(f["tracks"])}: {f["took"]} s, {f["cpu"]} CPU s' + (f'; {f["why"]}' if f.get("why") else ""))
@@ -644,8 +653,23 @@ def sub_time_report(rec, t):
         f = rec["sweep_facts"]
         cost = "sweep: words from the cache" if f.get("runs") and f.get("cached") == f["runs"] else f'sweep cost: {f["cpu"]} CPU s, {f["took"]} s'
         out.append(f'  {cost}' + "".join(f"; no words from {x}" for x in f["failed"]))
+        if f.get("dense"):
+            g = f["dense"]
+            cache = "; words from the cache" if g.get("runs") and g.get("cached") == g["runs"] else ""
+            out.append(f'  dense hearing of {g["windows"]} windows and the speech onsets: {g["cpu"]} CPU s, {g["took"]} s{cache}'
+                       + "".join(f"; no words from {x}" for x in g["failed"]) + "".join(f"; no speech onsets: {x}" for x in g.get("onset_why") or []))
     out += [f"  ALERT {alert_line(f, t, track_langs(rec))}" for f in rec.get("findings") or []]
     return "\n".join(out)
+
+
+def onset_text(o):
+    """What the speech onsets said of a block, see subsync.blocks(): they agree with Whisper, or there are too few, and
+    Whisper alone moves it from BLOCK_ALONE seconds."""
+    if not o:
+        return ""
+    if o.get("verdict") == "agree":
+        return f', speech onsets agree ({o["inside"]} in the block, {o["outside"]} around it)'
+    return f", few speech onsets, Whisper alone at {subsync.BLOCK_ALONE} s"
 
 
 def missed(rec):
@@ -656,7 +680,7 @@ def missed(rec):
         return rec["result"][:200]
     if hr.get("code") in ("header_repair_failed", "header_repair_skipped"):
         return hr["result"][:200]
-    if (rm.get("fixed") or rm.get("ended") or rm.get("remove")) and not rm.get("done"):
+    if (rm.get("fixed") or rm.get("ended") or rm.get("timed") or rm.get("remove")) and not rm.get("done"):
         return rm.get("result", "the subtitle remux did not run")[:200]
     left = [e["name"] for e in rec.get("sidecars") or [] if e.get("result") == "left"]
     return f'the sidecar {", ".join(left)} stays as it was' if left else None

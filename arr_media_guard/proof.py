@@ -138,6 +138,11 @@ def ff_streams(path):
     return f.get("format_name") or "", d["streams"], float(f.get("duration") or 0)
 
 
+def secs(t, unit=""):
+    """A time of a packet in seconds as a refusal names it, with unit, or "no time" when the read gave none."""
+    return "no time" if t is None else f"{t:.3f}{unit}"
+
+
 def media_streams(streams):
     """The video, audio and subtitle streams a conversion carries: every one but a cover picture."""
     return [s for s in streams if s.get("codec_type") in ("video", "audio", "subtitle") and not (s.get("disposition") or {}).get("attached_pic")]
@@ -215,7 +220,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     return stats, texts
 
 
-def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None):
+def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None):
     """(the refusal, or None; the proof per stream). The refusal is (stream, why): why the new file tmp is not a lossless
     copy of src with the sidecars subs, and the ffprobe index of the stream of src it refuses for its packet count or
     its packet data, else None. No stream is ever decoded.
@@ -255,12 +260,16 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     holds each stream to its own start time too, within SYNC, for a remux that must move no stream. The other checks
     compare each start with the video's, so a remux that moved every stream would pass them. ended maps the k-th
     subtitle stream of src to the planned end of each of its packets, in seconds, from the flash fix: its packets and
-    starts must match as before, and each end must be the planned one, moved by its fix when it is retimed too."""
+    starts must match as before, and each end must be the planned one, moved by its fix when it is retimed too. timed
+    maps the k-th subtitle stream of src to [(start, end)] of each of its packets in seconds, from a time plan of
+    remux.time_plan(): its packets must match, and each start and end must be the planned one within TIME_SLACK. A
+    stream in ended or timed whose original holds a cue with no duration is refused: its end is not known, and the
+    plan's end for it is made up."""
     fa, sa, _ = ff_streams(src)
     fb, sb, _ = ff_streams(tmp)
     a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped], media_streams(sb), fa.split(",")[0]
-    moved = {s["index"]: (retimed or {})[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in (retimed or {})}
-    lengthened = {s["index"]: (ended or {})[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in (ended or {})}
+    by_sub = lambda m: {s["index"]: m[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in m}
+    moved, lengthened, planned = by_sub(retimed or {}), by_sub(ended or {}), by_sub(timed or {})
     pairs, proof = [], []
     captions = captions or {}
     for kind in ("video", "audio", "subtitle"):
@@ -308,6 +317,10 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             to = lambda t: max(0, subsync.moved(t * 1000, fx)) / 1000
             xt, xs = [None if t is None else to(t) for t in xt], to(xs)
             proof[-1].update(retimed=fx, start=[round(xs - va, 3), proof[-1]["start"][1]])
+        if s["index"] in planned:   # the times of the plan
+            xt = [a for a, _ in planned[s["index"]]]
+            xs = min(xt, default=xs)
+            proof[-1]["start"][0] = round(xs - va, 3)
         if x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame, and that passes
             proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[:-1]
@@ -358,14 +371,24 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             why = f"stream {name} starts {y['start'] - vb:+.3f} s from the video in the new file, {xs - va:+.3f} s in the original"
         if not why and absolute and abs(xs - y["start"]) > SYNC:
             why = f"stream {name} starts at {y['start']:.3f} s in the new file, {xs:.3f} s in the original"
+        if not why and (s["index"] in lengthened or s["index"] in planned) and \
+                (n := sum(t is not None and e == t for t, e in zip(x.get("times") or [], x.get("ends") or []))):   # no BlockDuration
+            why = f"stream {name} holds {n} cue{'s' if n > 1 else ''} with no duration in the original, so {'their ends are' if n > 1 else 'its end is'} not known"
         if not why and s["index"] in lengthened:   # the flash fix: only the ends change, as planned
             fx = moved.get(s["index"])
             want = [max(0, subsync.moved(e * 1000, fx)) / 1000 if fx else e for e in lengthened[s["index"]]]
             cue = next((k for k, (e, g) in enumerate(zip(want, y.get("ends") or [])) if g is None or abs(e - g) > TIME_SLACK), None)
             if len(want) != len(y.get("ends") or []) or cue is not None:
                 why = (f"stream {name} ends {len(y.get('ends') or [])} cues, and the plan {len(want)}" if cue is None else
-                       f"stream {name} ends cue {cue + 1} at {y['ends'][cue]:.3f} s, and the plan at {want[cue]:.3f} s")
+                       f"stream {name} ends cue {cue + 1} at {secs(y['ends'][cue], ' s')}, and the plan at {want[cue]:.3f} s")
             proof[-1]["ended"] = len(want)
+        if not why and s["index"] in planned:   # a time plan: each start and end as planned
+            want, got = planned[s["index"]], list(zip(y.get("times") or [], y.get("ends") or []))
+            cue = next((k for k, ((a, e), (p, q)) in enumerate(zip(want, got)) if None in (p, q) or abs(a - p) > TIME_SLACK or abs(e - q) > TIME_SLACK), None)
+            if len(want) != len(got) or cue is not None:
+                why = (f"stream {name} holds {len(got)} timed cues, and the plan {len(want)}" if cue is None else
+                       f"stream {name} times cue {cue + 1} {secs(got[cue][0])} to {secs(got[cue][1], ' s')}, and the plan {want[cue][0]:.3f} to {want[cue][1]:.3f} s")
+            proof[-1]["timed"] = len(want)
         if not why and fam == "avi" and s["codec_type"] == "audio":
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:

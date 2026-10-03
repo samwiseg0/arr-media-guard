@@ -559,7 +559,10 @@ that makes a result gives its outcome code with it, and a result with no code lo
 reason codes come from the `say()` calls in
 `decide.py` and from the header and restore steps. An `editing` line with the undo goes
 out before each edit, so a crashed edit still has a record. A repack, a header repair and a subtitle
-remux each write a line before anything else runs, with the code of the step in `outcome`. Only a
+remux each write a line before anything else runs, with the code of the step in `outcome`. A subtitle remux
+that changes no flag gives the decision line the outcome `subtitles_remuxed`, and its result names each change, as
+`subtitles remuxed: s2 retimed, s1 blocks moved`. When only sidecars changed, the outcome is `sidecars_changed`, as
+`sidecars changed: Film.en.srt retimed`. Only a
 decision line has `schema`. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
 the log weekly with compression. The code never reads the log back, see "State".
@@ -1251,7 +1254,8 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 
 - A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitles"
   alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
-  both is remuxed once. The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
+  both is remuxed once. So do the blocks of `--sub-time` and the deep analysis (`subtitle_blocks_retimed`), see "Two
+  stages". The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
   extracted text, the proof's reads and the cover attachments, go into a folder under `STATE_DIR`, never the system
   temp dir, which is often a small tmpfs. The trim, the damage read, the conversion and the video windows keep their
   work files there too. A worker that starts removes a work folder that a killed step left over a day ago. ffmpeg
@@ -1383,7 +1387,180 @@ library would take weeks.
   rows. A part of the file is then off, and nothing fixed it. Other steps go to the log only, such as two windows near
   the end, or two stray windows of a sparse sweep. So does one window alone, because Whisper can hear a word with the
   line before it and move one window's offset by a second.
-  The sweep never changes a time.
+  The sweep itself changes no time. Its rows name the parts for the dense hearing. A row whose window lies inside a
+  block that moves, with no cue there that stays, counts with the block's shift taken off, so it never alerts. A row
+  whose window crosses an edge of the block, or holds a cue that stays, keeps its offset, because cues there still sit
+  off. In a part that dense hearing finds in time, a row counts at the part's median when 2 anchors or more lie in its
+  window. A row with fewer keeps its offset, because the hearing did not test it.
+- **Blocks.** A part of a track can sit off while the rest is in time, as after an edit. The sweep finds such a part,
+  and dense hearing confirms it (`subtitles.sub_dense()`). A sweep row counts when it heard 8 words, matched half of
+  them or more and matched 2 cues. A right track leans a little off its fitted line, so each row is measured from the
+  track's lean, the median offset of its rows that count. A row that sits 0.5 seconds or more off the lean is a
+  suspect (`subsync.suspect_rows()`). One row is enough, because the owner wants recall first, and the gate of
+  `subsync.blocks()` decides every move. A part reaches 120 seconds before and after its suspect rows, or to the
+  nearest row within 0.3 seconds of the lean when that is nearer, so the hearing sees both edges. Parts that cover over half the file are a whole-track matter for the fit, and the dense hearing
+  takes none of them. The tracks of one audio track share one hearing of all their parts, in windows of 10 seconds
+  every 7.5 seconds where their cues are, each track moved to the audio by its fix (`subsync.dense()`). A fix of
+  minutes would else hear the wrong stretch. The hearing runs as the sweep does, with one process, two windows a
+  Whisper run, the same cache and the same yield to an import.
+
+  The parts of one audio track hold 360 seconds of audio in all, for all its tracks together
+  (`subtitles.heard_parts()`). The parts with the rows farthest off come first. A part that does not fit in what is
+  left keeps the stretch that fits, centred on its row farthest off (`subsync.centred()`). `suspects()` first shrinks
+  its margins to 30 seconds on each side. When under 10 seconds are left, the part is not heard, and its why names the cap.
+
+  A part can end before the hearing sees the edge of its block, with under 3 heard cues on the line past it. That part
+  then asks for 30 seconds more past that end (`subsync.further()`). A second hearing hears only the pieces of those
+  stretches that the first hearing did not hear (`subsync.unheard()`), in new windows that `dense()` lays over them,
+  and their onsets join the others. Each piece counts against what the 360 seconds leave after the first hearing, as
+  10 seconds at least, because `dense()` hears a shorter piece as one whole window. So both hearings together stay
+  within 360 seconds. A stretch cut short keeps its end at the part, and one under 10 seconds is not heard. `blocks()`
+  counts an onset that two reads found once. `blocks()` then runs again for each track that asked, with its parts and
+  its whole stretches. In the deep analysis an import that waits goes first, before the second hearing.
+
+  `subsync.blocks()` anchors each heard cue at its first spoken word (`subsync.heard_anchors()`). The match pairs the
+  cue's first content word. The anchor then steps back over the cue's words before it, such as "so" or "the", while
+  Whisper heard each of them as that word and under a second before the next. Leading stopwords put the first content
+  word late, and on right tracks this step took the largest median of 6 heard cues in a row from 0.63 to 0.30 seconds.
+  Four filters drop an anchor that would mislead. A cue that shows under 0.05 seconds never anchors, because a cue of
+  1 ms that repeats its neighbour's text paired with that neighbour's speech 3 seconds off. Two cues in a row with the
+  same words never anchor. A heard word that anchors two cues anchors neither. A cue that two overlapping windows time
+  over 0.3 seconds apart anchors in neither. Else a cue keeps the anchor heard farthest from its window's edges. The
+  first cue after 2.5 seconds with no cue never anchors either. Whisper times the first word after a silence early, so
+  such a cue reads late.
+
+  The part's line is where its anchors near the fitted line sit, their median. So it follows a track that leans. A
+  block is a run of 6 anchored cues or more. 80 percent of them, the first and the last among them, lie within 0.3
+  seconds of their median, or within a quarter of the shift when that is more. So a block 2 seconds off agrees within
+  half a second, and its anchors still lie well off the line. None of them lies nearer the part's line than the block,
+  so a cue in time never joins a run. That median sits 0.5 seconds or more off the part's line, and 0.5 seconds or
+  more off the fitted line too. A block that fills most of a part can pull the part's line toward itself, and then
+  cues in time read 0.5 seconds off that line. The line beside the block, the median of the anchors on the line
+  nearest it, must lie within 0.15 seconds of the part's line. A block of the other sign next to it can pass for that
+  line, and the move then overshoots. The sweep rows outside every part give the track's lean, their median. The sweep
+  pairs a cue's first content word, and dense hearing steps back to the first word spoken, so the two read a track
+  apart by how its lines start, up to 0.35 seconds on the bench. The rows inside the parts, against the anchors of the
+  cues in their windows, measure that, and the lean takes it in. The part's line, the line beside the block and the
+  line on each side of it must lie within 0.3 seconds of that lean. The block must also sit 0.5 seconds off that lean.
+  A block of the other sign in the part can pull the part's line toward itself, and a few cues an author set 0.3 to
+  0.5 seconds late then read as a block. One side can sit off while the line of both sides passes. A long block can
+  fill a part, and both lines then sit on it. A block of the other sign beside it then moved by the sum of both
+  shifts.
+
+  On each side, the 6 nearest anchors that lie nearer the part's line than the block test the edge. The side sits on
+  the line when 3 of them lie within 0.3 seconds of it, or when the median of the nearest 3, or of all 6, does. So one
+  chance pair, or one cue that Whisper heard far off, never hides the line. When 3 of them in a row sit 0.3 seconds or
+  more off the line the way of the block, before 3 lie on it, the run is part of a longer stretch off the line. That
+  edge is then not seen. A side with under 3 such anchors counts only when the part reaches the track's first or last
+  cue. Else the part asks for more hearing past that end, see above. The shift is the median of the block's anchors
+  less the median of the 6 nearest anchors on the part's line at each side, so the block keeps the lead of the cues
+  around it. The second clock below then decides whether the block moves. When its onsets agree, an anchor past the
+  block, farther from the line, does not count in the share that must agree, because Whisper hears some cues of a
+  block far off.
+
+  A cue in time at the end of a block can read like the block, and a stray onset can confirm it. So an end of a run
+  must hold for more than one anchor. When the speech onsets agree, each end of the block moves in to its first heard
+  cue whose anchor lies within 0.15 seconds of the block, clearly off the line, and that one more thing puts there
+  too. It is an onset where the block puts the cue, the only onset within 1 second, with none where the cue sat. Or it
+  is the cue's heard words. Or it is an anchor 1.0 seconds or more off the line, beside the anchor of the next cue in,
+  which lies in the block the same way. On Whisper alone, the outermost heard cue at each end stays, unless an onset
+  puts it in the block that way, and so does each next one whose anchor sits under 1.0 seconds off the line. An end at
+  the file's start or end holds, as no cue in time lies beyond it.
+
+  A block moves toward the cues at one edge: after it when it sits late, and before it when it sits early. There a cue
+  of the block can sit past a cue in time, which then lies within the block's times, and Whisper pairs the words of
+  the two out of order. Only an onset tells them apart. So each cue within the shift and 0.3 seconds of the block's
+  outer cue at that edge, and that outer cue when the cue beyond it lies that near, needs an onset where the block
+  puts it. Whisper can read the shift up to 0.3 seconds short, so the window is that much wider. An onset within 0.3
+  seconds of two cue starts may be either cue's, so it times neither. The edge moves in past the last cue that has
+  none.
+
+  An edit leaves a mark between the last cue before it and the first cue after it. At the start of a block late by the
+  shift, a gap lies between them, and the move closes it to an overlap of two frames at most. At the start of a block
+  early by the shift, the two cues overlap, and the move ends that overlap to two frames at most. The end of a block
+  mirrors that. When such a pair lies within the first or the last 2 heard cues of the block, after the trims above,
+  the edge moves in to it. So a cue in time beside an edit never joins the block, even when its author set it as far
+  off.
+
+  Then each cue between the edges needs evidence of its own that it belongs to the block (`subsync.evidence()`). It is
+  the cue's anchor at the block's offset, or its heard words placed in the block. The words of the first cue after a
+  long silence read early, so that cue also needs an onset where the block puts it, with none where it sits. An onset
+  never counts without the cue's own words. Beside a block, `placed()` reads a cue in time as unsure, and a lone onset
+  where the block would put it is another sound as often as the cue's speech. An onset counts as a cue's own only when
+  no cue next to it starts within 0.3 seconds of it, where either cue sits or where the block puts it. A cue whose own
+  evidence puts it on the line cuts the block there: its anchor nearer the line, the anchor of a cue after a long
+  silence, its heard words, or its own onset where it sits. A cut inside the run sends each side back to be judged as
+  a block of its own. A cut nearer an edge moves that edge in past it. A cue with no evidence either way stays where
+  it is. The block names it in `keep`, `unproved` counts it, and `remux.time_plan()` leaves it. `time_plan()` keeps a
+  start, not a cue, so a cue that starts with a cue that stays, as two lines shown at once, stays too. A cue whose
+  move would put it at, past or on the same centisecond as a cue next to it that stays, stays too. The test uses the
+  times `time_plan()` writes, in centiseconds. So the order of the cue starts never changes, and no two starts tie. On
+  Whisper alone, a block with a cue that would pass a cue outside its edges is refused. Whisper can read a whole
+  stretch off, the cues in time beside the block among them, and with no onsets the order is the only check left on
+  the shift. When the onsets agree, the shift is sure, and such a cue stays. A block needs 3 heard cues that move. Two
+  blocks of the same sign a few cues apart showed why. A run joined them, and the cues in time between them, most of
+  them unheard, moved with the run.
+
+  **Second clock.** Whisper's word times can run early or late over a whole stretch. On one right track they ran about
+  0.4 seconds early for over a minute, and 6 cues in a row agreed at 0.34 seconds off. So the speech onsets, a clock
+  that does not use Whisper, confirm a block before it moves. `subtitles.onsets()` reads them with ffmpeg's
+  silencedetect at -25 dB, where a silence of 0.3 seconds or more ends, each with the length of that silence. It reads
+  the centre channel when the track has one, because the dialogue is there, and else the mono mix. It runs only on the
+  parts of a file whose sweep found a part, after the dense hearing, one ffmpeg read at nice 19 and idle I/O for each
+  part. The audio of a whole episode costs about 10 CPU seconds, so the parts cost a few. Only an onset that ends a
+  silence of 0.5 seconds or more counts.
+
+  The track's onset lead comes from the cues of the part around the block. Each of them takes the only onset within 1
+  second of its start, and the lead is the median of cue start less onset. The block's cues are then counted at two
+  places, from that lead: where the block puts them, and where they sat. A cue counts at a place when an onset lies
+  within 0.3 seconds of it, or within half the shift when that is less, so the two places never share an onset. Stray
+  onsets fall at both places alike, so the counts are weighed against each other. There are three outcomes.
+
+  - The onsets agree. 20 percent of the block's cues, and 3 at least, have an onset where the block puts them, and
+    twice as many as where they sat. The median of those onsets puts the block within 0.15 seconds of Whisper's shift,
+    0.5 seconds or more off the same way. As many of them lie within 0.15 seconds of where the block puts the cues,
+    because stray onsets scatter over the search and a block's own onsets cluster. The block moves. The search at each
+    place reaches 0.3 seconds, twice that bound, so onsets that cluster off Whisper's shift fail the test. In a fuzz
+    case of a right track that Whisper heard a second off, three stray onsets 0.11 to 0.21 seconds from Whisper's
+    shift agreed under a bound of 0.3 seconds.
+  - Too few. Under 3 cues around the block have an onset, or too few cues count at either place. The block moves
+    only at 1.0 seconds or more, on Whisper alone.
+  - The onsets disagree. As many cues count where they sat as where the block puts them, and enough to judge, or the
+    onsets count clearly and put the block elsewhere. Nothing moves, and the part's why gives both counts.
+
+  A failed read gives no onsets, so a block moves on Whisper alone then.
+
+  The edges come from the heard words. Among the cues between the last anchor on the line and the first anchor of the
+  block, an anchor nearer the line stays. An anchor that lies clearly in the block moves: within 0.3 seconds of it,
+  and 0.5 seconds or more off the part's line. Every other cue goes to the side where its heard words fit its times,
+  each word counted once. The words of the first cue after a long silence read early too, so they never put it in the
+  block. A cue that fits both sides, or has no heard word, stays where it is, and the block counts it in `edge_left` or
+  `edge_right`. A gap between cue starts alone never places an edge. At an edge in the middle of a scene, a gap rule
+  moved cues that were in time. Only the mark of an edit, see above, moves an edge by the cue times.
+
+  A part that dense hearing finds in time is in line. 12 heard cues or more anchor, and so do 70 percent of its cues
+  with words. They sit within 0.3 seconds of the line at their median. No 6 in a row sit 0.5 seconds off the part's
+  line, and no 3 in a row each sit 0.3 seconds off it the same way. The sweep rows there were noise, so a row with 2
+  anchors or more in its window takes the part's median as its offset and never alerts (`subsync.after_blocks()`). A
+  row with fewer keeps its offset and the alert rule above.
+  Any other part with no block names why in `blocks`, and its rows keep the alert rule above.
+
+  Two other designs were rejected. Per-line alignment of the whole file costs about 15 CPU minutes an episode, and on
+  a right track the author's spread of -0.23 to +0.48 seconds is the size of Whisper's noise. A block from the sweep
+  rows alone has no edge closer than a minute, and a row holds 1 to 3 cues that scatter by half a second on right
+  tracks. On right tracks the median of 6 anchored cues in a row reached 0.30 seconds against the line. On one right
+  track Whisper ran 0.4 seconds early over a stretch. A fuzz with such errors moved right tracks on Whisper alone at
+  0.7 seconds, so a block needs 1.0 on Whisper alone. The owner chose 0.5 when the speech onsets agree.
+
+  Dense hearing costs about 45 CPU seconds a minute of audio with the small model on one thread. A file whose sweep
+  finds a part pays at most about 4.5 CPU minutes for each audio track. A file whose sweep sits on the line pays
+  nothing.
+
+  A built-in SubRip, ASS or SSA track with blocks gets one plan of new times for each cue, `remux.time_plan()`, with
+  its fix and its flash ends. `resub()` writes it through the text round trip of the flash fix, with no `-itsoffset`,
+  and the proof holds each start and end to the plan (`subtitle_blocks_retimed`). A sidecar is written again with the
+  plan. The plan pairs with the cues in the order of the file's text. A WebVTT track is never rewritten, so its blocks
+  only report. A block that moves posts nothing. A planned block that did not move alerts as a failed retime.
 - **A clean sweep.** A match with too few anchors for a fix is a reference when its sweep is clean: in each half of the
   file 3 windows or more heard 8 words and gave an offset, every window that heard 8 words matched at 50 percent or
   more, and every such offset lies under 0.75 seconds.
@@ -1486,9 +1663,10 @@ Import Complete trigger also sends `Download`, but with `episodeFiles` and no `e
 listener refuses it and says which triggers to use.
 
 **Trust.** Each post needs HTTP basic auth, the only auth the Webhook connection sends. The apps
-send it with the first request. The listener refuses a body over 1 MiB before it reads it. It never
-uses the path in the body. The file record must belong to the item the body names, and its path
-must be a plain absolute path. An old file must sit in the item's folder,
+send it with the first request. The listener refuses a body over 1 MiB before it reads it. It takes
+the file's path from the app's API by the file id, never from `movieFile.path` or `episodeFile.path`
+in the body. The hook edits that file in place, and a body can name any path. The file record must
+belong to the item the body names, and its path must be a plain absolute path. An old file must sit in the item's folder,
 and its recycle bin copy in the app's recycle bin, because a restore renames the copy back over the
 old path. A refusal answers 4xx or 5xx, and the decision log gets a line with source `webhook`. The
 app shows the answer in its Test and in its log.

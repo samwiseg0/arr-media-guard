@@ -1125,3 +1125,1480 @@ def test_a_fix_must_agree_with_a_second_reference():
     assert r["timing"]["fix"] == {"rate": "1/1", "offset": 2.0}, r["timing"]
     r = s.reference(late, {"s1": TALK, "s2": moved_to(TALK, offset=0.5)}, LONG)
     assert r["timing"]["fix"] is None and "but s2 needs a fix of +1.50 s" in r["timing"]["why"], r["timing"]
+
+
+# --- the block timing of the sweep ------------------------------------------------------------------------------------
+
+SCENE, PAUSE = 12, 5.0   # lines of one scene, and seconds of silence between two scenes
+AT = [FIRST + GAP * i + PAUSE * (i // SCENE) for i in range(LINES)]   # where line i starts on the audio of a right track
+LENGTH = AT[-1] + 60     # the file's duration: the credits hold no speech
+
+
+def scenes(a, b):
+    """The lines of scenes a to b - 1."""
+    return range(a * SCENE, min(b * SCENE, LINES))
+
+
+def track(late=lambda i: 0.0, rate=1, offset=0.0, show=lambda i: SHOW, at=AT):
+    """The cues of RIGHT, cue i late(i) seconds after the speech of line i at at[i], moved to rate * t + offset."""
+    return [(float(rate) * (at[i] + late(i)) + offset, float(rate) * (at[i] + late(i) + show(i)) + offset, x) for i, x in enumerate(RIGHT)]
+
+
+def hear(starts, noise=0.2, at=AT, secs=s.WINDOW, mute=(), lost=(), extra=(), delay={}):
+    """What Whisper hears in each window: line i from at[i] + LEAD, each line moved by its own error of up to noise
+    seconds either way, as Whisper's word times are. Whisper hears no word of the lines in mute, and mishears the first
+    word of the lines in lost. extra holds (audio time, word) heard by chance, and delay {line: seconds} hears a line
+    later."""
+    r = random.Random(3)
+    err = [r.uniform(-noise, noise) for _ in RIGHT]
+    said = sorted([(at[i] + LEAD + err[i] + delay.get(i, 0.0) + STEP * k, "zzz" if k == 0 and i in lost else w) for i, x in enumerate(RIGHT) if i not in mute
+                   for k, w in enumerate(x.rstrip(".").split())] + list(extra))
+    return [{"at": a, "secs": secs, "words": [[round(t - a, 2), w] for t, w in said if a <= t < a + secs]} for a in starts]
+
+
+def swept(trk, fix=None, noise=0.2, mute=()):
+    """The sweep() rows of trk, one window a minute, as --sub-time hears them."""
+    there = [(s.moved(round(a * 1000), fix) / 1000, s.moved(round(b * 1000), fix) / 1000, x) for a, b, x in trk] if fix else trk
+    minutes = [w for m in range(int(LENGTH // 60) + 1)
+               for w in s.windows(there, LENGTH, parts=((m * 60 / LENGTH, min(1.0, (m + 1) * 60 / LENGTH)),))]
+    return s.sweep(hear(minutes, noise, mute=mute), trk, "eng", {"fix": fix})
+
+
+def timed(trk, fix=None, noise=0.2, mute=(), clock=True):
+    """The block timing of trk as --sub-time runs it. The sweep hears one window a minute, suspects() names the parts,
+    dense() hears them, and blocks() judges them, with the speech onsets of the audio unless clock is False. Returns
+    (sweep rows, parts, blocks())."""
+    timing = {"fix": fix}
+    there = [(s.moved(round(a * 1000), fix) / 1000, s.moved(round(b * 1000), fix) / 1000, x) for a, b, x in trk] if fix else trk
+    rows = swept(trk, fix, noise, mute)
+    parts = s.suspects(rows, LENGTH)
+    return rows, parts, s.blocks(hear(s.dense(there, parts, LENGTH), noise, mute=mute), trk, "eng", timing, parts, onsets(every=True) if clock else None, rows)
+
+
+def placed(trk, fix, got):
+    """Where each cue of trk starts on the audio after the fix and the block fixes, and whether a block moved it."""
+    out = []
+    for a, _, _ in trk:
+        b = next((b for b in got["blocks"] if b["from"] <= a < b["to"] and round(a, 3) not in b.get("keep", ())), None)
+        out.append(((s.moved(round(a * 1000), fix) / 1000 if fix else a) - (b["shift"] if b else 0.0), b is not None))
+    return out
+
+
+def lands(trk, fix, got, block, at=AT, exact=False):
+    """Only cues of block move, at least half of them, each to within 0.2 s of its speech. With exact, every cue of block
+    moves. blocks() leaves a cue at a block's edge where it is unless both clocks put it clearly in the block, see the
+    edges of blocks()."""
+    moved = [i for i, (t, m) in enumerate(placed(trk, fix, got)) if m]
+    assert set(moved) <= set(block) and 2 * len(moved) >= len(block), (sorted(set(moved) - set(block)), len(moved), len(block), got)
+    assert not exact or set(moved) == set(block), (sorted(set(block) - set(moved)), got)
+    for i in moved:
+        t = placed(trk, fix, got)[i][0]
+        assert abs(t - at[i]) <= 0.2, (i, t, at[i], got)
+
+
+@pytest.mark.parametrize("late, where", [(0.85, scenes(10, 15)), (1.5, scenes(10, 13)), (-2.0, scenes(10, 12))])
+def test_a_block_of_one_to_three_minutes_moves_to_its_speech(late, where):
+    """A block of 1 to 3 minutes sits late or early after an edit, and the cues around it are in time. The sweep finds it,
+    dense hearing hears it, and only its cues move. Its edges lie at the scene cuts."""
+    trk = track(late=lambda i: late if i in where else 0.0)
+    rows, parts, got = timed(trk)
+    assert any(abs(r["off"] or 0) >= s.BLOCK_SHIFT for r in rows) and parts, rows
+    assert len(got["blocks"]) == 1, got
+    b = got["blocks"][0]
+    assert trk[where[0]][0] <= b["from"] and b["to"] <= trk[where[-1] + 1][0], b
+    assert abs(b["shift"] - late) <= 0.1 and b["anchors"] >= s.BLOCK_CUES and b["spread"] <= s.TOLERANCE, b
+    assert all(p["why"] is None for p in got["parts"]), got
+    lands(trk, None, got, where)
+
+
+def test_a_block_at_the_file_end_runs_past_the_last_cue():
+    """The last scenes sit 2 s late up to the end of the file. No cue after them sits on the line, so the block runs
+    past the last cue. A block from the first cue starts at 0."""
+    where = scenes(30, 34)
+    trk = track(late=lambda i: 2.0 if i in where else 0.0)
+    _, parts, got = timed(trk)
+    assert parts[-1][1] == round(LENGTH, 1) and len(got["blocks"]) == 1, (parts, got)
+    assert got["blocks"][0]["from"] >= trk[where[0]][0] and got["blocks"][0]["to"] == trk[-1][0] + 1.0, got
+    lands(trk, None, got, where)
+    where = scenes(0, 3)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    _, parts, got = timed(trk)
+    assert parts[0][0] == 0.0 and [b["from"] for b in got["blocks"]] == [0.0], (parts, got)
+    lands(trk, None, got, where)
+
+
+def test_cues_with_no_heard_word_at_an_edge_stay_where_they_are():
+    """Whisper hears no word of the last line before the block and the first two lines of it. A scene cut lies between
+    them, but a block can also start mid-scene beside one, so no gap decides. The three lines stay, and the block counts
+    them at its start."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    _, _, got = timed(trk, mute={119, 120, 121})
+    assert got["blocks"][0]["from"] >= trk[122][0] and got["blocks"][0]["edge_left"] >= 3, got
+    lands(trk, None, got, [i for i in where if i not in (120, 121)])
+
+
+def test_two_blocks_each_move_by_their_own_shift():
+    """Two blocks in one part, with cues on the line between them, and two blocks in two parts. Each moves by its own
+    shift. In one track the sweep finds blocks of two minutes or more, and two of them exceed BLOCK_HEAR, so the
+    parts here are given."""
+    one, two = scenes(5, 7), scenes(10, 12)
+    trk = track(late=lambda i: 1.5 if i in one else -1.0 if i in two else 0.0)
+    for parts in ([(AT[50], AT[155])], [(AT[50], AT[96]), (AT[108], AT[155])]):
+        got = s.blocks(hear(s.dense(trk, parts, LENGTH)), trk, "eng", {"fix": None}, parts, onsets(every=True))
+        assert [round(b["shift"], 1) for b in got["blocks"]] == [1.5, -1.0], (parts, got)
+        lands(trk, None, got, set(one) | set(two))
+
+
+def test_a_ratio_fix_and_a_block_on_one_track():
+    """A track timed for 25 fps, 3 s late, holds a block 1.5 s later still. The block's shift counts after the fix."""
+    rate, where = Fraction(25025, 24000), scenes(15, 18)
+    fix = {"rate": "25025/24000", "offset": 3.0}
+    trk = track(late=lambda i: 1.5 if i in where else 0.0, rate=rate, offset=3.0)
+    _, _, got = timed(trk, fix)
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.5) <= 0.1, got
+    lands(trk, fix, got, where)
+
+
+def test_the_jitter_of_a_right_track_never_becomes_a_block():
+    """A right track whose author starts each cue from 0.23 s early to 0.48 s late, signs mixed, with Whisper's own
+    error on top. Even when dense hearing hears three minutes of it, no cue moves."""
+    r = random.Random(11)
+    jit = [r.uniform(-0.23, 0.48) for _ in RIGHT]
+    trk = track(late=lambda i: jit[i])
+    rows, parts, got = timed(trk)
+    assert got["blocks"] == [], (parts, got)
+    forced = [(300.0, 480.0), (700.0, 880.0)]
+    got = s.blocks(hear(s.dense(trk, forced, LENGTH)), trk, "eng", {"fix": None}, forced)
+    assert got["blocks"] == [] and all(p["why"] and p["anchors"] >= 40 for p in got["parts"]), got
+
+
+def test_a_few_slipped_cues_are_no_block():
+    """Three cues in a row slipped 0.9 s, as one sweep row can show. Dense hearing hears too few to move them."""
+    trk = track(late=lambda i: 0.9 if 200 <= i < 203 else 0.0)
+    part = [(AT[190], AT[212])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH)), trk, "eng", {"fix": None}, part)
+    assert got["blocks"] == [] and not got["parts"][0]["in_line"] and got["parts"][0]["why"].startswith("no 6 heard cues in a row agree"), got
+
+
+def test_the_suspects_reach_the_rows_on_the_line_around_them():
+    """Two rows a minute apart sit +1.65 and +0.61 s off, with 2 cues each, and both are suspects. The row after them
+    holds a single cue, so the part reaches BLOCK_MARGIN past the suspects, or the next row on the line with 2 cues when
+    that is nearer."""
+    rows = [{"at": a, "words": w, "overlap": 0.9, "cues": c, "offset": o, "off": o}
+            for a, o, c, w in [(841.7, 0.12, 3, 15), (901.7, -0.16, 3, 14), (985.7, 1.65, 2, 19), (1028.8, 0.61, 2, 13), (1084.4, -0.23, 1, 10),
+                               (1141.0, 0.05, 4, 16)]] + CALM
+    assert s.suspects(rows, 2600) == [(901.7, 1151.0)]
+    assert s.suspects(rows[:4] + [dict(r, at=r["at"] - 2000) for r in CALM], 1100) == [(901.7, 1100)]   # no row on the line after
+    early = [dict(r, at=r["at"] - 900) for r in rows[2:6]] + CALM
+    assert s.suspects(early, 2600) == [(0.0, 251.0)]       # no row on the line before: from the file's start
+    far = [dict(r, cues=1) if r["at"] in (901.7, 1141.0) else r for r in rows]
+    assert s.suspects(far, 2600) == [(985.7 - s.BLOCK_MARGIN, 1028.8 + s.WINDOW + s.BLOCK_MARGIN)]   # never out to a far row
+    half = sweep_rows([0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    assert s.suspects(half, 640) == [(60.0, 370.0)]
+    assert s.suspects(half, 600) == []                      # over half the file: the whole track is off
+
+
+def row(at, off, words=15, cues=3, overlap=0.9):
+    return {"at": at, "words": words, "overlap": overlap, "cues": cues, "offset": off, "off": off}
+
+
+CALM = [{"at": 2200.0 + 20 * k, "words": 15, "overlap": 0.9, "cues": 3, "offset": 0.0, "off": 0.0} for k in range(15)]   # rows in time
+
+
+def test_a_single_row_triggers_and_blocks_refuses_right_track_noise():
+    """One row 0.75 s off with in-time rows around it triggers dense hearing, so no block is missed. There dense
+    hearing hears right-track noise, a run of 6 heard cues seen on a real track, and blocks() moves nothing. A row that
+    heard 4 words gave -50.59 s by a chance pair, and a row with one cue proves little: neither triggers."""
+    rows = lambda o, words=12, cues=2: [row(1500.0, 0.1), row(1631.1, o, words, cues), row(1751.1, -0.1)]
+    assert s.suspects(rows(0.75), 6000) == [(1511.1, 1761.1)]   # BLOCK_MARGIN is nearer than the rows on the line
+    assert s.suspects(rows(-50.59), 6000) == [(1511.1, 1761.1)]
+    assert s.suspects(rows(s.BLOCK_SHIFT - 0.01), 6000) == []
+    assert s.suspects(rows(-50.59, words=4), 6000) == []
+    assert s.suspects(rows(-50.59, cues=1), 6000) == []
+    assert s.suspects(sweep_rows([-0.3, 0.46, 0.2, -0.31, 0.12, 0.44, -0.05]), 600) == []   # all under BLOCK_SHIFT off their lean
+    noise = [-0.81, -0.03, -0.45, -0.25, -0.81, -1.77]
+    r = random.Random(4)
+    jit = [r.uniform(-0.15, 0.15) for _ in RIGHT]
+    got = forced(lambda i: noise[i - 200] if 200 <= i < 206 else jit[i], 185, 220)
+    assert got["blocks"] == [], got   # its 6 cues sit 0.63 s off at their median, so the part is not called in time either
+
+
+def test_a_block_of_one_minute_with_one_sweep_row_moves():
+    where = scenes(10, 12)
+    trk = track(late=lambda i: -2.0 if i in where else 0.0)
+    rows, parts, got = timed(trk)
+    assert sum(abs(r["off"] or 0) >= s.BLOCK_SHIFT for r in rows) == 1 and len(parts) == 1, rows
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+def test_the_cap_trims_a_part_and_never_drops_one():
+    """Three suspect rows with full margins make one part of 370 s. Its margins shrink to fit BLOCK_HEAR."""
+    three = [row(300.0, 0.0), row(480.0, 0.0, cues=1), row(600.0, 1.0), row(660.0, 1.0), row(720.0, 1.0), row(780.0, 0.0, cues=1),
+             row(1100.0, 0.0)] + CALM
+    assert s.suspects(three, 3600) == [(485.0, 845.0)]
+    # The part 2 s off takes 310 s. The part 1 s off has 50 s left, under 2 * TRIM_MARGIN of margins, so it hears the
+    # 50 s around its row. The part 0.8 s off has no audio left: it gives a part of no length.
+    offs = [0.0] * 60
+    offs[9:13], offs[29], offs[49] = [2.0] * 4, 1.0, 0.8
+    parts = s.suspects(sweep_rows(offs), 3600)
+    assert parts == [(540.0, 850.0), (1780.0, 1830.0), (3000.0, 3000.0)], parts
+    got = s.blocks([], track(), "eng", {"fix": None}, parts)
+    assert got["parts"][2]["why"] == f"the dense hearing cap of {s.BLOCK_HEAR:.0f} s was used by parts farther off", got
+    assert s.dense(track(), [(600.0, 600.0)], LENGTH) == []   # dense hearing never hears a part of no length
+    # A margin of 20 s stays whole, and the other margin takes the rest of the 230 s left.
+    first = [row(100.0, 0.0), row(160.0, 2.0), row(220.0, 0.0)]
+    second = [row(580.0, 0.0), row(600.0, 1.0), row(660.0, 1.0), row(720.0, 1.0), row(780.0, 0.0, cues=1), row(1200.0, 0.0)]
+    assert s.suspects(first + second + CALM, 3600) == [(100.0, 230.0), (580.0, 810.0)]
+    # With 45 s left, the margins of 10 and 60 s cannot both keep TRIM_MARGIN, so the part is the 45 s around the row,
+    # moved to lie inside the part it had.
+    first = [row(100.0, 0.0)] + [row(a, 2.0) for a in (160.0, 220.0, 280.0, 340.0)] + [row(405.0, 0.0)]
+    second = [row(1990.0, 0.0), row(2000.0, 1.0), row(2060.0, 0.0)]
+    assert s.suspects(first + second + CALM, 3600) == [(100.0, 415.0), (1990.0, 2035.0)]
+    two = [row(100.0, 0.0), row(130.0, 0.9), row(160.0, 0.0), row(190.0, 0.9), row(220.0, 0.0)]
+    assert s.suspects(two, 3600) == [(100.0, 230.0)]   # parts that touch merge
+    assert s.suspects([row(500.0, 0.8), row(2000.0, 2.0)] + CALM, 3600) == [(450.0, 560.0), (1880.0, 2130.0)]   # the later part is farther off
+
+
+@pytest.mark.parametrize("second, found", [(scenes(24, 27), True), (scenes(22, 25), False)])
+def test_two_blocks_of_two_minutes_are_both_heard(second, found):
+    """The first block's part takes most of BLOCK_HEAR, and the second's part is trimmed. It still moves when its
+    trimmed part holds MIN_CUES heard cues on the line at each side. Else it gives why, and none of its cues moves."""
+    first = scenes(5, 9)
+    trk = track(late=lambda i: 1.5 if i in first else -1.0 if i in second else 0.0)
+    _, parts, got = timed(trk)
+    assert len(parts) == 2 and round(sum(b - a for a, b in parts)) == s.BLOCK_HEAR and all(p["anchors"] >= 20 for p in got["parts"]), got
+    if found:
+        assert len(got["blocks"]) == 2 and all(abs(b["shift"] - x) <= 0.1 for b, x in zip(got["blocks"], (1.5, -1.0))), got
+        lands(trk, None, got, set(first) | set(second))
+    else:
+        assert len(got["blocks"]) == 1 and "is not seen" in got["parts"][1]["why"], got
+        lands(trk, None, got, first)
+
+
+def test_dense_windows_overlap_and_skip_silence_and_songs():
+    trk = track()
+    got = s.dense(trk, [(300.0, 480.0)], LENGTH)
+    assert got[0] == 300.0 and got[-1] == 470.0, got
+    assert all(0 < b - a <= 7.5 for a, b in zip(got, got[1:])), got   # 10 s windows that share 2.5 s
+    gap = [c for c in trk if not 350 <= c[0] <= 420]   # a minute with no cue
+    song = [(c[0], c[1], "♪ " + c[2]) if 350 <= c[0] <= 420 else c for c in trk]
+    for cs in (gap, song):
+        got = s.dense(cs, [(300.0, 480.0)], LENGTH)
+        assert got and not any(350 + s.PAD < a and a + s.WINDOW < 420 - s.PAD for a in got), got
+    assert s.dense(trk, [(300.0, 400.0), (380.0, 480.0)], LENGTH) == s.dense(trk, [(300.0, 480.0)], LENGTH)   # parts that overlap merge
+
+
+def test_a_cue_before_a_block_keeps_its_end_when_the_block_moves_over_it():
+    """The last cue before a block shows until 0.5 s after the block's first line is spoken. The block moves 1.5 s
+    earlier, so its first cue starts while that cue shows. The block still moves, and that cue keeps its times."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0, show=lambda i: AT[120] + 0.5 - AT[119] if i == 119 else SHOW)
+    _, _, got = timed(trk)
+    assert len(got["blocks"]) == 1 and got["blocks"][0]["from"] == trk[120][0], got   # every line has an onset: the edge holds
+    assert trk[119][1] > placed(trk, None, got)[120][0]   # they overlap
+    lands(trk, None, got, where)
+
+
+def test_a_block_move_never_changes_the_order_of_cue_starts():
+    """Line 119 is spoken right after the block's first line, and its cue sits on the line before the block's first
+    cue, which is 2.5 s late. A move of the block would put that cue first. The onsets judge too few cues, so on Whisper
+    alone the block gets no move."""
+    at = [a + (2.0 if i > 120 else 0.0) for i, a in enumerate(AT)]
+    at[119] = AT[120] + 1.9
+    where = scenes(10, 14)
+    trk = sorted(track(late=lambda i: 2.5 if i in where else 0.0, at=at))
+    starts = [AT[120] - 20, AT[120] + 1.6] + [AT[120] + 11.6 + 7 * k for k in range(20)] + [AT[100] + 7 * k for k in range(5)]
+    heard = hear([a for a in starts if a != AT[120] - 20], at=at, noise=0.03) + hear([AT[120] - 20], at=at, secs=21.0, noise=0.03)
+    got = s.blocks(heard, trk, "eng", {"fix": None}, [(AT[100], AT[175])], [(a + LEAD, 1.0) for a in at])
+    assert got["blocks"] == [] and got["parts"][0]["whys"] == ["on Whisper alone, a move of -2.50 s would put a cue past the cue next to the block"], got
+
+
+def test_with_the_onsets_agreeing_a_cue_that_would_pass_the_cue_before_the_block_stays():
+    """A block 3 s late from line 120, the first line of a scene, whose lines start 2.5 s apart. Line 120 follows a long
+    silence, so it never joins the block. Each next line would move past the one before it, so lines 121 to 131 stay
+    too. The onsets agree, so the shift is sure, and the lines of the next scene move."""
+    trk = track(late=lambda i: 3.0 if 120 <= i <= 140 else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True))
+    lines = moved_lines(trk, got)
+    assert [b["onsets"]["verdict"] for b in got["blocks"]] == ["agree"] and set(range(132, 140)) <= lines <= set(range(132, 141)), got
+    assert keeps_order(trk, got)
+
+
+def test_on_whisper_alone_a_cue_that_would_pass_an_unproved_cue_in_the_block_stays():
+    """A block 2 s late from line 122 to 155, on Whisper alone. Line 136 has no heard words, so it stays. Line 137 is
+    spoken 1 s after it, so its move would pass it, and line 137 stays too. The cue it would pass lies in the block, so
+    the rest of the block moves."""
+    at = list(AT)
+    at[137] = AT[136] + 1.0
+    trk = sorted(track(late=lambda i: 2.0 if 122 <= i <= 155 else 0.0, at=at))
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, at=at, mute={136}), trk, "eng", {"fix": None}, part)
+    lines = moved_lines(trk, got)
+    assert [b["onsets"]["verdict"] for b in got["blocks"]] == ["few"] and not {136, 137} & lines, got
+    assert set(range(123, 132)) | set(range(138, 144)) <= lines and keeps_order(trk, got), sorted(lines)
+
+
+def test_an_onset_needs_the_cue_s_own_words_in_the_block():
+    """Blocks 1.5 s late on lines 120 to 139 and 141 to 164. Line 140, in time between them, has its first word
+    misheard, so its words fit both sides, and no onset of its own. A lone onset lies where the block would put it.
+    The onset alone never moves it."""
+    blk = set(range(120, 140)) | set(range(141, 165))
+    trk = track(late=lambda i: 1.5 if i in blk else 0.0)
+    ons = sorted([o for o in onsets(every=True) if abs(o[0] - AT[140] - LEAD) > 0.01] + [(AT[140] + LEAD - 1.45, 1.0)])
+    part = [(AT[100], AT[185])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, lost={140}), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert 140 not in lines and set(range(121, 139)) - HUSHED <= lines, sorted(lines)
+
+
+def test_a_cue_that_starts_with_a_cue_that_stays_stays_too():
+    """Lines 123 and 124 show at once in a block 1.5 s late, and Whisper hears nothing of line 123, so it stays.
+    remux.time_plan() keeps a start, not a cue, so line 124 stays with it, and the block counts only the cues that
+    move."""
+    at = list(AT)
+    at[123] = at[124]
+    trk = track(late=lambda i: 1.5 if 122 <= i <= 155 else 0.0, at=at)
+    got = quiet(trk, [(AT[100], AT[175])], at=at, mute={123})
+    lines = moved_lines(trk, got)
+    assert not {123, 124} & lines and [b["cues"] for b in got["blocks"]] == [len(lines)] and len(lines) >= 20, (sorted(lines), got["blocks"])
+
+
+def test_a_side_off_the_line_hides_the_edge():
+    """Dense hearing heard only the block and the cues after it. Its start is not seen, so no cue moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[where[0]] + 1.0, AT[where[-1]] + 40)]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH)), trk, "eng", {"fix": None}, part)
+    assert got["blocks"] == [] and "so its start is not seen" in got["parts"][0]["why"], got
+    assert got["parts"][0]["more"] == [(part[0][0] - s.FURTHER, part[0][0])], got["parts"][0]["more"]
+    part = [(AT[100], AT[where[-1]] - 5)]   # and only the cues before it and the block: its end is not seen
+    got = s.blocks(hear(s.dense(trk, part, LENGTH)), trk, "eng", {"fix": None}, part)
+    assert got["blocks"] == [] and "so its end is not seen" in got["parts"][0]["why"], got
+    assert got["parts"][0]["more"] == [(part[0][1], part[0][1] + s.FURTHER)], got["parts"][0]["more"]
+
+
+def test_a_second_hearing_past_an_unseen_end_finds_the_block():
+    """Dense hearing heard the cues before a block 1.5 s late and the block but its last line, so its end is not seen.
+    The part asks for FURTHER seconds past its end, and blocks() over the part with that stretch finds the block. Line
+    120 starts the scene, and its words never put it in the block."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[100], AT[where[-1]] - 5)]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH)), trk, "eng", {"fix": None}, part, onsets(every=True))
+    more = s.further({"s1": got}, part, LENGTH)["s1"]
+    assert got["blocks"] == [] and more == [(part[0][1], part[0][1] + s.FURTHER)], (got, more)
+    both = [tuple(p) for p in s.merged(part + more)]
+    got = s.blocks(hear(s.dense(trk, both, LENGTH)), trk, "eng", {"fix": None}, both, onsets(every=True))
+    assert set(where[1:]) <= moved_lines(trk, got) <= set(where), sorted(moved_lines(trk, got))   # line 120 starts the scene
+
+
+def test_further_hears_within_what_the_cap_leaves():
+    """The stretches of further() count against what BLOCK_HEAR leaves after the first hearing, in order. Only their
+    seconds that the first hearing did not hear count. A stretch cut short keeps its end at its part, one under WINDOW
+    seconds is not heard, and none reaches past the file."""
+    part = lambda lo, hi, more: {"lo": lo, "hi": hi, "more": more}
+    results = {"s1": {"parts": [part(100.0, 300.0, [(70.0, 100.0), (300.0, 330.0)])]}, "s2": {"parts": [part(500.0, 590.0, [(590.0, 620.0)])]}}
+    heard = lambda n: [(100.0, 300.0), (400.0, 400.0 + n), (500.0, 590.0)]   # 290 + n seconds heard first
+    assert s.BLOCK_HEAR == 360.0
+    assert s.further(results, [(100.0, 300.0)], 610.0) == {"s1": [(70.0, 100.0), (300.0, 330.0)], "s2": [(590.0, 610.0)]}
+    assert s.further(results, heard(0.0), 610.0) == {"s1": [(70.0, 100.0), (300.0, 330.0)], "s2": [(590.0, 600.0)]}
+    assert s.further(results, heard(45.0), 610.0) == {"s1": [(75.0, 100.0)]}
+    assert s.further(results, heard(55.0), 610.0) == {"s1": [(85.0, 100.0)]}
+    assert s.further(results, heard(65.0), 610.0) == {}
+    assert s.further(results, [(60.0, 300.0), (500.0, 590.0)], 610.0) == {"s1": [(70.0, 100.0), (300.0, 330.0)]}   # 70 to 100 was heard
+
+
+def test_unheard_leaves_out_what_was_heard():
+    assert s.unheard([(0.0, 100.0)], [(10.0, 20.0), (50.0, 120.0)]) == [(0.0, 10.0), (20.0, 50.0)]
+    assert s.unheard([(0.0, 10.0), (30.0, 40.0)], [(5.0, 35.0)]) == [(0.0, 5.0), (35.0, 40.0)]
+    assert s.unheard([(0.0, 10.0)], []) == [(0.0, 10.0)] and s.unheard([(0.0, 10.0)], [(0.0, 10.0)]) == []
+
+
+def test_after_blocks_takes_the_shift_off_the_rows_of_a_block():
+    where = scenes(15, 18)
+    fix = {"rate": "25025/24000", "offset": 3.0}
+    trk = track(late=lambda i: 1.5 if i in where else 0.0, rate=Fraction(25025, 24000), offset=3.0)
+    rows, _, got = timed(trk, fix)
+    after = s.after_blocks(rows, got["blocks"], {"fix": fix})
+    assert len(got["blocks"]) == 1 and sum(abs(r["off"]) >= 1.0 for r in rows if r["off"] is not None) >= 2, rows
+    assert all(abs(r["off"]) < s.BLOCK_SHIFT for r in after if r["off"] is not None), after
+    assert all(a == b for a, b in zip(rows, after) if a["off"] is not None and abs(a["off"]) < 0.5), (rows, after)   # rows on the line stay
+    assert s.after_blocks([{"at": 50.0, "off": None}], got["blocks"], {"fix": fix}) == [{"at": 50.0, "off": None}]
+
+
+def test_after_blocks_fixes_a_row_only_where_its_cues_moved():
+    """A block 1 s late from 100 s to 200 s keeps the cue at 150 s. A row inside it sits on the line after the move. A
+    row that holds the kept cue, and a row whose window crosses an edge, keep their off: cues there still sit off."""
+    blocks = [{"from": 100.0, "to": 200.0, "shift": 1.0, "keep": [150.0]}]
+    rows = [{"at": at, "off": off} for at, off in ((110.0, 1.0), (145.0, 1.0), (95.0, 1.0), (195.0, 1.0), (300.0, 0.1))]
+    assert [r["off"] for r in s.after_blocks(rows, blocks, None)] == [0.0, 1.0, 1.0, 1.0, 0.1]
+
+
+def test_cues_on_the_line_between_two_blocks_never_move():
+    """Two blocks 1.5 s late with three cues on the line between them. Together they agree at over AGREE, but three
+    heard cues in a row off the median split them, and the three cues keep their times."""
+    where = [i for i in scenes(10, 14) if not 144 <= i < 147]
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    _, _, got = timed(trk)
+    assert len(got["blocks"]) == 2 and got["blocks"][0]["to"] <= trk[144][0] and got["blocks"][1]["from"] >= trk[147][0], got
+    lands(trk, None, got, where)
+
+
+def forced(late, a=110, b=180, ons=None):
+    """blocks() of a track with these late times, heard in full from line a to line b, with these speech onsets."""
+    trk = track(late=late)
+    part = [(AT[a], AT[b])]
+    return s.blocks(hear(s.dense(trk, part, LENGTH)), trk, "eng", {"fix": None}, part, ons)
+
+
+def test_a_block_whose_heard_cues_disagree_does_not_move():
+    """Every third cue of the block sits 1 s later than the rest, so under AGREE of its heard cues agree."""
+    got = forced(lambda i: (2.0 if i % 3 == 2 else 1.0) if i in scenes(10, 13) else 0.0)
+    assert got["blocks"] == [] and got["parts"][0]["why"].startswith("no 6 heard cues in a row agree"), got
+
+
+def test_a_block_under_block_shift_does_not_move():
+    """With no speech onset, a block moves only when it sits BLOCK_ALONE off."""
+    assert forced(lambda i: 0.4 if i in scenes(10, 13) else 0.0)["blocks"] == []
+    assert forced(lambda i: 0.9 if i in scenes(10, 13) else 0.0)["blocks"] == []
+    assert len(forced(lambda i: 1.15 if i in scenes(10, 13) else 0.0)["blocks"]) == 1
+
+
+def test_two_blocks_side_by_side_never_move_each_others_cues():
+    """A block 2.5 s late runs straight into one 1.2 s late. The 1.2 s block's sides are the nearest cues on the line,
+    so it can move. The words of the 2.5 s block's cues fit neither side of it, so they stay."""
+    trk = track(late=lambda i: 2.5 if i in scenes(10, 12) else 1.2 if i in scenes(12, 14) else 0.0)
+    got = forced(lambda i: 2.5 if i in scenes(10, 12) else 1.2 if i in scenes(12, 14) else 0.0)
+    assert moved_lines(trk, got) <= set(scenes(12, 14)), got
+
+
+def test_a_window_that_heard_under_min_words_names_no_anchor():
+    """A window in the part heard the first words of the two lines before the block, by chance far from their speech.
+    It heard under MIN_WORDS words, so its pairs name no anchor, and the block still moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    chance = [[4.9 + 0.1 * k, w] for k, w in enumerate(RIGHT[117].split()[:3] + RIGHT[118].split()[:3])]
+    heard_ = hear(s.dense(trk, part, LENGTH), mute={117, 118}) + [{"at": AT[105], "words": chance}]   # only the chance window hears them
+    got = s.blocks(heard_, trk, "eng", {"fix": None}, part)
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+def test_a_block_keeps_the_lead_of_the_cues_around_it():
+    """Every cue of the track starts 0.2 s before its speech, as right tracks often do, and a block sits 1.2 s later
+    than the rest. Its shift counts against the cues around it, so its cues move to the same lead."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: (1.0 if i in where else -0.2))
+    _, _, got = timed(trk)
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.2) <= 0.1, got
+    lands(trk, None, got, where, at=[a - 0.2 for a in AT])
+    got = forced(lambda i: 0.6 if i in where else -0.2, ons=onsets())   # 0.8 s off the cues around it, 0.6 s off the fitted line
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 0.8) <= 0.1, got
+
+
+
+# --- the anchors and the edges of dense hearing ------------------------------------------------------------------------
+
+def spoken(lines=RIGHT, moved=lambda i, k: 0.0, drop=lambda i, k: False):
+    """(audio time, word) of every word of lines, line i from FIRST + GAP * i + LEAD, as heard() says them."""
+    return sorted((FIRST + GAP * i + LEAD + STEP * k + moved(i, k), w) for i, x in enumerate(lines)
+                  for k, w in enumerate(x.rstrip(".").split()) if not drop(i, k))
+
+
+def window(a, said, secs=s.WINDOW):
+    return {"at": a, "secs": secs, "words": [[round(t - a, 3), w] for t, w in said if a <= t < a + secs]}
+
+
+STOPS = s.decide.STOPWORDS["eng"]
+
+
+def test_dense_hearing_anchors_a_cue_at_its_first_spoken_word():
+    """Each line starts with two stopwords. The anchor steps back from the first content word to "and", the first word
+    spoken, while each word lies under SPOKEN_GAP before the next. A pause of 1.2 s before "the" stops it there."""
+    lines = [" ".join(["And", "the"] + x.rstrip(".").split()[:3]) + "." for x in RIGHT]   # 5 words, said in 1.5 s
+    track, starts = cues(lines), [500.0 + 5 * k for k in range(8)]
+    at, _ = s.heard_anchors([window(a, spoken(lines)) for a in starts], track, STOPS)
+    assert len(at) >= 10 and all(abs(t - (track[i][0] + LEAD)) <= 0.01 for i, t in at.items()), at
+    pause = spoken(lines, moved=lambda i, k: -1.2 if k == 0 else 0.0)
+    at, _ = s.heard_anchors([window(a, pause) for a in starts], track, STOPS)
+    assert len(at) >= 10 and all(abs(t - (track[i][0] + LEAD + STEP)) <= 0.01 for i, t in at.items()), at
+
+
+def test_a_cue_of_under_short_cue_or_that_repeats_its_neighbour_never_anchors():
+    track = cues(RIGHT)
+    track[200] = (track[200][0], track[200][0] + 0.001, track[200][2])   # shows 1 ms
+    starts = [FIRST + GAP * 196 + 5 * k for k in range(4)]
+    at, words = s.heard_anchors([window(a, spoken()) for a in starts], track, STOPS)
+    assert 200 not in at and 200 not in words and {199, 201} <= set(at), at
+    lines = list(RIGHT)
+    lines[201] = lines[200]   # a cue that repeats the one before it. Its line is never spoken, so one speech fits both.
+    at, _ = s.heard_anchors([window(FIRST + GAP * 198 + 1.0, spoken(lines, drop=lambda i, k: i == 201), 14.0)], cues(lines), STOPS)
+    assert not {200, 201} & set(at) and {199, 202} <= set(at), at
+
+
+def test_one_heard_word_anchors_one_cue_at_most():
+    """Two lines in a row start with the same name. One window hears both. Another hears only the name of the first
+    line and the second line without its name, so its name pairs with the second cue, 2.5 s early. That heard word
+    then anchors two cues and anchors neither. The second cue keeps its anchor from the first window."""
+    i = next(k for k in range(200, 300) if RIGHT[k].split()[0] == RIGHT[k + 1].split()[0])
+    track, a = cues(RIGHT), FIRST + GAP * i - 3.0
+    one = window(a, spoken())
+    two = window(a, spoken(drop=lambda li, k: (li == i and k > 0) or (li == i + 1 and k == 0)))
+    at, _ = s.heard_anchors([one, two], track, STOPS)
+    assert i not in at and abs(at[i + 1] - (track[i + 1][0] + LEAD)) <= 0.01, (i, at)
+
+
+@pytest.mark.parametrize("apart, kept", [(0.5, False), (0.2, True)])
+def test_two_windows_that_time_a_cue_apart_drop_it(apart, kept):
+    """One window hears a line 0.5 s later than the other, as after a song. The cue anchors in neither. Within
+    TOLERANCE it keeps the anchor heard farthest from its window's edges."""
+    i, track = 250, cues(RIGHT)
+    a = FIRST + GAP * i - 2.0
+    late = window(a - 3.0, spoken(moved=lambda li, k: apart if li == i else 0.0))
+    at, _ = s.heard_anchors([window(a, spoken()), late], track, STOPS)
+    assert (i in at) == kept and {i - 1, i + 1} <= set(at), at
+    if kept:
+        assert abs(at[i] - (track[i][0] + LEAD + apart)) <= 0.01, at[i]   # 5.05 s from the start of the later window
+
+
+def test_placed_puts_a_cue_on_the_side_its_heard_words_allow():
+    """A cue from 100 s. Two words heard 1.15 s and 0.5 s before it rule out the line, so the cue lies in a block 1.5 s
+    late. One early word may be a chance pair, and a word heard late proves nothing, so those cues are unsure."""
+    assert s.placed(100.0, [98.85, 99.5], 0.0, 1.5) == "block"
+    assert s.placed(100.0, [98.85, 100.4], 0.0, 1.5) == "unsure"
+    assert s.placed(100.0, [100.35, 101.0, 101.6], 0.0, 1.5) == "unsure"
+    assert s.placed(100.0, [100.35, 100.65], 0.0, -1.0) == "line"   # a block 1 s early would say them from 101 s
+    assert s.placed(100.0, [], 0.0, 1.5) is None
+
+
+def test_split_moves_only_cues_placed_in_the_block():
+    assert s.split([None], False) == (0, 1)
+    assert s.split([None, None, None], True) == (3, 3)
+    assert s.split(["line", "block"], True) == (1, 0)
+    assert s.split(["block", "block"], True) == (0, 0)
+    assert s.split([None, "block"], True) == (1, 1)
+    assert s.split(["unsure", "block"], True) == (1, 1)
+    assert s.split(["block", "line"], True) == (2, 1)       # sides that disagree: everything stays
+    assert s.split(["block", None, "line"], False) == (1, 1)
+    assert s.split(["block", "unsure"], False) == (1, 1)
+    assert s.split(["line", "block"], False) == (0, 1)
+
+
+def even_block(say=lambda i, k, w: w, keep=lambda i: True):
+    """blocks() of cues 2.5 s apart with no scene pause, lines 160 to 219 1.5 s late, heard in full from line 140 to 240."""
+    track = cues(RIGHT, where=lambda i: 1.5 if 160 <= i < 220 else 0.0)
+    part = [(FIRST + GAP * 140, FIRST + GAP * 240)]
+    return track, s.blocks(heard(s.dense(track, part, DURATION), say=say, keep=keep), track, "eng", {"fix": None}, part)
+
+
+@pytest.mark.parametrize("case", ["heard", "first word lost", "unheard"])
+def test_an_edge_on_even_cues_never_moves_a_cue_outside_the_block(case):
+    """Cue 220 follows the block and sits on the line. Its first word may go unheard. Its other heard words then put it
+    on the line. With no word heard, the largest gap lies at cue 220, and it is not clear in both readings, so cue 220
+    stays and counts at the block's end. Cue 160 starts the block. Unheard, it stays too and counts at its start. With
+    only its later words heard, cue 220 is unsure, because its speech fits both sides, and it stays too."""
+    say = (lambda i, k, w: "zzz" if i == 220 and k == 0 else w) if case == "first word lost" else (lambda i, k, w: w)
+    keep = (lambda i: i not in (160, 220)) if case == "unheard" else (lambda i: True)
+    track, got = even_block(say, keep)
+    (b,) = got["blocks"]
+    moved = {i for i, c in enumerate(track) if b["from"] <= c[0] < b["to"] and round(c[0], 3) not in b["keep"]}
+    assert moved <= set(range(160, 220)) and len(moved) >= 50, (sorted(moved)[:3], sorted(moved)[-3:], b)   # cue 220 never moves
+    assert abs(b["shift"] - 1.5) <= 0.1, b
+
+
+def test_a_part_in_line_takes_its_sweep_rows_to_its_median():
+    """The sweep put two rows of a right track 0.8 s off by chance. Dense hearing hears that part in line, so the rows
+    take its median and no alert fires. A part whose cues sit off but disagree keeps its rows."""
+    trk = track()
+    rows = [row(a, o) for a, o in ((300.0, 0.1), (360.0, 0.8), (420.0, 0.85), (480.0, -0.1), (540.0, 0.05))]
+    parts = s.suspects(rows, LENGTH)
+    got = s.blocks(hear(s.dense(trk, parts, LENGTH)), trk, "eng", {"fix": None}, parts)
+    (p,) = got["parts"]
+    assert got["blocks"] == [] and p["in_line"] and p["anchors"] >= s.IN_LINE and abs(p["median"]) <= 0.1, p
+    after = s.after_blocks(rows, got["blocks"], {"fix": None}, got["parts"])
+    # The row at the part's start holds under 2 anchors in its window, so it keeps its time. So does the row after the part.
+    assert [r["off"] for r in after] == [0.1] + [p["median"]] * 3 + [0.05], after
+    off = forced(lambda i: (2.0 if i % 3 == 2 else 1.0) if i in scenes(10, 13) else 0.0)
+    assert not off["parts"][0]["in_line"] and s.after_blocks(rows, [], {"fix": None}, off["parts"]) == rows, off
+    even = forced(lambda i: 0.5)   # every cue 0.5 s late: no run sits BLOCK_SHIFT off, but the median sits over TOLERANCE
+    assert not even["parts"][0]["in_line"] and even["blocks"] == [], even
+
+
+
+# --- shapes a fuzz of blocks() found -----------------------------------------------------------------------------------
+
+def test_a_block_near_the_file_start_never_takes_the_cues_in_time_before_it():
+    trk = track(late=lambda i: 1.5 if 5 <= i < 60 else 0.0)
+    part = [(0.0, AT[80])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), lost=range(5)), trk, "eng", {"fix": None}, part)
+    assert len(got["blocks"]) == 1 and got["blocks"][0]["from"] >= trk[5][0] and got["blocks"][0]["edge_left"] >= 5, got
+    lands(trk, None, got, range(5, 60))
+
+
+def test_a_block_is_measured_against_the_anchors_on_the_line_around_it():
+    """Whisper hears the three lines at each side of a block 0.2 s late. The block's shift counts against the
+    BLOCK_CUES nearest anchors on the line at each side, so those six never pull it 0.2 s off."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[90], AT[185])]
+    slow = {i: 0.2 for i in (117, 118, 119, 156, 157, 158)}
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), delay=slow), trk, "eng", {"fix": None}, part)
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.5) <= 0.1, got
+    lands(trk, None, got, where)
+
+
+def test_a_block_at_the_file_end_never_takes_the_cues_in_time_after_it():
+    """A block 1.5 s late on lines 340 to 394. Lines 395 to 399 are in time, and Whisper mishears only their first
+    words, so they have no anchor. Their later words fit both sides, so they stay. The block reaches the file's end
+    only when its own heard cues do."""
+    trk = track(late=lambda i: 1.5 if 340 <= i < 395 else 0.0)
+    part = [(AT[310], LENGTH)]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), lost=range(395, 400)), trk, "eng", {"fix": None}, part)
+    assert len(got["blocks"]) == 1 and got["blocks"][0]["to"] <= trk[395][0] and got["blocks"][0]["edge_right"] >= 5, got
+    lands(trk, None, got, range(340, 395))
+
+
+@pytest.mark.parametrize("unheard", [False, True])
+def test_a_chance_anchor_next_to_a_block_is_judged_by_its_words(unheard):
+    """A block 1.95 s early starts a scene. Line 131 before it is unheard. The first two words of the line before
+    them, or of line 131 itself, are heard by chance 4.9 s after its cue starts. That anchor sits nearer the block than
+    the line, but not within TOLERANCE of the block, so its words judge the cue: they fit both sides, and it stays."""
+    k = 130 if unheard else 131
+    trk = track(late=lambda i: -1.95 if i in scenes(11, 14) else 0.0)
+    chance = [(AT[k] + 4.92 + STEP * n, w) for n, w in enumerate(RIGHT[k].rstrip(".").split()[:2])]
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), mute={k} | ({131} if unheard else set()), extra=chance), trk, "eng", {"fix": None}, part)
+    at, _ = s.heard_anchors(hear(s.dense(trk, part, LENGTH), mute={k} | ({131} if unheard else set()), extra=chance), sorted(trk), STOPS)
+    assert abs(trk[k][0] - at[k] + 4.92) <= 0.05, at.get(k)   # the chance anchor, 4.92 s after the cue starts
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, scenes(11, 14))
+
+
+def test_the_cue_after_a_late_block_keeps_its_anchor_where_the_block_overlaps_it():
+    """A block 1.5 s late ends mid-scene at line 214. Its last cue shows over the start of line 215, which is in time.
+    The words of the two cues then lie out of order by time, and the search would drop the first word of line 215.
+    Clipped at the next start, line 215 keeps its anchor and stays."""
+    trk = track(late=lambda i: 1.5 if 180 <= i < 215 else 0.0)
+    part = [(AT[170], AT[235])]
+    heard_ = hear(s.dense(trk, part, LENGTH))
+    at, _ = s.heard_anchors(heard_, sorted(trk), STOPS)
+    assert trk[214][1] > trk[215][0] and abs(trk[215][0] - at[215] - (-LEAD)) <= 0.25, at.get(215)
+    got = s.blocks(heard_, trk, "eng", {"fix": None}, part)
+    assert len(got["blocks"]) == 1 and got["blocks"][0]["to"] <= trk[215][0], got
+    lands(trk, None, got, range(180, 215))
+
+
+def test_a_part_with_too_few_heard_cues_or_three_off_in_a_row_is_never_in_line():
+    """A block of 8 cues 0.8 s late, with every fourth line unheard. Under IN_LINE_SHARE of the part's cues anchor, or
+    three heard cues in a row sit BLOCK_SHIFT less TOLERANCE off, so the part is not in line and its rows keep their
+    times. The same part with every line heard and no block is in line."""
+    trk = track(late=lambda i: 0.8 if 200 <= i < 208 else 0.0)
+    part = [(AT[185], AT[225])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), mute=set(range(185, 225, 4))), trk, "eng", {"fix": None}, part)
+    assert got["blocks"] == [] and not got["parts"][0]["in_line"], got
+    right = track()
+    sparse = s.blocks(hear(s.dense(right, part, LENGTH), mute=set(range(185, 225, 3))), right, "eng", {"fix": None}, part)
+    full = s.blocks(hear(s.dense(right, part, LENGTH)), right, "eng", {"fix": None}, part)
+    assert not sparse["parts"][0]["in_line"] and full["parts"][0]["in_line"], (sparse, full)   # a third unheard: under the share
+
+
+
+# --- the second clock: speech onsets ------------------------------------------------------------------------------------
+
+def onsets(keep=lambda i: True, every=False):
+    """(time, seconds of the silence before it) of the start of each line's speech, from when the line before ends.
+    With every, each line starts after a silence long enough to time it, as a clean recording would give."""
+    out = []
+    for i in range(LINES):
+        end = AT[i - 1] + LEAD + STEP * len(RIGHT[i - 1].split()) if i else 0.0
+        if keep(i):
+            out.append((AT[i] + LEAD, max(AT[i] + LEAD - end, s.ONSET_QUIET) if every else AT[i] + LEAD - end))
+    return out
+
+
+def judged(late, delay={}, ons=None):
+    """blocks() of a track with these late times, heard with Whisper's times moved by delay, and these onsets."""
+    trk = track(late=late)
+    part = [(AT[100], AT[175])]
+    return s.blocks(hear(s.dense(trk, part, LENGTH), delay=delay), trk, "eng", {"fix": None}, part, ons)
+
+
+def test_a_block_the_onsets_agree_with_moves_at_block_shift():
+    where = scenes(10, 13)
+    got = judged(lambda i: 0.55 if i in where else 0.0, ons=onsets())
+    (b,) = got["blocks"]
+    assert b["onsets"]["verdict"] == "agree" and abs(b["onsets"]["shift"] - 0.55) <= 0.05 and min(b["onsets"]["inside"], b["onsets"]["outside"]) >= s.ONSET_MIN, b
+    assert abs(b["shift"] - 0.55) <= 0.1 and b["from"] >= track(late=lambda i: 0.55 if i in where else 0.0)[120][0], b
+
+
+@pytest.mark.parametrize("error", [0.34, 0.75])
+def test_whisper_early_across_a_stretch_never_moves_a_right_track(error):
+    """Whisper hears three scenes of a right track early, so their cues seem late. The onsets show the subtitle at its
+    usual lead. At 0.34 s the cues sit under BLOCK_SHIFT. At 0.75 s the onsets disagree, and nothing moves."""
+    got = judged(lambda i: 0.0, delay={i: -error for i in scenes(10, 13)}, ons=onsets())
+    assert got["blocks"] == [], got
+    if error > 0.5:
+        assert got["parts"][0]["onsets"]["verdict"] == "disagree", got
+        assert got["parts"][0]["why"].startswith("Whisper puts its cues +0.") and got["parts"][0]["why"].endswith("so they stay"), got
+
+
+@pytest.mark.parametrize("ons", [None, "two"])
+def test_with_few_onsets_a_block_moves_only_at_block_alone(ons):
+    where = scenes(10, 13)
+    few = None if ons is None else onsets(keep=lambda i: i in (121, 130))
+    got = judged(lambda i: 0.9 if i in where else 0.0, ons=few)
+    assert got["blocks"] == [] and got["parts"][0]["onsets"]["verdict"] == "few", got
+    assert " under 1.0 s, and " in got["parts"][0]["why"], got
+    got = judged(lambda i: 1.1 if i in where else 0.0, ons=few)
+    assert len(got["blocks"]) == 1 and got["blocks"][0]["onsets"]["verdict"] == "few", got
+
+
+def test_an_onset_counts_only_after_a_silence():
+    """The cues around the block are timed by onsets 0.05 s after their starts. Cue 0 has an onset where a block 1.5 s
+    late puts it, cue 1 one that ends a short silence, cue 2 one where it sat, and cue 3 none. Under ONSET_MIN cues count,
+    so the onsets are few."""
+    at = {k: 10.0 * k for k in range(7)}
+    ons = [(8.55, 0.8), (18.55, 0.3), (20.05 + 10.0, 0.8), (40.05, 0.8), (50.05, 0.8), (60.05, 0.8)]
+    got = s.clock(sorted(ons), at, [0, 1, 2, 3], [4, 5, 6], 1.5)
+    assert (got["inside"], got["original"], got["outside"], got["verdict"]) == (1, 1, 3, "few"), got
+
+
+def test_onsets_that_put_a_stretch_under_block_shift_never_move_it():
+    """An author set three scenes 0.38 s late, and Whisper hears them 0.17 s early, so they seem 0.55 s late. The onsets
+    put them 0.38 s late, within TOLERANCE of Whisper but under BLOCK_SHIFT, so they disagree and nothing moves."""
+    where = scenes(10, 13)
+    got = judged(lambda i: 0.38 if i in where else 0.0, delay={i: -0.17 for i in where}, ons=onsets())
+    assert got["blocks"] == [] and got["parts"][0]["onsets"]["verdict"] == "disagree", got
+    assert abs(got["parts"][0]["onsets"]["shift"] - 0.38) <= 0.05, got
+
+
+def test_the_onsets_time_a_cue_of_a_block_where_the_block_puts_it():
+    """A block 1.5 s late: each cue's speech starts 1.5 s before its start, outside ONSET_REACH of it. The onset is
+    sought where the block's shift puts the speech, so the onsets agree."""
+    at = {k: 10.0 * k + (1.5 if k < 4 else 0.0) for k in range(8)}
+    ons = [(10.0 * k + 0.05, 0.8) for k in range(8)]
+    got = s.clock(ons, at, range(4), range(4, 8), 1.5)
+    assert {k: got[k] for k in ("verdict", "inside", "original", "outside", "shift")} == {"verdict": "agree", "inside": 4, "original": 0, "outside": 4, "shift": 1.5}
+
+
+def test_an_anchor_nearer_the_line_never_ends_the_run_of_a_small_block():
+    """A run 0.55 s off its part's line. An anchor at 0.26 s lies within TOLERANCE of the run, but nearer the line, as
+    the first in-time cue after a small block can. The run never ends on it, so that cue never moves with the block."""
+    run = [0.5, 0.55, 0.6, 0.55, 0.6, 0.52]
+    assert s.agreeing(run, 0.0) and not s.agreeing(run + [0.26], 0.0) and not s.agreeing([0.26] + run, 0.0)
+    assert s.widest(run + [0.26], 0.0, 0, 7) == (0, 6)
+
+
+
+# --- the gates of blocks(), one test for each ----------------------------------------------------------------------------
+
+def moved_lines(trk, got):
+    return {i for i, c in enumerate(trk) for b in got["blocks"] if b["from"] <= c[0] < b["to"] and round(c[0], 3) not in b.get("keep", ())}
+
+
+HUSHED = set(range(0, LINES, SCENE))   # the first line of each scene: it never anchors, so it stays unproved in a block
+
+
+def keeps_order(trk, got, fix=None):
+    """Whether the cue starts of trk, sorted, still rise after the block moves, each on its own centisecond."""
+    shift = lambda c: next((b["shift"] for b in got["blocks"] if b["from"] <= c < b["to"] and round(c, 3) not in b.get("keep", ())), 0.0)
+    new = [s.written(c, shift(c), fix) for c, _, _ in sorted(trk)]
+    return all(a < b for a, b in zip(new, new[1:]))
+
+
+def quiet(trk, part, noise=0.03, **kw):
+    """blocks() of trk heard in full over part, with Whisper's error up to noise seconds."""
+    return s.blocks(hear(s.dense(trk, part, LENGTH), noise, **kw), trk, "eng", {"fix": None}, part)
+
+
+@pytest.mark.parametrize("end", [False, True])
+def test_a_block_at_a_file_edge_keeps_the_heard_cues_on_the_line_beside_it(end):
+    """Two lines in time lie between the file's edge and a block 1.5 s late. Their anchors sit nearer the line, so they
+    stay, and they count as placed on the line."""
+    n = len(RIGHT)
+    where = range(n - 36, n - 2) if end else range(2, 36)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[n - 50], LENGTH)] if end else [(0.0, AT[50])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True))
+    lands(trk, None, got, where)
+    assert got["blocks"][0]["edge_right" if end else "edge_left"] == 0, got   # on the line, so not counted
+
+
+def test_a_block_with_cues_at_its_edges_that_disagree_never_moves():
+    """Six cues sit 1.5 s late, and the cue at each side of them 0.95 s. Those two lie in the block by their words,
+    and then under AGREE of its heard cues agree. Nothing moves."""
+    trk = track(late=lambda i: 1.5 if 120 <= i < 126 else 0.95 if i in (119, 126) else 0.0)
+    got = quiet(trk, [(AT[100], AT[150])])
+    assert got["blocks"] == [], got
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else 0.95 if 110 <= i < 120 else 0.0)
+    assert moved_lines(trk, quiet(trk, [(AT[90], AT[175])])) <= set(scenes(10, 13))   # the cues 0.95 s late never move with it
+
+
+def test_a_block_under_block_shift_against_the_cues_around_it_never_moves():
+    """A block 0.75 s late on a line, with the six cues at each side of it 0.28 s late. Against those cues it sits
+    0.47 s off, under BLOCK_SHIFT, though the onsets agree that it sits 0.75 s off the rest. Nothing moves."""
+    where, near = scenes(10, 13), set(range(114, 120)) | set(range(156, 162))
+    trk = track(late=lambda i: 0.75 if i in where else 0.28 if i in near else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets())
+    assert got["blocks"] == [] and " sit +0.4" in got["parts"][0]["why"] and "off the cues around them" in got["parts"][0]["why"], got
+
+
+def test_a_block_move_never_puts_its_last_cue_past_the_cue_after_it():
+    """The block of lines 120 to 143 sits 2.5 s early. Line 144 sits on the line and is spoken right before line 143,
+    so its cue starts just after the cue of line 143. A move of the block would put line 143 after it."""
+    at = [a - (2.0 if i < 143 else 0.0) for i, a in enumerate(AT)]
+    at[144] = AT[143] - 1.9
+    trk = sorted(track(late=lambda i: -2.5 if 120 <= i <= 143 else 0.0, at=at))
+    part, c = [(at[100], at[168])], AT[143]
+    grid = [a for a in s.dense(trk, part, LENGTH) if a + s.WINDOW <= c - 12 or a >= c + 20]
+    heard_ = hear(grid, at=at, noise=0.03) + hear([c - 12], at=at, secs=11.9, noise=0.03) + hear([c], at=at, secs=20.0, noise=0.03)   # one window hears each
+    got = s.blocks(heard_, trk, "eng", {"fix": None}, part, [(a + LEAD, 1.0) for a in at])
+    lines = moved_lines(trk, got)
+    assert keeps_order(trk, got) and lines <= set(range(len(trk))) - {k for k, c in enumerate(trk) if c[0] >= AT[143] - 1.0}, (sorted(lines)[-3:], got)
+
+
+def test_a_window_under_match_names_no_anchor():
+    """A window heard the first words of the two lines before the block among words the cues never hold. It matched
+    under MATCH, so it names no anchor, and the block still moves."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else 0.0)
+    words = RIGHT[117].rstrip(".").split()[:2] + RIGHT[118].rstrip(".").split()[:2] + [f"qx{k}" for k in range(8)]
+    chance = {"at": AT[105], "words": [[1.0 + 0.3 * k, w] for k, w in enumerate(words)]}
+    got = s.blocks(hear(s.dense(trk, [(AT[100], AT[175])], LENGTH), mute={117, 118}) + [chance], trk, "eng", {"fix": None}, [(AT[100], AT[175])])
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, scenes(10, 13))
+
+
+@pytest.mark.parametrize("late, off", [(0.42, range(115, 120)), (-0.42, range(115, 120)), (-0.42, range(116, 120))])
+def test_cues_off_the_line_before_a_block_hide_its_start(late, off):
+    """Four or five lines before a block 1.5 s late sit 0.42 s off the line, more than TOLERANCE. Of the six nearest
+    anchors on that side, only one or two then lie on the line, and the median of the nearest three and of all six lies
+    0.42 s off. So the start of the block is not seen. Late, the lines also make a stretch off the line the way of the
+    block, see stretch(). Early, they do not, and the six nearest anchors alone decide."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else late if i in off else 0.0)
+    got = quiet(trk, [(AT[100], AT[175])])
+    assert got["blocks"] == [] and "before the cues" in got["parts"][0]["why"] and "sit off the line too" in got["parts"][0]["why"], got
+
+
+@pytest.mark.parametrize("off, side", [((116, 117, 118), "before"), ((158, 159, 160), "after")])
+def test_a_stretch_off_the_line_beside_a_block_hides_its_edge(off, side):
+    """Beside a block 1.5 s late, the nearest line with an anchor sits on the line, the next three sit 0.45 s late, and
+    the three after them on the line again. Three of the six nearest anchors lie on the line, but the three in a row
+    between sit IN_LINE_OFF off it the way of the block, as when Whisper hears the end of a block late. So that edge is
+    not seen. Line 156 starts a scene and never anchors."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else 0.45 if i in off else 0.0)
+    got = quiet(trk, [(AT[100], AT[175])])
+    assert got["blocks"] == [] and f"{side} the cues" in got["parts"][0]["why"] and "sit off the line too" in got["parts"][0]["why"], got
+
+
+@pytest.mark.parametrize("late", [{117: 0.35, 118: -1.6, 119: 0.42}, {116: -0.7, 117: -0.7, 119: -0.7},
+                                  {114: -0.6, 115: -0.6, 116: -0.6, 117: -0.6}, {114: 0.4, 117: 0.35, 118: -1.6, 119: 0.42}],
+                         ids=["a chance pair", "three of six on the line", "the three nearest on the line", "the median of six on the line"])
+def test_the_lines_before_a_block_sit_on_the_line_despite_a_few_far_anchors(late):
+    """Some of the six lines before a block 1.5 s late sit off the line, as a chance pair or a mishearing reads. The
+    start is still seen when three of the six nearest anchors on that side lie within TOLERANCE of the line, or the
+    median of the nearest three, or of all six, does. Each case holds by one of those alone, but the first. The lines
+    off the line sit early, against the way of the block, so they make no stretch off the line. The block moves, and
+    those lines stay."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else late.get(i, 0.0))
+    got = moved_lines(trk, quiet(trk, [(AT[100], AT[175])]))
+    assert got and not set(late) & got and got <= set(scenes(10, 13)), sorted(got)
+
+
+def test_a_cue_short_of_the_block_at_its_edge_stays():
+    """The cue at each side of a block 1.5 s late sits 1.1 s late, 0.4 s short of the block. Neither clock puts it
+    clearly in the block, so it stays, and the block moves."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else 1.1 if i in (119, 156) else 0.25)
+    got = moved_lines(trk, quiet(trk, [(AT[100], AT[175])], 0.02))
+    assert got and not {119, 156} & got and got <= set(scenes(10, 13)), got
+
+
+@pytest.mark.parametrize("k", [119, 156])
+def test_an_anchor_nearer_the_part_s_line_stays_at_each_edge(k):
+    """The track sits 0.25 s late, and a block 1.5 s late. The cue at one side of the block sits 0.8 s late: nearer the
+    part's line, 0.25 s, than the block. Against 0 s it would sit nearer the block. It stays, as an anchor on the
+    line."""
+    trk = track(late=lambda i: 1.5 if i in scenes(10, 13) else 0.80 if i == k else 0.25)
+    got = s.blocks(hear(s.dense(trk, [(AT[100], AT[175])], LENGTH), 0.02), trk, "eng", {"fix": None}, [(AT[100], AT[175])], onsets(every=True))
+    lines = moved_lines(trk, got)
+    assert k not in lines and lines and lines <= set(scenes(10, 13)), got
+    # It bounds the block as an anchor on the line, so only the first cue of the block's scene stays and counts.
+    assert got["blocks"][0]["edge_left" if k == 119 else "edge_right"] == 1, got
+
+
+def test_a_part_needs_in_line_heard_cues_to_be_in_line():
+    trk = track()
+    got = quiet(trk, [(AT[200], AT[209])], 0.2)   # about 8 heard cues, under IN_LINE
+    assert 6 <= got["parts"][0]["anchors"] < 12 and not got["parts"][0]["in_line"], got
+
+
+def test_the_anchor_steps_back_only_over_the_same_word():
+    """The cue starts "And the", and Whisper hears "but the". The anchor steps back to "the" and stops there."""
+    lines = [" ".join(["And", "the"] + x.rstrip(".").split()[:3]) + "." for x in RIGHT]
+    track_, starts = cues(lines), [500.0 + 5 * k for k in range(8)]
+    said_ = [(a, "but" if w == "And" else w) for a, w in spoken(lines)]
+    at, _ = s.heard_anchors([window(a, said_) for a in starts], track_, STOPS)
+    assert len(at) >= 10 and all(abs(x - (track_[i][0] + LEAD + STEP)) <= 0.01 for i, x in at.items()), at
+
+
+def test_a_part_inside_another_merges_whole():
+    assert s.merged([(100.0, 400.0), (150.0, 200.0)]) == [[100.0, 400.0]]
+
+
+@pytest.mark.parametrize("shape", ["three in a row", "two of three"])
+def test_each_rule_of_a_part_in_line_holds_alone(shape):
+    """Three cues 0.6 s late in a row: no 6 in a row sit BLOCK_SHIFT off at their median, but 3 in a row sit
+    IN_LINE_OFF off. Twelve cues 0.6 s late but every third in time: no 3 in a row sit off, but 6 in a row do at their
+    median, and they never agree as a block does. Neither part is in line, and nothing moves."""
+    if shape == "three in a row":
+        late = lambda i: 0.6 if 200 <= i < 203 else 0.0
+    else:
+        late = lambda i: 0.0 if not 200 <= i < 212 or (i - 200) % 3 == 2 else 0.6
+    trk = track(late=late)
+    got = quiet(trk, [(AT[190], AT[222])])
+    assert got["blocks"] == [] and not got["parts"][0]["in_line"], got
+    assert quiet(track(), [(AT[190], AT[222])])["parts"][0]["in_line"]
+
+
+
+def test_a_part_cut_to_the_cap_keeps_its_row_farthest_off():
+    """Nine suspect rows from 5:00 to 13:00. The first sits 2 s off, the rest 0.8 s. The part holds 730 s, over
+    BLOCK_HEAR, and the rows alone hold 490 s. The 360 s it keeps lie around the row farthest off, the row that ranked
+    it, and never around the middle of the rows, which would leave that row unheard."""
+    rows = [row(180.0, 0.0), row(300.0, 2.0)] + [row(360.0 + 60 * k, 0.8) for k in range(8)] + [row(900.0, 0.0)] + CALM
+    assert s.suspects(rows, 3600) == [(180.0, 540.0)]
+    late = [row(180.0, 0.0)] + [row(300.0 + 60 * k, 0.8) for k in range(8)] + [row(780.0, 2.0), row(900.0, 0.0)] + CALM
+    assert s.suspects(late, 3600) == [(550.0, 910.0)]   # the row farthest off at the end: the stretch stays inside the part
+
+
+def test_a_row_that_matched_under_match_is_no_suspect():
+    """A row 1.5 s off that matched 24% of its heard words may hear other speech than the track's. It starts no
+    dense hearing. The same row at MATCH does."""
+    rows = lambda overlap: [row(1500.0, 0.1), row(1631.1, 1.5, 12, 2, overlap), row(1751.1, -0.1)]
+    assert s.suspects(rows(0.24), 6000) == [] and s.suspects(rows(0.5), 6000) == [(1511.1, 1761.1)]
+
+
+# --- shapes from the reviews of the edges, the onset clock and the trigger ----------------------------------------------
+
+def test_a_cue_in_time_that_reads_like_the_block_at_its_edge_never_moves():
+    """A block 0.7 s early runs mid-scene from line 125 to 150. Whisper hears the line on each side of it, both in time,
+    0.45 s late, so their anchors read like the block. An end of a run sits BLOCK_SHIFT off the line itself, and their
+    words fit both sides, so both lines stay."""
+    where = range(125, 151)
+    trk = track(late=lambda i: -0.7 if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={124: 0.45, 151: 0.45}), trk, "eng", {"fix": None}, part, onsets(every=True))
+    lands(trk, None, got, where)
+
+
+def strays(rate=0.2, seed=7):
+    """(time, seconds of silence) of onsets that are no speech of a cue: other sounds that end a silence."""
+    r = random.Random(seed)
+    return [(r.uniform(0, LENGTH), r.uniform(0.5, 2.0)) for _ in range(int(LENGTH * rate))]
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_the_onsets_count_at_both_places_so_stray_onsets_never_carry_a_move(real):
+    """Whisper hears three scenes of a right track 1.2 s early, so they seem a block 1.2 s late. Stray onsets land where
+    that block would put the cues as often as anywhere, and the cues keep their own onsets where they sit, so the onsets
+    disagree and nothing moves. A real block 1.2 s late has its onsets where the block puts its cues, so it moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.2 if real and i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    delay = {} if real else {i: -1.2 for i in where}
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay=delay), trk, "eng", {"fix": None}, part, sorted(onsets(every=True) + strays()))
+    if real:
+        assert got["blocks"] and got["blocks"][0]["onsets"]["verdict"] == "agree", got
+        lands(trk, None, got, where)
+    else:
+        assert got["blocks"] == [] and got["parts"][0]["onsets"]["verdict"] == "disagree", got
+
+
+def test_a_row_over_a_stretch_no_heard_cue_covers_keeps_its_time():
+    """A part in line holds a block of 6 cues 1.2 s early that dense hearing anchored none of. The sweep row over it
+    keeps its time, so its alert rule still holds. A row whose window holds 2 heard cues takes the part's median."""
+    part = {"lo": 300.0, "hi": 600.0, "in_line": True, "median": 0.05, "anchored": [302.0 + 7.5 * k for k in range(40) if not 395 <= 302.0 + 7.5 * k <= 420]}
+    rows = [row(400.0, -1.2), row(450.0, 0.7)]
+    assert [r["off"] for r in s.after_blocks(rows, [], {"fix": None}, [part])] == [-1.2, 0.05]
+
+
+def test_one_word_that_two_windows_hear_counts_once():
+    """Two windows that overlap hear the same words of a line. placed() takes one time a word, however many windows
+    heard it, so one chance word never counts twice."""
+    i, track_ = 250, cues(RIGHT)
+    a = FIRST + GAP * i - 2.0
+    _, words_at = s.heard_anchors([window(a, spoken()), window(a - 3.0, spoken())], track_, STOPS)
+    assert words_at[i] and all(len(ts) == 2 for ts in words_at[i].values()), words_at[i]
+    assert sorted(words_at[i]) == list(range(len(words_at[i]))), words_at[i]   # one entry a word of the cue, by its place
+
+
+def test_suspect_rows_and_centred_serve_heard_parts():
+    rows = [row(300.0, -0.2), row(360.0, 0.4), row(420.0, -0.2)] + [dict(r, off=-0.2, offset=-0.2) for r in CALM]
+    assert s.suspect_rows(rows) == {360.0: pytest.approx(0.6)}   # 0.6 s off the track's lean of -0.2 s
+    assert s.centred(100.0, 900.0, {300.0: 0.8, 700.0: 2.0}, 200.0) == (605.0, 805.0)   # around the row farthest off
+    assert s.centred(100.0, 900.0, {300.0: 0.8}, 5.0) == (300.0, 300.0)   # under WINDOW left: no length, at that row
+
+
+def test_a_row_is_judged_against_the_track_s_lean():
+    """The rows of a track lean 0.2 s early. A row 0.35 s late sits 0.55 s off that lean, so it is a suspect, though it
+    sits under BLOCK_SHIFT off the fitted line. A row 0.25 s early sits on the lean."""
+    calm = [dict(r, off=-0.2, offset=-0.2) for r in CALM]
+    assert s.suspects([row(1631.1, 0.35)] + calm, 6000) == [(1511.1, 1761.1)]
+    assert s.suspects([row(1631.1, -0.25)] + calm, 6000) == []
+
+
+def test_anchors_of_the_block_left_out_of_its_run_never_stand_for_the_line():
+    """A block of 3 minutes sits 1.2 s late, and Whisper hears three of its cues near its end 0.5 s further off, so the
+    run leaves them out. The sides of the block are the nearest anchors on the line beyond them, so the block moves."""
+    where = scenes(10, 15)
+    trk = track(late=lambda i: 1.2 if i in where else 0.0)
+    part = [(AT[100], AT[195])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={i: -0.5 for i in (174, 175, 176)}), trk, "eng", {"fix": None}, part,
+                   onsets(every=True))
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+def test_the_first_cue_after_a_scene_cut_never_stands_for_the_line():
+    """A block 2 s early ends at a scene cut. The three cues after the cut read +0.41, +0.01 and +0.35 s, as the first
+    cue after a long silence reads late. That cue never anchors, so the side after the block is the next three, on the
+    line, and the block moves."""
+    where = scenes(10, 12)
+    after = {144: 0.41, 145: 0.01, 146: 0.35}
+    trk = track(late=lambda i: -2.0 if i in where else after.get(i, 0.0))
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True))
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+def test_on_whisper_alone_the_outermost_heard_cue_at_each_end_stays():
+    """With no onset, a block 1.5 s late moves on Whisper alone. A cue in time at its edge can read like it, so the
+    outermost heard cue at each end stays. Line 120 starts the scene: its words never put it in the block."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    got = moved_lines(trk, forced(lambda i: 1.5 if i in where else 0.0))
+    assert not {120, 121, 155} & got and {122, 154} <= got, sorted(got)
+
+
+@pytest.mark.parametrize("timed", [(125, 130, 135), range(123, 149, 5), range(123, 150, 3)])
+def test_onsets_on_too_few_cues_of_a_block_are_few(timed):
+    """A block 0.8 s late, with an onset on 3, 6 or 9 of its 36 cues. 3 and 6 lie under ONSET_SHARE of them, so the
+    onsets are few, and a block under BLOCK_ALONE stays. 9 is enough, so the onsets agree, and the block moves."""
+    where = scenes(10, 13)
+    ons = onsets(keep=lambda i: i not in where or i in timed, every=True)
+    got = forced(lambda i: 0.8 if i in where else 0.0, 100, 175, ons)
+    if len(timed) < 9:
+        assert got["blocks"] == [] and got["parts"][0]["onsets"]["verdict"] == "few", got
+    else:
+        assert [b["onsets"]["verdict"] for b in got["blocks"]] == ["agree"], got
+
+
+@pytest.mark.parametrize("case", ["clean", "onset 0.25 s off", "a second onset near", "anchor 0.2 s off", "two without onsets",
+                                  "early, two without onsets", "early, the last two without onsets", "early 0.8 s, two without onsets"])
+def test_an_edge_of_a_block_needs_both_clocks_on_it(case):
+    """A block 1.2 s late, timed by onsets that agree. Line 120 starts the scene and stays. The block starts at line 121
+    when its anchor lies within half of TOLERANCE of the block, and one more thing puts it there: an onset within half
+    of TOLERANCE of where the block puts it, alone within ONSET_REACH, two heard words too early for the line, see
+    placed(), or an anchor BLOCK_ALONE off the line beside the anchor of line 122 in the block. Else the edge moves in to
+    the next such cue. The end at line 155 is judged the same way. A block early has no such words, because a word
+    heard late proves nothing. So a block 0.8 s early needs the onset at its edge."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: (-0.8 if "0.8" in case else -1.2 if case.startswith("early") else 1.2) if i in where else 0.0)
+    ons = onsets(every=True)
+    near = lambda i: AT[i] + LEAD
+    if case == "onset 0.25 s off":
+        ons = [(t + 0.25, q) if abs(t - near(121)) < 0.01 else (t, q) for t, q in ons]
+    if case == "a second onset near":
+        ons = sorted(ons + [(near(121) + 0.6, 0.8)])
+    if case.endswith("two without onsets"):
+        ons = [(t, q) for t, q in ons if abs(t - near(121)) > 0.01 and abs(t - near(122)) > 0.01]
+    if case.endswith("the last two without onsets"):
+        ons = [(t, q) for t, q in ons if abs(t - near(154)) > 0.01 and abs(t - near(155)) > 0.01]
+    delay = {121: 0.2} if case == "anchor 0.2 s off" else {}
+    part = [(AT[100], AT[175])]
+    got = moved_lines(trk, s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay=delay), trk, "eng", {"fix": None}, part, ons))
+    stays = {"anchor 0.2 s off": {121}, "early 0.8 s, two without onsets": {121, 122}}.get(case, set())
+    assert 120 not in got and not stays & got and (set(range(121, 125)) - stays) <= got and {154, 155} <= got, (case, sorted(got)[:5])
+
+
+def test_a_chance_pair_past_unheard_lines_never_joins_a_block():
+    """A block 1.2 s early ends at line 155. Whisper hears none of lines 156 to 160, and hears line 161 1.2 s late, as a
+    chance pair reads. So the anchor of line 161 lies in the block, BLOCK_ALONE off the line, and its onset lies where it
+    sits. No anchor of the next line in stands beside it, so it stays, with the unheard lines before it."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: -1.2 if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    heard = hear(s.dense(trk, part, LENGTH), 0.03, mute=range(156, 161), delay={161: 1.2})
+    got = moved_lines(trk, s.blocks(heard, trk, "eng", {"fix": None}, part, onsets(every=True)))
+    assert got and not set(range(156, 162)) & got and got <= set(where), sorted(got)[-5:]
+
+
+def test_a_track_that_leans_late_keeps_its_line():
+    """Every cue of the track sits 0.4 s late, more than TOLERANCE off the fitted line, and a block 1.5 s later still.
+    The part's line follows the lean, and the sides of the block are judged against it, so the block moves to the lean."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 0.4 + (1.5 if i in where else 0.0))
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True), swept(trk, noise=0.03))
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.5) <= 0.1, got
+    lands(trk, None, got, where, at=[a + 0.4 for a in AT])
+
+
+@pytest.mark.parametrize("late, moves", [(0.6, False), (0.75, True)])
+def test_a_block_sits_off_the_track_s_lean_too(late, moves):
+    """The track leans 0.2 s late, and lines 95 to 179 sit on the fitted line, within TOLERANCE of that lean. A block
+    0.6 s late there sits 0.4 s off the lean, as cues an author set late can, so it stays. One 0.75 s late moves, by
+    its shift against the lean, the smaller of that and its shift against the line beside it."""
+    where = scenes(10, 11)
+    trk = track(late=lambda i: (late if i in where else 0.0) if 95 <= i < 180 else 0.2)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True), swept(trk, noise=0.03))
+    assert bool(got["blocks"]) == moves and (moves or "off the track's lean of" in got["parts"][0]["why"]), got   # the onsets agree on 0.75 s
+    assert not moves or abs(got["blocks"][0]["shift"] - (late - 0.2)) <= 0.1, got["blocks"]
+
+
+def test_the_sweep_s_own_lead_never_moves_the_track_s_lean():
+    """The sweep pairs a cue's first content word, so on a track whose lines open with short words its rows read 0.35 s
+    early everywhere. The rows inside the part measure that against dense hearing, so the block still moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    rows = [dict(r, off=None if r["off"] is None else r["off"] - 0.35) for r in swept(trk, noise=0.03)]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True), rows)
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.5) <= 0.1, got
+
+
+def test_a_part_whose_line_sits_off_the_track_s_lean_moves_nothing():
+    """Lines 95 to 179 sit 0.45 s late, a stretch that fills the part, and a block inside it 1.5 s later still. The sweep
+    rows outside the part put the track's lean on its fitted line. The part's line sits 0.45 s off that lean, so the cues
+    around the block are no line to measure it from, and nothing moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: (0.45 if 95 <= i < 180 else 0.0) + (1.5 if i in where else 0.0))
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True), swept(trk, noise=0.03))
+    assert got["blocks"] == [] and "off the track's lean of" in got["parts"][0]["why"], got
+
+
+def test_a_side_off_the_track_s_lean_moves_nothing():
+    """Lines 104 to 119 sit 0.4 s early, and a block 0.8 s late follows on lines 120 to 135. The part's line falls
+    between that stretch and the cues in time after the block, so the line of both sides passes. The side before the
+    block sits 0.4 s off the track's lean, so nothing moves."""
+    trk = track(late=lambda i: 0.8 if 120 <= i < 136 else -0.4 if 104 <= i < 120 else 0.0)
+    part = [(AT[104] - 1, AT[150])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.1), trk, "eng", {"fix": None}, part, onsets(every=True), swept(trk, noise=0.03))
+    assert got["blocks"] == [] and "off the track's lean of" in got["parts"][0]["why"], got
+
+
+def test_a_block_never_takes_in_the_cues_in_time_before_it():
+    """A live shape: a block 0.7 s late on lines 86 to 135. Whisper hears line 82, in time, 0.42 s late, within
+    TOLERANCE of the block, and lines 83 and 84 at 0.14 s and 0 s. An end of a run sits BLOCK_SHIFT off the line itself,
+    and no anchor nearer the line lies inside a run, so lines 82 to 85 stay."""
+    where = range(86, 136)
+    trk = track(late=lambda i: 0.7 if i in where else 0.0)
+    part = [(AT[70], AT[150])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={82: -0.42, 83: -0.14}), trk, "eng", {"fix": None}, part, onsets(every=True))
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+def test_the_side_of_a_block_looks_past_its_own_noisy_anchors():
+    """A live shape: a block 1.3 s early, whose last heard cues read -1.77, -0.19 and -0.80 s. The run ends before them.
+    The side after it takes the nearest anchors that sit nearer the line than the block, past those, so the block moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: -1.3 if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={151: 0.47, 152: -1.11, 153: -0.5}), trk, "eng", {"fix": None}, part,
+                   onsets(every=True))
+    assert len(got["blocks"]) == 1, got
+    lands(trk, None, got, where)
+
+
+@pytest.mark.parametrize("shift, moves", [(2.0, True), (1.2, False)])
+def test_the_heard_cues_of_a_block_agree_within_a_share_of_its_shift(shift, moves):
+    """Whisper hears each line up to 0.5 s early or late. A block 2 s late agrees within BLOCK_SPREAD of its shift,
+    0.5 s, and moves. A block 1.2 s late agrees within TOLERANCE only, so under AGREE of its heard cues agree, and it
+    stays."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: shift if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.5), trk, "eng", {"fix": None}, part)
+    lines = moved_lines(trk, got)
+    assert (len(lines) > len(where) / 2 and lines <= set(where)) if moves else got["blocks"] == [] and "agree within" in got["parts"][0]["why"], got
+
+
+@pytest.mark.parametrize("timed", [True, False])
+def test_heard_cues_past_a_block_leave_its_share_when_the_onsets_agree(timed):
+    """A block 1.5 s late ends in eight lines 2 s late. Its run ends before them, and their heard words put them in
+    the block, so they lie within its edges, past it, and under AGREE of its heard cues agree. With onsets that agree
+    they leave the share, and the block moves. On Whisper alone they stay in it, and the block stays."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: (2.0 if i >= 148 else 1.5) if i in where else 0.0)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True) if timed else None)
+    lines = moved_lines(trk, got)
+    assert set(range(122, 145)) <= lines if timed else not set(range(122, 140)) & lines, sorted(lines)   # the 2 s lines may move apart
+
+
+@pytest.mark.parametrize("late, block", [(2.6, range(122, 156)), (-2.6, range(120, 148))])
+def test_on_whisper_alone_the_outermost_heard_cue_stays_when_the_move_would_pass_it(late, block):
+    """A block 2.6 s late from line 122, or 2.6 s early to line 147, mid-scene, with no onsets. On Whisper alone the
+    outermost heard cue at each end stays, and the lines are 2.5 s apart, so the next line of the block would move past
+    it. The late block then does not move. Within the early block's last 2 heard cues lies the scene pause before line
+    144, which the move closes to 2.7 s and so reads as the mark of an edit. Its end moves in there, and only lines up
+    to 143 move. Line 121 shows 3 s, so line 122 ends no long silence."""
+    trk = track(late=lambda i: late if i in block else 0.0, show=lambda i: 3.0 if i == 121 else SHOW)
+    got = quiet(trk, [(AT[100], AT[175])])
+    lines = moved_lines(trk, got)
+    assert keeps_order(trk, got) and lines <= set(block) - {block[0], block[-1]}, sorted(lines)
+
+
+@pytest.mark.parametrize("block, beside, show", [(range(122, 156), 121, SHOW), (range(120, 151), 151, SHOW), (range(122, 156), 121, 2.45),
+                                                 (range(120, 151), 151, 2.45)])
+def test_a_cue_in_time_beside_an_edit_stays_when_its_speech_reads_like_the_block(block, beside, show):
+    """A block 0.8 s early sits beside a line in time whose speech starts 0.8 s after its cue, as an author may set a
+    line. Whisper and the onsets then both put that line in the block. Before the block, the first line of the block
+    overlaps it by 0.5 s, and after the block, the line beside it starts 1.1 s after the last line ends. The move ends
+    that overlap or gap, so it marks the edit, and the line beside it stays. When the line before the edge shows 2.45 s,
+    the move leaves only 0.05 s, and that still marks the edit."""
+    edge = block[-1] if beside > block[-1] else beside
+    trk = track(late=lambda i: -0.8 if i in block else 0.0, show=lambda i: show if i == edge else SHOW)
+    ons = [(t + 0.8, q) if abs(t - AT[beside] - LEAD) < 0.01 else (t, q) for t, q in onsets(every=True)]
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={beside: 0.8}), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert beside not in lines and set(block[2:-2]) - HUSHED <= lines <= set(block), sorted(lines)   # a scene's first line has only its onset
+
+
+def test_an_edit_mark_after_the_trim_keeps_the_cues_before_it():
+    """A block 1.2 s late starts at line 124, mid-scene, and has no onsets. Whisper hears lines 121 to 123, in time,
+    1.2 s early, so they read like the block and join it at its start. The outermost heard cue then stays, and the start
+    sits at line 122. Line 124 starts 1.5 s after line 123 ends, which the move closes to 0.3 s: the mark of the edit,
+    among the first EDIT_CUES cues. So lines 121 to 123 stay."""
+    where = range(124, 156)
+    trk = track(late=lambda i: 1.2 if i in where else 0.0)
+    got = quiet(trk, [(AT[100], AT[175])], delay={i: -1.2 for i in (121, 122, 123)})
+    lines = moved_lines(trk, got)
+    assert not {121, 122, 123} & lines and set(range(126, 154)) - HUSHED <= lines <= set(where), sorted(lines)
+
+
+def test_a_block_whose_edges_leave_no_heard_cue_stays():
+    """A block 0.8 s early, with onsets that agree 0.12 s from where the block puts its lines. A second onset lies 0.6 s
+    past each, within ONSET_REACH, so no onset times a cue alone. Words heard late prove nothing, and the block sits
+    under BLOCK_ALONE. So no heard cue is clearly in the block at its edges, the edges move in past every heard cue,
+    and the block stays."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: -0.8 if i in where else 0.0)
+    inside = lambda t: AT[where[0]] <= t < AT[where[-1]] + 1
+    ons = sorted([(t + 0.12, q) if inside(t) else (t, q) for t, q in onsets(every=True)] + [(t + 0.72, q) for t, q in onsets(every=True) if inside(t)])
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, ons)
+    assert got["blocks"] == [] and got["parts"][0]["why"] == "after its edges stay, 0 heard cues are left in it, under 3", got
+
+
+@pytest.mark.parametrize("timed, mute, room", [(True, (), 1.5), (False, (), 1.5), (True, (150,), 1.5), (True, (), 1.9)])
+def test_a_cue_in_time_that_a_late_block_passed_stays(timed, mute, room):
+    """A block 2.0 s late ends at line 150, and line 151, in time, starts 1.5 s after line 150 should. So line 150 now
+    starts after line 151, within the block's times. Whisper hears line 151 2.0 s early, so its anchor and its words
+    read like the block, and line 149 ends before it starts, so no edit mark lies there. Its onset lies where it sits.
+    Within the shift of the block's last cue, a cue needs an onset where the block puts it, so line 151 stays. When
+    Whisper hears nothing of line 150, line 151 is the block's last cue, and line 150 lies within the shift beyond it.
+    When line 151 starts 1.9 s after line 150 should and has no onset of its own, the onset of line 150 lies where the
+    block puts line 151 too. Line 150 then starts 0.1 s after it, so that onset may be either's, and it times neither."""
+    at = [a - (2.5 - room if i >= 151 else 0.0) for i, a in enumerate(AT)]
+    where = range(132, 151)
+    trk = track(late=lambda i: 2.0 if i in where else 0.0, at=at, show=lambda i: 1.0 if i == 149 else SHOW)
+    part = [(at[100], at[175])]
+    ons = sorted((at[i] + LEAD, 1.0) for i in range(LINES) if room < 1.9 or i != 151) if timed else None
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, at=at, delay={151: -2.0}, mute=mute), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert 151 not in lines and set(range(135, 149)) - HUSHED <= lines <= set(where), sorted(lines)
+
+
+@pytest.mark.parametrize("silent", [125, 126])
+def test_an_early_block_needs_onsets_within_its_shift_of_its_first_cue(silent):
+    """A block 1.2 s early starts at line 125. Line 125 should start 1.8 s after line 124, and line 126 1.15 s after line
+    125, so both lie within the shift of the cue before them. A block early moves toward the cues before it. So its
+    first cue, when the cue before it lies within the shift, and each cue within the shift after it, needs an onset
+    where the block puts it. The one with no onset stays, with every cue before it."""
+    at = [a - (0.7 if i >= 125 else 0.0) - (1.35 if i >= 126 else 0.0) for i, a in enumerate(AT)]
+    where = range(125, 141)
+    trk = track(late=lambda i: -1.2 if i in where else 0.0, at=at, show=lambda i: 1.0 if i == 125 else SHOW)   # no edit mark between
+    part = [(at[100], at[175])]
+    ons = sorted((at[i] + LEAD, 1.0) for i in range(LINES) if i != silent)
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, at=at), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert not set(range(124, silent + 1)) & lines and set(range(silent + 1, 139)) - HUSHED <= lines <= set(where), sorted(lines)
+
+
+def test_a_move_never_ties_two_starts_in_centiseconds():
+    """With the ratio fix 25025/24000, a cue at 216.40 s that moves by 1.294 s lands 10.3 ms after a cue at 215.04 s that
+    stays. remux.time_plan() writes ASS in centiseconds, where both start at 203.36 s, so the move would tie them. The
+    test uses the written times. A move by 1.25 s keeps them apart."""
+    fix = {"rate": "25025/24000", "offset": 3.0}
+    assert s.written(216.40, 1.294, fix) == s.written(215.04, 0.0, fix) == 20336
+    assert s.crossing([215.04, 216.40], {1}, 1, 1, 1.294, fix) == (1, 0) and s.crossing([215.04, 216.40], {1}, 1, 1, 1.25, fix) is None
+    assert s.crossing([10.0, 12.0], {1}, 1, 1, 2.5, None) == (1, 0) and s.crossing([10.0, 12.0, 14.0], {1, 2}, 1, 2, 1.5, None) is None
+    assert s.crossing([10.0, 12.0, 14.0], {0, 1}, 0, 1, -2.5, None) == (1, 2)   # an early cue moved past the cue after it
+
+
+def test_a_block_must_sit_off_the_fitted_line_too():
+    """The lines around a block sit 0.3 s early against the fitted line, and the block 0.25 s late: 0.55 s off the
+    cues around it, with onsets that agree. But it sits under BLOCK_SHIFT off the fitted line, as cues in time do when a
+    block pulls the part's line away. So it stays."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 0.25 if i in where else -0.3)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True))
+    assert got["blocks"] == [] and "off the fitted line" in got["parts"][0]["why"], got
+
+
+def test_an_onset_two_reads_found_counts_once():
+    """Two reads of the same audio find each onset twice, 0.02 s apart. blocks() counts each once, so the onsets still
+    agree, and a block 0.8 s late, under BLOCK_ALONE, moves."""
+    where = scenes(10, 13)
+    ons = onsets(every=True)
+    got = forced(lambda i: 0.8 if i in where else 0.0, 100, 175, sorted(ons + [(t + 0.02, q - 0.1) for t, q in ons]))
+    assert [b["onsets"]["verdict"] for b in got["blocks"]] == ["agree"], got
+
+
+def test_on_whisper_alone_edge_cues_under_block_alone_stay():
+    """A block 1.2 s late has no onsets, and Whisper hears its last three lines 0.25 s late. They read 0.95 s off the
+    line, within the block's run but under BLOCK_ALONE. On Whisper alone the outermost heard cue stays, and so does each
+    next one that reads under BLOCK_ALONE off the line. Lines 153 to 155 stay, and the rest of the block moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.2 if i in where else 0.0)
+    got = quiet(trk, [(AT[100], AT[175])], delay={i: 0.25 for i in (153, 154, 155)})
+    lines = moved_lines(trk, got)
+    assert not {153, 154, 155} & lines and set(range(122, 152)) - HUSHED <= lines <= set(where), sorted(lines)
+
+
+@pytest.mark.parametrize("late, where, beside, mute", [(-0.6, range(125, 156), 122, (123, 124)), (0.6, range(108, 131), 133, (131, 132))])
+def test_the_edit_mark_window_counts_heard_cues(late, where, beside, mute):
+    """A block 0.6 s early starts at line 125, mid-scene. Line 122, in time, has its speech 0.6 s after its cue, so both
+    clocks put it in the block, and Whisper hears nothing of lines 123 and 124. So the run starts at line 122. The edit
+    mark, line 125 overlapping line 124 by 0.3 s, lies three cues in, but within the first 2 heard cues. The edge moves
+    in to it, and lines 122 to 124 stay. A block 0.6 s late that ends at line 130 mirrors that with lines 131 to 133."""
+    trk = track(late=lambda i: late if i in where else 0.0)
+    ons = [(t - late, q) if abs(t - AT[beside] - LEAD) < 0.01 else (t, q) for t, q in onsets(every=True)]
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, delay={beside: -late}, mute=mute), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert not ({beside} | set(mute)) & lines and set(where[2:-2]) - HUSHED <= lines <= set(where), sorted(lines)
+
+
+@pytest.mark.parametrize("off, verdict", [(0.1, "agree"), (-0.1, "agree"), (0.2, "disagree"), (-0.2, "disagree")])
+def test_the_onsets_agree_only_near_whisper_s_shift(off, verdict):
+    """Every cue of a block 1 s late has an onset, off seconds from where Whisper's shift puts it. The search reaches
+    0.3 s, and the onsets agree only when they put the block within 0.15 s of Whisper's shift."""
+    at = {k: 10.0 * k for k in range(30)}
+    ons = sorted([(at[k], 1.0) for k in range(10)] + [(at[k], 1.0) for k in range(20, 30)] + [(at[k] - 1.0 - off, 1.0) for k in range(10, 20)])
+    got = s.clock(ons, at, range(10, 20), [*range(10), *range(20, 30)], 1.0)
+    assert got["verdict"] == verdict and got["inside"] == 10, got
+
+
+def test_onsets_scattered_over_the_reach_never_agree():
+    """A right track that Whisper heard 0.98 s early reads as a block of 16 cues. Four stray onsets lie 0.1 to 0.27 s from
+    where the block would put four cues, and one cue has its own onset. The strays meet the count, and their median lies
+    near Whisper's shift, but only one lies within half of TOLERANCE of its place, so the onsets are too few."""
+    at = {k: 10.0 * k for k in range(40)}
+    outside = [*range(12), *range(28, 40)]
+    ons = [(at[k], 1.0) for k in outside] + [(at[12], 1.0)] + [(at[k] - 0.98 - d, 1.0) for k, d in zip((14, 17, 20, 23), (-0.27, -0.1, 0.17, 0.24))]
+    got = s.clock(sorted(ons), at, range(12, 28), outside, 0.98)
+    assert got["verdict"] == "few" and got["inside"] == 4 and got["original"] == 1, got
+
+
+def test_evidence_of_a_cue_of_its_own():
+    """Evidence for the line wins. The anchor of a cue after a long silence only ever puts it on the line, and its words
+    put it in the block only with an onset there. An onset never counts with an anchor off the block or unsure words."""
+    on, at = (lambda x: abs(x) <= abs(x - 1.5)), (lambda x: abs(x - 1.5) <= 0.3)
+    ev = lambda late=None, hushed_late=None, words=None, new=False, old=False, hushed=False: s.evidence(late, hushed_late, words, new, old, on, at, hushed)
+    assert ev(1.5) == ev(words="block") == ev(words="block", hushed=True, new=True) == "block"
+    assert ev(0.1) == ev(1.5, old=True) == ev(words="line", new=True) == ev(hushed_late=0.1, words="block") == "line"
+    assert ev() is ev(0.9) is ev(words="unsure") is ev(new=True) is ev(words="block", hushed=True) is ev(hushed_late=1.5) is None
+    assert ev(0.9, new=True) is ev(words="unsure", new=True) is ev(words="unsure", hushed=True, new=True) is None
+
+
+def test_a_cue_in_time_between_two_blocks_stays():
+    """A block 1.4 s late and a block 1.05 s late lie one line apart, and the onsets agree. Line 132 between them is in
+    time and starts a scene, so its anchor never counts, and Whisper hears it on time. Its own anchor puts it on the
+    line, so it cuts the run, each block is judged on its own, and line 132 stays."""
+    late = lambda i: 1.4 if 120 <= i < 132 else 1.05 if 133 <= i < 150 else 0.0
+    trk = track(late=late)
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03), trk, "eng", {"fix": None}, part, onsets(every=True))
+    lines = moved_lines(trk, got)
+    assert 132 not in lines and lines <= set(range(120, 150)) and len(lines) > 20, (sorted(lines), got["parts"][0]["whys"])
+
+
+def test_a_cue_with_no_evidence_stays_unproved():
+    """On Whisper alone, a block 1.5 s late, where Whisper hears nothing of lines 125 and 140. They have no evidence of
+    their own, so they stay. The block names their starts in "keep", counts them as unproved, and the rest moves."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    got = quiet(trk, [(AT[100], AT[175])], mute=(125, 140))
+    (b,) = got["blocks"]
+    lines = moved_lines(trk, got)
+    assert b["unproved"] >= 2 and {round(trk[125][0], 3), round(trk[140][0], 3)} <= set(b["keep"]), b
+    assert not {125, 140} & lines and set(range(122, 154)) - {125, 140} - HUSHED <= lines, sorted(lines)
+
+
+def test_an_onset_where_a_cue_sits_cuts_the_block_there():
+    """A block 1.5 s late, timed by onsets that agree. Whisper hears nothing of line 137, and its onset lies, alone,
+    where it sits, not where the block puts it. That puts it on the line, so the block splits there into two blocks,
+    and line 137 stays."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 1.5 if i in where else 0.0)
+    ons = [(t + 1.5, q) if abs(t - AT[137] - LEAD) < 0.01 else (t, q) for t, q in onsets(every=True)]
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, mute=(137,)), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert 137 not in lines and len(got["blocks"]) == 2 and set(range(123, 135)) | set(range(139, 154)) <= lines | HUSHED, (sorted(lines), got)
+
+
+def test_further_counts_a_short_piece_as_a_window():
+    """dense() hears a piece under WINDOW seconds as one whole window, so further() counts it as WINDOW seconds."""
+    part = lambda lo, hi, more: {"lo": lo, "hi": hi, "more": more}
+    results = {"s1": {"parts": [part(100.0, 300.0, [(300.0, 330.0)])]}}
+    # 25 of the 30 seconds were heard, and the 5 left cost a whole window: 15 seconds left is enough, 9 is not
+    assert s.further(results, [(100.0, 325.0), (400.0, 520.0)], 600.0) == {"s1": [(300.0, 330.0)]}
+    assert s.further(results, [(100.0, 325.0), (400.0, 526.0)], 600.0) == {}
+
+
+def test_a_block_whose_neighbours_sit_off_the_part_s_line_stays():
+    """The six lines on each side of a block 0.9 s early sit 0.27 s late, and the rest of the part on the line. The line
+    beside the block then sits 0.27 s off the part's line, over half of TOLERANCE, as when a block of the other sign
+    lies beside it. A move to it would overshoot, so the block stays."""
+    late = lambda i: -0.9 if 132 <= i < 144 else 0.27 if 126 <= i < 132 or 144 <= i < 150 else 0.0
+    trk = track(late=late)
+    got = quiet(trk, [(AT[100], AT[175])])
+    assert got["blocks"] == [] and "off the part's line" in got["parts"][0]["why"], got
+
+
+def test_the_window_beside_the_edge_reaches_the_shift_and_tolerance():
+    """A block 1.0 s late ends at line 149, which starts 1.2 s after line 148 should, past the shift but within the shift
+    and TOLERANCE, as Whisper may read the shift short. Line 148 has no onset, so it stays with line 149."""
+    at = [a - (1.3 if i >= 149 else 0.0) for i, a in enumerate(AT)]
+    trk = track(late=lambda i: 1.0 if 132 <= i <= 149 else 0.0, at=at, show=lambda i: 1.0 if i == 148 else SHOW)
+    part = [(at[100], at[175])]
+    ons = sorted((at[i] + LEAD, 1.0) for i in range(LINES) if i != 148)
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, at=at), trk, "eng", {"fix": None}, part, ons)
+    lines = moved_lines(trk, got)
+    assert not {148, 149} & lines and set(range(135, 148)) - HUSHED <= lines, sorted(lines)
+
+
+def test_an_onset_that_may_be_a_neighbour_s_proves_nothing():
+    """A block 2.4 s late, with lines 2.5 s apart, timed by onsets that agree. Whisper hears nothing of line 137, and the
+    only onset near lies where it sits. That is also within TOLERANCE of where the block puts line 138, which has no
+    onset, so it may be line 138's onset, and it proves nothing about line 137. Line 137 stays as unproved, and the block
+    stays whole."""
+    where = scenes(10, 13)
+    trk = track(late=lambda i: 2.4 if i in where else 0.0)
+    ons = [(t + 2.4, q) if abs(t - AT[137] - LEAD) < 0.01 else (t, q) for t, q in onsets(every=True) if abs(t - AT[138] - LEAD) > 0.01]
+    part = [(AT[100], AT[175])]
+    got = s.blocks(hear(s.dense(trk, part, LENGTH), 0.03, mute=(137,)), trk, "eng", {"fix": None}, part, ons)
+    assert len(got["blocks"]) == 1 and round(trk[137][0], 3) in got["blocks"][0]["keep"], got

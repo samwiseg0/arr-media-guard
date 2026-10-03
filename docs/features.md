@@ -35,6 +35,8 @@ in the audio's language.
 - A subtitle of another episode leaves the file in a proven remux, or stays out of a conversion.
 - A sidecar of another episode moves to the kept originals, and a program such as Bazarr can download it again.
 - A subtitle that runs late by an offset or a frame-rate ratio gets new times.
+- A block of cues that sits off while the rest is in time, as after an edit, moves to its speech. `--sub-time` and the
+  deep analysis do this, see [subtitles.md](subtitles.md#blocks).
 - A text subtitle whose cues flash for a tenth of a second gets ends a viewer can read.
 
 `--sub-time` also times the subtitles it cannot hear, other languages and PGS or VobSub pictures, against a subtitle

@@ -245,11 +245,20 @@ def flash_check(path, j, sides, full=False, stop=None):
         plan = remux.flash_plan(cues, codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")) if len(cues) == len(lens[p]) else None
         out.update({p: plan} if plan else {})
     for s in sides:
-        with contextlib.suppress(OSError):
-            with open(s["path"], "rb") as f:
-                plan = remux.flash_plan([(a / 1000, b / 1000, t) for a, b, t in proof.srt_blocks(f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace"))])
-            out.update({s["name"]: plan} if plan else {})
+        plan = remux.flash_plan(side_cues(s))
+        out.update({s["name"]: plan} if plan else {})
     return out
+
+
+def side_cues(s):
+    """[(start, end, text)] in seconds of the cues of a sidecar_subs() entry s in file order, see proof.srt_blocks(). A
+    plan of new times pairs with the cues of the file in this order, see remux.set_ends(). A file that does not read
+    gives []."""
+    try:
+        with open(s["path"], "rb") as f:
+            return [(a / 1000, b / 1000, t) for a, b, t in proof.srt_blocks(f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace"))]
+    except OSError:
+        return []
 
 
 def subtitle_blocks(path, j, want, codecs, cap, use, failed):
@@ -679,12 +688,14 @@ def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop
 
 
 def swept_before(rec, ex):
-    """rec of a pass that followed Replan ex, with the sweep facts of the pass that raised it added to its own. The
-    second pass finds the words in the cache, so its facts alone would hide what the first pass heard."""
+    """rec of a pass that followed Replan ex, with the sweep facts of the pass that raised it added to its own, the
+    dense hearing's too. The second pass finds the words in the cache, so its facts alone would hide what the first
+    pass heard."""
     f, g = (ex.args[1] if len(ex.args) > 1 else None), rec.get("sweep_facts")
+    add = lambda g, f: dict(g, cpu=round(g["cpu"] + f["cpu"], 1), took=round(g["took"] + f["took"], 1), runs=g.get("runs", 0) + f.get("runs", 0),
+                            cached=g.get("cached", 0) + f.get("cached", 0), failed=g["failed"] + [x for x in f["failed"] if x not in g["failed"]])
     if f and g:
-        rec["sweep_facts"] = dict(g, cpu=round(g["cpu"] + f["cpu"], 1), took=round(g["took"] + f["took"], 1), runs=g.get("runs", 0) + f.get("runs", 0),
-                                  cached=g.get("cached", 0) + f.get("cached", 0), failed=g["failed"] + [x for x in f["failed"] if x not in g["failed"]])
+        rec["sweep_facts"] = dict(add(g, f), **({"dense": add(g["dense"], f["dense"])} if "dense" in f and "dense" in g else {}))
     return rec
 
 
@@ -718,32 +729,160 @@ class Yielded(Exception):
 def sub_sweep(path, j, items, sync, deep=False):
     """({subtitle position or sidecar name: subsync.sweep() rows}, facts) of the sweep of --sub-time and the deep
     analysis over the tracks and sidecars of the word check, items of sub_items() (docs/design.md, "Subtitle match"). Each
-    minute of the file gets one window of subsync.WINDOW seconds at its densest cues. One lid.py process hears
-    them with the model loaded once, two windows a Whisper run, and caches each pair like the check's own words.
-    Between two runs it yields when an import's hearing waits for the model, and then hears the rest with its next
-    turn. In the deep analysis it also yields to an import job in the queue, and deep raises Yielded then. It only
-    reports. facts holds the CPU and wall seconds and why a hearing heard nothing."""
+    minute of the file gets one window of subsync.WINDOW seconds at its densest cues, which sweep_hear() hears. deep
+    is the deep analysis, which yields to an import job in the queue. The rows change no time, and sub_dense() hears the
+    parts where they sit off. facts holds the CPU and wall seconds and why a hearing heard nothing."""
     dur, out, facts = decide.duration(j), {}, {"cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
-    gate = os.path.join(config.CFG.state_dir, "lid.turn.gate")
     for idx, (lang, cues) in sub_groups(items).items():
         stop = decide.STOPWORDS.get(lang, frozenset())
         starts = [w for m in range(int(dur // 60) + 1) for w in subsync.windows(cues, dur, stop, parts=((m * 60 / dur, min(1.0, (m + 1) * 60 / dur)),))]
-        heard, left = [], list(starts)
-        while left:
-            got = checks.lid_run(path, idx, j, (), config.SUB_TIMEOUT * (len(left) // 2 + 1), words=(lang, left, subsync.WINDOW, None, 2),
-                          yield_to=(gate, store.path() if deep else None))
-            heard += got.get("windows") or []
-            facts.update(cpu=round(facts["cpu"] + (got.get("cpu") or 0), 1), took=round(facts["took"] + (got.get("took") or 0), 1),
-                         runs=facts["runs"] + 1, cached=facts["cached"] + bool(got.get("cached")))
-            if not got.get("windows"):
-                facts["failed"].append(f'audio {idx}: {config.mask(str(got.get("why") or "no words"))[:120]}')
-            if not got.get("yielded") or not got.get("windows"):
-                break
-            if deep and runner.queued():
-                raise Yielded(f"an import waits, after {len(heard)} of {len(starts)} sweep windows")
-            left = left[len(got["windows"]):]
+        heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "sweep")
         out.update({k: subsync.sweep(heard, x[2], lang, sync.get(k, {}).get("timing")) for k, x in items.items() if x[1] == idx})
     return out, facts
+
+
+def sweep_hear(path, idx, j, lang, starts, facts, deep, what):
+    """The heard windows of starts, WINDOW seconds each, on audio idx, for sub_sweep() and sub_dense(). One lid.py
+    process hears them with the model loaded once, two windows a Whisper run, and caches each pair. Between two runs
+    it yields when an import's hearing waits for the model, and then hears the rest with its next turn. With deep it
+    raises Yielded when an import job waits in the queue. It adds its cost to facts. what names the windows in the
+    reason of Yielded."""
+    gate, heard, left = os.path.join(config.CFG.state_dir, "lid.turn.gate"), [], list(starts)
+    while left:
+        got = checks.lid_run(path, idx, j, (), config.SUB_TIMEOUT * (len(left) // 2 + 1), words=(lang, left, subsync.WINDOW, None, 2),
+                             yield_to=(gate, store.path() if deep else None))
+        heard += got.get("windows") or []
+        facts.update(cpu=round(facts["cpu"] + (got.get("cpu") or 0), 1), took=round(facts["took"] + (got.get("took") or 0), 1),
+                     runs=facts["runs"] + 1, cached=facts["cached"] + bool(got.get("cached")))
+        if not got.get("windows"):
+            facts["failed"].append(f'audio {idx}: {config.mask(str(got.get("why") or "no words"))[:120]}')
+        if not got.get("yielded") or not got.get("windows"):
+            break
+        if deep and runner.queued():
+            raise Yielded(f"an import waits, after {len(heard)} of {len(starts)} {what} windows")
+        left = left[len(got["windows"]):]
+    return heard
+
+
+def sub_dense(path, j, items, sweeps, sync, deep=False):
+    """({subtitle position or sidecar name: subsync.blocks() result}, facts) of the dense hearing of --sub-time and the
+    deep analysis (docs/design.md, "Subtitle match"). items are the sub_items() of the tracks and sidecars that
+    matched, sweeps their sub_sweep() rows and sync the word check. subsync.suspects() gives the parts of a track whose
+    sweep rows sit off its fitted line. The tracks of one audio track share one hearing of all their parts, in the
+    subsync.dense() windows that hear each part in full. Those windows lie where the cues of the tracks are, each track
+    moved to the audio by its fix. It hears and yields as sub_sweep() does. Then subsync.blocks() finds the blocks of
+    each track in its own parts, with the speech onsets of the parts as a second clock, see onsets(). A track with no
+    part gets no entry, and a file with no part hears nothing. facts holds the windows, the CPU and wall seconds of the
+    hearing and the onsets, and why a hearing heard nothing or the onsets failed. The parts of one audio track hold
+    subsync.BLOCK_HEAR seconds in all, see heard_parts().
+
+    A part whose edge the hearing did not see asks for a stretch past it, see subsync.further(). Those stretches come
+    from what BLOCK_HEAR leaves after the first hearing. A second hearing hears them all once, their onsets join the
+    others, and blocks() runs again for each track that asked, with its parts and its stretches. In the deep analysis an
+    import that waits goes first, before the second hearing."""
+    dur, out, facts = decide.duration(j), {}, {"windows": 0, "cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
+    fix = lambda k: ((sync.get(k) or {}).get("timing") or {}).get("fix")
+    audio = lambda t, f: subsync.moved(t * 1000, f) / 1000 if f else t
+    for idx, (lang, _) in sub_groups(items).items():
+        keys = [k for k, x in items.items() if x[1] == idx]
+        parts = {k: subsync.suspects(sweeps.get(k) or [], dur) for k in keys}
+        if not any(parts.values()):
+            continue
+        union, parts = heard_parts(parts, {k: sweeps.get(k) or [] for k in keys})
+        cues, stop = sorted((audio(a, fix(k)), audio(b, fix(k)), x) for k in keys for a, b, x in items[k][2]), decide.STOPWORDS.get(lang, frozenset())
+        timing = lambda k: (sync.get(k) or {}).get("timing")
+        starts = subsync.dense(cues, union, dur, stop)
+        facts["windows"] += len(starts)
+        heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
+        times = onsets(path, j, idx, union, facts) if union else []
+        out.update({k: subsync.blocks(heard, items[k][2], lang, timing(k), ps, onsets=times, rows=sweeps.get(k) or []) for k, ps in parts.items() if ps})
+        more = subsync.further({k: out[k] for k, ps in parts.items() if ps}, union, dur)
+        if more:
+            if deep and runner.queued():
+                raise Yielded("an import waits, before the second dense hearing")
+            extra = subsync.unheard([tuple(x) for x in subsync.merged(x for xs in more.values() for x in xs)], union)   # heard once
+            starts = subsync.dense(cues, extra, dur, stop)
+            facts["windows"] += len(starts)
+            heard += sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
+            times = sorted(times + onsets(path, j, idx, extra, facts))
+            out.update({k: subsync.blocks(heard, items[k][2], lang, timing(k), [tuple(x) for x in subsync.merged(parts[k] + xs)], onsets=times,
+                                          rows=sweeps.get(k) or []) for k, xs in more.items()})
+    return out, facts
+
+
+ONSET_TIMEOUT = 300   # seconds the onset read of one part may take at nice 19
+
+
+def onsets(path, j, idx, parts, facts=None):
+    """The speech onsets in parts [(lo, hi)] of ffmpeg audio track idx of path, sorted, as [(onset, seconds of silence
+    before it)] in seconds of the file. An onset is where ffmpeg's silencedetect at -25 dB ends a silence of 0.3 s or
+    more. A part that starts in a silence counts that silence from its own start. subsync.blocks() takes them as a
+    second clock beside Whisper's word times (docs/design.md, "Subtitle match"). It counts an onset that ends a silence
+    of 0.5 s or more, and checks that no other onset lies near it. A track with a centre channel is heard there,
+    where the dialogue is, and another track as its mono mix. j is the mkvmerge -J probe, which gives the channel
+    count. ffprobe names the layout of a track with 3 channels or more. Each part is one ffmpeg read at nice 19 and
+    idle I/O. A silence that runs to the end of a part ends no speech there. facts gets the CPU and wall seconds, and
+    why a read failed in "onset_why". A failure gives no onsets of that part and never raises."""
+    t0, c0, out, why = time.monotonic(), resource.getrusage(resource.RUSAGE_CHILDREN), [], []
+    audio = [t for t in j.get("tracks") or [] if t.get("type") == "audio"]
+    try:
+        channels = (audio[idx].get("properties") or {}).get("audio_channels") or 0
+        layout = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"a:{idx}", "-show_entries", "stream=channel_layout", "-of",
+                                 "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=60).stdout.strip() if channels > 2 else ""
+        centre = bool(layout) and "FC" in re.split(r"[+() ]", ffmpeg_layouts().get(layout, layout))
+        for lo, hi in parts:
+            r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-ss", f"{lo:.3f}", "-t",
+                                f"{hi - lo:.3f}", "-i", path, "-map", f"0:a:{idx}", "-vn", "-sn", "-dn", "-af",
+                                ("pan=mono|c0=FC," if centre else "aformat=channel_layouts=mono,") + "silencedetect=noise=-25dB:d=0.3",
+                                "-f", "null", "/dev/null"], capture_output=True, text=True, errors="replace", timeout=ONSET_TIMEOUT)
+            if r.returncode:
+                why.append(f"ffmpeg exited {r.returncode} at {content.hms(lo)}: {config.mask(r.stderr.strip())[-120:]}")
+                continue
+            out += [(lo + float(x), float(d)) for x, d in re.findall(r"silence_end: (-?[\d.]+) \| silence_duration: ([\d.]+)", r.stderr)
+                    if float(x) < hi - lo - 0.05]
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError) as ex:
+        why.append(config.mask(f"the onset read failed: {type(ex).__name__}: {ex}")[:200])
+    if facts is not None:
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        facts.update(cpu=round(facts["cpu"] + c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, 1), took=round(facts["took"] + time.monotonic() - t0, 1),
+                     **({"onset_why": why} if why else {}))
+    return sorted(out)
+
+
+LAYOUTS = {}   # ffmpeg -layouts, see ffmpeg_layouts()
+
+
+def ffmpeg_layouts():
+    """{layout name: its channels joined by +} of ffmpeg -layouts, as "5.1(side)": "FL+FR+FC+LFE+SL+SR". ffprobe names a
+    track's layout by these names. A process keeps the first read that gives them, and a failed read gives {}."""
+    if not LAYOUTS:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            text = subprocess.run(["ffmpeg", "-hide_banner", "-layouts"], capture_output=True, text=True, errors="replace", timeout=30).stdout
+            LAYOUTS.update(re.findall(r"(?m)^(\S+)\s+([A-Z][A-Z0-9]*(?:\+[A-Z][A-Z0-9]*)+)\s*$", text or ""))
+    return LAYOUTS
+
+
+def heard_parts(parts, rows):
+    """(the parts dense hearing hears, {key: its parts}) for parts {key: subsync.suspects()} of the tracks of one audio
+    track, whose sweep rows are rows {key: rows}. suspects() holds the parts of one track to BLOCK_HEAR seconds, and the
+    parts of tracks that differ could hear more together. So the parts merge, and they hold BLOCK_HEAR seconds in all.
+    The suspect rows are those of subsync.suspect_rows(), each track's against its own lean. The part with the row
+    farthest off comes first, as in suspects(). A part that does not fit in what is left keeps the stretch that fits,
+    see subsync.centred(). With under WINDOW seconds left it keeps none. A track's part keeps what of it is heard, and a
+    part with nothing heard gives (lo, lo), which blocks() names as the cap."""
+    sus = {}
+    for rs in rows.values():
+        for t, off in subsync.suspect_rows(rs).items():   # the tracks share their windows, so a time can be off in several
+            sus[t] = max(off, sus.get(t, 0.0))
+    far = lambda p: -max((o for t, o in sus.items() if p[0] <= t < p[1]), default=0.0)
+    union, left = [], subsync.BLOCK_HEAR
+    for lo, hi in sorted(subsync.merged(p for ps in parts.values() for p in ps if p[1] > p[0]), key=far):
+        if hi - lo > left:
+            lo, hi = (round(x, 1) for x in subsync.centred(lo, hi, sus, left))
+        union.append((lo, hi))
+        left -= hi - lo
+    heard = lambda p: next(((max(p[0], a), min(p[1], b)) for a, b in union if max(p[0], a) < min(p[1], b)), (p[0], p[0]))
+    return sorted(p for p in union if p[1] > p[0]), {k: [heard(p) for p in ps] for k, ps in parts.items()}
 
 
 def side_stats(path):
@@ -778,22 +917,24 @@ def sub_cached(path):
     return bool(got) and not got[1] and isinstance(got[0], dict) and got[0].get("sidecars") == side_stats(path)
 
 
-def sidecar_fix(sides, sync, apply, app, source, ends=None):
+def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     """Act on the sidecars beside a Matroska file (docs/design.md, "Subtitle match"). A sidecar that does not match the
     audio moves into originals_root() as a kept original. A sidecar whose times need a fix, or whose cues flash, with
-    ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. Both need a
-    place to keep the original, so with KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. Each move and rewrite gets a
-    log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
+    ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. A sidecar with
+    blocks, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
+    holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
+    KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
     "moved", "retimed", "left" or "dry run", kept or left}."""
-    out, ends = [], ends or {}
+    out, ends, timed = [], ends or {}, timed or {}
     for n, s in sorted(sides.items()):
-        r, plan = sync.get(n) or {}, ends.get(n)
+        r, plan, times = sync.get(n) or {}, ends.get(n), timed.get(n)
         fix = (r.get("timing") or {}).get("fix")
-        if r.get("verdict") != "mismatch" and not fix and not plan:
+        if r.get("verdict") != "mismatch" and not fix and not plan and not times:
             continue
         move = r.get("verdict") == "mismatch"
-        e = {"name": n, "action": "move" if move else "retime" if fix else "lengthen",
-             "why": r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan)) if x)}
+        e = {"name": n, "action": "move" if move else "retime" if fix or times else "lengthen",
+             "why": r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan),
+                                                                times and remux.blocks_moved(times, fix)) if x)}
         out.append(e)
         if not apply or not sub_fixes(source):
             e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is set to check")
@@ -807,10 +948,10 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None):
                 with open(s["path"], "rb") as f:
                     text = f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace")
                 try:
-                    text = remux.set_ends(text.replace("\r\n", "\n"), False, plan) if plan else text
+                    text = remux.set_ends(text.replace("\r\n", "\n"), False, times or plan) if times or plan else text
                 except RuntimeError as ex:
-                    raise OSError(f"its new ends do not fit its text: {ex}") from None
-                text = remux.srt_moved(text, fix) if fix else text
+                    raise OSError(f"its new {'times' if times else 'ends'} do not fit its text: {ex}") from None
+                text = remux.srt_moved(text, fix) if fix and not times else text
                 remux.new_tmp(tmp)
                 with open(tmp, "w", encoding="utf-8") as f:
                     f.write(text)
@@ -863,8 +1004,8 @@ def sub_findings(rec, sync, unmatched):
         t = r.get("timing") or {}
         if (t.get("piecewise") and round(max(t["offsets"]) - min(t["offsets"]), 2) >= config.STEP_ALERT) or "unfixed" in t:
             late.append({"code": "off", "track": p, "ref": r.get("reference"), "why": t["why"], "offsets": t.get("offsets"), "unfixed": t.get("unfixed")})
-    if (rm.get("fixed") or rm.get("ended")) and not rm.get("done"):
-        late.append({"code": "not_retimed", "tracks": sorted({*(rm.get("fixed") or []), *(rm.get("ended") or [])}), "result": rm.get("result"),
+    if (rm.get("fixed") or rm.get("ended") or rm.get("timed")) and not rm.get("done"):
+        late.append({"code": "not_retimed", "tracks": sorted({*(rm.get("fixed") or []), *(rm.get("ended") or []), *(rm.get("timed") or [])}), "result": rm.get("result"),
                      "block": plan.get("block")})
     if not flags_off:
         late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"]} for p, r in sorted(sync.items())

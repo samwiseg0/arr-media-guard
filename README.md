@@ -7,7 +7,8 @@ for each problem it leaves unresolved, and logs the problems it fixed. It edits 
 
 - **Default tracks.** It picks the audio and the subtitles that play first, from a policy file.
 - **Language detection.** An optional Whisper model hears a track whose language is in doubt.
-- **Subtitle match.** It finds a subtitle of another episode, and retimes a subtitle that runs late.
+- **Subtitle match.** It finds a subtitle of another episode, retimes a subtitle that runs late, and moves a block of
+  cues that sits off while the rest is in time.
 - **Broken files.** It re-grabs a file with broken audio or corrupt video, and can restore the old file.
 - **Wrong content.** It alerts when a file holds another film or another episode.
 - **Repairs.** It repairs a wrong Matroska header, and can convert AVI, MP4, M4V, TS and WebM files into Matroska.

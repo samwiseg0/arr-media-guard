@@ -3,7 +3,7 @@
 """The checks and the flag edit of one file, process(), with the metadata checks it runs."""
 import contextlib, dataclasses, fcntl, os, statistics, subprocess, time, uuid
 
-from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, subsync, subtitles, vault
 
 
 def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=None, nfo=None):
@@ -342,9 +342,10 @@ def languages(ctx):
 
 def subtitle_checks(ctx):
     """The subtitle match check, the reference timing and the flash check, and the one remux they ask for, see
-    resub(). A track that does not match leaves the file, and a track whose times need a fix gets them. When the remux
-    fails, a track that does not match loses its flags instead. Sidecars beside the file are checked too, see
-    sidecar_fix(). The decision then counts each track that does not match."""
+    resub(). A track that does not match leaves the file, and a track whose times need a fix gets them. --sub-time and
+    the deep analysis also hear the parts where the sweep sits off, see sub_dense(), and a block of cues there moves to
+    its speech. When the remux fails, a track that does not match loses its flags instead. Sidecars beside the file are
+    checked too, see sidecar_fix(). The decision then counts each track that does not match."""
     rec, j, d, path, mkv, subs_on = ctx.rec, ctx.j, ctx.d, ctx.path, ctx.mkv, ctx.subs_on
     timing = ctx.mode in ("sub_time", "deep")   # the reference timing and the sweep
     sync, unmatched, fixes, sides = {}, set(), {}, {}   # the subtitle match check, docs/design.md, "Subtitle match"
@@ -371,6 +372,12 @@ def subtitle_checks(ctx):
                     if t.get("fix") and (why := subtitles.sweep_confirms(rows)):
                         sync[k] = dict(r, timing={"fix": None, "unconfirmed": t["fix"], "swept": True, "why": f'{t["why"]}, but {why}'})
                         rec["sweep"][k] = [dict(w, off=w["offset"]) for w in rows]   # no line is fitted now, so each row sits off the audio
+                found, dense = subtitles.sub_dense(path, j, {k: items[k] for k, r in sync.items() if r["verdict"] == "match" and k in items},
+                                                   rec["sweep"], sync, deep=ctx.mode == "deep")
+                if found:
+                    rec["blocks"], rec["sweep_facts"]["dense"] = found, dense
+                for k, b in found.items():   # the rows of a part that dense hearing heard in time were noise, so they never alert
+                    rec["sweep"][k] = subsync.after_blocks(rec["sweep"][k], [], sync[k].get("timing"), b["parts"])
             if ctx.shared:
                 ctx.shared.reshare(ctx.st)
         for p in unindexed & set(sync):   # an import skips the track, and says why
@@ -390,30 +397,43 @@ def subtitle_checks(ctx):
         unmatched = {p for p, r in tracks.items() if r["verdict"] == "mismatch"}
         fixes = {p: r["timing"]["fix"] for p, r in tracks.items() if (r.get("timing") or {}).get("fix")} if subtitles.sub_fixes(ctx.source) else {}
         unmatched = unmatched if subtitles.sub_fixes(ctx.source) else set()   # SUBTITLES check turns no flag off. The alerts read sync.
+    blocks = {k: b["blocks"] for k, b in (rec.get("blocks") or {}).items() if b["blocks"]} if subtitles.sub_fixes(ctx.source) else {}
     remove = sorted(unmatched) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
     flashy = subtitles.flash_check(path, j, proof.sidecar_subs(path), full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
-    vtt = {p for p, c in subtitles.sub_codecs(j).items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
+    codecs = subtitles.sub_codecs(j)
+    vtt = {p for p, c in codecs.items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
     if flashy:
         rec["flash"] = {k: {"cues": len(v), "median": round(statistics.median(o - a for a, _, o, _ in v), 3), "lengthened": sum(n != o for _, _, o, n in v),
                             "first": [[a, o, n] for a, _, o, n in v[:3]], **({"report_only": "WebVTT"} if k in vtt else {})} for k, v in flashy.items()}
     ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt} if subtitles.sub_fixes(ctx.source) else {}
+    # The new times of each cue of a track or sidecar with blocks, with its fix and its flash ends, in one plan that
+    # resub() or sidecar_fix() writes. The plan takes the cues in the order of the file's text. A WebVTT track is never
+    # rewritten, so its blocks only report.
+    plan = lambda k, cues, fix, ass: remux.time_plan(cues, fix, blocks[k], [x[3] for x in flashy[k]] if k in flashy else None, ass)
+    moves = {p: x for p in blocks if p not in sides and codecs.get(p) in config.TEXT_CODECS
+             and (x := plan(p, items[p][2], fixes.get(p), codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")))}
+    side_moves = {n: x for n in blocks if n in sides and (x := plan(n, subtitles.side_cues(sides[n]), (sync[n].get("timing") or {}).get("fix"), False))}
+    for k in {**moves, **side_moves}:   # the rows of a block that moves to its speech sit on the line then, so they never alert
+        rec["sweep"][k] = subsync.after_blocks(rec["sweep"][k], blocks[k], sync[k].get("timing"))
     st = ctx.st
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
-    if fixes or remove or ends:
+    if fixes or remove or ends or moves:
         if ctx.mode == "deep":   # a remux of a film takes minutes, so an import that waits goes first
             runner.deep_waits()
         if ctx.shared and ctx.apply:
             raise runner.Replan("a subtitle needs a remux", rec.get("sweep_facts"))   # the facts of the sweep this pass heard
         ids_of = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
         by_id = lambda ps: [ids_of[int(p[1:]) - 1] for p in ps]
-        code, result, info = remux.resub(path, j, st, ctx.apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove), dict(zip(by_id(ends), ends.values())))
+        code, result, info = remux.resub(path, j, st, ctx.apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove), dict(zip(by_id(ends), ends.values())),
+                                         **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}))
         if "warnings" in info:
             ctx.rearm()   # resub() ran its remux with the time limit off, whatever came of it
         done = code == "subtitles_remuxed"
         rec["subremux"] = dict(info, result=result, done=done, fixed=sorted(fixes), ended=sorted(ends), remove=remove, removed=remove if done else [],
-                               codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_ends_lengthened", ends), ("subtitle_mismatch_removed", remove))
-                                      if x] if done else [code])
+                               codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_blocks_retimed", moves), ("subtitle_ends_lengthened", ends),
+                                                     ("subtitle_mismatch_removed", remove)) if x] if done else [code],
+                               **({"timed": sorted(moves)} if moves else {}))
         if done:
             rec["subremux"]["tracks_before"] = logs.track_log(d["tracks"])   # the places the check named, before a removal moves the tracks up
             logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
@@ -435,7 +455,7 @@ def subtitle_checks(ctx):
         if ctx.tags:
             d = decide.with_tags(d, ctx.tags)
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
-    ctx.fixes, ctx.remove, ctx.ends, ctx.flashy = fixes, remove, ends, flashy
+    ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves = fixes, remove, ends, flashy, moves, side_moves
 
 
 def deep_drop(ctx):
@@ -522,7 +542,7 @@ def act(ctx):
     ctx.sync_all = {**ctx.sync, **ctx.timed_by}
     ctx.sides, ctx.side_ends = sides, {n: v for n, v in ctx.flashy.items() if n in sides}   # at SUBTITLES check, sidecar_fix() only reports
     ctx.acts = [n for n in sides if (ctx.sync_all.get(n) or {}).get("verdict") == "mismatch" or ((ctx.sync_all.get(n) or {}).get("timing") or {}).get("fix")
-                or n in ctx.side_ends]
+                or n in ctx.side_ends or n in ctx.side_moves]
     if ctx.shared and ctx.apply and (certain or vcertain or (ctx.mkv and (d["edits"] or ctx.acts))):
         ctx.shared.exclusive(ctx.st)
     if certain:
@@ -557,6 +577,18 @@ def act(ctx):
             rec.update(outcome="dropped", result="dropped: " + "; ".join(d["dropped"]))
 
 
+def sub_outcome(rec):
+    """(outcome, result) of a run whose subtitle step changed a file and no flag, or None when it changed none. The
+    outcome is subtitles_remuxed after a remux, else sidecars_changed. The result names what happened to each track and
+    sidecar, as "subtitles remuxed: s2 retimed, s1 blocks moved, Film.en.srt retimed"."""
+    rm = rec.get("subremux") or {}
+    did = (("fixed", "retimed"), ("timed", "blocks moved"), ("ended", "ends lengthened"), ("removed", "removed")) if rm.get("done") else ()
+    what = [f"{p} {x}" for k, x in did for p in rm.get(k) or []] + \
+        [f'{e["name"]} {e["result"]}' for e in rec.get("sidecars") or [] if e.get("result") in ("retimed", "moved")]
+    code, head = ("subtitles_remuxed", "subtitles remuxed") if rm.get("done") else ("sidecars_changed", "sidecars changed")
+    return (code, f"{head}: " + ", ".join(what)) if what else None
+
+
 def after_edit(ctx):
     """The rescans after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
     rec, d = ctx.rec, ctx.d
@@ -570,11 +602,14 @@ def after_edit(ctx):
     if (rec.get("subremux") or {}).get("done"):
         rec["subremux"]["rescan"] = rescan_now()
     if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain):   # the sidecars beside the file, under the lock of the edit
-        rec["sidecars"] = subtitles.sidecar_fix({n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends)
+        rec["sidecars"] = subtitles.sidecar_fix({n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
+                                                **({"timed": ctx.side_moves} if ctx.side_moves else {}))
+    if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
+        rec.update(outcome=named[0], result=named[1])
     ctx.rest += subtitles.sub_findings(rec, ctx.sync_all, ctx.stay)
     if ctx.mkv and ctx.subs_on and checks.lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
-        muted, planned = {t["sel"] for t in d["tracks"] if t["pos"] in ctx.unmatched}, ctx.fixes or ctx.remove or ctx.ends
-        done = ctx.apply and rec["outcome"] in ("edited", "no_change") and (rec.get("subremux") or {}).get("done", not planned) \
+        muted, planned = {t["sel"] for t in d["tracks"] if t["pos"] in ctx.unmatched}, ctx.fixes or ctx.remove or ctx.ends or ctx.moves
+        done = ctx.apply and rec["outcome"] in ("edited", "no_change", "subtitles_remuxed", "sidecars_changed") and (rec.get("subremux") or {}).get("done", not planned) \
             and all(e["result"] in ("moved", "retimed") for e in rec.get("sidecars") or [])
         subtitles.sub_cache(ctx.path, {p: r["verdict"] for p, r in ctx.sync.items()},
                             (bool(planned or ctx.acts) or any(e[0] in muted for e in d["edits"])) and not done)
