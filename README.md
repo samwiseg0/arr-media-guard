@@ -7,11 +7,18 @@ for each problem it leaves unresolved, and logs the problems it fixed. It edits 
 
 - **Default tracks.** It picks the audio and the subtitles that play first, from a policy file.
 - **Language detection.** An optional Whisper model hears a track whose language is in doubt.
-- **Subtitle match.** It finds a subtitle of another episode, retimes a subtitle that runs late, and moves a block of
-  cues that sits off while the rest is in time.
+- **Subtitle match.** It finds a subtitle of another episode by its words. It retimes a subtitle that runs late.
+- **Subtitle block timing.** It moves a block of cues that sits off while the rest is in time.
+- **Live caption timing.** It moves each line of live captions to its speech.
+- **Incorrect subtitle identification.** When no word check can read a subtitle, it checks where its lines show. It
+  alerts on a subtitle of another episode or version, or one that runs late.
+- **Long subtitle track handling.** It reads subtitle tracks of up to 100,000 blocks, and stops a read that takes too
+  long.
+- **Subtitle character set detection.** It reads a sidecar in an old character set, such as Big5 or Windows-1250.
+- **Garbled subtitle repair.** It repairs subtitles an old muxer garbled, and takes out a track it cannot repair.
 - **Broken files.** It re-grabs a file with broken audio or corrupt video, and can restore the old file.
 - **Wrong content.** It alerts when a file holds another film or another episode.
-- **Repairs.** It repairs a wrong Matroska header, and can convert AVI, MP4, M4V, TS and WebM files into Matroska.
+- **Repairs.** It repairs a wrong Matroska header. It can convert AVI, MP4, M4V, TS and WebM files into Matroska.
 - **Backfill and scans.** It fixes and scans your whole library, and audits its own edits.
 - **Subtitle hunter.** A command of its own replaces a Radarr film that has no English subtitle with a release that
   has one.

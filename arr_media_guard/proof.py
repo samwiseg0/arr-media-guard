@@ -30,16 +30,50 @@ PROOF_BSF = {("mpegts", "aac"): ("aac_adtstoasc", None),
 TIMED_TEXT = ("mov_text",)   # timed text mkvmerge turns into SubRip. The proof compares the text.
 CAPTIONS = ("eia_608",)      # CEA-608 caption tracks (c608), which mkvmerge drops. They become SubRip.
 CC_NAME = "English (CC)"     # the name of the SubRip track a caption track becomes
-PY_CHARSET = {"UTF-16": "utf-16", "UTF-8": "utf-8-sig", "cp1252": "cp1252"}   # a sidecar charset as mkvmerge and Python name it
+# a sidecar charset as mkvmerge and Python name it, the codepages of decide.CODEPAGES too
+PY_CHARSET = {"UTF-16": "utf-16", "UTF-8": "utf-8-sig", **{cp: cp for cp in decide.CODEPAGES}}
+
+
+def sidecar_text(raw, named=None):
+    """(charset, text) of the bytes raw of a sidecar, the charset as mkvmerge names it (docs/design.md, "Subtitle text").
+    It is UTF-16 by its BOM, and UTF-8 when the bytes decode as UTF-8. Else the first codepage of decide.CODEPAGES
+    whose decode reads as a language it writes wins, see text_language(). The codepages that write named, the
+    language code of the sidecar's name, go first. When no decode reads, the first of those codepages whose decode is
+    plausible wins, see decide.plausible(), as for a short text or a language with no word list. Serbian in Latin
+    letters then takes cp1250, and in Cyrillic cp1251. Else the bytes decode as cp1252, as they did before any codepage
+    was read."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "UTF-16", raw.decode("utf-16", errors="replace")
+    try:
+        return "UTF-8", raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    code = named and (named if len(named) == 3 else checks.langs()[0].get(named.split("-")[0]))   # the 639-2 code of en or pt-br
+    own = [cp for cp in decide.CODEPAGES if code and decide.lang_key(code) in decide.writes(cp)]
+    for cp in own + [cp for cp in decide.CODEPAGES if cp not in own]:
+        try:
+            text = raw.decode(cp)
+        except UnicodeDecodeError:
+            continue
+        if decide.reads_as([c[2] for c in srt_cues(text)], cp):
+            return cp, text
+    for cp in own:
+        try:
+            text = raw.decode(cp)
+        except UnicodeDecodeError:
+            continue
+        if decide.plausible(" ".join(c[2] for c in srt_cues(text))):
+            return cp, text
+    return "cp1252", raw.decode("cp1252", errors="replace")
 
 
 def sidecar_subs(path):
-    """The .srt files beside path whose name starts with its base name, as {path, name, lang, flags, charset, end,
-    ordered, read}. The first part after the base name is the language when it reads as a code (Movie.en.srt, Movie.eng.srt),
-    else und. forced, hi, sdh and cc set a flag (Movie.en.forced.srt, Movie.en.hi.srt). The charset is UTF-16 by its
-    BOM, UTF-8 when the bytes decode as UTF-8, else cp1252. end is where its last cue ends, in seconds. ordered says
-    each cue starts no earlier than the one before, else mkvmerge warns. read is text_language() of its first cues, and
-    cues is srt_cues() of its text."""
+    """The .srt files beside path whose name starts with its base name, as {path, name, named, lang, flags, charset,
+    end, ordered, read}. The first part after the base name is the language when it reads as a code (Movie.en.srt,
+    Movie.eng.srt), and named holds it, else None. Else the language is the one its text reads as, and und when it reads as none, as for Movie.srt
+    and Movie.1.srt. forced, hi, sdh and cc set a flag (Movie.en.forced.srt, Movie.en.hi.srt). The charset is that of
+    sidecar_text(). end is where its last cue ends, in seconds. ordered says each cue starts no earlier than the one
+    before, else mkvmerge warns. read is text_language() of its first cues, and cues is srt_cues() of its text."""
     folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
     try:
         names = sorted(n for n in os.listdir(folder) if n.startswith(base + ".") and n.lower().endswith(".srt"))
@@ -48,26 +82,19 @@ def sidecar_subs(path):
     out = []
     for n in names:
         tags = [t for t in n[len(base) + 1:-4].lower().split(".") if t]
-        lang = tags[0] if tags and tags[0] not in SIDECAR_FLAGS and re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", tags[0]) else "und"
+        named = tags[0] if tags and tags[0] not in SIDECAR_FLAGS and re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", tags[0]) else None
         with open(os.path.join(folder, n), "rb") as f:
-            raw = f.read()
-        charset = "UTF-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "UTF-8"
-        if charset == "UTF-8":
-            try:
-                raw.decode("utf-8")
-            except UnicodeDecodeError:
-                charset = "cp1252"
-        text = raw.decode(PY_CHARSET[charset], errors="replace")
+            charset, text = sidecar_text(f.read(), named)
         cues, starts = srt_cues(text), [m.groups()[:4] for m in map(decide.SRT_TIME.match, text.splitlines()) if m]
         starts = [(int(h), int(m), int(s), int(f.ljust(3, "0")[:3])) for h, m, s, f in starts]
-        out.append(dict(path=os.path.join(folder, n), name=n, lang=lang, flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
-                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts),
-                        read=decide.text_language(c[2] for c in cues), cues=cues))
+        read = decide.text_language(c[2] for c in cues)
+        out.append(dict(path=os.path.join(folder, n), name=n, named=named, lang=named or read[0] or "und", flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
+                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts), read=read, cues=cues))
     return out
 
 
-def srt_blocks(text):
-    """[[start ms, end ms, text]] of the cues of a SubRip text in file order, each with its lines joined by a space. A
+def srt_blocks(text, sep=" "):
+    """[[start ms, end ms, text]] of the cues of a SubRip text in file order, each with its lines joined by sep. A
     block with no timing line is more text of the cue before it, as mkvmerge reads it."""
     ms = lambda h, m, s, f: int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(f.ljust(3, "0")[:3])
     cues = []
@@ -76,20 +103,29 @@ def srt_blocks(text):
         k = next((i for i, line in enumerate(lines[:2]) if decide.SRT_TIME.match(line)), None)
         if k is None:
             if cues:
-                cues[-1][2] += " " + " ".join(lines)
+                cues[-1][2] += sep + sep.join(lines)
             continue
         g = decide.SRT_TIME.match(lines[k]).groups()
-        cues.append([ms(*g[:4]), ms(*g[4:8]), " ".join(lines[k + 1:])])
+        cues.append([ms(*g[:4]), ms(*g[4:8]), sep.join(lines[k + 1:])])
     return cues
 
 
 def srt_cues(text, shift=0):
     """[(start ms, end ms, text)] of a SubRip text, sorted, for the proof. The text drops its tags and folds its
-    whitespace, and an empty cue drops, see srt_blocks(). shift is added to every time, in ms."""
+    whitespace, and an empty cue drops, see srt_blocks() and clean_cues(). shift is added to every time, in ms."""
+    return clean_cues(srt_blocks(text), shift)
+
+
+def clean_cues(blocks, shift=0):
+    """srt_cues() of the cues of srt_blocks()."""
+    return sorted((a + shift, b + shift, clean_text(t)) for a, b, t in blocks if clean_text(t))
+
+
+def clean_text(t):
+    """The text of a cue with no tags and its whitespace folded, as srt_cues() compares it."""
     # A tag holds no space: "July</i><font>." is "July.". ffmpeg writes a run of spaces in timed text as ASS hard spaces
     # (\h) and line breaks as \N, some of them only on one side.
-    clean = lambda t: " ".join(re.sub(r"\\[hNn]", " ", re.sub(r"<[^>]*>|\{\\[^}]*\}", "", t)).split())
-    return sorted((a + shift, b + shift, clean(t)) for a, b, t in srt_blocks(text) if clean(t))
+    return " ".join(re.sub(r"\\[hNn]", " ", re.sub(r"<[^>]*>|\{\\[^}]*\}", "", t)).split())
 
 
 def zero_cues(a, b):
@@ -158,8 +194,8 @@ class ReadFailed(RuntimeError):
 def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     """One read of path through ffmpeg with -c copy, -copyinkf and -copyts. No stream is decoded, only timed text becomes
     SubRip. -copyinkf keeps the frames before the first keyframe, which a copy drops by default in both files.
-    With raw the text streams are SubRip already and their packets are written as they are, because ffmpeg's SubRip
-    decoder drops a cue whose text starts with a line break.
+    With raw True the text streams are SubRip already and their packets are written as they are, because ffmpeg's
+    SubRip decoder drops a cue whose text starts with a line break. raw may also hold the stream indexes to write so.
     maps lists ffprobe stream indexes. bsf maps a stream index to the bitstream filter its packets go through first.
     opts are input options, such as -ignore_editlist 1.
     Returns ({stream index: count (packets with data), empty (packets without), bytes, digest (sha256 over their md5s),
@@ -172,7 +208,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
         argv += [a for i in maps for a in ("-map", f"0:{i}")] + ["-c", "copy", "-copyinkf"]   # frames before the first keyframe too
         argv += [a for k, i in enumerate(maps) if bsf.get(i) for a in (f"-bsf:{k}", bsf[i])] + ["-f", "framemd5", out]
     for i, f in srt.items():
-        argv += ["-map", f"0:{i}", "-c:s", "copy" if raw else "srt", "-f", "srt", f]
+        argv += ["-map", f"0:{i}", "-c:s", "copy" if raw is True or i in (raw or ()) else "srt", "-f", "srt", f]
     r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
     # ffmpeg decodes a few frames of each stream while it opens a file, and a decoder may complain there: "[mp3float @ ..]
     # Header missing", "[h264 @ ..] decode_slice_header error". ffprobe says the
@@ -220,7 +256,26 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
     return stats, texts
 
 
-def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None):
+def packet_text(srt, md5):
+    """Why the SubRip file srt does not hold the packets that the framemd5 file md5 lists, byte for byte, or None.
+    ffmpeg wrote both from one read of one stream, see remux.resub(). Each cue of srt is a number, a time line, the
+    packet's bytes and a blank line. Each packet's bytes must hash to its md5, in file order, and no byte may be left."""
+    with open(srt, "rb") as f:
+        data = f.read()
+    with open(md5) as f:
+        packets = [(int(p[4]), p[5]) for p in (line.split(",") for line in f if line[:1].isdigit())]
+    pos = 0
+    for k, (size, digest) in enumerate(packets, 1):
+        m = re.compile(rb"\d+\n[^\n]* --> [^\n]*\n").match(data, pos)
+        if not m:
+            return f"cue {k} has no time line"
+        body, pos = data[m.end():m.end() + size], m.end() + size + 2
+        if hashlib.md5(body).hexdigest() != digest.strip() or data[pos - 2:pos] != b"\n\n":
+            return f"cue {k} differs from its packet"
+    return f"{len(data) - pos} bytes follow the last packet" if pos != len(data) else None
+
+
+def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None, recoded=None):
     """(the refusal, or None; the proof per stream). The refusal is (stream, why): why the new file tmp is not a lossless
     copy of src with the sidecars subs, and the ffprobe index of the stream of src it refuses for its packet count or
     its packet data, else None. No stream is ever decoded.
@@ -264,12 +319,14 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     maps the k-th subtitle stream of src to [(start, end)] of each of its packets in seconds, from a time plan of
     remux.time_plan(): its packets must match, and each start and end must be the planned one within TIME_SLACK. A
     stream in ended or timed whose original holds a cue with no duration is refused: its end is not known, and the
-    plan's end for it is made up."""
+    plan's end for it is made up. recoded maps the k-th subtitle stream of src, a SubRip track, to a function that
+    gives the cues of the new text from srt_blocks() of the original's text, see remux.resub(). The proof compares
+    text then: the new stream must hold those cues, and they must keep the original's count and times."""
     fa, sa, _ = ff_streams(src)
     fb, sb, _ = ff_streams(tmp)
     a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped], media_streams(sb), fa.split(",")[0]
     by_sub = lambda m: {s["index"]: m[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in m}
-    moved, lengthened, planned = by_sub(retimed or {}), by_sub(ended or {}), by_sub(timed or {})
+    moved, lengthened, planned, recoded = by_sub(retimed or {}), by_sub(ended or {}), by_sub(timed or {}), by_sub(recoded or {})
     pairs, proof = [], []
     captions = captions or {}
     for kind in ("video", "audio", "subtitle"):
@@ -283,15 +340,15 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     for s, t, sc in pairs:
         if s and not sc and s["codec_name"] not in TIMED_TEXT and s["codec_name"] != t["codec_name"]:
             return (None, f"stream {s['index']} changed its codec from {s['codec_name']} to {t['codec_name']}"), proof
-    packets = [(s, t) for s, t, sc in pairs if s and not sc and s["codec_name"] not in TIMED_TEXT]
-    text = [(s, t) for s, t, sc in pairs if s and not sc and s["codec_name"] in TIMED_TEXT]
+    packets = [(s, t) for s, t, sc in pairs if s and not sc and s["codec_name"] not in TIMED_TEXT and s["index"] not in recoded]
+    text = [(s, t) for s, t, sc in pairs if s and not sc and (s["codec_name"] in TIMED_TEXT or s["index"] in recoded)]
     rule = lambda c: proof_bsf(fam, c)
     bsf = {s["index"]: rule(s["codec_name"]) for s, _ in packets if rule(s["codec_name"])}
     timeout = max(600, os.path.getsize(src) / PROOF_RATE)
     pool = concurrent.futures.ThreadPoolExecutor(2)   # both reads at once: the proof then takes about as long as the remux
     try:
         a_ = pool.submit(packet_hashes, src, [s["index"] for s, _ in packets], {i: f[0] for i, f in bsf.items() if f[0]},
-                         [s["index"] for s, _ in text], folder, timeout)
+                         [s["index"] for s, _ in text], folder, timeout, raw=set(recoded))
         b_ = pool.submit(packet_hashes, tmp, [t["index"] for _, t in packets], {t["index"]: bsf[s["index"]][1] for s, t in packets
                                                                                  if bsf.get(s["index"], ("", ""))[1]},
                          [t["index"] for _, t in text] + [t["index"] for s, t, sc in pairs if sc], folder, timeout, raw=True)
@@ -400,11 +457,18 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         if why and not fault:
             fault, stream = why, bad
     for s, t in text:
-        ca, cb = srt_cues(ta[s["index"]], -round(va * 1000)), srt_cues(tb[t["index"]], -round(vb * 1000))
-        cb, zero = zero_cues(ca, cb)
-        why = cue_fault(f"the {s['codec_name']} stream {s['index']}", ca, cb, last_end=False)
-        proof.append(dict(stream=f"s{s['index']}", codec=s["codec_name"], method="text", count=len(ca), match=not why,
-                          **({"zero_length": zero} if zero else {})))
+        what, cb = f"the {s['codec_name']} stream {s['index']}", srt_cues(tb[t["index"]], -round(vb * 1000))
+        if s["index"] in recoded:   # the new text, with the original's times
+            old = srt_blocks(ta[s["index"]])
+            ca, was = clean_cues(recoded[s["index"]](old), -round(va * 1000)), clean_cues(old, -round(va * 1000))
+            why = cue_fault(what, ca, cb) or cue_fault(f"the new text of {what}", [(a, b, "") for a, b, _ in was], [(a, b, "") for a, b, _ in ca])
+            proof.append(dict(stream=f"s{s['index']}", codec=s["codec_name"], method="recoded text", count=len(ca), match=not why))
+        else:
+            ca = srt_cues(ta[s["index"]], -round(va * 1000))
+            cb, zero = zero_cues(ca, cb)
+            why = cue_fault(what, ca, cb, last_end=False)
+            proof.append(dict(stream=f"s{s['index']}", codec=s["codec_name"], method="text", count=len(ca), match=not why,
+                              **({"zero_length": zero} if zero else {})))
         fault = fault or why
     for s, t, sc in pairs:
         if sc:

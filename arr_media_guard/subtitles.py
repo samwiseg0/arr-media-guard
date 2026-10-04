@@ -50,11 +50,36 @@ def timed(blocks):
     return [(s, s + d if d is not None else min(s + 5, got[k + 1][0] if k + 1 < len(got) else s + 5), text) for k, (s, d, text) in enumerate(got)]
 
 
+class Cut(list):
+    """The cues of a track whose read was cut short: it stopped at CUE_MAX or PICTURE_MAX blocks, or after READ_WALL
+    seconds, or FULL_WALL for full_read(). So the track goes on past its last cue here. A window
+    past that cue holds none of the track's cues and could pair its words only with cues far away by chance. So no check
+    judges such a window, see before_cut(). A remux rewrites every cue of a track, and a plan of new times or text
+    holds only the cues read. So a Cut track gets no plan of its own cues: no block, live, flash or garbled fix, see
+    sub_dense(), flash_check() and garbled_tracks(). A whole-track fix still moves every cue. Nor does it time another
+    track, see sub_reference()."""
+
+
+def cut_end(cues):
+    """The end of the last cue of cues when its read was cut short, see Cut, else None."""
+    return max(e for _, e, _ in cues) if isinstance(cues, Cut) else None
+
+
+def before_cut(heard, cues):
+    """The windows of heard, lid.py's, that end by cut_end() of cues. Every window when the read of cues was whole."""
+    end = cut_end(cues)
+    return heard if end is None else [w for w in heard if w["at"] + w.get("secs", subsync.WINDOW) <= end]
+
+
 def subtitle_cues(path, j, want, full=False):
     """{track position: [(start, end, text)] in seconds, see timed()} of every cue of the text subtitle tracks at the
     positions in want, for the subtitle match check (docs/design.md, "Subtitle match"). SubRip, ASS, SSA and WebVTT
-    tracks. With full, a track the Cues do not index comes from full_read(). A track the read cannot take gets no entry."""
-    got = {p: c for p, c in subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None).items() if c}
+    tracks. A track whose Cues list CUE_MAX blocks or more gives a Cut, as the read stopped there, and so does a read
+    that took READ_WALL seconds. A block that gives no cue still counts. With full, a track the Cues do not index comes
+    from full_read(). A track the read cannot take gets no entry."""
+    capped = set()
+    got = subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None, capped)
+    got = {p: Cut(c) if p in capped else c for p, c in got.items() if c}
     if full and set(want) - set(got):
         got.update({p: c for p, c in full_read(path, j)["cues"].items() if p in set(want) - set(got) and c})
     return got
@@ -127,7 +152,8 @@ def full_read(path, j):
     VobSub track its packets with their durations. ffmpeg writes each track into its own pipe, and the read keeps only
     the cue times and text as they arrive. A PGS track keeps only its PCS segments, see sup_pcs(). So the read writes
     no file and needs no free space. The result is kept for the file as it is, so a run reads a file whole once. A
-    failure gives no cues and why."""
+    failure gives no cues and why. A track keeps CUE_MAX cues at most, PICTURE_MAX for pictures, and a read stops after
+    FULL_WALL seconds. A track cut short either way gives a Cut, and a stop gives why too."""
     st = os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns)
     if key in FULL:
@@ -154,8 +180,13 @@ def full_read(path, j):
             fds, poll = {r: p for p, (r, _) in ends.items()} | {proc.stderr.fileno(): None}, select.poll()
             for fd in fds:
                 poll.register(fd, select.POLLIN)
+            until, late = time.monotonic() + config.FULL_WALL, False
             while fds:   # read every pipe as it fills, so ffmpeg never waits on a full one
-                for fd, _ in poll.poll():
+                if (left := until - time.monotonic()) <= 0:   # a slow share: the read stops here, see Cut
+                    late = True
+                    proc.kill()
+                    break
+                for fd, _ in poll.poll(left * 1000):
                     chunk, p = os.read(fd, 1 << 16), fds[fd]
                     if not chunk:
                         poll.unregister(fd); del fds[fd]
@@ -169,9 +200,15 @@ def full_read(path, j):
             proc.wait()
             c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
             out.update(tracks=sorted(take), took=round(time.monotonic() - t0, 1), cpu=round(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, 1))
-            if proc.returncode:
+            if proc.returncode and not late:
                 raise RuntimeError(f"ffmpeg exited {proc.returncode}: {config.mask(err.decode('utf-8', 'replace').strip())[-200:]}")
-            out["cues"] = {p: full_cues(bytes(keep[p]), FULL_OUT[codec][2]) for p, codec in take.items()}
+            for p, codec in take.items():
+                fmt = FULL_OUT[codec][2]
+                data = bytes(keep[p]) if fmt == "sup" or not late else bytes(keep[p][:keep[p].rfind(b"\n") + 1])   # whole lines only
+                c, cap = full_cues(data, fmt), config.PICTURE_MAX if fmt in ("sup", "framecrc") else config.CUE_MAX
+                out["cues"][p] = Cut(c[:cap]) if late or len(c) >= cap else c
+            if late:
+                out["why"] = f"the read stopped after {config.FULL_WALL} s, so each track holds only the cues read"
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as ex:
         out.update(cues={}, why=config.mask(f"the whole-file read failed: {type(ex).__name__}: {ex}")[:200])
     finally:
@@ -233,7 +270,8 @@ def flash_check(path, j, sides, full=False, stop=None):
     """{subtitle position or sidecar name: flash_plan()} of the text tracks and .srt sidecars whose cues flash
     (docs/design.md, "Subtitle match"). Any language and any role, forced too. The Cues give the duration of each
     block, so only a track whose median entry lasts under subsync.FLASH is read in full, and only when the read
-    gets every cue. A track with an entry that has no CueDuration is read too. With full, a track the Cues do not
+    gets every cue. A track whose read was cut short gets no plan, see Cut. A track with an entry that has no
+    CueDuration is read too. With full, a track the Cues do not
     index comes from full_read(). stop() true before a read leaves that track and the rest unread. SubRip, ASS, SSA
     and WebVTT tracks. sides are sidecar_subs() entries, read in their file order."""
     codecs, out = sub_codecs(j), {}
@@ -242,7 +280,7 @@ def flash_check(path, j, sides, full=False, stop=None):
         if stop and stop():
             break
         cues = subtitle_cues(path, j, {p}, full).get(p) or []
-        plan = remux.flash_plan(cues, codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")) if len(cues) == len(lens[p]) else None
+        plan = remux.flash_plan(cues, codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")) if len(cues) == len(lens[p]) and not isinstance(cues, Cut) else None
         out.update({p: plan} if plan else {})
     for s in sides:
         plan = remux.flash_plan(side_cues(s))
@@ -261,14 +299,15 @@ def side_cues(s):
         return []
 
 
-def subtitle_blocks(path, j, want, codecs, cap, use, failed):
+def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None):
     """{track position: use(its blocks)} for the tracks of codecs at the positions in want. mkvmerge and ffmpeg index
     every subtitle block in the Cues, so the read takes the Cues and then each block by its index entry, one small read
     each. It never reads a Cluster in full, so the cost does not grow with the file size. use gets an iterator of
     (start seconds, duration seconds or None, text) over at most cap blocks, read one at a time while use asks. A
     picture track gives the frame's bytes for its text, and a PGS block only its first bytes, see picture_cues(). A
     track with a content encoding other than zlib, and a track the Cues do not index get no entry, or failed(why). A
-    failure keeps what was read. The job's time limit passes."""
+    failure keeps what was read. The job's time limit passes. A track's read stops after READ_WALL seconds. The set
+    capped gets the position of each track whose read stopped there, or whose Cues list cap blocks or more."""
     tracks, n, out = {}, 0, {}
     for t in j.get("tracks") or []:
         p = t.get("properties") or {}
@@ -283,14 +322,18 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed):
     try:
         with open(path, "rb", buffering=0) as f:   # unbuffered, so each read takes only the bytes it asks for
             ds, cues = cue_entries(f, set(tracks), cap)
-            clusters = {}
+            clusters, late = {}, set()
             if ds is None:
                 return out
 
             def blocks(number, codec, packed):   # the cues of one track, read one block at a time while use() asks
                 head = codec == "S_HDMV/PGS"   # a PGS block can hold a large picture, and its first bytes say all
+                until = time.monotonic() + config.READ_WALL
                 for i, (cp, rp, _) in enumerate(cues[number]):
                     config.DEADLINE.check()   # up to cap small reads, each a wait on a cold NFS file
+                    if i and time.monotonic() > until:   # a slow share: the read stops here, see Cut
+                        late.add(number)
+                        return
                     if i % config.TEXT_AHEAD == 0:   # start the reads of the next blocks at once, so a cold NFS read waits about once a batch
                         for c, r, _ in cues[number][i:i + config.TEXT_AHEAD]:   # the Cluster header and its Timestamp, then the block
                             os.posix_fadvise(f.fileno(), ds + c, 48, os.POSIX_FADV_WILLNEED)
@@ -314,6 +357,8 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed):
                             text.split(",", 8)[-1] if codec in ("S_TEXT/ASS", "S_TEXT/SSA") else text   # an ASS event holds 8 fields before its text
             for number, (pos, codec, packed) in tracks.items():
                 out[pos] = use(blocks(number, codec, packed)) if number in cues else failed("the Cues index none of its blocks")
+                if capped is not None and (number in late or len(cues.get(number) or ()) >= cap):
+                    capped.add(pos)
     except content.OutOfTime:
         raise
     except Exception as ex:   # the text is one signal among others, so a failed read never stops a job
@@ -340,16 +385,17 @@ def picture_cues(path, j, want, full=False):
     reference timing of --sub-time (docs/design.md, "Subtitle match"). A PGS cue comes from its display sets, see
     pgs_shows(). A VobSub packet is one cue that ends at its stop command, see spu_stop(), else at its
     BlockDuration, else as a text cue ends, see timed(). With full, a track the Cues do not index comes from
-    full_read(). No picture cue lasts over subsync.SPAN seconds. A track the read cannot take gets no entry."""
-    vob = {t for t, c in sub_codecs(j).items() if c == "S_VOBSUB"}
+    full_read(). No picture cue lasts over subsync.SPAN seconds. A track the read cannot take gets no entry. A read cut
+    short gives a Cut, as in subtitle_cues()."""
+    vob, capped = {t for t, c in sub_codecs(j).items() if c == "S_VOBSUB"}, set()
     got = subtitle_blocks(path, j, want & vob, ("S_VOBSUB",), config.PICTURE_MAX,
-                          lambda b: timed((s, spu_stop(spu) or d, "") for s, d, spu in b), lambda why: None)
+                          lambda b: timed((s, spu_stop(spu) or d, "") for s, d, spu in b), lambda why: None, capped)
     got.update(subtitle_blocks(path, j, want - vob, ("S_HDMV/PGS",), config.PICTURE_MAX, lambda b: pgs_shows(sorted(b, key=lambda x: x[0] or 0)),
-                               lambda why: None))
-    got = {p: c for p, c in got.items() if c}
+                               lambda why: None, capped))
+    got = {p: Cut(c) if p in capped else c for p, c in got.items() if c}
     if full and set(want) - set(got):
         got.update({p: c for p, c in full_read(path, j)["cues"].items() if p in set(want) - set(got) and c})
-    return {p: [(s, min(e, s + subsync.SPAN), t) for s, e, t in c] for p, c in got.items()}
+    return {p: (Cut if isinstance(c, Cut) else list)((s, min(e, s + subsync.SPAN), t) for s, e, t in c) for p, c in got.items()}
 
 
 def spu_stop(spu):
@@ -465,7 +511,7 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False, streams=Non
         first = plan[0][0] if plan else subsync.windows(cues, dur, stop, lid_kept(path, idx))
         more = None if plan else subsync.windows(cues, dur, stop, secs=subsync.THIRD, taken=first) if first else None
         why = listen(first, more=more) if first else "a part of the file holds no cue"
-        check = lambda: {k: subsync.check(heard, items[k][2], lang, dur) for k in keys}
+        check = lambda: {k: subsync.check(before_cut(heard, items[k][2]), items[k][2], lang, dur) for k in keys}   # see Cut
         res = {} if why else check()
         before, done = res, set()   # the verdicts of the first hearing, and the later hearings and windows made
         for p in (plan or [])[1:] if not why else ():
@@ -540,7 +586,7 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False, streams=Non
                 listen(ws, more=alt, tag="line")
             for k in small:
                 t = res[k]["timing"]
-                if missed or not subsync.on_line(heard, items[k][2], lang, t["fix"], list(zip(ws, alt))):
+                if missed or not subsync.on_line(before_cut(heard, items[k][2]), items[k][2], lang, t["fix"], list(zip(ws, alt))):
                     res[k] = dict(res[k], timing={"fix": None, "unconfirmed": t["fix"], "line": ws, "why": (
                         f'{t["why"]}, but {"the windows at a third and two thirds of the file do not sit on its line" if not missed else missed}, so '
                         + ("the deep analysis judges it" if deep else "the times stay"))})
@@ -642,15 +688,18 @@ def ref_sidecars(path, d):
     return {s["name"]: s for s in proof.sidecar_subs(path) if s["name"] not in words and proof.SIDECAR_FLAGS["forced"] not in s["flags"]}
 
 
-def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop=None, report=True):
+def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop=None, report=True, blocks=None):
     """({subtitle position or sidecar name: subsync.reference() result, with its codec, language and role},
     {reference: "fixed", "in time" or "clean sweep"}) of the reference timing (docs/design.md, "Subtitle match"). It
     takes the subtitles the word check does not read: a text or picture track in a SUB_ROLES role that sub_targets()
     leaves out, and the sidecars others of ref_sidecars(). A reference is a track or sidecar of sync, the word check,
     with a match whose times are in time or fixed. A match with too few anchors for a fix is one too when its rows of
-    sweeps are clean, see subsync.clean(). Its cues come from items, sub_items(), and move into audio time first:
+    sweeps are clean, see subsync.clean(). A track whose read was cut short is none, see Cut: its fit would rest on
+    its first part alone. Its cues come from items, sub_items(), and move into audio time first:
     by its fix, or by its measured offset when it has none, the timing's for an in-time match, sweep_offset() for a
-    clean sweep.
+    clean sweep. blocks {key: subsync.blocks() blocks} are the blocks dense hearing found, and a cue of the reference in
+    one moves by its shift too, as remux.time_plan() moves it. A block left in place sits off the rest, so the slices of
+    a right track would disagree and its fix would stay out.
 
     full reads a track the Cues do not index from the whole file, see full_read(). Once stop() is true, the time
     limit less SUB_RESERVE in an import, no track is read or fit, and each one left is "deferred" to the deep
@@ -661,11 +710,12 @@ def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop
         t = r.get("timing") or {}
         basis[k] = "fixed" if t.get("fix") else "in time" if t.get("why") == "in time" else \
             "clean sweep" if ("few" in t or t.get("swept")) and subsync.clean((sweeps or {}).get(k) or [], dur) else None
-        if r["verdict"] == "match" and basis[k] and k in items:
+        if r["verdict"] == "match" and basis[k] and k in items and not isinstance(items[k][2], Cut):
             # The reference in audio time: moved by its fix, else by its own measured offset, which may reach MIN_SHIFT
             # while it is in time. So the target is judged, and moved, against the audio.
             f = t.get("fix") or {"rate": "1/1", "offset": (t.get("offset") or 0.0) if basis[k] == "in time" else sweep_offset((sweeps or {}).get(k))}
-            refs[k] = [(subsync.moved(a * 1000, f) / 1000, subsync.moved(b * 1000, f) / 1000, x) for a, b, x in items[k][2]]
+            late = lambda a: subsync.shift_of(blk, a) if (blk := subsync.mover((blocks or {}).get(k), a)) else 0.0   # a block's cues move by its shift
+            refs[k] = [(subsync.moved(a * 1000, f) / 1000 - late(a), subsync.moved(b * 1000, f) / 1000 - late(a), x) for a, b, x in items[k][2]]
     if not (refs or report):
         return {}, {}
     codecs, targets = sub_codecs(j), sub_targets(j, d)
@@ -685,6 +735,64 @@ def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop
         r = later if refs and late() else subsync.reference([(a / 1000, b / 1000) for a, b, _ in s["cues"]], refs, dur)
         out[n] = dict(r, codec="srt", lang=side_code(s), role=role)
     return out, {k: basis[k] for k in refs}
+
+
+def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
+    """({subtitle position or sidecar name: its sub_reference() result with "layout": subsync.layout()}, the facts of
+    the speech read) of the speech layout check (docs/design.md, "Incorrect subtitle identification"). It takes a text
+    track in a SUB_ROLES role and a sidecar of ref_sidecars() whose language no main audio track speaks, when the
+    reference timing found no fit for it. A layout mismatch alerts and keeps the verdict, so nothing moves. With
+    subsync.LAYOUT_ACTION "remove" it makes the verdict a mismatch, so the track leaves the file and the sidecar moves
+    aside as after the word check. The decision log holds the lift of every judged track under "layout". A fit gets its
+    times from subsync.layout_fix(), so a track off by one shift gets a fix, and a track at different offsets in
+    different parts gets none and alerts. A fix stands only when the speech onsets confirm it, see
+    subsync.layout_onsets(). The onsets are read once for the file, in the parts of subsync.onset_parts(), and only when
+    some track has a fix. With subsync.LAYOUT_FIX "alert" a fix then only alerts: "would" holds it, and "unfixed" its
+    offset. The spans of speech come from one read of the whole audio track that plays, see lid.speech(). A
+    track whose read was cut short is judged up to its last cue read, as a file that ends there, see Cut. With stop()
+    true before a read, nothing more is read, and the deep analysis checks the file later. With deep, the deep analysis,
+    the speech read stops between two of its chunks when an import job waits, and Yielded rises."""
+    audio, codecs = sub_audio(d["tracks"], d["edits"]), sub_codecs(j)
+    apart = lambda lang: lang not in decide.UNTAGGED and decide.lang_key(lang) not in audio   # no main audio track speaks it
+    open_ = lambda k: (timed_by.get(k) or {}).get("verdict", "unknown") in ("unknown", "weak")   # no reference fits it
+    tracks = {t["pos"]: t for t in d["tracks"] if t["kind"] == "s" and t["role"] in config.SUB_ROLES and codecs.get(t["pos"]) in config.SUB_CODECS
+              and apart(t["lang"]) and open_(t["pos"])}
+    sides = {n: s for n, s in others.items() if apart(side_code(s)) and open_(n)}
+    play = decide.default_audio(d["tracks"], d["edits"])
+    if not audio or not (tracks or sides) or decide.duration(j) < subsync.LAYOUT_MIN or (stop and stop()):   # no verdict could come
+        return {}, {}
+    idx = [t for t in d["tracks"] if t["kind"] == "a"].index(play)
+    got = checks.lid_speech(path, idx, j, config.SPEECH_TIMEOUT, (None, store.path()) if deep else None)
+    if got.get("yielded"):
+        raise Yielded("an import waits, during the speech read")
+    facts = {"audio": idx, **{k: got[k] for k in ("cached", "took", "cpu") if k in got}}
+    if not isinstance(got.get("spans"), list):
+        return {}, dict(facts, why=config.mask(str(got.get("why") or "no spans"))[:200])
+    cues = subtitle_cues(path, j, set(tracks), full=True) if tracks else {}
+    todo = {p: (cues.get(p) or [], t["lang"], codecs[p], t["role"]) for p, t in tracks.items()}
+    todo.update({n: ([(a / 1000, b / 1000, x) for a, b, x in s["cues"]], side_code(s), "srt",
+                      "sdh" if {proof.SIDECAR_FLAGS["hi"], proof.SIDECAR_FLAGS["sdh"]} & set(s["flags"]) else "full") for n, s in sides.items()})
+    out, heard, dur = {}, None, decide.duration(j)
+    for k, (cs, lang, codec, role) in todo.items():
+        end = cut_end(cs)   # no speech past a cut read counts, see Cut
+        spans = got["spans"] if end is None else [(a, min(b, end)) for a, b in got["spans"] if a < end]
+        upto = dur if end is None else min(dur, end)
+        lay = subsync.layout(cs, spans, upto)
+        timing = subsync.layout_fix(cs, spans, upto, lay)
+        if (timing or {}).get("fix"):   # the second clock, read once for the file
+            if heard is None and not (stop and stop()):
+                facts["onsets"] = {"cpu": 0.0, "took": 0.0}
+                heard = onsets(path, j, idx, subsync.onset_parts(dur), facts["onsets"])
+            timing = subsync.layout_onsets(cs, timing, heard, subsync.onset_parts(dur), dur) if heard is not None else \
+                {"fix": None, "why": f'{timing["why"]}, but the run had no time left to read the speech onsets, so the times stay'}
+        if (timing or {}).get("fix") and subsync.LAYOUT_FIX != "write":   # the fix it would make alerts, see LAYOUT_FIX
+            timing = dict(timing, fix=None, unfixed=timing["fix"]["offset"], would=timing["fix"],
+                          why=f'{timing["why"]}, but a fix from the speech layout only alerts for now, so the times stay')
+        r = timed_by.get(k) or {"verdict": "unknown", "why": "no track or sidecar of the file matched the audio in its words", "timing": None}
+        drop = lay["verdict"] == "mismatch" and subsync.LAYOUT_ACTION == "remove"
+        out[k] = dict(r, codec=codec, lang=lang, role=role, layout=lay, **({"verdict": "mismatch", "why": lay["why"]} if drop else {}),
+                      **({"timing": timing} if timing else {}))
+    return out, facts
 
 
 def swept_before(rec, ex):
@@ -731,14 +839,17 @@ def sub_sweep(path, j, items, sync, deep=False):
     analysis over the tracks and sidecars of the word check, items of sub_items() (docs/design.md, "Subtitle match"). Each
     minute of the file gets one window of subsync.WINDOW seconds at its densest cues, which sweep_hear() hears. deep
     is the deep analysis, which yields to an import job in the queue. The rows change no time, and sub_dense() hears the
-    parts where they sit off. facts holds the CPU and wall seconds and why a hearing heard nothing."""
+    parts where they sit off. facts holds the CPU and wall seconds and why a hearing heard nothing. A track whose read
+    was cut short gets no row past its last cue, see Cut, and facts holds that cue's end in "cut"."""
     dur, out, facts = decide.duration(j), {}, {"cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
     for idx, (lang, cues) in sub_groups(items).items():
         stop = decide.STOPWORDS.get(lang, frozenset())
-        starts = [w for m in range(int(dur // 60) + 1) for w in subsync.windows(cues, dur, stop, parts=((m * 60 / dur, min(1.0, (m + 1) * 60 / dur)),))]
+        ts = subsync.word_times(cues, stop)
+        starts = [w for m in range(int(dur // 60) + 1) for w in subsync.windows(cues, dur, stop, parts=((m * 60 / dur, min(1.0, (m + 1) * 60 / dur)),), ts=ts)]
         heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "sweep")
-        out.update({k: subsync.sweep(heard, x[2], lang, sync.get(k, {}).get("timing")) for k, x in items.items() if x[1] == idx})
-    return out, facts
+        out.update({k: subsync.sweep(before_cut(heard, x[2]), x[2], lang, sync.get(k, {}).get("timing")) for k, x in items.items() if x[1] == idx})
+    cut = {k: round(e, 1) for k, x in items.items() if (e := cut_end(x[2])) is not None}
+    return out, dict(facts, cut=cut) if cut else facts
 
 
 def sweep_hear(path, idx, j, lang, starts, facts, deep, what):
@@ -779,24 +890,41 @@ def sub_dense(path, j, items, sweeps, sync, deep=False):
     A part whose edge the hearing did not see asks for a stretch past it, see subsync.further(). Those stretches come
     from what BLOCK_HEAR leaves after the first hearing. A second hearing hears them all once, their onsets join the
     others, and blocks() runs again for each track that asked, with its parts and its stretches. In the deep analysis an
-    import that waits goes first, before the second hearing."""
+    import that waits goes first, before the second hearing.
+
+    A track whose read was cut short gets no parts and no live moves, see Cut. A track whose sweep looks
+    live-captioned, see subsync.live(), gets no parts. Dense hearing hears the whole audio track instead, past the cap,
+    and subsync.live_moves() moves each of its cues to its own speech. For the choice of windows its cues move by its
+    fix, then by the median "off" of its sweep rows against the fitted line, so the windows lie where the speech is.
+    The other tracks of that audio track keep their parts and their blocks. A hearing that stopped part way leaves the
+    cues past it where they are, and the track's "live" facts then say "fixed": False and hold the reasons in
+    "failed"."""
     dur, out, facts = decide.duration(j), {}, {"windows": 0, "cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
     fix = lambda k: ((sync.get(k) or {}).get("timing") or {}).get("fix")
     audio = lambda t, f: subsync.moved(t * 1000, f) / 1000 if f else t
     for idx, (lang, _) in sub_groups(items).items():
-        keys = [k for k, x in items.items() if x[1] == idx]
-        parts = {k: subsync.suspects(sweeps.get(k) or [], dur) for k in keys}
-        if not any(parts.values()):
+        keys = [k for k, x in items.items() if x[1] == idx and not isinstance(x[2], Cut)]   # see Cut
+        lives = {k: x for k in keys if (x := subsync.live(sweeps.get(k) or []))}
+        parts = {k: subsync.suspects(sweeps.get(k) or [], dur) for k in keys if k not in lives}
+        if not lives and not any(parts.values()):
             continue
-        union, parts = heard_parts(parts, {k: sweeps.get(k) or [] for k in keys})
-        cues, stop = sorted((audio(a, fix(k)), audio(b, fix(k)), x) for k in keys for a, b, x in items[k][2]), decide.STOPWORDS.get(lang, frozenset())
+        union, parts = heard_parts(parts, {k: sweeps.get(k) or [] for k in parts})
+        spots = union   # the parts of the other tracks, which alone read speech onsets
+        union = [(0.0, dur)] if lives else union   # a live-captioned track is heard whole
+        late = lambda k: lives[k]["off"] if k in lives else 0.0
+        cues, stop = sorted((audio(a, fix(k)) - late(k), audio(b, fix(k)) - late(k), x) for k in keys for a, b, x in items[k][2]), decide.STOPWORDS.get(lang, frozenset())
         timing = lambda k: (sync.get(k) or {}).get("timing")
         starts = subsync.dense(cues, union, dur, stop)
         facts["windows"] += len(starts)
+        failed = len(facts["failed"])
         heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
-        times = onsets(path, j, idx, union, facts) if union else []
-        out.update({k: subsync.blocks(heard, items[k][2], lang, timing(k), ps, onsets=times, rows=sweeps.get(k) or []) for k, ps in parts.items() if ps})
-        more = subsync.further({k: out[k] for k, ps in parts.items() if ps}, union, dur)
+        times = onsets(path, j, idx, spots, facts) if spots and any(parts.values()) else []   # live_moves() reads no onsets
+        out.update({k: subsync.live_moves(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), x) for k, x in lives.items()})
+        for k in lives if len(facts["failed"]) > failed else ():   # a hearing that stopped part way leaves the track not fixed
+            out[k]["live"].update(fixed=False, failed=facts["failed"][failed:])
+        out.update({k: subsync.blocks(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), ps, onsets=times, rows=sweeps.get(k) or [])
+                    for k, ps in parts.items() if ps})
+        more = subsync.further({k: out[k] for k, ps in parts.items() if ps}, union, dur)   # none past a whole track heard
         if more:
             if deep and runner.queued():
                 raise Yielded("an import waits, before the second dense hearing")
@@ -805,12 +933,13 @@ def sub_dense(path, j, items, sweeps, sync, deep=False):
             facts["windows"] += len(starts)
             heard += sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
             times = sorted(times + onsets(path, j, idx, extra, facts))
-            out.update({k: subsync.blocks(heard, items[k][2], lang, timing(k), [tuple(x) for x in subsync.merged(parts[k] + xs)], onsets=times,
+            out.update({k: subsync.blocks(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), [tuple(x) for x in subsync.merged(parts[k] + xs)], onsets=times,
                                           rows=sweeps.get(k) or []) for k, xs in more.items()})
     return out, facts
 
 
 ONSET_TIMEOUT = 300   # seconds the onset read of one part may take at nice 19
+ONSETS = {}   # (path, size, mtime_ns, audio index, lo, hi) -> the onsets of one part, so a pass that Replan runs again reads none twice
 
 
 def onsets(path, j, idx, parts, facts=None):
@@ -822,13 +951,18 @@ def onsets(path, j, idx, parts, facts=None):
     where the dialogue is, and another track as its mono mix. j is the mkvmerge -J probe, which gives the channel
     count. ffprobe names the layout of a track with 3 channels or more. Each part is one ffmpeg read at nice 19 and
     idle I/O. A silence that runs to the end of a part ends no speech there. facts gets the CPU and wall seconds, and
-    why a read failed in "onset_why". A failure gives no onsets of that part and never raises."""
+    why a read failed in "onset_why". A failure gives no onsets of that part and never raises. The onsets of each part
+    read stay in ONSETS for the file as it is, so a second pass of the job reads no part again."""
     t0, c0, out, why = time.monotonic(), resource.getrusage(resource.RUSAGE_CHILDREN), [], []
     audio = [t for t in j.get("tracks") or [] if t.get("type") == "audio"]
     try:
+        st = os.stat(path)
+        key = lambda lo, hi: (path, st.st_size, st.st_mtime_ns, idx, lo, hi)
+        out += [o for p in parts if key(*p) in ONSETS for o in ONSETS[key(*p)]]
+        parts = [p for p in parts if key(*p) not in ONSETS]
         channels = (audio[idx].get("properties") or {}).get("audio_channels") or 0
         layout = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"a:{idx}", "-show_entries", "stream=channel_layout", "-of",
-                                 "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=60).stdout.strip() if channels > 2 else ""
+                                 "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=60).stdout.strip() if channels > 2 and parts else ""
         centre = bool(layout) and "FC" in re.split(r"[+() ]", ffmpeg_layouts().get(layout, layout))
         for lo, hi in parts:
             r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-ss", f"{lo:.3f}", "-t",
@@ -838,8 +972,11 @@ def onsets(path, j, idx, parts, facts=None):
             if r.returncode:
                 why.append(f"ffmpeg exited {r.returncode} at {content.hms(lo)}: {config.mask(r.stderr.strip())[-120:]}")
                 continue
-            out += [(lo + float(x), float(d)) for x, d in re.findall(r"silence_end: (-?[\d.]+) \| silence_duration: ([\d.]+)", r.stderr)
-                    if float(x) < hi - lo - 0.05]
+            got = [(lo + float(x), float(d)) for x, d in re.findall(r"silence_end: (-?[\d.]+) \| silence_duration: ([\d.]+)", r.stderr)
+                   if float(x) < hi - lo - 0.05]
+            while len(ONSETS) >= 64:   # the parts of the files a backfill's workers read now
+                ONSETS.pop(next(iter(ONSETS)))
+            ONSETS[key(lo, hi)], out = got, out + got
     except (OSError, IndexError, ValueError, subprocess.SubprocessError) as ex:
         why.append(config.mask(f"the onset read failed: {type(ex).__name__}: {ex}")[:200])
     if facts is not None:
@@ -898,23 +1035,42 @@ def side_stats(path):
     return out
 
 
+SUB_CHECK = 2   # the version of the subtitle check a cached verdict holds. 2 added the garbled and speech layout
+                # checks, see sub_cached().
+
+
 def sub_cache(path, verdicts, pending):
-    """Cache the subtitle check's verdicts for path as it is now, with its sidecars, see lid.verdict_put()."""
+    """Cache the subtitle check's verdicts for path as it is now, with its sidecars and SUB_CHECK, see lid.verdict_put()."""
     with contextlib.suppress(ImportError):
         from . import lid
-        lid.verdict_put(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, {"verdicts": verdicts, "sidecars": side_stats(path)}, pending)
+        lid.verdict_put(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, {"verdicts": verdicts, "sidecars": side_stats(path),
+                                                                                "version": SUB_CHECK}, pending)
 
 
 def sub_cached(path):
     """The subtitle check of path as it is now is cached and asks for nothing more, so a backfill with --sub-check
     skips the file. A dry run's verdict that asks for an action does not count, so an apply after it still acts. A
-    sidecar that came, went or changed since counts as a change, so a new download from a program such as Bazarr is checked."""
+    sidecar that came, went or changed since counts as a change, so a new download from a program such as Bazarr is checked.
+    A verdict of another SUB_CHECK version does not count, so a new check runs once on every file."""
     try:
         from . import lid
     except ImportError:
         return False
     got = lid.verdict_get(os.path.join(config.CFG.state_dir, "lid.sqlite"), path)
-    return bool(got) and not got[1] and isinstance(got[0], dict) and got[0].get("sidecars") == side_stats(path)
+    return bool(got) and not got[1] and isinstance(got[0], dict) and got[0].get("version") == SUB_CHECK and got[0].get("sidecars") == side_stats(path)
+
+
+def raw_srt(raw):
+    """(BOM, codec, text) of the bytes raw of a SubRip sidecar, so a rewrite of its time lines keeps every other byte
+    as it was. A file with a UTF-16 BOM decodes as UTF-16 in its byte order. Every other file decodes as latin-1, which
+    reads each byte as one character and writes it back the same. The time lines are ASCII, so the charset of the text
+    never matters, and a charset the detection misses keeps its text. Raises OSError when UTF-16 text does not decode."""
+    for bom, code in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"), (b"\xef\xbb\xbf", "latin-1"), (b"", "latin-1")):
+        if raw.startswith(bom):
+            try:
+                return bom, code, raw[len(bom):].decode(code, "surrogatepass")
+            except UnicodeDecodeError as ex:
+                raise OSError(f"its text does not decode as {code}: {ex.reason}") from None
 
 
 def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
@@ -923,7 +1079,8 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. A sidecar with
     blocks, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
     holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
-    KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
+    KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. A rewrite changes only the time lines and keeps every other byte,
+    see raw_srt(). Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
     "moved", "retimed", "left" or "dry run", kept or left}."""
     out, ends, timed = [], ends or {}, timed or {}
     for n, s in sorted(sides.items()):
@@ -946,15 +1103,15 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
             if why: raise OSError(why)
             if not move:   # a new file over the name, so the kept hard link holds the old text
                 with open(s["path"], "rb") as f:
-                    text = f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace")
+                    bom, code, text = raw_srt(f.read())
                 try:
-                    text = remux.set_ends(text.replace("\r\n", "\n"), False, times or plan) if times or plan else text
+                    text = remux.set_ends(text, False, times or plan) if times or plan else text
                 except RuntimeError as ex:
                     raise OSError(f"its new {'times' if times else 'ends'} do not fit its text: {ex}") from None
                 text = remux.srt_moved(text, fix) if fix and not times else text
                 remux.new_tmp(tmp)
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(text)
+                with open(tmp, "wb") as f:
+                    f.write(bom + text.encode(code, "surrogatepass"))
                 with contextlib.suppress(PermissionError):   # a NAS share may refuse chown. The mode stays.
                     os.chown(tmp, st.st_uid, st.st_gid)
                 os.chmod(tmp, st.st_mode & 0o7777)
@@ -977,41 +1134,118 @@ def flash_why(plan):
             f"{len(plan)} cues get new ends")
 
 
+def garbled_tracks(path, j, sides, full=False):
+    """{subtitle position: decide.garbled() verdict} of the SubRip tracks of the Matroska file path whose text is
+    garbled (docs/design.md, "Garbled subtitle repair"). A repair reads the track back, see remux.repaired(). A
+    sidecar of sides, the sidecar_subs() entries, may fill the cues the old muxer cut. It must be in the track's
+    language, name and text alike. It must hold the track's cues at their times. Every other cue must equal the
+    read-back. The verdict then names it in "sidecar", counts the cues it fills in "filled" and holds its cues in
+    "side". "tag" is the track's language tag. The repair stops when more than decide.REPAIR_CUT of the cues stay cut,
+    or when the new text fails decide.repair_fault(). With full, a track the Cues do not index comes from full_read(). A
+    track the read cannot take gets no verdict. A track whose read was cut short, see Cut, is never repaired, and its
+    verdict holds "capped", because the cues past the cut were never judged."""
+    tags = {f"s{n}": ((t.get("properties") or {}).get("language") or "und")
+            for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
+    want = {p for p, c in sub_codecs(j).items() if c == "S_TEXT/UTF8"}
+    out = {}
+    for p, cues in sorted(subtitle_cues(path, j, want, full).items(), key=lambda x: int(x[0][1:])) if want else ():
+        texts = [t for _, _, t in cues]
+        g = decide.garbled(texts, tags[p])
+        if not g:
+            continue
+        if isinstance(cues, Cut):
+            g = dict(g, capped=True, **({"repair": False, "why": f'{g["why"]}, but only its first {len(cues)} cues were read'} if g["repair"] else {}))
+        if g["repair"]:
+            got, side = remux.repaired(texts, g["codepage"], tags[p]), None
+            for s in sides:
+                if not decide.lang_key(side_code(s)) == decide.lang_key(tags[p]) == decide.lang_key(s["read"][0]):
+                    continue
+                blocks = remux.side_blocks(s)
+                if len(blocks) != len(cues) or any(abs(a / 1000 - c[0]) > 0.002 or abs(b / 1000 - c[1]) > 0.002 for (a, b, _), c in zip(blocks, cues)):
+                    continue
+                fit = remux.repaired(texts, g["codepage"], tags[p], [t for _, _, t in blocks])
+                if fit and fit[1]:   # it fills a cut cue
+                    got, side = fit, (s, blocks)
+                    break
+            new, filled, left = got
+            why = (f"{left} of {len(cues)} cues were cut short" if left > decide.REPAIR_CUT * len(cues) else None) or decide.repair_fault(new, tags[p])
+            if why:
+                g = dict(g, repair=False, why=f'{g["why"]}, but {why}')
+            elif side:
+                g = dict(g, sidecar=side[0]["name"], filled=len(filled), side=[list(b) for b in side[1]])
+        out[p] = dict(g, tag=tags[p])
+    return out
+
+
 def sub_findings(rec, sync, unmatched):
     """The findings of the subtitle match check, each a list of sentence codes and facts, see report.SUB_LINES: one
-    submatch finding for the tracks and sidecars that do not match the audio, and one subtiming finding for the tracks
-    whose times are off and stay. unmatched holds the tracks, by their place before any remux, that stayed in the file
-    and lost their flags instead. A dry run also records what --apply would do with the file, see remux_block()."""
+    submatch finding for the tracks and sidecars that do not match the audio and the tracks whose text is garbled, and
+    one subtiming finding for the tracks whose times are off and stay. unmatched holds the tracks, by their place
+    before any remux, that stayed in the file and lost their flags instead. A line of a subtitle that the speech layout
+    check found off, or whose times it could not fix, says layout. Such a subtitle whose verdict stays, see
+    subsync.LAYOUT_ACTION, gets a layout line. A dry run also records what --apply would do with the file, see
+    remux_block()."""
     rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
     plan = {} if rec.get("apply", True) else remux_block(rec)
     flags_off, by = sub_fixes(rec.get("source")), "hook" if rec.get("source") in ("hook", "deep_analysis") else "run"
+    laid = lambda k: {"layout": True} if ((sync.get(k) or {}).get("layout") or {}).get("verdict") == "mismatch" else {}   # see sub_layout()
     for p in rm.get("removed") or []:
-        wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept")})
+        wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept"), **laid(p)})
     for p in unmatched:
         gone = p in (rm.get("remove") or []) and not rm.get("removed")   # the remux was to remove it
         wrong.append({"code": "stays", "track": p, "why": sync[p]["why"], "gone": gone, "result": rm["result"] if gone else None,
-                      "kept_back": rm.get("kept_back"), "flags_off": flags_off, **plan})
+                      "kept_back": rm.get("kept_back"), "flags_off": flags_off, **plan, **laid(p)})
     for e in rec.get("sidecars") or []:
         if e["action"] == "move":
-            wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left")})
+            wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left"), **laid(e["name"])})
         elif e["result"] == "left":
             late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]})
+    wrong += [{"code": "layout", "track": k} for k, r in sorted(sync.items()) if laid(k) and r["verdict"] != "mismatch"]   # see subsync.LAYOUT_ACTION
+    # The tracks whose text is garbled, by their place before any remux. A track that cannot be repaired is taken out
+    # with its bytes kept beside the video, or stays when a setting keeps it or its read was cut, see subtitle_checks().
+    garbled, mine, out = rec.get("garbled") or {}, rm.get("recoded") or [], rm.get("stripped") or {}
+    wrong += [{"code": "repaired", "tracks": mine, "kept": rm.get("kept")}] if mine and rm.get("done") else []
+    wrong += [{"code": "stripped", "track": p, "name": n, "kept": rm.get("kept")} for p, n in sorted(out.items()) if rm.get("done")]
+    rest = sorted(p for p, g in garbled.items() if not g["repair"] and p not in out)
+    kept_back = "check" if not flags_off else "keep_days" if not config.CFG.keep_days else None
+    for ps, repair, more in ((mine, True, {"result": rm.get("result"), **plan}),
+                             (sorted(p for p, g in garbled.items() if g["repair"] and p not in mine and p not in (rm.get("remove") or [])), True, {}),
+                             (sorted(out), False, {"result": rm.get("result"), "names": [out[p] for p in sorted(out)], **plan}),
+                             ([p for p in rest if not garbled[p].get("capped")], False, {"kept_back": kept_back} if kept_back else {}),
+                             ([p for p in rest if garbled[p].get("capped")], False, {})):
+        if ps and not ("result" in more and rm.get("done")):   # one sentence for the tracks that share their outcome
+            wrong.append({"code": "garbled", "tracks": sorted(ps, key=lambda p: int(p[1:])), "repair": repair, "flags_off": flags_off, **more})
     for e in rp.get("sidecars_unmatched", []):
         wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left")})
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
         wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept")})
+    # A live-captioned track gets one sentence in place of the sentences of its times and its sweep, and only when its
+    # lines stay out of sync: a setting kept them, or too many could not be timed, see subsync.live_moves(). When an
+    # apply's remux did not run, the not_retimed sentence alone says so. A dry run's live sentence says what --apply
+    # would do in place of the not_retimed sentence.
+    live = {k: b["live"] for k, b in (rec.get("blocks") or {}).items() if b.get("live")}
+    redo = set() if rm.get("done") else {*(rm.get("fixed") or []), *(rm.get("ended") or []), *(rm.get("timed") or [])}
+    said = set()
+    for k, f in sorted(live.items()):
+        if not (flags_off and f["fixed"]) and not (k in redo and rec.get("apply", True)):
+            said.add(k)
+            late.append({"code": "live", "track": k, "lag": (f.get("scan") or {}).get("lag") or (f["lags"] or [0.0])[1], "moved": f["moved"],
+                         "cues": f["cues"], "left": f["left"], "flags_off": flags_off, **({"block": plan.get("block")} if k in redo else {})})
     for p, r in sorted(sync.items()):
         t = r.get("timing") or {}
+        if p in live:
+            continue
         if (t.get("piecewise") and round(max(t["offsets"]) - min(t["offsets"]), 2) >= config.STEP_ALERT) or "unfixed" in t:
-            late.append({"code": "off", "track": p, "ref": r.get("reference"), "why": t["why"], "offsets": t.get("offsets"), "unfixed": t.get("unfixed")})
-    if (rm.get("fixed") or rm.get("ended") or rm.get("timed")) and not rm.get("done"):
-        late.append({"code": "not_retimed", "tracks": sorted({*(rm.get("fixed") or []), *(rm.get("ended") or []), *(rm.get("timed") or [])}), "result": rm.get("result"),
-                     "block": plan.get("block")})
+            laid_out = (r.get("layout") or {}).get("verdict") == "fit"   # the speech layout timed it, see sub_layout()
+            late.append({"code": "off", "track": p, "ref": None if laid_out else r.get("reference"), "why": t["why"], "offsets": t.get("offsets"),
+                         "unfixed": t.get("unfixed"), **({"layout": True} if laid_out else {}), **({"would": t["would"]} if t.get("would") else {})})
+    if redo - said:
+        late.append({"code": "not_retimed", "tracks": sorted(redo - said), "result": rm.get("result"), "block": plan.get("block")})
     if not flags_off:
         late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"]} for p, r in sorted(sync.items())
                  if (r.get("timing") or {}).get("fix")]
         late += [{"code": "check_flash", "track": p, "median": f["median"]} for p, f in sorted((rec.get("flash") or {}).items())]
-    far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) for w in rows if id(w) in cli.sweep_alerts(rows)]
+    far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) if k not in live for w in rows if id(w) in cli.sweep_alerts(rows)]
     if far:
         late.append({"code": "sweep", "far": far})
     return ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])

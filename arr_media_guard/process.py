@@ -365,8 +365,9 @@ def subtitle_checks(ctx):
             sync = subtitles.sub_match(path, j, d, {r["audio"]: r["starts"] for r in before.values() if r.get("starts")} or None, sides, ctx.known,
                                        items, full, line=not timing, deep=ctx.mode == "import" and config.CFG.subtitles == "deep",
                                        streams=(ctx.hp or {}).get("streams"))
-            if timing and sync:
-                rec["sweep"], rec["sweep_facts"] = subtitles.sub_sweep(path, j, items, sync, deep=ctx.mode == "deep")
+            if timing and sync:   # a track that does not match leaves the file or alerts as such, so the sweep hears none for it
+                rec["sweep"], rec["sweep_facts"] = subtitles.sub_sweep(path, j, {k: x for k, x in items.items() if (sync.get(k) or {}).get("verdict") != "mismatch"},
+                                                                       sync, deep=ctx.mode == "deep")
                 for k, r in sync.items():   # a fix stands only when the sweep confirms it
                     t, rows = r.get("timing") or {}, rec["sweep"].get(k) or []
                     if t.get("fix") and (why := subtitles.sweep_confirms(rows)):
@@ -389,28 +390,65 @@ def subtitle_checks(ctx):
     stop = runner.deep_waits if ctx.mode == "deep" else (lambda: time.monotonic() > deadline) if deadline is not None else None
     if mkv and subs_on:   # the reference timing
         others = subtitles.ref_sidecars(path, d)
-        timed_by, refs = subtitles.sub_reference(path, j, d, sync, items or {}, others, rec.get("sweep"), full, stop, report=timing)
+        timed_by, refs = subtitles.sub_reference(path, j, d, sync, items or {}, others, rec.get("sweep"), full, stop, report=timing,
+                                                 blocks={k: b["blocks"] for k, b in (rec.get("blocks") or {}).items()})
+        if full and checks.lid_ready():   # the speech layout of the subtitles no word check reads and no reference fits
+            if ctx.shared:   # the read of the whole audio track takes minutes for a film, so it runs without the file lock
+                fcntl.flock(ctx.lock, fcntl.LOCK_UN)
+            laid, rec_speech = subtitles.sub_layout(path, j, d, timed_by, others, stop, deep=ctx.mode == "deep")
+            if ctx.shared:
+                ctx.shared.reshare(ctx.st)
+            timed_by.update(laid)
+            if rec_speech:
+                rec["speech"] = rec_speech
         if timed_by:
             rec["subtime"], rec["references"] = timed_by, refs
+    # A SubRip track whose text is garbled, docs/design.md, "Garbled subtitle repair". Only a run that reads whole files
+    # checks it, so a track the Cues do not index is read too. The word check read its garbled text, so a mismatch waits
+    # for readable text, see later below. A cut read waits too, but it is never repaired, so it only alerts.
+    all_sides = proof.sidecar_subs(path) if mkv and full else []
+    garbled = subtitles.garbled_tracks(path, j, all_sides, full) if mkv and full else {}
+    if garbled:
+        rec["garbled"] = {p: {k: v for k, v in g.items() if k != "side"} for p, g in garbled.items()}
+    waits = {p for p, g in garbled.items() if (sync.get(p) or {}).get("verdict") == "mismatch"}
+    for p in waits:
+        sync[p] = dict(sync[p], verdict="unknown", why=f'{sync[p]["why"]}, but its text is garbled, so a later run judges it', held=True)
     if sync or timed_by:
         tracks = {p: r for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others}
         unmatched = {p for p, r in tracks.items() if r["verdict"] == "mismatch"}
         fixes = {p: r["timing"]["fix"] for p, r in tracks.items() if (r.get("timing") or {}).get("fix")} if subtitles.sub_fixes(ctx.source) else {}
         unmatched = unmatched if subtitles.sub_fixes(ctx.source) else set()   # SUBTITLES check turns no flag off. The alerts read sync.
     blocks = {k: b["blocks"] for k, b in (rec.get("blocks") or {}).items() if b["blocks"]} if subtitles.sub_fixes(ctx.source) else {}
-    remove = sorted(unmatched) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
+    # A garbled track that cannot be repaired leaves the file as a removal does, and its bytes go beside the video, see
+    # remux.resub(). A cut read never does, because the bytes past the cut were never read.
+    strip = {p: g["tag"] for p, g in garbled.items() if not g["repair"] and not g.get("capped")} \
+        if subtitles.sub_fixes(ctx.source) and config.CFG.keep_days else {}
+    remove = sorted(unmatched - set(strip)) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
+    # A repair takes the track's place in the remux and keeps its times, so the track gets no other change in this run.
+    # Its default flag goes when the decision turns it off, in a run whose flag edit acts on the decision, see act().
+    keep = ctx.mode == "deep" or not ctx.app   # the runs that keep the flags, as act() does
+    off, sel = {e[0] for e in d["edits"] if len(e) == 3 and e[1] == 0} if not keep else set(), {t["pos"]: t["sel"] for t in d["tracks"]}
+    recode = {p: dict(codepage=g["codepage"], lang=g["tag"], default_off=sel.get(p) in off,
+                      **({"sidecar": next(s for s in all_sides if s["name"] == g["sidecar"]), "side": g["side"], "filled": g["filled"]} if g.get("sidecar") else {}))
+              for p, g in garbled.items() if g["repair"] and p not in remove} if subtitles.sub_fixes(ctx.source) else {}
+    later = {p for p in recode if p in fixes or p in blocks or p in waits}   # judged again after the repair, see after_edit()
+    fixes = {p: f for p, f in fixes.items() if p not in recode and p not in strip}
     flashy = subtitles.flash_check(path, j, proof.sidecar_subs(path), full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
     codecs = subtitles.sub_codecs(j)
     vtt = {p for p, c in codecs.items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
     if flashy:
         rec["flash"] = {k: {"cues": len(v), "median": round(statistics.median(o - a for a, _, o, _ in v), 3), "lengthened": sum(n != o for _, _, o, n in v),
                             "first": [[a, o, n] for a, _, o, n in v[:3]], **({"report_only": "WebVTT"} if k in vtt else {})} for k, v in flashy.items()}
-    ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt} if subtitles.sub_fixes(ctx.source) else {}
+    later |= set(recode) & set(flashy)
+    for p in later:
+        rec["garbled"][p]["later"] = True
+    ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt and p not in recode
+            and p not in strip} if subtitles.sub_fixes(ctx.source) else {}
     # The new times of each cue of a track or sidecar with blocks, with its fix and its flash ends, in one plan that
     # resub() or sidecar_fix() writes. The plan takes the cues in the order of the file's text. A WebVTT track is never
     # rewritten, so its blocks only report.
     plan = lambda k, cues, fix, ass: remux.time_plan(cues, fix, blocks[k], [x[3] for x in flashy[k]] if k in flashy else None, ass)
-    moves = {p: x for p in blocks if p not in sides and codecs.get(p) in config.TEXT_CODECS
+    moves = {p: x for p in blocks if p not in sides and p not in recode and p not in strip and codecs.get(p) in config.TEXT_CODECS
              and (x := plan(p, items[p][2], fixes.get(p), codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")))}
     side_moves = {n: x for n in blocks if n in sides and (x := plan(n, subtitles.side_cues(sides[n]), (sync[n].get("timing") or {}).get("fix"), False))}
     for k in {**moves, **side_moves}:   # the rows of a block that moves to its speech sit on the line then, so they never alert
@@ -418,7 +456,7 @@ def subtitle_checks(ctx):
     st = ctx.st
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
-    if fixes or remove or ends or moves:
+    if fixes or remove or ends or moves or recode or strip:
         if ctx.mode == "deep":   # a remux of a film takes minutes, so an import that waits goes first
             runner.deep_waits()
         if ctx.shared and ctx.apply:
@@ -426,14 +464,18 @@ def subtitle_checks(ctx):
         ids_of = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
         by_id = lambda ps: [ids_of[int(p[1:]) - 1] for p in ps]
         code, result, info = remux.resub(path, j, st, ctx.apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove), dict(zip(by_id(ends), ends.values())),
-                                         **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}))
+                                         **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}),
+                                         **({"recode": dict(zip(by_id(recode), recode.values()))} if recode else {}),
+                                         **({"strip": dict(zip(by_id(strip), strip.values()))} if strip else {}))
         if "warnings" in info:
             ctx.rearm()   # resub() ran its remux with the time limit off, whatever came of it
         done = code == "subtitles_remuxed"
         rec["subremux"] = dict(info, result=result, done=done, fixed=sorted(fixes), ended=sorted(ends), remove=remove, removed=remove if done else [],
                                codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_blocks_retimed", moves), ("subtitle_ends_lengthened", ends),
-                                                     ("subtitle_mismatch_removed", remove)) if x] if done else [code],
-                               **({"timed": sorted(moves)} if moves else {}))
+                                                     ("subtitle_mismatch_removed", remove), ("subtitle_repaired", recode), ("subtitle_garbled_removed", strip))
+                                                    if x] if done else [code],
+                               **({"timed": sorted(moves)} if moves else {}), **({"recoded": sorted(recode)} if recode else {}),
+                               **({"stripped": {p: info["garbled_text"][str(i)] for p, i in zip(strip, by_id(strip))}} if strip else {}))
         if done:
             rec["subremux"]["tracks_before"] = logs.track_log(d["tracks"])   # the places the check named, before a removal moves the tracks up
             logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
@@ -441,11 +483,12 @@ def subtitle_checks(ctx):
             refresh(ctx, duration=False)
             if ctx.hp and ctx.hp["issue"]:   # ffmpeg wrote a new header, and a retime can end a subtitle overrun, see faults()
                 ctx.hp = checks.header_of(path, ctx.j) or ctx.hp
-            gone = set(remove)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
+            gone = set(remove) | set(strip)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
             ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
             unmatched = set(subtitles.renumber(dict.fromkeys(unmatched), gone))
             ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read)
-    stay = sorted({p for p, r in sync.items() if p not in sides and r["verdict"] == "mismatch"} - set((rec.get("subremux") or {}).get("removed") or []))
+    stay = sorted({p for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others and r["verdict"] == "mismatch"}
+                  - set((rec.get("subremux") or {}).get("removed") or []))
     if stay and not subtitles.sub_fixes(ctx.source):   # the tracks that stay, by their place before any remux, see report.KEPT_BACK
         rec.setdefault("subremux", {}).update(kept_back="check")
     elif stay and not config.CFG.keep_days:
@@ -455,7 +498,8 @@ def subtitle_checks(ctx):
         if ctx.tags:
             d = decide.with_tags(d, ctx.tags)
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
-    ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves = fixes, remove, ends, flashy, moves, side_moves
+    ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves, ctx.recode = fixes, remove, ends, flashy, moves, side_moves, recode
+    ctx.strip, ctx.later = strip, later
 
 
 def deep_drop(ctx):
@@ -580,9 +624,11 @@ def act(ctx):
 def sub_outcome(rec):
     """(outcome, result) of a run whose subtitle step changed a file and no flag, or None when it changed none. The
     outcome is subtitles_remuxed after a remux, else sidecars_changed. The result names what happened to each track and
-    sidecar, as "subtitles remuxed: s2 retimed, s1 blocks moved, Film.en.srt retimed"."""
+    sidecar, as "subtitles remuxed: s2 retimed, s1 blocks moved, s3 repaired, Film.en.srt retimed"."""
     rm = rec.get("subremux") or {}
-    did = (("fixed", "retimed"), ("timed", "blocks moved"), ("ended", "ends lengthened"), ("removed", "removed")) if rm.get("done") else ()
+    did = (("fixed", "retimed"), ("timed", "blocks moved"), ("ended", "ends lengthened"), ("removed", "removed"), ("recoded", "repaired"),
+           ("stripped", "taken out as garbled")) \
+        if rm.get("done") else ()
     what = [f"{p} {x}" for k, x in did for p in rm.get(k) or []] + \
         [f'{e["name"]} {e["result"]}' for e in rec.get("sidecars") or [] if e.get("result") in ("retimed", "moved")]
     code, head = ("subtitles_remuxed", "subtitles remuxed") if rm.get("done") else ("sidecars_changed", "sidecars changed")
@@ -608,11 +654,15 @@ def after_edit(ctx):
         rec.update(outcome=named[0], result=named[1])
     ctx.rest += subtitles.sub_findings(rec, ctx.sync_all, ctx.stay)
     if ctx.mkv and ctx.subs_on and checks.lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
-        muted, planned = {t["sel"] for t in d["tracks"] if t["pos"] in ctx.unmatched}, ctx.fixes or ctx.remove or ctx.ends or ctx.moves
+        muted = {t["sel"] for t in d["tracks"] if t["pos"] in ctx.unmatched}
+        planned = ctx.fixes or ctx.remove or ctx.ends or ctx.moves or ctx.recode or ctx.strip
         done = ctx.apply and rec["outcome"] in ("edited", "no_change", "subtitles_remuxed", "sidecars_changed") and (rec.get("subremux") or {}).get("done", not planned) \
             and all(e["result"] in ("moved", "retimed") for e in rec.get("sidecars") or [])
+        # A repaired track whose times or words this run left out stays pending, so the next run judges its readable text.
+        # So does a live-captioned track whose hearing stopped part way, see subtitles.sub_dense(): the next run times it.
+        stopped = any((b.get("live") or {}).get("failed") for b in (rec.get("blocks") or {}).values())
         subtitles.sub_cache(ctx.path, {p: r["verdict"] for p, r in ctx.sync.items()},
-                            (bool(planned or ctx.acts) or any(e[0] in muted for e in d["edits"])) and not done)
+                            (bool(planned or ctx.acts) or any(e[0] in muted for e in d["edits"])) and not done or bool(ctx.later) or stopped)
     if rec["outcome"] in ("verify_failed", "edit_failed"):
         ctx.rest.append({"kind": "edit", "error": short_error(rec["result"], rec["path"]), "unread": rec.get("after_error"),
                          "on": None if "after" not in rec else [f'{t["pos"]} {t["lang"]}' for t in rec["after"] if t["default"]]})

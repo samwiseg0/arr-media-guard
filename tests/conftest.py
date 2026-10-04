@@ -15,10 +15,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """The settings fixture, shared by the test files that load the package."""
 import dataclasses
+import os
 
 import pytest
 
-import amg
+os.environ["AMG_INVARIANTS"] = "1"   # every test checks the safety rules of a block move, see subsync.INVARIANTS
+
+import amg  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

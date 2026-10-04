@@ -290,6 +290,69 @@ SUB_LINES = [
      "The English subtitles (track 1) are about 2 min 19 s late at 4:17, 8:19, 12:05 and 15:00. They were left as they are.", None),
     ({"code": "sweep", "far": [["s1", 1366.4, 2.54], ["s1", 1381.6, 1.66], ["s3", 1366.4, 2.54], ["s3", 1381.6, 1.66]]},
      "Subtitle tracks 1 and 3 (English) are late by 2.5 s at 22:46 and 1.7 s at 23:01. They were left as they are.", None),
+    ({"code": "garbled", "tracks": ["s2"], "repair": True, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
+      "block": {"code": "remux"}, "hardlinked": False},
+     "The Spanish subtitles (track 2) show garbled characters, but the fix failed, because rewriting the file failed (mkvmerge exited 2). The "
+     "file was left as it is.", "The Spanish subtitles (track 2) show garbled characters. --apply would remux the file."),
+    ({"code": "garbled", "tracks": ["s1", "s3"], "repair": True, "flags_off": False},
+     "Subtitle tracks 1 and 3 (English) show garbled characters. SUBTITLES is set to check, so they were left as they are.", None),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True},
+     "The Spanish subtitles (track 2) show garbled characters, but the right text couldn't be worked out for sure, so they were left as they "
+     "are.", None),
+    ({"code": "repaired", "tracks": ["s1", "s2"], "kept": "/k/F.mkv"},
+     "The English subtitles (track 1) and the Spanish subtitles (track 2) showed garbled characters. Replaced them with the same subtitles "
+     "in readable characters and kept the original file at /k/F.mkv.", None),
+    ({"code": "removed", "track": "s3", "why": "a lift of 0.08", "by": "run", "kept": "/k/F.mkv", "layout": True},
+     "The English subtitles (track 3) don't line up with the speech in the audio, so they may be from another episode or "
+     "version. Removed them and kept the original file at /k/F.mkv.", None),
+    ({**STAYS, "layout": True, "kept_back": "check", "flags_off": False},
+     "The English subtitles (track 1) don't line up with the speech in the audio, so they may be from another episode or "
+     "version. They're still in the file, because SUBTITLES is set to check. Their flags were left as they are.", None),
+    ({"code": "sidecar", "name": "F.es.srt", "why": "a lift of 0.08", "kept": "/k/F.es.srt", "left": None, "layout": True},
+     "The subtitles in F.es.srt don't line up with the speech in the audio, so they may be from another episode or "
+     "version. Moved the file to /k/F.es.srt.", None),
+    ({"code": "layout", "track": "s3"},
+     "The English subtitles (track 3) don't line up with the speech in the audio, so they may be from another episode or "
+     "version. They were left as they are.", None),
+    ({"code": "layout", "track": "F.es.srt"},
+     "The subtitles in F.es.srt don't line up with the speech in the audio, so they may be from another episode or "
+     "version. They were left as they are.", None),
+    ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True},
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are."),
+    ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True, "block": {"code": "remux"}},
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are."),
+    ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True, "block": {"code": "cap", "why": "over the 30 GB repack cap"}},
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are. "
+     "--apply would skip the remux, because the file is over the 30 GB repack cap. Raise REPACK_MAX_GB to remux it."),
+    ({"code": "live", "track": "s1", "lag": 0.6, "moved": 0, "cues": 400, "left": 350, "flags_off": True},
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 0.6 s late. None of their lines could be matched to the speech, so they were left as they are.", None),
+    ({"code": "live", "track": "s1", "lag": 8.0, "moved": 380, "cues": 400, "left": 10, "flags_off": False},
+     "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
+     "are about 8.0 s late. SUBTITLES is set to check, so they were left as they are.", None),
+    ({"code": "stripped", "track": "s2", "name": "F.spa.garbled.txt", "kept": "/k/F.mkv"},
+     "The Spanish subtitles (track 2) showed garbled characters that couldn't be fixed. Took them out of the file and kept their text "
+     "beside the video as F.spa.garbled.txt. The original file is kept at /k/F.mkv.", None),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
+      "names": ["F.spa.garbled.txt"], "block": {"code": "remux"}, "hardlinked": False},
+     "The Spanish subtitles (track 2) show garbled characters, but the fix failed, because rewriting the file failed (mkvmerge exited 2). The "
+     "file was left as it is.", "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. "
+     "--apply would take them out of the file and keep their text beside the video as F.spa.garbled.txt."),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "kept_back": "keep_days"},
+     "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. They're still in the "
+     "file, because KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original.", None),
+    ({"code": "off", "track": "s2", "ref": None, "why": "the cues are off", "offsets": [2.05, 2.05, 10.05], "unfixed": None, "layout": True},
+     "The Spanish subtitles (track 2) line up with the speech at different times in different parts of the file, between 2.0 s late "
+     "and 10.1 s late. They may be from another version, so they were left as they are.", None),
 ]
 
 def test_every_template_has_a_golden():
@@ -387,8 +450,8 @@ def test_the_embed_target_is_one_embed_per_finding():
 # The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
 # program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
 # track a conversion left out. Every other golden posts, a doubt and a failed restore too.
-LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10}}
-SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track")   # the sentences of a submatch finding
+LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10, 26, 27, 29}}
+SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "stripped")   # the sentences of a submatch finding
 
 
 def every_alert():

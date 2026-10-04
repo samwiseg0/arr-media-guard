@@ -792,8 +792,17 @@ def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None
                 turn.close()
 
 
-def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None):
-    """The lid.py process of lid_run(), killed with its process group after timeout seconds."""
+def lid_speech(path, index, j, timeout, yield_to=None):
+    """The spans of speech of the whole of ffmpeg audio stream index, from one lid.py run, see lid.speech(). Silero VAD
+    needs no Whisper model, so the run takes no turn at it. yield_to is (the gate file or None, the state store or None)
+    at which the read yields, see lid.waits(). Returns lid.py's answer, or {"why": the reason there is none}."""
+    if not lid_ready():
+        return {"why": "language detection is not installed"}
+    return lid_cli(path, index, j, (), timeout, False, yield_to=yield_to, speech=True)
+
+
+def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None, speech=False):
+    """The lid.py process of lid_run() or lid_speech(), killed with its process group after timeout seconds."""
     argv = [os.path.join(config.CFG.lid_dir, "venv", "bin", "python"), os.path.join(os.path.dirname(__file__), "lid.py"), path,
             str(index), str(decide.duration(j)), "--cache", os.path.join(config.CFG.state_dir, "lid.sqlite"),
             "--model-dir", os.path.join(config.CFG.lid_dir, "models")]
@@ -801,9 +810,11 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
         argv += ["--words", words[0], *map(str, words[1]), "--secs", str(words[2] if len(words) > 2 else subsync.WINDOW)]
         argv += ["--more", *("-" if x is None else str(x) for x in words[3])] if len(words) > 3 and words[3] else []
         argv += ["--group", str(words[4])] if len(words) > 4 and words[4] else []   # the sweep, see sub_sweep()
-        argv += [a for opt, v in zip(("--yield-gate", "--yield-queue"), yield_to or ()) if v for a in (opt, v)]
+    elif speech:
+        argv.append("--speech")
     else:
         argv += (["--fresh"] if fresh else []) + (["--keep-pcm"] if keep else []) + ["--expect", *expect] + (["--then-words", then] if then else [])
+    argv += [a for opt, v in zip(("--yield-gate", "--yield-queue"), yield_to or ()) if v for a in (opt, v)]
     t0 = time.time()
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)

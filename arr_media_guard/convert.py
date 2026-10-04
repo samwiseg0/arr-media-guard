@@ -94,7 +94,9 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=()):
             items[t["pos"]] = (t["lang"], audio[k], [(a / 1000, b / 1000, c) for a, b, c in (proof.srt_cues(r.stdout) if r.returncode == 0 else [])])
     if not items:
         return subs, []
-    got = info["subcheck"] = subtitles.sub_held(subtitles.sub_verdicts(path, j, items), items, ts, known)
+    c = j.get("container") or {}   # mkvmerge gives no duration for an MP4, and the hearing needs one, so ffprobe's goes in
+    timed = j if decide.duration(j) else dict(j, container=dict(c, properties=dict(c.get("properties") or {}, duration=round(dur * 1e9))))
+    got = info["subcheck"] = subtitles.sub_held(subtitles.sub_verdicts(path, timed, items), items, ts, known)
     keep = []
     for s in subs:
         r = got.get(s["name"]) or {}

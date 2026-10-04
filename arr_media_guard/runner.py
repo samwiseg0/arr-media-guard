@@ -3,7 +3,7 @@
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
 import collections, contextlib, dataclasses, fcntl, hashlib, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error
 
-from . import apps, checks, cli, config, content, convert, decide, logs, plex, process, regrab, report, store, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, logs, plex, process, regrab, report, store, subsync, subtitles, vault
 
 
 def gated(f, op, wait=config.DEADLINE):
@@ -321,6 +321,8 @@ def deep_analysis(name, pending, claimed=False):
             requeue(name)
         return
     except Exception as ex:   # record it and go on: a deep analysis job never stops the worker
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+            raise
         held = dict(job, key=file_key(ctx.st)) if getattr(ctx, "st", None) else job   # ctx.st follows the run's own changes
         if job.get("path") and (drop := deep_replaced(held)):   # the app replaced or removed the file during the run
             rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
@@ -1154,6 +1156,8 @@ def run_job(name, pending, shared=False, claimed=False):
     except Unchecked as ex:
         rec.update(outcome="error", result=f"error: {ex}"[:500])
     except Exception as ex:   # the time limit, a timeout, a bad probe: record it and go on with the next job
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+            raise
         rec.update(outcome="error", result=f"error: {type(ex).__name__}: {ex}"[:500])
         rec["trace"] = traceback.format_exc(limit=3)[-800:]
     finally:

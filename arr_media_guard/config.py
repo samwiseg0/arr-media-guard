@@ -50,16 +50,21 @@ TEXT_CUES = 200                       # blocks subtitle_read() reads at most per
 TEXT_BLOCK = 64 << 10                 # bytes of one subtitle block it reads at most
 TEXT_AHEAD = 16                       # blocks whose reads it starts at once
 SUB_CODECS = TEXT_CODECS + ("S_TEXT/WEBVTT",)   # the text subtitle codecs the subtitle match check reads
-CUE_MAX = 5000                        # blocks subtitle_cues() reads at most per track. A film's text track holds far fewer.
+CUE_MAX = 100000                      # blocks subtitle_cues() reads at most per track, see subtitles.Cut. A typeset fansub
+                                      # track can hold tens of thousands, so a lower cap cut real tracks short.
 PICTURE_CODECS = ("S_HDMV/PGS", "S_VOBSUB")   # the picture subtitle codecs the reference timing of --sub-time reads
-PICTURE_MAX = 12000                   # blocks picture_cues() reads at most per track. A PGS cue takes a block that shows it and one that
-                                      # clears it, so a PGS track holds twice the blocks of its text.
+PICTURE_MAX = 100000                  # blocks picture_cues() reads at most per track. A PGS track redrawn every frame or two
+                                      # can hold tens of thousands.
+READ_WALL = 120                       # seconds the read of one subtitle track by its Cues may take. A slow share stops it
+                                      # there, as a cap does, see subtitles.Cut.
+FULL_WALL = 1800                      # seconds full_read() may take. It reads the whole file, which takes minutes for a film.
 SUB_MAX = 1800                        # seconds subtitle_ends() may take with no time limit, as in a scan or a backfill
 SUB_RESERVE = 150                     # seconds of the job's time limit it leaves for the zero probe and the windows
 LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_language", "audio_untagged_or_missing"}   # reason codes
 
 
 SUB_TIMEOUT = 90       # seconds the subtitle check may hear one file, the model load included
+SPEECH_TIMEOUT = 1800  # seconds the speech read of one whole audio track may take at nice 19, see subtitles.sub_layout()
 SUB_MIN_SECONDS = 300  # a shorter file is never checked: its two windows would sit too close for a timing fit
 STEP_ALERT = 1.0       # seconds the windows of a piecewise result must differ by to alert. A smaller step goes to the log only.
 SUB_ROLES = ("full", "sdh", "dub")   # the subtitle roles the check takes. A forced or commentary track is never checked.
@@ -67,7 +72,7 @@ SUB_ROLES = ("full", "sdh", "dub")   # the subtitle roles the check takes. A for
 # verdict and never hears them.
 NO_SPACES = frozenset({"jpn", "chi", "tha"})
 REPAIRED = ("header_repaired", "subtitle_trimmed", "subtitle_removed", "tail_removed", "subtitle_retimed", "subtitle_blocks_retimed",
-            "subtitle_mismatch_removed", "subtitle_ends_lengthened")   # the reason codes of a remux that replaced the file
+            "subtitle_mismatch_removed", "subtitle_ends_lengthened", "subtitle_repaired", "subtitle_garbled_removed")   # the reason codes of a remux that replaced the file
 CRASH_TRIES = 3                                  # a job whose process died this often is dropped, see requeue()
 SCHEMA = 2                                       # the decision log's line format. Raise it when a field changes meaning.
 HOST = os.uname().nodename

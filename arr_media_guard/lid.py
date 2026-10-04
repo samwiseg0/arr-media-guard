@@ -27,7 +27,8 @@ The subtitle check (docs/design.md, "Subtitle match") asks for the words of shor
 
     /opt/arr-media-guard-lid/venv/bin/python lid.py PATH INDEX DURATION --cache FILE --model-dir DIR --words LANG START...
 
-listen() transcribes every window in one Whisper run and caches the words by the same file identity.
+listen() transcribes every window in one Whisper run and caches the words by the same file identity. The speech
+layout check asks for the spans of speech of the whole stream with --speech, see speech().
 At install, "lid.py --fetch" downloads the pinned model once and checks its sha256. docs/design.md, section
 "Audio language detection", has the rules and the install.
 """
@@ -52,13 +53,15 @@ MIN_SPEECH = 8.0                         # seconds of speech a sample needs befo
 SAMPLE_MIN_PROB = 0.60                   # a sample under this names no language, it neither votes nor vetoes
 MIN_VOTES = 2
 MIN_PROB = 0.80                          # the mean probability of the agreed language over the votes
-# The subtitle check. Its two windows go through Whisper as one clip, so the encoder runs once. More threads cost more
-# CPU time than they save in wall time, so the check runs one thread.
-WORD_SECS = 10                           # seconds of each window, subsync.WINDOW
+# The subtitle check. Its two windows go through Whisper as one clip, so the encoder runs once. Three windows of WORD_SECS
+# in one clip made it run twice in most runs, at more CPU per window. More threads cost more CPU time than they save in
+# wall time, so the check runs one thread.
+WORD_SECS = 10.0                         # seconds of each window, subsync.WINDOW. A float, as the hook passes it, so the cache keys agree.
 THIRD_SECS = 24                          # seconds of a third window, subsync.THIRD
 MAX_COMPRESSION = 2.4                    # a segment whose text compresses more is a loop, faster-whisper's own threshold
 WORD_THREADS = 1
 PCM_KEEP = 3600                          # seconds a kept language sample stays in the cache for the subtitle check
+SPEECH_SECS = 600                        # seconds of audio Silero VAD reads at a time, so a film never sits in memory whole
 
 # Whisper's 99 languages plus yue (large-v3 only), as the ISO 639-2/B codes the classifier uses. no and nn are both
 # Norwegian, zh and yue Chinese.
@@ -139,6 +142,9 @@ def _db(path):
                " pcm BLOB, at REAL, PRIMARY KEY (path, size, mtime_ns, idx, start, secs))")
     db.execute("CREATE TABLE IF NOT EXISTS subcheck (path TEXT, size INTEGER, mtime_ns INTEGER, result TEXT, pending INTEGER,"
                " at REAL, PRIMARY KEY (path, size, mtime_ns))")
+    # The speech layout check: the spans of speech of a whole audio stream, by the VAD settings that drew them.
+    db.execute("CREATE TABLE IF NOT EXISTS speech (path TEXT, size INTEGER, mtime_ns INTEGER, idx INTEGER, how TEXT, spans TEXT,"
+               " at REAL, PRIMARY KEY (path, size, mtime_ns, idx, how))")
     return db
 
 
@@ -166,12 +172,13 @@ def carry(path, before, cache=CACHE, was=None):
     """Move the cached results of path from its os.stat() before an in-place edit to its stat now.
     mkvpropedit changes the mtime but never the audio, so the hook calls this in-process after each edit. It never
     raises and never creates the cache, because a cache problem must not fail an edit that already happened.
-    was is the old path of a conversion, whose proof shows the same audio. Only the subtitle check's words move then."""
+    was is the old path of a conversion, whose proof shows the same audio. Only the subtitle check's words and the
+    spans of speech move then."""
     if not os.path.exists(cache): return
     try:
         st = os.stat(path)
         with closing(_db(cache)) as db, db:
-            for table in ("words",) if was else ("lid", "words", "pcm"):   # never subcheck: a changed file needs a new verdict
+            for table in ("words", "speech") if was else ("lid", "words", "pcm", "speech"):   # never subcheck: a changed file needs a new verdict
                 db.execute(f"UPDATE OR REPLACE {table} SET path=?, size=?, mtime_ns=? WHERE path=? AND size=? AND mtime_ns=?",
                            (path, st.st_size, st.st_mtime_ns, was or path, before.st_size, before.st_mtime_ns))
     except (sqlite3.Error, OSError):
@@ -423,6 +430,76 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
     return {"windows": windows, "cached": False, "reused": reused, "model": key, "took": round(time.time() - t0, 2), "profile": prof}
 
 
+def speech_how():
+    """The VAD model and settings that draw the spans of speech, in the cache key of speech(). faster-whisper bundles
+    the Silero VAD model, so its version names the model. A change of either reads the audio again."""
+    from importlib import metadata
+    from . import subsync
+    try:
+        model = f"silero@faster-whisper-{metadata.version('faster-whisper')}"
+    except metadata.PackageNotFoundError:
+        model = "silero@unknown"
+    return f"{model}/{subsync.VAD_ON}/{subsync.VAD_OFF}/{subsync.VAD_GAP}"
+
+
+def start_delay(path, audio_index):
+    """Seconds ffmpeg audio stream audio_index of path starts after the file starts, or 0 when ffprobe gives none. A
+    decode to raw audio starts at the stream's first packet, but the cues and the speech onsets run on the file's
+    clock. Without the delay, the speech of a delayed stream reads early by it."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"a:{audio_index}", "-show_entries", "stream=start_time:format=start_time",
+                        "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=60)
+    try:
+        j = json.loads(r.stdout)
+        return round(float(j["streams"][0]["start_time"]) - float(j["format"]["start_time"]), 3)
+    except (ValueError, KeyError, IndexError, TypeError):
+        return 0.0
+
+
+def speech(path, audio_index, cache=CACHE, gate=None, queue=None):
+    """The spans of speech of the whole of ffmpeg audio stream audio_index of path, for the speech layout check
+    (docs/design.md, "Incorrect subtitle identification"). One ffmpeg read at nice 19 and idle I/O decodes the
+    stream, mono at 16 kHz. Silero VAD, which faster-whisper bundles, gives a speech probability for each frame,
+    SPEECH_SECS of audio at a time, and subsync.voiced() joins them into spans. The spans move by start_delay(), so
+    they run on the file's clock. The spans are cached by path, size, mtime, stream and the VAD model and settings, see
+    speech_how(). Silero VAD needs no Whisper model, so the read takes no turn at it. After each SPEECH_SECS it yields
+    when waits() names a job or a hearing at gate and queue: it stops the read and caches nothing. Returns {"spans":
+    [[start, end]] in seconds, "cached", "took": wall seconds}, or {"yielded": True, "cached", "took"}. Raises when
+    ffmpeg or ffprobe fails, and nothing is cached then."""
+    from . import subsync
+    t0, how, st = time.time(), speech_how(), os.stat(path)
+    key = (path, st.st_size, st.st_mtime_ns, audio_index, how)
+    with closing(_db(cache)) as db, db:
+        row = db.execute("SELECT spans FROM speech WHERE path=? AND size=? AND mtime_ns=? AND idx=? AND how=?", key).fetchone()
+    if row:
+        return {"spans": json.loads(row[0]), "cached": True, "took": round(time.time() - t0, 2)}
+    import numpy as np
+    from faster_whisper.vad import get_vad_model
+    model, probs = get_vad_model(), []
+    p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path,
+                          "-map", f"0:a:{audio_index}", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while chunk := p.stdout.read(SPEECH_SECS * 16000 * 2):
+            audio = np.frombuffer(chunk[:len(chunk) // 2 * 2], np.int16).astype(np.float32) / 32768
+            probs.append(model(np.pad(audio, (0, -len(audio) % 512))))   # the model reads frames of 512 samples
+            if waits(gate, queue):
+                p.kill()
+                return {"yielded": True, "cached": False, "took": round(time.time() - t0, 2)}
+    except BaseException:
+        p.kill()
+        raise
+    finally:
+        p.stdout.close()
+        p.wait()
+    if p.returncode:
+        raise RuntimeError(f"ffmpeg exited {p.returncode} reading audio stream {audio_index}")
+    late = start_delay(path, audio_index)
+    spans = [[round(a + late, 3), round(b + late, 3)] for a, b in subsync.voiced(np.concatenate(probs).tolist() if probs else [])]
+    with closing(_db(cache)) as db, db:
+        db.execute("INSERT OR REPLACE INTO speech VALUES (?, ?, ?, ?, ?, ?, ?)", (*key, json.dumps(spans), time.time()))
+    return {"spans": spans, "cached": False, "took": round(time.time() - t0, 2)}
+
+
 def waits(gate, queue):
     """Another hearing waits for the host's model: it holds gate, the lid.turn.gate file of the hook, while it waits for
     its turn. Or an import job waits in the queue of queue, the hook's state store, or as a file in the queue folder
@@ -524,16 +601,19 @@ def main(argv=None):
     ap.add_argument("--secs", type=float, default=WORD_SECS, help="the seconds of each --words window")
     ap.add_argument("--more", nargs="+", help="a second window per --words START, - for none, heard when its window hears too little")
     ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the sweep, see sweep()")
-    ap.add_argument("--yield-gate", help="the sweep yields while another hearing holds this gate file, see waits()")
-    ap.add_argument("--yield-queue", help="the sweep yields while an import job waits in this state store, see waits()")
+    ap.add_argument("--yield-gate", help="the sweep and the speech read yield while another hearing holds this gate file, see waits()")
+    ap.add_argument("--yield-queue", help="the sweep and the speech read yield while an import job waits in this state store, see waits()")
     ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
+    ap.add_argument("--speech", action="store_true", help="the spans of speech of the whole stream, for the speech layout check, see speech()")
     a = ap.parse_args(argv)
     if a.fetch:
         print(fetch(a.model_dir))
         return 0
     if a.duration is None: ap.error("PATH, INDEX and DURATION are required")
     try:
-        if a.words:
+        if a.speech:
+            r = speech(a.path, a.index, a.cache, a.yield_gate, a.yield_queue)
+        elif a.words:
             more = [None if x == "-" else float(x) for x in a.more] if a.more else None
             if a.group:
                 r = sweep(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.group, a.secs, a.yield_gate, a.yield_queue, model=a.model,
@@ -558,5 +638,5 @@ if __name__ == "__main__":
     # imports the package's subsync, and no module of the package hides a module of the venv.
     sys.path[0] = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     __package__ = "arr_media_guard"
-    lower_priority(WORD_THREADS if "--words" in sys.argv or "--then-words" in sys.argv else THREADS)
+    lower_priority(WORD_THREADS if {"--words", "--then-words", "--speech"} & set(sys.argv) else THREADS)
     sys.exit(main())

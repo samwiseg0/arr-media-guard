@@ -22,7 +22,8 @@ file, see [policy.md](policy.md). When the signals conflict, it abstains and edi
 When a track's language is in doubt, an optional Whisper model hears the audio. A count of common words reads the
 language of subtitle text.
 
-- A sidecar whose text is in another language than its name goes in with the text's language.
+- A sidecar whose text is in another language than its name goes in with the text's language. A sidecar with no language
+  in its name takes the language of its text.
 - A text track with a wrong tag gets a fixed tag, or an alert. When no audio track speaks its language, it also stops
   showing by itself.
 - An `und` track takes the language its text reads.
@@ -35,13 +36,60 @@ in the audio's language.
 - A subtitle of another episode leaves the file in a proven remux, or stays out of a conversion.
 - A sidecar of another episode moves to the kept originals, and a program such as Bazarr can download it again.
 - A subtitle that runs late by an offset or a frame-rate ratio gets new times.
-- A block of cues that sits off while the rest is in time, as after an edit, moves to its speech. `--sub-time` and the
-  deep analysis do this, see [subtitles.md](subtitles.md#blocks).
 - A text subtitle whose cues flash for a tenth of a second gets ends a viewer can read.
 
 `--sub-time` also times the subtitles it cannot hear, other languages and PGS or VobSub pictures, against a subtitle
 that matched the audio. An import does that too, as its time allows. `SUBTITLES=deep` adds the rest in a deep analysis
 while no import waits. See [subtitles.md](subtitles.md).
+
+### Subtitle block timing
+
+Subtitle block timing moves a block of cues that sits off while the rest is in time, as after an edit, to its speech.
+A cue whose move would pass a cue that stays moves part of the way. Two pieces of its own evidence must put it in the
+block. `--sub-time` and the deep analysis do this, see [subtitles.md](subtitles.md#subtitle-block-timing).
+
+### Live caption timing
+
+A captioner who types along with a live broadcast shows each line some seconds late, by a different time each line.
+Live caption timing moves each line of such a track to its speech. `--sub-time` and the deep analysis do this, see
+[subtitles.md](subtitles.md#live-caption-timing).
+
+### Incorrect subtitle identification
+
+Some subtitles have no subtitle of the audio's language to time them, such as an English subtitle on a Japanese film.
+No word check can read them. Incorrect subtitle identification checks that their lines show while people speak.
+`--sub-check`, `--sub-time` and the deep analysis run it.
+
+- A subtitle whose lines do not line up with the speech alerts that it may be from another episode or version. It
+  stays in the file.
+- A subtitle whose parts line up at different times alerts that it may be from another version, and keeps its times.
+- A subtitle that lines up but runs late by one shift or a frame-rate ratio alerts with how late it seems. For now its
+  times stay.
+
+See [subtitles.md](subtitles.md#incorrect-subtitle-identification).
+
+### Long subtitle track handling
+
+Long subtitle track handling reads up to 100,000 blocks of each subtitle track, as a typeset fansub track can hold tens
+of thousands. A read stops after 2 minutes on a slow share, or after 30 minutes for a read of the whole file. A track
+read only in part can still get a fix of its whole timing. It gets no fix that rewrites single lines, and no check
+judges it past its last line read. See [subtitles.md](subtitles.md#long-subtitle-track-handling).
+
+## Subtitle character set detection
+
+Subtitle character set detection reads a sidecar in an old character set, such as Big5 or Windows-1250. It tries each
+character set in turn and keeps the one whose text reads as a language that set writes. A conversion muxes the sidecar
+decoded right, and the subtitle check reads it the same way. A sidecar that no character set reads goes in as
+Windows-1252, as before.
+
+## Garbled subtitle repair
+
+An old muxer could garble the characters of a SubRip track. It stored text in another character set as Western
+European letters. Garbled subtitle repair gives the track its text back in a proven remux, from its own bytes, when
+the repaired text reads as its language. A sidecar of the same lines fills in the lines the muxer cut short. A track
+that cannot be repaired leaves the file, and its bytes stay beside the video in a `<name>.<language>.garbled.txt`
+file. `--sub-check`, `--sub-time` and the deep analysis do this, see
+[subtitles.md](subtitles.md#garbled-subtitle-repair).
 
 ## Broken audio and corrupt video
 
@@ -100,7 +148,7 @@ The hook posts one Discord alert for each problem it leaves unresolved. Set `DIS
 - **Posts.** A problem posts when its fix failed, a setting turns the fix off, the fix cannot run, or the hook is
   unsure, as in "Audio may be broken" or "Maybe the wrong episode".
 - **Log only.** A problem that the hook fixed goes to the decision log and Loki only. That is a re-grab, an old file
-  put back that the app picked up again, a repaired file, removed or retimed subtitles, or a moved subtitle file. The
+  put back that the app picked up again, a repaired file, removed, repaired or retimed subtitles, or a moved subtitle file. The
   other alerts of a file the hook deleted go to the log only too. A "Wrong content" alert names each signal that
   scored. A wrong language or runtime alert beside it goes to the log only when the "Wrong content" alert names that
   signal. The decision log keeps every finding.

@@ -16,8 +16,12 @@ Set `SUBTITLES` in the env file. The default is `fix`.
 | `deep` | `fix`, then a deep analysis after the import. |
 
 - The deep analysis reads the whole file for unindexed subtitle tracks, and hears one window a minute. It times the
-  subtitles that had no reference, and moves a block of cues that sits off, see [Blocks](#blocks). It runs only while
-  no import waits.
+  subtitles that had no reference. It moves a block of cues that sits off, see
+  [Subtitle block timing](#subtitle-block-timing), and each line of live captions, see
+  [Live caption timing](#live-caption-timing). It also repairs garbled text, see
+  [Garbled subtitle repair](#garbled-subtitle-repair). It checks where the lines of a subtitle in another language
+  show, see [Incorrect subtitle identification](#incorrect-subtitle-identification). It runs only while no import
+  waits.
 - An unknown level acts as `check`, and `--selftest` fails on it.
 - `--sub-check` and `--sub-time` ignore `SUBTITLES`. Without `--apply` they report, and with it they fix.
 
@@ -38,7 +42,9 @@ arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film
 - A dry run prints each verdict and the removal or timing fix it would make. An apply acts as an import does.
 - `--paths` limits the run to the listed files.
 - The check caches its verdicts. A later run skips a file that stays as it was, with the same sidecars, and needs
-  nothing more.
+  nothing more. A verdict from before 2.4.0 does not count, so the first `--sub-check` after the update checks every
+  file again. It then reads the whole audio of each file with a subtitle in another language that no other subtitle
+  times, see [Incorrect subtitle identification](#incorrect-subtitle-identification).
 - A stopped run goes on where it stopped.
 - It hears at the backfill's priority with one Whisper thread.
 - The last line counts the files checked, the verdicts, the timing fixes and the CPU time. It also estimates the time
@@ -53,7 +59,8 @@ arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv" --appl
 
 `--sub-time` runs the subtitle check of `--sub-check` on each file it names, and reads the cache of neither. It then
 times every other subtitle against a track or sidecar whose words matched the audio, and hears one window a minute.
-Where those windows sit off, it hears that part in full and moves a block of cues that is off, see [Blocks](#blocks).
+Where those windows sit off, it hears that part in full and moves a block of cues that is off, see
+[Subtitle block timing](#subtitle-block-timing).
 
 - The file needs no app. For a path outside Sonarr and Radarr, such as a copy, it runs with no item, so it knows no
   original language. A mismatch then counts unless the file also holds audio in another language.
@@ -82,16 +89,20 @@ Each subtitle gets one line. The columns are:
 2. The codec, the language and the role (`full`, `sdh` or `dub`).
 3. The method. `words` is the check against the heard audio. It shows `a reference: in time`, `fixed` or
    `clean sweep` when it times other tracks. `reference s1` means the track was timed against `s1`.
-   `reference, none` means no track could time it.
+   `reference, none` means no track could time it. `speech layout` means that
+   [Incorrect subtitle identification](#incorrect-subtitle-identification) judged it.
 4. The verdict. The word check gives `match`, `mismatch` or `unknown`. The reference timing gives `fit` or `weak`
-   with its score, where a weak fit only reports. It can also give `unknown` or `deferred`.
+   with its score, where a weak fit only reports. It can also give `unknown` or `deferred`. The speech layout gives
+   `fit`, `mismatch` or `unknown` with its score, and the weak fit of the reference after it.
 5. The new times, as an offset and a frame-rate ratio, or `in time`.
-6. The action, such as `none`, `retimed`, `removed`, `flags off`, `report only` or the remux it would make.
+6. The action, such as `none`, `retimed`, `removed`, `flags off`, `report only`, `alert only` or the remux it would make.
 7. Why.
 
 - A `flash` line names a text track whose cues show for a tenth of a second, and the new ends of its first cues.
 - The sweep table has one row per heard window. A row holds the window's time, the heard words, the share that matched
-  the cues, the cues whose first word matched, and their offset.
+  the cues, the cues whose first word matched, and their offset. When the read of a track stopped short, see
+  [Long subtitle track handling](#long-subtitle-track-handling), its sweep line gives the time of its last cue read.
+  No window past it counts.
 - `ALERT` marks the windows of a step, two neighbouring windows 1 second or more off the fitted line the same way, when
   the steps hold 3 rows or more, or every row that heard 3 cues, and at least a quarter of those rows. A part of the
   file is then off.
@@ -99,22 +110,31 @@ Each subtitle gets one line. The columns are:
   window alone is marked "one window alone". Neither alerts.
 - A block line names a block of cues that the dense hearing found off, such as `s1: 14 cues from 16:21 to 17:40 moved
   -1.42 s, 80% of 11 heard cues agree within 0.30 s, speech onsets agree (5 in the block, 7 around it)`. Its end says
-  what the speech onsets said, see [Blocks](#blocks). A dry run says `would move`. `not moved` means that the remux
-  failed, or that the track is WebVTT, which is never rewritten. The sweep rows of a block that moves show where they
-  sit after the move.
+  what the speech onsets said, see [Subtitle block timing](#subtitle-block-timing). A dry run says `would move`.
+  `not moved` means that the remux failed, or that the track is WebVTT, which is never rewritten. The sweep rows of a
+  block that moves show where they sit after the move.
 - A `no block` line names a part that the dense hearing heard and left as it is, and why. A part with several
   reasons gets one line for each.
-- The last lines give the cost of the sweep, and of the dense hearing with the speech onsets.
-- The decision log holds the results under `subcheck`, `subtime`, `flash`, `sweep` and `blocks`.
+- A `garbled` line names a track whose characters are garbled, see
+  [Garbled subtitle repair](#garbled-subtitle-repair). It gives the source of the right text, the language it reads
+  as, the cues cut short, the action and why.
+- A `live captions` line names a track timed line by line, see [Live caption timing](#live-caption-timing). It counts
+  the cues that move by their own anchor, between anchors that prove the move and between anchors that agree. It
+  gives how late the moved cues sat, and how many stay off or unproved.
+- The last lines give the cost of the sweep, and of the dense hearing with the speech onsets. A `speech read` line
+  gives the cost of the read of [Incorrect subtitle identification](#incorrect-subtitle-identification).
+- The decision log holds the results under `subcheck`, `subtime`, `flash`, `sweep`, `blocks`, `garbled` and `speech`.
 
-### Blocks
+### Subtitle block timing
 
 A part of a subtitle can sit off while the rest is in time, for example after an edit. One shift for the whole track
-cannot fix that. `--sub-time` and the deep analysis find such a part with the sweep, and fix it in six steps.
+cannot fix that. Subtitle block timing finds such a part, a *block* of cues, and moves it to its speech. `--sub-time`
+and the deep analysis find it with the sweep, and fix it in six steps.
 
 1. The sweep finds the part. A window that heard enough words, matched half of them and 2 cues or more, sits 0.5
-   seconds or more off the track's lean, where most of its windows sit. One such window is enough, so a short block is
-   not missed. Steps 3 and 4 decide every move.
+   seconds or more off the track's lean, where most of its windows sit. One such window is enough, and steps 3 and 4
+   decide every move. A block shorter than about a minute can lie between two windows, and then the sweep does not
+   see it.
 2. The dense hearing hears the part in full, in windows of 10 seconds every 7.5 seconds. The part reaches 2 minutes
    past that window, or to the nearest window that sits on the line, so it holds both edges. When the hearing still
    does not see an edge, a second hearing hears up to 30 seconds past it, only where nothing was heard yet, within
@@ -140,16 +160,17 @@ cannot fix that. `--sub-time` and the deep analysis find such a part with the sw
    because a cue of the block may sit past a cue in time there. An onset within 0.3 seconds of two cue starts may be
    either cue's, so it times neither. The mark of an edit within the first or last 2 heard cues sets the edge. The
    mark is a gap or an overlap between two cues that the move closes.
-6. Every cue that moves needs evidence of its own: its own anchor at the block's offset, or its own heard words in
-   the block. An onset counts only with the cue's own heard words. The first cue after a long silence needs both its
-   words in the block and an onset where the block puts it, because its words alone read early. A cue that starts
-   with a cue that stays, as two lines shown at once, stays too. A cue whose own anchor sits over 0.3 seconds off the
-   block moves on its words only with an onset there. A cue whose own evidence puts it on the line splits the block
-   there, and each side is judged as a block of its own. A cue with no evidence either way stays where it is, and the
-   record of the block counts it as unproved. Each cue that moves takes the block's shift, measured against the cues
-   around it. No other cue moves, and a cue whose move would pass a cue that stays, or land on its centisecond, stays
-   too. On Whisper alone, a block whose move would pass a cue outside it is not moved, because the order is the only
-   check left on Whisper's shift.
+6. Every cue that moves needs evidence of its own: its own anchor at the block's offset, or its own heard words in the
+   block. An onset counts only with the cue's own heard words. The first cue after a long silence needs both its words
+   in the block and an onset where the block puts it, because its words alone read early. A cue that starts with a cue
+   that stays, as two lines shown at once, stays too. A cue whose own anchor sits over 0.3 seconds off the block moves
+   on its words only with an onset there. A cue whose own evidence puts it on the line splits the block there, and each
+   side is judged as a block of its own. A cue with no evidence either way stays where it is, and the record of the
+   block counts it as unproved. Each cue that moves takes the block's shift, measured against the cues around it. No
+   other cue moves. A move can pass the cue next to it that stays, or land on its centisecond. The cue then moves only
+   to one centisecond short of it. So the order never changes. It needs two pieces of its own evidence for that, such as
+   its anchor and its heard words, or it stays. On Whisper alone, a block whose move would pass a cue outside it is not
+   moved. The order is the only check left on Whisper's shift.
 
 The speech onsets of step 4 give one of three outcomes.
 
@@ -172,9 +193,17 @@ The speech onsets of step 4 give one of three outcomes.
   checks each start and end. A sidecar is written again, and its original is kept. A WebVTT track is never rewritten,
   so its blocks only report.
 - A block that moves posts nothing. A part with no block keeps the sweep alert. So does a sweep window that crosses
-  an edge of a block, or holds a cue that stays. A block that `--apply` could not move alerts that the subtitles need
-  new times, as a failed fix does.
+  an edge of a block, or holds a cue that stays or moves part of the way. A block that `--apply` could not move
+  alerts that the subtitles need new times, as a failed fix does.
 - An import never sweeps, so it never moves a block. With `SUBTITLES=deep`, its deep analysis does.
+
+Two kinds of wrong move are accepted, because nothing in the audio tells them from a real block.
+
+- Whisper can time a whole stretch of a right track early or late. When too few cues there have a speech onset, a
+  stretch that Whisper hears 1.0 seconds or more off moves on Whisper alone. The worst such stretch measured on real
+  right tracks sat about half a second off.
+- A cue in time between two blocks of one sign can move with them. That happens when its own anchor or its own heard
+  words put it at the blocks' offset. No speech onset lies where it sits or where the block puts it.
 
 The dense hearing costs about 45 CPU seconds a minute of audio. A file whose sweep finds a part hears 6 minutes of audio
 at most for each audio track, for all its subtitles together, about 4.5 CPU minutes. The speech onsets of those parts
@@ -182,12 +211,126 @@ add a few CPU seconds, about 10 for the audio of a whole episode. A longer part 
 around its windows that fits, and a part with under 10 seconds left is not heard. A file whose sweep sits on the line
 pays nothing for it.
 
+### Garbled subtitle repair
+
+An old muxer could read a subtitle in another character set as Western European text. Greek "Καλημέρα, φίλε μου" then
+shows as "ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. Garbled subtitle repair gives the track its text back.
+`--sub-check`, `--sub-time` and the deep analysis check each SubRip (`.srt`) track for that, and an import does not.
+Old muxes have no index of their subtitle blocks, and only a run that reads the whole file finds them.
+
+- The hook reads the track's bytes in the right character set. When that text reads as the language of the track's tag,
+  the track is repaired. Else it is taken out of the file, see below.
+- The word check cannot read garbled text, so a garbled track that fails it is repaired, not removed. The next run
+  checks the repaired words and times.
+- The track's own bytes give the right text. A line the old muxer cut short stays cut, unless a `.srt` sidecar holds it
+  whole. Such a sidecar, as the `Movie.3.srt` Radarr writes, must hold the same lines as the track, else it gives none.
+- When more than 2 percent of the lines were cut short, the track is not repaired. It leaves the file as below. Some
+  character sets leave no trace of a cut, such as Windows-1250 at "ť", so the count can miss those lines. The repair
+  loses no text the track still held.
+- A right letter that the character set would change into a letter the language never writes stays as it is. So
+  does a letter right after a digit, as in "40.5ºC", unless a lowercase letter follows it. A Latin word such as "Café"
+  in Cyrillic, Greek or Hebrew text stays too.
+- A track whose read was cut short, see [Long subtitle track handling](#long-subtitle-track-handling), only gets an
+  alert.
+- The repair is one remux that the packet proof checks. When the hook would turn a repaired track's default flag off,
+  the same remux does it. A run that keeps every flag, as the deep analysis, keeps it.
+- Language detection is not needed for this check.
+
+A garbled track the hook cannot repair leaves the file in a proven remux, and the original file is kept for
+`KEEP_ORIGINALS_DAYS`. With `KEEP_ORIGINALS_DAYS` 0 the track stays and alerts. Its exact bytes go beside the video as
+`<name>.<language>.garbled.txt`, for example `Film (2001).bul.garbled.txt`. Players skip that file, and no file is
+ever written over. To fix it, open that file in a subtitle editor that can read other character sets, such as
+Subtitle Edit. Pick the set that makes it readable. Save it as a UTF-8 `.srt`, then add it back:
+
+```sh
+mkvmerge -o "Film (2001).new.mkv" "Film (2001).mkv" --language 0:bul "Film (2001).bul.srt"
+```
+
+### Incorrect subtitle identification
+
+A subtitle in a language that no audio track speaks has no words to compare. When no subtitle of the audio's language
+times it, incorrect subtitle identification checks where its lines show instead. A right subtitle shows its lines
+while people speak. Another episode's subtitle shows them at other times. `--sub-check`, `--sub-time` and the deep
+analysis run this check, and the output names its method `speech layout`.
+
+- Silero VAD, a small speech detector that comes with the language detection, marks the speech in the whole audio
+  track that plays. The read takes about 40 CPU seconds for a 45-minute episode, and it is cached.
+- The check fits the lines to the speech at the best offset and frame rate. So a subtitle up to 5 minutes late still
+  fits.
+- A subtitle that fits but runs late, or was timed for another frame rate, gets an alert that says how late it seems.
+  For now its times stay. The fix must hold in ten slices of the file, and the moved lines must fit again with no
+  shift. The lines at each end must line up best at the fix. The speech onsets, see step 4 of
+  [Subtitle block timing](#subtitle-block-timing), must confirm it in each half of the file. When a check fails, an
+  alert says the subtitles seem late, and that no fix lined them up.
+- A subtitle whose parts fit at different offsets keeps its times. The alert says it may be from another version.
+- A subtitle that does not line up alerts that it may be from another episode or version, and it stays as it is.
+- A file under 15 minutes gets no verdict. Nor does a track of sound captions, or live captions that roll on with no
+  gap.
+- An import never reads the whole audio, so it never runs this check. `SUBTITLES=deep` runs it in the deep analysis.
+
+[design.md](design.md#incorrect-subtitle-identification) has the rules and the calibration.
+
+### Live caption timing
+
+A captioner who types along with a live broadcast shows each cue some seconds after it is spoken, and by a different
+time each cue. One shift cannot fix that, and neither can a block. Live caption timing moves each cue of such a track
+to its own speech. `--sub-time` and the deep analysis run it.
+
+1. The sweep finds it. At least 10 windows count. Their median sits 0.3 seconds or more late. Half of them lie 0.4
+   seconds or more from where most of them sit, so no one shift fits them. 5 windows are enough when each sits 3
+   seconds or more late. Roll-up captions, which repeat the last line at the top of the next cue, let few windows
+   count. On tracks that were not live captions, half the windows lay within 0.26 seconds of where most sat.
+2. The dense hearing hears the whole audio track, past the cap of 6 minutes. Each cue's first spoken word is its
+   anchor. A speaker's name before a cue's text, such as `>> Reporter:`, is never spoken, so it does not count.
+   Neither do the top lines of a roll-up cue that repeat the cue before, because they were spoken with that cue.
+3. Live captions keep the order of the speech, so the anchors must rise with the cues. Only the longest run of
+   anchors that rises counts. An anchor out of that order paired a word said elsewhere.
+4. A cue moves to its anchor when it sits 1 second or more off it. The 2 anchored cues on each side must also sit 0.5
+   seconds or more off the same way, at their median. So one cue that Whisper heard off never moves alone. Whisper times
+   the first word after a silence early, so a smaller move is not safe on Whisper alone. When the first word was heard
+   again up to a few seconds later, the anchor may be the wrong one. The cue then moves to it only when the new start is
+   nearer the later word too. Else it moves as a cue with no anchor does.
+5. A cue with no anchor that counts lies between the anchored cues around it, because its speech lies between theirs.
+   Its place sits at the same share of the way between their anchors as its start sits between their starts. At the
+   first or the last anchor, it takes the lag of the nearest. It moves there when the new start is nearer than the old
+   one wherever its speech lies in the span. It also moves there when the two cues around it move by their own anchors,
+   the same way and 2 seconds or more. The place must then lie inside the audio that was heard.
+6. Every other cue stays. A cue whose speech would lie before the file's start starts at 0. A move can pass a cue that
+   stays, or land on its centisecond. When the cue that stays has no anchor, it moves part of the way toward its place
+   between anchors instead. It stops where its start is still nearer every speech up to the anchor of the cue after it.
+   When the cue that moves has its own anchor, it stops a centisecond after the cue that stays, when that is still
+   nearer its anchor. Else the move stays too. So the order of the cues never changes.
+7. A moved cue ends where the next cue starts, at most, as live captions do. It still shows half a second, or its old
+   length when that is less, so a line never becomes a flash.
+
+The remux writes the new times through the same plan and proof as a block. A hearing that stops part way leaves the
+lines past it as they are, and the track counts as not fixed. A later `--sub-check` takes the file again. A track with
+a fifth of its cues or fewer left 1 second or more off, or with no anchor around them, posts nothing. Else one
+sentence says how many lines moved and how many stay out of sync. At `SUBTITLES=check` it says the setting left them
+as they are. Such a track gets no sweep or timing sentence of its own.
+
+The dense hearing of a whole track costs about 1 CPU minute a minute of audio. It runs only on a track whose sweep
+looks live-captioned, and the deep analysis yields to an import between its hearings.
+
+### Long subtitle track handling
+
+A subtitle track can hold far more blocks than the dialogue of a film. A typeset fansub track, or a PGS track redrawn
+every frame, can hold tens of thousands. Long subtitle track handling reads up to 100,000 blocks of each track.
+A read by the Cues index stops after 2 minutes, as on a slow share. A read of the whole file stops after 30 minutes.
+A track whose read stopped at the cap or at a time limit is read only in part.
+
+- No check judges a window or speech past its last cue read. Incorrect subtitle identification judges it as a file
+  that ends there.
+- A remux rewrites every cue of a track, and a plan would hold only the cues read. So the track gets no fix of its
+  own cues: no block, live caption, flash or garbled fix. A fix of the whole track's timing still moves every cue.
+- It times no other track, because that fit would rest on its first part alone.
+
 ### Apply the changes
 
-With `--apply`, a built-in track gets its new times, new ends, the new times of its blocks or its removal in one remux
-that the packet proof checks. A sidecar is written again or moved. The hook keeps the original file or sidecar for
-`KEEP_ORIGINALS_DAYS` (7) days in `.<NAME>-originals`. [regrabs.md](regrabs.md#kept-originals) says where that folder goes and how to undo
-a change.
+With `--apply`, one remux that the packet proof checks writes the changes of a built-in track. These are its new
+times, new ends, the new times of its blocks, its repaired text or its removal. A sidecar is written again or moved.
+The hook keeps the original file or sidecar for `KEEP_ORIGINALS_DAYS` (7) days in `.<NAME>-originals`.
+[regrabs.md](regrabs.md#kept-originals) says where that folder goes and how to undo a change.
 
 ## Try it on one file
 
@@ -242,5 +385,6 @@ Move-Item -Force ".arr-media-guard-originals\<UTC time>\Episode.mkv" "Episode.mk
 The exit codes are those of `--sub-time` above.
 
 The sweep hears one window a minute and takes a few minutes of CPU. A 24-minute episode took about a minute on the test
-host. A part that sits off adds the dense hearing, see [Blocks](#blocks). The run was tested on Linux. Windows with
-Docker Desktop, and Apple Silicon, which runs the amd64 image under emulation, were not tested.
+host. A part that sits off adds the dense hearing, see [Subtitle block timing](#subtitle-block-timing). The run was
+tested on Linux. Windows with Docker Desktop, and Apple Silicon, which runs the amd64 image under emulation, were not
+tested.

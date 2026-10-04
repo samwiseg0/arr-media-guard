@@ -21,6 +21,7 @@ An edit is [selector, new, old] for a default flag. An edit that clears a forced
 POLICY is the policy file (POLICY_FILE), JSON. The hook passes it to set_policy() at start.
 docs/design.md explains the rules behind it.
 """
+import codecs
 import re
 import statistics
 import unicodedata
@@ -45,7 +46,8 @@ LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "Germa
               "kor": "Korean", "chi": "Chinese", "rus": "Russian", "hin": "Hindi", "tur": "Turkish", "dut": "Dutch", "swe": "Swedish",
               "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "pol": "Polish", "ara": "Arabic", "heb": "Hebrew", "tha": "Thai",
               "ind": "Indonesian", "vie": "Vietnamese", "gre": "Greek", "cze": "Czech", "hun": "Hungarian", "rum": "Romanian", "ukr": "Ukrainian",
-              "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "bel": "Belarusian", "und": "untagged"}
+              "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "bel": "Belarusian", "afr": "Afrikaans", "aze": "Azerbaijani",
+              "bos": "Bosnian", "bul": "Bulgarian", "cat": "Catalan", "est": "Estonian", "lit": "Lithuanian", "urd": "Urdu", "und": "untagged"}
 NOT_SPEECH = re.compile(r"\w+\s+(score|sub\w*|dub\w*)", re.I)   # audio titles: "UK Dub / Japanese Score"
 NOT_SUB_SPEECH = re.compile(r"\w+\s+dub\w*", re.I)                 # subtitle titles keep "English Subtitles"
 # Subtitle titles. "English Signs", "Alien Only", "For Foreign Parts Only" and "Titles Only" are forced. "Songs SDH"
@@ -586,7 +588,7 @@ TEXT_STOP = 3000     # letters after which the count stops, about 600 words
 TEXT_TELL = 25       # telling words the top language needs for an answer
 TEXT_COVER = 0.2     # the share of all words the top language's whole list must hold. A language with no list holds less.
 TEXT_SHARE = 0.9     # the share of the telling words, or of the letters for a script, the top language must hold
-TEXT_MIXED = 0.75    # a text whose top language holds less than this share is mixed at once. More stays open until TEXT_STOP.
+TEXT_MIXED = 0.75    # a text whose top script or language holds less than this share is mixed at once. More stays open until TEXT_STOP.
 STOPWORDS = {k: frozenset(v.split()) for k, v in {
     "eng": "the you to and it of that what this have your my for not be do are don know just can with all get but there they she him "
            "her his like right well if go out up how about want now come think why who did will would been were had could should going one "
@@ -655,6 +657,17 @@ SCRIPTS = {"GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara", "THAI": "tha", "HAN
 PERSIAN = frozenset("پچژگکی")   # letters Persian writes and Arabic does not
 SOUTH_CYRILLIC = frozenset("јљњћђџѓќѕ")   # Serbian and Macedonian letters. Russian and Ukrainian never write them.
 TEXT_LANGS = frozenset(STOPWORDS) | frozenset(SCRIPTS.values()) | {"per"}   # every language text_language() can name
+# Common Han characters of Chinese dialogue, simplified and traditional. Chinese text holds many of them. The bytes of
+# another codepage decoded as Chinese give rare characters, which hold almost none, see text_judge().
+HAN_COMMON = frozenset("的一是不了在人有我他这這个個们們中来來上大为為和国國地到以说說时時要就出会會可也你对對生能而子那得于着著下自之年"
+                       "过過发發后後作里裡用道行所然家种種事成方多经經么麼去法学學如都同现現当當没沒动動面起看定天分还還进進好小部其些主样樣"
+                       "理心她本前开開但因只从從想实實吗嗎呢吧啊什知怎谁誰哪走让讓给給再太很真跟把被别別请請谢謝嗯喂哦呀快回做告诉訴听聽等"
+                       "叫找问問已爱愛死东東西妈媽爸先姐点點头頭儿兒孩係唔佢嘅咗冇啲喇咁嘢")
+HAN_SHARE = 0.2   # the share of the Han characters that HAN_COMMON must hold for text to read as Chinese
+# Greek writes ς only at the end of a word. Hebrew bytes decoded as cp1253 give it inside words, for the letter ע. So
+# text with ς inside more than this share of its words is no Greek, see text_judge(). A few words of real Greek that
+# lost the space after their ς weigh much at the first counts, so the count reads on to TEXT_STOP.
+GREEK_INNER_SIGMA = 0.01
 TEXT_NOISE = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # SubRip tags, ASS override blocks and ASS line breaks
 TEXT_FOLD = str.maketrans("şţё", "șțе")   # Romanian cedillas to commas below, and Russian ё to е, as the lists spell them
 WORD = re.compile(r"[^\W\d_]+")
@@ -669,17 +682,23 @@ def script_of(c):
 
 def text_judge(words, scripts, letters):
     """(language or None, confidence, why, final) from the counts text_language() keeps. final is False when the top
-    language has too few telling words yet, or holds between TEXT_MIXED and TEXT_SHARE of them, so more text may decide."""
+    script holds between TEXT_MIXED and TEXT_SHARE of the letters, as a few names in Latin letters early in Greek
+    dialogue do. It is also False when the top language has too few telling words yet, or holds between TEXT_MIXED and
+    TEXT_SHARE of them. More text may decide then."""
     if scripts.get("HIRAGANA", 0) + scripts.get("KATAKANA", 0) > 0.1 * scripts.get("CJK", 0):
         scripts = dict(scripts, KATAKANA=scripts.get("KATAKANA", 0) + scripts.get("CJK", 0), CJK=0)   # kanji in Japanese
     top = max(scripts, key=scripts.get)
     n = sum(v for k, v in scripts.items() if SCRIPTS.get(k, k) == SCRIPTS.get(top, top))
     if n < TEXT_SHARE * letters:
-        return None, round(n / letters, 2), f"mixed scripts, {n / letters:.0%} {top.lower()}", True
+        return None, round(n / letters, 2), f"mixed scripts, {n / letters:.0%} {top.lower()}", n < TEXT_MIXED * letters
     if top not in ("LATIN", "CYRILLIC"):
         lang = SCRIPTS.get(top)
         if lang == "ara" and sum(k * sum(c in PERSIAN for c in w) for w, k in words.items()) > 0.05 * n:
             lang = "per"
+        if lang == "chi" and sum(k * sum(c in HAN_COMMON for c in w) for w, k in words.items()) < HAN_SHARE * n:
+            return None, round(n / letters, 2), f"{n / letters:.0%} of the letters are cjk, but few are common Chinese characters", True
+        if lang == "gre" and sum(k for w, k in words.items() if "ς" in w[:-1]) > GREEK_INNER_SIGMA * sum(words.values()):   # more text may decide
+            return None, round(n / letters, 2), f"{n / letters:.0%} of the letters are greek, but ς sits inside words", False
         return lang, round(n / letters, 2), f"{n / letters:.0%} of the letters are {top.lower()}" + ("" if lang else ", which names no one language"), True
     tell = {k: sum(words.get(w, 0) for w in s) for k, s in TELLING.items()}
     lang = max(tell, key=tell.get)
@@ -733,6 +752,177 @@ def sidecar_language(named, read, audio):
     if not (lang and named) or lang_key(named) not in {lang_key(x) for x in TEXT_LANGS} or lang_key(named) == lang_key(lang):
         return None
     return lang, lang_key(lang) in {lang_key(a) for a in audio}, f"named {named}, but the text reads as {lang}: {read[2]}"
+
+
+# Legacy codepages (docs/design.md, "Subtitle text"), by the name mkvmerge and Python share, with the languages each one
+# writes. A sidecar that is not UTF-8 or UTF-16 is in one of them, and so is the text an old muxer read as cp1252, see
+# recode(). The codepages of Chinese, Japanese and Korean come first. Their decode of other text fails on most bytes,
+# and a decode that passes gives rare Han characters, see HAN_COMMON. A one-byte codepage decodes most bytes, and
+# Greek, Hebrew and Arabic letters name their language by their script alone. Serbian is in Latin letters or in Cyrillic.
+CODEPAGES = {"cp950": "chi", "gbk": "chi", "cp932": "jpn", "cp949": "kor",
+             "cp1252": "eng spa por fre ger ita dut afr swe dan nor fin ice cat glg baq ind may wel gle alb",
+             "cp1250": "pol cze slo rum hun hrv slv bos srp", "cp1251": "rus ukr bul bel srp mac", "cp1253": "gre", "cp1254": "tur aze",
+             "cp1255": "heb", "cp1256": "ara per urd", "cp1257": "lit lav est"}
+CP1252_HOLES = (0x81, 0x8D, 0x8F, 0x90, 0x9D)   # the bytes cp1252 leaves undefined
+# cp1252 with each undefined byte as the control character of its value, as Windows reads it. Python's codec raises on them.
+CP1252_TEXT = "".join(chr(b) if b in CP1252_HOLES else bytes([b]).decode("cp1252") for b in range(256))
+CP1252_MAP = codecs.charmap_build(CP1252_TEXT)
+CP1252_RUNS = re.compile("[" + re.escape(CP1252_TEXT) + "]+")   # the runs of a text that cp1252 writes
+REPAIR_CUT = 0.02   # the share of a track's cues a read-back may find cut short, see subtitles.garbled_tracks()
+# The share of the letters a read-back must change to show garbled text, see recode(). In its right codepage, text
+# changes only in a few borrowed words, such as an Italian "perchè" in Romanian dialogue.
+GARBLE_SHARE = 0.01
+# The letters outside ASCII of the languages a one-byte codepage writes in Latin letters, and the script of the others.
+# A read-back keeps a character as it was when it would give a letter outside them, see read_back().
+ALPHABETS = {"pol": "ąćęłńóśźż", "cze": "áčďéěíňóřšťúůýž", "slo": "áäčďéíĺľňóôŕšťúýž", "rum": "ăâîșțşţ", "hun": "áéíóöőúüű",
+             "hrv": "čćđšž", "bos": "čćđšž", "srp": "čćđšž", "slv": "čšž", "tur": "çğıöşüâîûİ", "aze": "çəğıöşüİ",
+             "lit": "ąčęėįšųūž", "lav": "āčēģīķļņšūž", "est": "äöõüšž"}
+SCRIPT_LANGS = {"CYRILLIC": "rus ukr bul bel srp mac", "GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara per urd"}
+SYMBOLS = ("So", "Sc")   # the symbols a read-back always gives, as № and € of cp1251. Marks such as ˇ and ˛ stay kept.
+
+
+def writes(cp):
+    """The language keys of the languages the codepage cp of CODEPAGES writes. UTF-8 writes them all, as None."""
+    return None if cp == "utf-8" else {lang_key(x) for x in CODEPAGES[cp].split()}
+
+
+def reads_as(texts, cp):
+    """The language text_language() reads in texts, when the codepage cp writes it, else None."""
+    lang = text_language(texts)[0]
+    return lang if lang and (cp == "utf-8" or lang_key(lang) in writes(cp)) else None
+
+
+def plausible(text):
+    """Whether a decode gives the letters of one script, and in Latin letters mostly ASCII ones. Cyrillic bytes
+    decoded as cp1250 give Latin letters too, but hardly any ASCII ones."""
+    letters = [c for c in text if c.isalpha()]
+    scripts = {}
+    for c in letters:
+        scripts[script_of(c)] = scripts.get(script_of(c), 0) + 1
+    top = max(scripts, key=scripts.get, default=None)
+    return bool(top) and scripts[top] >= TEXT_SHARE * len(letters) and (top != "LATIN" or sum(c.isascii() for c in letters) >= len(letters) / 2)
+
+
+def letter_of(c, lang):
+    """Whether c is a letter that lang writes: ASCII, one of its ALPHABETS letters or a letter of its script. A
+    language with neither entry takes every letter."""
+    key = lang_key(lang)
+    alphabet = next((v for k, v in ALPHABETS.items() if lang_key(k) == key), None)
+    script = next((s for s, ls in SCRIPT_LANGS.items() if key in {lang_key(x) for x in ls.split()}), None)
+    if alphabet is None and script is None:
+        return c.isalpha()
+    return c.isascii() or c in (alphabet or "") or c.lower() in (alphabet or "") or (script is not None and script_of(c) == script)
+
+
+def read_back(text, cp, lang=None):
+    """(text as the codepage cp reads its cp1252 bytes, True when it ends cut inside a character), see recode().
+    A character that cp1252 does not write stays as it is, as a right "♪" a later tool added. Raises UnicodeError
+    when the bytes of a run between such characters do not decode as cp. With lang, a one-byte codepage keeps a
+    character as it was when its read-back is neither a letter lang writes, see letter_of(), nor a symbol of SYMBOLS.
+    A right "Señor" in Romanian text then stays, where cp1250 would give "Seńor", and Russian "№" reads back. See kept()
+    for the letters that stay too."""
+    out, cut, runs = [], False, list(CP1252_RUNS.finditer(text))
+    pos = 0
+    for k, m in enumerate(runs):
+        out.append(text[pos:m.start()])   # the characters cp1252 does not write
+        pos = m.end()
+        raw = codecs.charmap_encode(m[0], "strict", CP1252_MAP)[0]
+        dec = codecs.getincrementaldecoder(cp)()
+        back = dec.decode(raw)   # a character cut at the end waits in the decoder
+        try:
+            dec.decode(b"", final=True)
+        except UnicodeDecodeError:
+            if k < len(runs) - 1 or pos < len(text):   # only the end of a cue can be cut
+                raise
+            back, cut = back + "\N{REPLACEMENT CHARACTER}", True
+        if lang and cp.startswith("cp125") and len(back) == len(m[0]):
+            back = "".join(g if g != b and kept(m[0], i, b, lang) else b for i, (g, b) in enumerate(zip(m[0], back)))
+        out.append(back)
+    out.append(text[pos:])
+    return "".join(out), cut
+
+
+def kept(run, i, b, lang):
+    """Whether a one-byte read-back keeps run[i] as it was, where the codepage gives b, see read_back(). It keeps a
+    character whose read-back is neither a letter lang writes, see letter_of(), nor a symbol of SYMBOLS. It keeps a
+    Latin letter right after a digit, as the "º" of "40.5ºC", which cp1250 gives as "ş", unless a lowercase letter
+    follows, as in a word joined to a number: "9876ºase" reads back as "9876şase". It keeps a letter of another
+    script in a word that holds ASCII letters too, as the "é" of "Café", which cp1251 gives as "й". Garbled Cyrillic,
+    Greek, Hebrew and Arabic words hold no ASCII letters, because those codepages write their letters above 0x7F."""
+    if not (letter_of(b, lang) or unicodedata.category(b) in SYMBOLS):
+        return True
+    if not b.isalpha():
+        return False
+    if script_of(b) == "LATIN":
+        # "¹".isdigit() holds, and cp1250 reads it as "ą"
+        return i > 0 and run[i - 1] in "0123456789" and not (i + 1 < len(run) and run[i + 1].islower())
+    lo, hi = i, i + 1
+    while lo and run[lo - 1].isalpha():
+        lo -= 1
+    while hi < len(run) and run[hi].isalpha():
+        hi += 1
+    return any(c.isascii() for c in run[lo:hi])
+
+
+def recode(texts):
+    """[(codepage, the language the texts read as, the texts read back, the count of texts cut short)] of each codepage
+    of UTF-8 and CODEPAGES that reads cue texts back, in that order (docs/design.md, "Garbled subtitle repair"). An old
+    muxer that took a sidecar's bytes for cp1252 wrote each byte as the character cp1252 gives it. So the cp1252 bytes
+    of the text are the sidecar's bytes, and read_back() reads them as the codepage they were in. A codepage counts
+    when every text decodes, the read-back changes GARBLE_SHARE of the letters at least, and the texts read as a
+    language it writes. UTF-8 counts with no language too, as when the muxer cut most cues. Text in another codepage
+    does not decode as UTF-8, because that needs pairs such as "Ã©" that real text does not hold. The language is
+    None then. In a codepage of more than one byte, each character outside ASCII that cp1252 writes counts as changed. The muxer
+    cut a cue at a byte cp1252 leaves undefined. A cue cut inside a character, as UTF-8 always cuts it, gets U+FFFD
+    there and counts as cut. A cue cut between two characters only ends early, and the count misses it. In a one-byte
+    codepage that is every cut, such as at Ť and ť of cp1250."""
+    if not any(not t.isascii() for t in texts):
+        return []
+    letters, out = sum(c.isalpha() for t in texts for c in t), []
+    for cp in ("utf-8", *CODEPAGES):
+        if cp == "cp1252":
+            continue
+        try:
+            got = [read_back(t, cp) for t in texts]
+        except UnicodeError:
+            continue
+        back = [t for t, _ in got]
+        changed = sum(sum(a != b for a, b in zip(t, u)) if len(t) == len(u) else sum(not c.isascii() and c in CP1252_TEXT for c in t)
+                      for t, u in zip(texts, back))
+        if changed >= GARBLE_SHARE * letters and ((lang := reads_as(back, cp)) or cp == "utf-8"):
+            out.append((cp, lang, back, sum(c for _, c in got)))
+    return out
+
+
+def garbled(texts, tag):
+    """The verdict on the cue texts of a SubRip track tagged tag, or None when they are not garbled (docs/design.md,
+    "Garbled subtitle repair"). The texts are garbled when they hold enough letters and a codepage of recode() reads
+    them back. A UTF-8 reading wins over the others: Hebrew letters read back from UTF-8 cut at every cue give a few
+    letters that read as Hebrew by their script alone. Else the reading in the tag's language wins, then one in any
+    language, then the first one. The verdict is
+    {"repair", "codepage", "lang", "read", "cut", "cues", "why"}. repair is True under the repair rule: the reading
+    reads as the tag's language. read is the language the texts read as."""
+    texts = list(texts)
+    read = text_language(texts)
+    got = recode(texts) if not read[2].startswith("short") else []
+    if not got:
+        return None
+    got = [g for g in got if g[0] == "utf-8"] or got   # text that decodes as UTF-8 is UTF-8, even when the muxer cut most of it
+    cp, lang, _, cut = min(got, key=lambda g: (lang_key(g[1]) != lang_key(tag), g[1] is None))
+    why = None if lang and lang_key(lang) == lang_key(tag) else f"the track is tagged {tag}"
+    return {"repair": not why, "codepage": cp, "lang": lang, "read": read[0], "cut": cut, "cues": len(texts),
+            "why": f"read back as {cp}, the text reads as {lang or 'no language'}" + (f", but {why}" if why else "")}
+
+
+def repair_fault(texts, tag):
+    """Why the repaired cue texts of a track tagged tag may not go in, or None. They must read as the tag's language,
+    and garbled() must find no reading in them, as it finds in text garbled twice."""
+    read = text_language(texts)[0]
+    if lang_key(read) != lang_key(tag):
+        return f"the repaired text reads as {read or 'no language'}, not as {tag}"
+    if g := garbled(texts, tag):
+        return f"the repaired text is still garbled: {g['why']}"
+    return None
 
 
 def duration(j):

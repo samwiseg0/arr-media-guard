@@ -79,6 +79,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
                 with runner.locked() as lock:
                     rec = subtitles.swept_before(run(lock, False, None), ex)
     except Exception as ex:
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+            raise
         rec = dict(app=app, source="backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, rec
 
@@ -207,7 +209,8 @@ def backfill(argv):
         for code in {"repacked", *config.REPAIRED, "would_repair_header"} & set(rec.get("reasons", [])) - {rec["outcome"]}:   # each file once
             counts[code] = counts.get(code, 0) + 1
         if rec.get("edits") or rec.get("findings") or rec.get("heard") or "repack" in rec or "header_repair" in rec or rec.get("subcheck") \
-                or rec.get("flash") or rec["outcome"] in ("undecided", "dropped", "error", "verify_failed", "edit_failed", "read_only", "hardlinked"):
+                or rec.get("flash") or rec.get("garbled") or rec["outcome"] in ("undecided", "dropped", "error", "verify_failed", "edit_failed", "read_only",
+                                                                                 "hardlinked"):
             print(report.render(rec, "cli"), flush=True)
         if a.apply and process.changed(rec) and want and config.CFG.plex_url:
             p = plex.plex_after(app, "backfill", rec, want)

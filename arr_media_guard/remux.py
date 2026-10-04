@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import contextlib, fractions, os, re, shutil, signal, statistics, subprocess, threading, time
+import bisect, contextlib, fractions, itertools, os, re, shutil, signal, subprocess, threading, time
 
 from . import checks, config, decide, logs, proof, runner, subsync, vault
 
@@ -368,13 +368,13 @@ def props_fault(j, new, drop=()):
 def srt_moved(text, fix):
     """SubRip text with each time line moved by fix, see subsync.moved(). A start before 0 becomes 0. An end at or
     before 0 becomes 1 ms, so the cue never shows. mkvmerge drops a cue of length 0, and the proof of a conversion
-    then refuses the new file. The rest of the text stays as it is."""
+    then refuses the new file. The rest of the text stays as it is, its line ends too."""
     ms = lambda h, m, sec, f: int(h) * 3600000 + int(m) * 60000 + int(sec) * 1000 + int(f.ljust(3, "0")[:3])
     at = lambda x, lo=0: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(max(lo, subsync.moved(x, fix)))
     def line(m):
         g = m.groups()
         return f"{at(ms(*g[:4]))} --> {at(ms(*g[4:8]), 1)}{g[8]}"
-    return "\n".join(decide.SRT_TIME.sub(line, x) for x in text.replace("\r\n", "\n").split("\n"))
+    return "".join(x if k % 2 else decide.SRT_TIME.sub(line, x) for k, x in enumerate(re.split(r"(\r\n|\r|\n)", text)))
 
 
 def flash_plan(cues, ass=False):
@@ -384,49 +384,71 @@ def flash_plan(cues, ass=False):
     return [(s, t, e, round(n, 2) if ass else n) for (s, e, t), n in zip(cues, ends)] if ends else None
 
 
+class Plan(list):
+    """The rows of a time_plan(), with the blocks it follows in blocks. So blocks_moved() counts each cue with its
+    block."""
+    blocks = ()
+
+
 def time_plan(cues, fix, blocks, ends=None, ass=False):
-    """[(start, text, old end, new start, new end)] of cues [(start, end, text)] in their order, or None when no time
-    moves. fix is a fix of subsync.timing(), or None. blocks are the blocks of subsync.blocks(). A cue starts at
+    """A Plan [(start, text, old end, new start, new end)] of cues [(start, end, text)] in their order, or None when no
+    time moves. fix is a fix of subsync.timing(), or None. blocks are the blocks of subsync.blocks(). A cue starts at
     moved(start, fix) less the shift of the block whose [from, to) holds its start, unless the block keeps that start,
-    rounded to ms, in "keep": a cue with no evidence of its own stays. ends are the new ends of
-    flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does. A start
-    stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an ASS time
-    rounds to them, and an ASS end stays 1 cs after its start."""
+    rounded to ms, in "keep": a cue with no evidence of its own stays, see subsync.mover(). Each start takes the shift
+    of subsync.shift_of(): its own shift on a live-captioned track, see subsync.live_moves(), or the shift the block's
+    "clamp" names, so it stops one centisecond short of the cue next to it, see subsync.clamped(). ends are the new ends
+    of flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does. A cue
+    a live block moves ends at the next later new start at most, as live captions end where the next line starts. It
+    still shows subsync.FLASH seconds or its planned length, the less, so no cue turns into a flash. A few cues then
+    show over the next one, by under half a second on live tracks. A
+    start stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an ASS
+    time rounds to them, and an ASS end stays 1 cs after its start. With subsync.INVARIANTS, subsync.ordered() checks
+    the order of the new starts."""
     step = 10 if ass else 1   # ms
     at = lambda t, shift: round(((subsync.moved(t * 1000, fix) if fix else t * 1000) - shift * 1000) / step) * step
-    out = []
+    out, live = [], []
     for k, (s, e, text) in enumerate(cues):
-        shift = next((b["shift"] for b in blocks or () if b["from"] <= s < b["to"] and round(s, 3) not in b.get("keep", ())), 0)
+        b = subsync.mover(blocks, s)
+        shift = subsync.shift_of(b, s) if b else 0
         a = max(0, at(s, shift))
         out.append((s, text, e, a / 1000, max(at(ends[k] if ends else e, shift), a + step) / 1000))
-    return out if any(abs(a - s) + abs(b - e) > 0.0005 for s, _, e, a, b in out) else None
+        live.append(bool(b) and "shifts" in b)
+    if any(live):
+        later = sorted({a for *_, a, _ in out}) + [float("inf")]
+        out = [(s, text, e, a, max(min(n, later[bisect.bisect_right(later, a)]), a + min(n - a, subsync.FLASH), a + step / 1000) if moved else n)
+               for (s, text, e, a, n), moved in zip(out, live)]
+    if subsync.INVARIANTS:   # the order rule
+        subsync.ordered([(s, max(0, at(s, 0)) / 1000, a) for s, _, _, a, _ in out], {"cues": cues, "fix": fix, "blocks": blocks, "ends": ends, "ass": ass, "plan": out})
+    plan = Plan(out)
+    plan.blocks = blocks
+    return plan if any(abs(a - s) + abs(b - e) > 0.0005 for s, _, e, a, b in out) else None
 
 
 def blocks_moved(plan, fix=None):
     """How the time_plan() plan moves its cues past fix, the whole-track fix it holds, as "14 cues of 1 block moved
-    -1.42 s", or None when it moves none. A block is a run of cues in start order that move by the same time, within
-    0.05 s. A move under 0.05 s is the rounding of ASS times."""
-    runs = []
+    -1.42 s", or None when it moves none. Each cue counts with the block that moves it, see subsync.mover(), a cue that
+    moves part of the way too, see subsync.clamped(). A block gives its shift. A move under 0.05 s is the rounding of
+    ASS times. A live-captioned track moves each cue by its own time, so it gives the range, as "1203 cues moved
+    -18.20 s to -3.10 s, each by its own time"."""
+    runs = {}
     for s, _, _, a, _ in sorted(plan, key=lambda p: p[0]):
-        d = a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
-        if abs(d) <= 0.05:
-            runs.append(None)
-        elif runs and runs[-1] and abs(d - runs[-1][-1]) <= 0.05:
-            runs[-1].append(d)
-        else:
-            runs.append([d])
-    runs = [r for r in runs if r]
+        b, d = subsync.mover(plan.blocks, s), a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
+        if b is not None and abs(d) > 0.05:
+            runs.setdefault(id(b), (b, []))[1].append(d)
     if not runs:
         return None
-    return (f"{sum(map(len, runs))} cues of {len(runs)} block{'s' if len(runs) > 1 else ''} moved "
-            + ", ".join(f"{statistics.median(r):+.2f} s" for r in runs))
+    if any("shifts" in b for b, _ in runs.values()):
+        moves = sorted(d for _, ds in runs.values() for d in ds)
+        return f"{len(moves)} cues moved {moves[0]:+.2f} s to {moves[-1]:+.2f} s, each by its own time"
+    return (f"{sum(len(ds) for _, ds in runs.values())} cues of {len(runs)} block{'s' if len(runs) > 1 else ''} moved "
+            + ", ".join(f"{-b['shift']:+.2f} s" for b, _ in runs.values()))
 
 
 def set_ends(text, ass, plan):
     """The text of a SubRip, ASS or SSA file with the new times of plan in their order. plan is a time_plan(), or a
     flash_plan(), whose starts stay. A SubRip cue pairs with the plan by its place and must have the plan's old start.
-    An ASS event pairs by its start and text, because mkvextract may write the events in another order. A cue must
-    also have the plan's old end, within 2 ms. mkvextract cuts an ASS time to centiseconds, so an ASS end must be the
+    An ASS event pairs by its start, cut to centiseconds as mkvextract writes it, and its text, because mkvextract may
+    write the events in another order. A cue must also have the plan's old end, within 2 ms. mkvextract cuts an ASS time to centiseconds, so an ASS end must be the
     old end cut the same way. A start that does not move keeps its text. Raises when a cue finds no pair.
 
     A block with no BlockDuration has no known end, and timed() makes one up for the plan. mkvextract then writes an
@@ -439,11 +461,11 @@ def set_ends(text, ass, plan):
         todo, clock = {}, lambda t: sum(float(x) * m for x, m in zip(t.split(":"), (3600, 60, 1)))
         cs = lambda x: (lambda v: f"{v // 360000}:{v // 6000 % 60:02d}:{v // 100 % 60:02d}.{v % 100:02d}")(round(x * 100))
         for s, t, o, a, e in plan:
-            todo.setdefault((round(s * 100), t), []).append((o, a, e))
+            todo.setdefault((round(s * 1000) // 10, t), []).append((o, a, e))   # mkvextract cuts a start to centiseconds too
         for k, line in enumerate(lines):
             m = re.match(r"(Dialogue:\s*[^,]*,)([^,]*),([^,]*)((?:,[^,]*){6},(.*))$", line.rstrip("\r"))
             if m:
-                twins, end = todo[(round(clock(m[2]) * 100), m[5])], round(clock(m[3]) * 100)
+                twins, end = todo.get((round(clock(m[2]) * 100), m[5])) or [], round(clock(m[3]) * 100)
                 n = next((n for n, (o, _, _) in enumerate(twins) if round(o * 1000) // 10 == end), None)
                 if n is None:
                     raise RuntimeError(f"the ASS event at {clock(m[2]):.3f} s has no duration in the file, so its end is not known"
@@ -474,20 +496,23 @@ def set_ends(text, ass, plan):
     return "\n".join(lines)
 
 
-def ended_track(path, j, tid, plan, folder):
+def ended_track(path, j, tid, plan, folder, text=None):
     """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new times of plan, a
     time_plan() or a flash_plan(). mkvextract writes the track's text, set_ends() puts the times in, and mkvmerge reads
     it back. That round trip keeps the packets and the ASS header byte for byte. The language goes in here, as ffmpeg
-    copies it. The flags and names come back later with mkvpropedit, see resub()."""
+    copies it. The flags and names come back later with mkvpropedit, see resub(). text takes the place of plan for a
+    repair, see resub(): the new SubRip text, which needs no mkvextract, or a function of the extracted text."""
     p = next(t.get("properties") or {} for t in j.get("tracks") or [] if t.get("id") == tid)
     codec = p.get("codec_id")
     ext = {"S_TEXT/UTF8": "srt", "S_TEXT/ASS": "ass", "S_TEXT/SSA": "ssa"}[codec]
     raw, out = os.path.join(folder, f"{tid}.{ext}"), os.path.join(folder, f"{tid}.mkv")
-    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvextract", path, "tracks", f"{tid}:{raw}"], capture_output=True, text=True, errors="replace")
-    if r.returncode:   # 1 is a warning, and a fix never builds on one
-        raise RuntimeError(f"mkvextract exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
-    with open(raw, encoding="utf-8", newline="") as f:
-        text = set_ends(f.read(), ext != "srt", plan)
+    if not isinstance(text, str):
+        r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvextract", path, "tracks", f"{tid}:{raw}"], capture_output=True, text=True,
+                           errors="replace")
+        if r.returncode:   # 1 is a warning, and a fix never builds on one
+            raise RuntimeError(f"mkvextract exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
+        with open(raw, encoding="utf-8", newline="") as f:
+            text = text(f.read()) if text else set_ends(f.read(), ext != "srt", plan)
     with open(raw, "w", encoding="utf-8", newline="") as f:
         f.write(text)
     r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", "-o", out, "--sub-charset", "0:UTF-8", "--language",
@@ -495,6 +520,127 @@ def ended_track(path, j, tid, plan, folder):
     if r.returncode:
         raise RuntimeError(f"mkvmerge exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
     return out
+
+
+def repair_name(r):
+    """What the repair r of a garbled track writes, see repair_text(): "its text read back as cp950", and "with 1 cue
+    from Movie.3.srt" when a sidecar fills cut cues."""
+    side = f' with {r["filled"]} cue{"s" if r["filled"] > 1 else ""} from {r["sidecar"]["name"]}' if r.get("sidecar") else ""
+    return f'its text read back as {r["codepage"]}{side}'
+
+
+def repaired(texts, cp, tag, side=None):
+    """(the repaired cue texts, the places of the cues that side fills, the count of cues left cut) of the cue texts of a
+    garbled SubRip track tagged tag, read back as the codepage cp (docs/design.md, "Garbled subtitle repair"). side,
+    the cue texts of a sidecar in the same order, may fill the cues the old muxer cut: there the read-back is the start
+    of the sidecar's text, and the next character holds a byte cp1252 leaves undefined. Every other cue of side must
+    equal the read-back, as srt_cues() compares text. Else the result is None, because the sidecar is not the source of
+    the track: a garbled copy, the track extracted again or an SDH version."""
+    if side is not None and len(side) != len(texts):
+        return None
+    out, filled, left = [], [], 0
+    for k, t in enumerate(texts):
+        back, cut = decide.read_back(t, cp, tag)
+        if side is not None:
+            mine, theirs = proof.clean_text(back.removesuffix("\N{REPLACEMENT CHARACTER}")), proof.clean_text(side[k])
+            if theirs != mine or cut:
+                rest = theirs[len(mine):].lstrip() if theirs.startswith(mine) else ""
+                if not (rest and set(rest[0].encode(cp, errors="ignore")) & set(decide.CP1252_HOLES)):
+                    return None
+                out.append(side[k])
+                filled.append(k)
+                continue
+        left += cut
+        out.append(back)
+    return out, filled, left
+
+
+def srt_rewrite(text, fix):
+    """text, a SubRip text, with the text of its cues replaced by fix() of their texts, the lines of each joined by a
+    line break. The numbers, the times and the lines between the cues stay as they are."""
+    parts = re.split(r"(\n[ \t]*\n)", text.replace("\r\n", "\n"))   # the blocks and the blank lines between them
+    cues = []
+    for i in range(0, len(parts), 2):
+        lines = parts[i].split("\n")
+        k = next((n for n, line in enumerate(lines[:2]) if decide.SRT_TIME.match(line)), None)
+        if k is not None:
+            cues.append((i, k))
+    for (i, k), t in zip(cues, fix(["\n".join(parts[i].split("\n")[k + 1:]) for i, k in cues])):
+        parts[i] = "\n".join(parts[i].split("\n")[:k + 1] + ([t] if t else []))
+    return "".join(parts)
+
+
+def side_blocks(side):
+    """srt_blocks() of the sidecar_subs() entry side as it is on disk now, its lines joined by a line break."""
+    with open(side["path"], "rb") as f:
+        return proof.srt_blocks(proof.sidecar_text(f.read(), side.get("named"))[1], "\n")
+
+
+def repair_text(r):
+    """(the new text for ended_track(), a function of srt_blocks() of the old text that gives the new cues for prove())
+    of the repair r of a garbled SubRip track (docs/design.md, "Garbled subtitle repair"). r holds "codepage", which
+    reads the track back, see repaired(), and "lang", its tag. With "sidecar", the sidecar_subs() entry, the sidecar
+    fills the cut cues. It must still hold "side", the cues the check read, else the remux stops: a sidecar written
+    again since then is read again, and never with the charset the check gave it. The new text must pass
+    decide.repair_fault(), and at most decide.REPAIR_CUT of all its cues may stay cut. A cue that does not read back
+    stops the remux too."""
+    side = None
+    if r.get("sidecar"):
+        now = [list(b) for b in side_blocks(r["sidecar"])]
+        if now != [list(b) for b in r["side"]]:
+            raise RuntimeError(f'the sidecar {r["sidecar"]["name"]} changed since the check')
+        side = [t for _, _, t in now]
+
+    def fix(texts):
+        try:
+            got = repaired(texts, r["codepage"], r["lang"], side)
+        except UnicodeError:
+            raise RuntimeError(f'some of its cues do not read back as {r["codepage"]}') from None
+        if got is None:
+            raise RuntimeError(f'the sidecar {r["sidecar"]["name"]} no longer fits the track')
+        why = (f"{got[2]} of {len(texts)} cues were cut short" if got[2] > decide.REPAIR_CUT * len(texts) else None) \
+            or decide.repair_fault(got[0], r["lang"])
+        if why:
+            raise RuntimeError(why)
+        return got[0]
+    return (lambda text: srt_rewrite(text, fix)), (lambda blocks: [(a, b, t) for (a, b, _), t in zip(blocks, fix([t for _, _, t in blocks]))])
+
+
+def text_name(path, lang, taken=()):
+    """The first free name beside the video path for the bytes of a garbled track tagged lang, see resub():
+    <base>.<lang>.garbled.txt, then <base>.<lang>.garbled.1.txt and on. Players skip a .txt file. A name in taken is
+    used too."""
+    base = os.path.splitext(path)[0]
+    for n in itertools.count():
+        name = f"{base}.{lang}.garbled{f'.{n}' if n else ''}.txt"
+        if name not in taken and not os.path.lexists(name):
+            return name
+
+
+def keep_text(src, path, lang, st):
+    """Copy the file src beside the video path under text_name(), with the video's owner and mode less any execute
+    bits, and return the new path. It never writes over a file. It reads the copy back and raises when its bytes are
+    not those of src."""
+    with open(src, "rb") as f:
+        data = f.read()
+    while True:
+        name = text_name(path, lang)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, st.st_mode & 0o666)
+            break
+        except FileExistsError:   # a file came since text_name() looked
+            continue
+    with os.fdopen(fd, "wb") as f:
+        os.fchmod(fd, st.st_mode & 0o666)   # os.open() applies the umask
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    with contextlib.suppress(PermissionError):   # a NAS share may refuse chown. The mode stays.
+        os.chown(name, st.st_uid, st.st_gid)
+    with open(name, "rb") as f:
+        if f.read() != data:
+            raise RuntimeError(f"{os.path.basename(name)} does not hold the bytes of its track")
+    return name
 
 
 def cover_edits(path, j, pics, folder):
@@ -517,13 +663,18 @@ def cover_edits(path, j, pics, folder):
     return out
 
 
-def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
+def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None, strip=None):
     """Remux a Matroska file in place with new times for the subtitle tracks in fixes, {mkvmerge track id: fix of
     subsync.timing()}, new cue ends for the text tracks in ends, {mkvmerge track id: the plan of flash_plan()}, new
-    times for the text tracks in timed, {mkvmerge track id: time_plan()}, and without the subtitle track ids in drop,
-    in one remux under the caller's exclusive file lock (docs/design.md, "Subtitle match"). Returns (code, result,
+    times for the text tracks in timed, {mkvmerge track id: time_plan()}, new text for the garbled SubRip tracks in
+    recode, {mkvmerge track id: its repair, see repair_text()}, and without the subtitle track ids in drop and in
+    strip, in one remux under the caller's exclusive file lock (docs/design.md, "Subtitle match"). Returns (code, result,
     info). result is "subtitles remuxed", "would remux subtitles: ...", "subtitle remux failed: ..." or "subtitle remux
     skipped, ...", and code subtitles_remuxed, would_remux_subtitles, subtitle_remux_failed or subtitle_remux_skipped.
+
+    A track in recode comes from its own input as a track in ends does, with the text of its repair, see repair_text().
+    Its times stay. A repair with default_off turns its default flag off in the same remux. The proof holds each cue to
+    the repair's text and to the original's times, see prove().
 
     A track with new ends comes from its own input: mkvextract writes its text, set_ends() puts each new end in, and
     mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, and the proof
@@ -541,18 +692,31 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
     UID, which ffmpeg does not keep. The new file must keep every other track and its properties (props_fault()), and
     prove() must show every packet of every kept stream the same, the retimed tracks' times as the fix moves them.
 
+    A garbled SubRip track in strip, {mkvmerge track id: its language tag}, leaves the file, and its bytes go beside the
+    video, see keep_text(). The remux's ffmpeg also writes its packets as they are into a SubRip file, and
+    proof.packet_text() shows each cue's bytes equal to its packet's. After the proof and the kept original, keep_text()
+    copies that file beside the video. A failure after that removes the copy. info["garbled_text"] names each copy.
+
     It runs like repack(): the temp file in hide_dir, no time limit during the remux, and SIGTERM removes the temp file.
     The original must still be the file st describes. The temp file takes its owner and mode, the original is kept in
     originals_root() for keep_days, and the temp file is renamed over it. A removal needs that kept original, so with
     KEEP_ORIGINALS_DAYS 0 the caller never asks for one. The extracted text, the proof's reads and the cover
     attachments go into a folder under STATE_DIR, never the system temp dir, which is often a small tmpfs."""
-    ends, timed = ends or {}, timed or {}
+    ends, timed, recode, strip = ends or {}, timed or {}, recode or {}, strip or {}
+    drop = [*drop, *strip]
+    names, written = {}, []
+    for i, lang in strip.items():   # the plan's names. keep_text() takes the first free name when it writes.
+        names[i] = text_name(path, lang, names.values())
     info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()},
-            **({"timed": {str(i): len(plan) for i, plan in timed.items()}} if timed else {})}
+            **({"timed": {str(i): len(plan) for i, plan in timed.items()}} if timed else {}),
+            **({"recode": {str(i): repair_name(r) for i, r in recode.items()}} if recode else {}),
+            **({"garbled_text": {str(i): os.path.basename(n) for i, n in names.items()}} if strip else {})}
     what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
                      + [f"track {i}: new ends for {sum(e != o for _, _, o, e in plan)} of {len(plan)} cues" for i, plan in ends.items()]
                      + [f"track {i}: {blocks_moved(plan, fixes.get(i)) or f'new times for {len(plan)} cues'}" for i, plan in timed.items()]
-                     + [f"remove track {i}" for i in drop])
+                     + [f"track {i}: {repair_name(r)}" + (", default flag off" if r.get("default_off") else "") for i, r in recode.items()]
+                     + [f"remove track {i}" for i in drop if i not in strip]
+                     + [f"take out track {i}, its bytes to {os.path.basename(n)}" for i, n in names.items()])
     why = repack_skip(path, st)
     if why:
         return "subtitle_remux_skipped", f"subtitle remux skipped, {why}: {what}", info
@@ -568,6 +732,10 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
             raise RuntimeError(f"ffprobe reads {len(text)} subtitle streams and mkvmerge {len(subs)}")
         moved, gone = {text[subs.index(i)]: f for i, f in fixes.items() if i not in timed}, {text[subs.index(i)] for i in drop}
         ended = {text[subs.index(i)]: ended_track(path, j, i, plan, folder) for i, plan in {**ends, **timed}.items()}
+        repairs = {i: repair_text(r) for i, r in recode.items()}   # (the new text for ended_track(), the cues for the proof)
+        ended.update({text[subs.index(i)]: ended_track(path, j, i, None, folder, new) for i, (new, _) in repairs.items()})
+        j = dict(j, tracks=[dict(t, properties=dict(t.get("properties") or {}, default_track=False)) if (recode.get(t.get("id")) or {}).get("default_off")
+                            else t for t in j.get("tracks") or []])   # the new flags, for mkvpropedit and props_fault()
         argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
         own = sorted(set(moved) | set(ended))
         for x in own:   # one input per track: -itsoffset holds for a whole input
@@ -585,11 +753,18 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
         clamp = lambda k: (f"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(1\\,PTS+DURATION*{k})\\,DURATION*{k})")
         argv += [a for n, x in enumerate(kept) if x in moved for a in (f"-bsf:{n}", clamp(repr(1 / float(fractions.Fraction(moved[x]["rate"])))))]
         argv += ["-c", "copy", "-copyinkf", "-default_mode", "passthrough", "-f", "matroska", tmp]
+        texts = {i: (os.path.join(folder, f"{i}.garbled.srt"), os.path.join(folder, f"{i}.md5")) for i in strip}   # the same read writes them
+        for i, (srt, md5) in texts.items():
+            x = text[subs.index(i)]
+            argv += ["-map", f"0:{x}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{x}", "-c", "copy", "-f", "srt", srt]
         new_tmp(tmp)
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         if r.returncode or info["warnings"]:
             raise RuntimeError(f"ffmpeg exited {r.returncode}: {info['warnings']}")
+        for i, (srt, md5) in texts.items():
+            if why := proof.packet_text(srt, md5):
+                raise RuntimeError(f"the bytes of track {i} were not written whole: {why}")
         uid = ((j.get("container") or {}).get("properties") or {}).get("segment_uid")
         edits = ["--edit", "info", "--set", f"segment-uid=0x{uid}"] if uid else []
         for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("id") not in drop), 1):   # the n-th track of the new file
@@ -608,14 +783,21 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None):
             refused, info["proof"] = proof.prove(path, tmp, [], folder, dropped=gone, absolute=True,
                                                  retimed={kept.index(i): f for i, f in fixes.items() if i not in timed},
                                                  ended={kept.index(i): [e for _, _, _, e in plan] for i, plan in ends.items() if i not in timed},
-                                                 timed={kept.index(i): [(a, e) for _, _, _, a, e in plan] for i, plan in timed.items()})
+                                                 timed={kept.index(i): [(a, e) for _, _, _, a, e in plan] for i, plan in timed.items()},
+                                                 recoded={kept.index(i): cues for i, (_, cues) in repairs.items()})
             fault = refused and refused[1]
         if fault: raise RuntimeError(fault)
         size = sw.own()
         sw.check("the app replaced or renamed the original during the subtitle remux", config.CFG.keep_days)
+        for i, (srt, _) in texts.items():
+            written.append(keep_text(srt, path, strip[i], st))
+            info["garbled_text"][str(i)] = os.path.basename(written[-1])
         os.replace(tmp, path)
     except BaseException as ex:
         sw.unkeep(path)
+        for n in written:
+            with contextlib.suppress(OSError):
+                os.remove(n)
         if not isinstance(ex, Exception):
             raise
         return "subtitle_remux_failed", config.mask(f"subtitle remux failed{', the original changed' if isinstance(ex, SourceChanged) else ''}: {ex}")[:500], info

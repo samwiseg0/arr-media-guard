@@ -152,6 +152,56 @@ def test_carry_never_fails_an_edit(tmp_path):
     arr_lid.carry(str(tmp_path / "gone.mkv"), os.stat(media), str(broken))   # so is OSError
 
 
+def test_the_spans_of_speech_come_from_the_cache_and_follow_an_edit(tmp_path, monkeypatch):
+    """speech() answers from the cache by path, size, mtime, stream and the VAD settings, with no model and no ffmpeg.
+    An edit changes the mtime and never the audio, so carry() moves the spans to the new stat. A change of the VAD
+    settings misses the row, so the audio is read again, and so does a new faster-whisper, which bundles the VAD model."""
+    media, cache = tmp_path / "a.mkv", str(tmp_path / "lid.sqlite")
+    media.write_bytes(b"x")
+    st, spans = os.stat(media), [[1.0, 2.5], [4.0, 6.0]]
+    with contextlib.closing(arr_lid._db(cache)) as db, db:
+        db.execute("INSERT INTO speech VALUES (?, ?, ?, ?, ?, ?, ?)", (str(media), st.st_size, st.st_mtime_ns, 0, arr_lid.speech_how(), json.dumps(spans), time.time()))
+    assert arr_lid.speech(str(media), 0, cache) == {"spans": spans, "cached": True, "took": pytest.approx(0, abs=1)}
+    os.utime(media, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    arr_lid.carry(str(media), st, cache)
+    assert arr_lid.speech(str(media), 0, cache)["spans"] == spans
+    how = arr_lid.speech_how()
+    monkeypatch.setattr("importlib.metadata.version", lambda name: "9.9.9")
+    assert arr_lid.speech_how() == how.replace(how.split("/")[0], "silero@faster-whisper-9.9.9") != how
+    monkeypatch.setattr(arr_lid, "speech_how", lambda: "0.6/0.4/0.5")
+    with pytest.raises(Exception):   # a miss reads the audio, and this file holds none
+        arr_lid.speech(str(media), 0, cache)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("mkvmerge") is None, reason="no ffmpeg or no mkvmerge")
+def test_the_speech_runs_on_the_files_clock_when_the_audio_starts_late(tmp_path, monkeypatch):
+    """An audio track that starts 1.5 s after the video decodes from its first packet. start_delay() gives the delay, and
+    speech() adds it, so a burst at 5 s of the audio is speech at 6.5 s of the file. A track with no delay gets 0."""
+    src = tmp_path / "av.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=32x32:rate=5:duration=12", "-f", "lavfi", "-i",
+                    "aevalsrc=if(between(t\\,5\\,7)\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d=12", "-c:v", "mpeg4", "-c:a", "flac", str(src)], check=True)
+    late = tmp_path / "late.mkv"
+    subprocess.run(["mkvmerge", "-q", "-o", str(late), "--sync", "1:1500", str(src)], check=True)
+    assert arr_lid.start_delay(str(src), 0) == 0.0 and arr_lid.start_delay(str(late), 0) == pytest.approx(1.5, abs=0.002)
+    np = pytest.importorskip("numpy")
+    vad = type(sys)("faster_whisper.vad")
+    vad.get_vad_model = lambda: lambda a: (np.abs(a.reshape(-1, 512)).max(axis=1) > 0.1).astype(np.float32)   # loud frames speak
+    monkeypatch.setitem(sys.modules, "faster_whisper", type(sys)("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
+    for path, at in ((src, 5.0), (late, 6.5)):
+        (a, b), = arr_lid.speech(str(path), 0, str(tmp_path / "lid.sqlite"))["spans"]
+        assert a == pytest.approx(at, abs=0.05) and b == pytest.approx(at + 2, abs=0.1), (path, a, b)
+
+
+def test_the_speech_read_yields_between_its_chunks(tmp_path, monkeypatch, capsys):
+    """--speech passes the gate and the queue to speech(), and checks.lid_speech() passes them to lid.py. speech()
+    asks waits() after each chunk, stops ffmpeg, and caches nothing."""
+    got = []
+    monkeypatch.setattr(arr_lid, "speech", lambda path, idx, cache, gate=None, queue=None: got.append((gate, queue)) or {"yielded": True})
+    assert arr_lid.main(["f.mkv", "0", "600", "--speech", "--yield-queue", "q.sqlite"]) == 0 and got == [(None, "q.sqlite")], got
+    assert json.loads(capsys.readouterr().out.strip())["yielded"]
+
+
 def test_one_window_never_votes_twice(fake):
     """A 40-second file fits one window. It gets one cut, so one vote and no answer."""
     calls, media, cache = fake
@@ -370,7 +420,8 @@ def test_jobs_hear_the_windows_the_hook_would_pick(ears, tmp_path):
     spec.write_text(json.dumps([{"index": 1, "lang": "eng", "cues": cues, "duration": 1320.0}]))
     (got,) = arr_lid.jobs(media, str(spec), cache)
     first = arr_subsync.windows(cues, 1320.0, arr_decide.STOPWORDS["eng"])
-    assert got == {"index": 1, "starts": first} and arr_lid.words_get(cache, media, 1, arr_lid.tag(arr_lid.MODEL), "eng", first) is not None
+    assert got == {"index": 1, "starts": first}
+    assert arr_lid.words_get(cache, media, 1, arr_lid.tag(arr_lid.MODEL), "eng", first, arr_subsync.WINDOW) is not None   # the hook's key
 
 
 def test_the_sweep_hears_each_group_as_one_clip_in_one_process(monkeypatch, capsys):

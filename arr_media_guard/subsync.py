@@ -19,13 +19,18 @@ time. lid.listen() hears two short windows of the audio. This module compares th
 - blocks() times a block of cues that sits off while the rest of the track is in time, as after an edit. The sweep finds
   it, see suspects(), dense hearing hears it in full, see dense(), and only the cues of a block whose heard cues agree
   move.
+- layout() checks a subtitle that no word check reads by where its lines show: over the spans of speech that Silero
+  VAD found in the audio, see voiced().
 """
 import bisect
 import collections
 import difflib
+import json
 import math
+import os
 import re
 import statistics
+import tempfile
 from fractions import Fraction
 
 from . import decide
@@ -86,20 +91,28 @@ def flat(cues, stop=frozenset()):
     return out
 
 
-def windows(cues, duration, stop=frozenset(), have=(), secs=WINDOW, taken=(), parts=PARTS):
+def word_times(cues, stop=frozenset()):
+    """The times of the content words of cues, see flat(), in order. Song lyrics never count, because Whisper hears
+    singing badly. windows() and dense() pick their windows by them."""
+    return [x[0] for x in flat([c for c in cues if not MUSIC.search(NOISE.sub(" ", c[2]))], stop)]
+
+
+def windows(cues, duration, stop=frozenset(), have=(), secs=WINDOW, taken=(), parts=PARTS, ts=None):
     """[a start in seconds per part], or [] when a part of the file holds no cue. parts are shares of the duration,
     PARTS by default: one early and one late window near the ends of the file, for the drift. In each part it takes the
-    window of secs that holds the most cue content words. Song lyrics never count, because Whisper hears singing badly.
+    window of secs that holds the most cue content words, see word_times(). ts is word_times() of cues when the caller
+    has it, so a caller that picks a window in each minute builds it once.
     have lists (start, seconds) of audio that is decoded already, the language check's samples. A window inside one of
     them wins when it holds 3/4 of the best count, so that audio is not decoded again. taken lists windows heard already.
     A window that overlaps one never comes back, and a part with no other place gives None, so the caller can pick a
     third window in the same part."""
-    ts = [x[0] for x in flat([c for c in cues if not MUSIC.search(NOISE.sub(" ", c[2]))], stop)]
+    ts = word_times(cues, stop) if ts is None else ts
     count = lambda s: bisect.bisect_left(ts, s + secs) - bisect.bisect_left(ts, s)
     free = lambda s: all(s + secs <= a or s >= a + WINDOW for a in taken)
     out = []
     for lo, hi in ((a * duration, b * duration) for a, b in parts):
-        starts = [s for s in (max(lo, t - 0.5) for t in ts if lo <= t <= hi - secs) if free(s)]   # half a second before a word
+        inner = ts[bisect.bisect_left(ts, lo):bisect.bisect_right(ts, hi - secs)]   # the words of the part, in order
+        starts = [s for s in (max(lo, t - 0.5) for t in inner) if free(s)]   # half a second before a word
         if not starts:
             if not taken:
                 return []
@@ -461,27 +474,49 @@ def near(ts, rs, rate, offset, tol):
     return out
 
 
-def align(ts, rs, rate, around=0.0, reach=SEARCH, clear=0):
-    """The offset that puts the most cue starts ts near reference starts rs at rate, as cue = rate * reference +
-    offset, or None. Each pair whose offset lies within reach of around votes for it in bins of STEP, and three
-    neighbour bins count as one. The peak nearest around wins a tie. With clear, a peak over 1 s from around needs more
-    than clear times the votes of every offset over 1 s from it, else there is no offset. The median of the pairs near
-    the peak refines it, at 1 s and then at PAIR."""
+def voted(ts, rs, rate, around=0.0, reach=SEARCH):
+    """{offset bin: votes} of the pairs of a cue start ts and a reference start rs at rate, as cue = rate * reference +
+    offset, whose offset lies within reach of around. A bin is STEP wide."""
     m, votes = [float(rate) * a for a in rs], collections.Counter()
     for t in ts:
         for x in m[bisect.bisect_left(m, t - around - reach):bisect.bisect_right(m, t - around + reach)]:
             votes[round((t - x) / STEP)] += 1
+    return votes
+
+
+def refined(ts, rs, rate, offset):
+    """offset moved to the median of the pairs near it, at 1 s and then at PAIR, see near()."""
+    for tol in (1.0, PAIR):
+        got = near(ts, rs, rate, offset, tol)
+        offset = statistics.median(t - float(rate) * a for a, t, _ in got) if got else offset
+    return round(offset, 3)
+
+
+def align(ts, rs, rate, around=0.0, reach=SEARCH, clear=0):
+    """The offset that puts the most cue starts ts near reference starts rs at rate, as cue = rate * reference +
+    offset, or None. Each pair whose offset lies within reach of around votes for it, see voted(), and three
+    neighbour bins count as one. The peak nearest around wins a tie. With clear, a peak over 1 s from around needs more
+    than clear times the votes of every offset over 1 s from it, else there is no offset. The median of the pairs near
+    the peak refines it, see refined()."""
+    votes = voted(ts, rs, rate, around, reach)
     if not votes:
         return None
     three = lambda b: votes[b - 1] + votes[b] + votes[b + 1]
     peak = min(votes, key=lambda b: (-three(b), abs(b * STEP - around)))
     if clear and abs(peak * STEP - around) > 1.0 and any(clear * three(b) >= three(peak) for b in votes if abs(b - peak) * STEP > 1.0):
         return None
-    offset = STEP * peak
-    for tol in (1.0, PAIR):
-        got = near(ts, rs, rate, offset, tol)
-        offset = statistics.median(t - float(rate) * a for a, t, _ in got) if got else offset
-    return round(offset, 3)
+    return refined(ts, rs, rate, STEP * peak)
+
+
+def searched(mine, theirs):
+    """(the lift, the rate, the offset) of the cue spans mine, see spans(), against the spans theirs. Each ratio of
+    RATES tries the offset that align() gives for the span starts, and the one where the cues show over the most of
+    theirs wins. Each span votes once, so a karaoke song or a drawing of thousands of short events outvotes no
+    dialogue. With no start within SEARCH, the lift is that of rate 1 at offset 0: chance."""
+    ts, rs = [a for a, _ in mine], [a for a, _ in theirs]
+    tried = [(shown(mine, theirs, r, o), r, o) for r in RATES if (o := align(ts, rs, r)) is not None]
+    _, r, o = max(tried, key=lambda x: (x[0], x[1] == 1), default=(0.0, Fraction(1), 0.0))
+    return round(lift(mine, theirs, r, o), 3), r, o
 
 
 def unflashed(cues):
@@ -491,12 +526,12 @@ def unflashed(cues):
     return [(c[0], n, *c[2:]) for c, n in zip(cues, ends)] if ends else cues
 
 
-def sliced(cues, ts, ref, rate, offset, duration):
+def sliced(cues, ts, ref, rate, offset, duration, lead=0.0):
     """fit() of cues against the reference cues ref in SLICES slices of the reference's span, after the search put the
     cues at rate and offset. Each slice pairs cue starts with reference starts at its own best offset, so a cut shows
     as slices at different offsets. fit() judges the slices by the rules of the word check: every slice within
-    TOLERANCE of one line, a middle slice on it for a ratio, and the file's ends under MIN_SHIFT. There is no lead,
-    since both sides are cue starts.
+    TOLERANCE of one line, a middle slice on it for a ratio, and the file's ends under MIN_SHIFT. lead is 0 when both
+    sides are cue starts, and LAYOUT_LEAD against the spans of speech, see layout_fix().
 
     A slice where the cues or the reference start under SPARSE times, such as the credits, is left out. Each half of
     the span needs HALF slices that are not, else no fix. A slice searches its offset within REACH of the search's,
@@ -524,7 +559,7 @@ def sliced(cues, ts, ref, rate, offset, duration):
     if min(early, len(kept) - early) < HALF:
         return {"fix": None, "why": f"the early half of the reference holds {early} slices with enough cues, and the late half "
                 f"{len(kept) - early}, under {HALF}, so the times stay"}
-    timing = fit(kept, ends, pairs, cues, duration, lead=0.0, unit="slice")
+    timing = fit(kept, ends, pairs, cues, duration, lead=lead, unit="slice")
     if "confirm" in timing:   # a slice cannot be heard again: its place is fixed
         timing = {"fix": None, "why": "the middle slice lies too far from the centre to confirm the ratio " + timing["confirm"]["rate"]}
     return timing
@@ -555,10 +590,8 @@ def reference(cues, refs, duration):
                 "timing": None}
     ts, mine, found = [c[0] for c in cues], spans(cues), []
     for name, ref in sorted(refs.items()):
-        rs, theirs = [c[0] for c in ref], spans(ref)
-        tried = [(shown(mine, theirs, r, o), r, o) for r in RATES if (o := align(ts, rs, r)) is not None]
-        _, r, o = max(tried, key=lambda x: (x[0], x[1] == 1), default=(0.0, Fraction(1), 0.0))   # no cue within SEARCH: chance
-        found.append((round(lift(mine, theirs, r, o), 3), name, r, o))
+        score, r, o = searched(mine, spans(ref))
+        found.append((score, name, r, o))
     score, name, rate, offset = max(found, key=lambda x: x[0])
     out = {"reference": name, "score": score, "rate": f"{rate.numerator}/{rate.denominator}", "offset": offset, "timing": None}
     if score < FIT:
@@ -576,6 +609,227 @@ def reference(cues, refs, duration):
                           + (f"needs a fix of {says(them['fix'])}" if them.get("fix") else f"says {them['why'].removesuffix(', so the times stay')}") + ", so the times stay"}
                 break
     return dict(out, verdict="fit", why=f"the cues fit {name} at a lift of {score:.2f} over chance", timing=timing)
+
+
+# The speech layout (docs/design.md, "Incorrect subtitle identification"). A subtitle in no main audio language has no
+# words to compare, and often no reference. Its cues still show while people speak. lid.speech() gives the spans of
+# speech of the whole audio from Silero VAD, and layout() fits the cue spans to them as reference() fits a track to a
+# reference.
+VAD_FRAME = 512 / 16000   # seconds of one frame of Silero VAD, which gives one speech probability a frame
+VAD_ON = 0.5      # the probability at which a span of speech starts, Silero's own threshold
+VAD_OFF = 0.35    # the probability under which it ends, Silero's own threshold less 0.15
+VAD_GAP = 0.5     # seconds of silence under which two spans of speech join
+LAYOUT = 0.35     # the least lift over chance of the cue spans over the speech spans. Verified right tracks lifted 0.49
+                  # or more, and another episode's or show's track 0.27 at most, see docs/design.md
+LAYOUT_SEARCH = 300.0   # seconds of offset the layout search covers each way. A wider search than SEARCH found right tracks
+                        # shifted 200 s at 1.5 times the CPU, and no other episode's track fit better.
+LAYOUT_PEAKS = 3  # offsets of the most votes that each ratio tries. The one vote peak of align() missed the right offset of
+                  # some right tracks, as a span of speech can hold several lines.
+LAYOUT_MIN = 900.0     # seconds a file runs at least before layout() judges. A shorter file holds few lines, and chance fits
+                       # score higher on it: 0.71 at 5 minutes, 0.32 at 15.
+LAYOUT_SPEECH = 60.0   # seconds of speech the audio needs before layout() judges
+LAYOUT_SHARE = 0.5     # the share of the speech time the lines must show for, else they do not follow the speech, such as
+                       # a track of sound captions and songs
+LAYOUT_CHANCE = 0.9    # the overlap by chance at which the fit tells nothing: the lines cover the speech at any offset,
+                       # such as live captions that roll on with no gap
+LAYOUT_ACTION = "alert"   # what a layout mismatch does: "alert" only, or "remove" the track as a word-check mismatch
+                          # does. It alerts until a soak of the logged lifts shows how far right tracks stay from LAYOUT.
+
+
+def voiced(probs):
+    """[[start, end]] in seconds of the speech in probs, Silero VAD's probability for each frame of VAD_FRAME. A span
+    starts at a frame of VAD_ON or more and ends at the first frame under VAD_OFF. Spans under VAD_GAP apart join."""
+    out, on = [], None
+    for k, p in enumerate([*probs, 0.0]):
+        if on is None and p >= VAD_ON:
+            on = k
+        elif on is not None and p < VAD_OFF:
+            if out and on * VAD_FRAME - out[-1][1] < VAD_GAP:
+                out[-1][1] = round(k * VAD_FRAME, 3)
+            else:
+                out.append([round(on * VAD_FRAME, 3), round(k * VAD_FRAME, 3)])
+            on = None
+    return out
+
+
+def peaks(ts, rs, rate, k=LAYOUT_PEAKS):
+    """The k offsets with the most votes of voted() within LAYOUT_SEARCH, each over 1 s from the others, refined, see
+    refined()."""
+    votes, out = voted(ts, rs, rate, reach=LAYOUT_SEARCH), []
+    three = lambda b: votes[b - 1] + votes[b] + votes[b + 1]
+    for b in sorted(votes, key=lambda b: (-three(b), abs(b))):
+        if len(out) < k and all(abs(b - o) * STEP > 1.0 for o in out):
+            out.append(b)
+    return [refined(ts, rs, rate, b * STEP) for b in out]
+
+
+def layout(cues, speech, duration):
+    """The speech layout check of a subtitle that no word check reads (docs/design.md, "Incorrect subtitle
+    identification"). cues is [(start, end, ...)] in seconds, speech the voiced() spans of the audio it plays with,
+    duration the file's. Each ratio of RATES tries the LAYOUT_PEAKS offsets that the cue starts point to most, and the
+    fit with the most lift over chance wins. So a whole-track offset or a frame-rate error still fits. Each span of the
+    cues, see spans(), votes once, so the events of a karaoke song or a drawing outvote no dialogue. A lift under LAYOUT
+    is a mismatch: the lines show where no one speaks, as another episode's do. A file under LAYOUT_MIN, too little
+    speech, lines that show for under LAYOUT_SHARE of the speech, and an overlap by chance of LAYOUT_CHANCE or more give
+    unknown.
+
+    Returns {"verdict": "fit", "mismatch" or "unknown", "why", "score": the lift, "rate", "offset"}."""
+    cues = unflashed(sorted(cues))
+    if duration < LAYOUT_MIN:
+        return {"verdict": "unknown", "why": f"the file runs {duration / 60:.0f} min, under {LAYOUT_MIN / 60:.0f}"}
+    if len(cues) < MIN_TRACK_CUES:
+        return {"verdict": "unknown", "why": f"the track holds {len(cues)} cues, under {MIN_TRACK_CUES}"}
+    mine, rs = spans(cues), [a for a, _ in speech]
+    ts = [a for a, _ in mine]
+    heard, lines = sum(b - a for a, b in speech), sum(b - a for a, b in mine)
+    if heard < LAYOUT_SPEECH:
+        return {"verdict": "unknown", "why": f"the audio holds {heard:.0f} s of speech, under {LAYOUT_SPEECH:.0f}"}
+    if lines < LAYOUT_SHARE * heard:
+        return {"verdict": "unknown", "why": f"its lines show for {lines:.0f} s, under {LAYOUT_SHARE:.0%} of the {heard:.0f} s of speech, so they "
+                "do not follow the speech"}
+    tried = [(lift(mine, speech, r, o), r, o) for r in RATES for o in peaks(ts, rs, r)]
+    score, rate, offset = max(tried, key=lambda x: (x[0], x[1] == 1), default=(0.0, Fraction(1), 0.0))
+    out = {"score": round(score, 3), "rate": f"{rate.numerator}/{rate.denominator}", "offset": offset}
+    chance = statistics.fmean(shown(mine, speech, rate, offset + d) for d in NULL)
+    if chance >= LAYOUT_CHANCE:
+        return dict(out, verdict="unknown", why=f"its lines cover {chance:.0%} of the speech at any offset, so where they show tells nothing")
+    if score < LAYOUT:
+        return dict(out, verdict="mismatch", why=f"its lines line up with the speech at a lift of {score:.2f} over chance, under {LAYOUT}, "
+                    "so they may belong to another episode")
+    return dict(out, verdict="fit", why=f"its lines line up with the speech at a lift of {score:.2f} over chance")
+
+
+LAYOUT_LEAD = -0.2   # seconds a right track's lines start after the speech starts, the median over verified right tracks.
+                     # A line shows a little before VAD hears the speech. A fix keeps it.
+ONSET_LEAD = -0.1    # seconds a right track's lines start after their speech onsets, the median over verified right tracks
+ONSET_PARTS = 10     # parts of the file, spread evenly, whose onsets confirm a fix of layout_fix(), see onset_parts()
+ONSET_PART = 120.0   # seconds of each part at most
+LAYOUT_FIX = "alert"   # what a fix of layout_fix() that the speech onsets confirm does: "alert" only, or "write" the new
+                       # times. On planted steps near a file's end, some fixes moved right lines farther, see docs/design.md.
+LAYOUT_EDGE = 0.08   # the share of the cue spans at each end of the file, MIN_TRACK_CUES at least, that must line up with
+                     # the speech best at a fix of layout_fix(), see edges()
+LAYOUT_PARTS = 20    # parts of the cue spans, equal by count, none of which may vote for another offset, see edges()
+
+
+def stepped(offsets):
+    """The slices of a piecewise fit, at offsets, show a step: two or more of them lie within TOLERANCE of one offset
+    at least 1 s from the offset most slices share. One slice alone off, or a slow trend, may be noise, such as an end
+    song a few lines time, or a ratio the search missed."""
+    group = lambda u, xs: [v for v in xs if abs(v - u) <= TOLERANCE]
+    main = max(offsets, key=lambda u: len(group(u, offsets)))
+    off = [u for u in offsets if abs(u - main) >= 1.0]
+    return any(len(group(u, off)) >= 2 for u in off)
+
+
+def edges(mine, speech, rate, offset):
+    """Why the cue spans mine, see spans(), do not line up with the speech spans at a fix of layout_fix(), or None
+    when they do. offset maps them as cue = rate * speech + offset, with no LAYOUT_LEAD. The slices of sliced() each
+    hold a tenth of the speech, so a step in the first or last tenth of the lines can pass every slice. Two rules catch
+    it. The first and the last LAYOUT_EDGE of the spans must show over the speech near them at least as much within
+    TOLERANCE of the fix as at any offset 1 s or more from it, within REACH. And no part of LAYOUT_PARTS, equal by
+    count, may have a clear vote peak over TOLERANCE from the fix, see align(), unless the speech holds under SPARSE
+    starts there."""
+    rs, m, grid = [a for a, _ in speech], max(MIN_TRACK_CUES, int(LAYOUT_EDGE * len(mine))), round(REACH / STEP)
+    for name, block in (("first", mine[:m]), ("last", mine[-m:])):
+        a, b = (block[0][0] - offset) / float(rate), (block[-1][1] - offset) / float(rate)
+        near = [x for x in speech if x[1] >= a - REACH - SPAN and x[0] <= b + REACH + SPAN]
+        if near:
+            got = {k: shown(block, near, rate, offset + k * STEP) for k in range(-grid, grid + 1)}
+            at, far = max(got[k] for k in got if abs(k) <= round(TOLERANCE / STEP)), max((k for k in got if abs(k) >= round(1.0 / STEP)), key=got.get)
+            if got[far] > at:
+                return f"the {name} {len(block)} lines line up with the speech better {far * STEP:+.1f} s from it"
+    ts = [a for a, _ in mine]
+    for i in range(LAYOUT_PARTS):
+        part = ts[i * len(ts) // LAYOUT_PARTS:(i + 1) * len(ts) // LAYOUT_PARTS]
+        if not part:
+            continue
+        a, b = (part[0] - offset) / float(rate), (part[-1] - offset) / float(rate)
+        here = align(part, rs, rate, offset, REACH, CLEAR) if bisect.bisect_right(rs, b + 1) - bisect.bisect_left(rs, a - 1) >= SPARSE else None
+        if here is not None and abs(here - offset) > TOLERANCE:
+            return f"part {i + 1} of {LAYOUT_PARTS} of its lines lines up with the speech {here - offset:+.2f} s from it"
+    return None
+
+
+def layout_fix(cues, speech, duration, lay):
+    """The times of a subtitle that layout() fit, as fit() gives them, or None when lay is no fit. The cue spans, see
+    spans(), fit the speech spans in slices at the ratio and offset of lay, as reference() fits a reference, see
+    sliced(). So a track off by one shift, or timed for another frame rate, gets a fix that keeps LAYOUT_LEAD. Slices
+    at different offsets, as of another cut, are "piecewise" and get no fix, and alert only when stepped() shows a
+    step. The fix must then line the moved cues up with the speech at ratio 1, within TOLERANCE of LAYOUT_LEAD, else
+    the times stay. The speech onsets confirm it later, see layout_onsets()."""
+    if lay["verdict"] != "fit":
+        return None
+    mine = [tuple(x) for x in spans(unflashed(sorted(cues)))]
+    timing = sliced(mine, [a for a, _ in mine], speech, Fraction(lay["rate"]), lay["offset"], duration, LAYOUT_LEAD)
+    if timing.get("piecewise") and not stepped(timing["offsets"]):
+        return {"fix": None, "offsets": timing["offsets"], "why": f'{timing["why"]}, but no two slices agree on another offset, so the times stay'}
+    fix = timing.get("fix")
+    if fix:
+        moved_cues = [(moved(a * 1000, fix) / 1000, moved(b * 1000, fix) / 1000, *x) for a, b, *x in cues]
+        again = layout(moved_cues, speech, duration)
+        if again["verdict"] != "fit" or again["rate"] != "1/1" or abs(again["offset"] - LAYOUT_LEAD) > TOLERANCE:
+            return {"fix": None, "unfixed": fix["offset"], "why": f'{timing["why"]}, but the lines it moves do not line up with the speech in '
+                    "time, so the times stay"}
+        off = edges(mine, speech, Fraction(fix["rate"]), fix["offset"] + LAYOUT_LEAD * float(Fraction(fix["rate"])))
+        if off:
+            return {"fix": None, "unfixed": fix["offset"], "why": f'{timing["why"]}, but {off}, so the times stay'}
+        if INVARIANTS:
+            nearer(cues, moved_cues, speech, fix)
+    return timing
+
+
+def nearer(cues, moved_cues, speech, fix):
+    """Check the nearer-its-speech rule on a fix of layout_fix(), see INVARIANTS: the moved cues show over at least as
+    much of the speech as the cues did. Raises Broken."""
+    before, after = shown(spans(unflashed(sorted(cues))), speech), shown(spans(unflashed(sorted(moved_cues))), speech)
+    if after < before:
+        broken("nearer its speech", min(c[0] for c in cues), f"the fix {fix} moves the lines off the speech: they show over {after:.1%} "
+               f"of it, and {before:.1%} before", {"cues": [c[:2] for c in cues], "speech": speech, "fix": fix})
+
+
+def onset_parts(duration):
+    """[(lo, hi)] of the ONSET_PARTS parts of the file whose onsets layout_onsets() reads: one at the centre of each
+    tenth of the file, ONSET_PART seconds long at most, so no two overlap."""
+    tenth = duration / ONSET_PARTS
+    half = min(ONSET_PART, tenth) / 2
+    return [(round((k + 0.5) * tenth - half, 3), round((k + 0.5) * tenth + half, 3)) for k in range(ONSET_PARTS)]
+
+
+def layout_onsets(cues, timing, onsets, read, duration):
+    """timing, a fix of layout_fix(), when the speech onsets confirm it, else no fix and "unfixed". The onsets are a
+    second clock: silencedetect marks them, and VAD the spans of speech. onsets are [(time, seconds of silence before
+    it)] read in the parts read, see onset_parts(). A cue span start, see spans(), counts where the fix puts it when an
+    onset that ends ONSET_QUIET of silence lies within half of TOLERANCE of it less ONSET_LEAD, and likewise where it
+    sat. Each half of the file must agree, as clock() judges a block: ONSET_MIN and ONSET_SHARE of its starts count
+    where the fix puts them, twice as many as where they sat, and as many are rare by chance. Chance is the same count
+    at the NULL offsets, or the rate of the counted onsets in the parts, whichever is more, and the chance of as many
+    or more must be ONSET_CHANCE at most. A half where enough count where they sat disagrees. Else there are too few.
+    "onsets" holds the counts of each half: starts, where the fix puts them, where they sat, chance."""
+    fix = timing["fix"]
+    times = [t for t, quiet in onsets if quiet >= ONSET_QUIET]
+    hits = lambda ps: sum(bool(times[bisect.bisect_left(times, p - TOLERANCE / 2):bisect.bisect_right(times, p + TOLERANCE / 2)]) for p in ps)
+    starts = [a for a, _ in spans(unflashed(sorted(cues)))]
+    halves = [[0, 0, 0, 0.0], [0, 0, 0, 0.0]]
+    for lo, hi in read:
+        new = [p for t in starts if lo <= (p := moved(t * 1000, fix) / 1000 - ONSET_LEAD) <= hi]
+        old = [p for t in starts if lo <= (p := t - ONSET_LEAD) <= hi]
+        nulls = [hits(q) * len(new) / len(q) for d in NULL if (q := [p + d for p in new if lo <= p + d <= hi])]
+        rate = sum(lo <= t <= hi for t in times) / (hi - lo) if hi > lo else 0.0
+        h = halves[(lo + hi) / 2 >= duration / 2]
+        h[0], h[1], h[2], h[3] = h[0] + len(new), h[1] + hits(new), h[2] + hits(old), h[3] + max(statistics.fmean(nulls) if nulls else 0.0, len(new) * TOLERANCE * rate)
+
+    def judge(n, new, old, chance):
+        term, below = math.exp(-chance), 0.0   # the Poisson tail by a running term, as clock() takes it
+        for i in range(new):
+            below, term = below + term, term * chance / (i + 1)
+        need = max(ONSET_MIN, ONSET_SHARE * n)
+        return "agree" if new >= need and new >= 2 * old and 1 - below <= ONSET_CHANCE else "disagree" if old >= need and old >= new else "few"
+    said = [judge(*h) for h in halves]
+    counts = [[n, a, b, round(c, 2)] for n, a, b, c in halves]
+    if said == ["agree", "agree"]:
+        return dict(timing, onsets=counts)
+    why = "the speech onsets put the lines where they sat" if "disagree" in said else "too few speech onsets confirm it"
+    return {"fix": None, "unfixed": fix["offset"], "onsets": counts, "why": f'{timing["why"]}, but {why}, so the times stay'}
 
 
 SWEPT = 3         # windows of the sweep in each half of the file that heard MIN_WORDS words and put an offset on the cues,
@@ -710,7 +964,7 @@ def dense(cues, parts, duration, stop=frozenset()):
     window. As in windows(), a window with no cue content word, song lyrics left out, within PAD seconds is not heard.
     cues are [(start, end, text)] in audio time: the caller moves each track's cues by its fix first, see moved().
     With the small model on one thread, this hearing costs about 45 CPU seconds a minute of audio."""
-    ts = [x[0] for x in flat([c for c in cues if not MUSIC.search(NOISE.sub(" ", c[2]))], stop)]
+    ts = word_times(cues, stop)
     out = []
     for lo, hi in merged(p for p in parts if p[1] > p[0]):   # a part of no length is one the cap left unheard
         lo, hi = max(0.0, lo), min(duration, hi)
@@ -765,8 +1019,8 @@ ONSET_QUIET = 0.5   # seconds of the silence an onset must end to time a cue
 ONSET_REACH = 1.0   # seconds around the start of a cue around a block in which its onset must be the only one
 ONSET_TWICE = 0.1   # seconds within which two onsets are one, found by two reads that overlap. A read that starts in a
                     # silence counts it from its own start. Onsets that each end a silence of 0.3 s lie farther apart.
-ONSET_SHARE = 0.2   # the share of a block's cues with an onset where the block puts them, at least. Stray onsets, at 0.01
-                    # to 0.09 a second on the bench, fill at most 6% of such places by chance.
+ONSET_SHARE = 0.2   # the share of a block's cues with an onset where the block puts them, at least. Stray onsets are
+                    # sparse, under one a second, so they fill few such places by chance.
 ONSET_CHANCE = 0.001  # the chance at most that the onsets within half of TOLERANCE of a block's cues are as many by chance,
                       # from the same count at the NULL offsets. With real noise a right track that Whisper heard 0.8 s
                       # early drew 4 such onsets of 13 cues, at a chance of 0.003.
@@ -947,10 +1201,115 @@ def evidence(late, hushed_late, words, onset_new, onset_old, on, at_block, hushe
     return None
 
 
+# The safety rules of a block move (docs/development.md, "Safety self-checks"). AMG_INVARIANTS=1 checks them on every
+# result. blocks() checks own evidence and nearer its speech at its end, and remux.time_plan() checks the order. The
+# tests turn it on. Off, no check runs.
+INVARIANTS = os.environ.get("AMG_INVARIANTS") == "1"
+NEAR = 0.01   # seconds of rounding that the nearer-its-speech check allows against each line. A shift keeps ms, and ASS keeps cs.
+
+
+class Broken(AssertionError):
+    """A result that breaks a safety rule. The message names the rule and the cue."""
+
+
+def broken(rule, cue, why, case):
+    """Raise Broken for rule at the cue that starts at cue seconds. When AMG_INVARIANT_DUMP names a folder, the case,
+    the inputs of the check, goes there first as one JSON file."""
+    folder = os.environ.get("AMG_INVARIANT_DUMP")
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        fd, path = tempfile.mkstemp(".json", rule.replace(" ", "-") + "-", folder)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"rule": rule, "cue": cue, "why": why, **case}, f, default=lambda x: sorted(x) if isinstance(x, (set, frozenset)) else str(x))
+    raise Broken(f"rule {rule} broken at the cue at {cue} s: {why}")
+
+
+def mover(blocks, t):
+    """The block of blocks that moves a cue that starts at t, as remux.time_plan() moves it, or None: the first whose
+    [from, to) holds t and whose "keep" does not name it."""
+    return next((b for b in blocks or () if b["from"] <= t < b["to"] and round(t, 3) not in b.get("keep", ())), None)
+
+
+def shift_of(block, t):
+    """The shift by which block moves its cue that starts at t: its own shift in "shifts" on a live-captioned track,
+    see live_moves(), else the shift its "clamp" names for that start, else the block's. See clamped()."""
+    if "shifts" in block:
+        return block["shifts"][round(t, 3)]
+    return next((v for c, v in block.get("clamp") or () if c == round(t, 3)), block["shift"])
+
+
+def check_blocks(cues, blocks, proved, case):
+    """Check two safety rules on the blocks of blocks(), see INVARIANTS. cues are the track's cues in start order. proved
+    holds one entry for each block that moves. The entry gives the block, its median anchor "mid", its spread "tol", the
+    run's median "m", the part's line "base" and the line its move uses "ref". Its "cues" maps each cue the block moves,
+    by index, to how late its anchor sits or None, whether it follows a long silence, placed() of its words or None, its
+    own onset where it sat, and its own onset where the block puts it. Its "between" maps each cue that stays between
+    two cues the block moves to the first four of those. Raises Broken.
+
+    Own evidence: a cue that a block moves is one the block proved, by the rules of evidence(). Its anchor sits at the
+    block's offset, or its words lie in the block. A cue after a long silence, or one whose anchor sits over TOLERANCE
+    off the block, moves on its words only with its own onset where the block puts it. An anchor nearer the part's line
+    than the run, or words placed on the line, keep the cue where it is. Such evidence, or the cue's own onset where it
+    sat, also cuts the block, so no such cue stays between two cues the block moves. A cue in "keep", or outside every
+    block, moves only by the whole-track fix, see mover().
+
+    Nearer its speech: a moved cue never ends up farther from its speech than it was. Its anchor gives its speech. The
+    rule breaks only when the cue ends farther from both the line the move uses and the part's line, each by more than
+    NEAR. The line the move uses is the line beside the block, or the track's lean when the move takes that. So the real
+    margin is NEAR plus the distance between the two lines, up to about 0.15 s beside a block and 0.3 s against the lean.
+    The rule catches an overshoot, and the harnesses measure a wrong move against the planted truth. The first cue after
+    a long silence never anchors here, see blocks(). A cue with its own onset where it sat stays, because a shift of
+    BLOCK_SHIFT takes it farther from that onset."""
+    lined = lambda p, late, said, onset: late is not None and abs(late - p["base"]) <= abs(late - p["m"]) or said == "line" or onset   # as evidence() takes it
+    for p in proved:
+        for k, (late, _, said, onset) in p.get("between", {}).items():
+            if lined(p, late, said, onset):
+                broken("own evidence", cues[k][0], "its own evidence puts it on the line, so the block must not move the cues on both sides of it", case)
+    for k, c in enumerate(cues):
+        b = mover(blocks, c[0])
+        if b is None:
+            continue
+        p = next((p for p in proved if p["block"] is b), None)
+        if p is None or k not in p["cues"]:
+            broken("own evidence", c[0], "a block moves it, but the block never proved it", case)
+        late, hushed, said, onset, onset_new = p["cues"][k]
+        on = lambda x: abs(x - p["base"]) <= abs(x - p["m"])   # nearer the part's line than the run, as blocks() takes it
+        own = None if hushed else late   # the anchor of a cue after a long silence only ever keeps it on the line
+        conflict = own is not None and abs(own - p["mid"]) > TOLERANCE
+        at_block = own is not None and abs(own - p["mid"]) <= p["tol"] and not on(own)
+        if late is not None and on(late) or said == "line" or not (at_block or said == "block" and (not (hushed or conflict) or onset_new)):
+            anchor = "no anchor" if late is None else f"an anchor {late:+.3f} s late" + (" after a long silence" if hushed else "")
+            broken("own evidence", c[0], f"it has {anchor}, its words place it {said or 'nowhere'}, and {'an' if onset_new else 'no'} onset of its "
+                   f"own lies where the block puts it, against the block at {p['mid']:+.3f} s and the part's line at {p['base']:+.3f} s", case)
+        moved_by = shift_of(b, c[0])   # a clamped cue moves part of the way, see clamped()
+        farther = lambda line: abs(late - moved_by - line) > abs(late - line) + NEAR
+        if own is not None and farther(p["ref"]) and farther(p["base"]):
+            broken("nearer its speech", c[0], f"its anchor sits {late - p['ref']:+.3f} s off the line the move uses and {late - p['base']:+.3f} s off the part's "
+                   f"line, and {late - moved_by - p['ref']:+.3f} s and {late - moved_by - p['base']:+.3f} s after the move", case)
+        if onset:
+            broken("nearer its speech", c[0], "its own onset lies where it sat", case)
+
+
+def ordered(rows, case):
+    """Check the order rule, see INVARIANTS, on rows [(start, new start with no block, new start)] of one track's
+    remux.time_plan(). Two cues in start order keep their order, and two whose starts did not tie never tie. Two cues
+    that time_plan() clamps to 0 may tie, because no start lies before 0. A moved cue may still start before the end of
+    a cue that stays. Raises Broken."""
+    rows = sorted(rows)
+    for (s0, a0, n0), (s1, a1, n1) in zip(rows, rows[1:]):
+        if s0 < s1 and (n0 > n1 or n0 == n1 > 0 and a0 < a1):
+            broken("order", s1, f"it starts at {n1} s, and the cue at {s0} s before it at {n0} s", case)
+
+
+def fixed_ms(t, fix):
+    """The time in ms where fix puts a cue time t in seconds, before a block moves it, as remux.time_plan() takes it."""
+    return moved(t * 1000, fix) if fix else t * 1000
+
+
 def written(t, shift, fix):
     """The start in centiseconds that remux.time_plan() writes for a cue that starts at t in its own time and moves by
     shift. ASS keeps centiseconds, so a test on them never lets two starts tie."""
-    return round(((moved(t * 1000, fix) if fix else t * 1000) - shift * 1000) / 10)
+    return round((fixed_ms(t, fix) - shift * 1000) / 10)
 
 
 def crossing(starts, moving, first, last, shift, fix):
@@ -960,6 +1319,37 @@ def crossing(starts, moving, first, last, shift, fix):
     new = lambda k: written(starts[k], shift if k in moving else 0.0, fix)
     return next(((k, k + 1) if k in moving else (k + 1, k) for k in range(max(0, first - 1), min(len(starts) - 1, last + 1))
                  if (k in moving) != (k + 1 in moving) and new(k) >= new(k + 1)), None)
+
+
+def clamped(starts, moving, first, last, shift, fix, may=lambda k: True):
+    """{k: shift} of each cue k of moving, indices into the sorted cue starts, whose move by shift would put it at,
+    past or on the same centisecond as the cue next to it on the side it moves toward. That cue stays, or moves less
+    by this clamp. The shift puts the cue one centisecond short of that cue instead, so it moves only part of the way
+    to its speech. It is 0 when no part of the move is left, or when may(k) is false: such a cue stays, as it did
+    before the clamp. The cues lie from first - 1 to last + 1. A block moves its cues early when shift is over 0, so the
+    cue before each one bounds it, and late when under 0. A cue next to a block keeps its place, as in crossing(). Two
+    cues that start at once keep one start, as remux.time_plan() keeps a start."""
+    d, new, out = (1 if shift > 0 else -1), {}, {}
+    for k in (range(first, last + 1) if shift > 0 else range(last, first - 1, -1)):
+        if k not in moving:
+            continue
+        j = k - d   # the cue next to it on the side it moves toward
+        if j in new and round(starts[j], 3) == round(starts[k], 3):   # two lines shown at once move as one
+            new[k] = new[j]
+            if j in out:
+                out[k] = out[j]
+            continue
+        full = written(starts[k], shift, fix)
+        bound = new[j] if j in new else written(starts[j], 0.0, fix) if 0 <= j < len(starts) else None
+        if bound is None or (full - bound) * d > 0:
+            new[k] = full
+            continue
+        target = bound + d
+        if not may(k) or (written(starts[k], 0.0, fix) - target) * d <= 0:   # not allowed, or no room left: it stays
+            new[k], out[k] = written(starts[k], 0.0, fix), 0.0
+        else:
+            new[k], out[k] = target, round((fixed_ms(starts[k], fix) - target * 10) / 1000, 6)
+    return out
 
 
 def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
@@ -1033,14 +1423,14 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
     Accepted residual: a cue in time between two blocks of one sign whose own anchor, words and both windows put it at
     the block's offset, with no onset at either place, moves with the block. Nothing tells it from the block's own cues,
     as nothing tells Whisper's error from a block on Whisper alone, see BLOCK_ALONE. So does such a cue with only its
-    words or only its anchor in the block: asking those for a second piece cost over 5% of the cues fixed.
+    words or only its anchor in the block: asking those for a second piece cost many of the cues fixed.
     A cue whose move would put it at, past or on the same centisecond as a cue next to it that stays, stays too, see
     crossing(). So the order of cue starts never changes, and no two starts tie. On Whisper alone, a block with a cue
     that would pass a cue outside its edges is refused. Whisper can read a whole stretch off, the cues on the line
     beside the block among them, and with no onsets the order is the only check left on the shift. "cues" counts the
     cues that move, and the block needs MIN_CUES heard cues that move. A cue outside a block never moves. A moved cue
     may start before the end of a cue that stays. That cue keeps its times, and a player shows both lines while they
-    overlap.
+    overlap. With INVARIANTS, check_blocks() checks the result.
 """
     stop, raw = decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
     ons = []
@@ -1059,7 +1449,7 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
     found = [(i, t, audio(cues[i][0]) - t - BLOCK_LEAD) for i, t in sorted(at.items()) if i not in hushed]   # (cue, heard time, how late)
     late_of = {i: x for i, _, x in found}
     worded = [bool(words(c[2], stop)) and not MUSIC.search(NOISE.sub(" ", c[2])) for c in cues]   # cues dense hearing can anchor
-    out = {"blocks": [], "parts": []}
+    out, proved = {"blocks": [], "parts": []}, []   # proved: the evidence of each cue a block moves, see check_blocks()
     # The track's lean: the median off of its sweep rows that count, outside every part. The sweep pairs a cue's first
     # content word, and dense hearing steps back to the first word spoken, so their leans differ by how the track's lines
     # start. The rows inside the parts, against the anchors of the cues in their windows, measure that.
@@ -1268,13 +1658,22 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
                 # at once, stays too, and so does the first or the last when a cue outside the edges starts with it.
                 still = {starts[k] for k in range(len(starts)) if k not in moving}
                 moving = {k for k in moving if starts[k] not in still}
-                # A cue whose move would pass a cue that stays, or tie with it, stays too, and so on until none would.
-                passed = []
-                while (x := crossing(starts, moving, first, last, move, fix)) is not None:
-                    moving.discard(x[0])
+                # A cue whose move would pass a cue that stays, or tie with it, would stay, and so on until none would.
+                # The block is judged on the cues that move all the way. A cue that stops short moves part of the way
+                # instead, to one centisecond short of the cue next to it, see clamped(), when two pieces of its own
+                # evidence put it in the block: its anchor, its heard words, or its own onset where the block puts it.
+                # Else it stays: the crossing kept a cue in time whose anchor alone read like the block, between two
+                # blocks of one sign.
+                passed, whole = [], set(moving)
+                while (x := crossing(starts, whole, first, last, move, fix)) is not None:
+                    whole.discard(x[0])
                     passed.append(x[1])
+                two = lambda k: sum((k in late_of and abs(late_of[k] - mid) <= tol and not on(late_of[k]), k in said_at and words_say(k) == "block",
+                                     k in confirmed and alone(k))) >= 2
+                part = clamped(starts, moving, first, last, move, fix, two)
+                moving -= {k for k, v in part.items() if not v}
                 stays = [k for k in range(first, last + 1) if k not in moving]   # time_plan() skips their starts
-                n = min(n, sum(k in late_of for k in moving))
+                n = min(n, sum(k in late_of for k in whole))
                 if n < MIN_CUES:
                     whys.append(f"after its edges stay, {n} heard cues are left in it, under {MIN_CUES}")
                 elif said["verdict"] != "agree" and any(not first <= k <= last for k in passed):
@@ -1286,7 +1685,14 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
                     out["blocks"].append({"from": start, "to": end, "shift": move, "cues": len(moving), "anchors": b - a,
                                           "spread": round(near[math.ceil(AGREE * len(near)) - 1], 2), "edge_left": edge[0],
                                           "edge_right": edge[1], "onsets": said, "unproved": sum(proof[k] is None for k in stays),
-                                          "keep": [round(starts[k], 3) for k in stays]})
+                                          "keep": [round(starts[k], 3) for k in stays],
+                                          "clamp": [[round(starts[k], 3), v] for k, v in sorted(part.items()) if v]})
+                    if INVARIANTS:
+                        fact = lambda k: (audio(starts[k]) - at[k] - BLOCK_LEAD if k in at else None, k in hushed, words_say(k) if k in said_at else None,
+                                          k in stayed and alone(k))
+                        proved.append({"block": out["blocks"][-1], "mid": mid, "tol": tol, "m": m, "base": base, "ref": line if move == shift else lean,
+                                       "cues": {k: fact(k) + (k in confirmed and alone(k),) for k in moving},
+                                       "between": {k: fact(k) for k in range(min(moving), max(moving)) if k not in moving}})
         median = round(statistics.median(late), 2) if late else None
         share = len(late) / max(1, sum(w and lo <= audio(c[0]) <= hi for w, c in zip(worded, cues)))
         in_line = len(late) >= IN_LINE and share >= IN_LINE_SHARE and abs(median) <= TOLERANCE and \
@@ -1308,6 +1714,9 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
                              "more": [tuple(x) for x in merged(more)],
                              "anchored": [round(t, 1) for _, t, _ in got]})
     out["blocks"].sort(key=lambda x: x["from"])
+    if INVARIANTS:
+        check_blocks(raw, out["blocks"], proved, {"blocks": out["blocks"], "proved": proved, "anchors": at, "fix": fix, "call": {
+            "heard": heard, "cues": raw, "lang": lang, "timing": timing, "parts": parts, "onsets": onsets, "rows": rows}})
     return out
 
 
@@ -1351,18 +1760,286 @@ def after_blocks(rows, blocks, timing, parts=()):
     """The sweep() rows after dense hearing, so the sweep alert never fires on a part that dense hearing judged. A row in
     a block of blocks() that moved gets "off" less the block's shift. A row sits in a block when the cue times of its
     window, rate * (t + CUE_LEAD) + offset + off from its start to its end, lie in the block's [from, to) and no cue the
-    block keeps starts there. A row whose window crosses an edge, or holds a cue that stays, keeps its "off": cues there
-    still sit off. A row in a part of parts, blocks()'s, that is in line gets the part's median as its "off": the heard
+    block keeps starts there. A row whose window crosses an edge, or holds a cue that stays or moves only part of the
+    way, see clamped(), keeps its "off": cues there still sit off. A row in a part of parts, blocks()'s, that is in line gets the part's median as its "off": the heard
     cues there showed the row was noise. A part off the line whose cues do not agree keeps its rows. rows and parts use
-    audio time, and blocks cue time."""
+    audio time, and blocks cue time. The block of a live-captioned track moves each cue by its own shift, so a row in it
+    takes the median shift of the cues that start in its window."""
     fix = (timing or {}).get("fix")
     rate, offset = (float(Fraction(fix["rate"])), fix["offset"]) if fix else (1.0, 0.0)
     out = []
     for r in rows:
         c = None if r["off"] is None else rate * (r["at"] + WINDOW / 2 + CUE_LEAD) + offset + r["off"]
         lo, hi = (None, None) if c is None else (c - rate * WINDOW / 2, c + rate * WINDOW / 2)
-        b = next((b for b in blocks if c is not None and b["from"] <= lo and hi < b["to"] and not any(lo <= x <= hi for x in b.get("keep", ()))), None)
+        b = next((b for b in blocks if c is not None and b["from"] <= lo and hi < b["to"]
+                  and not any(lo <= x <= hi for x in [*b.get("keep", ()), *(x for x, _ in b.get("clamp") or ())])), None)
         p = next((p for p in parts if c is not None and p.get("in_line") and p["lo"] <= r["at"] + WINDOW / 2 <= p["hi"]
                   and ("anchored" not in p or sum(r["at"] <= a <= r["at"] + WINDOW for a in p["anchored"]) >= 2)), None)
-        out.append(dict(r, off=round(r["off"] - rate * b["shift"], 2)) if b else dict(r, off=round(rate * p["median"], 2)) if p else dict(r))
+        shift = b and (statistics.median([v for t, v in b["shifts"].items() if lo <= t <= hi] or [b["shift"]]) if "shifts" in b else b["shift"])
+        out.append(dict(r, off=round(r["off"] - rate * shift, 2)) if b else dict(r, off=round(rate * p["median"], 2)) if p else dict(r))
     return out
+
+
+# Live captions (docs/design.md, "Subtitle match"). A captioner who types along with a broadcast shows each line some
+# seconds after it is spoken, by a different time each line. One shift cannot fix that, and neither can a block. So on a
+# track whose sweep looks live-captioned, dense hearing hears the whole track, and each cue moves to its own speech.
+# Per-cue moves on other tracks stay out: there an author's jitter is the size of Whisper's noise.
+LIVE_ROWS = 10       # sweep rows that count a track needs before the sweep can call it live-captioned, see live()
+LIVE_FEW = 5         # sweep rows that count that are enough when each sits LIVE_FAR or more late. Roll-up captions, which
+                     # repeat the last line, let few rows match 2 cues.
+LIVE_FAR = 3.0       # seconds late each of those rows sits at least. No row of a verified right track sat 2.5 s late.
+LIVE_LAG = 0.3       # seconds late its rows sit at their median at least: live captions trail the speech
+LIVE_SCATTER = 0.4   # seconds its rows sit from their median, at the median, at least. Logged tracks that were
+                     # not live captions sat at 0.26 s or less, and the live ones at 0.49 s or more.
+LIVE_AGREE = 2.0     # seconds the two cues around a cue with no anchor sit off at least before it takes their shift on their word
+                     # alone. With each anchor hidden in turn, the place between moving neighbours 1 s off was farther than the
+                     # old start for about a third of the cues of a test track, and at 2 s for almost none.
+LIVE_AROUND = 2      # anchored cues on each side of a cue whose median must sit off the same way before the cue moves by its own anchor
+LIVE_LEFT = 0.2      # the share of a track's cues that may stay off before the track counts as not fixed, see live_moves()
+LIVE_STEPS = 8       # steps per cue at most of the loop that keeps the cue order, see live_moves(). It needs 5 at most.
+LIVE_TWICE = 3.0     # seconds after a cue's anchor within which its first content word heard again may be its speech, see unsure()
+LABEL = re.compile(r"(^|\n|>>)([ \t]*)[^\W\d_][\w.'’-]*(?: [^\W\d_][\w.'’-]*)?:(?=\s)")   # a speaker's name before a line, never spoken
+
+
+def live(rows):
+    """{"lag", "off", "scatter", "rows"} of a track whose sweep() rows look live-captioned, else None. The rows that
+    count, see trusted(), give it. lag is their median offset against the audio, off their median "off" against the
+    fitted line, and scatter the median distance of their "off" from off. A track looks live-captioned when LIVE_ROWS
+    rows count, lag is LIVE_LAG or more and scatter is LIVE_SCATTER or more. LIVE_FEW rows are enough when each of
+    them sits LIVE_FAR or more late. A fix for the whole track leaves the scatter. A right track, a track off by one
+    shift and a block leave little."""
+    rows = trusted(rows)[0]
+    if len(rows) < LIVE_FEW or len(rows) < LIVE_ROWS and min(r["offset"] for r in rows) < LIVE_FAR:
+        return None
+    lag, off = statistics.median(r["offset"] for r in rows), statistics.median(r["off"] for r in rows)
+    scatter = statistics.median(abs(r["off"] - off) for r in rows)
+    return {"lag": round(lag, 2), "off": round(off, 2), "scatter": round(scatter, 2), "rows": len(rows)} \
+        if lag >= LIVE_LAG and scatter >= LIVE_SCATTER else None
+
+
+def rolled(cues):
+    """The text of each cue of cues [(start, end, text)], in order, less its top lines that repeat the bottom lines of the
+    cue before it. Roll-up captions show each new line under the last ones, so those lines were spoken before the cue."""
+    out, last = [], []
+    for c in cues:
+        lines = re.split(r"\n|\\[Nn]", c[2])
+        said_by = [tokens(x) for x in lines]
+        n = next((n for n in range(min(len(lines) - 1, len(last)), 0, -1) if said_by[:n] == last[-n:] and all(said_by[:n])), 0)
+        out.append("\n".join(lines[n:]) if n else c[2])
+        last = said_by
+    return out
+
+
+def unsure(heard, at, texts, stop):
+    """{cue: d} of the anchors at {cue: audio time} that may pair the wrong word: a window that holds the anchor heard
+    the cue's first content word again up to d seconds later, within LIVE_TWICE, as often as the cue holds it or more.
+    texts are the cue texts that anchored. Two "yeah" a second apart, or an "I'm" said before a line the captioner left
+    out, sent cues the wrong way: the cue's speech was the later word. A word said twice in a row counts twice here,
+    though said() keeps one of them for the match."""
+    spans = [(w["at"], w["at"] + w.get("secs", WINDOW), [(w["at"] + t, v) for t, x in w["words"] for v in words(x, stop)])
+             for w in sorted(heard, key=lambda w: w["at"])]   # every heard word, a repeat that said() drops too
+    starts, longest, out = [a for a, _, _ in spans], max((b - a for a, b, _ in spans), default=0.0), {}
+    for k, t in at.items():
+        mine = words(texts[k], stop)
+        first = (mine or [None])[0]
+        for a, b, ws in spans[bisect.bisect_left(starts, t - longest):bisect.bisect_right(starts, t)]:
+            ts = [x for x, v in ws if v == first]
+            t0 = min((x for x in ts if x >= t - TOLERANCE), default=None)   # the anchor's word, as this window times it
+            later = [x - t0 for x in ts if t0 < x <= t0 + LIVE_TWICE] if t < b and t0 is not None else []
+            if later and len(later) >= mine.count(first):
+                out[k] = max(out.get(k, 0.0), *later)
+    return out
+
+
+def rising(pairs):
+    """The keys of the longest run of pairs [(key, time)], in their order, whose times rise strictly."""
+    tops, ends, back = [], [], []   # the least last time of a run of each length, the pair that ends it, each pair's one before
+    for n, (_, t) in enumerate(pairs):
+        k = bisect.bisect_left(tops, t)
+        back.append(ends[k - 1] if k else None)
+        tops[k:k + 1], ends[k:k + 1] = [t], [n]
+    out, n = set(), ends[-1] if ends else None
+    while n is not None:
+        out.add(pairs[n][0])
+        n = back[n]
+    return out
+
+
+def live_moves(heard, cues, lang, timing, scan=None):
+    """The moves of a live-captioned track: each cue to its own speech (docs/design.md, "Subtitle match"). heard is
+    lid.listen()'s windows of dense hearing over the whole track, cues the track's [(start, end, text)] in seconds, lang
+    its 639-2 language, timing the word check's timing(), whose fix may be None, and scan its live() reading.
+
+    A cue's speech starts at its first spoken word, its anchor, see heard_anchors(). A speaker's name before a cue's
+    text, as ">> Reporter:", is never spoken, so it leaves the text first, and so do the top lines that roll-up
+    captions repeat from the cue before, see rolled(). Live captions keep the order of the speech, so only the longest
+    run of anchors that rises with the cues counts, see rising(). An anchor out of that order paired a word said
+    elsewhere. A cue then moves in one of three ways.
+
+    - By its own anchor, when it sits BLOCK_ALONE or more off it, and the median of the LIVE_AROUND anchored cues on
+      each side sits BLOCK_SHIFT or more off the same way. A lone anchor off is Whisper's error or an author's slip.
+      Whisper times the first word after a silence early. On a test track that sent a few cues 0.5 to 1 s off the wrong
+      way, so a move on Whisper alone needs BLOCK_ALONE, as a block does. Its new start is the anchor less BLOCK_LEAD.
+      An anchor whose first word was heard again up to d seconds later may be the wrong one, see unsure(). Its cue
+      moves by it only when that is nearer the later word too: an early cue, or one late by 2 d or more. Else it
+      moves as a cue with no anchor. As a bound for the cues around it, such an anchor reaches d seconds later.
+    - Between the anchors of the cues around it, when it has no anchor that counts and the span proves the move. Its
+      speech lies between theirs, TOLERANCE wider for Whisper's error. Its new place sits at the same share of the way
+      between their anchors as its start sits between their starts. At the first or the last anchor, it takes the lag
+      of the nearest. The move stands when the new place is nearer every point of the span than the old start. So a
+      late cue's old start lies past the span's end by the distance from the new place to that end or more.
+    - Between the anchors of the cues around it, when both of them move by their own anchors the same way, LIVE_AGREE
+      or more, and the new place lies inside the heard windows. At the first or the last anchor, the two nearest. It
+      takes their shift, as above. A stay costs more here than on a block. On captions late by more than their spacing,
+      a cue that stays blocks every later move that would pass it. A place outside the heard windows, as past a hearing
+      that stopped part way, is no guess either, so such a cue stays and counts as left.
+
+    A cue that starts with another cue stays, as two lines shown at once. A cue whose new start would lie before the
+    file's start starts at 0, and two such cues may tie there. Every other cue stays. A move that would put
+    a cue at, past or on the same centisecond as the cue next to it, see written(), changes. When the cue that stays
+    has no anchor, it takes the nearest place to its guess between anchors that is nearer every speech up to the bound
+    the next cue gives: its anchor, TOLERANCE wider, or the end of its span. When the cue that moves has its own anchor,
+    it stops a centisecond after the cue that stays, when that is still nearer its anchor. Else that move stays too.
+    So the order of cue starts never changes, and no two starts tie that did not tie before. Two cues that both stay
+    may share a centisecond, as the file has them. A loop past LIVE_STEPS steps a cue moves nothing.
+
+    Returns {"blocks": [one block over the track with "shifts", {start: how late it sat}, and "keep", the starts that
+    stay, or none], "parts": [{"lo", "hi", "anchors", "median", "in_line": False, "why", "whys", "onsets": None, "more":
+    [], "anchored": []}], "live": {"cues", "anchored", "moved", "own", "between", "agree", "stayed", "left", "lags",
+    "fixed", "scan", "stopped"}}. A block holds every cue whose start lies in [from, to). "own", "between" and "agree"
+    count the cues that move each way, "stopped" the cues that stopped after a cue that stays, "stayed" the cues that
+    stay, "left" those of them BLOCK_ALONE or more off their anchor or their place between anchors, or with no anchor
+    around them, "lags" the 10th, 50th and 90th percentile of how late the moved cues sat, and "fixed" whether "left"
+    is LIVE_LEFT of the cues or less. With INVARIANTS, check_live() checks the result."""
+    stop, raw = decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
+    fix = (timing or {}).get("fix")
+    rate, offset = (float(Fraction(fix["rate"])), fix["offset"]) if fix else (1.0, 0.0)
+    starts = [c[0] for c in raw]
+    said = [(c[0] - offset) / rate - BLOCK_LEAD for c in raw]   # where each cue puts its first spoken word on the audio
+    texts = [LABEL.sub(r"\1\2", x) for x in rolled(raw)]
+    at = heard_anchors(heard, [(c[0], c[1], x) for c, x in zip(raw, texts)], stop)[0]
+    doubt = unsure(heard, at, texts, stop)   # {cue: seconds its speech may start after its anchor}
+    cover = merged((w["at"], w["at"] + w.get("secs", WINDOW)) for w in heard)
+    known = lambda t: any(lo - NEAR <= t <= hi + NEAR for lo, hi in cover)   # a place inside the heard windows
+    twice = {t for t, n in collections.Counter(starts).items() if n > 1}   # two lines shown at once
+    own = rising([(k, at[k]) for k in sorted(at) if starts[k] not in twice])
+    keys, new, how, span, guess, stopped = sorted(own), {}, {}, {}, {}, set()   # guess: the place between anchors of a cue that did not move
+    late = lambda j: said[j] - at[j]
+    refused = {k for k, d in doubt.items() if k in own and 0 <= late(k) < 2 * d}   # a move to its anchor may pass its speech
+    sure = own - refused
+    bounds = [k for k in keys if k in sure]   # the anchors that bound the speech of the cues between them
+    for i, k in enumerate(keys):   # by its own anchor, when the anchors around it sit off the same way
+        around = statistics.median([late(j) for j in keys[max(0, i - LIVE_AROUND):i] + keys[i + 1:i + 1 + LIVE_AROUND]] or [0.0])
+        if k not in refused and abs(late(k)) >= BLOCK_ALONE and abs(around) >= BLOCK_SHIFT and around * late(k) > 0:
+            new[k], how[k] = at[k], "own"
+    for k, c in enumerate(raw):   # between the anchors around it
+        if starts[k] in twice or k in sure:
+            continue
+        i = bisect.bisect_left(bounds, k)
+        p, n = bounds[i - 1] if i else None, bounds[i] if i < len(bounds) else None
+        if p is None and n is None:
+            continue
+        lo, hi = at[p] - TOLERANCE if p is not None else -math.inf, at[n] + TOLERANCE + doubt.get(n, 0.0) if n is not None else math.inf
+        x = at[p] + (said[k] - said[p]) / (said[n] - said[p]) * (at[n] - at[p]) if p is not None and n is not None else \
+            said[k] - (said[n] - at[n] if n is not None else said[p] - at[p])   # at an end of the anchors, the lag of the nearest
+        # Nearer every speech in [lo, hi]: past hi by at least the distance from x up to hi, or before lo by that from lo.
+        proof = said[k] > hi and 2 * hi - said[k] <= x or said[k] < lo and x <= 2 * lo - said[k]
+        pair = (p, n) if p is not None and n is not None else bounds[:2] if n is not None else bounds[-2:]
+        two = [late(j) for j in pair]
+        agree = known(x) and len(two) == 2 and all(how.get(j) == "own" for j in pair) and two[0] * two[1] > 0 and min(map(abs, two)) >= LIVE_AGREE
+        if (proof or agree) and abs(said[k] - x) >= BLOCK_SHIFT:
+            new[k], how[k], span[k] = x, "between" if proof else "agree", (lo, hi, *two)
+        elif known(x):   # a place past what the hearing heard is no guess: such a cue counts as left
+            guess[k] = x
+    shift = {k: round(said[k] - x, 3) for k, x in new.items()}
+    for k in [k for k, v in shift.items() if written(starts[k], v, fix) < 0]:   # a speech before the file's start: the cue starts at 0
+        shift[k] = (moved(starts[k] * 1000, fix) if fix else round(starts[k] * 1000)) / 1000
+        new[k] = said[k] - shift[k]
+    w = lambda k: written(starts[k], shift.get(k, 0.0), fix)
+    k, steps = 0, 0
+    while k < len(raw) - 1:   # a move that would pass the cue next to it, or tie with it, stays, and so on until none would
+        steps += 1
+        if steps > LIVE_STEPS * len(raw):   # a second guard: each step moves on or drops a move, so the loop always ends
+            for d in (shift, new, how, span):
+                d.clear()
+            break
+        # Two starts at 0 may tie, and so may two cues that both stay, as the file has them on one centisecond
+        if starts[k] < starts[k + 1] and (k in shift or k + 1 in shift) and w(k) >= w(k + 1) and w(k + 1) > 0:
+            j = k + 1
+            # A cue with no anchor that stays bounds no speech, but the cue after it does: its speech comes first. So it
+            # takes the nearest place to its own guess that is nearer every speech up to that bound, when the place
+            # fits between its neighbours. Else the move after it stays.
+            top = at[j] + TOLERANCE + doubt.get(j, 0.0) if how.get(j) == "own" else span[j][1] if j in span else math.inf
+            x = max(guess.get(k, -math.inf), 2 * top - said[k])
+            fits = k in guess and said[k] > top and x <= top and written(starts[k], round(said[k] - x, 3), fix) < w(j) \
+                and (k == 0 or written(starts[k], round(said[k] - x, 3), fix) > w(k - 1))
+            if fits:
+                new[k], how[k], span[k], shift[k] = x, "between", (-math.inf, top), round(said[k] - x, 3)
+                guess.pop(k)
+                k += 1
+                continue
+            # A cue that moves by its own anchor stops a centisecond after the cue that stays, when that is still nearer
+            # its anchor. The cues after it then rarely meet the cue that stays.
+            ms = (moved(starts[j] * 1000, fix) if fix else round(starts[j] * 1000)) - (w(k) + 1) * 10   # the shift to that centisecond, in ms
+            if how.get(j) == "own" and k not in shift and abs(said[j] - ms / 1000 - at[j]) < abs(said[j] - at[j]) - NEAR:
+                shift[j], new[j] = ms / 1000, said[j] - ms / 1000
+                stopped.add(j)
+                k += 1
+                continue
+            drop = j if j in shift else k
+            for d in (shift, new, how, span):
+                d.pop(drop, None)
+            k = max(0, k - 1)
+            continue
+        k += 1
+    stays = [k for k in range(len(raw)) if k not in shift]
+    # left: off by its own anchor, or by its place between anchors, or with no anchor around it
+    left = sum(abs(said[k] - (at[k] if k in sure else guess.get(k, math.inf))) >= BLOCK_ALONE for k in stays)
+    lags = sorted(shift.values())
+    facts = {"cues": len(raw), "anchored": len(at), "moved": len(shift), **{x: sum(v == x for v in how.values()) for x in ("own", "between", "agree")},
+             "stopped": len(stopped & set(shift)), "stayed": len(stays), "left": left, "lags": [lags[int(q * (len(lags) - 1))] for q in (0.1, 0.5, 0.9)] if lags else [],
+             "fixed": bool(raw) and left <= LIVE_LEFT * len(raw), **({"scan": scan} if scan else {})}
+    blocks = [{"from": starts[0], "to": starts[-1] + 1.0, "shift": lags[len(lags) // 2], "cues": len(shift), "anchors": facts["own"],
+               "shifts": {round(starts[k], 3): v for k, v in shift.items()}, "keep": [round(starts[k], 3) for k in range(len(raw)) if k not in shift],
+               "live": True}] if shift else []
+    why = None if shift else "the moves did not settle in the order of the cues, so none moved" if steps > LIVE_STEPS * len(raw) else \
+        f"dense hearing anchored {len(own)} of {len(raw)} cues in the order of the speech, and none moved {BLOCK_SHIFT} s or more"
+    part = {"lo": 0.0, "hi": max((w["at"] + w.get("secs", WINDOW) for w in heard), default=0.0), "anchors": len(own),
+            "median": facts["lags"][1] if lags else None, "in_line": False, "why": why, "whys": [why] if why else [], "onsets": None, "more": [], "anchored": []}
+    if INVARIANTS:
+        check_live(raw, blocks, {"said": said, "at": at, "own": sure, "how": how, "span": span, "heard": cover, "doubt": doubt}, {"blocks": blocks, "fix": fix, "call": {
+            "heard": heard, "cues": raw, "lang": lang, "timing": timing}})
+    return {"blocks": blocks, "parts": [part], "live": facts}
+
+
+def check_live(cues, blocks, proved, case):
+    """Check two safety rules, see INVARIANTS, on the block of live_moves(). proved holds "said", where each cue puts
+    its speech on the audio, "at", the anchors, "own", the anchors that rise in order, "how" each move and "span" the
+    span of a move between anchors. Raises Broken.
+
+    Own evidence: a cue the block moves has its own anchor among those that rise, or no anchor that counts and a span
+    between two such anchors. When the span did not prove the move, the cues around it sat LIVE_AGREE or more off the
+    same way, and the cue ends inside the span and inside the heard windows, proved "heard". Nearer its speech: a cue
+    moved by its anchor ends nearer it, and nearer the later word that proved "doubt" names, and a cue whose span proved
+    the move ends nearer every point of the span than it sat, each by NEAR for rounding."""
+    for k, c in enumerate(cues):
+        b = mover(blocks, c[0])
+        if b is None:
+            continue
+        new, how = proved["said"][k] - b["shifts"][round(c[0], 3)], proved["how"].get(k)
+        if how == "own" and k in proved["own"]:
+            t, d = proved["at"][k], proved.get("doubt", {}).get(k, 0.0)
+            if any(abs(new - x) > abs(proved["said"][k] - x) + NEAR for x in (t, t + d)):
+                broken("nearer its speech", c[0], f"it moves to {new:.3f} s, and its anchor sits at {t:.3f} s, or {d:.3f} s later", case)
+        elif how == "between" and k not in proved["own"]:
+            lo, hi = proved["span"][k][:2]
+            if any(abs(new - t) > abs(proved["said"][k] - t) + NEAR for t in (lo, hi, min(max(proved["said"][k], lo), hi)) if math.isfinite(t)):
+                broken("nearer its speech", c[0], f"it moves to {new:.3f} s, farther from a point of its span {lo:.3f} to {hi:.3f} s", case)
+        elif how == "agree" and k not in proved["own"]:
+            lo, hi, a, z = proved["span"][k]
+            heard = any(x - NEAR <= new <= y + NEAR for x, y in proved["heard"])
+            if not lo - NEAR <= new <= hi + NEAR or not heard or a * z <= 0 or min(abs(a), abs(z)) < LIVE_AGREE:
+                broken("own evidence", c[0], f"it moves to {new:.3f} s, with its span {lo:.3f} to {hi:.3f} s, the lags {a:+.3f} and {z:+.3f} s "
+                       f"around it, {'inside' if heard else 'outside'} the heard windows", case)
+        else:
+            broken("own evidence", c[0], "the live block moves it, but neither its anchor nor a span proved it", case)
