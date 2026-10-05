@@ -396,7 +396,8 @@ def time_plan(cues, fix, blocks, ends=None, ass=False):
     moved(start, fix) less the shift of the block whose [from, to) holds its start, unless the block keeps that start,
     rounded to ms, in "keep": a cue with no evidence of its own stays, see subsync.mover(). Each start takes the shift
     of subsync.shift_of(): its own shift on a live-captioned track, see subsync.live_moves(), or the shift the block's
-    "clamp" names, so it stops one centisecond short of the cue next to it, see subsync.clamped(). ends are the new ends
+    "clamp" names, so it stops one centisecond short of the cue next to it, see subsync.clamped(). A cue of a "kept"
+    block, see subsync.keep_blocks(), keeps its start and end, or its flash end, whatever the fix. ends are the new ends
     of flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does. A cue
     a live block moves ends at the next later new start at most, as live captions end where the next line starts. It
     still shows subsync.FLASH seconds or its planned length, the less, so no cue turns into a flash. A few cues then
@@ -409,6 +410,10 @@ def time_plan(cues, fix, blocks, ends=None, ass=False):
     out, live = [], []
     for k, (s, e, text) in enumerate(cues):
         b = subsync.mover(blocks, s)
+        if b is not None and b.get("kept"):   # a run a partial shift keeps, see subsync.keep_blocks(): its own times
+            out.append((s, text, e, s, ends[k] if ends else e))
+            live.append(False)
+            continue
         shift = subsync.shift_of(b, s) if b else 0
         a = max(0, at(s, shift))
         out.append((s, text, e, a / 1000, max(at(ends[k] if ends else e, shift), a + step) / 1000))
@@ -429,14 +434,17 @@ def blocks_moved(plan, fix=None):
     -1.42 s", or None when it moves none. Each cue counts with the block that moves it, see subsync.mover(), a cue that
     moves part of the way too, see subsync.clamped(). A block gives its shift. A move under 0.05 s is the rounding of
     ASS times. A live-captioned track moves each cue by its own time, so it gives the range, as "1203 cues moved
-    -18.20 s to -3.10 s, each by its own time"."""
+    -18.20 s to -3.10 s, each by its own time". The runs of a partial shift that keep their times against the fix give
+    "12 cues kept their times"."""
     runs = {}
     for s, _, _, a, _ in sorted(plan, key=lambda p: p[0]):
         b, d = subsync.mover(plan.blocks, s), a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
         if b is not None and abs(d) > 0.05:
             runs.setdefault(id(b), (b, []))[1].append(d)
+    kept = sum(len(ds) for b, ds in runs.values() if b.get("kept"))   # a run of a partial shift that keeps its times, see subsync.shifted()
+    runs = {k: v for k, v in runs.items() if not v[0].get("kept")}
     if not runs:
-        return None
+        return f"{kept} cues kept their times" if kept else None
     if any("shifts" in b for b, _ in runs.values()):
         moves = sorted(d for _, ds in runs.values() for d in ds)
         return f"{len(moves)} cues moved {moves[0]:+.2f} s to {moves[-1]:+.2f} s, each by its own time"

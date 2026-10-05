@@ -25,6 +25,7 @@ time. lid.listen() hears two short windows of the audio. This module compares th
 import bisect
 import collections
 import difflib
+import itertools
 import json
 import math
 import os
@@ -611,10 +612,10 @@ def reference(cues, refs, duration):
     return dict(out, verdict="fit", why=f"the cues fit {name} at a lift of {score:.2f} over chance", timing=timing)
 
 
-# The speech layout (docs/design.md, "Incorrect subtitle identification"). A subtitle in no main audio language has no
-# words to compare, and often no reference. Its cues still show while people speak. lid.speech() gives the spans of
-# speech of the whole audio from Silero VAD, and layout() fits the cue spans to them as reference() fits a track to a
-# reference.
+# The speech layout (docs/design.md, "Incorrect subtitle identification" and "Foreign subtitle timing"). A subtitle in
+# no main audio language has no words to compare, and often no reference. Its cues still show while people speak.
+# lid.speech() gives the spans of speech of the whole audio from Silero VAD, and layout() fits the cue spans to them as
+# reference() fits a track to a reference.
 VAD_FRAME = 512 / 16000   # seconds of one frame of Silero VAD, which gives one speech probability a frame
 VAD_ON = 0.5      # the probability at which a span of speech starts, Silero's own threshold
 VAD_OFF = 0.35    # the probability under which it ends, Silero's own threshold less 0.15
@@ -704,8 +705,12 @@ LAYOUT_LEAD = -0.2   # seconds a right track's lines start after the speech star
 ONSET_LEAD = -0.1    # seconds a right track's lines start after their speech onsets, the median over verified right tracks
 ONSET_PARTS = 10     # parts of the file, spread evenly, whose onsets confirm a fix of layout_fix(), see onset_parts()
 ONSET_PART = 120.0   # seconds of each part at most
-LAYOUT_FIX = "alert"   # what a fix of layout_fix() that the speech onsets confirm does: "alert" only, or "write" the new
-                       # times. On planted steps near a file's end, some fixes moved right lines farther, see docs/design.md.
+LAYOUT_ONSET_SHARE = 0.0   # the share of a half's starts that must have an onset where a fix of layout_onsets() puts them.
+                           # A block of clock() asks ONSET_SHARE. A whole track asks none, the owner's choice: under a music
+                           # bed silencedetect marks few onsets. Set it to ONSET_SHARE to ask it again.
+LAYOUT_FIX = "write"   # what a fix of layout_fix() that the speech onsets confirm does: "alert" only, or "write" the new
+                       # times. On planted steps of a review's shapes no right line moved, but no rule makes a right line
+                       # safe for sure, and runs of lines at the ends stay where they are, see shifted() and docs/design.md.
 LAYOUT_EDGE = 0.08   # the share of the cue spans at each end of the file, MIN_TRACK_CUES at least, that must line up with
                      # the speech best at a fix of layout_fix(), see edges()
 LAYOUT_PARTS = 20    # parts of the cue spans, equal by count, none of which may vote for another offset, see edges()
@@ -755,8 +760,13 @@ def layout_fix(cues, speech, duration, lay):
     spans(), fit the speech spans in slices at the ratio and offset of lay, as reference() fits a reference, see
     sliced(). So a track off by one shift, or timed for another frame rate, gets a fix that keeps LAYOUT_LEAD. Slices
     at different offsets, as of another cut, are "piecewise" and get no fix, and alert only when stepped() shows a
-    step. The fix must then line the moved cues up with the speech at ratio 1, within TOLERANCE of LAYOUT_LEAD, else
-    the times stay. The speech onsets confirm it later, see layout_onsets()."""
+    step. A fix at ratio 1 moves only the lines that agree with it, see shifted(): a run of lines at the file's start
+    or end that has no evidence at the fix keeps its times. Its "keep" holds the kept runs, and "kept" counts their
+    lines. A fix at another ratio moves every line, unless an end sits on speech now, see sat_on_speech().
+    The lines after the fix must then line up with the speech at ratio 1, within TOLERANCE of LAYOUT_LEAD, and every
+    part of the moved lines must line up there, see edges(). A kept run keeps its own rule in shifted(): an opening
+    song in time lines up with the speech nowhere, and edges() would read it as off. Else the times stay. The speech
+    onsets confirm the moved lines later, see layout_onsets()."""
     if lay["verdict"] != "fit":
         return None
     mine = [tuple(x) for x in spans(unflashed(sorted(cues)))]
@@ -764,18 +774,214 @@ def layout_fix(cues, speech, duration, lay):
     if timing.get("piecewise") and not stepped(timing["offsets"]):
         return {"fix": None, "offsets": timing["offsets"], "why": f'{timing["why"]}, but no two slices agree on another offset, so the times stay'}
     fix = timing.get("fix")
-    if fix:
-        moved_cues = [(moved(a * 1000, fix) / 1000, moved(b * 1000, fix) / 1000, *x) for a, b, *x in cues]
-        again = layout(moved_cues, speech, duration)
-        if again["verdict"] != "fit" or again["rate"] != "1/1" or abs(again["offset"] - LAYOUT_LEAD) > TOLERANCE:
-            return {"fix": None, "unfixed": fix["offset"], "why": f'{timing["why"]}, but the lines it moves do not line up with the speech in '
-                    "time, so the times stay"}
-        off = edges(mine, speech, Fraction(fix["rate"]), fix["offset"] + LAYOUT_LEAD * float(Fraction(fix["rate"])))
-        if off:
-            return {"fix": None, "unfixed": fix["offset"], "why": f'{timing["why"]}, but {off}, so the times stay'}
-        if INVARIANTS:
-            nearer(cues, moved_cues, speech, fix)
-    return timing
+    if not fix:
+        return timing
+    unfixed = lambda why: {"fix": None, "unfixed": fix["offset"], "why": f'{timing["why"]}, but {why}, so the times stay'}
+    cs = sorted(cues)
+    if fix["rate"] == "1/1":
+        moves, why, keep = shifted(cs, speech, fix)
+    else:   # a frame-rate error covers the whole file, so every line moves, unless an end sits on speech now
+        moves, why, keep = [True] * len(cs), sat_on_speech(cs, speech, fix), []
+    if why:
+        return unfixed(why)
+    to = lambda x: moved(x * 1000, fix) / 1000
+    moved_cues = [(to(a), to(b), *x) if m else (a, b, *x) for (a, b, *x), m in zip(cs, moves)]
+    again = layout(moved_cues, speech, duration)
+    if again["verdict"] != "fit" or again["rate"] != "1/1" or abs(again["offset"] - LAYOUT_LEAD) > TOLERANCE:
+        return unfixed("the lines it moves do not line up with the speech in time")
+    off = edges([tuple(x) for x in spans(unflashed(sorted(c for c, m in zip(moved_cues, moves) if m)))], speech, Fraction(1), LAYOUT_LEAD)
+    if off:
+        return unfixed(off)
+    if INVARIANTS:
+        nearer(cues, moved_cues, speech, fix)
+        check_kept(cs, moves, fix, speech) if fix["rate"] == "1/1" else check_ratio(cs, moves, fix, speech)
+    if not keep:
+        return timing
+    runs = " and ".join(f'the {"first" if lo is None else "last"} ' + (f"{n} lines" if n > 1 else "line") for lo, _, n in keep)
+    keeps = "keep their times" if len(keep) > 1 or keep[0][2] > 1 else "keeps its time"
+    return dict(timing, keep=keep, kept=sum(n for *_, n in keep), why=f'{timing["why"]}, and {runs} {keeps}, as no speech confirms them at the fix')
+
+
+# The partial shift of layout_fix() (docs/design.md, "Foreign subtitle timing"). A track from another cut can have a
+# cold open in time and the rest shifted. A fix then moves only the lines that agree with it. Each line votes on
+# whether it stays: a speech start (VAD) within TOLERANCE of where the fix puts it, and one where it sits. A run at an
+# end of the file whose votes rise stays.
+KEEP_VOTES = (0.55, 1.57, 1.1, 0.25)   # a line's vote that it stays, from VAD: no speech start at the fix, one there,
+                     # one where it sits, none there. 48% of the lines of verified right tracks start within TOLERANCE of
+                     # a speech start, and 10% at an offset by chance. A line that stays sits right (48%) or where no one
+                     # speaks (10%), so 30% is taken where it sits. Each vote is the log of the ratio of the two chances.
+KEEP_SLACK = 4.0     # votes the running sum of a run that stays may fall below its peak and still keep its lines: two
+                     # chance speech starts at the fix, with a line beside them. Right lines with no speech under them
+                     # drew two such starts in a row on a review's plants, and a slack of one start moved them.
+SAT_STARTS = 2       # lines with a speech start where they sit and none at a frame-rate fix that make an end sit on
+                     # speech now, see sat_on_speech()
+SAT_CHANCE = 0.05    # the chance at most of as many such starts in that run. The owner's choice: on planted subtitles
+                     # with one end in time and the rest at another frame rate, a lower bar lost real fixes, and a
+                     # higher one moved right lines with speech under them more often.
+KEEP_PASS = 1.0      # seconds the first or last moved line with evidence must pass where a line that stays sits before
+                     # that line moves too. A fix lands within TOLERANCE of the speech, and one planted fix landed 0.33 s off.
+
+
+def near_times(starts, times, shift, tol):
+    """[some time of the sorted times lies within tol of t - shift] for each t of starts."""
+    return [bool(times[bisect.bisect_left(times, t - shift - tol):bisect.bisect_right(times, t - shift + tol)]) for t in starts]
+
+
+def kept_run(votes):
+    """The number of lines from the start of votes, each line's vote that it stays, that keep their times: every line
+    up to the last place where the running sum of the votes lies within KEEP_SLACK of its peak. So a chance speech
+    start at the fix near the end of a run that stays cuts no line off."""
+    run = list(itertools.accumulate(votes, initial=0.0))
+    top = max(run)
+    return max(k for k, v in enumerate(run) if v >= top - KEEP_SLACK)
+
+
+def stay_votes(cues, speech, fix):
+    """(span starts, where fix puts them, here, there, votes) of the spans of cues, sorted, see spans() and
+    shifted(): here and there flag a VAD speech start within TOLERANCE of a span start, less LAYOUT_LEAD, where it
+    sits and where fix puts it. votes are each span's KEEP_VOTES that it stays."""
+    ts, rs = [a for a, _ in spans(unflashed(cues))], [a for a, _ in speech]
+    to = [moved(t * 1000, fix) / 1000 for t in ts]
+    here = near_times(ts, rs, LAYOUT_LEAD, TOLERANCE)
+    there = [bool(rs[bisect.bisect_left(rs, x - LAYOUT_LEAD - TOLERANCE):bisect.bisect_right(rs, x - LAYOUT_LEAD + TOLERANCE)]) for x in to]
+    w = KEEP_VOTES
+    return ts, to, here, there, [(-w[1] if y else w[0]) + (w[2] if x else -w[3]) for x, y in zip(here, there)]
+
+
+def shifted(cues, speech, fix):
+    """(moves, why, keep) of a fix of layout_fix() for cues, sorted: moves flags each cue that moves, why says why
+    nothing may move or is None, and keep holds the runs that stay as [from, to, lines] in cue seconds, from None at
+    the file's start or to None at its end. Each span of the cues votes that it stays, see stay_votes(), and
+    kept_run() gives the lines that stay at each end. The first and the last span that move, the core's edges, need
+    a speech start where the fix puts them and none where they sit, so lines with no evidence at the fix stay. A line
+    that stays where the core's first or last moved line would pass it moves too, when the move goes toward its end
+    of the file and passes it by KEEP_PASS or more. A moved line lands on its speech, so it passes a right line by the
+    fix's error at most. A line that only a line moved this way would pass, any other pass, a run that stays but lines
+    up with the speech elsewhere, see align(), and under MIN_TRACK_CUES lines to move give why."""
+    ts, to, here, there, votes = stay_votes(cues, speech, fix)
+    rs = [a for a, _ in speech]
+    lo, hi = kept_run(votes), len(ts) - kept_run(votes[::-1])
+    while lo < hi and not (there[lo] and not here[lo]):   # the core's first line has its own evidence at the fix
+        lo += 1
+    while hi > lo and not (there[hi - 1] and not here[hi - 1]):
+        hi -= 1
+    if hi - lo < MIN_TRACK_CUES:
+        return None, f"only {hi - lo} lines would move", []
+    span = [max(0, bisect.bisect_right(ts, c[0]) - 1) for c in cues]
+    new = [moved(c[0] * 1000, fix) / 1000 for c in cues]
+    core = [k for k in range(len(cues)) if lo <= span[k] < hi]
+    first, last = new[core[0]], new[core[-1]]
+    move = set(core)
+    for k in range(len(cues)):   # a line the core passes: only the core's own first or last line may move it
+        if span[k] < lo and cues[k][0] > first or span[k] >= hi and cues[k][0] < last:
+            toward = first < cues[core[0]][0] if span[k] < lo else last > cues[core[-1]][0]
+            if not toward or abs(cues[k][0] - (first if span[k] < lo else last)) < KEEP_PASS:
+                return None, "a line it moves would pass a line that keeps its time", []
+            move.add(k)
+    at = [new[k] if k in move else c[0] for k, c in enumerate(cues)]
+    if any(at[k] >= at[k + 1] and cues[k][0] < cues[k + 1][0] for k in range(len(cues) - 1)):   # a moved line passes another line
+        return None, "a line it moves would pass a line that keeps its time", []
+    moves = [k in move for k in range(len(cues))]
+    a, b = moves.index(True), len(moves) - moves[::-1].index(True)
+    for name, run in (("first", sorted({ts[span[k]] for k in range(a)})), ("last", sorted({ts[span[k]] for k in range(b, len(cues))}))):
+        if len(run) >= SPARSE and bisect.bisect_right(rs, run[-1] - LAYOUT_LEAD + 1) - bisect.bisect_left(rs, run[0] - LAYOUT_LEAD - 1) >= SPARSE:
+            got = align(run, rs, 1, LAYOUT_LEAD, REACH, CLEAR)
+            if got is not None and abs(got - LAYOUT_LEAD) > TOLERANCE:
+                return None, f"the {name} {len(run)} lines, which keep their times, line up with the speech {got - LAYOUT_LEAD:+.2f} s from where they are", []
+    keep = ([[None, cues[a][0], a]] if a else []) + ([[cues[b][0], None, len(cues) - b]] if b < len(cues) else [])
+    return moves, None, keep
+
+
+def sat_run(cues, speech, fix):
+    """[(end, lines, starts, chance)] of each end of cues, sorted, at fix: the lines from that end up to the last peak
+    of the running sum of their stay votes, see stay_votes(), how many of them have a speech start where they sit and
+    none at the fix, and the chance of as many: the Poisson tail at the rate of such starts at the NULL offsets."""
+    ts, _, here, there, votes = stay_votes(cues, speech, fix)
+    rs = [a for a, _ in speech]
+    rate = statistics.fmean(statistics.fmean(near_times(ts, rs, LAYOUT_LEAD + d, TOLERANCE)) for d in NULL)
+    out = []
+    for end, h, th, v in (("first", here, there, votes), ("last", here[::-1], there[::-1], votes[::-1])):
+        run = list(itertools.accumulate(v, initial=0.0))
+        k = max(range(len(run)), key=lambda i: (run[i], i))
+        got = sum(1 for x, y in zip(h[:k], th[:k]) if x and not y)
+        term, below = math.exp(-k * rate), 0.0   # the Poisson tail by a running term, as clock() takes it
+        for i in range(got):
+            below, term = below + term, term * k * rate / (i + 1)
+        out.append((end, k, got, max(0.0, 1 - below)))
+    return out
+
+
+def sat_on_speech(cues, speech, fix):
+    """Why a fix at a frame-rate ratio would move lines that sit on speech now, or None. A frame-rate error covers the
+    whole file, so such a fix moves every line, those with no speech at either place too. But when the run at an end,
+    see sat_run(), holds SAT_STARTS or more lines with a speech start where they sit and none at the fix, at a chance
+    of SAT_CHANCE at most, that end is in time and the rest is not: two sources. Then nothing moves, and the alert
+    says the subtitles seem late."""
+    for end, k, got, chance in sat_run(cues, speech, fix):
+        if got >= SAT_STARTS and chance <= SAT_CHANCE:
+            return f"the {end} {k} lines line up with the speech where they sit, at {got} speech starts, so they would move off it"
+    return None
+
+
+def check_ratio(cues, moves, fix, speech):
+    """Check the rule of a fix at a frame-rate ratio, see sat_on_speech() and INVARIANTS: every line moves, the order
+    of the lines holds, see ordered(), and no end holds a run that sits on speech now. Raises Broken."""
+    new = [moved(c[0] * 1000, fix) / 1000 for c in cues]
+    case = {"cues": [c[:2] for c in cues], "moves": moves, "fix": fix}
+    if not all(moves):
+        broken("every line", cues[moves.index(False)][0], "a fix at a frame-rate ratio keeps this line's time", case)
+    ordered([(c[0], c[0], n) for c, n in zip(cues, new)], case)
+    for end, k, got, chance in sat_run(cues, speech, fix):
+        if got >= SAT_STARTS and chance <= SAT_CHANCE:
+            broken("sits on speech", cues[0 if end == "first" else -1][0], f"the {end} {k} lines hold {got} speech starts where they sit, at a chance of "
+                   f"{chance:.3f}, and the fix moves them", case)
+
+
+def kept_at(keep, t):
+    """A cue that starts at t lies in a run of keep that keeps its times, see shifted()."""
+    return any((lo is None or lo <= t) and (hi is None or t < hi) for lo, hi, _ in keep or ())
+
+
+def keep_ordered(cues, timing):
+    """The new starts of cues [(start, end, ...)] in their file's order, after the fix of timing with its kept runs,
+    keep the order of their starts, as subsync.ordered() asks. A line with no text, which the check never read, can
+    sit between a kept run and the moved lines."""
+    rows = sorted((c[0], c[0] if kept_at(timing.get("keep"), c[0]) else moved(c[0] * 1000, timing["fix"]) / 1000) for c in cues)
+    return all(n0 < n1 or s0 == s1 for (s0, n0), (s1, n1) in zip(rows, rows[1:]))
+
+
+def keep_blocks(timing):
+    """The blocks of remux.time_plan() that hold the runs of timing["keep"] where they are against its fix, see
+    shifted(): a "kept" block keeps the start and end of each of its cues."""
+    return [{"from": -1e12 if lo is None else lo, "to": 1e12 if hi is None else hi, "shift": 0.0, "cues": n, "kept": True} for lo, hi, n in timing.get("keep") or ()]
+
+
+def check_kept(cues, moves, fix, speech):
+    """Check the rules of the moves of shifted() for cues, sorted, see INVARIANTS. moves flags the cues that move by
+    fix. Order: no moved cue passes a cue that stays, and no two starts that differed tie, see ordered(). Edges: the
+    cues that stay lie at the ends of the file only. Own evidence, at each end of the file: some moved span has a
+    speech start where the fix puts it and none where it sits, and the running sum of the stay votes from that end,
+    see stay_votes(), has fallen over KEEP_SLACK below its peak at it, see kept_run(). That is the core's edge. Every
+    moved cue between it and that end lies where the edge's cue passes it by KEEP_PASS or more. Raises Broken."""
+    new = [moved(c[0] * 1000, fix) / 1000 if m else c[0] for c, m in zip(cues, moves)]
+    case = {"cues": [c[:2] for c in cues], "moves": moves, "fix": fix}
+    ordered([(c[0], c[0], n) for c, n in zip(cues, new)], case)
+    a, b = moves.index(True), len(moves) - moves[::-1].index(True)
+    if not all(moves[a:b]):
+        broken("edges", cues[a + moves[a:b].index(False)][0], "a cue between two cues that move keeps its time", case)
+    ts, _, here, there, votes = stay_votes(cues, speech, fix)
+    span = [max(0, bisect.bisect_right(ts, c[0]) - 1) for c in cues]
+    for start in (True, False):   # each end, one with no kept line too: a cascade there moved every line before the edge
+        idx = list(range(a, b)) if start else list(range(b - 1, a - 1, -1))
+        run = list(itertools.accumulate(votes if start else votes[::-1], initial=0.0))
+        at = lambda s: s + 1 if start else len(ts) - s
+        edge = next((k for k in idx if there[span[k]] and not here[span[k]] and max(run[:at(span[k])]) - run[at(span[k])] > KEEP_SLACK), None)
+        if edge is None:
+            broken("own evidence", cues[idx[0]][0], "no moved line has a speech start at the fix, none where it sits, and the stay votes over KEEP_SLACK "
+                   "under their peak", case)
+        for k in idx[:idx.index(edge)]:
+            if span[k] != span[edge] and (cues[k][0] - new[edge] if start else new[edge] - cues[k][0]) < KEEP_PASS:
+                broken("own evidence", cues[k][0], "it moves with no evidence of the core's edge at the fix, and the edge's line does not pass it", case)
 
 
 def nearer(cues, moved_cues, speech, fix):
@@ -800,15 +1006,19 @@ def layout_onsets(cues, timing, onsets, read, duration):
     second clock: silencedetect marks them, and VAD the spans of speech. onsets are [(time, seconds of silence before
     it)] read in the parts read, see onset_parts(). A cue span start, see spans(), counts where the fix puts it when an
     onset that ends ONSET_QUIET of silence lies within half of TOLERANCE of it less ONSET_LEAD, and likewise where it
-    sat. Each half of the file must agree, as clock() judges a block: ONSET_MIN and ONSET_SHARE of its starts count
-    where the fix puts them, twice as many as where they sat, and as many are rare by chance. Chance is the same count
-    at the NULL offsets, or the rate of the counted onsets in the parts, whichever is more, and the chance of as many
-    or more must be ONSET_CHANCE at most. A half where enough count where they sat disagrees. Else there are too few.
-    "onsets" holds the counts of each half: starts, where the fix puts them, where they sat, chance."""
+    sat. Each half of the file must agree: ONSET_MIN of its starts, and LAYOUT_ONSET_SHARE of them, count where the
+    fix puts them, twice as many as where they sat, and as many are rare by chance. Chance is the same count at the
+    NULL offsets, or the rate of the counted onsets in the parts, whichever is more, and the chance of as many or more
+    must be ONSET_CHANCE at most. A half where as many count where they sat, and no fewer than at the fix, disagrees.
+    Else there are too few. clock() asks a block for ONSET_SHARE of its cues. A whole track asks LAYOUT_ONSET_SHARE:
+    under a music bed silencedetect marks few onsets, and verified real shifts of about 1 s drew 9% to 19% of their
+    starts there, at a chance of 1e-6 or less.
+    The lines of timing["keep"], which keep their times, see shifted(), do not count. "onsets" holds the counts of each
+    half: starts, where the fix puts them, where they sat, chance."""
     fix = timing["fix"]
     times = [t for t, quiet in onsets if quiet >= ONSET_QUIET]
     hits = lambda ps: sum(bool(times[bisect.bisect_left(times, p - TOLERANCE / 2):bisect.bisect_right(times, p + TOLERANCE / 2)]) for p in ps)
-    starts = [a for a, _ in spans(unflashed(sorted(cues)))]
+    starts = [a for a, _ in spans(unflashed(sorted(c for c in cues if not kept_at(timing.get("keep"), c[0]))))]
     halves = [[0, 0, 0, 0.0], [0, 0, 0, 0.0]]
     for lo, hi in read:
         new = [p for t in starts if lo <= (p := moved(t * 1000, fix) / 1000 - ONSET_LEAD) <= hi]
@@ -822,7 +1032,7 @@ def layout_onsets(cues, timing, onsets, read, duration):
         term, below = math.exp(-chance), 0.0   # the Poisson tail by a running term, as clock() takes it
         for i in range(new):
             below, term = below + term, term * chance / (i + 1)
-        need = max(ONSET_MIN, ONSET_SHARE * n)
+        need = max(ONSET_MIN, LAYOUT_ONSET_SHARE * n)
         return "agree" if new >= need and new >= 2 * old and 1 - below <= ONSET_CHANCE else "disagree" if old >= need and old >= new else "few"
     said = [judge(*h) for h in halves]
     counts = [[n, a, b, round(c, 2)] for n, a, b, c in halves]

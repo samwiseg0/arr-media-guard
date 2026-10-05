@@ -55,6 +55,32 @@ def app_list(app):
         sys.exit(no_key(app, ex) or f"{app.capitalize()} is not set up. Set {config.env_key(app)}_URL and {config.env_key(app)}_API_KEY.")
 
 
+def hunter_urls(app):
+    """{"sab": (SABnzbd's API URL, None), "hydra": (the Newznab indexer's API URL, None)} of the subtitle hunter, from
+    the Radarr instance app. Each is the first of its kind by id, as the app stores them. SABNZBD_URL and NEWZNAB_URL
+    take the place of the address the app saved, as for a container that does not resolve it. The API path stays. A
+    kind the app has not saved gives (None, why), as "Radarr has no Newznab indexer". One saved with no address gives
+    ("", why), as "Radarr's SABnzbd download client has no host". The hunter and the start check use it, see
+    arr_subhunt.creds() and runner.hunter_checks()."""
+    c, name = config.CFG, ARR[app].name
+    first = lambda kind, impl: min((p for p in arr(app, kind) if p.get("implementation") == impl), key=lambda p: p["id"], default=None)
+    sab, hyd = ({f["name"]: f.get("value") for f in p.get("fields") or []} if p else None
+                for p in (first("downloadclient", "Sabnzbd"), first("indexer", "Newznab")))
+    if sab is None:
+        s = None, f"{name} has no SABnzbd download client"
+    elif not c.sabnzbd_url and not (sab.get("host") and sab.get("port")):
+        s = "", f"{name}'s SABnzbd download client has no {'host' if not sab.get('host') else 'port'}"
+    else:
+        s = (c.sabnzbd_url or f'{"https" if sab.get("useSsl") else "http"}://{sab["host"]}:{sab["port"]}{sab.get("urlBase") or ""}').rstrip("/") + "/api", None
+    if hyd is None:
+        n = None, f"{name} has no Newznab indexer"
+    elif not (c.newznab_url or hyd.get("baseUrl")):
+        n = "", f"{name}'s Newznab indexer has no base URL"
+    else:
+        n = (c.newznab_url or hyd["baseUrl"]).rstrip("/") + (hyd.get("apiPath") or "/api"), None
+    return {"sab": s, "hydra": n}
+
+
 def own_key(who):
     """The key of the own map of who, an instance or "plex": SONARR_PATH_MAP, SONARR_4K_PATH_MAP, PLEX_PATH_MAP."""
     return f"{config.env_key(who)}_PATH_MAP"
@@ -424,12 +450,14 @@ class Sonarr(App):
 ARR = {app: (Radarr if a.program == "radarr" else Sonarr)(app) for app, a in config.CFG.apps.items()}
 
 
-def path_warnings(per_app=True):
+def path_warnings(per_app=True, plex_warned=False):
     """Why a path map does not fit, as warnings. Each app whose API key reads names its root folders. A root folder
     this script does not see warns, and so does one that no Plex library folder holds or sits in. --selftest and the
-    listener start print them, and neither fails on them. Plex libraries that hold no root folder never warn, so a
-    music library or another host's library stays quiet. per_app=False leaves out an app that does not answer and a root
-    folder this script does not see, because the listener's start check reports both."""
+    listener start print them, and neither fails on them. A Plex that does not answer warns that the folders went
+    unchecked. plex_warned leaves that line out, because the plex check of runner.service_checks() already said why.
+    Plex libraries that hold no root folder never warn, so a music library or another host's library stays quiet.
+    per_app=False leaves out an app that does not answer and a root folder this script does not see, because the
+    listener's start check reports both."""
     out, roots = [], []
     for app in config.CFG.apps:
         name = ARR[app].name
@@ -454,7 +482,7 @@ def path_warnings(per_app=True):
     try:
         locs = [loc["path"].rstrip("/") for d in plex.plex_get("/library/sections").get("Directory", []) for loc in d.get("Location", [])]
     except Exception as ex:
-        return out + [config.mask(f"Plex did not answer, so its library folders are not checked: {type(ex).__name__}: {ex}")[:300]]
+        return out if plex_warned else out + [config.mask(f"Plex did not answer, so its library folders are not checked: {type(ex).__name__}: {ex}")[:300]]
     for name, r in roots:
         p = mapped(r, "plex", True).rstrip("/")
         if not any(p == x or p.startswith(x + "/") or x.startswith(p + "/") for x in locs):

@@ -607,8 +607,8 @@ def and_join(xs):
 
 
 def episode_why(imported, said, title, names, quote=lambda s: f'"{s}"'):
-    """The words of an episode title that names another episode, as in: imported as S01E02 "Sleepover". The release
-    name calls it "Anxious Times at Clone High", which is S01E03. imported holds the [number, Sonarr's title or None] of
+    """The words of an episode title that names another episode, as in: imported as S01E02 "Overnight". The release
+    name calls it "Anxious Times at Show Alpha", which is S01E03. imported holds the [number, Sonarr's title or None] of
     each imported episode. quote marks a title. The Discord embed bolds the titles with it, see report.quote()."""
     ours = and_join([n + (f" {quote(t)}" if t else "") for n, t in imported])
     return f"imported as {ours}. {said[:1].upper()}{said[1:]} calls it {quote(title)}, which is {names}"

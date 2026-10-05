@@ -262,6 +262,7 @@ WHOLE = "is not a whole number of {} or more, so it counts as {}."
     ("HEADER_REPAIR='off'", "header_repair", True, "HEADER_REPAIR 'off' " + SWITCH.format("arr-media-guard repairs a broken header")),
     ("RESTORE='no'", "restore", True, "RESTORE 'no' " + SWITCH.format("a re-grab of a broken upgrade puts the old file back")),
     ("CONVERT='yes'", "convert", False, "CONVERT 'yes' " + SWITCH.format("arr-media-guard converts no import")),
+    ("RECHECK_ON_UPDATE='no'", "recheck_on_update", True, "RECHECK_ON_UPDATE 'no' " + SWITCH.format("a new version queues a recheck of the files it can fix")),
     ("HOOK_WORKERS='0'", "hook_workers", 1, "HOOK_WORKERS '0' is not a whole number of 1 or more, so 1 runs"),
     ("KEEP_ORIGINALS_DAYS='a week'", "keep_days", 7, "KEEP_ORIGINALS_DAYS 'a week' " + WHOLE.format(0, 7)),
     ("KEEP_ORIGINALS_DAYS='-3'", "keep_days", 0, "KEEP_ORIGINALS_DAYS '-3' " + WHOLE.format(0, 0)),
@@ -360,14 +361,14 @@ def test_each_instance_links_its_alerts_to_its_own_link_setting(tmp_path):
     instance named with -link keeps its keys apart from the link key of another instance, as radarr-link reads
     RADARR_LINK_URL and radarr reads RADARR_LINK."""
     m = load(tmp_path, "APP_INSTANCES='sonarr-4k:sonarr,radarr-4k:radarr,radarr-link:radarr'\nSONARR_4K_URL='http://sonarr-4k:8989'\n"
-                       "SONARR_4K_LINK='https://tv4k.watch-tower.net'\nRADARR_4K_URL='http://radarr-4k:7878'\nRADARR_4K_LINK=''\n"
-                       "SONARR_URL='http://sonarr:8989'\nSONARR_LINK='https://tv.watch-tower.net/'\n"
-                       "RADARR_LINK='https://movies.watch-tower.net'\nRADARR_LINK_URL='http://radarr-link:7878'\n")
+                       "SONARR_4K_LINK='https://tv4k.media-host.test'\nRADARR_4K_URL='http://radarr-4k:7878'\nRADARR_4K_LINK=''\n"
+                       "SONARR_URL='http://sonarr:8989'\nSONARR_LINK='https://tv.media-host.test/'\n"
+                       "RADARR_LINK='https://movies.media-host.test'\nRADARR_LINK_URL='http://radarr-link:7878'\n")
     assert m.CFG.errors == [] and [(a.url, a.link) for a in m.CFG.apps.values()] == [
-        ("http://127.0.0.1:7878", "https://movies.watch-tower.net"), ("http://sonarr:8989", "https://tv.watch-tower.net/"),
-        ("http://sonarr-4k:8989", "https://tv4k.watch-tower.net"), ("http://radarr-4k:7878", ""), ("http://radarr-link:7878", "")]
-    assert [m.ARR[a].page("x-1") for a in m.CFG.apps] == ["https://movies.watch-tower.net/movie/x-1", "https://tv.watch-tower.net/series/x-1",
-                                                          "https://tv4k.watch-tower.net/series/x-1", None, None]
+        ("http://127.0.0.1:7878", "https://movies.media-host.test"), ("http://sonarr:8989", "https://tv.media-host.test/"),
+        ("http://sonarr-4k:8989", "https://tv4k.media-host.test"), ("http://radarr-4k:7878", ""), ("http://radarr-link:7878", "")]
+    assert [m.ARR[a].page("x-1") for a in m.CFG.apps] == ["https://movies.media-host.test/movie/x-1", "https://tv.media-host.test/series/x-1",
+                                                          "https://tv4k.media-host.test/series/x-1", None, None]
 
 
 @pytest.mark.parametrize("text, why", [
@@ -431,7 +432,8 @@ def test_an_environment_variable_that_is_no_setting_is_ignored(tmp_path):
 
 
 @pytest.mark.parametrize("key, value", [("HEADER_REPAIR", "off"), ("HOOK_WORKERS", "0"), ("REPACK_MAX_GB", "lots"), ("SUBTITLES", ""),
-                                        ("REGRAB", "sound"), ("PLEX_PATH_MAP", "/a"), ("NAME", "a b"), ("APP_INSTANCES", "sonarr-4k")])
+                                        ("REGRAB", "sound"), ("PLEX_PATH_MAP", "/a"), ("NAME", "a b"), ("APP_INSTANCES", "sonarr-4k"),
+                                        ("DISCORD_POSTS", "every")])
 def test_a_bad_value_from_the_environment_fails_the_selftest_as_in_the_env_file(tmp_path, monkeypatch, capsys, key, value):
     """The same parsers read both, so the reading and the error are the same. The selftest line names the key."""
     from_file = load(tmp_path, f"{key}='{value}'\n")
@@ -442,6 +444,32 @@ def test_a_bad_value_from_the_environment_fails_the_selftest_as_in_the_env_file(
         m.main(["--selftest"])
     assert str(ex.value) == "selftest failed: " + " ".join(from_file.CFG.errors)
     assert capsys.readouterr().out == f"keys from the environment: {key}\n"
+
+
+@pytest.mark.parametrize("how", ["mode 0", "folder", "missing"])
+def test_an_env_file_that_does_not_read_fails_the_selftest_and_a_missing_one_is_no_error(tmp_path, monkeypatch, how):
+    """Sonarr and Radarr run the hook as their own user, and README step 2 installs the env file for root. A file there
+    that this user cannot read fails the selftest, which names the file and the user. A missing file is no error,
+    because Docker writes it at the first start."""
+    if how == "mode 0" and os.geteuid() == 0:
+        pytest.skip("root reads a file of mode 0, and the folder case covers root")
+    env = tmp_path / "arr-media-guard.env"
+    if how == "folder":
+        env.mkdir()
+    elif how == "mode 0":
+        env.write_text(f"POLICY_FILE='{POLICY}'\n")
+        env.chmod(0)
+    monkeypatch.setenv("ARR_MEDIA_GUARD_ENV", str(env))
+    monkeypatch.setenv("ARR_MEDIA_GUARD_LIB", FILES)
+    m = amg.load(f"arr_media_guard_settings{next(COUNT)}")
+    why = m.CFG.env_error
+    if how == "missing":
+        assert why is None and m.CFG.errors == [], m.CFG.errors
+        return
+    assert m.CFG.errors == [why] and why.startswith(f"uid {os.getuid()} and gid {os.getgid()} cannot read the env file {env} ("), why
+    with pytest.raises(SystemExit) as ex:
+        m.main(["--selftest"])
+    assert str(ex.value) == f"selftest failed: {why}"
 
 
 @pytest.mark.parametrize("file_text, environ", [
@@ -534,14 +562,14 @@ def test_the_compose_file_runs_the_latest_image_once_each_placeholder_is_filled(
     or offers is a setting. CHANGE_ME marks each value a user must fill, and the filled settings hold no error. Every
     example of the image takes the tag latest."""
     text = open(os.path.join(FILES, "docker", "compose.yml")).read()
-    full = re.sub(r"^( +)# (?=[A-Z][A-Z0-9_]*: |- /)", r"\1", text, flags=re.M)   # the optional lines turned on
+    full = re.sub(r"^( +)# (?=[A-Z][A-Z0-9_]*: |- /|- CHANGE_ME:)", r"\1", text, flags=re.M)   # the optional lines turned on
     (tree, end), (opt, _) = yaml_block(yaml_lines(text)), yaml_block(yaml_lines(full))
     svc, opt = tree["services"]["arr-media-guard"], opt["services"]["arr-media-guard"]
     assert end == len(yaml_lines(text)) and list(tree) == ["services", "volumes"] and tree["volumes"] == {"amg-state": {"name": "amg-state"}}
     assert (svc["image"], svc["ports"], svc["restart"], svc["stop_grace_period"]) == (
         "ghcr.io/samwiseg0/arr-media-guard:latest", ["8484:8484"], "unless-stopped", "1m")
-    assert svc["volumes"] == ["./arr-media-guard:/config", "amg-state:/config/state", "CHANGE_ME:/data"]
-    assert opt["volumes"] == svc["volumes"] + ["/dev/log:/dev/log"]
+    assert svc["volumes"] == ["CHANGE_ME:/config", "amg-state:/config/state", "CHANGE_ME:/data"]
+    assert opt["volumes"] == svc["volumes"] + ["CHANGE_ME:/downloads:ro", "/dev/log:/dev/log"]
     links = {"RADARR_LINK", "SONARR_LINK", "SONARR_4K_LINK", "RADARR_4K_LINK"}   # the owner asked to show them beside each app's URL
     assert links <= set(opt["environment"]) and not links & set(svc["environment"])
     assert {"      # RADARR_LINK: https://movies.example.com   # the address your browser opens, for the link in each alert",

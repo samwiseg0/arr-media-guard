@@ -244,17 +244,20 @@ def volume(path):
     return os.stat(path).st_dev, vault.mount_top(os.path.realpath(path))
 
 
-def bin_warnings(app):
+def bin_warnings(app, fix=None):
     """Why the restore after a bad upgrade cannot work for app, as warnings: the app has no recycle bin, this program
-    does not see its bin, or the bin sits on another file system than a root folder, and a restore only renames. With
-    KEEP_REPLACED on, keep_warnings() come first. When none of them starts with KEPT_NOTHING, the program keeps its own
-    copy of each replaced file, and the bin needs no warning. [] when all is well or the app does not answer. --selftest and the Test
-    event print them, and neither fails on them."""
+    does not see its bin, or the bin sits on another file system than a root folder, and a restore only renames. When
+    the root folders themselves are on more than one file system, no bin can serve them all. The warning then names
+    KEEP_REPLACED and the snapshot setup, and KEEP_ORIGINALS_DAYS at 0 silences it. With KEEP_REPLACED on,
+    keep_warnings() come first, and they alone show for root folders on more than one file system. When none of them
+    starts with KEPT_NOTHING, the program keeps its own copy of each replaced file, and the bin needs no warning. []
+    when all is well or the app does not answer. --selftest and the Test event print them, and neither fails on them.
+    fix passes to keep_warnings()."""
     name = apps.ARR[app].name
     try:
         rbin = (apps.arr(app, "config/mediamanagement") or {}).get("recycleBin") or ""
         roots = [r["path"] for r in apps.arr(app, "rootfolder")]
-        out = keep_warnings(app, roots) if config.CFG.keep_replaced else []
+        out = keep_warnings(app, roots, fix) if config.CFG.keep_replaced else []
     except Exception:
         return []
     if config.CFG.keep_replaced and not any(w.startswith(KEPT_NOTHING) for w in out):   # the kept copies stand in for the bin
@@ -267,6 +270,12 @@ def bin_warnings(app):
                       f"after a bad upgrade cannot use it. Mount it at that path, or {apps.map_fix(app)}."]
     with contextlib.suppress(OSError):
         other = [r for r in roots if volume(r) != volume(rbin)]
+        if other and len({volume(r) for r in roots}) > 1:   # no one bin sits beside them all
+            if config.CFG.keep_replaced or not config.CFG.keep_days:   # KEEP_REPLACED's own warnings say what to fix. The snapshot setup restores by hand.
+                return out
+            return out + [f"{name}'s root folders are on more than one file system, so its one recycle bin {rbin} cannot serve "
+                          "the restore after a bad upgrade, which needs a rename. Set KEEP_REPLACED to true to keep a copy of each "
+                          "replaced file on the file system of its root folder."]
         if other:
             return out + [f"{name}'s recycle bin {rbin} is on another file system than {', '.join(other)}, and the restore after a "
                           "bad upgrade needs a rename. Move the bin onto the media's file system."]
@@ -276,26 +285,70 @@ def bin_warnings(app):
 KEPT_NOTHING = "KEEP_REPLACED is on, but "   # starts each warning of keep_warnings() that means a file may go unkept
 
 
-def keep_warnings(app, roots):
-    """Why KEEP_REPLACED keeps nothing for app, as warnings that start with KEPT_NOTHING: KEEP_ORIGINALS_DAYS is 0, the
-    app has no saved connection to this hook, its connection does not send Grab, or the hook cannot hard-link a file on
-    the mount of a root folder in roots. The connection to this hook is a Custom Script with this script's path, or a
-    Webhook whose URL path is /radarr or /sonarr. The API lists the saved connections, so a Test before a Save sees the
-    old triggers, or no connection. When keep_root() takes a folder below the mount top, a warning without KEPT_NOTHING
-    says where the copies go."""
-    name, out = apps.ARR[app].name, []
-    if not config.CFG.keep_days:
-        out.append(f"{KEPT_NOTHING}KEEP_ORIGINALS_DAYS is 0, so arr-media-guard keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0.")
+def connections(app):
+    """The saved connections of app to this hook: a Custom Script with this script's path, or a Webhook whose URL path
+    ends in /radarr or /sonarr and whose username is WEBHOOK_USER. A reverse proxy may put a prefix before it, as in
+    /amg/radarr. The listener refuses every other user, so another program's Webhook on that path never counts. The API lists the saved connections, so a Test before a Save sees the old
+    triggers, or none."""
     ours = []
     for n in apps.arr(app, "notification") or []:
         f = {x.get("name"): x.get("value") for x in n.get("fields") or []}
         if (n.get("implementation") == "CustomScript" and os.path.realpath(f.get("path") or "/") == config.SCRIPT) or \
-                (n.get("implementation") == "Webhook" and urllib.parse.urlparse(f.get("url") or "").path.rstrip("/") == f"/{app}"):
+                (n.get("implementation") == "Webhook" and urllib.parse.urlparse(f.get("url") or "").path.rstrip("/").rsplit("/", 1)[-1] == app
+                 and config.CFG.webhook_user and f.get("username") == config.CFG.webhook_user):
             ours.append(n)
+    return ours
+
+
+def grab_fix(app, source, ours=None):
+    """Turn on On Grab in app's connections to this hook, see connections(), when KEEP_REPLACED needs it: KEEP_REPLACED is
+    on, KEEP_ORIGINALS_DAYS is above 0, and no connection sends Grab. It writes only to a connection that sends On File
+    Import or On File Upgrade. A connection with neither does nothing for this hook, as when the user turned it off.
+    ours is the list of connections when the caller has it. The listener's start check and the nightly audit run it,
+    never a Test event or --selftest. The app saves a connection after its Test, and that save would undo a fix made
+    during the Test. Each write is a GET of the connection as the app holds it, then a PUT of it with onGrab true and
+    forceSave=true. forceSave skips the app's own Test, which would call this hook. The GET shows the Webhook password
+    as ********, and the app keeps its stored value for that mask (Servarr SchemaBuilder.ReadFromSchema()). A GET after
+    the PUT must read On Grab on. Each write gets one line in the decision log, with source, and one on stdout. A write
+    that fails says why there. Returns whether On Grab is on in one of the connections now."""
+    if not (config.CFG.keep_replaced and config.CFG.keep_days):
+        return False
+    ours = connections(app) if ours is None else ours
+    if not ours or any(n.get("onGrab") for n in ours):
+        return False
+    done, name = False, apps.ARR[app].name
+    for n in [n for n in ours if n.get("onDownload") or n.get("onUpgrade")]:
+        try:   # unmapped both ways, so a path map never changes another field
+            url, key = f"{config.CFG.apps[app].url}/api/v3/notification/{n.get('id')}", {"X-Api-Key": apps.api_key(app)}
+            apps.http(f"{url}?forceSave=true", "PUT", dict(apps.http(url, headers=key), onGrab=True), key)
+            why = None if (apps.http(url, headers=key) or {}).get("onGrab") else f"{name} still reads it off after the write"
+        except Exception as ex:
+            why = f"{type(ex).__name__}: {ex}"
+        if why:
+            result, text = "warning", f"On Grab in {name}'s connection {n.get('name')} did not turn on: {why}"[:300]
+        else:
+            done, result, text = True, "fixed", f"turned on On Grab in {name}'s connection {n.get('name')}, because KEEP_REPLACED is on"
+        text = config.mask(text)
+        print(f"arr-media-guard: {app} {result}: {text}" if config.SERVE else text, flush=True)   # as serve.note() writes a line
+        with contextlib.suppress(OSError):
+            logs.log(dict(source=source, app=app, result=result, note=text))
+    return done
+
+
+def keep_warnings(app, roots, fix=None):
+    """Why KEEP_REPLACED keeps nothing for app, as warnings that start with KEPT_NOTHING: KEEP_ORIGINALS_DAYS is 0, the
+    app has no saved connection to this hook, see connections(), its connection does not send Grab, or the hook cannot
+    hard-link a file on the mount of a root folder in roots. With fix, the source of a decision line, grab_fix() turns
+    On Grab on first, and a fix that worked leaves no warning. When keep_root() takes a folder below the mount top, a
+    warning without KEPT_NOTHING says where the copies go."""
+    name, out = apps.ARR[app].name, []
+    if not config.CFG.keep_days:
+        out.append(f"{KEPT_NOTHING}KEEP_ORIGINALS_DAYS is 0, so arr-media-guard keeps nothing at a grab. Set KEEP_ORIGINALS_DAYS above 0.")
+    ours = connections(app)
     if not ours:
         out.append(f"{KEPT_NOTHING}{name} has no saved connection to arr-media-guard, so arr-media-guard keeps nothing at a grab. "
                    "Save the connection with On Grab on.")
-    elif not any(n.get("onGrab") for n in ours):
+    elif not any(n.get("onGrab") for n in ours) and not (fix and grab_fix(app, fix, ours)):
         out.append(f"{KEPT_NOTHING}{name}'s connection {', '.join(str(n.get('name')) for n in ours)} does not send Grab, so "
                    "arr-media-guard keeps nothing. Turn on On Grab in that connection.")
     seen = set()

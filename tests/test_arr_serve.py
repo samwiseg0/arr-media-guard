@@ -26,6 +26,7 @@ import dataclasses
 import datetime
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
@@ -40,6 +41,8 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import urllib.request
+import urllib.response
 
 import pytest
 
@@ -54,6 +57,7 @@ arr_serve = h.arr_serve
 with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     h.arr_decide.set_policy(json.load(_f))
 AUTH = "Basic " + base64.b64encode(b"guard:s3cret-pass").decode()
+TMDB_OK = "arr-media-guard: tmdb start check: ok"   # conftest's no_network answers TMDB's key check
 
 
 def http_error(code):
@@ -373,7 +377,8 @@ def test_an_empty_password_is_generated_into_the_env_file_in_place(tmp_path, mon
     assert oct(env.stat().st_mode & 0o7777) == oct(0o640) and [p.name for p in tmp_path.iterdir()] == [env.name]
     out = capsys.readouterr().out
     assert out.count("\n") == 1 and pw not in out, out
-    assert f"generated a Webhook password and wrote it to {env} as WEBHOOK_PASSWORD." in out, out
+    assert f"generated a Webhook password and wrote it to {env} as WEBHOOK_PASSWORD. With docker/compose.yml, that is " \
+           "arr-media-guard.env in the config folder on the host." in out, out   # compose.yml mounts a folder of the user's choice at /config
     assert "set Username to WEBHOOK_USER and Password to WEBHOOK_PASSWORD from that file." in out, out
 
 
@@ -633,11 +638,13 @@ def test_a_pair_with_trailing_slashes_maps_the_root_folder_itself(tester, settin
 
 
 def test_the_path_check_says_when_an_app_or_plex_does_not_answer(tester, monkeypatch, settings, capsys):
+    """plex_warned leaves the Plex line out, because the plex check of service_checks() already said why."""
     tester["api"]["sonarr/rootfolder"] = urllib.error.URLError("refused")
     tester["api"]["plex/library/sections"] = urllib.error.URLError("http://plex.invalid/library/sections?X-Plex-Token=plex-t0ken-1234 refused")
-    assert h.path_warnings() == ["Sonarr did not answer, so its root folders are not checked: URLError: <urlopen error refused>",
-                                 "Plex did not answer, so its library folders are not checked: URLError: "
-                                 "<urlopen error http://plex.invalid/library/sections?X-Plex-Token=<PLEX_TOKEN> refused>"]
+    sonarr = "Sonarr did not answer, so its root folders are not checked: URLError: <urlopen error refused>"
+    assert h.path_warnings() == [sonarr, "Plex did not answer, so its library folders are not checked: URLError: "
+                                         "<urlopen error http://plex.invalid/library/sections?X-Plex-Token=<PLEX_TOKEN> refused>"]
+    assert h.path_warnings(plex_warned=True) == [sonarr]
     arr_serve.path_check()
     assert "Sonarr did not answer" in capsys.readouterr().out
     arr_serve.path_check(per_app=False)   # the listener's start check reports an app that does not answer
@@ -1052,6 +1059,15 @@ def test_the_listener_starts_a_worker_only_when_work_waits_and_no_worker_runs(ap
     assert h.ensure_worker(spawn) == 4242 and started == [("worker", True)]   # the new worker takes the lock itself
 
 
+def test_the_start_check_queues_the_rechecks_of_a_new_version(app, monkeypatch, settings):
+    """After the app checks, so an app that starts beside the listener answers the recheck's item lookup."""
+    settings(radarr={"api_key": "radarr-key-1"}, sonarr={"api_key": "", "dir": "/nonexistent"})
+    ran = []
+    monkeypatch.setattr(h, "queue_rechecks", lambda: ran.append([c[1] for c in app["calls"]]))
+    arr_serve.start_check()
+    assert len(ran) == 1 and "rootfolder" in ran[0], ran
+
+
 def test_the_start_check_asks_an_app_again_then_warns_and_the_listener_goes_on(app, monkeypatch, settings, capsys):
     """An app that starts beside the listener is asked again for START_WAIT seconds. The check prints each result and
     never stops the listener. An app with no API key is not checked."""
@@ -1059,7 +1075,7 @@ def test_the_start_check_asks_an_app_again_then_warns_and_the_listener_goes_on(a
     monkeypatch.setattr(arr_serve, "START_WAIT", 0.5)
     monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
     real, roots = h.arr, app["api"]["rootfolder"]
-    def arr(a, p):   # the app answers at the fourth ask: the path check asks once, then the start check
+    def arr(a, p):   # the app answers at the fourth ask of the start check. The path check asks last.
         if p == "rootfolder" and len([c for c in app["calls"] if c[1] == p]) < 3:
             app["calls"].append((a, p))
             raise urllib.error.URLError("refused")
@@ -1067,14 +1083,14 @@ def test_the_start_check_asks_an_app_again_then_warns_and_the_listener_goes_on(a
     monkeypatch.setattr(h, "arr", arr)
     arr_serve.start_check()
     out = capsys.readouterr().out.splitlines()
-    assert out == ["arr-media-guard: radarr start check: ok"]   # the path check leaves an app that does not answer to it
-    assert [c for c in app["calls"] if c[1] == "rootfolder"] == [("radarr", "rootfolder")] * 5   # 3 refused, then the check and the bin warnings
+    assert out == ["arr-media-guard: radarr start check: ok", TMDB_OK]   # the path check leaves an app that does not answer to it
+    assert [c for c in app["calls"] if c[1] == "rootfolder"] == [("radarr", "rootfolder")] * 6   # 3 refused, the check, the bin warnings, the path check
     app["api"]["rootfolder"], app["calls"][:] = urllib.error.URLError("refused"), []
     started = time.monotonic()
     arr_serve.start_check()   # it returns, so the listener goes on
     assert 0.5 <= time.monotonic() - started < 3
-    assert capsys.readouterr().out.splitlines()[-1] == ("arr-media-guard: radarr warning: the start check failed: the Radarr API did not answer: "
-                                                        "URLError: <urlopen error refused>")
+    assert capsys.readouterr().out.splitlines()[-2:] == [("arr-media-guard: radarr warning: the start check failed: the Radarr API did not answer: "
+                                                          "URLError: <urlopen error refused>"), TMDB_OK]
     assert len([c for c in app["calls"] if c[1] == "rootfolder"]) > 3 and not os.path.exists(h.CFG.log)
     app["api"]["rootfolder"] = roots + [{"path": "/nonexistent/anime"}]
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}
@@ -1098,7 +1114,248 @@ def test_the_start_check_names_an_app_with_its_own_url_and_no_api_key(app, setti
     arr_serve.start_check()
     assert capsys.readouterr().out.splitlines() == [
         "arr-media-guard: sonarr warning: SONARR_URL is set, but the Sonarr API key does not read: [Errno 2] No such file or directory: "
-        "'/nonexistent/config.xml'. Set SONARR_API_KEY."] and app["calls"] == []
+        "'/nonexistent/config.xml'. Set SONARR_API_KEY.", TMDB_OK] and app["calls"] == []
+
+
+# --- the start check of the other services ---------------------------------------------------------------------------
+
+SERVICES = {"plex_url": "http://plex.test:32400", "plex_token": "plex-t0ken-1234", "tmdb_token": "tmdb-t0ken-12345678",
+            "discord_webhook": "https://discord.test/api/webhooks/123/hook-t0ken-5678?thread_id=9",
+            "sabnzbd_api_key": "sab-key-0123456789", "newznab_api_key": "hydra-key-0123456789"}
+SERVICE_HOSTS = ("plex.test", "discord.test", "api.themoviedb.org", "sab.test", "hydra.test")
+SECRETS = ("plex-t0ken-1234", "hook-t0ken-5678", "discord.test", "tmdb-t0ken-12345678", "sab-key-0123456789", "hydra-key-0123456789")
+CAPS = b'<?xml version="1.0" encoding="UTF-8"?>\n<caps><server version="1.0" title="Indexer A"/><searching/></caps>'
+SERVICES_OK = ["arr-media-guard: radarr start check: ok"] + [f"arr-media-guard: {s} start check: ok" for s in ("plex", "discord", "tmdb", "sabnzbd", "newznab")]
+
+
+@pytest.fixture
+def services(app, monkeypatch, settings):
+    """Plex, Discord, TMDB, SABnzbd and NZBHydra2 that all work, faked at urlopen, beside the fake Radarr of app, which
+    has saved SABnzbd and the indexer. answers maps each host to (HTTP status, body), an error to raise, or a function
+    that gives one of them. calls holds (method, URL, headers, timeout) of each request. Plex lists both root folders."""
+    settings(radarr={"api_key": "radarr-key-1"}, sonarr={"api_key": "", "dir": "/nonexistent"}, **SERVICES)
+    app["api"]["downloadclient"] = [{"id": 1, "implementation": "Sabnzbd", "fields": [
+        {"name": "host", "value": "sab.test"}, {"name": "port", "value": 8080}, {"name": "apiKey", "value": "********"}]}]
+    app["api"]["indexer"] = [{"id": 2, "implementation": "Newznab", "fields": [
+        {"name": "baseUrl", "value": "http://hydra.test:5076"}, {"name": "apiPath", "value": "/api"}, {"name": "apiKey", "value": "********"}]}]
+    libraries = [{"key": str(i), "Location": [{"path": r["path"]}]} for i, r in enumerate(app["api"]["rootfolder"])]
+    s = {"calls": [], "answers": {
+        "plex.test": (200, {"MediaContainer": {"Directory": libraries}}), "discord.test": (200, {"id": "123", "name": "guard", "token": "hook-t0ken-5678"}),
+        "api.themoviedb.org": (200, {"success": True, "status_code": 1, "status_message": "Success."}),
+        "sab.test": (200, {"queue": {"slots": []}}), "hydra.test": (200, CAPS)}}
+
+    def urlopen(req, timeout):
+        s["calls"].append((req.get_method(), req.full_url, dict(req.header_items()), timeout))
+        got = s["answers"][urllib.parse.urlsplit(req.full_url).hostname]
+        got = got() if callable(got) else got
+        if isinstance(got, Exception):
+            raise got
+        code, body = got
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        if code >= 400:
+            raise urllib.error.HTTPError(req.full_url, code, "error", {}, io.BytesIO(raw))
+        return urllib.response.addinfourl(io.BytesIO(raw), {}, req.full_url, code)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return s
+
+
+def test_the_start_check_checks_each_service_with_one_get(services, capsys):
+    """One line per service after the apps. Plex gets its token in a header, Discord the webhook URL without its
+    query, TMDB the key, SABnzbd a read of its queue and the indexer t=caps. Each waits TEST_TIMEOUT seconds. The
+    last request is the path check's list of Plex libraries."""
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == SERVICES_OK
+    assert [(m, u) for m, u, _, _ in services["calls"]] == [
+        ("GET", "http://plex.test:32400/library/sections"), ("GET", "https://discord.test/api/webhooks/123/hook-t0ken-5678"),
+        ("GET", "https://api.themoviedb.org/3/authentication"),
+        ("GET", "http://sab.test:8080/api?mode=queue&limit=1&output=json&apikey=sab-key-0123456789"),
+        ("GET", "http://hydra.test:5076/api?t=caps&apikey=hydra-key-0123456789"),
+        ("GET", "http://plex.test:32400/library/sections?X-Plex-Token=plex-t0ken-1234")]
+    headers = [c[2] for c in services["calls"]]
+    assert headers[0]["X-plex-token"] == "plex-t0ken-1234" and headers[2]["Authorization"] == "Bearer tmdb-t0ken-12345678"
+    assert {c[3] for c in services["calls"][:-1]} == {h.TEST_TIMEOUT}
+    h.main(["--selftest"])   # the selftest prints a warning only
+    out = capsys.readouterr().out
+    assert "warning" not in out and out.rstrip().endswith("selftest ok")
+
+
+def test_a_service_that_is_not_set_up_gets_no_line_and_no_request(services, settings, capsys):
+    """TMDB always counts, because amg always has a key for it: TMDB_TOKEN, else Radarr's. SABnzbd and the indexer
+    count only with their keys and a Radarr whose API key reads, because the subtitle hunter needs all three."""
+    settings(plex_url="", discord_webhook="", tmdb_token="", sabnzbd_api_key="", newznab_api_key="")
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == ["arr-media-guard: radarr start check: ok", "arr-media-guard: tmdb start check: ok"]
+    assert [c[1] for c in services["calls"]] == ["https://api.themoviedb.org/3/authentication"]
+    assert services["calls"][0][2]["Authorization"] == f"Bearer {h.arr_meta.radarr_token() or h.arr_meta.RADARR_TOKEN}"
+    settings(sabnzbd_api_key="sab-key-0123456789", radarr={"api_key": "", "dir": "/nonexistent"})
+    services["calls"].clear()
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == ["arr-media-guard: tmdb start check: ok"] and len(services["calls"]) == 1
+
+
+def test_a_service_that_does_not_answer_warns_and_the_listener_goes_on(services, monkeypatch, capsys):
+    """The start check asks a service again until START_WAIT, as an app, then warns. The selftest asks once, warns and
+    passes. No line shows a token, a key or the webhook."""
+    monkeypatch.setattr(arr_serve, "START_WAIT", 0.3)
+    monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
+    for host in SERVICE_HOSTS:
+        services["answers"][host] = urllib.error.URLError("refused")
+    started = time.monotonic()
+    arr_serve.start_check()
+    assert time.monotonic() - started < 3
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["arr-media-guard: radarr start check: ok",
+                   "arr-media-guard: plex warning: Plex at http://plex.test:32400 did not answer: URLError: <urlopen error refused>",
+                   "arr-media-guard: discord warning: Discord did not answer: URLError: <urlopen error refused>",
+                   "arr-media-guard: tmdb warning: TMDB did not answer: URLError: <urlopen error refused>",
+                   "arr-media-guard: sabnzbd warning: SABnzbd at http://sab.test:8080/api did not answer: URLError: <urlopen error refused>",
+                   "arr-media-guard: newznab warning: the Newznab indexer at http://hydra.test:5076/api did not answer: URLError: <urlopen error refused>"]
+    assert len([c for c in services["calls"] if c[1] == "http://plex.test:32400/library/sections"]) > 2   # asked again
+    services["calls"].clear()
+    h.main(["--selftest"])
+    text = capsys.readouterr().out
+    assert [x for x in text.splitlines() if x.startswith("warning: ")] == [x.replace("arr-media-guard: ", "").split(" ", 1)[1] for x in out[1:]]
+    assert text.rstrip().endswith("selftest ok") and len(services["calls"]) == 6   # one ask each, and the path check's
+    assert not [x for x in SECRETS if x in "".join(out) + text]
+    calls = iter([urllib.error.URLError("refused")] * 2)   # Plex answers at the third ask
+    services["answers"]["plex.test"] = lambda: next(calls, (200, {"MediaContainer": {}}))
+    for host in SERVICE_HOSTS[1:]:
+        services["answers"][host] = (200, {})
+    arr_serve.start_check()
+    assert "arr-media-guard: plex start check: ok" in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize("host, answer, line", [
+    ("plex.test", (401, b"<html><head><title>Unauthorized</title></head></html>"), "plex warning: Plex at http://plex.test:32400 refused PLEX_TOKEN"),
+    ("plex.test", (200, b"<html>a router's login page</html>"), "plex warning: Plex at http://plex.test:32400 gave an unexpected answer: HTTP 200"),
+    ("discord.test", (401, {"message": "Invalid Webhook Token", "code": 50027}), "discord warning: Discord refused the token in DISCORD_WEBHOOK"),
+    ("discord.test", (404, {"message": "Unknown Webhook", "code": 10015}), "discord warning: Discord does not know the webhook in DISCORD_WEBHOOK"),
+    ("api.themoviedb.org", (401, {"status_code": 7, "status_message": "Invalid API key: You must be granted a valid key.", "success": False}),
+     "tmdb warning: TMDB refused the key in TMDB_TOKEN"),
+    ("sab.test", (403, b"API Key Incorrect"), "sabnzbd warning: SABnzbd at http://sab.test:8080/api refused SABNZBD_API_KEY"),
+    ("sab.test", (200, {"status": False, "error": "API Key Incorrect"}), "sabnzbd warning: SABnzbd at http://sab.test:8080/api refused SABNZBD_API_KEY"),
+    ("sab.test", (403, b"Access denied"), "sabnzbd warning: SABnzbd at http://sab.test:8080/api refused the request: Access denied"),
+    ("sab.test", (403, b""), "sabnzbd warning: SABnzbd at http://sab.test:8080/api refused the request: HTTP 403"),   # api_warnings off
+    ("hydra.test", (200, b'<?xml version="1.0" encoding="UTF-8"?>\n<error code="100" description="Wrong api key"/>'),
+     "newznab warning: the Newznab indexer at http://hydra.test:5076/api refused NEWZNAB_API_KEY"),
+    ("hydra.test", (404, b"Not Found"), "newznab warning: the Newznab indexer at http://hydra.test:5076/api gave an unexpected answer: HTTP 404"),
+])
+def test_a_refused_key_or_another_answer_names_the_service_and_the_setting(services, capsys, host, answer, line):
+    """One service fails, and every other one says ok. A refusal is never asked again. The selftest warns the same."""
+    services["answers"][host] = answer
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    assert f"arr-media-guard: {line}" in out and len(out) == len(SERVICES_OK) and len([x for x in out if "warning" in x]) == 1
+    assert len([c for c in services["calls"] if urllib.parse.urlsplit(c[1]).hostname == host]) == 1 + (host == "plex.test")   # the path check asks Plex too
+    h.main(["--selftest"])
+    text = capsys.readouterr().out
+    assert f"warning: {line.split(' warning: ')[1]}\n" in text and text.rstrip().endswith("selftest ok")
+
+
+def test_the_start_check_reads_the_plex_folders_after_the_plex_check(services, monkeypatch, capsys):
+    """A Plex that starts beside the listener refuses the first ask and answers the next. Its folders are read after
+    that, so each root folder no library holds warns. A Plex that never answers gives one line, from the Plex check.
+    A Plex that passes its check and then fails the folder read says the folders went unchecked."""
+    monkeypatch.setattr(arr_serve, "START_WAIT", 0.5)
+    monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
+    asks = iter([urllib.error.URLError("refused")])
+    services["answers"]["plex.test"] = lambda: next(asks, (200, {"MediaContainer": {"Directory": []}}))
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    assert "arr-media-guard: plex start check: ok" in out and len([x for x in out if "no Plex library folder holds" in x]) == 2
+    services["answers"]["plex.test"] = urllib.error.URLError("refused")
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    assert [x for x in out if "Plex" in x] == ["arr-media-guard: plex warning: Plex at http://plex.test:32400 did not answer: URLError: <urlopen error refused>"]
+    h.main(["--selftest"])
+    assert [x for x in capsys.readouterr().out.splitlines() if "Plex" in x] == [
+        "warning: Plex at http://plex.test:32400 did not answer: URLError: <urlopen error refused>"]
+    asks = iter([(200, {"MediaContainer": {}})])   # the Plex check passes, the folder read fails
+    services["answers"]["plex.test"] = lambda: next(asks, urllib.error.URLError("refused"))
+    arr_serve.start_check()
+    assert "arr-media-guard: warning: Plex did not answer, so its library folders are not checked: URLError: <urlopen error refused>" \
+        in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize("change, line", [
+    ({"tmdb_token": "tmdb-t0ken’-12345678"}, "tmdb warning: TMDB refused the key in TMDB_TOKEN: UnicodeEncodeError: "),
+    ({"plex_token": "plex-t0ken’-1234"}, "plex warning: Plex at http://plex.test:32400 refused PLEX_TOKEN: UnicodeEncodeError: "),
+    ({"plex_url": "plex.test:32400"}, "plex warning: PLEX_URL is no address amg can use: the address starts with no http:// or https://"),
+    ({"plex_url": "http://[plex.test:32400"}, "plex warning: PLEX_URL is no address amg can use: ValueError: Invalid IPv6 URL"),
+    ({"discord_webhook": "https://[discord.test/api/webhooks/123/hook-t0ken-5678"},
+     "discord warning: DISCORD_WEBHOOK is no address amg can use: ValueError: Invalid IPv6 URL"),
+    ({"discord_webhook": "discord.test/api/webhooks/123/hook-t0ken-5678?thread_id=9"},
+     "discord warning: DISCORD_WEBHOOK is no address amg can use: the address starts with no http:// or https://"),
+    ({"sabnzbd_url": "sab.test:8080"}, "sabnzbd warning: SABnzbd at sab.test:8080/api is no address amg can use: the address starts with no "
+                                       "http:// or https://"),
+    ({"sabnzbd_url": "http://sab.test:80x80"}, "sabnzbd warning: SABnzbd at http://sab.test:80x80/api is no address amg can use: InvalidURL: "),
+])
+def test_a_setting_urllib_cannot_send_warns_at_once_and_names_it(app, monkeypatch, settings, capsys, change, line):
+    """A curly apostrophe from a web page in a token, or an address with no scheme. The real urllib reads the request,
+    and conftest's no_network refuses any connection, so the line comes from urllib itself. The error stays, so the
+    start check never asks again, and the selftest warns and passes."""
+    app["api"]["downloadclient"] = [{"id": 1, "implementation": "Sabnzbd", "fields": [{"name": "host", "value": "sab.test"}, {"name": "port", "value": 8080}]}]
+    app["api"]["indexer"] = []
+    alone = {k: v if k in change or k == {"plex_token": "plex_url", "sabnzbd_url": "sabnzbd_api_key"}.get(next(iter(change))) else ""
+             for k, v in SERVICES.items()}   # only the service under test, so no other one waits for an answer
+    settings(radarr={"api_key": "radarr-key-1"}, sonarr={"api_key": "", "dir": "/nonexistent"}, **dict(alone, **change))
+    if "tmdb_token" in change:
+        monkeypatch.setattr(h.arr_meta, "TMDB", "https://tmdb.test/3")   # past conftest's answer, so urllib reads the token
+    monkeypatch.setattr(h, "ASK_AGAIN", 30)
+    monkeypatch.setattr(arr_serve, "START_WAIT", 60)
+    started = time.monotonic()
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    assert time.monotonic() - started < 5 and [x for x in out if x.startswith(f"arr-media-guard: {line}")], out
+    h.main(["--selftest"])
+    text = capsys.readouterr().out
+    assert f"warning: {line.split(' warning: ')[1]}" in text and text.rstrip().endswith("selftest ok")
+    assert not [x for x in SECRETS if x in "\n".join(out) + text]
+
+
+def test_the_hunter_checks_name_a_radarr_with_no_sabnzbd_or_indexer(services, app, capsys):
+    app["api"]["downloadclient"], app["api"]["indexer"] = [], []
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines()[-2:] == ["arr-media-guard: sabnzbd warning: Radarr has no SABnzbd download client",
+                                                         "arr-media-guard: newznab warning: Radarr has no Newznab indexer"]
+    app["api"]["downloadclient"] = urllib.error.URLError("refused")
+    h.main(["--selftest"])
+    out = capsys.readouterr().out.splitlines()
+    assert out[-3:] == ["warning: Radarr did not answer, so the address of SABnzbd is not known: URLError: <urlopen error refused>",
+                        "warning: Radarr did not answer, so the address of the Newznab indexer is not known: URLError: <urlopen error refused>",
+                        "selftest ok"]
+    assert not [c for c in services["calls"] if "sab.test" in c[1] or "hydra.test" in c[1]]
+
+
+@pytest.mark.parametrize("client, indexer, lines", [
+    ({"port": 8080}, None, ["sabnzbd warning: Radarr's SABnzbd download client has no host", "newznab warning: Radarr has no Newznab indexer"]),
+    (None, {"apiPath": "/api"}, ["sabnzbd warning: Radarr has no SABnzbd download client", "newznab warning: Radarr's Newznab indexer has no base URL"]),
+])
+def test_the_hunter_checks_name_a_client_or_indexer_saved_with_no_address(services, app, capsys, client, indexer, lines):
+    """The real cause, never "Radarr did not answer". Nothing is asked of SABnzbd or the indexer."""
+    app["api"]["downloadclient"] = [{"id": 1, "implementation": "Sabnzbd", "fields": [{"name": k, "value": v} for k, v in client.items()]}] if client else []
+    app["api"]["indexer"] = [{"id": 2, "implementation": "Newznab", "fields": [{"name": k, "value": v} for k, v in indexer.items()]}] if indexer else []
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines()[-2:] == [f"arr-media-guard: {x}" for x in lines]
+    h.main(["--selftest"])
+    assert capsys.readouterr().out.splitlines()[-3:-1] == [f"warning: {x.split(' warning: ')[1]}" for x in lines]
+    assert not [c for c in services["calls"] if "sab.test" in c[1] or "hydra.test" in c[1]]
+
+
+def test_no_check_posts_to_discord_or_sends_an_indexer_search(services, monkeypatch, capsys):
+    """A post would put a message in the channel at each start. An indexer search costs each indexer behind NZBHydra2 a
+    hit of its daily limit. For each answer a service may give, the checks send GETs only, and the indexer gets t=caps."""
+    monkeypatch.setattr(arr_serve, "START_WAIT", 0.1)
+    monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
+    ok = dict(services["answers"])
+    for answer in (None, (401, {}), (403, b""), (404, {}), (500, b"error"), (200, b"<error code=\"201\"/>"), urllib.error.URLError("refused")):
+        services["answers"] = {host: answer or ok[host] for host in SERVICE_HOSTS}
+        arr_serve.start_check()
+        h.main(["--selftest"])
+    capsys.readouterr()
+    assert len(services["calls"]) > 7 * 2 * 5 and {c[0] for c in services["calls"]} == {"GET"}
+    hydra = [urllib.parse.parse_qs(urllib.parse.urlsplit(c[1]).query) for c in services["calls"] if "hydra.test" in c[1]]
+    assert hydra and all(q["t"] == ["caps"] for q in hydra)
 
 
 def test_the_test_checks_wait_10_seconds_for_each_api_call(tester, monkeypatch):
@@ -1136,7 +1393,7 @@ def test_under_the_listener_the_summary_line_goes_to_stdout_too(app, monkeypatch
     monkeypatch.setattr(h, "worker", lambda lock: h.decision(rec, time.time()))
     arr_serve.main(["--worker"])
     assert capsys.readouterr().out == sent[1] + "\n" and sent[1] == sent[0]
-    assert sent[0].startswith("arr=radarr source=hook outcome=no_change ") and sent[0].endswith(' label="Film A (1979)" id=x1')
+    assert sent[0].startswith("arr=radarr source=hook outcome=no_change ") and sent[0].endswith(' label="Film A (1979)" id=x1 job=""')
     monkeypatch.setattr(h, "SERVE", False)
     ran = []
     monkeypatch.setattr(h, "main", lambda argv: ran.append((argv, h.SERVE)))
@@ -1539,8 +1796,9 @@ def test_the_listener_holds_96_connections_and_closes_the_97th(live, live_srv, m
 LISTENER = """
 import sys
 sys.path.insert(0, sys.argv[1])
-from arr_media_guard import serve
+from arr_media_guard import content, serve
 serve.PORT, serve.POLL, serve.START_WAIT = int(sys.argv[2]), 0.1, 1
+content.TMDB = "http://127.0.0.1:0/3"   # no test reaches TMDB, so its start check warns
 serve.main([])
 """
 
@@ -1581,8 +1839,9 @@ def test_a_stop_ends_the_listener_at_once_and_prints_the_last_count(tmp_path):
 
 
 def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path):
-    """The start line names the map of each program. The checks run beside the listener, so an app that does not
-    answer gives one warning, from the start check, and never holds up the start. A bad pair in any map stops the start."""
+    """The start line names the map of each program. The checks run beside the listener, so an app or TMDB that does
+    not answer gives one warning, from the start check, and never holds up the start. A bad pair in any map stops the
+    start."""
     port, env, out = free_port(), tmp_path / "env", tmp_path / "out"
     base = (f"WEBHOOK_USER='guard'\nWEBHOOK_PASSWORD='s3cret-pass'\nAUDIT_TIME=''\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\n"
             f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\nRADARR_DIR='/nonexistent'\n"
@@ -1593,11 +1852,12 @@ def test_the_listener_prints_each_map_and_checks_the_paths_at_its_start(tmp_path
                              env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
     try:
         for _ in range(100):
-            if "sonarr warning: the start check failed" in out.read_text():
+            if "tmdb warning" in out.read_text():
                 break
             time.sleep(0.1)
         text = out.read_text()
         assert text.startswith(arr_serve.BANNER + "\narr-media-guard ") and text.count(arr_serve.BANNER) == 1, text   # once, above the listening line
+        assert "arr-media-guard: tmdb warning: TMDB did not answer: URLError: <urlopen error [Errno 111] Connection refused>" in text, text
         assert "Path maps: sonarr /data:/media, radarr /data:/media, plex /mnt/TV Shows:/media/TV." in text, text
         assert "arr-media-guard: sonarr warning: the start check failed: the Sonarr API did not answer: URLError" in text, text
         assert "Sonarr did not answer, so its root folders are not checked" not in text, text   # the path check leaves it to the start check
@@ -1694,6 +1954,17 @@ def test_a_config_xml_with_no_key_gives_no_warning_in_the_selftest(app, monkeypa
     assert "warning:" not in out and out.rstrip().endswith("selftest ok") and app["calls"] == []
 
 
+def test_the_selftest_names_an_app_with_its_own_url_and_no_api_key(app, settings, capsys):
+    """The selftest warns as the start check does: an app with its own URL and no key that reads needs <APP>_API_KEY.
+    An app with the shipped URL stays quiet. The selftest still passes, as an app only warns."""
+    settings(radarr={"api_key": "", "dir": "/nonexistent"}, sonarr={"api_key": "", "dir": "/nonexistent", "url": "http://sonarr.lan:8989"})
+    h.main(["--selftest"])
+    out = capsys.readouterr().out
+    assert ("warning: SONARR_URL is set, but the Sonarr API key does not read: [Errno 2] No such file or directory: "
+            "'/nonexistent/config.xml'. Set SONARR_API_KEY.") in out.splitlines()
+    assert "RADARR_URL" not in out and out.rstrip().endswith("selftest ok") and app["calls"] == []
+
+
 def test_the_custom_script_test_prints_the_bin_warning(app, monkeypatch, capsys):
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}
     for k in list(os.environ):
@@ -1738,6 +2009,26 @@ def test_a_recycle_bin_on_another_file_system_warns(app, monkeypatch):
     assert w.startswith(f"Radarr's recycle bin {app['rbin']} is on another file system than ") and "needs a rename" in w
 
 
+def test_root_folders_on_two_file_systems_warn_to_keep_replaced_files(app, monkeypatch, settings):
+    """No one bin can sit beside root folders on two file systems, so the warning names KEEP_REPLACED and the snapshot
+    setup. With KEEP_REPLACED on, the hook's own copies stand in for the bin. With KEEP_ORIGINALS_DAYS at 0, snapshots
+    do. Either way the warning goes."""
+    real, tv = h.volume, os.path.dirname(app["tv"])   # the root folder of the shows
+    monkeypatch.setattr(h, "volume", lambda p: -1 if p.startswith(tv) else real(p))
+    (w,) = h.bin_warnings("radarr")
+    assert w.startswith("Radarr's root folders are on more than one file system, so its one recycle bin ") and "Set KEEP_REPLACED to true" in w
+    assert w.endswith("keep a copy of each replaced file on the file system of its root folder.") and "KEEP_ORIGINALS_DAYS" not in w
+    settings(keep_days=0)
+    assert h.bin_warnings("radarr") == []
+    settings(keep_days=7)
+    monkeypatch.setattr(h, "keep_warnings", lambda app, roots, fix=None: [])
+    settings(keep_replaced=True)
+    assert h.bin_warnings("radarr") == []
+    kept_nothing = f"{h.KEPT_NOTHING}Radarr's connection guard does not send Grab."   # KEEP_REPLACED's own warning names the fix
+    monkeypatch.setattr(h, "keep_warnings", lambda app, roots, fix=None: [kept_nothing])
+    assert h.bin_warnings("radarr") == [kept_nothing]
+
+
 def test_a_recycle_bin_on_its_own_bind_mount_of_the_same_file_system_warns(app, monkeypatch):
     """The bin and the root folders share st_dev, but the bin is its own mount, so a rename from it fails with EXDEV."""
     real = os.path.ismount
@@ -1752,13 +2043,13 @@ def test_a_recycle_bin_beside_the_media_gives_no_warning(app):
 
 # --- KEEP_REPLACED: the Grab event and its warnings ---------------------------------------------------------------
 
-GRAB_ON = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://x/{a}"}]}
+GRAB_ON = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://x/{a}"}, {"name": "username", "value": "guard"}]}
            for a in ("radarr", "sonarr")]   # a saved connection of each app that sends Grab
 
 
 def keep_on(monkeypatch, tmp_path):
-    """KEEP_REPLACED on, with the top of the mount at tmp_path. Returns replaced_root()."""
-    monkeypatch.setattr(h, "CFG", dataclasses.replace(h.CFG, keep_replaced=True))
+    """KEEP_REPLACED on, with the top of the mount at tmp_path and WEBHOOK_USER guard. Returns replaced_root()."""
+    monkeypatch.setattr(h, "CFG", dataclasses.replace(h.CFG, keep_replaced=True, webhook_user="guard"))
     monkeypatch.setattr(h, "mount_top", lambda f: str(tmp_path))
     return str(tmp_path / h.CFG.recycle_dir)
 
@@ -1804,7 +2095,8 @@ def test_keep_replaced_warns_when_the_connection_to_the_hook_sends_no_grab(app, 
     Save the API lists none, and that warns too, because then a grab keeps nothing."""
     keep_on(monkeypatch, tmp_path)
     script = {"name": "guard", "implementation": "CustomScript", "onGrab": False, "fields": [{"name": "path", "value": h.__file__}]}
-    web = {"name": "guard-web", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://arr-media-guard:8484/radarr/"}]}
+    web = {"name": "guard-web", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://arr-media-guard:8484/radarr/"},
+                                                                                         {"name": "username", "value": "guard"}]}
     other = {"name": "Discord", "implementation": "Discord", "onGrab": False, "fields": [{"name": "webHookUrl", "value": "https://x.invalid/radarr"}]}
     app["api"]["notification"] = [script, other]
     assert h.bin_warnings("radarr") == ["KEEP_REPLACED is on, but Radarr's connection guard does not send Grab, so arr-media-guard keeps nothing. "
@@ -1882,10 +2174,10 @@ def test_a_recycle_bin_this_program_does_not_see_warns(app, monkeypatch, serve, 
 def test_with_keep_replaced_working_the_recycle_bin_gives_no_warning(app, monkeypatch, settings, tmp_path, case):
     """The program keeps its own copy of each file an upgrade replaces, so the bin warning has nothing to act on. The
     owner saw this line at the first start of 2.1.0 in Docker:
-    arr-media-guard: radarr warning: Radarr's recycle bin /media-storage/v2_media/.recycle/radarr is on another file
-    system than /media-storage/all/movies. The hook keeps its own copy of each file an upgrade replaces, ..."""
+    arr-media-guard: radarr warning: Radarr's recycle bin /mnt/pool/.recycle/radarr is on another file
+    system than /mnt/media/movies. The hook keeps its own copy of each file an upgrade replaces, ..."""
     keep_on(monkeypatch, tmp_path)
-    app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
+    app["api"]["notification"] = GRAB_ON[:1]
     if case == "other file system":
         real = h.volume
         monkeypatch.setattr(h, "volume", lambda p: -1 if p.startswith(app["rbin"]) else real(p))
@@ -1898,13 +2190,137 @@ def test_with_keep_replaced_working_the_recycle_bin_gives_no_warning(app, monkey
     assert ("cannot" in w1 or "needs a rename" in w1) and "hook" not in w1
 
 
-def test_the_test_event_and_the_selftest_print_the_keep_warnings(server, app, monkeypatch, settings, tmp_path, capsys):
+@pytest.fixture
+def saved(app, monkeypatch, tmp_path, settings):
+    """KEEP_REPLACED on, and Radarr's saved Webhook connection to the hook, guard, with On Grab off. The fake HTTP plays
+    Radarr's side of the write, as a live Radarr showed it: a GET gives the connection with its password masked, and a
+    PUT saves the body. Returns calls, each (method, path, query, body), and fail: "400" makes the PUT answer 400, and
+    "kept" makes it answer 202 and save nothing."""
     keep_on(monkeypatch, tmp_path)
-    app["api"]["notification"] = [{"name": "guard", "implementation": "Webhook", "onGrab": False, "fields": [{"name": "url", "value": "http://x/radarr"}]}]
+    settings(radarr={"api_key": "k"}, sonarr={"api_key": "", "dir": "/nonexistent"})
+    app["api"]["notification"] = [{"id": 3, "name": "guard", "implementation": "Webhook", "onGrab": False, "onDownload": True, "tags": [], "fields": [
+        {"name": "url", "value": "http://arr-media-guard:8484/radarr"}, {"name": "username", "value": "guard"}, {"name": "password", "value": "********"}]}]
+    s = {"calls": [], "fail": None}
+
+    def fake_http(url, method="GET", body=None, headers=None, timeout=15):
+        u = urllib.parse.urlsplit(url)
+        s["calls"].append((method, u.path, u.query, body))
+        assert headers == {"X-Api-Key": "k"}
+        saved = app["api"]["notification"]
+        (i,) = [i for i, n in enumerate(saved) if u.path == f"/api/v3/notification/{n['id']}"]
+        if method == "PUT" and s["fail"] == "400":
+            raise http_error(400)
+        if method == "PUT" and s["fail"] != "kept":
+            saved[i] = body
+        return b"" if method == "PUT" else json.loads(json.dumps(saved[i]))
+    monkeypatch.setattr(h, "http", fake_http)
+    return s
+
+
+GRAB_FIXED = "turned on On Grab in Radarr's connection guard, because KEEP_REPLACED is on"
+
+
+def test_the_start_check_turns_on_grab_once_and_logs_it(saved, app, monkeypatch, settings, capsys):
+    """The write sends back every field of the GET, the masked password too, with onGrab true and forceSave=true. The
+    next start finds On Grab on and writes nothing. With KEEP_ORIGINALS_DAYS at 0 a grab keeps nothing, so no write."""
+    monkeypatch.setattr(h, "SERVE", True)   # as under the listener
+    before = dict(app["api"]["notification"][0])
+    settings(keep_days=0)
+    arr_serve.start_check()
+    assert saved["calls"] == []
+    settings(keep_days=7)
+    capsys.readouterr()
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == [f"arr-media-guard: radarr fixed: {GRAB_FIXED}", "arr-media-guard: radarr start check: ok", TMDB_OK]
+    path = "/api/v3/notification/3"
+    assert saved["calls"] == [("GET", path, "", None), ("PUT", path, "forceSave=true", dict(before, onGrab=True)), ("GET", path, "", None)]
+    assert [(r["source"], r["app"], r["result"], r["note"]) for r in log_lines()] == [("webhook", "radarr", "fixed", GRAB_FIXED)]
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == ["arr-media-guard: radarr start check: ok", TMDB_OK] and len(saved["calls"]) == 3
+
+
+def test_the_nightly_audit_turns_on_grab_only_with_keep_replaced_on(saved, app, monkeypatch, settings, capsys):
+    monkeypatch.setattr(syslog, "syslog", lambda priority, line: None)
+    monkeypatch.setattr(h.os, "nice", lambda n: None)
+    monkeypatch.setattr(h.subprocess, "run", lambda argv, **k: None)   # ionice
+    monkeypatch.setattr(h, "SERVE", False)   # main() sets it, and the test ends with it unset
+    settings(keep_replaced=False)
+    arr_serve.main(["--audit", "radarr", "--since", "24h"])
+    assert saved["calls"] == [] and not os.path.exists(h.CFG.log)
+    settings(keep_replaced=True)
+    capsys.readouterr()
+    arr_serve.main(["--audit", "radarr", "--since", "24h"])
+    assert capsys.readouterr().out.startswith(f"arr-media-guard: radarr fixed: {GRAB_FIXED}\n")
+    assert [c[0] for c in saved["calls"]] == ["GET", "PUT", "GET"] and app["api"]["notification"][0]["onGrab"] is True
+    assert [(r["source"], r["result"], r["note"]) for r in log_lines()] == [("audit", "fixed", GRAB_FIXED)]
+    arr_serve.main(["--audit", "radarr", "--since", "24h"])   # On Grab is on now
+    assert len(saved["calls"]) == 3 and "fixed" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fail, why", [("400", "HTTPError: HTTP Error 400: error"), ("kept", "Radarr still reads it off after the write")])
+def test_a_failed_write_keeps_the_warning_and_logs_why(saved, app, monkeypatch, capsys, fail, why):
+    """The app refuses the write, or it accepts the write and still reads On Grab off."""
+    monkeypatch.setattr(h, "SERVE", True)   # as under the listener
+    saved["fail"] = fail
+    arr_serve.start_check()
+    out = capsys.readouterr().out.splitlines()
+    why = f"On Grab in Radarr's connection guard did not turn on: {why}"
+    assert out[0] == f"arr-media-guard: radarr warning: {why}"
+    assert out[1].startswith("arr-media-guard: radarr warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab")
+    assert [(r["source"], r["result"], r["note"]) for r in log_lines()] == [("webhook", "warning", why)]
+
+
+def test_a_webhook_of_another_program_on_the_same_path_gets_no_write_and_no_warning(saved, app, monkeypatch, settings, capsys):
+    """Another program's Webhook may end in /radarr too. The listener refuses every user but WEBHOOK_USER, so only a
+    Webhook with that user is the hook's connection."""
+    monkeypatch.setattr(h, "SERVE", True)
+    own = app["api"]["notification"][0]
+    other = dict(own, id=4, name="other", fields=[{"name": "url", "value": "http://other.invalid:1880/radarr"}, {"name": "username", "value": "someone"}])
+    app["api"]["notification"] = [own, other]
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == [f"arr-media-guard: radarr fixed: {GRAB_FIXED}", "arr-media-guard: radarr start check: ok", TMDB_OK]
+    assert [c[:2] for c in saved["calls"]] == [("GET", "/api/v3/notification/3"), ("PUT", "/api/v3/notification/3"), ("GET", "/api/v3/notification/3")]
+    assert [n["onGrab"] for n in app["api"]["notification"]] == [True, False]
+    app["api"]["notification"] = [other]   # alone, it is no connection to the hook
+    arr_serve.start_check()
+    assert len(saved["calls"]) == 3 and "someone" not in capsys.readouterr().out
+    assert h.bin_warnings("radarr") == [f"{h.KEPT_NOTHING}Radarr has no saved connection to arr-media-guard, so arr-media-guard keeps nothing at a "
+                                        "grab. Save the connection with On Grab on."]
+    settings(webhook_user="")   # as on a host with no listener: a Webhook with no user is not the hook's either
+    other["fields"][1]["value"] = ""
+    assert h.connections("radarr") == []
+
+
+def test_a_webhook_behind_a_proxy_prefix_is_the_hooks_connection(saved, app, monkeypatch, capsys):
+    """A reverse proxy may serve the listener under a prefix, as in /amg/radarr, and strip it on the way in. Only the
+    last part of the path names the app, and the username still decides."""
+    monkeypatch.setattr(h, "SERVE", True)
+    app["api"]["notification"][0]["fields"][0]["value"] = "https://proxy.invalid/amg/radarr/"
+    arr_serve.start_check()
+    assert capsys.readouterr().out.splitlines() == [f"arr-media-guard: radarr fixed: {GRAB_FIXED}", "arr-media-guard: radarr start check: ok",
+                                                    "arr-media-guard: tmdb start check: ok"]
+    app["api"]["notification"][0]["fields"][0]["value"] = "https://proxy.invalid/amg/radarr-old"
+    assert h.connections("radarr") == []
+
+
+def test_a_connection_that_sends_no_import_and_no_upgrade_gets_no_write(saved, app, monkeypatch, capsys):
+    """Without On File Import and On File Upgrade the connection does nothing for the hook, as when the user turned it
+    off. The warning stays. On File Upgrade alone is enough for a write."""
+    monkeypatch.setattr(h, "SERVE", True)
+    app["api"]["notification"][0].update(onDownload=False, onUpgrade=False)
+    arr_serve.start_check()
+    assert saved["calls"] == [] and "Radarr's connection guard does not send Grab" in capsys.readouterr().out
+    app["api"]["notification"][0]["onUpgrade"] = True
+    arr_serve.start_check()
+    assert [c[0] for c in saved["calls"]] == ["GET", "PUT", "GET"] and app["api"]["notification"][0]["onGrab"] is True
+
+
+def test_the_test_event_and_the_selftest_print_the_keep_warnings_and_write_nothing(saved, server, app, capsys):
+    """The app saves a connection after its Test, and that save would undo a fix made during the Test."""
     code, text, _ = server("POST", "/radarr", {"eventType": "Test"})
     assert code == 200 and "Warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab" in text
-    settings(radarr={"api_key": "k"}, sonarr={"dir": "/nonexistent"})
     capsys.readouterr()
     h.main(["--selftest"])
     out = capsys.readouterr().out
     assert "warning: KEEP_REPLACED is on, but Radarr's connection guard does not send Grab" in out and out.rstrip().endswith("selftest ok")
+    assert saved["calls"] == []

@@ -198,6 +198,26 @@ def verdict_get(cache, path):
         return None
 
 
+def verdicts(cache):
+    """[(path, size, mtime_ns, the saved result)] of every saved subtitle result, of the file as it is now or as it was.
+    It never raises and never creates the cache."""
+    try:
+        if not os.path.exists(cache): return []
+        with closing(_db(cache)) as db, db:
+            rows = db.execute("SELECT path, size, mtime_ns, result FROM subcheck").fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+    out = []
+    for path, size, mtime_ns, result in rows:
+        try:
+            r = json.loads(result)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            out.append((path, size, mtime_ns, r))
+    return out
+
+
 def verdict_put(cache, path, result, pending):
     """Cache the subtitle check's result for path as it is now. It never raises, because the check is done."""
     try:

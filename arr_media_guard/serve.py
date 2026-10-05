@@ -346,18 +346,21 @@ def daily():
         print("arr-media-guard: logrotate is not installed, so the decision log is not rotated", flush=True)
 
 
-def path_check(per_app=True):
+def path_check(per_app=True, plex_warned=False):
     """Print the warnings of apps.path_warnings(), for docker logs."""
-    for w in apps.path_warnings(per_app):
+    for w in apps.path_warnings(per_app, plex_warned):
         print(f"arr-media-guard: warning: {w}", flush=True)
 
 
 def start_check():
-    """path_check(), then the checks of the Test event for each app with an API key, see runner.app_check(), with one
-    line per result for docker logs. An app that does not answer is asked again for START_WAIT seconds. A failed check
-    warns, and the listener keeps running. An app with its own URL and no API key warns too, see apps.no_key(). The
-    listener runs it in a thread at its start, so a slow app or Plex never delays the listener."""
-    path_check(per_app=False)   # the start check below reports an app that does not answer and a root folder not seen
+    """The checks of the Test event for each app with an API key, see runner.app_check(), with one line per result for
+    docker logs. An app that does not answer is asked again for START_WAIT seconds. A failed check warns, and the
+    listener keeps running. An app with its own URL and no API key warns too, see apps.no_key(). It turns On Grab on
+    where KEEP_REPLACED needs it, see regrab.grab_fix(). Then it checks each other service the setup uses, see
+    runner.service_checks(), with one line each, and path_check() last. So a Plex that starts beside the listener has
+    answered its check before its library folders are read. The first start of a new version then queues its rechecks,
+    see runner.queue_rechecks(). The listener runs it in a thread at its start, so a slow app or service never delays
+    the listener."""
     if decide.POLICY is None:   # once, and each app is still checked
         print(f"arr-media-guard: warning: the start check failed: {config.policy_help()}", flush=True)
     until = time.monotonic() + START_WAIT
@@ -370,10 +373,15 @@ def start_check():
             continue
         except (OSError, AttributeError):   # no key in config.xml, as for apps_on()
             continue
-        why, warnings = runner.app_check(app, until, policy=False)
+        why, warnings = runner.app_check(app, until, policy=False, fix="webhook")
         for w in warnings:
             note(app, "warning", w, logged=False)
         note(app, "warning", f"the start check failed: {why}", logged=False) if why else note(app, "start check", "ok", logged=False)
+    results = runner.service_checks(until)
+    for service, why in results:
+        note(service, "warning", why, logged=False) if why else note(service, "start check", "ok", logged=False)
+    path_check(per_app=False, plex_warned=bool(dict(results).get("plex")))   # the app checks report an app or a root folder
+    runner.queue_rechecks()   # after the app checks, so an app that starts beside the listener answers
 
 
 def new_password(user):
@@ -404,7 +412,7 @@ def new_password(user):
         sys.exit(f"arr-media-guard --serve: WEBHOOK_PASSWORD is empty, and the listener did not write a new one to {path}: {ex}. "
                  "Set WEBHOOK_USER and WEBHOOK_PASSWORD in it")
     print(f"arr-media-guard: generated a Webhook password and wrote it to {path} as WEBHOOK_PASSWORD. With docker/compose.yml, "
-          "that is ./arr-media-guard/arr-media-guard.env on the host. In the Webhook connection of each app, set Username to "
+          "that is arr-media-guard.env in the config folder on the host. In the Webhook connection of each app, set Username to "
           f"WEBHOOK_USER{' from the environment' if 'WEBHOOK_USER' in config.CFG.from_env else ''} and Password to WEBHOOK_PASSWORD "
           "from that file.", flush=True)
     return keys.get("WEBHOOK_USER", user), keys["WEBHOOK_PASSWORD"]

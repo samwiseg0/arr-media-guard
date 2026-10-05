@@ -26,9 +26,12 @@ import dataclasses
 import http.client
 import itertools
 import json
+import io
 import os
 import threading
 import urllib.parse
+import urllib.request
+import urllib.response
 
 import pytest
 
@@ -69,7 +72,8 @@ def g(tmp_path, monkeypatch):
                   "episode?episodeFileId=9": [{"id": 31, "seasonNumber": 1, "episodeNumber": 1, "runtime": 22, "seriesId": 5, "episodeFileId": 9}],
                   "episode?episodeIds=31": [{"id": 31, "seasonNumber": 1, "episodeNumber": 1, "seriesId": 5, "episodeFileId": 9}],
                   "rootfolder": [{"path": "/tv"}], "config/mediamanagement": {"recycleBin": ""},
-                  "notification": [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://guard:8484/{app}"}]}],
+                  "notification": [{"name": "guard", "implementation": "Webhook", "onGrab": True, "fields": [{"name": "url", "value": f"http://guard:8484/{app}"},
+                                                                                                       {"name": "username", "value": "guard"}]}],
                   "system/status": {"instanceName": {"sonarr": "Sonarr", "sonarr-4k": "Sonarr 4K"}[app]}}
            for app, host in HOSTS.items()}
 
@@ -82,6 +86,13 @@ def g(tmp_path, monkeypatch):
         calls.append((u.netloc, (headers or {}).get("X-Api-Key"), path))
         return copy.deepcopy(api[u.netloc][path])
     monkeypatch.setattr(m, "http", fake_http)
+    guard = urllib.request.urlopen   # conftest's no_network
+
+    def urlopen(req, *args, **kwargs):   # the start check's GET of the webhook, which answers with its details
+        if req.full_url == "https://discord.invalid/hook" and req.get_method() == "GET":
+            return urllib.response.addinfourl(io.BytesIO(b'{"id": "1"}'), {}, req.full_url, 200)
+        return guard(req, *args, **kwargs)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     monkeypatch.setattr(m, "to_syslog", syslog.append)
     monkeypatch.setattr(m, "mount_top", lambda f: str(tmp_path))   # the kept folders stay in tmp_path
     for k in list(os.environ):
@@ -313,8 +324,9 @@ def test_the_test_event_and_the_start_check_run_per_instance(g, post, capsys):
     g.calls.clear()
     capsys.readouterr()
     g.arr_serve.start_check()   # radarr has no API key, so it is not checked
-    assert [x for x in capsys.readouterr().out.splitlines() if "start check" in x] == ["arr-media-guard: sonarr start check: ok",
-                                                                                      "arr-media-guard: sonarr-4k start check: ok"]
+    assert [x for x in capsys.readouterr().out.splitlines() if "start check" in x] == [
+        "arr-media-guard: sonarr start check: ok", "arr-media-guard: sonarr-4k start check: ok", "arr-media-guard: discord start check: ok",
+        "arr-media-guard: tmdb start check: ok"]
     assert {c[:2] for c in g.calls} == {(HOSTS[a], KEYS[a]) for a in HOSTS}
     assert g.arr_serve.apps_on() == ["sonarr", "sonarr-4k"]
 

@@ -63,22 +63,22 @@ def scrub(text):
 
 
 def creds(app):
-    """SABnzbd and NZBHydra2 URLs from the app's API, and their keys from SABNZBD_API_KEY and NEWZNAB_API_KEY, because
-    the API masks both keys. Each is the first of its kind by id, as the app stores them. SABNZBD_URL and NEWZNAB_URL
-    take the place of the address the app saved, as for a container that does not resolve it. The API path stays."""
+    """SABnzbd and NZBHydra2 URLs from the app's API, see apps.hunter_urls(), and their keys from SABNZBD_API_KEY and
+    NEWZNAB_API_KEY, because the API masks both keys."""
     keys = {"SABNZBD_API_KEY": config.CFG.sabnzbd_api_key, "NEWZNAB_API_KEY": config.CFG.newznab_api_key}
     missing = [k for k, v in keys.items() if not v]
     if missing:
         sys.exit(f"Set {' and '.join(missing)} in the env file or the environment. {app.capitalize()}'s API hides the keys of its download "
                  "clients and indexers.")
-    first = lambda kind, impl: min((p for p in apps.arr(app, kind) if p.get("implementation") == impl), key=lambda p: p["id"], default=None)
-    sab, hyd = first("downloadclient", "Sabnzbd"), first("indexer", "Newznab")
-    if not (sab and hyd):
-        sys.exit(f"{app.capitalize()} has no {'SABnzbd download client' if not sab else 'Newznab indexer'}")
-    sab, hyd = ({f["name"]: f.get("value") for f in p.get("fields") or []} for p in (sab, hyd))
-    sab_url = config.CFG.sabnzbd_url or f'{"https" if sab.get("useSsl") else "http"}://{sab["host"]}:{sab["port"]}{sab.get("urlBase") or ""}'
-    return {"sab": sab_url.rstrip("/") + "/api", "sab_key": keys["SABNZBD_API_KEY"],
-            "hydra": (config.CFG.newznab_url or hyd["baseUrl"]).rstrip("/") + (hyd.get("apiPath") or "/api"), "hydra_key": keys["NEWZNAB_API_KEY"]}
+    try:
+        urls = apps.hunter_urls(app)
+    except FileNotFoundError as ex:   # api_key() found no key and no config.xml, as apps.app_list() handles it
+        sys.exit(apps.no_key(app, ex) or f"{app.capitalize()} is not set up. Set {config.env_key(app)}_URL and {config.env_key(app)}_API_KEY.")
+    pair = (urls["sab"], urls["hydra"])
+    whys = [why for url, why in pair if url is None] + [why for url, why in pair if url == ""]   # a kind not saved first, as before
+    if whys:
+        sys.exit(whys[0])
+    return {"sab": urls["sab"][0], "sab_key": keys["SABNZBD_API_KEY"], "hydra": urls["hydra"][0], "hydra_key": keys["NEWZNAB_API_KEY"]}
 
 
 def pubdate(d):

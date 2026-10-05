@@ -443,6 +443,39 @@ def test_creds_take_the_urls_from_the_api_and_the_keys_from_the_env_file(env, mo
     assert str(ex.value) == "Radarr has no Newznab indexer"
 
 
+SAB_NO_HOST, HYDRA_NO_BASE = provider(4, "Sabnzbd", port=8080), provider(3, "Newznab", apiPath="/api")
+
+
+@pytest.mark.parametrize("clients, indexers, why", [
+    ([SAB_NO_HOST], [], "Radarr has no Newznab indexer"),   # a kind not saved comes first, as the hunter said before
+    ([], [HYDRA_NO_BASE], "Radarr has no SABnzbd download client"),
+    ([SAB_NO_HOST], [HYDRA_NO_BASE], "Radarr's SABnzbd download client has no host"),
+    ([provider(4, "Sabnzbd", host="sab.y", port=8080)], [HYDRA_NO_BASE], "Radarr's Newznab indexer has no base URL"),
+])
+def test_a_client_or_indexer_saved_with_no_address_stops_the_hunter_with_one_line(env, monkeypatch, settings, clients, indexers, why):
+    """Radarr can hold a download client or an indexer with no host or base URL. The hunter names it, never a KeyError."""
+    monkeypatch.setattr(hook, "arr", lambda app, p: {"downloadclient": clients, "indexer": indexers}[p])
+    settings(sabnzbd_api_key="sab-key-0123456789", newznab_api_key="hydra-key-0123456789")
+    with pytest.raises(SystemExit) as ex:
+        REAL_CREDS("radarr")
+    assert str(ex.value) == why
+    settings(sabnzbd_url="http://192.0.2.1:8080", newznab_url="http://192.0.2.2:5076")   # each address of its own needs none from Radarr
+    if clients and indexers:
+        assert REAL_CREDS("radarr")["sab"] == "http://192.0.2.1:8080/api"
+
+
+def test_a_radarr_key_that_does_not_read_stops_the_hunter_with_one_line(env, monkeypatch, settings):
+    """With both hunter keys set, a Radarr whose API key does not read stops the hunter with one line, as a backfill
+    does, never a traceback."""
+    def no_key(app, p):
+        raise FileNotFoundError("no config.xml in /var/lib/radarr")
+    monkeypatch.setattr(hook, "arr", no_key)
+    settings(sabnzbd_api_key="sab-key-0123456789", newznab_api_key="hydra-key-0123456789")
+    with pytest.raises(SystemExit) as ex:
+        REAL_CREDS("radarr")
+    assert isinstance(ex.value.code, str) and ("is not set up" in ex.value.code or "API key does not read" in ex.value.code), ex.value.code
+
+
 @pytest.mark.parametrize("keys, missing", [({}, "SABNZBD_API_KEY and NEWZNAB_API_KEY"), ({"SABNZBD_API_KEY": "S"}, "NEWZNAB_API_KEY"),
                                            ({"NEWZNAB_API_KEY": "H"}, "SABNZBD_API_KEY")])
 def test_a_missing_key_stops_the_hunter_with_one_line(env, monkeypatch, settings, keys, missing):

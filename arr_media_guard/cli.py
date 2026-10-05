@@ -55,12 +55,10 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     pool is the conversion pool of a --convert apply. The file then holds a slot of it throughout, taken before the
     lock, and its conversion runs under the shared lock, see convert(). A re-run converts under the exclusive lock.
     --convert takes every file that is not .mkv, so selected() does not apply. With --sub-check a file whose subtitle
-    check is cached and asks for nothing more is skipped, and the result is "checked". A file with a sidecar is taken
-    then, whatever its tracks."""
+    check is saved and asks for nothing more is skipped, and the result is "checked", unless --recheck is given, see
+    subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks."""
     label, original, runtime, want, kids, ctx = info
-    started, path = time.time(), f["path"]
-    ids = {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": (want or {}).get("guids", []),
-           "slug": (ctx or {}).get("slug")}   # --sub-time may name no item. The slug links the audit post to the item.
+    started, path, ids = time.time(), f["path"], file_ids(f, want, ctx)
     mode = "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
     run = lambda lock, shared, pool: process.process(process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=False, kids=kids,
                                                                  release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock,
@@ -69,7 +67,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
                 with runner.locked(shared=True) as lock:
-                    if a.sub_check and not a.sub_time and subtitles.sub_cached(path):   # --sub-time takes each file it names
+                    if a.sub_check and not a.recheck and subtitles.sub_cached(path):   # --sub-time takes each file it names
                         return "checked"
                     if not (a.sub_time or a.plan_from or a.convert or selected(path) or (a.sub_check and subtitles.side_stats(path))):
                         return None
@@ -83,6 +81,13 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
             raise
         rec = dict(app=app, source="backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, rec
+
+
+def file_ids(f, want, ctx):
+    """The ids of the file record f of App.library(), with its Plex lookup want and its metadata context ctx. --sub-time
+    may name no item. The slug links the audit post to the item."""
+    return {"app_id": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"), "guids": (want or {}).get("guids", []),
+            "slug": (ctx or {}).get("slug")}
 
 
 def logged_refusals(paths):
@@ -126,8 +131,11 @@ def backfill(argv):
                     "decision log names, and keep each original")
     ap.add_argument("--sub-check", action="store_true", help="run the subtitle match and timing check too")
     ap.add_argument("--paths", nargs="+", default=[], metavar="PATH", help="only these files")
+    ap.add_argument("--recheck", action="store_true", help="with --sub-check, check each file again, whatever its saved result says")
     a = ap.parse_args(argv); app, ids = a.app, set(a.ids)
     a.sub_time = False   # see sub_time()
+    if a.recheck and not a.sub_check:
+        ap.error("--recheck needs --sub-check")
     if a.sub_check and (a.convert or a.check_audio or a.check_video):
         ap.error("--sub-check runs with the flag backfill, not with --convert or a scan")
     if a.paths and (a.check_audio or a.check_video):
@@ -298,7 +306,7 @@ def sub_time(argv):
     ap.add_argument("paths", nargs="+", metavar="PATH")
     ap.add_argument("--apply", action="store_true", help="make the changes. Without it the run is dry and changes nothing")
     a = ap.parse_args(argv)
-    a.sub_check, a.sub_time, a.plan_from, a.convert, a.force = True, True, None, False, {}
+    a.sub_check, a.sub_time, a.recheck, a.plan_from, a.convert, a.force = True, True, True, None, False, {}
     os.nice(19)   # it hears and reads files on the NAS, so it yields to imports and to Plex
     subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
     checks.langs()
@@ -490,9 +498,12 @@ def lines_field(name, groups):
 
 
 def audit(argv):
-    """One summary of a dry run's plans (--plan-from) or of the edits since a time (--since). Read-only."""
+    """One summary of a dry run's plans (--plan-from) or of the edits since a time (--since). It edits no file. --since
+    also removes the kept files older than KEEP_ORIGINALS_DAYS, turns on On Grab where KEEP_REPLACED needs it, see
+    regrab.grab_fix(), and queues the rechecks of a new version, see runner.queue_rechecks()."""
     ap = argparse.ArgumentParser(prog="arr-media-guard --audit", description="One summary of a dry run's plans or of the edits "
-                                 "since a time. It edits nothing. --since also removes the kept files older than KEEP_ORIGINALS_DAYS.")
+                                 "since a time. It edits nothing. --since also removes the kept files older than KEEP_ORIGINALS_DAYS, "
+                                 "turns on On Grab where KEEP_REPLACED needs it, and queues the rechecks of a new version.")
     ap.add_argument("app", choices=sorted(config.CFG.apps)); g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--plan-from", metavar="FILE", help="group the plans of a dry run by policy path and rule, and check the "
                    "invariants again")
@@ -569,6 +580,8 @@ def audit(argv):
         # The nightly run drops the originals a repack kept, and the grab links, older than keep_days. At 0 it drops every
         # grab link and leaves the originals.
         say = lambda kind, text: print(f"arr-media-guard: {app} {kind}: {text}" if config.SERVE else text)   # as serve.note() writes a line
+        with contextlib.suppress(Exception):   # an API that fails here fails the prune below too, and that warns
+            regrab.grab_fix(app, "audit")
         roots = vault.prune_roots(config.CFG.keep_days > 0)   # a folder below a root folder, as on a mount per show or a fallback, too
         try:
             roots |= {f(os.path.join(r["path"], "x")) for r in apps.arr(app, "rootfolder") for f in ((vault.originals_root, vault.replaced_root) if config.CFG.keep_days else (vault.replaced_root,))}
@@ -581,6 +594,7 @@ def audit(argv):
             if gone: say("audit", f"removed {len(gone)} kept folders older than {config.CFG.keep_days} days under {root}")
         with contextlib.suppress(sqlite3.Error):   # a busy store shrinks the next night
             store.shrink()
+        runner.queue_rechecks()   # on a host the first nightly audit of a new version queues its rechecks
         # one summary line a night, so Loki sees each host even on a day without imports
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", sum(map(len, further.values()))), ("undecided", sum(map(len, undecided.values()))),
@@ -763,6 +777,7 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --sub-time PATH [PATH ...] [--apply]
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
+  arr-media-guard --test-discord      post a test message to DISCORD_WEBHOOK and print Discord's answer
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
 <instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k.
@@ -784,13 +799,28 @@ def main(argv):
         if decide.POLICY is None:
             sys.exit(f"selftest failed: {config.policy_help()}")
         for app in config.CFG.apps:   # a warning only: an app this host does not run has no key here
-            with contextlib.suppress(OSError, AttributeError):
+            try:
                 apps.api_key(app)
-                for w in runner.app_check(app)[1]:   # path_warnings() below names an API or a root folder that fails it
-                    print(f"warning: {w}")
-        for w in apps.path_warnings():
+            except FileNotFoundError as ex:   # no API key and no config.xml: an app with a URL of its own warns, as the start check does
+                if why := apps.no_key(app, ex):
+                    print(f"warning: {why}")
+                continue
+            except (OSError, AttributeError):
+                continue
+            for w in runner.app_check(app)[1]:   # path_warnings() below names an API or a root folder that fails it
+                print(f"warning: {w}")
+        results = runner.service_checks()
+        for _, why in results:   # a warning only, as for an app
+            if why:
+                print(f"warning: {why}")
+        for w in apps.path_warnings(plex_warned=bool(dict(results).get("plex"))):
             print(f"warning: {w}")
         print("selftest ok")
+    elif mode == ["--test-discord"]:
+        ok, line = logs.discord_test()
+        if not ok:
+            sys.exit(line)
+        print(line)
     elif mode == ["--subhunt"]:
         print("arr-media-guard: the subtitle hunter is a command of its own. Run arr-media-guard-subhunt with the same arguments.",
               file=sys.stderr)

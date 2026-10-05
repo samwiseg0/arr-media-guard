@@ -185,7 +185,23 @@ other findings are log only. A `content` finding names each signal that scored, 
 points, so the `episode` finding posts. A `duration` finding is log only when the header repair fixed the file, or
 when a `header`, `cut` or `subtitle` finding of the file posts its cause. It posts when no repair ran, as with
 `HEADER_REPAIR` off or a repair that another fault blocked. The decision line keeps every finding, and its
-`alert_result` says `log only` for each one that did not post.
+`alert_result` says `log only` for each one that did not post. An alert whose text fails still posts, with its title
+and its file, and the sentence `report.UNTOLD` in place of the error. Its line in `alerts` keeps the error.
+
+**Every change.** With `DISCORD_POSTS=all`, `logs.alert_findings()` also posts each change of the run, see
+`report.render()` target `changes`. A finding of `report.fixes()` that the gate logs only keeps its alert's words and
+color. A change that no finding words posts in green, see `report.changes()`. That is a conversion to MKV, a file
+repair, retimed subtitles or a track edit. A track edit says each kind it made: default flags, forced flags and
+language tags. One fix posts once. A change that a posted alert already says is left out, see `report.said()`: lines a
+live caption alert moved, flags a `stays` or `sublang` alert turned off, and a conversion that a subtitle sentence
+names. After a re-grab deleted the file, only the re-grab posts, as in issues mode. A change whose text fails posts
+nothing. Its line in `change_result` starts with `no text:`, and the other changes still post. These posts skip the
+marker, because a second run finds nothing left to change. `change_result` in the decision line keeps what each post
+gave.
+
+**Track numbers.** Every post of a run names a subtitle by its place in the file after the run, see `report.number()`.
+A track the subtitle remux took out is "track 2 of the original file". The decision log and the CLI keep the places
+the check saw.
 
 **Format.** A template marks the names to look for and the key fact of an alert, see `report.bold()`. The embed bolds
 them, and the decision log, the CLI and Loki show plain text. `logs.embed()` escapes each Discord markdown character
@@ -220,7 +236,10 @@ hunter links the movie in the Title field of its posts.
 
 A fault that the second check did not find again is amber, "not confirmed". A rejected TMDB key
 posts one embed a day. It names the key that failed, which is `TMDB_TOKEN`, Radarr's key in its DLL, or the built-in
-copy of Radarr's key. A 429 from Discord waits `retry_after` and retries once. A state store that the
+copy of Radarr's key. A 429 from Discord waits `retry_after` and tries again, up to `logs.POST_TRIES` tries in all,
+because several job processes may post at once, as for a season pack. A `retry_after` over `logs.POST_WAIT` seconds,
+or a 429 on the last try, gives up. The later posts of that process then skip until the time Discord named, and each
+result says so. A state store that the
 worker moved aside posts one embed a day too, see "State".
 
 **One output model.** The checks and the steps keep codes and facts. A finding is `{"kind": <kind>, ...facts}`, and its
@@ -408,7 +427,11 @@ records name once a day, so a host with no nightly audit prunes too. A grab neve
 never waits for it. With `0`, the hook keeps nothing, and a prune removes every grab link.
 `--selftest` and Test warn when the app has no saved connection to the hook, when that connection
 does not send Grab, and when the hook cannot hard-link a file on a mount. They probe each mount with a small temp file that they
-remove. With the copies working, the bin gives no warning.
+remove. With the copies working, the bin gives no warning. The hook's connection is a Custom Script
+with this script's path, or a Webhook to `/radarr` or `/sonarr` with the user `WEBHOOK_USER`. The
+listener's start check and the nightly audit turn On Grab on in it when it sends On File Import or
+On File Upgrade. Each change gets a line in the decision log and one on stdout, the container log
+in Docker. Test and `--selftest` never write, because the app saves the connection after its Test.
 
 Two bind mounts of one file system share `st_dev`, but a rename between them fails. So the restore
 and the bin warning compare the mount tops too. A bin under another mount top counts as another
@@ -1241,7 +1264,9 @@ check, the sweep and incorrect subtitle identification then judge no window and 
 window holds none of its cues, and its words paired by chance with cues far away, at offsets near -2,000 seconds.
 Incorrect subtitle identification judges such a track as a file that ends at its last cue read. A remux rewrites every
 cue of a track, and a plan of new times or text would hold only the cues read. So such a track gets no fix of its own
-cues: no block, live caption, flash or garbled fix. A whole-track fix still moves every cue. Nor does it time another
+cues: no block, live caption, flash or garbled fix. A whole-track fix of the word check or a reference still moves
+every cue. Foreign subtitle timing gives such a track no fix: on a review's plants the lines past the read were in time
+again, and a whole-track fix moved them off. Nor does it time another
 track, because that fit would rest on its first part alone.
 
 **The hearing.** The check picks two windows of 10 seconds, one between 5 and 25 percent of the file and one between
@@ -1422,12 +1447,19 @@ when 10 seconds of the check's time are left. More threads cost more CPU time th
 check runs one thread. A failure or a timeout gives unknown and never stops the import. The check shares the job's
 time limit, 90 seconds at most.
 
-**Cache and backfill.** `lid.sqlite` also holds each file's verdicts and the size and mtime of its sidecars, with a mark
-when they ask for an action that no apply made yet. A backfill with `--sub-check` skips a file whose verdicts are cached
-for its size and mtime and its sidecars, and ask for nothing more. So a stopped run goes on where it stopped, an apply
-after a dry run still acts, and a new sidecar from a program such as Bazarr is checked. `--sub-check` also takes a file with a sidecar
-that the flag backfill leaves out. The decision log holds each result in `subcheck`, the remux in `subremux` and the
-sidecar actions in `sidecars`.
+**Cache and backfill.** `lid.sqlite` also holds each file's saved result. It holds the version and the findings of each
+check the run made, the app, the run, and the size and mtime of its sidecars. It has a mark when it asks for an action
+that no apply made yet. A backfill with `--sub-check` skips a file whose result is saved for its size and mtime and its
+sidecars, comes from a run that makes every check of `--sub-check`, has no stale check, and asks for nothing more. So a
+stopped run goes on where it stopped, an apply after a dry run still acts, and a new sidecar from a program such as
+Bazarr is checked. `--sub-check` also takes a file with a sidecar that the flag backfill leaves out, and `--recheck`
+skips no file. The decision log holds each result in `subcheck`, the remux in `subremux` and the sidecar actions in
+`sidecars`.
+
+A check is stale when its registry entry says a newer version can fix its findings, see
+[development.md](development.md#when-a-change-can-fix-old-files). After an update, `runner.queue_rechecks()` queues a
+recheck job of each stale file in the background queue, behind the imports and the deep analyses. A recheck makes the
+checks of the run that saved the result, and none deeper.
 
 **Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.
 The check reads the CueDuration of each subtitle entry from the Cues, which mkvmerge and ffmpeg write, so it reads no
@@ -1498,8 +1530,9 @@ library would take weeks.
   cue times and text as they arrive. A PGS track keeps only its PCS segments, because its pictures can take GBs. So
   the read writes no file and needs no free space. `--sub-check` and `--sub-time` read under the shared file lock.
   The deep analysis reads before it takes the lock, since a film takes minutes. The read is kept by the file's size
-  and mtime, so a file that changed meanwhile is read again under the lock. ffmpeg reads mkvmerge's WebVTT codec id
-  as unknown, so such a track stays unread.
+  and mtime, so a file that changed meanwhile is read again under the lock. A deep analysis that yields keeps the
+  read in the store for its next run, and a track whose read was cut short stays marked as cut there. ffmpeg reads
+  mkvmerge's WebVTT codec id as unknown, so such a track stays unread.
 - **The sweep.** `--sub-time` and the deep analysis hear one 10-second window a minute of each track the word check
   reads, at its densest cues. The sweep builds the word list of a track once and picks each minute's window from it.
   A track whose words do not match the audio gets no sweep. One lid.py process hears the windows with the model
@@ -1841,33 +1874,6 @@ So a whole-track offset of up to 5 minutes, or a frame-rate error, still fits, a
 The lift is the overlap at the fit, above its mean at ten offsets far from it, as a share of what was left above that
 mean. Under 0.35 is a mismatch.
 
-**The times.** A fit gives the offset and the frame-rate ratio, so a subtitle that fits but runs late gets a fix as in
-"Subtitle match" (`subsync.layout_fix()`). For now the fix only alerts, see "Actions". The search reaches 5 minutes each way, wider than the 2 minutes of the
-reference timing. It found verified right tracks shifted by 200 seconds, at 1.5 times the CPU, and no other episode's
-track lifted higher. The cue spans fit the speech spans in ten slices, at the search's ratio and offset. Every slice
-must lie within 0.3 seconds of one line, and a ratio needs a middle slice on it. The fix keeps the lines 0.2 seconds
-before the speech, the median of verified right tracks. The moved lines must then fit again at ratio 1, within 0.3
-seconds of that lead. A fix written this way sat a median of 0.05 seconds from the right times.
-
-The speech onsets are a second clock, as for a block in "Subtitle match". They come from silencedetect, and the spans of
-speech from VAD. One read takes the onsets of ten parts of up to 2 minutes, one in each tenth of the file, and only when
-some subtitle has a fix. In each half of the file, 20 percent of the cue starts, and at least 3, must have an onset
-where the fix puts them, 0.1 seconds after the start. That count must be twice the count where the cues sat, and rare by
-chance. A half that confirms where the cues sat, or too few onsets, leaves the times as they are, and the alert says the
-subtitles seem late. The onsets confirmed most fixes of shifted right tracks, and no fit of another episode's track.
-
-Slices at different offsets keep the times. When two slices or more share an offset at least 1 second from the rest,
-the alert says the subtitles may be from another version. One slice alone off alerts nothing: an end song that a few
-lines time did that on a right track.
-
-A step in the first or last tenth of the lines can pass every slice, because each slice holds a tenth of the speech.
-A fix then moves the lines on the small side of the step off by the step. Two more rules catch most such steps
-(`subsync.edges()`). The first and the last 8 percent of the cue spans, at least 20, must line up with the speech at
-least as well at the fix as at any offset 1 second or more from it. And no part of 20 parts of the cue spans, equal by
-count, may have a clear vote peak over 0.3 seconds from the fix. A failed rule leaves the times, and the alert says the
-subtitles seem late. A step in the first or last few percent of the lines can still pass both rules. On verified
-tracks with such a planted step, some fixes still moved right lines farther, so a fix only alerts for now.
-
 The check gives no verdict, and so changes nothing, when it cannot judge:
 
 - The file runs under 15 minutes. A short file holds few lines, and chance fits score higher on it. In files cut
@@ -1888,11 +1894,7 @@ shifted by up to 45 seconds or timed for another frame rate too, and wrong track
 under the bar, and every wrong track the check judged did. Sidecars that fit no track of their file, made for a longer
 cut or for another episode, lifted 0.25 at most.
 
-**Actions.** A fix only alerts for now (`subsync.LAYOUT_FIX`). The track or sidecar keeps its times, and the alert
-says how late the subtitles seem against the speech. The decision log holds the fix under `would` in `timing`. With
-`LAYOUT_FIX` set to `write`, a fix the speech onsets confirm writes the new times as in "Subtitle match".
-
-A mismatch only alerts for now (`subsync.LAYOUT_ACTION`). The track or sidecar stays as it is, and the
+**Actions.** A mismatch only alerts for now (`subsync.LAYOUT_ACTION`). The track or sidecar stays as it is, and the
 "Wrong subtitles" alert says that the subtitles don't line up with the speech in the audio, so they may be from another
 episode or version. A weak reference fit with a mismatch alerts the same way. The decision log holds each result under
 `subtime` in `layout`, with its lift, and the read under `speech`. So a soak shows how far right tracks stay from the
@@ -1901,8 +1903,92 @@ match": the track leaves the file in the one remux, and a sidecar moves into `.<
 
 **Cost.** Decoding the audio costs most: about 0.7 CPU seconds a minute of audio for a 5.1 track, and Silero VAD about
 0.25. A 45-minute episode costs about 40 CPU seconds, and a 2-hour film about 2 CPU minutes. The read reads the whole
-file from disk. The fit costs under a second a track. A fix adds the onset read, about 1 CPU second a minute of the up
-to 20 minutes it reads. A file whose subtitles all fit a reference, or that has none of these subtitles, pays nothing.
+file from disk. The fit costs under a second a track. A file whose subtitles all fit a reference, or that has none of
+these subtitles, pays nothing.
+
+## Foreign subtitle timing
+
+Foreign subtitle timing retimes a subtitle in a language no audio speaks by its speech (`subsync.layout_fix()`). It
+takes a track that incorrect subtitle identification fits but that runs late, or was timed for another frame rate.
+`--sub-check` and `--sub-time` run it, and write with `--apply`, and so does the deep analysis. The code names it the
+speech layout fix.
+
+**The times.** A fit gives the offset and the frame-rate ratio, so a subtitle that fits but runs late gets a fix as in
+"Subtitle match". The search reaches 5 minutes each way, wider than the 2 minutes of the reference timing. It found
+verified right tracks shifted by 200 seconds, at 1.5 times the CPU, and no other episode's track lifted higher. The cue
+spans fit the speech spans in ten slices, at the search's ratio and offset. Every slice must lie within 0.3 seconds of
+one line, and a ratio needs a middle slice on it. The fix keeps the lines 0.2 seconds before the speech, the median of
+verified right tracks. The moved lines must then fit again at ratio 1, within 0.3 seconds of that lead. A fix written
+this way sat a median of 0.05 seconds from the right times.
+
+The speech onsets are a second clock, as for a block in "Subtitle match". They come from silencedetect, and the spans of
+speech from VAD. One read takes the onsets of ten parts of up to 2 minutes, one in each tenth of the file, and only when
+some subtitle has a fix. In each half of the file, at least 3 cue starts must have an onset where the fix puts them,
+0.1 seconds after the start. That count must be twice the count where the cues sat, and rare by chance: a chance of
+0.001 at most. A block of "Subtitle match" also needs 20 percent of its cues. A whole track does not
+(`subsync.LAYOUT_ONSET_SHARE`), because under a music bed silencedetect marks few onsets. Verified real shifts of about
+1 second drew onsets at 9 to 19 percent of their starts in a half, at a chance of 1 in a million or less, and the share
+rule left them off. A half that confirms where the cues sat, or too few onsets, leaves the times as they are, and the
+alert says the subtitles seem late. The onsets confirmed most fixes of shifted right tracks, and no fit of another
+episode's track.
+
+Slices at different offsets keep the times. When two slices or more share an offset at least 1 second from the rest,
+the alert says the subtitles may be from another version. One slice alone off alerts nothing: an end song that a few
+lines time did that on a right track.
+
+**The partial shift.** A step in the first or last tenth of the lines can pass every slice, because each slice holds a
+tenth of the speech. A subtitle of a cut with a longer or shorter opening has a cold open in time and the rest shifted.
+A fix of every line would then move the cold open off by the step. So a fix at ratio 1 moves only the lines that agree
+with it (`subsync.shifted()`), and a run of lines at the start or the end of the file that has no evidence at the fix
+keeps its times. A fix at another frame rate moves every line, see "Frame-rate fixes" below.
+
+- Each line votes on whether it stays. A speech start within 0.3 seconds of where the fix puts the line votes to move
+  it. A speech start where it sits, or none at the fix, votes to keep it. Each vote is the log of a ratio of two
+  chances. On verified right tracks, 48 percent of the lines start near a speech start, and 10 percent at an offset by
+  chance.
+- The running sum of the votes from each end of the file peaks after the lines that stay. Every line up to the last
+  place within 4.0 of the peak stays, so two chance speech starts at the fix near the end of a run that stays cut no
+  right line off. With one start of slack, right lines with no speech under them and two chance starts in a row moved
+  on a review's plants. The boundary comes from these votes, never from a share of the file.
+- The first and the last span that move, the core's edges, need a speech start at the fix and none where they sit.
+- The order of the lines holds. The core's own first or last line may move a line it passes, when the move goes toward
+  that line's end of the file and passes it by 1 second or more. Then the line belongs to the moved part, as a moved
+  line lands on its speech and passes no right line. A line that only such a passed line would pass, and any other
+  pass, leaves the times as they are. On a review's plant a cold open in time, a short block 29 seconds late and the
+  rest 35 seconds late, the move passed the block, the block then passed the cold open, and the cold open moved.
+- A run that stays, of 6 lines or more, must not line up with the speech elsewhere, by a clear vote peak over 0.3
+  seconds from where it sits. Else the times stay: the edge is off by its own offset.
+- Every part of the lines that move must then line up with the speech in time (`subsync.edges()`). The first and the
+  last 8 percent of them, at least 20, line up best there, and no part of 20 parts has a clear vote peak over 0.3
+  seconds away. A run that stays keeps the rule above only: an opening song in time lines up with the speech nowhere,
+  and the rule of the 8 percent read it as off. The speech onsets confirm only the lines that move.
+- A track read only in part gets no fix, as the lines past the read were never judged, see "Long subtitle track
+  handling".
+
+**Frame-rate fixes.** A fix at a frame-rate ratio moves every line (`subsync.sat_on_speech()`). A frame-rate error
+covers the whole file, so lines with no speech at either place move with the rest. Only an end that sits on speech now
+stops it. The run from each end up to the peak of its stay votes must not hold 2 or more lines with a speech start
+where they sit and none at the fix, at a chance of 0.05 or less. Such an end is in time while the rest is not, two
+sources that one fix cannot serve. Then nothing moves, and the alert says the subtitles seem late. With the rules of
+ratio 1 instead, real frame-rate tracks kept dozens of lines at their ends off, or wrote nothing.
+
+**Limits.** A subtitle with one end in time and the rest at another frame rate moves the end off when no speech lies
+under the end's lines, as under an opening song. On such planted subtitles about 7 in 10 writes moved right lines, a
+few of them with speech under them. The library scan found no such subtitle. The owner accepted this risk.
+
+No rule makes a right line safe for sure: a right line with no speech under it, beside three chance speech starts at
+the fix, would move. On the plants of a review's shapes, of new strata and of real tracks, no right line moved. The cost is lines left: a run at an end with no evidence at the fix keeps its times. That holds the first
+and last line or two of a track shifted as a whole, as no line of the move passes them when the shift is small.
+
+**Actions.** A fix the speech onsets confirm writes the new times as in "Subtitle match" (`subsync.LAYOUT_FIX`). A
+partial shift writes a plan of every line: its kept runs, in `keep` of `timing`, hold their times byte for byte. A
+plan that would put a line with no text out of order writes nothing. A WebVTT track, which is never rewritten, gets no
+partial shift and alerts. With `LAYOUT_FIX` set to `alert`, a fix only alerts. The track or sidecar keeps its times,
+and the alert says how late the subtitles seem against the speech, and how many lines at the start or end would keep
+their times. The decision log then holds the fix under `would` in `timing`.
+
+**Cost.** A fix adds the onset read, about 1 CPU second a minute of the up to 20 minutes it reads. The votes and the
+checks cost under a second a track.
 
 ## Status file
 
@@ -2019,13 +2105,29 @@ the script does not see warns, with the app's map setting. A root folder that no
 folder holds or sits in warns, with `PLEX_PATH_MAP`. The check starts from the root folders, so a
 Plex library that holds none of them, such as music or another host's library, never warns. Both
 are warnings only. A deploy may run `--selftest` while a mount or an app is down. The listener must
-start before the apps answer, so it runs the check in a thread. In the same thread it then runs the
-checks of the Test event for each app with an API key, and prints one line per app to the container
-log. It asks an app that does not answer again for 2 minutes. A failed check warns, and the listener
-keeps running. A policy that did not load warns once, and each app is still checked. The path check
-at the start leaves an app that does not answer and a root folder it does not see to this check, so
-each warns once. Each API call of the Test checks waits at most 10 seconds, so a hung app fails the
-Test fast.
+start before the apps answer, so it runs its start check in a thread. The thread runs the checks of
+the Test event for each app with an API key, and prints one line per app to the container log. It
+asks an app that does not answer again for 2 minutes. A failed check warns, and the listener keeps
+running. A policy that did not load warns once, and each app is still checked. The path check runs
+last in the thread. It leaves an app that does not answer and a root folder it does not see to the
+app checks, so each warns once. Each API call of the Test checks waits at most 10 seconds, so a hung
+app fails the Test fast.
+
+After the apps, the start check and `--selftest` check each other service the setup uses, see
+`runner.service_checks()`. A tester found that a wrong Plex URL or token stayed silent before. Each
+check is one GET that changes nothing, and each prints one line. Plex lists its
+libraries with `PLEX_TOKEN`. Discord answers a GET of the webhook URL with the webhook's details, so
+the check proves the webhook and its token without a post. TMDB has a key check of its own. SABnzbd
+reads one slot of its queue, which needs the full API key. The Newznab indexer answers `t=caps`. A
+search would cost each indexer behind NZBHydra2 a hit of its daily limit, so no check sends one.
+SABnzbd and the indexer count only for a Radarr whose API key reads, because the subtitle hunter
+reads their addresses from Radarr. A service that does not answer is asked again for 2 minutes at
+the start, as an app is. A failed service check warns in both, and never fails the selftest. A
+token or an address that urllib cannot send fails at once, with the setting's name, and is never
+asked again. The path check runs after the Plex check. So a Plex that starts beside the listener has
+answered its check before the path check reads its library folders. When the Plex check warned, the
+path check adds no line of its own. When the Plex check passed and the folder read still failed, the
+path check says the folders went unchecked.
 
 The image reads the apps only through their APIs, so it needs no app config folder, and the env file
 or the environment holds each API key. No feature reads an app's database. A database shared between hosts is not safe,

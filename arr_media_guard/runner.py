@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
-import collections, contextlib, dataclasses, fcntl, hashlib, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error
+import collections, contextlib, dataclasses, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request
 
 from . import apps, checks, cli, config, content, convert, decide, logs, plex, process, regrab, report, store, subsync, subtitles, vault
 
@@ -198,8 +198,12 @@ def queued():
 
 
 def deep_analysis_queued():
-    """Deep analysis job names, the one queued longest ago first."""
-    return [n for n, in store.read("SELECT name FROM jobs WHERE claimed = 0 AND name LIKE 'deep-analysis-%' ORDER BY at, name")]
+    """The names of the deep analysis and recheck jobs, see deep_name(). The deep analyses go first, so a new import's
+    waits behind no batch of rechecks. Then each kind runs the one queued longest ago first. json.dumps() writes the
+    key of a recheck as "recheck": with a space, and a value that holds the word escapes its quotes, so the test
+    matches the key alone, on any SQLite."""
+    return [n for n, in store.read("SELECT name FROM jobs WHERE claimed = 0 AND name LIKE 'deep-analysis-%' "
+                                   """ORDER BY instr(job, '"recheck": ') > 0, at, name""")]
 
 
 def job_of(name, claimed=False):
@@ -235,10 +239,66 @@ def queue_deep_analysis(job, rec, inputs):
     if not (config.CFG.subtitles == "deep" and path and path.lower().endswith(".mkv") and os.path.exists(path)) or \
             not (any(t["i"].startswith("s") for t in rec.get("tracks") or []) or subtitles.side_stats(path)):
         return None
-    name = f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
+    name = deep_name(path)
     store.write("INSERT OR REPLACE INTO jobs (name, at, job) VALUES (?, ?, ?)", name, time.time(),
                 json.dumps(dict(app=job.get("app"), path=path, ids=ids, inputs=inputs, time=time.time(), key=file_key(os.stat(path)))))
     return name
+
+
+def deep_name(path):
+    """The name of the job of the background queue for path, a deep analysis or a recheck. The worker runs a job of
+    this name only while no import waits, one at a time."""
+    return f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
+
+
+def queue_rechecks():
+    """Queue a recheck job for each file whose saved subtitle result a newer check can fix, see subtitles.sub_stale(),
+    once per version of the code. RECHECK_ON_UPDATE false or SUBTITLES off queues nothing. A recheck is a job of the
+    background queue, as a deep analysis is, so imports and then deep analyses go first, and one runs at a time. The
+    job takes the inputs of its item from the app now, as --sub-check does. A job of the path that waits or runs
+    already stays. The mark of the version goes in only after every app answered. So after a stop or a failure part
+    way, the next start or nightly audit queues the rest. One line on stdout and in the decision log gives the count,
+    or the failure. With nothing queued and nothing failed it writes none. It never raises. Returns the count, or None
+    when nothing ran."""
+    if not config.CFG.recheck_on_update or config.CFG.subtitles == "off":
+        return None
+    n, failed = 0, []
+    try:
+        if store.get("mark", "recheck") == config.VERSION:
+            return None
+        for app, paths in sorted(subtitles.sub_stale().items()):
+            try:
+                found = apps.ARR[app].library(apps.arr(app, apps.ARR[app].kind), paths=list(paths))[0]
+            except Exception:
+                failed.append(apps.ARR[app].name)
+                continue
+            for f, (label, original, runtime, want, kids, item) in found:
+                if f.get("path") not in paths:   # a Radarr movie whose movieFile names the path, while movieFileId names another file
+                    continue
+                with contextlib.suppress(OSError):
+                    item = {k: v for k, v in (item or {}).items() if k != "episodes"}   # a series' episodes serve only the title check
+                    job = dict(app=app, path=f["path"], ids=cli.file_ids(f, want, item), time=time.time(), key=file_key(os.stat(f["path"])),
+                               recheck=paths[f["path"]], inputs=dict(label=label, original=original, runtime=runtime, want=want, kids=kids,
+                                                                    ctx=item, release=f.get("sceneName") or ""))
+                    name = deep_name(f["path"])   # a job of the path that waits or runs stays, so a second pass queues no double
+                    n += store.write("INSERT INTO jobs (name, at, job) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE name = ?)",
+                                     name, time.time(), json.dumps(job), name).rowcount
+        text = (f"this version can improve the subtitle check of {n} file{'s' if n != 1 else ''} checked before. "
+                f"{'They wait' if n != 1 else 'It waits'} in the background queue for a recheck.") if n else ""
+        if failed:
+            text += f" {report.and_list(failed)} did not answer, so the next start or nightly audit asks again."
+        else:   # only once every app answered, so a stop or a failure part way queues the rest next time
+            store.put("mark", "recheck", config.VERSION)
+    except Exception as ex:
+        failed, text = [True], config.mask(f"the recheck after an update did not run, so the next start or nightly audit tries again: "
+                                           f"{type(ex).__name__}: {ex}")[:300]
+    text = text.strip()
+    if not text:   # nothing to recheck, and nothing failed
+        return n
+    print(f"arr-media-guard: recheck: {text}", flush=True)
+    with contextlib.suppress(OSError):
+        logs.log(dict(source="recheck", result="warning" if failed else "queued", queued=n, note=text))
+    return n
 
 
 def deep_replaced(job):
@@ -271,29 +331,39 @@ def deep_analysis(name, pending, claimed=False):
     deep_replaced(). It checks that at its start, each time it takes the file lock, after its remux, see
     process.deep_drop(), and after an error.
 
+    A recheck job, see queue_rechecks(), runs here too. Its "recheck" names the run of the saved result it repeats,
+    import, sub_check, sub_time or deep, and it checks no deeper than that run, see process.Ctx. Its source is recheck.
+    Its inputs come from the app at the time it was queued. At SUBTITLES off it drops itself before any read.
+
     It reads the whole file for the tracks the Cues do not index before it takes the file lock, since a film takes
     minutes. That read is kept by the file's size and mtime, so a file that changed is read again under the lock. It
     takes the lock shared, hears without it, and takes it exclusive before an edit, and it plans again when the file
     changed, as a backfill file does. When an import waits in the queue, it stops between two steps: after the
     whole-file read, between two groups of its sweep, before each read and each fit of a track, and before a remux.
     The job goes back to the deep analysis queue, and its next run finds the words heard so far in the cache, and the
-    whole-file read in the store. A conversion of its own before the stop changed the file, so the job then takes the
-    key of the new file."""
+    whole-file read in the store. A track of that read that was cut short is a Cut again, see subtitles.Cut. A read
+    kept by a version that did not mark such tracks is read again. A conversion of its own before the stop changed the
+    file, so the job then takes the key of the new file."""
     started, rec, want, job, ctx = time.time(), dict(source="deep_analysis", job=name), None, {}, None
     try:
         job = job_of(name, claimed)
         app, path, got = job["app"], job["path"], job.get("inputs") or {}
-        rec.update(app=app, path=path)
+        rec.update(app=app, path=path, **({"source": "recheck"} if job.get("recheck") else {}))
         if drop := deep_replaced(job):
             rec.update(drop)
+        elif job.get("recheck") and not subtitles.sub_on("recheck"):   # SUBTITLES went off after the job was queued
+            rec.update(outcome="subtitles_off", result="dropped, SUBTITLES is off")
         elif not got:
             rec.update(outcome="job_stale", result="dropped, the job holds no decision inputs of its import")
         else:
             st, read = os.stat(path), store.get("deep-read", name) or {}   # the whole-file read of a run that yielded
-            if read.get("key") == [st.st_size, st.st_mtime_ns]:
-                subtitles.FULL[(path, st.st_size, st.st_mtime_ns)] = read["read"]
-            if (path, st.st_size, st.st_mtime_ns) not in subtitles.FULL:   # outside the file lock, and kept for a run after a yield
-                store.put("deep-read", name, {"key": [st.st_size, st.st_mtime_ns], "read": subtitles.full_read(path, checks.mkvmerge(path))})
+            if read.get("key") == [st.st_size, st.st_mtime_ns] and "cut" in read:   # JSON keeps no Cut, so "cut" names those tracks
+                subtitles.FULL[(path, st.st_size, st.st_mtime_ns)] = dict(read["read"], cues={p: (subtitles.Cut if p in read["cut"] else list)(map(tuple, c))
+                                                                                             for p, c in read["read"]["cues"].items()})
+            if (path, st.st_size, st.st_mtime_ns) not in subtitles.FULL and job.get("recheck") != "import":   # outside the file lock, and kept for a yield
+                whole = subtitles.full_read(path, checks.mkvmerge(path))
+                store.put("deep-read", name, {"key": [st.st_size, st.st_mtime_ns], "read": whole,
+                                              "cut": [p for p, c in whole["cues"].items() if isinstance(c, subtitles.Cut)]})
             deep_waits()
             want = got.get("want")
 
@@ -301,7 +371,8 @@ def deep_analysis(name, pending, claimed=False):
                 nonlocal ctx
                 if drop := deep_replaced(job):   # the file went or was replaced while the job read it or waited for the lock
                     return dict(rec, **drop)
-                ctx = process.Ctx(app, path, got.get("label") or os.path.basename(path), got.get("original"), got.get("runtime") or 0, mode="deep",
+                ctx = process.Ctx(app, path, got.get("label") or os.path.basename(path), got.get("original"), got.get("runtime") or 0,
+                                  mode={"import": "sub_check"}.get(job.get("recheck"), job.get("recheck") or "deep"), recheck=job.get("recheck"),
                                   kids=bool(got.get("kids")), release=got.get("release") or "", ids=job.get("ids"), item=got.get("ctx"),
                                   lock=lock, shared=shared)
                 return process.process(ctx)
@@ -332,7 +403,7 @@ def deep_analysis(name, pending, claimed=False):
     rec = logs.decision(rec, started)
     path = rec.get("path")
     if want and path and os.path.exists(path) and process.changed(rec):
-        pending.append(plex.plex_after(rec["app"], "deep_analysis", rec, want))
+        pending.append(plex.plex_after(rec["app"], rec.get("source", "deep_analysis"), rec, want))
     store.drop("deep-read", name)
     drop_job(name, claimed)
 
@@ -533,7 +604,7 @@ def body_old_files(app, files, owner):
     return "|".join(old), "|".join(rb)
 
 
-def app_check(app, until=0, policy=True, routed=False):
+def app_check(app, until=0, policy=True, routed=False, fix=None):
     """(why the setup cannot work for app or None, the warnings: a name clash and those of regrab.bin_warnings()). It
     checks that the policy loaded, that the app's API answers with the key, that its Instance Name picks app, see
     name_clash(), and that this script sees each root folder. The Test event of the hook and of the listener, --selftest and the listener's start
@@ -542,7 +613,11 @@ def app_check(app, until=0, policy=True, routed=False):
     app. routed is a Custom Script run, the hook's Test, where the Instance Name picks the instance. It checks the name
     of every instance of the program, because a run of a misnamed one reaches the Test of another, and a clash fails.
     --selftest on a host checks the name of app, and a clash only warns. Under the listener and in the image, the URL
-    path of the Webhook picks the instance, so it checks no name."""
+    path of the Webhook picks the instance, so it checks no name. fix passes to regrab.keep_warnings(). Only the
+    listener's start check sets it. An env file that does not read fails it first, see config.settings(). policy=False
+    leaves that to the caller too."""
+    if policy and config.CFG.env_error:
+        return config.CFG.env_error, []
     if policy and decide.POLICY is None:
         return config.policy_help(), []
     short = apps.ARR_TIMEOUT.set(TEST_TIMEOUT)
@@ -563,9 +638,177 @@ def app_check(app, until=0, policy=True, routed=False):
         if missing:
             return (f"this {config.here()} does not see the root folders {', '.join(missing)}. Mount the "
                     f"media at the app's paths, or {apps.map_fix(app)}"), clashes
-        return None, clashes + regrab.bin_warnings(app)
+        return None, clashes + regrab.bin_warnings(app, fix)
     finally:
         apps.ARR_TIMEOUT.reset(short)
+
+
+def service_checks(until=0):
+    """[(service, why its check failed or None)] for each service this setup uses besides the apps: plex with
+    PLEX_URL, discord with DISCORD_WEBHOOK, tmdb always, and sabnzbd and newznab each with its subtitle hunter key. Each
+    check is one GET that changes nothing. None posts to Discord or sends a search. The listener's start check and
+    --selftest run them after the apps. A service that does not answer is asked again every ASK_AGAIN seconds until
+    the monotonic time until. Two Radarr instances with the same result give one line."""
+    c, out = config.CFG, []
+    short = apps.ARR_TIMEOUT.set(TEST_TIMEOUT)   # the hunter's addresses come from Radarr
+    try:
+        if c.plex_url:
+            out.append(("plex", plex_check(until)))
+        if c.discord_webhook:
+            out.append(("discord", discord_check(until)))
+        out.append(("tmdb", tmdb_check(until)))
+        if c.sabnzbd_api_key or c.newznab_api_key:
+            out += hunter_checks(until)
+    finally:
+        apps.ARR_TIMEOUT.reset(short)
+    return [(s, re.sub(r"(apikey=)[^&\s'\"]+", r"\1<key>", config.mask(why))[:300] if why else None) for s, why in dict.fromkeys(out)]
+
+
+def service_answer(url, until, headers=None):
+    """(HTTP status, answer) of one GET of a service check. The answer is JSON when it reads as JSON, else bytes, for an
+    error status too. (None, the error) when the service did not answer. (0, the error) when urllib cannot send the
+    request: an address with no http or https, one it cannot read, or a character a header cannot hold, as a curly
+    apostrophe in a token. That
+    error stays, so it is never asked again, and content._get() reads it as a refused key too. Each ask waits
+    TEST_TIMEOUT seconds."""
+    while True:
+        try:
+            if urllib.parse.urlsplit(url).scheme not in ("http", "https"):   # urllib's URLError for another scheme stays too
+                return 0, "the address starts with no http:// or https://"
+            req = urllib.request.Request(url, headers={"User-Agent": "arr-media-guard", **(headers or {})})
+            with urllib.request.urlopen(req, timeout=TEST_TIMEOUT) as r:
+                code, raw = r.status, r.read()
+        except urllib.error.HTTPError as ex:
+            code, raw = ex.code, b""
+            with contextlib.suppress(Exception):
+                raw = ex.read()
+        except (ValueError, http.client.InvalidURL) as ex:   # UnicodeEncodeError is a ValueError
+            return 0, error_text(ex)
+        except Exception as ex:
+            if time.monotonic() >= until:
+                return None, error_text(ex)
+            time.sleep(min(ASK_AGAIN, max(0, until - time.monotonic())))
+            continue
+        with contextlib.suppress(ValueError):
+            return code, json.loads(raw)
+        return code, raw
+
+
+def error_text(ex):
+    return f"{type(ex).__name__}: {ex}"
+
+
+def plex_check(until):
+    """Plex lists its libraries only with a token it accepts, and answers 401 to one it refuses. A Plex that lets this
+    address in without a token accepts any token."""
+    url, token = config.CFG.plex_url.rstrip("/"), config.CFG.plex_token
+    code, got = service_answer(f"{url}/library/sections", until, {"X-Plex-Token": token, "Accept": "application/json"})
+    if code is None:
+        return f"Plex at {url} did not answer: {got}"
+    if code == 0:   # a header holds Latin-1 only, so another character is the token's
+        return f"Plex at {url} refused PLEX_TOKEN: {got}" if any(ord(c) > 255 for c in token) else f"PLEX_URL is no address amg can use: {got}"
+    if code == 401:
+        return f"Plex at {url} refused PLEX_TOKEN"
+    return None if code == 200 and isinstance(got, dict) and "MediaContainer" in got else f"Plex at {url} gave an unexpected answer: HTTP {code}"
+
+
+def discord_check(until):
+    """Discord answers a GET of the webhook URL with the webhook's details, which proves the webhook and its token
+    without a post. It answers 404 and code 10015 to a webhook it does not have, and 401 and code 50027 to a wrong
+    token. The GET takes no query, so wait or thread_id stays off it. The line never shows the URL."""
+    try:
+        url = urllib.parse.urlsplit(config.CFG.discord_webhook)._replace(query="", fragment="").geturl()
+    except ValueError as ex:   # as a '[' in the host
+        return f"DISCORD_WEBHOOK is no address amg can use: {error_text(ex)}"
+    code, got = service_answer(url, until)
+    err = got.get("code") if isinstance(got, dict) else None
+    if code is None:
+        why = f"Discord did not answer: {got}"
+    elif code == 0:
+        why = f"DISCORD_WEBHOOK is no address amg can use: {got}"
+    elif code == 200 and isinstance(got, dict) and got.get("id"):
+        return None
+    elif code == 404 or err == 10015:
+        why = "Discord does not know the webhook in DISCORD_WEBHOOK"
+    elif code == 401 or err == 50027:
+        why = "Discord refused the token in DISCORD_WEBHOOK"
+    else:
+        why = f"Discord gave an unexpected answer: HTTP {code}"
+    return why.replace(url, "<DISCORD_WEBHOOK>") if url else why
+
+
+def tmdb_check(until):
+    """TMDB's GET /authentication says whether the token amg would use is valid: TMDB_TOKEN, else Radarr's key, as for
+    content.expected_languages(). TMDB answers 401 to a token it refuses."""
+    token = config.CFG.tmdb_token or content.radarr_token() or content.RADARR_TOKEN
+    code, got = service_answer(f"{content.TMDB}/authentication", until, {"Authorization": f"Bearer {token}"})
+    if code is None:
+        return f"TMDB did not answer: {got}"
+    if code == 0:   # the address is fixed, so the token holds a character a header cannot hold
+        return f"TMDB refused {content.key_name(config.CFG.tmdb_token)}: {got}"
+    if code in (401, 403):
+        return f"TMDB refused {content.key_name(config.CFG.tmdb_token)}"
+    return None if code == 200 and isinstance(got, dict) and got.get("success") else f"TMDB gave an unexpected answer: HTTP {code}"
+
+
+def hunter_checks(until):
+    """[(service, why or None)] of SABnzbd and the Newznab indexer, each when its subtitle hunter key is set, at the
+    addresses of apps.hunter_urls() for each Radarr instance whose API key reads. Without one the hunter does not run."""
+    c, out = config.CFG, []
+    for app in [a for a in c.apps if config.program(a) == "radarr"]:
+        try:
+            apps.api_key(app)
+        except (OSError, AttributeError):   # an app this host does not run, as for the app checks
+            continue
+        name, wanted = apps.ARR[app].name, [s for s, key in (("sabnzbd", c.sabnzbd_api_key), ("newznab", c.newznab_api_key)) if key]
+        try:
+            urls = apps.hunter_urls(app)
+        except Exception as ex:
+            out += [(s, f"{name} did not answer, so the address of {'SABnzbd' if s == 'sabnzbd' else 'the Newznab indexer'} is not known: "
+                        f"{error_text(ex)}") for s in wanted]
+            continue
+        (sab, sab_why), (hydra, hydra_why) = urls["sab"], urls["hydra"]
+        if "sabnzbd" in wanted:
+            out.append(("sabnzbd", sab_why or sab_check(sab, until)))
+        if "newznab" in wanted:
+            out.append(("newznab", hydra_why or newznab_check(hydra, until)))
+    return out
+
+
+def sab_check(url, until):
+    """SABnzbd answers its queue, here one slot, only with the full API key (mode=queue). It refuses another key with
+    403 or with status false, and says why, as "API Key Incorrect", or "Access denied" for an address it does not let
+    in. With api_warnings off the body is empty. Only a reason that names the key blames SABNZBD_API_KEY. The key goes
+    in the query, quoted, so a request urllib cannot send has an address it cannot read."""
+    q = urllib.parse.urlencode({"mode": "queue", "limit": 1, "output": "json", "apikey": config.CFG.sabnzbd_api_key})
+    code, got = service_answer(f"{url}?{q}", until)
+    if code is None:
+        return f"SABnzbd at {url} did not answer: {got}"
+    if code == 0:
+        return f"SABnzbd at {url} is no address amg can use: {got}"
+    if code == 200 and isinstance(got, dict) and "queue" in got:
+        return None
+    said = str(got.get("error") or "") if isinstance(got, dict) else got.decode(errors="replace").strip()[:100] if isinstance(got, bytes) else ""
+    if code in (401, 403) or isinstance(got, dict) and got.get("status") is False:
+        return f"SABnzbd at {url} refused SABNZBD_API_KEY" if "key" in said.lower() else f"SABnzbd at {url} refused the request: {said or f'HTTP {code}'}"
+    return f"SABnzbd at {url} gave an unexpected answer: HTTP {code}"
+
+
+def newznab_check(url, until):
+    """The indexer answers t=caps, its list of features, and sends no search to the indexers behind it. A search costs
+    each indexer behind NZBHydra2 a hit of its daily limit. NZBHydra2 checks the key before caps and answers a wrong
+    one with error code 100. The Newznab spec lets an indexer answer caps without a key, so on another indexer the
+    check proves the address only. Codes 100 to 102 refuse the key."""
+    code, got = service_answer(f"{url}?{urllib.parse.urlencode({'t': 'caps', 'apikey': config.CFG.newznab_api_key})}", until)
+    if code is None:
+        return f"the Newznab indexer at {url} did not answer: {got}"
+    if code == 0:   # the key goes in the query, quoted
+        return f"the Newznab indexer at {url} is no address amg can use: {got}"
+    text = got if isinstance(got, bytes) else b""
+    err = re.search(rb'<error\b[^>]*\bcode="(\d+)"', text)
+    if code in (401, 403) or err and err.group(1) in (b"100", b"101", b"102"):
+        return f"the Newznab indexer at {url} refused NEWZNAB_API_KEY"
+    return None if code == 200 and b"<caps" in text and not err else f"the Newznab indexer at {url} gave an unexpected answer: HTTP {code}"
 
 
 def waiting():
@@ -1147,6 +1390,7 @@ def run_job(name, pending, shared=False, claimed=False):
                         kids=kids, release=job.get("release") or "", ids=ids, item=ctx, lock=lock,
                         shared=shared and types.SimpleNamespace(exclusive=lambda st: exclusive(lock, path, st, name, job, unit), settle=lambda: settle(name),
                                                                 turn=lambda: wait_turn(name, job), reshare=lambda st: reshared(lock, path, st))))
+                    rec["job"] = name   # process() gives a new record, and the summary line names the job, see report.render()
                     if handled:
                         rec.setdefault("notes", []).append(f"{kind} already checked with its download")
                     if path != old:

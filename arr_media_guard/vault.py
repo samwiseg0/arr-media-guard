@@ -144,6 +144,7 @@ def keep_grab(app, owner, download_id, eps=()):
                     os.rmdir(sub)
     for root in sorted(roots):
         remember_folder(root)
+        plex_ignore(root)
     if not kept and not missed:
         return None
     rec = dict(source="hook", app=app, result="kept_replaced" if kept else "not_kept_replaced", download_id=download_id or "", kept=[r["kept"] for r in kept],
@@ -205,6 +206,15 @@ def replaced_root(path):
 def kept_folders():
     """The folders a keep wrote in, from the store, see remember_folder()."""
     return set(store.get("kept", "folders", []))
+
+
+def plex_ignore(root):
+    """Write .plexignore with the pattern * in root, a keep_dir or recycle_dir, when it has none. Plex skips a hidden
+    folder, and the file makes sure where keep_root() put the folder inside a library folder. An existing file stays
+    as it is. An error leaves the folder without one."""
+    with contextlib.suppress(OSError):
+        with open(os.path.join(root, ".plexignore"), "x") as f:
+            f.write("*\n")
 
 
 def remember_folder(root):
@@ -273,6 +283,7 @@ def keep_original(path, note=None):
     keep = os.path.join(root, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time())), os.path.relpath(path, os.path.dirname(root)))
     os.makedirs(os.path.dirname(keep), exist_ok=True)
     remember_folder(root)
+    plex_ignore(root)
     try:
         os.link(path, keep)
         return keep

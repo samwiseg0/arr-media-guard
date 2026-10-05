@@ -15,7 +15,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """The settings fixture, shared by the test files that load the package."""
 import dataclasses
+import io
 import os
+import socket
+import urllib.request
+import urllib.response
 
 import pytest
 
@@ -33,6 +37,31 @@ def no_time_limit():
     yield
     for d in amg.deadlines():
         d.stop()
+
+
+LOCAL = ("127.0.0.1", "localhost", "::1")
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """No test reaches a host other than this one, so no test reaches a real service. A connection to another host
+    fails, as one to a host with no server does, and urllib reads the request as it would for a real host first.
+    TMDB's key check of the start check answers that the key is valid, so a start check or a selftest prints only the
+    services its test sets up. A test that fakes urlopen replaces that answer."""
+    connect, urlopen = socket.create_connection, urllib.request.urlopen
+
+    def guard(address, *args, **kwargs):
+        if address[0] not in LOCAL:
+            raise OSError(f"the tests reach no network, and this call asked {address[0]}")
+        return connect(address, *args, **kwargs)
+
+    def tmdb_ok(req, *args, **kwargs):
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        if url == "https://api.themoviedb.org/3/authentication":
+            return urllib.response.addinfourl(io.BytesIO(b'{"success": true}'), {}, url, 200)
+        return urlopen(req, *args, **kwargs)
+    monkeypatch.setattr(socket, "create_connection", guard)
+    monkeypatch.setattr(urllib.request, "urlopen", tmdb_ok)
 
 
 @pytest.fixture

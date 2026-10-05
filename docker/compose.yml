@@ -1,5 +1,5 @@
 # arr-media-guard in Docker. Replace each CHANGE_ME, then run: docker compose up -d
-# The first start generates the Webhook password. Read WEBHOOK_PASSWORD in ./arr-media-guard/arr-media-guard.env.
+# The first start generates the Webhook password. Read WEBHOOK_PASSWORD in arr-media-guard.env in the config folder.
 # The README has the steps, and docs/docker.md has the detail.
 services:
   arr-media-guard:
@@ -26,10 +26,13 @@ services:
       # RADARR_4K_LINK: https://movies4k.example.com
       # RADARR_4K_API_KEY: CHANGE_ME       # Settings > General in the 4K Radarr
     volumes:
-      - ./arr-media-guard:/config          # the env file, the policy and the decision log
+      - CHANGE_ME:/config                  # the config folder of the host, such as /srv/appdata/arr-media-guard:
+                                           # the env file, the policy and the decision log
       - amg-state:/config/state            # the state store, which needs a local disk
       - CHANGE_ME:/data                    # the media folder of the host, at the path the apps use
                                            # when the apps use another path, change /data to it, or set PATH_MAP
+      # - CHANGE_ME:/downloads:ro          # Sonarr's download folder, read-only, for the episode title check. Change
+                                           # /downloads to the path Sonarr uses. Skip it when the media folder holds it.
       # - /dev/log:/dev/log                # the host's syslog, for Loki
     ports:
       - "8484:8484"                        # the Webhook listener. Docker publishes a port past ufw. To bind it to

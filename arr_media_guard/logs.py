@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
-import contextlib, datetime, hashlib, json, os, sqlite3, syslog, time, urllib.error
+import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error, urllib.request
 
 from . import apps, checks, config, content, decide, health, report, store
 
@@ -126,28 +126,79 @@ def embed(app, title, description, color, fields, footer=None):
     return e
 
 
+POST_TRIES = 4   # tries of one post while Discord answers 429. Several job processes may post at once, as for a season pack.
+# Seconds of retry_after a post waits at most. Discord allows 5 posts per 2 seconds per webhook, so a longer wait comes
+# from another limit, as after too many refused requests.
+POST_WAIT = 10
+QUIET_UNTIL = 0.0   # the time.monotonic() until which Discord asked this process for no posts, see post()
+
+
 def post(app, emb):
-    """One embed to DISCORD_WEBHOOK, as the app ("Radarr <INSTANCE>"). A 429 waits retry_after and tries once more."""
+    """One embed to DISCORD_WEBHOOK, as the app ("Radarr <INSTANCE>"). A 429 waits retry_after and tries again, up to
+    POST_TRIES tries in all. A retry_after over POST_WAIT, or the last try, gives up. Every later post of this process
+    then skips until the time Discord named, and its result says so."""
+    global QUIET_UNTIL
     hook_url = config.CFG.discord_webhook
     if not hook_url: return "no webhook configured"
+    if (left := QUIET_UNTIL - time.monotonic()) > 0:
+        return f"skipped, Discord asked for no posts for {left:.0f} s more"
     body = json.loads(config.mask(json.dumps({"username": app_name(app), "embeds": [emb], "allowed_mentions": {"parse": []}})))
     try:
-        try:
-            apps.http(hook_url, "POST", body)
-        except urllib.error.HTTPError as ex:   # Discord allows 5 posts per 2 seconds per webhook
-            if ex.code != 429: raise
-            time.sleep(config.DEADLINE.bound(min(float(json.loads(ex.read() or b"{}").get("retry_after", 2)), 30)))
-            apps.http(hook_url, "POST", body)
-        return "sent"
+        for n in range(POST_TRIES):
+            try:
+                apps.http(hook_url, "POST", body)
+                return "sent"
+            except urllib.error.HTTPError as ex:   # Discord allows 5 posts per 2 seconds per webhook
+                if ex.code != 429: raise
+                wait = float(json.loads(ex.read() or b"{}").get("retry_after", 2))
+                if wait > POST_WAIT or n == POST_TRIES - 1:
+                    QUIET_UNTIL = time.monotonic() + wait
+                    return f"failed: Discord asked for no posts for {wait:g} s"
+                time.sleep(config.DEADLINE.bound(wait))
     except Exception as ex:
         return config.mask(f"failed: {type(ex).__name__}: {ex}")[:200]
 
 
 def alert_findings(rec, size):
     """Post the findings of rec that report.posts() passes, one embed each, see report.alert_embed() and alert(). This is
-    the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log."""
-    return [alert(rec["app"], f["kind"], rec["path"], size, e) if report.posts(f, rec) else "log only"
-            for f, e in zip(rec["findings"], report.render(rec, "embed"))]
+    the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log.
+
+    With DISCORD_POSTS all, each change the run made to the file posts too, see report.render() "changes". They skip the
+    marker of alert(), because a second run finds nothing left to change. rec["change_result"] says what each post gave.
+    A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line."""
+    out = [alert(rec["app"], f["kind"], rec["path"], size, e) if report.posts(f, rec) else "log only"
+           for f, e in zip(rec["findings"], report.render(rec, "embed"))]
+    if config.CFG.discord_posts == "all":
+        try:
+            rec["change_result"] = [post(rec["app"], e) if isinstance(e, dict) else e for e in report.render(rec, "changes")]
+        except Exception as ex:
+            rec["change_result"] = [config.mask(f"no text: {type(ex).__name__}: {ex}")[:200]]
+    return out
+
+
+def discord_test():
+    """--test-discord: one short message to DISCORD_WEBHOOK. Returns (whether Discord took it, the line to print): its
+    HTTP status, or the error. mask() hides the webhook in the error, and the path of any webhook goes too. A refusal
+    names only the message and the code of Discord's JSON answer, because another server may echo the path, which holds
+    the webhook's token."""
+    hide = lambda text: re.sub(r"webhooks/[^\s'\"]+", "webhooks/<hidden>", config.mask(text))[:300]
+    if not config.CFG.discord_webhook:
+        return False, "DISCORD_WEBHOOK is not set, so no test message was sent."
+    body = {"username": config.CFG.name, "content": f"Test message from {config.CFG.name} on {config.CFG.instance}.", "allowed_mentions": {"parse": []}}
+    req = urllib.request.Request(config.CFG.discord_webhook, json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "arr-media-guard"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return True, f"Discord took the test message: HTTP {r.status}."
+    except urllib.error.HTTPError as ex:
+        try:
+            said = json.loads(ex.read()[:2000])
+            said = f' {said["message"]} (code {said["code"]}).' if isinstance(said, dict) and {"message", "code"} <= set(said) else ""
+        except ValueError:
+            said = ""
+        return False, hide(f"Discord refused the test message: HTTP {ex.code} {ex.reason}.{said}")
+    except Exception as ex:
+        return False, hide(f"The test message failed: {type(ex).__name__}: {ex}")
 
 
 def alert(app, kind, path, size, emb):

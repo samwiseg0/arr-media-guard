@@ -17,7 +17,7 @@ HOME = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the fold
 SCRIPT = os.path.join(HOME, "arr-media-guard")   # the launcher, the path a Custom Script connection runs
 LIB = tuple(f"arr_media_guard/{n}" for n in sorted(os.listdir(os.path.join(HOME, "arr_media_guard"))) if n.endswith(".py")) + \
     ("arr-media-guard-subhunt", "arr_subhunt.py")   # the code files besides the launcher, relative to HOME
-COLORS = {"red": 0xD64541, "amber": 0xF0A020}   # red: a re-grab fault. amber: other alerts.
+COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x43B581}   # red: a re-grab fault. amber: other alerts. green: a change.
 # The outcome code of a wrong-content verdict per regrab() code, so the outcome says what happened: would_regrab only when
 # the grab record, the cap and the second check all passed. report.VERDICTS words each one.
 CONTENT_CODES = {"regrabbed": "wrong_content", "would_regrab": "would_regrab", "unconfirmed": "wrong_content_unconfirmed", "capped": "regrab_capped",
@@ -88,6 +88,9 @@ REGRAB_KINDS = ("audio", "video", "content", "damage")   # broken audio, corrupt
 # and alerts, and changes nothing. fix: it also removes, retimes and lengthens. deep: fix, and a deep analysis after the
 # import, see deep_analysis(). --sub-check and --sub-time ignore it, see sub_on() and sub_fixes().
 SUBTITLES_LEVELS = ("off", "check", "fix", "deep")
+# What goes to DISCORD_WEBHOOK. issues: what arr-media-guard left unresolved, see report.posts(). all: also one post for
+# each change it made to a file, see report.changes().
+DISCORD_POSTS = ("issues", "all")
 # PATH_MAP='/tv:/media/tv|/movies:/media/movies' pairs the path an app uses with the path this script sees, as in Docker.
 # SONARR_PATH_MAP, RADARR_PATH_MAP and PLEX_PATH_MAP pair the paths of one program the same way. Each one that is empty
 # or missing takes PATH_MAP, see Settings.map_of(). An instance of APP_INSTANCES has its own, see env_key().
@@ -132,7 +135,9 @@ class Settings:
     plex_path_map: list
     path_map: list           # the map of each program whose own map has no pair
     map_error: str           # every map's error, or None. --serve refuses to start on it.
+    env_error: str           # why the env file, which is there, does not read, or None. The Test fails on it.
     discord_webhook: str
+    discord_posts: str       # one of DISCORD_POSTS
     tmdb_token: str
     webhook_user: str
     webhook_password: str
@@ -149,6 +154,7 @@ class Settings:
     header_repair: bool      # off: a header issue is logged and never remuxed
     repack_max: float        # REPACK_MAX_GB in bytes. A larger file that is not Matroska is skipped. A header repair too.
     subtitles: str           # one of SUBTITLES_LEVELS
+    recheck_on_update: bool  # on: the first start of a new version queues a recheck of the files it can fix, see runner.queue_rechecks()
     convert: bool            # the hook's conversion of an import. A backfill converts with --convert only.
     convert_max: int         # CONVERT_MAX_FILES, the conversions one backfill run applies. Then it stops, for the NAS load.
     convert_workers: int
@@ -181,14 +187,17 @@ class Settings:
 
 
 def env_file(path):
-    """{KEY: value} of the KEY='value' lines of the env file at path, {} when it does not read."""
-    out = {}
+    """{KEY: value} of the KEY='value' lines of the env file at path, {} when there is no file. Docker writes it at the
+    first start. A file that is there and does not read raises OSError, see settings()."""
     try:
-        for line in open(path):
+        f = open(path)
+    except FileNotFoundError:
+        return {}
+    out = {}
+    with f:
+        for line in f:
             k, sep, v = line.strip().partition("=")
             if sep and not k.startswith("#"): out[k] = v.strip("'\"")
-    except OSError:
-        pass
     return out
 
 
@@ -211,8 +220,13 @@ class Lookup(collections.ChainMap):
 
 def settings(path, environ=os.environ):
     """The Settings of the env file at path. A key in environ wins over the file, an empty one too. settings() reads
-    only the keys of the settings, so any other variable of environ is ignored. A missing key takes its default."""
-    env, errors = Lookup(environ, env_file(path)), []
+    only the keys of the settings, so any other variable of environ is ignored. A missing key takes its default. An env
+    file that is there and does not read gives env_error. Sonarr and Radarr run the hook as their own user."""
+    try:
+        kept, env_error = env_file(path), None
+    except OSError as ex:
+        kept, env_error = {}, f"uid {os.getuid()} and gid {os.getgid()} cannot read the env file {path} ({ex.strerror or ex}), so its settings take their defaults."
+    env, errors = Lookup(environ, kept), [env_error] if env_error else []
     env.taken = set()
 
     def number(key, default, bad, why, least=None, cast=int):
@@ -298,8 +312,10 @@ def settings(path, environ=os.environ):
         instance=env.get("INSTANCE", os.uname().nodename), log=env.get("LOG", "/var/log/arr-media-guard.jsonl"),
         state_dir=env.get("STATE_DIR", "/var/lib/arr-media-guard"), policy_file=env.get("POLICY_FILE") or "/etc/arr-media-guard.policy.json",
         lid_dir=env.get("LID_DIR", "/opt/arr-media-guard-lid"), name=name, plex_url=env.get("PLEX_URL", ""), plex_token=env.get("PLEX_TOKEN", ""),
-        plex_path_map=maps["PLEX_PATH_MAP"][0], path_map=maps["PATH_MAP"][0], map_error=" ".join(map_errors) or None,
-        discord_webhook=env.get("DISCORD_WEBHOOK", ""), tmdb_token=env.get("TMDB_TOKEN", ""), webhook_user=env.get("WEBHOOK_USER", ""),
+        plex_path_map=maps["PLEX_PATH_MAP"][0], path_map=maps["PATH_MAP"][0], map_error=" ".join(map_errors) or None, env_error=env_error,
+        discord_webhook=env.get("DISCORD_WEBHOOK", ""),
+        discord_posts=level("DISCORD_POSTS", "issues", DISCORD_POSTS, "issues", "Discord gets only the problems arr-media-guard leaves unresolved"),
+        tmdb_token=env.get("TMDB_TOKEN", ""), webhook_user=env.get("WEBHOOK_USER", ""),
         webhook_password=env.get("WEBHOOK_PASSWORD", ""), sabnzbd_api_key=env.get("SABNZBD_API_KEY", ""),
         newznab_api_key=env.get("NEWZNAB_API_KEY", ""), sabnzbd_url=env.get("SABNZBD_URL", ""), newznab_url=env.get("NEWZNAB_URL", ""),
         audit_time=env.get("AUDIT_TIME", "07:30"), regrab=regrab, regrab_cap=regrab_cap,
@@ -307,6 +323,7 @@ def settings(path, environ=os.environ):
         restore=switch("RESTORE", True, "a re-grab of a broken upgrade puts the old file back"),
         header_repair=switch("HEADER_REPAIR", True, "arr-media-guard repairs a broken header"),
         convert=switch("CONVERT", False, "arr-media-guard converts no import"),
+        recheck_on_update=switch("RECHECK_ON_UPDATE", True, "a new version queues a recheck of the files it can fix"),
         keep_days=number("KEEP_ORIGINALS_DAYS", 7, 7, "is not a whole number of 0 or more, so it counts as {}.", least=0),
         repack_max=repack_max, subtitles=subtitles, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),

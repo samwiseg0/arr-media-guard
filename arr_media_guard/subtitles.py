@@ -424,16 +424,20 @@ def lid_kept(path, index):
     return lid.kept_pcm(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, index)
 
 
+SUB_SOURCES = ("hook", "deep_analysis", "recheck")   # an import and the jobs of the background queue follow SUBTITLES
+
+
 def sub_on(source, sub_check=False):
-    """The subtitle match check runs: on an import and in the deep analysis unless SUBTITLES is off, and in a backfill
-    only with --sub-check or --sub-time, whatever SUBTITLES says."""
-    return config.CFG.subtitles != "off" if source in ("hook", "deep_analysis") else sub_check
+    """The subtitle match check runs: on an import, in the deep analysis and in a recheck unless SUBTITLES is off, and
+    in a backfill only with --sub-check or --sub-time, whatever SUBTITLES says."""
+    return config.CFG.subtitles != "off" if source in SUB_SOURCES else sub_check
 
 
 def sub_fixes(source):
     """Whether the subtitle check may change the file: remove a track, retime, lengthen cues, move a sidecar or turn a
-    flag off. An import and the deep analysis do at SUBTITLES fix or deep. --sub-check and --sub-time do with --apply."""
-    return source not in ("hook", "deep_analysis") or config.CFG.subtitles in ("fix", "deep")
+    flag off. An import, the deep analysis and a recheck do at SUBTITLES fix or deep. --sub-check and --sub-time do with
+    --apply."""
+    return source not in SUB_SOURCES or config.CFG.subtitles in ("fix", "deep")
 
 
 def sub_audio(ts, edits=()):
@@ -737,6 +741,15 @@ def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop
     return out, {k: basis[k] for k in refs}
 
 
+LAYOUT_READ = {}   # (path, size, mtime_ns, track position) -> the cues sub_layout() read of a track, see layout_cues()
+
+
+def layout_cues(path, p):
+    """The cues sub_layout() read of track position p of path as it is now, or None."""
+    st = os.stat(path)
+    return LAYOUT_READ.get((path, st.st_size, st.st_mtime_ns, p))
+
+
 def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
     """({subtitle position or sidecar name: its sub_reference() result with "layout": subsync.layout()}, the facts of
     the speech read) of the speech layout check (docs/design.md, "Incorrect subtitle identification"). It takes a text
@@ -745,8 +758,10 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
     subsync.LAYOUT_ACTION "remove" it makes the verdict a mismatch, so the track leaves the file and the sidecar moves
     aside as after the word check. The decision log holds the lift of every judged track under "layout". A fit gets its
     times from subsync.layout_fix(), so a track off by one shift gets a fix, and a track at different offsets in
-    different parts gets none and alerts. A fix stands only when the speech onsets confirm it, see
-    subsync.layout_onsets(). The onsets are read once for the file, in the parts of subsync.onset_parts(), and only when
+    different parts gets none and alerts. A fix may keep runs of lines at the file's ends where they are, see
+    subsync.shifted(). Such a fix needs a plan of every cue, so a WebVTT track gets none and alerts. A cut read gets no
+    fix at all, as the fix would move the lines past the read unseen. The cues read stay in LAYOUT_READ for the plan.
+    A fix stands only when the speech onsets confirm it, see subsync.layout_onsets(). The onsets are read once for the file, in the parts of subsync.onset_parts(), and only when
     some track has a fix. With subsync.LAYOUT_FIX "alert" a fix then only alerts: "would" holds it, and "unfixed" its
     offset. The spans of speech come from one read of the whole audio track that plays, see lid.speech(). A
     track whose read was cut short is judged up to its last cue read, as a file that ends there, see Cut. With stop()
@@ -769,6 +784,9 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
     if not isinstance(got.get("spans"), list):
         return {}, dict(facts, why=config.mask(str(got.get("why") or "no spans"))[:200])
     cues = subtitle_cues(path, j, set(tracks), full=True) if tracks else {}
+    LAYOUT_READ.clear()   # the plan of a partial shift takes these cues, so the remux never reads them again
+    st = os.stat(path)
+    LAYOUT_READ.update({(path, st.st_size, st.st_mtime_ns, p): c for p, c in cues.items()})
     todo = {p: (cues.get(p) or [], t["lang"], codecs[p], t["role"]) for p, t in tracks.items()}
     todo.update({n: ([(a / 1000, b / 1000, x) for a, b, x in s["cues"]], side_code(s), "srt",
                       "sdh" if {proof.SIDECAR_FLAGS["hi"], proof.SIDECAR_FLAGS["sdh"]} & set(s["flags"]) else "full") for n, s in sides.items()})
@@ -779,6 +797,10 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
         upto = dur if end is None else min(dur, end)
         lay = subsync.layout(cs, spans, upto)
         timing = subsync.layout_fix(cs, spans, upto, lay)
+        if (timing or {}).get("fix") and end is not None:   # a fix would move the lines past the read too, unseen
+            timing = {"fix": None, "unfixed": timing["fix"]["offset"], "why": f'{timing["why"]}, but the read of its lines stopped part way, so the times stay'}
+        if (timing or {}).get("keep") and codec == "S_TEXT/WEBVTT":   # a partial shift needs every cue in a new plan
+            timing = {"fix": None, "unfixed": timing["fix"]["offset"], "why": f'{timing["why"]}, but a WebVTT track is never rewritten, so the times stay'}
         if (timing or {}).get("fix"):   # the second clock, read once for the file
             if heard is None and not (stop and stop()):
                 facts["onsets"] = {"cpu": 0.0, "took": 0.0}
@@ -786,7 +808,7 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
             timing = subsync.layout_onsets(cs, timing, heard, subsync.onset_parts(dur), dur) if heard is not None else \
                 {"fix": None, "why": f'{timing["why"]}, but the run had no time left to read the speech onsets, so the times stay'}
         if (timing or {}).get("fix") and subsync.LAYOUT_FIX != "write":   # the fix it would make alerts, see LAYOUT_FIX
-            timing = dict(timing, fix=None, unfixed=timing["fix"]["offset"], would=timing["fix"],
+            timing = dict(timing, fix=None, unfixed=timing["fix"]["offset"], would=dict(timing["fix"], **({"kept": timing["kept"]} if timing.get("kept") else {})),
                           why=f'{timing["why"]}, but a fix from the speech layout only alerts for now, so the times stay')
         r = timed_by.get(k) or {"verdict": "unknown", "why": "no track or sidecar of the file matched the audio in its words", "timing": None}
         drop = lay["verdict"] == "mismatch" and subsync.LAYOUT_ACTION == "remove"
@@ -1035,29 +1057,106 @@ def side_stats(path):
     return out
 
 
-SUB_CHECK = 2   # the version of the subtitle check a cached verdict holds. 2 added the garbled and speech layout
-                # checks, see sub_cached().
+# The checks a saved subtitle result records, each with its version (docs/development.md, "When a change can fix old
+# files"). Raise a check's version with every change to it. fixes says which older saved results the change of a
+# version can fix: {version: the findings of those results, see sub_found(), or None for every older result}. A list
+# names a result when any one of its words is among the result's findings of that check. Those results are stale. The
+# next --sub-check checks such a file again, and RECHECK_ON_UPDATE queues a recheck of it. A version with no entry, as
+# for a change of speed or wording, keeps every older result. tests/test_arr_media_guard.py checks each entry against
+# SUB_FINDINGS and the version.
+SUB_CHECKS = {
+    "subtitle_match": {"version": 1, "fixes": {}},     # the word check of a subtitle in an audio language, and its fix
+    "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
+    "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
+                                                       # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
+    "garbled_repair": {"version": 1, "fixes": {}},
+    "flash": {"version": 1, "fixes": {}},              # lines that flash by too fast to read
+    "block_timing": {"version": 1, "fixes": {}},       # Subtitle block timing and Live caption timing
+}
+SUB_FINDINGS = ("mismatch", "unknown", "fix", "off", "steps", "unfixable", "cut", "live", "unread")   # the words of sub_found()
+SUB_RUNS = {"import": ("subtitle_match", "reference_timing", "flash")}   # the checks each run of process() makes
+SUB_RUNS["sub_check"] = SUB_RUNS["import"] + ("foreign_timing", "garbled_repair")
+SUB_RUNS["sub_time"] = SUB_RUNS["deep"] = SUB_RUNS["sub_check"] + ("block_timing",)
 
 
-def sub_cache(path, verdicts, pending):
-    """Cache the subtitle check's verdicts for path as it is now, with its sidecars and SUB_CHECK, see lid.verdict_put()."""
+def sub_found(rec):
+    """{check of SUB_CHECKS: its findings} of the run of rec, sorted words. Each subtitle gives the words of its result:
+    mismatch (it does not belong to the audio), unknown (no verdict), fix (new times or a repair, made or not), off
+    (times off by one amount that stay), steps (times off by different amounts in parts of the file), unfixable
+    (garbled text with no repair), cut (its read stopped part way) and live (live captions). Foreign subtitle timing
+    gives unread when the read of the speech failed, so it judged nothing. A clean check gives []."""
+    def words(verdict, t):
+        return {w for w, on in (("mismatch", verdict == "mismatch"), ("unknown", verdict not in ("match", "fit", "mismatch")), ("fix", t.get("fix")),
+                                ("off", "unfixed" in t or "unconfirmed" in t), ("steps", t.get("piecewise"))) if on}
+    timed = (rec.get("subtime") or {}).values()
+    out = {"subtitle_match": [words(r.get("verdict"), r.get("timing") or {}) for r in (rec.get("subcheck") or {}).values()],
+           "reference_timing": [words(r.get("verdict"), r.get("timing") or {}) for r in timed if "layout" not in r],
+           "foreign_timing": [words(r["layout"].get("verdict"), r.get("timing") or {}) for r in timed if "layout" in r]
+           + ([{"unread"}] if "why" in (rec.get("speech") or {}) else []),
+           "garbled_repair": [{"cut" if g.get("capped") else "fix" if g.get("repair") else "unfixable"} for g in (rec.get("garbled") or {}).values()],
+           "flash": [{"off" if f.get("report_only") else "fix"} for f in (rec.get("flash") or {}).values()],
+           "block_timing": [{w for w, on in (("fix", b.get("blocks")), ("live", b.get("live"))) if on} for b in (rec.get("blocks") or {}).values()]
+           + [{"off"} for rows in (rec.get("sweep") or {}).values() if cli.sweep_alerts(rows)]}
+    return {k: sorted(set().union(*v)) for k, v in out.items()}
+
+
+def sub_cache(path, rec, mode, app, pending):
+    """Save the subtitle check of the run of rec, of mode, for path as it is now, see lid.verdict_put(): the version
+    and the findings of each check the run made (SUB_RUNS), the app and the sidecars. The rows are the saved results."""
     with contextlib.suppress(ImportError):
         from . import lid
-        lid.verdict_put(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, {"verdicts": verdicts, "sidecars": side_stats(path),
-                                                                                "version": SUB_CHECK}, pending)
+        found = sub_found(rec)
+        lid.verdict_put(os.path.join(config.CFG.state_dir, "lid.sqlite"), path,
+                        {"checks": {c: {"version": SUB_CHECKS[c]["version"], "found": found[c]} for c in SUB_RUNS[mode]}, "app": app, "mode": mode,
+                         "sidecars": side_stats(path)}, pending)
+
+
+def sub_fixed(result):
+    """The checks of the saved result whose newer version can fix it, see SUB_CHECKS. Only the checks of the run that
+    saved it count, see SUB_RUNS. A check that run makes now and the result lacks, as one added later, counts as
+    version 0 with no findings, so only a fixes entry of None makes it stale. A result saved before 2.5.0 names no run,
+    so it has none."""
+    r = result if isinstance(result, dict) else {}
+    have = r.get("checks") if isinstance(r.get("checks"), dict) else {}
+
+    def stale(c):
+        e = have.get(c) or {}
+        return any(e.get("version", 0) < v <= SUB_CHECKS[c]["version"] and (found is None or set(found) & set(e.get("found") or []))
+                   for v, found in SUB_CHECKS[c]["fixes"].items())
+    return [c for c in SUB_RUNS.get(r.get("mode"), ()) if stale(c)]
 
 
 def sub_cached(path):
-    """The subtitle check of path as it is now is cached and asks for nothing more, so a backfill with --sub-check
-    skips the file. A dry run's verdict that asks for an action does not count, so an apply after it still acts. A
+    """The subtitle check of path as it is now is saved and asks for nothing more, so a backfill with --sub-check
+    skips the file. A dry run's result that asks for an action does not count, so an apply after it still acts. A
     sidecar that came, went or changed since counts as a change, so a new download from a program such as Bazarr is checked.
-    A verdict of another SUB_CHECK version does not count, so a new check runs once on every file."""
+    The result must come from a run that makes every check of --sub-check, with none of them stale, see sub_fixed().
+    So a result of an import, or of 2.4.0 and older, does not count, and the file is checked once more."""
     try:
         from . import lid
     except ImportError:
         return False
     got = lid.verdict_get(os.path.join(config.CFG.state_dir, "lid.sqlite"), path)
-    return bool(got) and not got[1] and isinstance(got[0], dict) and got[0].get("version") == SUB_CHECK and got[0].get("sidecars") == side_stats(path)
+    r = got[0] if got and not got[1] and isinstance(got[0], dict) else {}
+    return set(SUB_RUNS["sub_check"]) <= set(SUB_RUNS.get(r.get("mode"), ())) and not sub_fixed(r) and r.get("sidecars") == side_stats(path)
+
+
+def sub_stale():
+    """{app: {path: the run of its saved result}} of the files whose saved result a newer check can fix, see
+    sub_fixed(). Only a result of the file as it is now counts, and only one an instance of this setup made. A recheck
+    repeats the checks of that run, and none deeper, see process.Ctx. It never raises."""
+    try:
+        from . import lid
+    except ImportError:
+        return {}
+    out = {}
+    for path, size, mtime_ns, r in lid.verdicts(os.path.join(config.CFG.state_dir, "lid.sqlite")):
+        if r.get("app") in config.CFG.apps and r.get("mode") in SUB_RUNS and sub_fixed(r):
+            with contextlib.suppress(OSError):
+                st = os.stat(path)
+                if (st.st_size, st.st_mtime_ns) == (size, mtime_ns):
+                    out.setdefault(r["app"], {})[path] = r["mode"]
+    return out
 
 
 def raw_srt(raw):
@@ -1187,7 +1286,7 @@ def sub_findings(rec, sync, unmatched):
     remux_block()."""
     rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
     plan = {} if rec.get("apply", True) else remux_block(rec)
-    flags_off, by = sub_fixes(rec.get("source")), "hook" if rec.get("source") in ("hook", "deep_analysis") else "run"
+    flags_off, by = sub_fixes(rec.get("source")), "hook" if rec.get("source") in SUB_SOURCES else "run"
     laid = lambda k: {"layout": True} if ((sync.get(k) or {}).get("layout") or {}).get("verdict") == "mismatch" else {}   # see sub_layout()
     for p in rm.get("removed") or []:
         wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept"), **laid(p)})
@@ -1242,8 +1341,8 @@ def sub_findings(rec, sync, unmatched):
     if redo - said:
         late.append({"code": "not_retimed", "tracks": sorted(redo - said), "result": rm.get("result"), "block": plan.get("block")})
     if not flags_off:
-        late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"]} for p, r in sorted(sync.items())
-                 if (r.get("timing") or {}).get("fix")]
+        late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"], **({"kept": r["timing"]["kept"]} if r["timing"].get("kept") else {})}
+                 for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
         late += [{"code": "check_flash", "track": p, "median": f["median"]} for p, f in sorted((rec.get("flash") or {}).items())]
     far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) if k not in live for w in rows if id(w) in cli.sweep_alerts(rows)]
     if far:

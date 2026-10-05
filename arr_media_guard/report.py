@@ -19,7 +19,7 @@ LINK_TEXT = re.compile(r"([\\*_~`|\[\]])")   # the characters escaped in the tex
 SPAN = re.compile(f"{L}([^{M}]*){M}([^{R}]*){R}|{MARKDOWN.pattern}")   # a link span, or one markdown character, see escaped()
 # a bold span or a link span, which never breaks, or the space after a sentence
 SENTENCE_END = re.compile(f"{B}[^{E}]*{E}|{L}[^{R}]*{R}|(?<=[.!?])[ \n]+(?=[A-Z\"{B}{L}])")
-GLUE = "\x04"   # a space after a full stop inside a fact, as in the name "PJ Robot Vs. Romeo". markdown() never breaks a line there.
+GLUE = "\x04"   # a space after a full stop inside a fact, as in the name "Robo Vs. Dr. Bolt". markdown() never breaks a line there.
 
 
 def tense_of(rec):
@@ -111,9 +111,28 @@ def lang_word(code):
     return "" if code is None or code in decide.UNTAGGED else decide.lang_name(code)
 
 
-def track_langs(rec):
-    """{place: language} of the tracks of rec, by their place before any remux. The subtitle sentences name those places."""
-    return {x["i"]: x["lang"] for x in (rec.get("subremux") or {}).get("tracks_before") or rec.get("tracks") or []}
+class Langs(dict):
+    """{place: language} of the tracks of a run, by their place before its remux, see track_langs(). gone holds the
+    subtitle places the remux took out."""
+    gone = frozenset()
+
+
+def track_langs(rec, after=False):
+    """{place: language} of the tracks of rec, by their place before any remux. The subtitle sentences name those places.
+    With after, a post names each track by its place in the file after the run instead, see number()."""
+    langs, rm = Langs({x["i"]: x["lang"] for x in (rec.get("subremux") or {}).get("tracks_before") or rec.get("tracks") or []}), rec.get("subremux") or {}
+    if after and rm.get("done"):
+        langs.gone = frozenset([*(rm.get("removed") or []), *(rm.get("stripped") or {})])
+    return langs
+
+
+def number(p, langs):
+    """The number of the subtitle at place p before the remux: "2", or with the gone of langs its number in the file after
+    the run. A track the remux took out is "2 of the original file"."""
+    gone = getattr(langs, "gone", ())
+    if p in gone:
+        return f"{p[1:]} of the original file"
+    return str(int(p[1:]) - sum(int(g[1:]) < int(p[1:]) for g in gone))
 
 
 def sub_name(p, langs):
@@ -121,15 +140,15 @@ def sub_name(p, langs):
     if not re.fullmatch(r"s\d+", p):
         return f"the subtitles in {bold(p)}"
     word = lang_word(langs.get(p))
-    return "the " + bold(f'{word + " " if word else ""}subtitles (track {p[1:]})')
+    return "the " + bold(f'{word + " " if word else ""}subtitles (track {number(p, langs)})')
 
 
 def subs_name(ps, langs):
     """Subtitles as one subject: "subtitle tracks 1 and 2 (English)" for tracks of one language."""
     words = {lang_word(langs.get(p)) for p in ps}
-    if len(ps) > 1 and len(words) == 1 and all(re.fullmatch(r"s\d+", p) for p in ps):
+    if len(ps) > 1 and len(words) == 1 and all(re.fullmatch(r"s\d+", p) and p not in getattr(langs, "gone", ()) for p in ps):
         word = words.pop()
-        return bold(f"subtitle tracks {and_list(p[1:] for p in ps)}" + (f" ({word})" if word else ""))
+        return bold(f"subtitle tracks {and_list(number(p, langs) for p in ps)}" + (f" ({word})" if word else ""))
     return and_list(sub_name(p, langs) for p in ps)
 
 
@@ -324,8 +343,18 @@ def posts(f, rec=None):
     if f["kind"] == "duration":
         return ((rec or {}).get("header_repair") or {}).get("code") not in config.REPAIRED and not any(x["kind"] in COVERS_LENGTH for x in found)
     if "lines" in f:
-        return any(x["code"] not in LOGGED_LINES and not (x["code"] in ("sidecar", "converted_sidecar") and x.get("kept")) for x in f["lines"])
+        return not all(map(logged, f["lines"]))
     return True
+
+
+def logged(x):
+    """Whether the subtitle sentence x says the program fixed its subtitle, see LOGGED_LINES. A moved sidecar counts."""
+    return x["code"] in LOGGED_LINES or (x["code"] in ("sidecar", "converted_sidecar") and bool(x.get("kept")))
+
+
+def fixes(f):
+    """Whether finding f holds a fix the program made: an action of fixed(), or a subtitle sentence of logged()."""
+    return fixed(f["action"]) if f.get("action") else any(map(logged, f.get("lines") or []))
 
 
 def texts(f, t, langs=None, marked=False):
@@ -338,7 +367,12 @@ def texts(f, t, langs=None, marked=False):
         text, act = FINDINGS[f["kind"]][1](dict(f, langs=langs or {}), t), restored(a, ACTIONS[a["code"]][1](a, t)) if a else None
         return (text, act) if marked else (unmarked(text), act and unmarked(act))
     except Exception as ex:
-        return config.mask(f"no text: {type(ex).__name__}: {ex}")[:200], None
+        return config.mask(f"{NO_TEXT}{type(ex).__name__}: {ex}")[:200], None
+
+
+NO_TEXT = "no text: "   # the start of the line of a text that failed, see texts() and changes()
+# What the post of an alert whose text failed says, see alert_embed(). The decision line keeps the error in alerts.
+UNTOLD = "AMG found a problem with this file but could not describe it. The details are in the decision log."
 
 
 # What --apply would do with the subtitle remux a dry run planned, per code of subtitles.remux_block()
@@ -420,7 +454,8 @@ def off_line(x, t):
                 "fix that, so they were left as they are.")
     if x.get("would"):   # a fix of the speech layout that only alerts, see subsync.LAYOUT_FIX
         drift = "" if x["would"]["rate"] == "1/1" else " at the start and drift over time"
-        return f'{name} seem {bold("about " + late_by([x["would"]["offset"]]))}{drift} against the speech. They were left as they are.'
+        but = f', except {x["would"]["kept"]} line{"s" if x["would"]["kept"] > 1 else ""} at the start or end' if x["would"].get("kept") else ""
+        return f'{name} seem {bold("about " + late_by([x["would"]["offset"]]))}{drift} against the speech{but}. They were left as they are.'
     seem = f' seem {bold("about " + late_by([x["unfixed"]]))}{vs}' if x.get("unfixed") is not None else f" are out of sync{vs}"
     return f"{name}{seem}, but no fix lined them up well enough, so they were left as they are."
 
@@ -428,7 +463,8 @@ def off_line(x, t):
 def check_times(x, t):
     """A subtitle whose times need a fix that SUBTITLES check leaves out."""
     fix = x.get("fix")
-    off = (f'are {bold("about " + late_by([fix["offset"]]))}' + ("" if fix["rate"] == "1/1" else " at the start and drift over time")) if fix else "are out of sync"
+    off = (f'are {bold("about " + late_by([fix["offset"]]))}' + ("" if fix["rate"] == "1/1" else " at the start and drift over time")
+           + (f', except {x["kept"]} line{"s" if x["kept"] > 1 else ""} at the start or end' if x.get("kept") else "")) if fix else "are out of sync"
     return f'{cap(sub_name(x["track"], x["langs"]))} {off}. SUBTITLES is set to check, so they were left as they are.'
 
 
@@ -548,14 +584,139 @@ def alert_embed(rec, f, t):
     and the footer with the host. A language or content alert names a TMDB failure there, because TMDB's language check
     did not run. When the item has a page in its app, the field shows the item's name as a link to it, on its own line
     above the file. The field name is then blank, because Discord shows no link in a field name. With no link, the field
-    name is the item's name, as before."""
-    (text, act), (head, color) = texts(f, t, track_langs(rec), marked=True), title(f)
+    name is the item's name, as before. A text that failed posts UNTOLD in place of the error."""
+    (text, act), (head, color) = texts(f, t, track_langs(rec, after=True), marked=True), title(f)
+    text = UNTOLD if text.startswith(NO_TEXT) else text
     note = f'{TMDB_SKIPPED[rec["tmdb"]]}, so its language check was skipped' if f["kind"] in ("language", "content") \
         and rec.get("tmdb") in TMDB_SKIPPED else None
+    return item_embed(rec, head, f"{text}\n{act}" if act else text, color, note)
+
+
+def item_embed(rec, head, text, color, note=None):
+    """The embed of one post on the file of rec: its field with the item and the file, see alert_embed(), and the
+    footer with note and the host."""
     shown, file = link(rec["label"], logs.page(rec)), os.path.basename(rec["path"])
     item = (rec["label"], file) if shown == rec["label"] else ("\u200b", f"{shown}\n{file}")   # U+200B, a zero-width space
-    return logs.embed(rec["app"], head, f"{text}\n{act}" if act else text, color, [item],
-                      " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
+    return logs.embed(rec["app"], head, text, color, [item], " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
+
+
+def kept(facts):
+    """The sentence that names where a change kept the original file, with a space before it, or "" when it kept none."""
+    return f' The original file is kept at {facts["kept"]}.' if facts.get("kept") else ""
+
+
+def said(rec):
+    """What the posted alerts of rec say of its changes already, so no change post says it again: "flags", the places
+    after the run of the tracks whose default and forced flags an alert says were turned off, "live", the places of the
+    live captions whose lines an alert says were moved, and "converted", whether a subtitle sentence names the
+    conversion to MKV."""
+    langs, out = track_langs(rec, after=True), {"flags": set(), "live": set(), "converted": False}
+    for f in rec.get("findings") or []:
+        lines = f.get("lines") or []
+        out["converted"] |= any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)
+        if posts(f, rec):
+            out["flags"] |= {n.split(" ")[0] for n in f.get("muted") or []}   # see FINDINGS sublang
+            out["flags"] |= {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")}
+            out["live"] |= {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off")}
+    return out
+
+
+def conversion_change(rec, told):
+    """A conversion to MKV that no subtitle sentence names, see said()."""
+    rp = rec.get("repack") or {}
+    if rp.get("new_size") and not told["converted"]:
+        return "Converted to MKV", f'Converted the {rec.get("container") or "original"} file to MKV. Its video and audio stayed the same.' + kept(rp)
+
+
+# The words of a header repair that replaced the file, per its code, see remux.repack()
+REPAIRS = {"header_repaired": "Repaired the file. Its video, audio and subtitles stayed the same.",
+           "tail_removed": "Removed extra data from the end of the file. Its video, audio and subtitles stayed the same.",
+           "subtitle_trimmed": "Cut the subtitle lines that kept going past the end of the video and audio.",
+           "subtitle_removed": "Removed the subtitles that kept going past the end of the video and audio."}
+
+
+def repair_change(rec, told):
+    """A header repair: its removal and its trim, as one repair may do both, else the words of its code."""
+    hr = rec.get("header_repair") or {}
+    if hr.get("code") in REPAIRS:
+        both = [REPAIRS[c] for c, k in (("subtitle_removed", "removed"), ("subtitle_trimmed", "trimmed")) if hr.get(k)]
+        return "File repaired", " ".join(both or [REPAIRS[hr["code"]]]) + kept(hr)
+
+
+def retime_change(rec, told):
+    """The subtitles whose times the run of rec changed, one sentence or two each: a shift of the whole track, lines
+    moved to their speech, and ends made longer. A track counts when the remux ran, a sidecar when it was rewritten. A
+    partial shift says how many lines kept their times. Live captions whose alert says so already are left out."""
+    rm, langs = rec.get("subremux") or {}, track_langs(rec, after=True)
+    timing = {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}
+    sides = [e["name"] for e in rec.get("sidecars") or [] if e.get("result") == "retimed"]
+    done = rm if rm.get("done") else {}
+    shift, moved, ended = (list(done.get(k) or []) + sides for k in ("fixed", "timed", "ended"))
+    moved = [k for k in moved if k not in told["live"]]
+    out = []
+    for k in dict.fromkeys(shift + moved + ended):
+        name, line = cap(sub_name(k, langs)), []
+        fit = ((timing.get(k) or {}).get("timing") or {}) if k in shift else {}
+        fix, b = fit.get("fix"), (rec.get("blocks") or {}).get(k) if k in moved else None
+        f = (rec.get("flash") or {}).get(k) if k in ended else None
+        if fix:
+            drift = "" if fix["rate"] == "1/1" else " at the start and drifted over time"
+            line.append(f'{name} were {bold("about " + late_by([fix["offset"]]))}{drift}. Retimed them to match the speech.')
+            if fit.get("kept"):   # a partial shift, see subsync.layout_fix()
+                line.append(f'Kept the times of {fit["kept"]} line{"s" if fit["kept"] > 1 else ""} at the start or end.')
+        if b:
+            n = b["live"]["moved"] if b.get("live") else sum(x["cues"] for x in b.get("blocks") or [])
+            line.append(f'Moved {bold(f"{n} line" + ("" if n == 1 else "s"))} of {sub_name(k, langs)} to their speech.')
+        if f and f.get("lengthened"):
+            line.append(f'{name} flashed by too fast to read. Made {f["lengthened"]} of their lines stay on screen longer.')
+        out += line or [f"Retimed {sub_name(k, langs)} to match the speech."]
+    if out:
+        return "Subtitles retimed", " ".join(out) + kept(done)
+
+
+def edit_change(rec, told):
+    """The track edit of rec, one sentence per kind: the default flags, the forced flags, and each language tag. The
+    title names the kinds. A flag an alert says was turned off is left out, see said(). Each track goes by its place
+    after the run, as the probe after the edit has it."""
+    if "edited" not in (rec.get("result"), rec.get("edit_result")):
+        return None
+    after = {t["sel"]: t for t in rec.get("after") or []}
+    name = lambda e, lang=True: default_track(f'{after[e[0]]["pos"]} {after[e[0]]["lang"] if lang else "und"}')
+    off = lambda e: decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and not e[1] and after[e[0]]["pos"] in told["flags"]
+    edits, heads, out = [e for e in rec.get("edits") or [] if not off(e)], [], []
+    for prop, word, head in (("flag-default", "default", "default tracks"), (decide.FORCED_FLAG, "forced", "forced flag")):
+        on, no = ([name(e) for e in edits if decide.prop(e) == prop and bool(e[1]) == v] for v in (True, False))
+        parts = [f"on for {and_list(on)}"] * bool(on) + [f"off for {and_list(no)}"] * bool(no)
+        if parts:
+            heads.append(head + ("s" if head == "forced flag" and len(on + no) > 1 else ""))
+            out.append(f'Turned the {word} flag {", and ".join(parts)}.')
+    tags = [e for e in edits if decide.prop(e) == decide.LANG_EDIT]
+    for e in tags:
+        was, now = lang_word(e[2]), lang_word(after[e[0]]["lang"])
+        out.append(f"Wrote the language tag of {name(e)} in its standard form." if was == now else
+                   f"Changed the language of {name(e, False)} from {was} to {bold(now)}." if was else
+                   f"Tagged {name(e, False)} as {bold(now)}.")
+    if tags:
+        heads.append("language tag" + ("s" if len(tags) > 1 else ""))
+    if out:
+        return f"{cap(and_list(heads))} changed", " ".join(out)
+
+
+def changes(rec):
+    """(title, text) of each change the run of rec made to its file that no finding of rec words, for DISCORD_POSTS
+    all: a conversion to MKV, a file repair, retimed subtitles and a track edit. A dry run makes none. A change that a
+    posted alert says already is left out, see said(). A text that fails gives (None, a line that says so), so it
+    posts nothing and the other changes still post."""
+    told, out = said(rec), []
+    for head, step in (("Converted to MKV", conversion_change), ("File repaired", repair_change), ("Subtitles retimed", retime_change),
+                       ("Tracks changed", edit_change)):
+        try:
+            got = step(rec, told)
+        except Exception as ex:
+            got = None, config.mask(f"{NO_TEXT}{head}: {type(ex).__name__}: {ex}")[:200]
+        if got:
+            out.append(got)
+    return out
 
 
 def logfmt(pairs):
@@ -576,6 +737,8 @@ def render(rec, target, tense=None):
     logfmt: its one-line summary for syslog. Loki reads its keys, so they stay. An error line ends with error, its
     result cut to 150 characters.
     embed: one Discord embed per finding.
+    changes: one Discord embed per change to the file, for DISCORD_POSTS all, see changes(). A change whose text
+    failed is the line that says so, in place of its embed.
     cli: the line of a backfill."""
     t = tense or tense_of(rec)
     if t not in TENSES:
@@ -586,15 +749,21 @@ def render(rec, target, tense=None):
         if "findings" in rec:
             out["alerts"] = [alert_line(f, t, track_langs(rec)) for f in rec["findings"]]
         return out
-    if target == "logfmt":   # an error adds its result, and a line with no label names its file or its job
+    if target == "logfmt":   # an error adds its result, a line with no label names its file or its job, and job ties it to its queued line
         label = rec.get("label") or (os.path.basename(rec["path"]) if rec.get("path") else rec.get("job"))
         error = [("error", config.mask(rec.get("result") or "")[:150])] if rec.get("outcome") == "error" else []
         return config.mask(logfmt([("arr", rec.get("app")), ("source", rec.get("source")), ("outcome", rec.get("outcome", "other")),
                                    ("class", rec.get("class")), ("edits", len(rec.get("edits") or [])), ("reasons", ",".join(rec.get("reasons") or [])),
                                    ("alerts", ",".join(rec.get("alert_kinds") or [])), ("tmdb", rec.get("tmdb") or "not_asked"),
-                                   ("label", label), ("id", rec.get("id"))] + error))
+                                   ("label", label), ("id", rec.get("id")), ("job", rec.get("job"))] + error))
     if target == "embed":
         return [alert_embed(rec, f, t) for f in rec.get("findings") or []]
+    if target == "changes":   # the fixes that the issue gate logs only keep their alert's words and color. A text that failed is its line.
+        found = rec.get("findings") or []
+        gone = any((f.get("action") or {}).get("code") in DELETED for f in found)   # the file is gone: only its re-grab posts
+        fix = lambda f: text if (text := texts(f, t, track_langs(rec, after=True))[0]).startswith(NO_TEXT) else alert_embed(rec, f, t)
+        return [fix(f) for f in found if fixes(f) and not posts(f, rec) and (f.get("action") or not gone)] + \
+            ([] if gone else [item_embed(rec, head, text, "green") if head else text for head, text in changes(rec)])
     if target == "cli":
         return cli_line(rec, t)
     raise ValueError(f"no target {target}")
@@ -663,7 +832,7 @@ def sub_time_report(rec, t):
     for p, r in [*(rec.get("subcheck") or {}).items(), *(rec.get("subtime") or {}).items()]:
         x, info = r.get("timing") or {}, tracks.get(p) or {}
         fix = x.get("fix")
-        when = f'{fix["offset"]:+.2f} s {fix["rate"]}' if fix else "in time" if x.get("why") == "in time" else "-"
+        when = (f'{fix["offset"]:+.2f} s {fix["rate"]}' + (f', {x["kept"]} lines kept' if x.get("kept") else "")) if fix else "in time" if x.get("why") == "in time" else "-"
         if p in done:
             act = f'sidecar {done[p]["result"]}' + (f': {done[p]["left"]}' if done[p].get("left") else "")
         elif p in (rm.get("remove") or []) or p in (rm.get("fixed") or []) or p in (rm.get("timed") or []):

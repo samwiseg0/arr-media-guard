@@ -20,13 +20,18 @@ test files assert codes and fields, so a reworded template changes this file onl
 Run: pytest tests/test_report.py
 """
 import ast
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import types
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -35,6 +40,7 @@ import amg
 os.environ["ARR_MEDIA_GUARD_ENV"] = "/nonexistent/arr-media-guard.env"
 h = amg.load("arr_media_guard_report")
 h.CFG = dataclasses.replace(h.CFG, instance="host1", name="arr-media-guard")
+HOOK = "https://discord.example/api/webhooks/1/t0ken-0123456789"   # a made-up webhook
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SILENT = "the audio is silent at all 3 places checked"
@@ -54,9 +60,9 @@ FINDINGS = [
     ({"kind": "episode", "imported": [["S04E15", "Ship Voyage"]], "said": "the release's NFO", "title": "Squidtastic Voyage/That's No Lady",
       "names": "S04E23 and S04E27"}, "Maybe the wrong episode", "amber",
      "Imported as S04E15 \"Ship Voyage\". The release's NFO calls it \"Squidtastic Voyage/That's No Lady\", which is S04E23 and S04E27."),
-    ({"kind": "episode", "imported": [["S01E02", "Sleepover"]], "said": "the release name", "title": "Anxious Times at Clone High",
+    ({"kind": "episode", "imported": [["S01E02", "Overnight"]], "said": "the release name", "title": "Anxious Times at Show Alpha",
       "names": "S01E03"}, "Maybe the wrong episode", "amber",
-     "Imported as S01E02 \"Sleepover\". The release name calls it \"Anxious Times at Clone High\", which is S01E03."),
+     "Imported as S01E02 \"Overnight\". The release name calls it \"Anxious Times at Show Alpha\", which is S01E03."),
     ({"kind": "episode", "imported": [["S01E05", None], ["S01E06", "Two"]], "said": "the file name", "title": "Three", "names": "S01E07"},
      "Maybe the wrong episode", "amber", "Imported as S01E05 and S01E06 \"Two\". The file name calls it \"Three\", which is S01E07."),
     ({"kind": "content", "signals": ["the audio is Portuguese, but it should be English",
@@ -422,8 +428,8 @@ def test_the_log_target_is_the_decision_line(monkeypatch):
 def test_the_logfmt_target_keeps_every_key():
     """Loki reads these keys with the syslog tag NAME, so they stay."""
     assert h.render(decision(), "logfmt") == ('arr=radarr source=hook outcome=edited class="English original: audio switched" edits=1 reasons=kids_dub '
-                                             'alerts=language,audio tmdb=found label="Film A (1979)" id=65ab6056ca69')
-    assert h.render({}, "logfmt") == 'arr="" source="" outcome=other class="" edits=0 reasons="" alerts="" tmdb=not_asked label="" id=""'
+                                             'alerts=language,audio tmdb=found label="Film A (1979)" id=65ab6056ca69 job=""')
+    assert h.render({}, "logfmt") == 'arr="" source="" outcome=other class="" edits=0 reasons="" alerts="" tmdb=not_asked label="" id="" job=""'
 
 
 def test_a_job_error_names_its_error_and_its_job_in_the_logfmt_line():
@@ -431,9 +437,9 @@ def test_a_job_error_names_its_error_and_its_job_in_the_logfmt_line():
     syslog line keeps its keys in their order, takes the job file as the label, and ends with the error."""
     rec = {"source": "hook", "job": "1790904088348071068-813305.json", "outcome": "error", "result": "error: OperationalError: disk I/O error"}
     assert h.render(rec, "logfmt") == ('arr="" source=hook outcome=error class="" edits=0 reasons="" alerts="" tmdb=not_asked '
-                                       'label=1790904088348071068-813305.json id="" error="error: OperationalError: disk I/O error"')
+                                       'label=1790904088348071068-813305.json id="" job=1790904088348071068-813305.json error="error: OperationalError: disk I/O error"')
     rec = dict(rec, path="/tv/Show/Season 1/Show - s01e01.mkv", result="error: " + "x" * 300)
-    assert h.render(rec, "logfmt").endswith(f'label="Show - s01e01.mkv" id="" error="error: {"x" * 143}"')
+    assert h.render(rec, "logfmt").endswith(f'label="Show - s01e01.mkv" id="" job=1790904088348071068-813305.json error="error: {"x" * 143}"')
     assert "error=" not in h.render(decision(), "logfmt")
 
 
@@ -497,6 +503,236 @@ DOUBT = {"kind": "audio", "doubts": ["the audio fails to play at 1 of 3 places c
 LANGUAGE, RUNTIME, EPISODE, CONTENT = (FINDINGS[i][0] for i in (0, 2, 4, 7))
 
 
+# A run that made every kind of change: a conversion, a file repair, a subtitle remux that retimed two tracks and
+# removed the first, and a track edit. Made-up facts, as process.py records them. The remux took out s1, so the posts
+# name s2 as track 1 and s3 as track 2, the places of the file after the run.
+CHANGED = dict(
+    outcome="edited", result="edited", container="MP4/QuickTime",
+    repack={"new_size": 9, "kept": "/k/Film A.mp4"}, header_repair={"code": "tail_removed", "removed": {}},
+    subremux={"done": True, "fixed": ["s2"], "timed": ["s3"], "ended": ["s2"], "removed": ["s1"], "kept": "/k/Film A.mkv",
+              "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}, {"i": "s3", "lang": "spa"}]},
+    subcheck={"s2": {"verdict": "match", "timing": {"fix": {"offset": 2.5, "rate": "1/1"}}}},
+    blocks={"s3": {"blocks": [{"cues": 12}, {"cues": 3}]}}, flash={"s2": {"lengthened": 40, "cues": 300, "median": 0.5}},
+    edits=[["track:=1", 1, 0], ["track:=2", 0, 1], ["track:=3", 1, 0], ["track:=5", 0, 1, "flag-forced"], ["track:=1", "jpn", "und", "language"]],
+    after=[{"sel": "track:=1", "pos": "a1", "lang": "jpn", "default": True}, {"sel": "track:=2", "pos": "a2", "lang": "eng", "default": False},
+           {"sel": "track:=3", "pos": "s1", "lang": "eng", "default": True}, {"sel": "track:=5", "pos": "s2", "lang": "spa", "default": False}],
+    findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "kept": "/k/Film A.mkv"}]}])
+CHANGE_POSTS = [  # (title, color, description) of each post of CHANGED with DISCORD_POSTS all
+    ("Wrong subtitles", "amber", "The **French subtitles (track 1 of the original file)** don't match what's said in the audio. Removed them and "
+     "kept the original file at /k/Film A.mkv."),
+    ("Converted to MKV", "green", "Converted the MP4/QuickTime file to MKV.\nIts video and audio stayed the same.\nThe original file is kept "
+     "at /k/Film A.mp4."),
+    ("File repaired", "green", "Removed extra data from the end of the file. Its video, audio and subtitles stayed the same."),
+    ("Subtitles retimed", "green", "The **English subtitles (track 1)** were **about 2.5 s late**.\nRetimed them to match the speech.\nThe "
+     "**English subtitles (track 1)** flashed by too fast to read.\nMade 40 of their lines stay on screen longer.\nMoved **15 lines** of the "
+     "**Spanish subtitles (track 2)** to their speech.\nThe original file is kept at /k/Film A.mkv."),
+    ("Default tracks, forced flag and language tag changed", "green", "Turned the default flag on for the **Japanese audio (track 1)** and "
+     "the **English subtitles (track 1)**, and off for the **English audio (track 2)**.\nTurned the forced flag off for the **Spanish "
+     "subtitles (track 2)**.\nTagged the **audio (track 1)** as **Japanese**.")]
+REGRAB = dict(CONTENT, action={"code": "regrabbed", "name": "Radarr", "kind": "content", "n": 1})
+
+
+def changed(**kw):
+    """alert_findings() of the record CHANGED with kw, and the record."""
+    rec = decision(**dict(CHANGED, **kw))
+    return h.alert_findings(rec, 1), rec
+
+
+def described(sent):
+    return [(e["title"], e["description"]) for e in sent]
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    """The embeds that post() would send. No marker of an earlier post stops one."""
+    out = []
+    monkeypatch.setattr(h, "post", lambda app, emb: out.append(emb) or "sent")
+    monkeypatch.setattr(h.store, "add", lambda *a: True)
+    return out
+
+
+def test_discord_posts_issues_posts_nothing_for_a_change(sent):
+    """The default, issues: a run that changed its file in every way and fixed its problems posts nothing."""
+    assert h.CFG.discord_posts == "issues"
+    got, rec = changed()
+    assert got == ["log only"] and sent == [] and "change_result" not in rec
+
+
+def test_discord_posts_all_posts_one_per_change_and_nothing_for_no_change(sent, settings):
+    """all: one post for each change, in the words of the issue posts. A fix that the issue gate logs only keeps its
+    alert. A change no finding words posts in green. Every post names a track by its place in the file after the run.
+    A clean check, a dry run and an issue alone post no change."""
+    settings(discord_posts="all")
+    got, rec = changed()
+    assert got == ["log only"] and rec["change_result"] == ["sent"] * len(CHANGE_POSTS)
+    assert [(e["title"], e["color"], e["description"]) for e in sent] == [(t, h.COLORS[c], d) for t, c, d in CHANGE_POSTS]
+    assert all(e["fields"] == [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}] for e in sent)
+    assert h.render(decision(**CHANGED), "log")["alerts"][0].startswith("submatch: The French subtitles (track 1) don't match")   # the log keeps the places the check saw
+    sent.clear()
+    clean = decision(outcome="no_change", result="no change", edits=[], findings=[DOUBT])
+    assert h.alert_findings(clean, 1) == ["sent"] and clean["change_result"] == [] and [e["title"] for e in sent] == ["Audio may be broken"]
+    sent.clear()
+    dry = decision(**dict(CHANGED, apply=False, outcome="dry_run", result="dry run", repack={}, header_repair={"code": "would_repair_header"},
+                          subremux=dict(CHANGED["subremux"], done=False, removed=[]), findings=[]))
+    assert h.alert_findings(dry, 1) == [] and dry["change_result"] == [] and sent == []
+
+
+def test_after_a_re_grab_only_the_re_grab_posts(sent, settings):
+    """The re-grab deleted the file, so its other changes are gone too. issues mode logs the re-grab only."""
+    settings(discord_posts="all")
+    got, rec = changed(outcome="wrong_content", result="wrong content: x", edit_result="edited", findings=[REGRAB, LANGUAGE, *CHANGED["findings"]])
+    assert got == ["log only"] * 3 and [e["title"] for e in sent] == ["Wrong content, re-grabbed"] and rec["change_result"] == ["sent"]
+    sent.clear()
+    got, rec = changed(findings=[dict(REGRAB, action={"code": "deleted"})])   # the issue alert says it, and no change posts
+    assert got == ["sent"] and rec["change_result"] == [] and [e["title"] for e in sent] == ["Wrong content"]
+
+
+LIVE = {"code": "live", "track": "s3", "lag": 4.0, "moved": 900, "cues": 1200, "left": 300, "flags_off": True}
+
+
+@pytest.mark.parametrize("kw, want", [
+    ({"subremux": dict(CHANGED["subremux"], fixed=[], ended=[]), "blocks": {"s3": {"blocks": [{"cues": 900}], "live": {"moved": 900}}},
+      "edits": [], "findings": [{"kind": "subtiming", "lines": [LIVE]}]}, ["Subtitles out of sync"]),
+    ({"subremux": {}, "edits": [["track:=5", 0, 1], ["track:=5", 0, 1, "flag-forced"]],
+      "findings": [{"kind": "submatch", "lines": [dict(STAYS, track="s2")]}]}, ["Wrong subtitles"]),
+    ({"subremux": {}, "edits": [["track:=5", 0, 1], ["track:=1", 1, 0]],
+      "findings": [{"kind": "sublang", "mismatch": ["subtitle track 2 is tagged Spanish, but its text reads as Romanian"],
+                    "muted": ["s2 loses its default and forced flags, because x"]}]}, ["Subtitle language may be wrong", "Default tracks changed"]),
+    ({"subremux": {}, "edits": [], "repack": CHANGED["repack"],
+      "findings": [{"kind": "submatch", "lines": [{"code": "converted_track", "track": "s2", "why": "x", "kept": "/k/F.avi"}]}]}, ["Wrong subtitles"])])
+def test_a_fix_an_alert_says_posts_once(sent, settings, kw, want):
+    """A live caption alert says which lines moved, a stays or a language alert says which flags went off, and a track
+    a conversion left out names the conversion. Their change posts would say it twice."""
+    settings(discord_posts="all")
+    changed(**dict(dict(repack={}, header_repair={}), **kw))
+    assert [e["title"] for e in sent] == want, described(sent)
+
+
+def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
+    """A fix of the speech layout that moves only the lines that agree with it, see subsync.layout_fix()."""
+    rec = decision(edits=[], findings=[], subremux={"done": True, "fixed": ["s3"], "kept": "/k/F.mkv", "tracks_before": [{"i": "s3", "lang": "fre"}]},
+                   subtime={"s3": {"verdict": "fit", "timing": {"fix": {"offset": 4.2, "rate": "1/1"}, "keep": [[0.0, 50.0, 6]], "kept": 6}}})
+    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [("Subtitles retimed", (
+        "The **French subtitles (track 3)** were **about 4.2 s late**.\nRetimed them to match the speech.\nKept the times of 6 lines at the start "
+        "or end.\nThe original file is kept at /k/F.mkv."))]
+
+
+@pytest.mark.parametrize("edits, after, want", [
+    ([["track:=2", "spa", "eng", "language"], ["track:=2", "spa", "en-US", "language-ietf"]], "spa",
+     ("Language tag changed", "Changed the language of the **audio (track 1)** from English to **Spanish**.")),
+    ([["track:=2", "en-US", "eng", "language"]], "eng", ("Language tag changed", "Wrote the language tag of the **English audio (track 1)** in its "
+                                                                             "standard form.")),
+    ([["track:=2", 0, 1, "flag-forced"], ["track:=4", 0, 1, "flag-forced"]], "eng",
+     ("Forced flags changed", "Turned the forced flag off for the **English audio (track 1)** and the **English subtitles (track 1)**."))])
+def test_a_track_edit_says_each_kind_it_made_and_only_those(edits, after, want):
+    """A language tag edit alone is no change of the default tracks. The title follows the kinds of edit."""
+    rec = decision(edits=edits, findings=[], after=[{"sel": "track:=2", "pos": "a1", "lang": after, "default": True},
+                                                    {"sel": "track:=4", "pos": "s1", "lang": "eng", "default": False}])
+    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [want]
+
+
+def test_a_repair_that_removes_and_trims_says_both():
+    rec = decision(edits=[], findings=[], header_repair={"code": "subtitle_removed", "removed": {"4": {}}, "trimmed": {"3": 4}})
+    assert h.changes(rec) == [("File repaired", "Removed the subtitles that kept going past the end of the video and audio. Cut the subtitle "
+                                                "lines that kept going past the end of the video and audio.")]
+
+
+def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings):
+    """The change posts follow the voice of the issue posts. A broken fact costs only its own change: it posts nothing,
+    its line in change_result says why, and the other changes still post. It never costs the decision line."""
+    settings(discord_posts="all")
+    said = [h.unmarked(t + " " + x) for t, x in h.changes(decision(**CHANGED))] + [h.unmarked(t + " " + x) for t, x in h.REPAIRS.items()]
+    assert not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)] and not [s for s in said if INSTRUCTION.search(s)]
+    got, rec = changed(blocks={"s3": {"blocks": [{}]}})
+    assert rec["change_result"] == ["sent"] * 3 + ["no text: Subtitles retimed: KeyError: 'cues'", "sent"]
+    assert described(sent) == [(t, d) for t, c, d in CHANGE_POSTS if t != "Subtitles retimed"]
+    sent.clear()
+    got, rec = changed(findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x"}]}])   # no kept
+    assert rec["change_result"][0] == "no text: KeyError: 'kept'" and "Wrong subtitles" not in [e["title"] for e in sent] and len(sent) == 4
+
+
+def test_an_alert_whose_text_fails_posts_a_plain_sentence(sent):
+    """Owner 2026-10-05: the problem still posts, with its title and its file, and the decision line keeps the error."""
+    rec = decision(findings=[{"kind": "runtime", "listed": 62}])   # no runs
+    assert h.alert_findings(rec, 1) == ["sent"]
+    (e,) = sent
+    assert (e["title"], e["description"], e["fields"]) == ("Wrong runtime", h.UNTOLD, [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}])
+    assert "AMG" in e["description"] and not re.search(r"\w+(Error|Exception)\b|no text", e["description"])
+    assert h.render(rec, "log")["alerts"] == ["runtime: no text: KeyError: 'runs'"]
+
+
+@pytest.mark.parametrize("tries, wait, want, calls_n, sleeps_n", [
+    (3, 0.5, "sent", 4, 3), (4, 0.5, "failed: Discord asked for no posts for 0.5 s", 4, 3),
+    (1, 3600, "failed: Discord asked for no posts for 3600 s", 1, 0)])
+def test_a_post_waits_out_each_429_up_to_its_tries(monkeypatch, settings, tries, wait, want, calls_n, sleeps_n):
+    """Several job processes may post at once, as for a season pack. Each 429 waits Discord's retry_after. A wait over
+    POST_WAIT, or the last try, gives up, and the later posts of the process skip with no request until that time."""
+    settings(discord_webhook=HOOK)
+    calls, sleeps, clock = [], [], [100.0]
+    def http(url, method="GET", body=None, headers=None, timeout=15):
+        calls.append(url)
+        if len(calls) <= tries:
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, io.BytesIO(json.dumps({"retry_after": wait}).encode()))
+    monkeypatch.setattr(h, "http", http)
+    monkeypatch.setattr(h, "QUIET_UNTIL", 0.0)
+    monkeypatch.setattr(h.time, "sleep", sleeps.append)
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock[0])
+    assert h.post("radarr", {"title": "x"}) == want and len(calls) == calls_n and sleeps == [wait] * sleeps_n
+    if want == "sent":
+        return
+    assert h.post("radarr", {"title": "y"}) == f"skipped, Discord asked for no posts for {wait:.0f} s more" and len(calls) == calls_n
+    clock[0] += wait
+    assert h.post("radarr", {"title": "z"}) == "sent" and len(calls) == calls_n + 1
+
+
+def test_an_overrun_alert_after_a_strip_names_the_track_that_runs_over():
+    """The remux took out the garbled French track s1, and the English PGS track that runs past the end moved up to s1.
+    faults() maps it back past both a removal and a strip, so the alert names the English track by its place after the
+    run."""
+    rec = decision(edits=[], findings=[], header_repair={"code": "subtitle_overrun_unfixable"},
+                   subremux={"done": True, "removed": [], "stripped": {"s1": "Film A.fre.srt"}, "kept": "/k/A.mkv",
+                             "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}]})
+    hp = {"issue": ["a subtitle runs past the end"], "unfixable": [{"track": "s1", "codec": "S_HDMV/PGS", "end": 7300.0, "streams": 6000.0}]}
+    ctx = types.SimpleNamespace(rec=rec, d={}, hp=hp, vpre=None, damaged=None, unconverted=None, tags=None, mode="sub_time")
+    h.faults(ctx)
+    assert ctx.rest[0]["tracks"][0]["track"] == "s2"
+    assert h.render(dict(rec, findings=ctx.rest), "embed")[0]["description"].startswith("The **English subtitles (track 1)** keep going until")
+
+
+@pytest.mark.parametrize("answer, ok, line", [
+    (204, True, "Discord took the test message: HTTP 204."),
+    (urllib.error.HTTPError(HOOK, 404, "Not Found", {}, io.BytesIO(b'{"message": "Unknown Webhook", "code": 10015}')), False,
+     "Discord refused the test message: HTTP 404 Not Found. Unknown Webhook (code 10015)."),
+    (urllib.error.HTTPError(HOOK, 404, "Not Found", {}, io.BytesIO(b"Cannot POST /api/webhooks/1/t0ken-0123456789")), False,
+     "Discord refused the test message: HTTP 404 Not Found."),
+    (ValueError(f"unknown url type: {HOOK}"), False, "The test message failed: ValueError: unknown url type: <DISCORD_WEBHOOK>"),
+    (ValueError(f"URL can't contain control characters. {'https://discord.example/api/webhooks/2/t0ken-x' + chr(10)!r}"), False,
+     "The test message failed: ValueError: URL can't contain control characters. 'https://discord.example/api/webhooks/<hidden>'"),
+    (None, False, "DISCORD_WEBHOOK is not set, so no test message was sent.")])
+def test_the_discord_test_posts_one_message_and_prints_the_answer(monkeypatch, settings, capsys, answer, ok, line):
+    """--test-discord posts one message and prints Discord's HTTP status. A refusal or an error prints the reason with the
+    webhook masked and exits 1. A body that is not Discord's JSON may echo the path, so it is left out. With no webhook
+    it posts nothing and exits 1."""
+    settings(discord_webhook="" if answer is None else HOOK)
+    calls = []
+
+    def urlopen(req, timeout):
+        calls.append(json.loads(req.data))
+        if isinstance(answer, Exception):
+            raise answer
+        return contextlib.nullcontext(types.SimpleNamespace(status=answer))
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    if ok:
+        h.main(["--test-discord"])
+        assert capsys.readouterr().out == line + "\n"
+    else:
+        with pytest.raises(SystemExit) as ex:
+            h.main(["--test-discord"])
+        assert str(ex.value) == line and ex.value.code != 0 and "t0ken" not in str(ex.value)
+    assert calls == ([] if answer is None else [{"username": "arr-media-guard", "content": "Test message from arr-media-guard on host1.",
+                                                 "allowed_mentions": {"parse": []}}])
+
+
 @pytest.mark.parametrize("findings, want", [
     ([{"kind": "video", "certain": "x", "action": REGRABBED}, DOUBT], ["log only", "log only"]),   # hd, Outlander S05E08
     ([{"kind": "video", "certain": "x", "action": dict(REGRABBED, code="deleted")}, DOUBT, LANGUAGE], ["sent", "log only", "log only"]),
@@ -543,13 +779,13 @@ def test_a_wrong_length_posts_once_and_only_when_no_repair_ran(monkeypatch, code
 def test_an_embed_bolds_the_names_and_escapes_their_markdown():
     """The embed bolds the episode titles and the track names. A markdown character in a name is escaped, so it never
     breaks the bold. The decision line and the CLI stay plain."""
-    f = {"kind": "episode", "imported": [["S01E02", "Sleep*over_"]], "said": "the release name", "title": "Anxious ~Times~ at `Clone` | High\\",
+    f = {"kind": "episode", "imported": [["S01E02", "Over*night_"]], "said": "the release name", "title": "Anxious ~Times~ at `Show` | Alpha\\",
          "names": "S01E03"}
     (e,) = h.render(decision(findings=[f]), "embed")
-    assert e["description"] == ('Imported as S01E02 **"Sleep\\*over\\_"**. The release name calls it **"Anxious \\~Times\\~ at \\`Clone\\` '
-                                '\\| High\\\\"**, which is S01E03.')
-    assert h.render(decision(findings=[f]), "log")["alerts"] == ['episode: Imported as S01E02 "Sleep*over_". The release name calls it '
-                                                                 '"Anxious ~Times~ at `Clone` | High\\", which is S01E03.']
+    assert e["description"] == ('Imported as S01E02 **"Over\\*night\\_"**. The release name calls it **"Anxious \\~Times\\~ at \\`Show\\` '
+                                '\\| Alpha\\\\"**, which is S01E03.')
+    assert h.render(decision(findings=[f]), "log")["alerts"] == ['episode: Imported as S01E02 "Over*night_". The release name calls it '
+                                                                 '"Anxious ~Times~ at `Show` | Alpha\\", which is S01E03.']
     lines = [{"code": "check_times", "track": "s1", "why": "x", "fix": {"offset": 139.06, "rate": "1/1"}}, {"code": "removed", "track": "s2",
              "why": "x", "kept": "/k/F_1.mkv"}]
     (e,) = h.render(decision(findings=[{"kind": "subtiming", "lines": lines}], tracks=[{"i": "s1", "lang": "eng"}, {"i": "s2", "lang": "spa"}]), "embed")
@@ -559,46 +795,46 @@ def test_an_embed_bolds_the_names_and_escapes_their_markdown():
 
 
 def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
-    """hd record 43: the file name in an edit error holds "PJ Robot Vs. Romeo", and the label of another show holds
+    """A library record: the file name in an edit error holds "KS Rover Vs. Moped", and the label of another show holds
     markdown. The embed breaks no line inside a fact, and escapes the markdown of the field too. The decision line
     keeps its plain text."""
-    f = {"kind": "edit", "error": "mkvpropedit failed: Error: The file 'PJ Robot Vs. Romeo.mkv' is not a Matroska file.", "unread": None,
+    f = {"kind": "edit", "error": "mkvpropedit failed: Error: The file 'KS Rover Vs. Moped.mkv' is not a Matroska file.", "unread": None,
          "on": ["a1 eng"]}
     rec = decision(findings=[f], label="M*A*S*H S01E01", path="/tv/M_A_S_H.mkv")
     (e,) = h.render(rec, "embed")
-    assert e["description"] == ("Couldn't change which tracks play by default.\nMkvpropedit failed: Error: The file 'PJ Robot Vs. Romeo.mkv' is "
+    assert e["description"] == ("Couldn't change which tracks play by default.\nMkvpropedit failed: Error: The file 'KS Rover Vs. Moped.mkv' is "
                                 "not a Matroska file.\nThe file still opens, and its default tracks are the **English audio (track 1)**.")
     assert e["fields"] == [{"name": "M\\*A\\*S\\*H S01E01", "value": "M\\_A\\_S\\_H.mkv", "inline": False}]
-    assert h.render(rec, "log")["alerts"] == ["edit: Couldn't change which tracks play by default. Mkvpropedit failed: Error: The file 'PJ Robot "
-                                              "Vs. Romeo.mkv' is not a Matroska file. The file still opens, and its default tracks are the "
+    assert h.render(rec, "log")["alerts"] == ["edit: Couldn't change which tracks play by default. Mkvpropedit failed: Error: The file 'KS Rover "
+                                              "Vs. Moped.mkv' is not a Matroska file. The file still opens, and its default tracks are the "
                                               "English audio (track 1)."]
 
 
-CLONE_HIGH = {"kind": "episode", "imported": [["S01E02", "Sleepover"]], "said": "the release name", "title": "Anxious Times at Clone High",
+SHOW_ALPHA = {"kind": "episode", "imported": [["S01E02", "Overnight"]], "said": "the release name", "title": "Anxious Times at Show Alpha",
               "names": "S01E03"}
-CLONE_FILE = "Clone High (2023) - s01e02 - Sleepover - WEBDL-720p.mkv"
-TV, MOVIES = "https://tv.watch-tower.net", "https://movies.watch-tower.net"   # the owner's bases, an https proxy per app
+ALPHA_FILE = "Show Alpha (2023) - s01e02 - Overnight - WEBDL-720p.mkv"
+TV, MOVIES = "https://tv.media-host.test", "https://movies.media-host.test"   # made-up bases, an https proxy per app
 
 
-def clone_high(**kw):
-    return decision(app="sonarr", label="Clone High (2023) S01E02", path=f"/media/{CLONE_FILE}", ids={"slug": "clone-high-2023"},
-                    findings=[CLONE_HIGH], **kw)
+def show_alpha(**kw):
+    return decision(app="sonarr", label="Show Alpha (2023) S01E02", path=f"/media/{ALPHA_FILE}", ids={"slug": "show-alpha-2023"},
+                    findings=[SHOW_ALPHA], **kw)
 
 
-PLAIN_FIELD = [{"name": "Clone High (2023) S01E02", "value": CLONE_FILE, "inline": False}]   # the field with no link
+PLAIN_FIELD = [{"name": "Show Alpha (2023) S01E02", "value": ALPHA_FILE, "inline": False}]   # the field with no link
 
 
 @pytest.mark.parametrize("app, label, slug, finding, base, url", [
-    ("sonarr", "Clone High (2023) S01E02", "clone-high-2023", CLONE_HIGH, TV, f"{TV}/series/clone-high-2023"),
+    ("sonarr", "Show Alpha (2023) S01E02", "show-alpha-2023", SHOW_ALPHA, TV, f"{TV}/series/show-alpha-2023"),
     ("radarr", "Film A (1979)", "90001", {"kind": "language", "want": "English", "has": ["por"]}, MOVIES + "/", f"{MOVIES}/movie/90001")])
 def test_an_alert_links_the_item_to_its_page_in_the_app(settings, app, label, slug, finding, base, url):
     """The owner asked for a link to the item in its app. The field shows the item's name as a link above the file,
     with a blank name, because Discord shows no link in a field name. The decision line, the logfmt line and the CLI
     line stay plain."""
     settings(**{app: {"link": base}})
-    rec = decision(app=app, label=label, path=f"/media/{CLONE_FILE}", ids={"slug": slug}, findings=[finding])
+    rec = decision(app=app, label=label, path=f"/media/{ALPHA_FILE}", ids={"slug": slug}, findings=[finding])
     (e,) = h.render(rec, "embed")
-    assert e["fields"] == [{"name": "​", "value": f"[{label}]({url})\n{CLONE_FILE}", "inline": False}]
+    assert e["fields"] == [{"name": "​", "value": f"[{label}]({url})\n{ALPHA_FILE}", "inline": False}]
     plain = json.dumps(h.render(rec, "log")["alerts"]) + h.render(rec, "logfmt") + h.render(rec, "cli")
     assert "](" not in plain and "http" not in plain
 
@@ -607,13 +843,13 @@ def test_an_empty_link_setting_gives_no_link_whatever_the_app_url(settings):
     """Owner: the connection URL may not be the address a browser opens, as behind a reverse proxy or in Docker. So
     only <KEY>_LINK makes a link."""
     settings(sonarr={"url": TV, "link": ""})
-    assert h.render(clone_high(), "embed")[0]["fields"] == PLAIN_FIELD
+    assert h.render(show_alpha(), "embed")[0]["fields"] == PLAIN_FIELD
 
 
 @pytest.mark.parametrize("base, url", [
-    ("http://admin:pa55-0123456789@sonarr.lan:8989/base/?apikey=k3y-0123456789#top", "http://sonarr.lan:8989/base/series/clone-high-2023"),
-    ("http://[FE80::1]:8989", "http://[fe80::1]:8989/series/clone-high-2023"),
-    ("https://TV.watch-tower.net/a b(1)", "https://tv.watch-tower.net/a%20b%281%29/series/clone-high-2023"),
+    ("http://admin:pa55-0123456789@sonarr.lan:8989/base/?apikey=k3y-0123456789#top", "http://sonarr.lan:8989/base/series/show-alpha-2023"),
+    ("http://[FE80::1]:8989", "http://[fe80::1]:8989/series/show-alpha-2023"),
+    ("https://TV.media-host.test/a b(1)", "https://tv.media-host.test/a%20b%281%29/series/show-alpha-2023"),
     ("sonarr.lan:8989", None), ("ftp://sonarr.lan/", None), ("http://[sonarr", None), ("http://admin@:8989", None),
     ("http://host:99999/", None), ("http://ho)st/", None), ("http://ho st/", None),
     ("http://admin:8989/pa55@sonarr.lan/", None), ("http://admin:pa#55@sonarr.lan/", None), ("http://admin:pa?55@sonarr.lan/", None)])
@@ -622,8 +858,8 @@ def test_a_link_keeps_only_a_clean_host_port_and_path(settings, base, url):
     out of the host part, and such a base gives no link. A host with other characters gives no link. A base that gives no
     link leaves the field as before, and the alert still renders."""
     settings(sonarr={"link": base})
-    (e,) = h.render(clone_high(), "embed")
-    assert e["fields"] == ([{"name": "​", "value": f"[Clone High (2023) S01E02]({url})\n{CLONE_FILE}", "inline": False}] if url else PLAIN_FIELD)
+    (e,) = h.render(show_alpha(), "embed")
+    assert e["fields"] == ([{"name": "​", "value": f"[Show Alpha (2023) S01E02]({url})\n{ALPHA_FILE}", "inline": False}] if url else PLAIN_FIELD)
     assert not [x for x in ("admin", "pa55", "k3y", "apikey", "top") if x in json.dumps(e)]
 
 
@@ -655,11 +891,11 @@ def test_a_title_with_markdown_and_brackets_keeps_its_link_whole(settings):
 
 
 def test_an_edit_error_keeps_its_reason_after_a_long_path():
-    """hd record 44: the path pushed the reason of mkvpropedit past the cut at 150 characters. The path becomes the
+    """A library record: the path pushed the reason of mkvpropedit past the cut at 150 characters. The path becomes the
     file's name, cut as far as needed."""
-    path = "/media-storage/all/tv/tv_req/PJ Masks/Season 3/PJ Masks - s03e51-e52 - Master of the Moat + PJ Robot Vs. Romeo - WEBDL-1080p.mkv"
+    path = "/mnt/media/tv/Kid Show/Season 3/Kid Show - s03e51-e52 - Tower of the Glens + KS Rover Vs. Moped - WEBDL-1080p.mkv"
     got = h.short_error(f"mkvpropedit failed: Error: The file '{path}' is not a Matroska file or it could not be found.", path)
-    assert got == ("mkvpropedit failed: Error: The file 'PJ Masks - s03e51-e52 - Master of the Moat + PJ Robot Vs. Rome…' is not a Matroska "
+    assert got == ("mkvpropedit failed: Error: The file 'Kid Show - s03e51-e52 - Tower of the Glens + KS Rover Vs. Mope…' is not a Matroska "
                    "file or it could not be found.") and len(got) == 150
     assert h.short_error("mkvpropedit failed: x", path) == "mkvpropedit failed: x" and h.short_error("y" * 200, path) == "y" * 150
 

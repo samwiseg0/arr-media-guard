@@ -30,7 +30,7 @@ from fractions import Fraction
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from arr_media_guard import subsync as s  # noqa: E402
+from arr_media_guard import remux, subsync as s  # noqa: E402
 
 NAMES = ["mira", "tobin", "juna", "pell"]   # the names both scripts of one show share
 WORDS = ("garden window bicycle pancake lantern river mountain rocket pillow marble ladder violin carpet thunder biscuit "
@@ -951,15 +951,170 @@ def test_layout_fix_moves_nothing_when_the_parts_sit_at_different_offsets():
     assert t["fix"] is None and t["piecewise"] and s.stepped(t["offsets"]), t
 
 
-@pytest.mark.parametrize("at, step, why", [(385, 8.0, "the last 32 lines line up with the speech better"),
-                                           (15, -6.0, "part 1 of 20 of its lines lines up with the speech +6.00 s from it"), (390, 8.0, None)])
-def test_layout_fix_refuses_a_step_near_an_end_of_the_file(at, step, why):
-    """From cue at on, the lines sit step seconds later. The step lies within the first or last slice, so every slice
-    holds one offset. edges() refuses the fix when the lines at an end line up better elsewhere, or a part of 20 votes
-    elsewhere. A step in the last 10 lines passes every rule, and with LAYOUT_FIX "alert" its fix only alerts."""
+@pytest.mark.parametrize("at, step, unfixed, why", [(385, 8.0, 5.05, "the last 16 lines, which keep their times, line up with the speech +13.05 s"),
+                                                   (15, -6.0, -0.95, "the first 17 lines, which keep their times, line up with the speech +5.05 s"),
+                                                   (390, 8.0, 5.05, "the last 12 lines, which keep their times, line up with the speech +13.05 s")])
+def test_layout_fix_refuses_an_end_off_by_its_own_offset(at, step, unfixed, why):
+    """The track sits 5 s late, and from cue at on step seconds later. The lines at the end the step leaves have no
+    speech start at the fix, so they keep their times. They line up with the speech at their own offset, so nothing
+    moves."""
     cs, speech = moved_to(TALK, offset=5.0, cut=(TALK[at][0], step)), voice(TALK)
     t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
-    assert (t["fix"] is None and "unfixed" in t and why in t["why"]) if why else t["fix"] == {"rate": "1/1", "offset": 5.05}, t
+    assert t["fix"] is None and t["unfixed"] == unfixed and why in t["why"], t
+
+
+def kept_judged(cs, t):
+    """(right lines the fix t moves off, the largest distance of a moved line from TALK, lines kept) of cs, one cue
+    for each cue of TALK. A right line sits within TOLERANCE of TALK."""
+    new = [a if s.kept_at(t.get("keep"), a) else s.moved(a * 1000, t["fix"]) / 1000 for a, _, _ in cs]
+    right = [abs(a - b) <= s.TOLERANCE for (a, _, _), (b, _, _) in zip(cs, TALK)]
+    return (sum(r and abs(n - b) > s.TOLERANCE for r, n, (b, _, _) in zip(right, new, TALK)),
+            max(abs(n - b) for (a, _, _), n, (b, _, _) in zip(cs, new, TALK) if not s.kept_at(t.get("keep"), a)),
+            sum(s.kept_at(t.get("keep"), a) for a, _, _ in cs))
+
+
+@pytest.mark.parametrize("step, kept", [(40.0, 17), (6.0, 19)])
+def test_a_cold_open_in_time_keeps_its_times_and_the_rest_moves(step, kept):
+    """The first 15 lines are in time, and the rest sits step seconds late, as on a subtitle of a cut with a longer
+    opening. The fix moves the rest, and the first lines keep their times. The move goes away from the file's end, so
+    its last 2 lines, with no line of the fix to pass them, keep their times too. At 6 s two body lines after the cold
+    open sit within the slack of the stay votes and keep their times."""
+    cs, speech = moved_to(TALK, cut=(TALK[15][0], step)), voice(TALK)
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    right_moved, off, n = kept_judged(cs, t)
+    assert t["fix"]["offset"] == pytest.approx(step, abs=0.1) and n == t["kept"] == kept and t["keep"][0][0] is None, t
+    assert right_moved == 0 and off < 0.1 and t["keep"][-1][2] == 2, (right_moved, off, t["keep"])
+    assert "keep their times" in t["why"], t["why"]
+
+
+@pytest.mark.parametrize("at, g, kept", [(385, -20.0, 17), (380, -40.0, 22)])
+def test_an_end_in_time_keeps_its_times_and_the_rest_moves(at, g, kept):
+    """The track sits g seconds early, and from cue at on it is in time. The rest moves later, toward the end, and the
+    last lines keep their times. The first 2 lines, which the move leaves behind, keep their times too."""
+    cs, speech = moved_to(TALK, offset=g, cut=(TALK[at][0], -g)), voice(TALK)
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    assert t["fix"]["offset"] == pytest.approx(g + 0.05) and kept_judged(cs, t)[:2] == (0, pytest.approx(0.05, abs=0.01)) and t["kept"] == kept, t
+
+
+def test_a_whole_track_shift_moves_the_lines_the_move_passes():
+    """The track sits 30 s late, and no one speaks the first two lines. They have no speech start at the fix, but the
+    first moved line with its own evidence passes where they sit, so they move. The last 2 lines, which the move goes
+    away from, keep their times: the slack of two chance speech starts keeps them."""
+    cs, speech = moved_to(TALK, offset=30.0), voice(TALK[2:])
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    assert t["fix"]["offset"] == pytest.approx(30.05) and t["keep"] == [[cs[-2][0], None, 2]] and kept_judged(cs, t)[1] < 0.1, t
+
+
+def test_lines_no_one_speaks_at_the_start_keep_their_times():
+    """The first two lines are in time where no one speaks, as signs are, and the rest sits 30 s late. Nothing says
+    they belong at the fix, and no moved line passes them, so they keep their times."""
+    cs = TALK[:2] + moved_to(TALK[2:], offset=30.0)
+    t = s.layout_fix(cs, voice(TALK[2:]), LONG, s.layout(cs, voice(TALK[2:]), LONG))
+    assert t["keep"][0] == [None, cs[2][0], 2] and kept_judged(cs, t)[:2] == (0, pytest.approx(0.05, abs=0.01)), t
+
+
+def test_a_short_block_beside_the_cold_open_moves_nothing():
+    """The review's cascade: the first 10 lines are in time, the next 6 sit 29 s late, and the rest 35 s late. The fix
+    of 35 s passes the block, and the block, moved, would pass the cold open. Only the core's own edge line may move a
+    line it passes, so the cold open never moves: the times stay."""
+    cs = [c if k < 10 else (c[0] + 29, c[1] + 29, c[2]) if k < 16 else (c[0] + 35, c[1] + 35, c[2]) for k, c in enumerate(TALK)]
+    t = s.layout_fix(cs, voice(TALK), LONG, s.layout(cs, voice(TALK), LONG))
+    assert t["fix"] is None and "would pass a line that keeps its time" in t["why"], t
+
+
+def test_a_frame_rate_fix_moves_every_line():
+    """The track was timed for 25 fps on a 24 fps video. A frame-rate error covers the whole file, so the fix moves
+    every line, the first and last lines too, which the move passes by too little to move them at ratio 1."""
+    cs = moved_to(TALK, rate=Fraction(25, 24), offset=2.0)
+    t = s.layout_fix(cs, voice(TALK), LONG, s.layout(cs, voice(TALK), LONG))
+    assert t["fix"]["rate"] == "25/24" and "keep" not in t and kept_judged(cs, t)[:2] == (0, pytest.approx(0.05, abs=0.01)), t
+
+
+def test_a_frame_rate_fix_moves_lines_with_no_speech_at_either_place():
+    """The first 15 lines are in time, as a sign or a song with no speech under them, and the rest was timed for 25 fps.
+    Nothing says the first lines sit right, so they move with the rest. This is the known limit of the two-source
+    shape, see docs/design.md."""
+    cs = TALK[:15] + moved_to(TALK[15:], rate=Fraction(25, 24), offset=2.0)
+    t = s.layout_fix(cs, voice(TALK[15:]), LONG, s.layout(cs, voice(TALK[15:]), LONG))
+    assert t["fix"]["rate"] == "25/24" and "keep" not in t and kept_judged(cs, t)[0] == 15, t
+
+
+def test_a_frame_rate_fix_whose_end_sits_on_speech_moves_nothing():
+    """The first 15 lines are in time and spoken, and the rest was timed for 25 fps. The run at the start holds speech
+    starts where its lines sit and none at the fix, far over chance. The two sources cannot share one fix, so nothing
+    moves, and the offset is kept for the alert."""
+    cs = TALK[:15] + moved_to(TALK[15:], rate=Fraction(25, 24), offset=2.0)
+    t = s.layout_fix(cs, voice(TALK), LONG, s.layout(cs, voice(TALK), LONG))
+    assert t["fix"] is None and "unfixed" in t and "line up with the speech where they sit" in t["why"], t
+
+
+def test_the_frame_rate_rule_breaks_on_a_kept_line_or_an_end_on_speech():
+    """check_ratio() breaks when a fix at a ratio keeps a line, and when it moves an end that sits on speech."""
+    cs = TALK[:15] + moved_to(TALK[15:], rate=Fraction(25, 24), offset=2.0)
+    fix = {"rate": "25/24", "offset": 2.052}
+    with pytest.raises(s.Broken, match="every line"):
+        s.check_ratio(cs, [k >= 1 for k in range(len(cs))], fix, voice(TALK))
+    with pytest.raises(s.Broken, match="sits on speech"):
+        s.check_ratio(cs, [True] * len(cs), fix, voice(TALK))
+
+
+def test_kept_runs_need_a_plan_of_blocks_that_holds_them_in_place():
+    """keep_blocks() marks each kept run, so remux.time_plan() writes the times of its cues as they were."""
+    for cs in (moved_to(TALK, cut=(TALK[15][0], 40.0)), moved_to(TALK, cut=(TALK[15][0], -40.0))):
+        t = s.layout_fix(cs, voice(TALK), LONG, s.layout(cs, voice(TALK), LONG))
+        plan = remux.time_plan(cs, t["fix"], s.keep_blocks(t))
+        assert [(a, n) for _, _, _, a, n in plan[:15]] == [(a, b) for a, b, _ in cs[:15]], plan[:15]
+        assert remux.blocks_moved(plan, t["fix"]) == f'{t["kept"]} cues kept their times'
+
+
+def test_a_line_with_no_text_between_a_kept_run_and_the_moved_lines_stops_the_plan():
+    """keep_ordered() takes every cue of the file, a line with no text too, which the check never read. Here such a line
+    sits just after the cold open, and the moved lines would land before it."""
+    cs = moved_to(TALK, cut=(TALK[15][0], 40.0))
+    t = s.layout_fix(cs, voice(TALK), LONG, s.layout(cs, voice(TALK), LONG))
+    assert s.keep_ordered(cs, t)
+    blank = (round(cs[15][0] - 1.0, 3), round(cs[15][0] - 0.5, 3), "")
+    assert not s.keep_ordered(sorted(cs + [blank]), t)
+
+
+def rules_case(move=()):
+    """(cues, moves, fix, speech) of a partial shift for check_kept(): five right lines 50 s apart, then the dialogue of
+    TALK from 300 s on, 40 s late. The fix moves the dialogue back, and the right lines at the places in move move too."""
+    right = [(10.0 + 50 * k, 12.0 + 50 * k, f"right {k}") for k in range(5)]
+    body = [c for c in TALK if c[0] >= 300]
+    cs = right + moved_to(body, offset=40.0)
+    return cs, [k >= 5 or k in move for k in range(len(cs))], {"rate": "1/1", "offset": 40.05}, voice(right + body)
+
+
+@pytest.mark.parametrize("move", [(2, 3, 4), (4,), ()])
+def test_the_rules_of_a_partial_shift_catch_a_right_line_the_edge_never_passes(move):
+    """check_kept() breaks when a line moves at the start that the core's edge line never passes: a cascade of passes
+    moved the review's cold open that way, and a weak edge run moved one right line at its end. The order holds in
+    both, so only the own evidence rule sees them. The moves shifted() makes pass."""
+    cs, moves, fix, speech = rules_case(move)
+    if move:
+        with pytest.raises(s.Broken, match="own evidence"):
+            s.check_kept(cs, moves, fix, speech)
+    else:
+        t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+        assert t["keep"][0] == [None, cs[5][0], 5], t
+        s.check_kept(cs, [not s.kept_at(t["keep"], a) for a, _, _ in cs], t["fix"], speech)
+
+
+def test_a_hole_of_kept_lines_breaks_the_edges_rule():
+    cs = moved_to(TALK, offset=0.5)
+    moves = [k != 200 for k in range(len(cs))]
+    with pytest.raises(s.Broken, match="edges"):
+        s.check_kept(cs, moves, {"rate": "1/1", "offset": 0.5}, voice(TALK))
+
+
+def test_the_onsets_judge_only_the_lines_that_move():
+    """The first 15 lines keep their times. Onsets lie only where the moved lines' speech starts, so both halves agree,
+    and the kept lines count in neither."""
+    cs, speech = moved_to(TALK, cut=(TALK[15][0], 40.0)), voice(TALK)
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    got = s.layout_onsets(cs, t, [(a, 1.0) for a, _ in voice(TALK[15:])], s.onset_parts(LONG), LONG)
+    assert got["fix"] == t["fix"] and got["keep"] == t["keep"], got
 
 
 @pytest.mark.parametrize("offsets, step", [([0.0] * 9 + [32.1], False), ([0.1 * k for k in range(10)], False), ([1.0 * k for k in range(10)], False),
@@ -1010,6 +1165,33 @@ def test_the_speech_onsets_confirm_a_layout_fix():
     for onsets in ([], [(a, 1.0) for a, _ in speech if a < LONG / 2], [(a, s.ONSET_QUIET - 0.1) for a, _ in speech]):
         few = judge(onsets)
         assert few["fix"] is None and "too few speech onsets" in few["why"], few
+
+
+def test_a_music_bed_with_few_onsets_still_confirms_a_layout_fix():
+    """Under a music bed silencedetect marks few onsets: here one at every eighth speech start, 14% of the starts in a
+    half, under the 20% that clock() asks of a block. They lie where the fix puts the lines, none where the lines sat,
+    and they are far over chance, so the fix stands."""
+    cs, speech = moved_to(TALK, offset=30.0), voice(TALK)
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    got = s.layout_onsets(cs, t, [(a, 1.0) for a, _ in speech[::8]], s.onset_parts(LONG), LONG)
+    assert got["fix"] == t["fix"] and all(new < s.ONSET_SHARE * n and new >= 10 * chance for n, new, _, chance in got["onsets"]), got
+
+
+@pytest.mark.parametrize("case", ["under ONSET_MIN", "under the chance limit"])
+def test_a_layout_fix_still_needs_onset_min_and_the_chance_limit(case):
+    """Two onsets in each half lie under ONSET_MIN. A track whose parts sound every half second draws as many onsets by
+    chance as the music bed gives, so its count is not rare. Neither confirms the fix."""
+    cs, speech = moved_to(TALK, offset=30.0), voice(TALK)
+    t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
+    parts = s.onset_parts(LONG)
+    if case == "under ONSET_MIN":
+        onsets = [(a, 1.0) for half in (False, True) for a in [a for a, _ in speech if any(lo <= a <= hi for lo, hi in parts) and (a > LONG / 2) == half][:2]]
+    else:
+        places = [a - s.ONSET_LEAD for a, _, _ in TALK + cs]
+        noise = [(round(lo + 0.5 * k, 3), 1.0) for lo, hi in parts for k in range(int((hi - lo) / 0.5))]
+        onsets = [(a, 1.0) for a, _ in speech[::8]] + [o for o in noise if all(abs(o[0] - p) > 0.2 for p in places)]
+    got = s.layout_onsets(cs, t, sorted(onsets), parts, LONG)
+    assert got["fix"] is None and "too few speech onsets" in got["why"], got
 
 
 def test_align_refines_the_offset_past_its_vote_bins():
