@@ -443,6 +443,86 @@ def test_a_job_error_names_its_error_and_its_job_in_the_logfmt_line():
     assert "error=" not in h.render(decision(), "logfmt")
 
 
+def test_a_deep_analysis_line_names_the_job_of_its_import():
+    """from= follows the old keys, before error, so a reader can match the line to the import that queued it."""
+    rec = {"source": "deep_analysis", "job": "deep-analysis-0123456789abcdef.json", "from": "1790904088348071068-813305.json", "outcome": "error",
+           "result": "error: OSError: x"}
+    assert h.render(rec, "logfmt").endswith(' job=deep-analysis-0123456789abcdef.json from=1790904088348071068-813305.json error="error: OSError: x"')
+    assert " from=" not in h.render(decision(), "logfmt")
+
+
+def test_an_import_holds_only_the_subtitle_alerts_that_would_post(sent):
+    """The deep analysis follows, so the import keeps each subtitle alert that would post in held, for that analysis.
+    A subtitle fix that logs only stays log only, and every other alert posts at once."""
+    late = {"kind": "subtiming", "lines": [{"code": "off", "track": "s1", "ref": None, "why": "x", "unfixed": 2.4}]}
+    gone = {"kind": "submatch", "lines": [{"code": "removed", "track": "s3", "why": "x", "kept": "/k/F.mkv"}]}
+    rec, held = decision(findings=[late, gone, DOUBT]), []
+    assert h.alert_findings(rec, 7, held) == [h.HOLD_RESULT, "log only", "sent"] and [e["title"] for e in sent] == ["Audio may be broken"]
+    assert [(x["kind"], x["size"], x["embed"]["title"]) for x in held] == [("subtiming", 7, "Subtitles out of sync")]
+    assert h.alert_findings(rec, 7) == ["sent", "log only", "sent"]   # no deep analysis follows
+
+
+def test_a_held_alert_counts_as_judged_only_when_each_subtitle_it_names_got_a_verdict():
+    """A failed hearing says unknown, and a weak fit judges nothing. The speech layout judges a track no reference fits."""
+    rec = {"subcheck": {"s1": {"verdict": "match"}, "s2": {"verdict": "unknown"}},
+           "subtime": {"s3": {"verdict": "unknown", "layout": {"verdict": "fit"}}, "s4": {"verdict": "weak"}}}
+    assert [h.judged(rec, k) for k in (["s1"], ["s1", "s2"], ["s3"], ["s4"], ["s5"], [])] == [True, False, True, False, False, False]
+    rec = {"subremux": {"done": True, "timed": ["s1"], "removed": ["s3"]}, "sidecars": [{"name": "F.en.srt", "result": "retimed"},
+                                                                                       {"name": "F.fr.srt", "result": "left"}]}
+    assert h.remuxed(rec) == {"s1", "s3", "F.en.srt"} and h.remuxed({"subremux": {"done": False, "timed": ["s1"]}}) == set()
+
+
+def test_a_conversion_a_held_alert_names_posts_once(sent, settings):
+    """A sidecar that did not match the audio at the conversion to MKV stayed beside the file, and its held alert names
+    the conversion. So the import posts no conversion change. When the deep analysis checks the sidecar again, the
+    conversion posts as a change. When nothing checks it, the held alert posts and names the conversion itself."""
+    settings(discord_posts="all")
+    side = {"kind": "submatch", "lines": [{"code": "converted_sidecar", "name": "Film A.en.srt", "why": "x", "kept": None,
+                                          "left": "the folder is read-only"}]}
+    rec, held = decision(outcome="no_change", result="no change", edits=[], findings=[side], container="MP4/QuickTime",
+                         repack={"new_size": 9, "kept": "/k/Film A.mp4"}), []
+    assert h.alert_findings(rec, 7, held) == [h.HOLD_RESULT] and sent == [] and rec["change_result"] == []
+    job = {"app": "radarr", "path": rec["path"], "held": held}
+    assert h.held_after(job, {"alert_kinds": [], "subcheck": {"Film A.en.srt": {"verdict": "match"}}}) == ["checked again, change sent"]
+    assert [e["title"] for e in sent] == ["Converted to MKV"]
+    sent.clear()
+    assert h.held_after(job, {"outcome": "error"}) == ["sent"] and [e["title"] for e in sent] == ["Wrong subtitles"]
+    assert "MKV" in sent[0]["description"] or "convert" in sent[0]["description"].lower(), sent[0]["description"]
+
+
+def test_held_keys_name_each_track_by_its_place_after_the_import_remux():
+    """The import removed track 1, so the track that was 2 is track 1 when the deep analysis reads the file."""
+    rec = decision(subremux={"done": True, "removed": ["s1"], "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}]})
+    f = {"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "kept": "/k/F.mkv"}, dict(STAYS, track="s2")]}
+    assert h.named(rec, f) == ["s1"]
+
+
+MIXED = {"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "by": "hook", "kept": "/k/Film A.mkv"},
+                                       {"code": "sidecar", "name": "Film A.en.srt", "why": "x", "kept": None, "left": "the folder is read-only"}]}
+
+
+@pytest.mark.parametrize("posts", ["issues", "all"])
+def test_a_held_alert_that_goes_unposted_still_posts_the_fix_of_the_import_in_all_mode(sent, settings, posts):
+    """The import removed a track and left a sidecar that does not match. Their one alert waits for the deep analysis,
+    which checks again and posts in its place. all mode still posts the removal, as the change the import made. issues
+    mode posts nothing. When nothing checks again, the whole alert posts, and it names the removal itself."""
+    settings(discord_posts=posts)
+    rec, held = decision(outcome="no_change", result="no change", edits=[], findings=[MIXED], subremux={
+        "done": True, "removed": ["s1"], "kept": "/k/Film A.mkv", "tracks_before": [{"i": "s1", "lang": "fre"}]}), []
+    assert h.alert_findings(rec, 7, held) == [h.HOLD_RESULT] and sent == []
+    job = {"app": "radarr", "path": rec["path"], "held": held}
+    assert held[0]["keys"] == ["Film A.en.srt"]   # the removed track is settled, so only the sidecar waits for a verdict
+    checked = {"alert_kinds": [], "outcome": "no_change", "subcheck": {"Film A.en.srt": {"verdict": "match"}}}
+    assert h.held_after(job, checked) == ["checked again" + (", change sent" if posts == "all" else "")]
+    assert described(sent) == ([("Wrong subtitles", "The **French subtitles (track 1 of the original file)** don't match what's said in the audio. "
+                                                     "Removed them and kept the original file at /k/Film A.mkv.")] if posts == "all" else []), described(sent)
+    sent.clear()
+    assert h.held_after(job, {"outcome": "file_replaced"}) == ["dropped with the file" + (", change sent" if posts == "all" else "")]
+    assert len(sent) == (posts == "all"), described(sent)
+    sent.clear()
+    assert h.held_after(job, {"outcome": "error"}) == ["sent"] and len(sent) == 1 and "Removed them" in sent[0]["description"], described(sent)
+
+
 def test_the_embed_target_is_one_embed_per_finding():
     language, audio = h.render(decision(), "embed")
     assert {k: v for k, v in language.items() if k != "timestamp"} == {

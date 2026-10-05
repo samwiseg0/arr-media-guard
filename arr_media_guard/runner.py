@@ -228,21 +228,92 @@ def drop_job(name, claimed=False):
     store.write("DELETE FROM jobs WHERE name = ? AND claimed = ?", name, int(claimed))
 
 
-def queue_deep_analysis(job, rec, inputs):
+def deep_wanted(rec):
+    """Whether the import of the decision record rec queues the deep analysis of its file: SUBTITLES is deep, and the
+    Matroska file holds a subtitle track or has an .srt beside it."""
+    path = rec.get("path")
+    return bool(config.CFG.subtitles == "deep" and path and path.lower().endswith(".mkv") and os.path.exists(path)
+                and (any(t["i"].startswith("s") for t in rec.get("tracks") or []) or subtitles.side_stats(path)))
+
+
+def queue_deep_analysis(job, rec, inputs, held=None):
     """Queue the deep analysis of the file an import job checked (docs/design.md, "Subtitle match"), when
-    SUBTITLES is deep, and the Matroska file holds a subtitle track or has an .srt beside it. The
-    job carries inputs, the decision inputs of the import: its label, original language, runtime, Plex lookup, kids
-    flag, metadata context and release name. So the deep analysis asks no app and decides as the import did. The job
-    is named by the path, so a newer import of the path replaces a queued one. The job holds the file_key() of the
-    file the import left, see deep_replaced(). Returns its name, or None."""
-    path, ids = rec.get("path"), rec.get("ids") or {}
-    if not (config.CFG.subtitles == "deep" and path and path.lower().endswith(".mkv") and os.path.exists(path)) or \
-            not (any(t["i"].startswith("s") for t in rec.get("tracks") or []) or subtitles.side_stats(path)):
+    deep_wanted(rec). The job carries inputs, the decision inputs of the import: its label, original language,
+    runtime, Plex lookup, kids flag, metadata context and release name. So the deep analysis asks no app and decides as
+    the import did. The job is named by the path, so a newer import of the path replaces a queued one. The job holds
+    the file_key() of the file the import left, see deep_replaced(). It names the import's job in "from", and it keeps
+    held, the alerts the import held for it, see process.alerts() and held_after(). Returns its name, or None."""
+    if not deep_wanted(rec):
         return None
-    name = deep_name(path)
+    path, ids, name = rec["path"], rec.get("ids") or {}, deep_name(rec["path"])
     store.write("INSERT OR REPLACE INTO jobs (name, at, job) VALUES (?, ?, ?)", name, time.time(),
-                json.dumps(dict(app=job.get("app"), path=path, ids=ids, inputs=inputs, time=time.time(), key=file_key(os.stat(path)))))
+                json.dumps(dict(app=job.get("app"), path=path, ids=ids, inputs=inputs, time=time.time(), key=file_key(os.stat(path)),
+                                **({"from": rec["job"]} if rec.get("job") else {}), **({"held": held} if held else {}))))
     return name
+
+
+JUDGED = ("match", "fit", "mismatch")   # the verdicts that judge a subtitle, as subtitles.sub_found() reads them
+
+
+def judged(rec, keys):
+    """Whether the run of rec judged each subtitle of keys, see logs.alert_findings(): its words or where its lines show
+    gave one of JUDGED. A failed hearing gives unknown, and a missing language model gives no verdict at all."""
+    seen = lambda k: {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}.get(k) or {}
+    return bool(keys) and all({seen(k).get("verdict"), (seen(k).get("layout") or {}).get("verdict")} & set(JUDGED) for k in keys)
+
+
+def remuxed(rec):
+    """The subtitles that a finished subtitle remux or a sidecar rewrite of the run of rec retimed, moved to their speech
+    or removed, by their place before that remux, see process.subtitle_checks() and process.after_edit(). Longer ends
+    and a repaired text fix no timing and no mismatch, so they leave a held alert to post."""
+    rm = rec.get("subremux") or {}
+    done = [p for k in ("fixed", "timed", "removed") for p in rm.get(k) or []] if rm.get("done") else []
+    return set(done) | {e["name"] for e in rec.get("sidecars") or [] if e.get("result") in ("moved", "retimed")}
+
+
+def app_file(job):
+    """Where the app lists the file of the deep analysis job now, asked by its file id, see moved(): (the new path, None,
+    False) after a rename or a move, else (None, why, whether the app said it no longer has the file). Raises when the
+    app cannot be asked, as for a job with no file id."""
+    ids = job.get("ids") or {}
+    if not ids.get("file_id"):
+        raise LookupError("the job has no file id to ask the app about")
+    return moved(job["app"], {"file_id": ids["file_id"], "owner": ids.get("app_id"), "episode_ids": ids.get("episode_ids"), "path": job["path"]})
+
+
+def gone_for_good(job, rec):
+    """Whether the file of the deep analysis job of the record rec is gone for good: the app replaced it at its path, or
+    the app says it no longer has it, see moved(). A file the app moved, one it lists where this container does not see
+    it, as at the same missing path while a mount is down, and an app that does not answer, are not."""
+    if rec.get("outcome") == "file_replaced" or rec.get("app_said") == "gone":
+        return True
+    try:
+        return rec.get("outcome") == "file_gone" and app_file(job)[2]
+    except Exception:
+        return False
+
+
+def held_after(job, rec):
+    """What became of the alerts the import held for the deep analysis job, see queue_deep_analysis(), as the decision
+    record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(). A job
+    that judged each subtitle a held alert names posted what it still found in its place, see judged(). Verdicts reach
+    rec only when the run reached its alerts, because every step after the subtitle checks runs. A job whose remux
+    changed those subtitles before an error counts too, see remuxed(). A dropped alert still posts the changes it keeps,
+    see logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing. Every other held
+    alert posts now, because nothing judged its subtitles again. That is an error, a failed hearing, SUBTITLES off, or
+    a file the app moved during the run, or one the app lists where this container does not see it."""
+    app, out = job["app"], []
+    if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
+        return logs.held_changes(app, job["held"], "dropped with the file")
+    said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or [] if report.posts(f, rec)))
+    for h in job["held"]:
+        if judged(rec, h.get("keys")):   # only a run that reached its alerts holds verdicts, see process.STEPS
+            out += logs.held_changes(app, [h], "checked again", said)
+        elif rec.get("outcome") == "error" and h.get("keys") and set(h["keys"]) <= remuxed(rec):
+            out += logs.held_changes(app, [h], "fixed before the error")
+        else:
+            out += logs.post_held(app, job["path"], [h])
+    return out
 
 
 def deep_name(path):
@@ -325,7 +396,8 @@ def deep_waits():
 def deep_analysis(name, pending, claimed=False):
     """One deep analysis job, queued or claimed (docs/design.md, "Subtitle match"): the check of
     --sub-time on the file of an import, with the proof, the kept originals, the subtitle alerts and the Plex analyze of
-    an import. It decides with the import's inputs, which the job carries, and it asks no app. It keeps every flag
+    an import. It decides with the import's inputs, which the job carries, and it asks the app only where its file is
+    when the file is gone from its path, see app_file(). It follows a rename or a move there. It keeps every flag
     the import set, after a remux of its own too, and only a subtitle verdict changes a flag, see process(). It has no
     time limit, and it never drops by age. It drops itself when its file is gone or replaced since its import, see
     deep_replaced(). It checks that at its start, each time it takes the file lock, after its remux, see
@@ -349,7 +421,19 @@ def deep_analysis(name, pending, claimed=False):
         job = job_of(name, claimed)
         app, path, got = job["app"], job["path"], job.get("inputs") or {}
         rec.update(app=app, path=path, **({"source": "recheck"} if job.get("recheck") else {}))
-        if drop := deep_replaced(job):
+        if (drop := deep_replaced(job)) and drop["outcome"] == "file_gone":   # a rename or a move of the app queues no new import
+            try:
+                new, why, gone = app_file(job)
+            except Exception as ex:
+                new, why, gone = None, config.mask(f"the app was not asked where the file is: {type(ex).__name__}: {ex}")[:300], False
+            if new:   # the job goes on at the new path, and a yield keeps it
+                logs.log(dict(source=rec["source"], app=app, job=name, result="file_moved", old_path=path, path=new))
+                job, path, drop = dict(job, path=new, key=file_key(os.stat(new))), new, None
+                put_job(name, job, claimed)
+                rec["path"] = path
+            else:
+                drop.update(note=why, **({"app_said": "gone"} if gone else {}))
+        if drop:
             rec.update(drop)
         elif job.get("recheck") and not subtitles.sub_on("recheck"):   # SUBTITLES went off after the job was queued
             rec.update(outcome="subtitles_off", result="dropped, SUBTITLES is off")
@@ -400,6 +484,12 @@ def deep_analysis(name, pending, claimed=False):
         else:
             rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500])
             rec["trace"] = traceback.format_exc(limit=3)[-800:]
+            if getattr(ctx, "rec", None):   # what the run changed before the error, see held_after()
+                rec.update({k: ctx.rec[k] for k in ("subremux", "sidecars") if k in ctx.rec})
+    if job.get("from"):   # the import job that queued it, so a reader can match the two lines
+        rec["from"] = job["from"]
+    if job.get("held"):
+        rec["held_result"] = held_after(job, rec)
     rec = logs.decision(rec, started)
     path = rec.get("path")
     if want and path and os.path.exists(path) and process.changed(rec):
@@ -1219,7 +1309,9 @@ def requeue(name, crash=None):
             job["crashes"] = job.get("crashes", 0) + 1
             if job["crashes"] >= config.CRASH_TRIES:
                 logs.decision(dict(source="hook", job=name, app=job.get("app"), path=job.get("path"), outcome="error",
-                              result=f"error: the job process {crash}, {config.CRASH_TRIES} times, so the job is dropped"), time.time())
+                              result=f"error: the job process {crash}, {config.CRASH_TRIES} times, so the job is dropped",
+                              **({"from": job["from"]} if job.get("from") else {}),
+                              **({"held_result": logs.post_held(job["app"], job["path"], job["held"])} if job.get("held") else {})), time.time())
                 drop_job(name, True)
                 return
             put_job(name, job, True)
@@ -1233,34 +1325,36 @@ def requeue(name, crash=None):
 
 
 def moved(app, job):
-    """(the file's current path, None) when the app moved or renamed the job's file since the import, else (None, why the
-    job is dropped). The app is asked by the job's file id. Its answer must name the job's movie, or the job's series
+    """(the file's current path, None, False) when the app moved or renamed the job's file since the import, else (None,
+    why the job is dropped, whether the app said it no longer has the file). It says so with a 404, another movie or
+    series, or other episodes. A path the app lists that this container does not see says nothing of that. The app is
+    asked by the job's file id. Its answer must name the job's movie, or the job's series
     and the same episodes, and its path must sit under one of the app's root folders. A 404 means the app no longer has the file. That is an upgrade or a delete, and a new import
     has its own job. A job marked unseen whose file the app still lists raises Unseen. Any other error raises, and the
     job's line says error."""
     a, name = apps.ARR[app], apps.ARR[app].name
     if not job.get("file_id"):
-        return None, "the job has no file id to ask the app about"
+        return None, "the job has no file id to ask the app about", False
     fid = int(job["file_id"])
     try:
         f = apps.arr(app, f"{a.file_kind}/{fid}")
     except urllib.error.HTTPError as ex:
         if ex.code != 404: raise
-        return None, f"{name} no longer has file {fid}"
+        return None, f"{name} no longer has file {fid}", True
     owner = f.get(a.owner_key)
     if str(owner) != str(job.get("owner")):
-        return None, f"{name} file {fid} belongs to {a.kind} {owner} now"
+        return None, f"{name} file {fid} belongs to {a.kind} {owner} now", True
     if not a.film and job.get("episode_ids"):
         eps = sorted(e["id"] for e in apps.arr(app, f"episode?episodeFileId={fid}"))
         if eps != regrab.job_episodes(job):
-            return None, f"{name} file {fid} holds episodes {eps} now"
+            return None, f"{name} file {fid} holds episodes {eps} now", True
     if not f.get("path") or f["path"] == job.get("path") or not os.path.exists(f["path"]):
         if job.get("unseen"):   # the listener's container never saw the file, see serve.download()
             raise Unseen(f"{name} lists file {fid} at {f.get('path')}, and this container does not see it there")
-        return None, f"{name} lists file {fid} at {f.get('path')}, which is missing too"
+        return None, f"{name} lists file {fid} at {f.get('path')}, which is missing too", False
     if not any(f["path"].startswith(r["path"].rstrip("/") + "/") for r in apps.arr(app, "rootfolder")):
-        return None, f"{name} lists file {fid} at {f['path']}, outside its root folders"
-    return f["path"], None
+        return None, f"{name} lists file {fid} at {f['path']}, outside its root folders", False
+    return f["path"], None, False
 
 
 RETRY_WAIT = 60   # seconds before the next try of a Webhook job whose API did not answer. It doubles each try, up to an hour.
@@ -1323,7 +1417,7 @@ def run_job(name, pending, shared=False, claimed=False):
     from the start, after a log line that says why."""
     if name.startswith("deep-analysis-"):   # a job process of coordinate() runs a deep analysis job too
         return deep_analysis(name, pending, claimed)
-    rec, want, started, path, again = dict(source="hook", job=name), None, time.time(), None, None
+    rec, want, started, path, again, run = dict(source="hook", job=name), None, time.time(), None, None, None
     job = {}   # restore_log() reads it after an error too
     try:
         job = job_of(name, claimed)
@@ -1343,7 +1437,7 @@ def run_job(name, pending, shared=False, claimed=False):
         old, gone = job.get("moved_from") or path, None
         if fid not in unit.get("deleted", []) and not (path and os.path.exists(path)):
             try:
-                new, gone = moved(app, job)
+                new, gone, _ = moved(app, job)
             except Unseen as ex:   # the mount may be missing or slow, so the job waits for the file as for the API
                 if time.time() - job["time"] > config.JOB_MAX_AGE:
                     raise Unchecked(f"{ex}. A day passed, so the import was never checked") from None
@@ -1385,11 +1479,12 @@ def run_job(name, pending, shared=False, claimed=False):
                     label, original, runtime, want, kids, ctx = apps.ARR[app].item(int(job["owner"]), fid)
                     ids = {"app_id": job.get("owner"), "file_id": job.get("file_id"), "episode_ids": job.get("episode_ids"), "guids": want["guids"],
                            "slug": ctx.get("slug")}   # the slug links the alerts to the item, see apps.App.page()
-                    rec = process.process(process.Ctx(
+                    run = process.Ctx(
                         app, path, label, original, runtime, job=job, audio=not (handled and kind == "audio"), video=not (handled and kind == "video"),
                         kids=kids, release=job.get("release") or "", ids=ids, item=ctx, lock=lock,
                         shared=shared and types.SimpleNamespace(exclusive=lambda st: exclusive(lock, path, st, name, job, unit), settle=lambda: settle(name),
-                                                                turn=lambda: wait_turn(name, job), reshare=lambda st: reshared(lock, path, st))))
+                                                                turn=lambda: wait_turn(name, job), reshare=lambda st: reshared(lock, path, st)))
+                    rec = process.process(run)
                     rec["job"] = name   # process() gives a new record, and the summary line names the job, see report.render()
                     if handled:
                         rec.setdefault("notes", []).append(f"{kind} already checked with its download")
@@ -1416,7 +1511,13 @@ def run_job(name, pending, shared=False, claimed=False):
     edited = process.changed(rec) and os.path.exists(path or "")   # a re-grab may have deleted it
     if edited and want:   # outside the file lock, so a slow Plex never holds up the next file
         pending.append(plex.plex_after(app, "hook", rec, want))
+    held, deep = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
     if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match"
+        with contextlib.suppress(OSError, sqlite3.Error):
+            deep = queue_deep_analysis(job, rec, dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx,
+                                                      release=job.get("release") or ""), held)
+    if held and not deep:   # a held alert is never lost
         with contextlib.suppress(OSError):
-            queue_deep_analysis(job, rec, dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx, release=job.get("release") or ""))
+            logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning", held_result=logs.post_held(rec["app"], rec["path"], held),
+                          note="the deep analysis of the file did not queue, so the alerts held for it posted now"))
     drop_job(name, claimed)

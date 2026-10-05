@@ -600,6 +600,13 @@ def item_embed(rec, head, text, color, note=None):
     return logs.embed(rec["app"], head, text, color, [item], " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
 
 
+def fix_post(rec, f, t):
+    """The change post of finding f of rec, a fix in its alert's words and color, for DISCORD_POSTS all. A text that
+    failed gives its line, which posts nothing, see changes()."""
+    text = texts(f, t, track_langs(rec, after=True))[0]
+    return text if text.startswith(NO_TEXT) else alert_embed(rec, f, t)
+
+
 def kept(facts):
     """The sentence that names where a change kept the original file, with a space before it, or "" when it kept none."""
     return f' The original file is kept at {facts["kept"]}.' if facts.get("kept") else ""
@@ -612,13 +619,55 @@ def said(rec):
     conversion to MKV."""
     langs, out = track_langs(rec, after=True), {"flags": set(), "live": set(), "converted": False}
     for f in rec.get("findings") or []:
-        lines = f.get("lines") or []
-        out["converted"] |= any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)
+        told = tells(f, langs)
+        out["converted"] |= told["converted"]
         if posts(f, rec):
-            out["flags"] |= {n.split(" ")[0] for n in f.get("muted") or []}   # see FINDINGS sublang
-            out["flags"] |= {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")}
-            out["live"] |= {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off")}
+            out["flags"] |= told["flags"]
+            out["live"] |= told["live"]
     return out
+
+
+def tells(f, langs):
+    """What the sentences of finding f say of the changes of its run, see said(). A track goes by its place in langs,
+    after the run with track_langs(after=True), else before its remux."""
+    lines = f.get("lines") or []
+    return {"flags": {n.split(" ")[0] for n in f.get("muted") or []}   # see FINDINGS sublang
+            | {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")},
+            "live": {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off")},
+            "converted": any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)}
+
+
+def held_posts(rec, f, t):
+    """The change posts of the run of rec that its held finding f says itself, for DISCORD_POSTS all, see
+    logs.alert_findings(). Each is {"post": the embed, or the line of a text that failed}, and the flag edit adds
+    "flags", the places of its tracks after the run. They are the fixes of its logged lines, see fix_post(), the
+    conversion to MKV it names, and the flags it says were turned off. said() leaves them out of the change posts of
+    rec, and logs.held_changes() posts them when the held alert goes unposted."""
+    told, fixed, after = tells(f, track_langs(rec, after=True)), [x for x in f.get("lines") or [] if logged(x)], {
+        x["sel"]: x for x in rec.get("after") or []}
+    flags = [e for e in rec.get("edits") or [] if decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and not e[1]
+             and (after.get(e[0]) or {}).get("pos") in told["flags"]]
+    out = [{"post": fix_post(rec, dict(f, lines=fixed), t)}] if fixed else []
+    none = {"flags": set(), "live": set(), "converted": False}
+    for head, step, of, more in (("Converted to MKV", conversion_change, told["converted"] and rec, {}),
+                                 ("Tracks changed", edit_change, flags and dict(rec, edits=flags), {"flags": sorted(told["flags"])})):
+        try:
+            got = step(of, none) if of else None
+        except Exception as ex:
+            got = None, config.mask(f"{NO_TEXT}{head}: {type(ex).__name__}: {ex}")[:200]
+        if got:
+            out.append(dict(post=item_embed(rec, got[0], got[1], "green") if got[0] else got[1], **more))
+    return out
+
+
+def named(rec, f):
+    """The subtitles that the sentences of finding f of rec name and that a fix of the run did not settle: a track by its
+    place in the file after the run, as "s2", and a sidecar by its file name, see runner.judged()."""
+    langs, out = track_langs(rec, after=True), set()
+    for x in f.get("lines") or []:
+        if not logged(x):
+            out |= {x[k] for k in ("track", "name") if x.get(k)} | set(x.get("tracks") or []) | {w[0] for w in x.get("far") or []}
+    return sorted(f"s{number(p, langs)}" if re.fullmatch(r"s\d+", p) else p for p in out)
 
 
 def conversion_change(rec, told):
@@ -734,8 +783,8 @@ def render(rec, target, tense=None):
 
     log: the decision line, with the schema, the script and policy versions, the outcome code (other when rec has
     none), the seconds it took from rec["took"], and the text of each finding in alerts.
-    logfmt: its one-line summary for syslog. Loki reads its keys, so they stay. An error line ends with error, its
-    result cut to 150 characters.
+    logfmt: its one-line summary for syslog. Loki reads its keys, so they stay. A deep analysis line adds from, the job
+    of the import that queued it. An error line ends with error, its result cut to 150 characters.
     embed: one Discord embed per finding.
     changes: one Discord embed per change to the file, for DISCORD_POSTS all, see changes(). A change whose text
     failed is the line that says so, in place of its embed.
@@ -755,14 +804,14 @@ def render(rec, target, tense=None):
         return config.mask(logfmt([("arr", rec.get("app")), ("source", rec.get("source")), ("outcome", rec.get("outcome", "other")),
                                    ("class", rec.get("class")), ("edits", len(rec.get("edits") or [])), ("reasons", ",".join(rec.get("reasons") or [])),
                                    ("alerts", ",".join(rec.get("alert_kinds") or [])), ("tmdb", rec.get("tmdb") or "not_asked"),
-                                   ("label", label), ("id", rec.get("id")), ("job", rec.get("job"))] + error))
+                                   ("label", label), ("id", rec.get("id")), ("job", rec.get("job"))]
+                                  + ([("from", rec["from"])] if rec.get("from") else []) + error))
     if target == "embed":
         return [alert_embed(rec, f, t) for f in rec.get("findings") or []]
     if target == "changes":   # the fixes that the issue gate logs only keep their alert's words and color. A text that failed is its line.
         found = rec.get("findings") or []
         gone = any((f.get("action") or {}).get("code") in DELETED for f in found)   # the file is gone: only its re-grab posts
-        fix = lambda f: text if (text := texts(f, t, track_langs(rec, after=True))[0]).startswith(NO_TEXT) else alert_embed(rec, f, t)
-        return [fix(f) for f in found if fixes(f) and not posts(f, rec) and (f.get("action") or not gone)] + \
+        return [fix_post(rec, f, t) for f in found if fixes(f) and not posts(f, rec) and (f.get("action") or not gone)] + \
             ([] if gone else [item_embed(rec, head, text, "green") if head else text for head, text in changes(rec)])
     if target == "cli":
         return cli_line(rec, t)

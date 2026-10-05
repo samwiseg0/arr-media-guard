@@ -199,6 +199,30 @@ nothing. Its line in `change_result` starts with `no text:`, and the other chang
 marker, because a second run finds nothing left to change. `change_result` in the decision line keeps what each post
 gave.
 
+**One alert per problem.** With `SUBTITLES=deep`, an import whose file gets the deep analysis holds its `submatch` and
+`subtiming` alerts, see `logs.DEEP_KINDS` and `process.alerts()`. The deep analysis checks those subtitles again, so it
+alone posts what is still wrong. A held alert never posts at the import, and its `alert_result` says `held for the deep
+analysis`. Its kind, size and embed go into the deep analysis job as `held`, with the subtitles it names in `keys`, see
+`runner.queue_deep_analysis()` and `report.named()`. A track goes by its place after the import's remux. The job ends
+with `runner.held_after()`, which decides each held alert. The alert goes unposted when the file is gone for good, see
+`runner.gone_for_good()`. That is a file with another inode at its path, or a file the app says it no longer has for the
+item. The app says so with a 404, another movie or series, or other episodes, see `runner.moved()`. A file the app lists
+at its old missing path or at a path this container does not see is not gone, so its held alerts post. A person's
+`--sub-check --apply` or `--sub-time --apply` remux gives the file a new inode too, so it counts as replaced. That run
+checked the subtitles itself. The alert also goes unposted when the job ran to its alerts and judged each subtitle the
+alert names, see `runner.judged()`. A verdict of `match`, `fit` or `mismatch` judges. The `unknown` of a failed hearing
+does not, and with no language model there is no verdict. A job whose remux or sidecar rewrite retimed, moved or removed
+those subtitles before an error counts too, see `runner.remuxed()`. Longer ends and a repaired text do not. Every other
+held alert posts through `logs.post_held()`, because nothing judged its subtitles again. That is an error, a failed
+hearing, no language model, `SUBTITLES=off`, a file the app moved during the run, or a third crash in
+`runner.requeue()`. When the import cannot queue the job, its held alerts post at once. With `DISCORD_POSTS=all`, a held
+finding keeps the change posts of what it says itself as `changes`, see `report.held_posts()`. That is a fix of its
+logged lines, such as a removed track, a flag it says was turned off, and the conversion it names. `report.said()`
+leaves them out of the import's change posts. `logs.held_changes()` posts them when the held alert goes unposted. It
+skips a flag edit that a posted alert of the deep analysis says already, as when the deep analysis finds the same
+mismatch. A held alert that posts names the change itself. So each change posts once. Every other kind posts at the
+import.
+
 **Track numbers.** Every post of a run names a subtitle by its place in the file after the run, see `report.number()`.
 A track the subtitle remux took out is "track 2 of the original file". The decision log and the CLI keep the places
 the check saw.
@@ -493,7 +517,9 @@ app's import of the new file skips that file, and the conversion's job then chec
 named by the path, so a newer import of the path replaces it. The job holds the inode, size and mtime of the file the
 import left. The worker runs one only when no import job waits, one at a time per host, and never drops one by age. A
 job drops itself with one decision line when its file is gone or has another inode, as after an upgrade, whose import
-queues a job of its own. An edit in place keeps the inode, and the job goes on. It checks this when it starts, each time
+queues a job of its own. When the file is gone at its start, the job first asks the app by the file id where it is now,
+see `runner.app_file()`. After a rename or a move, which queues no import, it goes on at the new path and logs a
+`file_moved` line. An edit in place keeps the inode, and the job goes on. It checks this when it starts, each time
 it takes the file lock, after its remux and after an error, because the app holds no lock. A change of its own never
 counts. A conversion of its own before a yield gives the job the new file's inode, size and mtime. The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
@@ -504,7 +530,9 @@ remux. It then goes back to its queue. Its next run finds the words heard so far
 in the state store. With `HOOK_WORKERS=1` an import job so waits at most for one step: the whole-file read of one film,
 the read or fit of one track, one pair of windows, 10 minutes of audio of the speech read, or one remux. With more
 workers it runs in a job process of its own. A deep analysis decides with the inputs its import stored in the job: the
-original language, the release name, the kids flag and the rest, so it asks no app. It never hears the language again.
+original language, the release name, the kids flag and the rest, so it asks no app for them. It never hears the language
+again. The job names the import's job in `from`, and its decision line and syslog line carry it. It also holds the
+subtitle alerts its import held for it, see "Alerts".
 It keeps every flag the import set, after a remux of its own too. Only a subtitle verdict changes a flag: a track whose
 words do not match the audio loses its default and forced flags.
 
@@ -514,7 +542,10 @@ inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending
 the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the
 app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
-by the file's id. A 404 or another item drops the job as `file_gone`.
+by the file's id. A 404 or another item drops the job as `file_gone`. With `HOOK_WORKERS=1` the worker runs a deep
+analysis in its own process, so no crash count covers it. A deep analysis that kills the worker runs again at the next
+start, and the subtitle alerts its import held wait. A count of starts would count each stop of the container too,
+because a stop ends the worker the same way.
 
 ## State
 
@@ -592,7 +623,7 @@ the log weekly with compression. The code never reads the log back, see "State".
 
 Each decision also goes to syslog as one logfmt line with the tag `NAME`. It holds no path, no track
 list and no secret. The app key is `arr`, because a log store such as Loki often puts the syslog tag
-in its `app` label.
+in its `app` label. A deep analysis line adds `from`, the job of the import that queued it.
 
 ```
 arr=radarr source=hook outcome=edited class="English original: audio switched" edits=2 reasons=kids_dub alerts="" tmdb=found label="Film A" id=65ab6056ca69

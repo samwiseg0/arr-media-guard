@@ -202,6 +202,19 @@ AMG also posts each change it makes to a file, unless an alert already says it. 
 backfill, `--sub-check` and `--sub-time` never post. A scan or the audit posts one summary when it finds a problem.
 `arr-media-guard --test-discord` posts a test message and prints Discord's answer.
 
+With `SUBTITLES=deep`, each problem gets one alert. The import holds back its subtitle alerts, because the deep analysis
+checks those subtitles again. The deep analysis then posts once, and only what it still finds wrong. A subtitle problem
+it fixes gets no alert. With `DISCORD_POSTS=all` it gets the one post of the change. A held alert still posts when
+nothing judged its subtitles again. That happens after an error, after a failed hearing, or when `SUBTITLES` is `off` by
+then. With `HOOK_WORKERS` at 2 or more, it also posts when the deep analysis crashes three times. With `HOOK_WORKERS=1`,
+a deep analysis that crashes the worker runs again at the next start, and its held alert waits. A held alert waits with
+the deep analysis job in the background queue, so a restart keeps it. When the app renames or moves the file, the deep
+analysis asks the app where it is and checks it there. A held alert goes unposted only when the app replaced the file,
+or the app says it no longer has the file for that item. When the app lists the file where AMG cannot see it, as while a
+mount is down, the held alert posts. With `DISCORD_POSTS=all`, each change the import made posts once, such as a removed
+track or a flag it turned off. A held alert that posts names the change itself. Otherwise the change posts on its own.
+Every other alert of the import posts at once, such as wrong content, broken audio or video, and a failed flag change.
+
 ## Service checks
 
 When the listener starts, it checks each Sonarr and Radarr, and Plex, Discord, TMDB, SABnzbd and the indexer where the

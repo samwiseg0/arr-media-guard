@@ -423,7 +423,7 @@ TESTER_NFO = "spongebob.squarepants.s04e15.1080p.web.h264-outpost31.nfo"   # as 
 TESTER_RELEASE = "SpongeBob.SquarePants.S04E15.1080p.WEB.H264-OUTPOST31"   # the folder and the video, mixed case
 
 
-def tester_import(monkeypatch, env, tmp_path, release=TESTER_RELEASE, nfo=TESTER_NFO):
+def run_tester_import(monkeypatch, env, tmp_path, release=TESTER_RELEASE, nfo=TESTER_NFO):
     """A tester's import of S04E15 from a download folder named like the release, with the NFO nfo in it."""
     eps = json.load(open(os.path.join(FIXTURES, "spongebob-s00-s04-episodes.json")))
     own = [e for e in eps if (e["seasonNumber"], e["episodeNumber"]) == (4, 15)]
@@ -442,7 +442,7 @@ def tester_import(monkeypatch, env, tmp_path, release=TESTER_RELEASE, nfo=TESTER
 def test_the_testers_release_alerts_the_two_episodes_it_holds(env, monkeypatch, tmp_path):
     """The release follows another episode order. Its NFO names two segments that Sonarr lists as S04E23 and S04E27,
     and Sonarr imported it as S04E15 by its number. The language and the runtime both match."""
-    tester_import(monkeypatch, env, tmp_path)
+    run_tester_import(monkeypatch, env, tmp_path)
     hook.main([])
     rec = decided(env)
     assert {"kind": "episode", "imported": [["S04E15", "Ghost Host"]], "said": "the release's NFO", "title": "Squidtastic Voyage/That's No Lady",
@@ -456,7 +456,7 @@ def test_the_testers_release_alerts_the_two_episodes_it_holds(env, monkeypatch, 
 def test_the_testers_nfo_counts_by_its_name_or_as_the_one_nfo_of_the_release_folder(tmp_path, monkeypatch, env, nfo):
     """Its name is the video's in lower case. Renamed, it is still the one NFO of a folder named like the video. With a
     second NFO beside it, only the name decides."""
-    folder = tester_import(monkeypatch, env, tmp_path, nfo=nfo)
+    folder = run_tester_import(monkeypatch, env, tmp_path, nfo=nfo)
     source = str(folder / f"{TESTER_RELEASE}.mkv")
     assert hook.release_nfo_title(source, TESTER_RELEASE) == "Squidtastic Voyage/That's No Lady"
     (folder / "sample.nfo").write_text("Title: Ghost Host\n")
@@ -465,7 +465,7 @@ def test_the_testers_nfo_counts_by_its_name_or_as_the_one_nfo_of_the_release_fol
 
 def test_the_release_now_in_the_library_gives_no_signal(env, monkeypatch, tmp_path):
     """Its title is S04E15's own, so it alerts nothing. The REPACK flag is no part of the title."""
-    tester_import(monkeypatch, env, tmp_path, release="SpongeBob.SquarePants.S04E15.Ghost.Host.REPACK.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune",
+    run_tester_import(monkeypatch, env, tmp_path, release="SpongeBob.SquarePants.S04E15.Ghost.Host.REPACK.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune",
                   nfo=None)
     hook.main([])
     rec = decided(env)
@@ -9653,6 +9653,7 @@ def test_a_header_repair_remux_runs_with_no_time_limit(mkvs, tmp_path, monkeypat
     assert remux and all("timeout" not in kw and end is None for kw, end in remux), remux
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")   # Python prints the stop a finalizer drops
 def test_a_sigterm_that_a_finalizer_drops_still_stops_the_header_repair(mkvs, tmp_path, monkeypatch, settings):
     """The repair renames the temp file over the original with no no_stop() block. check() raises the dropped stop
     before that rename."""
@@ -9668,6 +9669,7 @@ def test_a_sigterm_that_a_finalizer_drops_still_stops_the_header_repair(mkvs, tm
     assert got.value.code == 128 + signal.SIGTERM and sent and path.read_bytes() == before and os.listdir(path.parent) == ["long.mkv"]
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")   # Python prints the stop a finalizer drops
 @pytest.mark.parametrize("when", ["remux", "probe"])
 def test_a_sigterm_that_a_finalizer_drops_still_stops_the_conversion(convertible, tmp_path, monkeypatch, when):
     """SIGTERM can land while Popen.__del__ runs, after the remux or after the probe of the new file. CPython drops the
@@ -9685,6 +9687,7 @@ def test_a_sigterm_that_a_finalizer_drops_still_stops_the_conversion(convertible
     assert signal.getsignal(signal.SIGTERM) == handler and len(proofs) == (when == "probe")
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")   # Python prints the stop a finalizer drops
 @pytest.mark.parametrize("when", ["remux", "probe"])
 def test_a_ctrl_c_that_a_finalizer_drops_still_stops_the_conversion(convertible, tmp_path, monkeypatch, when):
     """Ctrl+C can land in Popen.__del__ too, and CPython drops its KeyboardInterrupt there. stopped() records it, and
@@ -9724,6 +9727,7 @@ def test_a_ctrl_c_stays_ignored_in_a_process_that_ignores_it(convertible, tmp_pa
     assert seen == [[hook.stopped, signal.SIG_IGN]] and back == [signal.SIG_IGN] * 2
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")   # Python prints the stop a finalizer drops
 def test_a_stop_that_a_finalizer_dropped_ends_the_job_before_its_edit(env, monkeypatch):
     """A job process: job_term() raises in a finalizer during a check, and CPython drops it. The job runs on to its
     edit, and no_stop() raises it again before the editing line. So no write starts after a stop."""
@@ -13018,7 +13022,7 @@ def test_a_job_whose_episode_ids_repeat_asks_the_app_for_each_id_once(monkeypatc
     job = {"owner": "5", "file_id": "70", "episode_ids": "27,27", "path": "/tv/gone/S01E02.mkv"}
     assert hook.unit_files("sonarr", [], job)[70]["items"] == [27] and hook.job_episodes({"episode_ids": "28,27,28"}) == [27, 28]
     (tmp_path / "S01E02.mkv").write_bytes(b"x")
-    assert hook.moved("sonarr", job) == (str(tmp_path / "S01E02.mkv"), None)   # the app's one episode is the job's
+    assert hook.moved("sonarr", job) == (str(tmp_path / "S01E02.mkv"), None, False)   # the app's one episode is the job's
 
 
 @pytest.mark.parametrize("fail", [TimeoutError("timed out"), ConnectionResetError("the app restarts")])
@@ -15223,6 +15227,256 @@ def test_a_deep_analysis_of_an_unchanged_file_keeps_the_flags_of_its_import(env,
     assert rec["source"] == "deep_analysis" and rec["outcome"] == "no_change" and env["mkvpropedit"] == [], rec
     assert ("flags_kept" in rec) == (original is None) and rec["subcheck"]["s1"]["verdict"] == "match", rec
 
+
+
+# --- one alert per problem under SUBTITLES=deep (owner 2026-10-05) ---------------------------------------------------
+
+LATE = {"verdict": "match", "why": "the heard words match the cues at 90%, 92%", "windows": [],
+        "timing": {"fix": None, "unfixed": 2.4, "why": "no fix puts the windows within 0.3 s"}}
+SEEM_LATE = "The English subtitles (track 1) seem about 2.4 s late, but no fix lined them up well enough, so they were left as they are."
+SEEM_POST = ("Subtitles out of sync", "The **English subtitles (track 1)** seem **about 2.4 s late**, but no fix lined them up well enough, so "
+                                      "they were left as they are.")   # the post of SEEM_LATE
+
+
+def one_alert_film(env, monkeypatch, settings, then="fixed", posts="issues"):
+    """A tester's case of 2026-10-05 at SUBTITLES=deep. The import finds the English subtitles about 2.4 s late, with no
+    fix that lines them up. Its deep analysis then hears the file. With then fixed, a block of lines moves to its
+    speech and the rest is in time. With then left, the times stay off. With then error, the deep analysis raises."""
+    settings(subtitles="deep", discord_posts=posts)
+    sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF})
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
+        k: dict(LATE if line or then == "left" else IN_TIME, audio=0, starts=[]) for k in items if k == "s1"})   # line: an import
+    block_stand_ins(env, monkeypatch, found=(SHIFTED,) if then == "fixed" else ())
+    if then == "error":
+        real = hook.process
+        monkeypatch.setattr(hook, "process", lambda ctx: (_ for _ in ()).throw(OSError(5, "Input/output error")) if ctx.mode == "deep" else real(ctx))
+
+
+def posted(env):
+    """(title, description) of each Discord post, in order."""
+    return [(e["title"], e["description"]) for m, u, b in env["http"] if m == "POST" and "discord" in u for e in b["embeds"]]
+
+
+def two_lines(env):
+    """The decision lines of the import and of its deep analysis."""
+    lines = [r for r in log_lines(env) if "schema" in r]
+    deep = lambda r: str(r.get("job")).startswith("deep-analysis-")
+    return [r for r in lines if r["source"] == "hook" and not deep(r)][-1], [r for r in lines if deep(r)]
+
+
+@pytest.mark.parametrize("posts, want", [("issues", []), ("all", ["Subtitles retimed"])])
+def test_an_import_holds_the_alert_its_deep_analysis_fixes(env, monkeypatch, settings, posts, want):
+    """The tester's case: the import alerted "seem about 2.4 s late" and the deep analysis fixed the subtitles an hour
+    later. Now the import holds that alert, and the decision line keeps it. The deep analysis fixed the problem, so
+    issues mode posts nothing, and all mode posts its one change. The deep analysis's lines name the import's job."""
+    one_alert_film(env, monkeypatch, settings, "fixed", posts)
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert first["alert_kinds"] == ["subtiming"] and first["alert_result"] == [hook.HOLD_RESULT] and first["alerts"] == [f"subtiming: {SEEM_LATE}"], first
+    assert (deep["outcome"], deep["subremux"]["codes"], deep["findings"]) == ("subtitles_remuxed", ["subtitle_blocks_retimed"], []), deep
+    assert [t for t, _ in posted(env)] == want and deep["held_result"] == ["checked again"], posted(env)
+    assert deep["from"] == first["job"] and deep["job"].startswith("deep-analysis-"), deep
+    line = [x for x in env["syslog"] if "source=deep_analysis" in x][-1]
+    assert f' job={deep["job"]} from={first["job"]}' in line and line.endswith(f'from={first["job"]}'), line
+    assert " from=" not in [x for x in env["syslog"] if "source=hook" in x][-1]
+
+
+def test_the_deep_analysis_posts_once_what_it_leaves_unresolved(env, monkeypatch, settings):
+    """The deep analysis finds the times still off. It posts that once, in its own words. The import posted nothing."""
+    one_alert_film(env, monkeypatch, settings, "left")
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and deep["alert_kinds"] == ["subtiming"] and deep["alert_result"] == ["sent"], deep
+    assert [t for t, _ in posted(env)] == ["Subtitles out of sync"] and deep["held_result"] == ["checked again"], posted(env)
+
+
+def test_an_alert_the_deep_analysis_never_checks_posts_at_the_import(env, monkeypatch, settings):
+    """The runtime alert is no subtitle alert, so it posts at the import as before. Only the subtitle alert waits."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    env["movies"]["movie/7"]["runtime"] = 300   # the file runs far shorter than the app lists
+    name = enqueue(env, 0, env["path"])
+    hook.run_job(name, [])
+    first, _ = two_lines(env)
+    assert dict(zip(first["alert_kinds"], first["alert_result"])) == {"runtime": "sent", "subtiming": hook.HOLD_RESULT}, first
+    assert [t for t, _ in posted(env)] == ["Wrong runtime"] and hook.job_of(hook.deep_name(env["path"]))["from"] == name
+
+
+def test_a_deep_analysis_that_errors_posts_the_held_alert(env, monkeypatch, settings):
+    """The deep analysis never checked the subtitles again, so the alert the import held posts, in the import's words."""
+    one_alert_film(env, monkeypatch, settings, "error")
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert deep["outcome"] == "error" and deep["held_result"] == ["sent"] and deep["from"] == first["job"], deep
+    assert posted(env) == [SEEM_POST], posted(env)
+
+
+def test_a_deep_analysis_that_crashes_past_its_tries_posts_the_held_alert(env, monkeypatch, settings):
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    name = hook.deep_name(env["path"])
+    for _ in range(hook.CRASH_TRIES):
+        assert hook.claim(name) and posted(env) == []
+        hook.requeue(name, "died by signal 9")
+    first, (deep,) = two_lines(env)
+    assert hook.deep_analysis_queued() == [] and deep["outcome"] == "error" and deep["held_result"] == ["sent"], deep
+    assert deep["from"] == first["job"] and posted(env) == [SEEM_POST], posted(env)
+
+
+def app_answers(env, monkeypatch, answer):
+    """The app's answer for its file 11, the file of the import: answer() gives it, or an exception to raise."""
+    env["movies"]["rootfolder"] = [{"path": os.path.dirname(os.path.dirname(env["path"])) + "/"}]
+    real = hook.arr
+
+    def arr(app, p):
+        got = answer() if p == "moviefile/11" else None
+        if isinstance(got, Exception):
+            raise got
+        return got if p == "moviefile/11" else real(app, p)
+    monkeypatch.setattr(hook, "arr", arr)
+
+
+@pytest.mark.parametrize("how", ["replaced", "removed"])
+def test_a_deep_analysis_dropped_with_its_file_posts_nothing(env, monkeypatch, settings, how):
+    """The app replaced the file, or removed it and says it no longer has it. A new import checks a new file, so the
+    held alert goes with the old one."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    hook.run_job(enqueue(env, 0, env["path"], file_id="11"), [])
+    change_file(env["path"], how)
+    app_answers(env, monkeypatch, lambda: http_error(404))
+    hook.deep_analysis(hook.deep_name(env["path"]), [])
+    _, (deep,) = two_lines(env)
+    assert deep["outcome"] in ("file_replaced", "file_gone") and deep["held_result"] == ["dropped with the file"] and posted(env) == [], deep
+
+
+@pytest.mark.parametrize("answer, held", [("moved", "checked again"), ("error", "sent"), ("same path", "sent"), ("not mounted", "sent")])
+def test_a_deep_analysis_follows_a_file_the_app_renamed_while_it_waited(env, monkeypatch, settings, answer, held):
+    """The app renamed the file after the import, and no import follows a rename. The deep analysis asks the app where
+    the file is now and checks it there. When the app does not answer, nothing checks the subtitles, so the held alert
+    posts. So it does when the app still lists the file at its old path, as while a mount is down, or at a path this
+    container does not see. Only the app's own word drops a held alert."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    old = env["path"]
+    hook.run_job(enqueue(env, 0, old, file_id="11"), [])
+    new = old[:-4] + " Renamed.mkv"
+    os.rename(old, new)
+    where = {"moved": new, "same path": old, "not mounted": "/elsewhere/Film A (1979)/Film A.mkv"}
+    app_answers(env, monkeypatch, lambda: {"id": 11, "movieId": 7, "path": where[answer]} if answer in where else http_error(500))
+    hook.deep_analysis(hook.deep_name(old), [])
+    _, (deep,) = two_lines(env)
+    assert deep["held_result"] == [held] and posted(env) == ([] if answer == "moved" else [SEEM_POST]), (deep, posted(env))
+    if answer == "moved":
+        moved = [r for r in log_lines(env) if r.get("result") == "file_moved"]
+        assert [(r["old_path"], r["path"]) for r in moved] == [(old, new)] and deep["path"] == new and deep["outcome"] == "subtitles_remuxed", deep
+    else:
+        assert deep["outcome"] == "file_gone" and "app_said" not in deep, deep
+        assert ("the app was not asked where the file is: HTTPError" if answer == "error" else "which is missing too") in deep["note"], deep
+
+
+@pytest.mark.parametrize("how", ["failed hearing", "no language model"])
+def test_a_deep_analysis_that_judged_nothing_posts_the_held_alert(env, monkeypatch, settings, how):
+    """The hearing of the deep analysis failed, so its word check says unknown, or the language model is not there. It
+    judged nothing, so the alert the import held posts."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    if how == "failed hearing":
+        fail = {"verdict": "unknown", "why": "no answer in 600 seconds", "windows": [], "timing": None}
+        monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
+            k: dict(fail, audio=0, starts=[]) for k in items if k == "s1"})
+        monkeypatch.setattr(hook, "sub_sweep", lambda path, j, items, sync, deep=False: ({k: [] for k in items}, {"cpu": 0, "took": 0, "failed": list(items)}))
+    else:
+        monkeypatch.setattr(hook, "lid_ready", lambda: False)
+    hook.deep_analysis(hook.deep_name(env["path"]), [])
+    _, (deep,) = two_lines(env)
+    assert deep["held_result"] == ["sent"] and posted(env) == [SEEM_POST], (deep, posted(env))
+
+
+def test_a_deep_analysis_that_fixed_the_subtitles_and_then_errs_posts_nothing_stale(env, monkeypatch, settings):
+    """The deep analysis moved the block in its remux, then its subtitle cache write failed. The error line keeps the
+    remux, and the held alert of that track goes unposted, because the remux fixed it."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    real = hook.sub_cache
+    monkeypatch.setattr(hook, "sub_cache", lambda path, rec, mode, app, pending: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
+                        if mode == "deep" else real(path, rec, mode, app, pending))
+    hook.main([])
+    _, (deep,) = two_lines(env)
+    assert deep["outcome"] == "error" and deep["subremux"]["timed"] == ["s1"] and deep["held_result"] == ["fixed before the error"], deep
+    assert posted(env) == []
+
+
+@pytest.mark.parametrize("deep_says, held, titles", [
+    ("match", "checked again, change sent", ["Default tracks changed"]),
+    ("mismatch", "checked again, change said by the deep analysis", ["Wrong subtitles"]),
+    ("error", "sent", ["Wrong subtitles"])])
+def test_all_mode_names_the_flag_change_of_a_held_alert_once(env, monkeypatch, settings, deep_says, held, titles):
+    """The import calls the default English track a mismatch. With no original kept the track stays and its flags go
+    off. The held alert names that, so the import posts no change for it. When the deep analysis finds the track
+    matches, the held alert goes, and the flag change posts in its place. When the deep analysis finds the mismatch
+    too, its own alert says the flags, so the change posts nothing. After an error the held alert posts and says it."""
+    settings(subtitles="deep", discord_posts="all")
+    sub_time_film(env, monkeypatch, [("eng", True, {})], {"s1": REF})
+    wrong = {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best", "windows": [], "timing": None}
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
+        k: dict(wrong if line or deep_says == "mismatch" else IN_TIME, audio=0, starts=[]) for k in items if k == "s1"})
+    block_stand_ins(env, monkeypatch, found=(), rows={"s1": [dict(w, offset=0.1, off=0.1) for w in LATE_ROWS]})
+    if deep_says == "error":
+        real = hook.process
+        monkeypatch.setattr(hook, "process", lambda ctx: (_ for _ in ()).throw(OSError(5, "Input/output error")) if ctx.mode == "deep" else real(ctx))
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert first["edits"] and first["alert_result"] == [hook.HOLD_RESULT] and first["change_result"] == [], first
+    assert deep["held_result"] == [held] and [t for t, _ in posted(env)] == titles, (deep["held_result"], posted(env))
+    assert sum("default" in d for _, d in posted(env)) == 1, posted(env)   # one post names the flag change
+
+
+def test_a_remux_that_only_lengthened_ends_before_an_error_leaves_the_held_timing_alert_to_post(env, monkeypatch, settings):
+    """The deep analysis finds the track still 2.4 s late with no block to move. Its remux only makes short lines stay
+    on screen longer, then its subtitle cache write fails. Longer ends fix no timing, so the held alert posts."""
+    one_alert_film(env, monkeypatch, settings, "left")
+    monkeypatch.setattr(hook, "flash_check", lambda path, j, sides, full=False, stop=None: {"s1": [(a, t, b, b + 1.0) for a, b, t in REF]})
+    real = hook.sub_cache
+    monkeypatch.setattr(hook, "sub_cache", lambda path, rec, mode, app, pending: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
+                        if mode == "deep" else real(path, rec, mode, app, pending))
+    hook.main([])
+    _, (deep,) = two_lines(env)
+    assert deep["outcome"] == "error" and deep["subremux"]["ended"] == ["s1"] and deep["held_result"] == ["sent"], deep
+    assert posted(env) == [SEEM_POST], posted(env)
+
+
+@pytest.mark.parametrize("level, held, titles", [("fix", "checked again", []), ("check", "checked again", ["Subtitles out of sync"]),
+                                                  ("off", "sent", ["Subtitles out of sync"])])
+def test_a_held_alert_posts_only_when_nothing_checks_the_subtitles_again(env, monkeypatch, settings, level, held, titles):
+    """SUBTITLES changed before the deep analysis ran. At fix and check the deep analysis still checks the subtitles, so
+    its own result replaces the held alert. At fix it moves the block and posts nothing. At check it leaves the block
+    and posts that once, in its own words. At off nothing checks again, so the held alert posts."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    settings(subtitles=level)
+    hook.deep_analysis(hook.deep_name(env["path"]), [])
+    _, (deep,) = two_lines(env)
+    assert deep["held_result"] == [held] and [t for t, _ in posted(env)] == titles, (deep, posted(env))
+    assert (posted(env) == [SEEM_POST]) == (level == "off"), posted(env)
+
+
+def test_an_import_posts_its_held_alert_when_the_deep_analysis_does_not_queue(env, monkeypatch, settings):
+    """The store did not take the deep analysis job, so the alert the import held posts at once."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    monkeypatch.setattr(hook, "queue_deep_analysis", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    note = [r for r in log_lines(env) if "held_result" in r]
+    assert [t for t, _ in posted(env)] == ["Subtitles out of sync"] and note[0]["held_result"] == ["sent"], note
+
+
+def test_a_waiting_deep_analysis_keeps_the_held_alert_across_a_restart(env, monkeypatch, settings):
+    """The container stopped while the deep analysis job waited, or while it ran. The next start runs it, and the held
+    alert is still there: it posts when the deep analysis errors."""
+    one_alert_film(env, monkeypatch, settings, "error")
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    name = hook.deep_name(env["path"])
+    assert hook.claim(name) and len(hook.job_of(name, True)["held"]) == 1   # a job process ran it when the container stopped
+    hook.store.close()
+    run_worker()
+    _, (deep,) = two_lines(env)
+    assert deep["held_result"] == ["sent"] and [t for t, _ in posted(env)] == ["Subtitles out of sync"] and not claimed(), deep
 
 def test_a_hearing_leaves_no_onnxruntime_log_in_the_system_temp_dir(env, monkeypatch, tmp_path):
     """onnxruntime in the Whisper venv creates an empty log named by the process id on import. The hearing removes the

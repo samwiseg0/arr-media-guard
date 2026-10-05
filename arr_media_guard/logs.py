@@ -159,15 +159,35 @@ def post(app, emb):
         return config.mask(f"failed: {type(ex).__name__}: {ex}")[:200]
 
 
-def alert_findings(rec, size):
+DEEP_KINDS = ("submatch", "subtiming")   # the alert kinds the deep analysis checks again, see alert_findings()
+HOLD_RESULT = "held for the deep analysis"   # what alert_findings() gives for an alert it holds
+
+
+def alert_findings(rec, size, held=None):
     """Post the findings of rec that report.posts() passes, one embed each, see report.alert_embed() and alert(). This is
     the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log.
+
+    held is a list when the deep analysis of the file follows this import, see process.alerts(). A finding of
+    DEEP_KINDS that would post then goes into held as its kind, size and embed, the subtitles it names as "keys", see
+    report.named(), and gives HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
+    nothing judged those subtitles again, see runner.held_after(). With DISCORD_POSTS all, a held finding keeps the
+    change posts of what it says itself in "changes", see report.held_posts(): a removed track, a flag it says was
+    turned off, and the conversion it names. The change posts of rec leave those out, see report.said(). held_changes()
+    posts them when the held alert goes unposted, so each change posts once.
 
     With DISCORD_POSTS all, each change the run made to the file posts too, see report.render() "changes". They skip the
     marker of alert(), because a second run finds nothing left to change. rec["change_result"] says what each post gave.
     A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line."""
-    out = [alert(rec["app"], f["kind"], rec["path"], size, e) if report.posts(f, rec) else "log only"
-           for f, e in zip(rec["findings"], report.render(rec, "embed"))]
+    out = []
+    for f, e in zip(rec["findings"], report.render(rec, "embed")):
+        if not report.posts(f, rec):
+            out.append("log only")
+        elif held is not None and f["kind"] in DEEP_KINDS:
+            changes = report.held_posts(rec, f, report.tense_of(rec)) if config.CFG.discord_posts == "all" else []
+            held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {})})
+            out.append(HOLD_RESULT)
+        else:
+            out.append(alert(rec["app"], f["kind"], rec["path"], size, e))
     if config.CFG.discord_posts == "all":
         try:
             rec["change_result"] = [post(rec["app"], e) if isinstance(e, dict) else e for e in report.render(rec, "changes")]
@@ -217,6 +237,24 @@ def alert(app, kind, path, size, emb):
             with contextlib.suppress(sqlite3.Error, OSError):
                 store.drop("alert", mark)
     return sent
+
+
+def post_held(app, path, held):
+    """Post the alerts an import held for the deep analysis of path, see alert_findings(), each once per file, kind and
+    size, see alert(). Each embed takes the time of the post. Returns what each post gave."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    return [alert(app, h["kind"], path, h["size"], dict(h["embed"], timestamp=now)) for h in held]
+
+
+def held_changes(app, held, why, flags=frozenset()):
+    """Post the changes each held alert keeps, see alert_findings() and report.held_posts(), when the alert itself goes
+    unposted. A flag edit whose tracks are all in flags posts nothing, because a posted alert of the deep analysis says
+    those flags already. Returns one entry per held alert: why, and what each of its change posts gave. A change whose
+    text failed posts nothing."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    post_one = lambda c: "said by the deep analysis" if c.get("flags") and set(c["flags"]) <= set(flags) else \
+        post(app, dict(c["post"], timestamp=now)) if isinstance(c["post"], dict) else c["post"]
+    return [f'{why}, change {", ".join(post_one(c) for c in h["changes"])}' if h.get("changes") else why for h in held]
 
 
 def forced_note(repack):

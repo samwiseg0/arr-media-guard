@@ -29,12 +29,22 @@ flowchart TD
     fault -->|"yes"| regrab["Re-grab, and put back the old file of an upgrade"]
     fault -->|"no"| edit["Flag and tag edit, after the undo line in the log"]
     edit --> content["Wrong content checks"]
-    content --> alerts["Discord alerts for unresolved problems"]
+    content --> follows{"SUBTITLES=deep and the file has subtitles?"}
+    follows -->|"no"| alerts["Discord: one alert for each problem AMG could not fix"]
+    follows -->|"yes"| hold["Discord: alerts on anything but subtitles post now, subtitle alerts wait"]
     regrab --> alerts
     alerts --> log["Decision log and syslog"]
+    hold --> log
     log --> plex["Plex reads the changed file again"]
-    log --> deep["The deep analysis, with SUBTITLES=deep, while no import waits"]
+    log -->|"SUBTITLES=deep"| deep["The deep analysis, while no import waits"]
+    deep --> deepalert["Discord: one alert for each subtitle problem still left, nothing for a problem it fixed"]
 ```
+
+Each problem gets one Discord post. The import posts the problems it could not fix. With `SUBTITLES=deep`, the import
+holds its subtitle alerts, because the deep analysis checks the subtitles again. The deep analysis posts only what it
+still finds wrong. When it ends in an error or cannot judge the subtitles, the held alerts post then. With
+`DISCORD_POSTS=all`, each change AMG made to the file posts too. See [6. What you see](#6-what-you-see) and
+[7. The deep analysis](#7-the-deep-analysis).
 
 ## 1. The app tells AMG about the file
 
@@ -126,7 +136,8 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
   the job, as the listener's `queued` line does. See [monitoring.md](monitoring.md#syslog).
 - **Discord.** One alert for each problem the job left unresolved, to `DISCORD_WEBHOOK`. A problem AMG fixed, such as a
   re-grab or a removed subtitle, goes to the decision log only. The same alert posts once for the same file. With
-  `DISCORD_POSTS=all`, each change AMG made to the file posts too. See [features.md](features.md#alerts).
+  `DISCORD_POSTS=all`, each change AMG made to the file posts too. With `SUBTITLES=deep`, the subtitle alerts wait for
+  the deep analysis, see [7. The deep analysis](#7-the-deep-analysis). See [features.md](features.md#alerts).
 - **Plex.** After a change, AMG asks Plex to read the item again, so Plex shows the new tracks. A new import is often
   not in Plex yet, so AMG looks for it for 10 minutes. The item's library must be idle on two checks 15 seconds apart,
   because a read during a Plex scan can crash Plex. After 30 minutes of a busy library, AMG leaves it to Plex's own
@@ -142,8 +153,15 @@ to much more of the audio. It can move a stretch of lines that is out of sync, a
 can also retime foreign subtitles by the speech, and repair garbled text. See [features.md](features.md#subtitle-match).
 
 It runs only while no import waits, and it stops between two steps when one arrives. It keeps the flags the import set,
-and it alerts only on subtitles. It drops itself when the app replaced or removed the file. A deep analysis that a
+and it alerts only on subtitles. When the app renamed or moved the file, it checks the file at its new path. It drops
+itself when the app replaced or removed the file. A deep analysis that a
 stopped container left runs after the next start.
+
+The import posts no subtitle alert when a deep analysis follows. It keeps those alerts in the deep analysis job. The
+deep analysis checks the subtitles again and posts once, only what it still finds wrong. So a problem it fixes gets no
+alert. The kept alerts post when the deep analysis cannot judge the subtitles again. That happens after an error, a
+failed hearing, or with `SUBTITLES` set to `off` by then. They wait in the state store, so a restart keeps them. The
+decision line of the deep analysis names the import's job in `from`, so you can match the two lines.
 
 A *recheck* is another kind of job in the background queue. After an update, AMG queues one for each file whose saved
 subtitle check the new version can improve. It repeats that check on the file, and never checks deeper. It waits behind

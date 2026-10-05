@@ -140,6 +140,7 @@ class Ctx:
     pool: object = None   # the conversion pool of a backfill with several workers, see backfill_files(). It converts under the shared lock.
     force: str = None   # the refusal a person accepts, see convert()
     recheck: str = None
+    held: list = None   # the alerts an import holds for the deep analysis of its file, see alerts()
 
     def __post_init__(self):
         if self.mode not in MODES:
@@ -759,17 +760,20 @@ def content_checks(ctx):
 
 def alerts(ctx):
     """The findings of the run in the record, and their alerts, posted unless post is False. The deep analysis and a
-    recheck alert on the subtitles only, because the import alerted on the rest."""
+    recheck alert on the subtitles only, because the import alerted on the rest. An import whose file gets the deep
+    analysis holds the subtitle alerts in held, because that analysis checks them again and posts what it still finds,
+    see logs.alert_findings() and runner.queue_deep_analysis()."""
     rec = ctx.rec
     try:
         problems = ctx.first + file_alerts(ctx.d, ctx.file_checks, ctx.meta, ctx.original, ctx.item) + ctx.rest
     except Exception as ex:   # a finding must never cost the decision line or the Plex analyze of an edited file
         rec["alert_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         problems = ctx.first + ctx.rest
-    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in ("submatch", "subtiming")]
+    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in logs.DEEP_KINDS]
     rec["alert_kinds"] = [p["kind"] for p in rec["findings"]]
     if ctx.post:   # after the edit, so a failed post never blocks one
-        rec["alert_result"] = logs.alert_findings(rec, ctx.size)
+        ctx.held = [] if ctx.mode == "import" and runner.deep_wanted(rec) else None
+        rec["alert_result"] = logs.alert_findings(rec, ctx.size, ctx.held)
 
 
 STEPS = (start, conversion, header, languages, subtitle_checks, deep_drop, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
