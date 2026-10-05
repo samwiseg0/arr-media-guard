@@ -900,6 +900,24 @@ def test_a_stuck_state_lock_ends_at_the_time_limit(held, take, done):
     assert done()
 
 
+@pytest.mark.parametrize("take", [lambda: hook.remember_folder("/nonexistent/.keep"), kept_records_taken])
+def test_a_store_wait_the_time_limit_bound_ends_the_job_on_any_clock(monkeypatch, take):
+    """busy_timeout takes whole ms, so on a fast host the wait for the store can end just before the limit. A frozen
+    clock gives that case every time: the limit still has time left when the wait ends. The wait ends the job anyway,
+    and the limit ends with it. A wait that its own bound ended keeps the limit and raises the store's error."""
+    monkeypatch.setattr(hook.time, "monotonic", lambda: 1000.0)
+    with store_held():
+        hook.DEADLINE.start(0.05)
+        with pytest.raises(hook.arr_meta.OutOfTime):
+            take()
+        assert hook.DEADLINE.end is None
+        hook.DEADLINE.start(5)
+        monkeypatch.setattr(hook.store, "wait", 0.05)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            hook.store.put("probe", "k", 1)
+        assert hook.DEADLINE.end == 1005.0
+
+
 @pytest.mark.parametrize("read", ["mkvmerge", "ffprobe_audio", "ffprobe_duration", "video_stream_seconds", "ff_streams", "convert_captions"])
 def test_each_read_under_the_time_limit_ends_at_it(monkeypatch, tmp_path, read):
     clock, asked = [1000.0], []

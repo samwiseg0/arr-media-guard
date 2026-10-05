@@ -155,17 +155,21 @@ def carry(moved):
 def tx():
     """One write transaction. It takes the write lock at its start, so what it reads stays true until it ends. Its wait
     for another writer ends after wait seconds, at until, or at the job's time limit with OutOfTime. Inside a transaction
-    it adds nothing."""
+    it adds nothing. busy_timeout takes whole ms, so the wait can end up to 1 ms before the limit, with time left on the
+    clock. So a busy wait that the limit bound raises OutOfTime when it ends."""
     c = db()
     if c.in_transaction:
         yield c
         return
-    secs = config.DEADLINE.bound(wait) if until is None else max(0.0, min(config.DEADLINE.bound(wait), until - time.perf_counter()))
+    limit = config.DEADLINE.bound(wait)
+    secs = limit if until is None else max(0.0, min(limit, until - time.perf_counter()))
     c.execute(f"PRAGMA busy_timeout = {int(secs * 1000)}")
     try:
         c.execute("BEGIN IMMEDIATE")
-    except sqlite3.OperationalError:
-        config.DEADLINE.check()   # the wait took the time the job had left
+    except sqlite3.OperationalError as ex:
+        if secs == limit < wait and ex.sqlite_errorcode & 0xff == sqlite3.SQLITE_BUSY:
+            config.DEADLINE.out()   # the limit bound the wait, so the wait took the time the job had left
+        config.DEADLINE.check()
         raise
     try:
         yield c

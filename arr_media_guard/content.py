@@ -102,9 +102,14 @@ class Deadline:
             return None
         left = self.end - time.monotonic()
         if left <= 0:
-            self.end = None
-            raise OutOfTime(self.why)
+            self.out()
         return left
+
+    def out(self):
+        """Raise OutOfTime and end the limit. A wait that the limit bound calls it when the wait ends, because the
+        wait's own timer may stop a little before the limit's end."""
+        self.end = None
+        raise OutOfTime(self.why)
 
     def check(self):
         self.left()
