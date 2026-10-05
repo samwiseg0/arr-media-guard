@@ -66,6 +66,8 @@ with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     POLICY = json.load(_f)
 hook.arr_decide.set_policy(POLICY)
 hook.CFG = dataclasses.replace(hook.CFG, keep_days=0)   # a repack drops its original. The tests of the kept original switch it on.
+# One job at a time in the worker, and no deep analysis. A test of job processes or of the deep analysis sets its own.
+hook.CFG = dataclasses.replace(hook.CFG, hook_workers=1, subtitles="fix")
 # mkvmerge's language table as `mkvmerge --list-languages` prints it, so no test runs mkvmerge for it
 LANGUAGES = ("English | eng | eng | en\nSpanish | spa | spa | es\nFrench | fre | fre | fr\nJapanese | jpn | jpn | ja\n"
              "Portuguese | por | por | pt\nChinese | chi | chi | zh\nUndetermined | und | und |\n")
@@ -3437,9 +3439,11 @@ print("after the edit", rec["outcome"], flush=True)
 def test_a_ctrl_c_during_mkvpropedit_lets_the_write_finish_then_stops(tmp_path):
     """Ctrl+C in a terminal sends SIGINT to the whole foreground process group, mkvpropedit included. no_stop() blocks
     it, and the child inherits the block, so the write finishes. The run stops right after it."""
-    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
-    (bin_dir / "mkvpropedit").write_text(f"#!{sys.executable}\nimport sys, time\n"   # dash clears its signal mask at start, mkvpropedit does not
-                                         "open(sys.argv[1], 'ab').write(b'part1')\ntime.sleep(1)\nopen(sys.argv[1], 'ab').write(b' part2')\n")
+    bin_dir, go = tmp_path / "bin", tmp_path / "go"; bin_dir.mkdir()
+    (bin_dir / "mkvpropedit").write_text(f"#!{sys.executable}\nimport os, sys, time\n"   # dash clears its signal mask at start, mkvpropedit does not
+                                         "open(sys.argv[1], 'ab').write(b'part1')\nend = time.time() + 60\n"   # the second part waits for the Ctrl+C
+                                         f"while not os.path.exists({str(go)!r}) and time.time() < end: time.sleep(0.005)\n"
+                                         "open(sys.argv[1], 'ab').write(b' part2')\n")
     (bin_dir / "mkvpropedit").chmod(0o755)
     path = tmp_path / "Movie.mkv"
     path.write_bytes(b"")
@@ -3450,6 +3454,7 @@ def test_a_ctrl_c_during_mkvpropedit_lets_the_write_finish_then_stops(tmp_path):
     while not written(path) and time.time() < deadline:
         time.sleep(0.005)
     os.killpg(p.pid, signal.SIGINT)   # the terminal's Ctrl+C, to every process of the group
+    go.touch()
     out, err = p.communicate(timeout=60)
     assert (p.returncode, out) == (-signal.SIGINT, ""), (p.returncode, out, err)
     assert path.read_bytes() == b"part1 part2" and "KeyboardInterrupt" in err
@@ -5120,7 +5125,7 @@ def test_sigterm_after_an_edit_finishes_the_job_and_keeps_its_plex_analyze(pool,
     assert hook.store.get("plex", "pending") is None
 
 
-@pytest.mark.parametrize("value, workers", [("4", 4), ("x", 1), ("0", 1), ("-2", 1), ("", 1)])
+@pytest.mark.parametrize("value, workers", [("4", 4), ("x", 1), ("0", 1), ("-2", 1), ("", 2)])
 def test_a_bad_hook_workers_value_falls_back_to_one_and_says_so(tmp_path, monkeypatch, value, workers):
     (tmp_path / "queue").mkdir()
     (tmp_path / "env").write_text(f"HOOK_WORKERS='{value}'\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\n")
@@ -13191,8 +13196,8 @@ def test_sub_time_says_nothing_of_an_app_the_user_did_not_set_up(env, monkeypatc
     elif setup == "host one app":
         assert out[:2] == [f"no app lists it, so it knows no original language: {p}" for p in (env["path"], other)], out
     else:
-        failed = (f"RADARR_URL is set, but the Radarr API key does not read: [Errno 2] No such file or directory: "
-                  f"'{tmp_path / 'no-app' / 'config.xml'}'. Set RADARR_API_KEY.")
+        error = f"[Errno 2] No such file or directory: '{tmp_path / 'no-app' / 'config.xml'}'"
+        failed = f"RADARR_URL is set, but the Radarr API key does not read: {error[:150]}. Set RADARR_API_KEY."   # a long tmp_path is cut
         assert out[:3] == [failed] + [f"no app could be asked, so this dry run knows no original language: {p}" for p in (env["path"], other)], out
         with pytest.raises(SystemExit) as ex:
             hook.main(["--sub-time", env["path"], "--apply"])
@@ -13324,13 +13329,17 @@ def test_an_import_keeps_its_alert_when_the_original_cannot_be_kept(env, monkeyp
     settings(keep_days=7)
     monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
     not_writable(monkeypatch, tmp_path)
+    before = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)   # the stamp keeps whole seconds
     hook.main([])
+    after = datetime.datetime.now(datetime.timezone.utc)
     rec = decided(env)
     assert rec["apply"] and rec["findings"] == [{"kind": "subtiming", "lines": [{
         "code": "not_retimed", "tracks": ["s1"], "block": None,
         "result": f"subtitle remux skipped, the original cannot be kept: {tmp_path} is not writable: track 2: new ends for 40 of 40 cues"}]}]
     (b,) = [b for m, u, b in env["http"] if "discord" in u]
-    assert b["embeds"] == hook.render(rec, "embed", "done"), b["embeds"]
+    stamp = b["embeds"][0]["timestamp"]   # render() stamps the second it runs in, and a busy host may run it a second later
+    assert before <= datetime.datetime.fromisoformat(stamp) <= after, (before, stamp, after)
+    assert b["embeds"] == [dict(e, timestamp=stamp) for e in hook.render(rec, "embed", "done")], b["embeds"]
 
 
 @pytest.mark.parametrize("dense", [False, True])
@@ -16714,17 +16723,26 @@ def test_the_bytes_of_a_garbled_track_never_overwrite_a_file_and_must_match_its_
     assert hook.packet_text(str(src), str(md5)) == "1 bytes follow the last packet"
 
 
-def garbled_run(env, monkeypatch, settings, tmp_path, cues, cp, lang, film_lang="eng"):
+@pytest.fixture(scope="module")
+def garbled_av(tmp_path_factory):
+    """The video and audio of garbled_run(), 400 seconds, made once for the tests that use it."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    path = tmp_path_factory.mktemp("garbled") / "av.mp4"
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=400", "-f", "lavfi", "-i",
+              "sine=sample_rate=8000:duration=400", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(path)], check=True)
+    return path
+
+
+def garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, cp, lang, film_lang="eng"):
     """A 400-second file with one SubRip track tagged lang, garbled from cp by an old muxer, ready for --sub-time with
     the real reads and remux. The word check and the hearing are faked by the caller."""
     english_film(env, ("eng", False, {}))
     env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
     d = tmp_path / "src"
     d.mkdir()
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=400", "-f", "lavfi", "-i",
-              "sine=sample_rate=8000:duration=400", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
     (d / "0.srt").write_bytes(srt_text(cues).encode(cp))
-    REAL_RUN(["mkvmerge", "-q", "-o", env["path"], "--language", f"1:{film_lang}", str(d / "av.mp4"), "--language", f"0:{lang}", "--sub-charset",
+    REAL_RUN(["mkvmerge", "-q", "-o", env["path"], "--language", f"1:{film_lang}", str(garbled_av), "--language", f"0:{lang}", "--sub-charset",
               "0:cp1252", str(d / "0.srt")], check=True)
     monkeypatch.setattr(hook, "subtitle_cues", REAL_SUBTITLE_CUES)
     monkeypatch.setattr(hook, "mkvmerge", REAL_MKVMERGE)
@@ -16743,13 +16761,13 @@ def garbled_run(env, monkeypatch, settings, tmp_path, cues, cp, lang, film_lang=
     return cache
 
 
-def test_a_garbled_track_whose_words_do_not_match_is_repaired_and_judged_again(env, monkeypatch, settings, tmp_path):
+def test_a_garbled_track_whose_words_do_not_match_is_repaired_and_judged_again(env, monkeypatch, settings, tmp_path, garbled_av):
     """A Russian film whose Russian subtitles an old muxer garbled from cp1251. The word check hears the right words and
     finds none of them in the garbled cues. The track's verdict waits, so the repair runs and the track stays. The run
     stays pending in the cache, so the next run judges the readable text."""
     env["movies"]["movie/7"]["originalLanguage"] = {"name": "Russian"}
     cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("rus", 2))]
-    cache = garbled_run(env, monkeypatch, settings, tmp_path, cues, "cp1251", "rus", "rus")
+    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "rus", "rus")
     env["movies"]["movie"][0]["originalLanguage"] = {"name": "Russian"}
     sub = hook.arr_subsync
     heard = [{"at": at, "words": [[round(t - at, 2), w] for t, _, w, _ in sub.flat(cues) if at <= t < at + sub.WINDOW]} for at in (40.0, 180.0)]
@@ -16763,12 +16781,12 @@ def test_a_garbled_track_whose_words_do_not_match_is_repaired_and_judged_again(e
     assert [t for _, _, t in after] == [t for _, _, t in cues] and cache[env["path"]] == (os.stat(env["path"]).st_mtime_ns, True)
 
 
-def test_a_garbled_track_whose_words_do_not_match_and_whose_read_was_cut_stays_and_alerts(env, monkeypatch, settings, tmp_path):
+def test_a_garbled_track_whose_words_do_not_match_and_whose_read_was_cut_stays_and_alerts(env, monkeypatch, settings, tmp_path, garbled_av):
     """The same track, with its read cut 3 cues short of its end. The word check judged garbled text, so the verdict
     waits. A cut read is never repaired, so the track stays in the file with an alert, and nothing is pending."""
     env["movies"]["movie/7"]["originalLanguage"] = {"name": "Russian"}
     cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("rus", 2))]
-    cache = garbled_run(env, monkeypatch, settings, tmp_path, cues, "cp1251", "rus", "rus")
+    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "rus", "rus")
     env["movies"]["movie"][0]["originalLanguage"] = {"name": "Russian"}
     monkeypatch.setattr(hook, "CUE_MAX", len(cues) - 3)
     sub = hook.arr_subsync
@@ -16784,12 +16802,12 @@ def test_a_garbled_track_whose_words_do_not_match_and_whose_read_was_cut_stays_a
 
 
 @pytest.mark.parametrize("failed", [[], ["audio 0: the hearing timed out"]])
-def test_a_live_track_whose_hearing_stopped_part_way_stays_pending(env, monkeypatch, settings, tmp_path, failed):
+def test_a_live_track_whose_hearing_stopped_part_way_stays_pending(env, monkeypatch, settings, tmp_path, garbled_av, failed):
     """The English track matches in time, and dense hearing finds it live-captioned. When the hearing stopped part way,
     the track is not fixed, and the run stays pending in the cache, so the next run times it. A hearing that ran whole
     leaves nothing pending."""
     cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("eng", 2))]
-    cache = garbled_run(env, monkeypatch, settings, tmp_path, cues, "utf-8", "eng")
+    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "utf-8", "eng")
     sub = hook.arr_subsync
     heard = [{"at": at, "words": [[round(t - at, 2), w] for t, _, w, _ in sub.flat(cues) if at <= t < at + sub.WINDOW]} for at in (40.0, 180.0)]
     monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, *a, **k: {key: dict(sub.check(heard, c, lang, 400.0), audio=idx, starts=[40.0, 180.0])
@@ -16805,12 +16823,12 @@ def test_a_live_track_whose_hearing_stopped_part_way_stays_pending(env, monkeypa
     assert cache[env["path"]] == (os.stat(env["path"]).st_mtime_ns, bool(failed)), cache
 
 
-def test_a_repaired_track_whose_ends_flash_stays_pending_until_they_are_fixed(env, monkeypatch, settings, tmp_path):
+def test_a_repaired_track_whose_ends_flash_stays_pending_until_they_are_fixed(env, monkeypatch, settings, tmp_path, garbled_av):
     """A garbled Polish track whose cues show 0.4 s each. The repair leaves the ends for a later run, so the cache stays
     pending. The next run lengthens them, and the cache then holds the file as done."""
     pool = [t for t in scene("pol", 2) if "Ł" not in t]
     cues = [(10 + 2.0 * i, 10.4 + 2.0 * i, t) for i, t in enumerate(pool)]
-    cache = garbled_run(env, monkeypatch, settings, tmp_path, cues, "utf-8", "pol")
+    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "utf-8", "pol")
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
     got = []
     for _ in range(2):
@@ -16820,11 +16838,11 @@ def test_a_repaired_track_whose_ends_flash_stays_pending_until_they_are_fixed(en
     assert got == [(["subtitle_repaired"], True), (["subtitle_ends_lengthened"], False)], got
 
 
-def test_a_garbled_track_read_only_in_part_only_alerts(env, monkeypatch, settings, tmp_path):
+def test_a_garbled_track_read_only_in_part_only_alerts(env, monkeypatch, settings, tmp_path, garbled_av):
     """Russian text garbled from cp1251 under a Bulgarian tag cannot be repaired. Its read stops at CUE_MAX, so the cues
     past the cut were never judged, and the track stays in the file with an alert."""
     cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("rus", 2))]
-    garbled_run(env, monkeypatch, settings, tmp_path, cues, "cp1251", "bul")
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "bul")
     monkeypatch.setattr(hook, "CUE_MAX", len(cues) // 2)
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
     hook.main(["--sub-time", env["path"], "--apply"])
@@ -16835,7 +16853,7 @@ def test_a_garbled_track_read_only_in_part_only_alerts(env, monkeypatch, setting
 
 
 @pytest.mark.parametrize("kind", ["garbled", "flash"])
-def test_a_cut_whole_file_read_stays_cut_when_a_deep_analysis_resumes(env, monkeypatch, settings, tmp_path, kind):
+def test_a_cut_whole_file_read_stays_cut_when_a_deep_analysis_resumes(env, monkeypatch, settings, tmp_path, garbled_av, kind):
     """The Cues index no block of the track, so the deep analysis reads it from the whole file. That read stops at
     CUE_MAX, so it is a Cut. An import waits, so the analysis yields after the read, and its next run finds the read in
     the store. garbled: Russian text garbled from cp1251 under a Bulgarian tag, which no repair fixes. flash: English
@@ -16843,7 +16861,7 @@ def test_a_cut_whole_file_read_stays_cut_when_a_deep_analysis_resumes(env, monke
     only alerts, after the resume too, and the file stays as it is."""
     texts, cp, lang = (scene("rus", 2), "cp1251", "bul") if kind == "garbled" else (scene("eng", 2), "utf-8", "eng")
     cues = [(10 + 3.0 * i, 12.5 + 3.0 * i if kind == "garbled" else 10.4 + 3.0 * i, t) for i, t in enumerate(texts)]
-    garbled_run(env, monkeypatch, settings, tmp_path, cues, cp, lang)
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, cp, lang)
     settings(subtitles="deep")
     REAL_RUN(["mkvmerge", "-q", "-o", env["path"] + ".tmp.mkv", "--cues", "2:none", env["path"]], check=True)
     os.replace(env["path"] + ".tmp.mkv", env["path"])
@@ -16864,11 +16882,11 @@ def test_a_cut_whole_file_read_stays_cut_when_a_deep_analysis_resumes(env, monke
     assert isinstance(hook.full_read(env["path"], REAL_MKVMERGE(env["path"]))["cues"]["s1"], hook.Cut)
 
 
-def test_a_garbled_track_that_flashes_and_cannot_be_repaired_is_taken_out(env, monkeypatch, settings, tmp_path):
+def test_a_garbled_track_that_flashes_and_cannot_be_repaired_is_taken_out(env, monkeypatch, settings, tmp_path, garbled_av):
     """Its cues show 0.4 s each, so the flash check plans new ends. The track leaves the file instead, and its bytes go
     beside the video. A second track the same way and tag takes the next free name."""
     cues = [(10 + 2.0 * i, 10.4 + 2.0 * i, t) for i, t in enumerate(scene("rus", 2))]
-    garbled_run(env, monkeypatch, settings, tmp_path, cues, "cp1251", "bul")
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "bul")
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
     open(env["path"][:-4] + ".bul.garbled.txt", "w").close()
     hook.main(["--sub-time", env["path"], "--apply"])

@@ -471,7 +471,7 @@ a worker if none runs, and exits 0.
 `worker.lock` keeps one worker. The worker runs the queue oldest first and checks it once more after
 it drops its lock, so no job is lost. A job older than a day is dropped.
 
-`HOOK_WORKERS` (1) sets how many jobs run at a time. Set it to about the cores the host can spare.
+`HOOK_WORKERS` (2) sets how many jobs run at a time. Set it to about the cores the host can spare.
 With more than 1, the worker claims each job by one change in the state store, forks one process
 per job, and sends every Plex analyze itself, so the idle-section gate holds. A season pack of 200
 episodes runs at most `HOOK_WORKERS` processes at a time. A job process that crashes writes one decision line with
@@ -1279,7 +1279,7 @@ track that does. A forced, commentary or picture track, a forced sidecar, a trac
 check could never give a verdict. The check of a conversion takes the duration ffprobe reads, because mkvmerge gives an
 MP4 none. So a file with no such track or sidecar costs nothing. The check runs on imports, and a
 backfill runs it only with `--sub-check`. `SUBTITLES` sets what an import does with it: `off` runs no check, `check`
-reads, reports and alerts and changes nothing, `fix` (the default) acts, and `deep` adds the deep analysis. An unknown
+reads, reports and alerts and changes nothing, `fix` acts, and `deep` (the default) adds the deep analysis. An unknown
 level acts as `check`. `--sub-check` and `--sub-time` ignore `SUBTITLES`, because a person asked for them. Without
 `--apply` they report, and with it they fix. It needs language detection, see "Audio language detection".
 

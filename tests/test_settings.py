@@ -112,11 +112,20 @@ def test_a_name_that_is_no_plain_folder_name_takes_the_default_and_fails_the_sel
         m.main(["--selftest"])
 
 
-@pytest.mark.parametrize("text, level", [("", "fix"), ("SUBTITLES='off'\n", "off"), ("SUBTITLES='Check'\n", "check"),
-                                         ("SUBTITLES='deep'\n", "deep")])
+@pytest.mark.parametrize("text, level", [("", "deep"), ("SUBTITLES='off'\n", "off"), ("SUBTITLES='Check'\n", "check"),
+                                         ("SUBTITLES='fix'\n", "fix"), ("SUBTITLES='deep'\n", "deep")])
 def test_subtitles_sets_the_level_of_an_import(tmp_path, text, level):
     m = load(tmp_path, text)
     assert m.CFG.subtitles == level and m.CFG.errors == []
+
+
+def test_an_env_file_that_sets_neither_key_runs_two_hook_workers_at_the_deep_level(tmp_path):
+    """The defaults of 2026-10-05. The example env file, which a host install copies and the image writes at its first
+    start, holds the same values."""
+    m = load(tmp_path)
+    assert (m.CFG.hook_workers, m.CFG.subtitles, m.CFG.errors) == (2, "deep", [])
+    example = dict(env_lines(open(os.path.join(FILES, "examples", "arr-media-guard.env")).read()))
+    assert (example["HOOK_WORKERS"], example["SUBTITLES"]) == ("'2'", "'deep'")
 
 
 def test_an_unknown_subtitles_level_acts_as_check_and_fails_the_selftest(tmp_path):
@@ -293,7 +302,7 @@ FIELDS = ("keep_days", "hook_workers", "convert_max", "scan_workers", "convert_w
 def test_a_missing_key_takes_its_default_and_an_empty_one_its_empty_reading(tmp_path):
     """An empty AUDIT_TIME runs no nightly audit. Every other empty key in FIELDS takes its default, KEEP_ORIGINALS_DAYS
     too. So an unset ${VAR} in compose never drops the kept originals at once."""
-    defaults = (7, 1, 200, 1, 1, 30, 30e9, True, True, False, False, "07:30", POLICY)
+    defaults = (7, 2, 200, 1, 1, 30, 30e9, True, True, False, False, "07:30", POLICY)
     m = load(tmp_path)
     assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults and m.CFG.errors == []
     m = load(tmp_path, "".join(f"{k}=''\n" for k in ("KEEP_ORIGINALS_DAYS", "HOOK_WORKERS", "CONVERT_MAX_FILES", "SCAN_WORKERS", "CONVERT_WORKERS",

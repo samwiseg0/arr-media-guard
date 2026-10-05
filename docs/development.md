@@ -45,6 +45,7 @@ python -m pytest -q
 ```
 
 The tests need pytest. The tests on real media files need `ffmpeg` and `mkvtoolnix`, and skip without them.
+With pytest-xdist installed, `python -m pytest -q -n auto` runs them on every core, as CI does.
 
 The tests assert codes and fields. [tests/test_report.py](../tests/test_report.py) holds the golden text of each
 template in `report.py`, so a reworded template changes that file only.

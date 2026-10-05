@@ -17,6 +17,7 @@
 import dataclasses
 import io
 import os
+import signal
 import socket
 import urllib.request
 import urllib.response
@@ -24,8 +25,16 @@ import urllib.response
 import pytest
 
 os.environ["AMG_INVARIANTS"] = "1"   # every test checks the safety rules of a block move, see subsync.INVARIANTS
+# A shell starts a background job with SIGINT ignored, and Python keeps it ignored. The tests of Ctrl+C need the
+# default handler, as a run in a terminal has it, in the test process and in each process it starts.
+signal.signal(signal.SIGINT, signal.default_int_handler)
 
 import amg  # noqa: E402
+
+
+def pytest_configure(config):
+    if hasattr(config, "workerinput"):   # an xdist worker: execnet's IO thread makes each fork of a test warn
+        config.addinivalue_line("filterwarnings", r"ignore:This process \(pid=\d+\) is multi-threaded, use of fork\(\):DeprecationWarning")
 
 
 @pytest.fixture(autouse=True)

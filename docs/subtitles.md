@@ -8,7 +8,7 @@ the video is a *sidecar*, and AMG checks it too. [design.md](design.md#subtitle-
 
 ## Levels
 
-Set `SUBTITLES` in the env file. The default is `fix`.
+Set `SUBTITLES` in the env file. The default is `deep`.
 
 | Level | What the check of an import does |
 | --- | --- |

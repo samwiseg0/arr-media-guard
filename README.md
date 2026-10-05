@@ -348,10 +348,10 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `SUBTITLES` | `fix` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import. See [docs/subtitles.md](docs/subtitles.md#levels). |
+| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import. See [docs/subtitles.md](docs/subtitles.md#levels). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
-| `HOOK_WORKERS` | `1` | Imports AMG checks at a time. A season pack still runs at most this many. |
+| `HOOK_WORKERS` | `2` | Imports AMG checks at a time. A season pack still runs at most this many. |
 
 ### Subtitle hunter
 

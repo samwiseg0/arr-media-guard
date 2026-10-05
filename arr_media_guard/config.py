@@ -276,7 +276,7 @@ def settings(path, environ=os.environ):
         return out
 
     # These run in this order, so the errors keep the order the worker logs them in.
-    hook_workers = number("HOOK_WORKERS", 1, 1, "is not a whole number of 1 or more, so {} runs", least=1)
+    hook_workers = number("HOOK_WORKERS", 2, 1, "is not a whole number of 1 or more, so {} runs", least=1)
     regrab_cap = number("REGRAB_CAP", 30, 0, "is no whole number, so the cap is {} and every fault only alerts.")
     name = env.get("NAME", "arr-media-guard")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):   # NAME names folders, see Settings.keep_dir
@@ -284,7 +284,7 @@ def settings(path, environ=os.environ):
         name = "arr-media-guard"
     regrab = kinds("REGRAB", "audio,video", REGRAB_KINDS)
     repack_max = number("REPACK_MAX_GB", 30, 0, "is no number, so the cap is {} GB and every remux is skipped.", cast=float) * 1e9
-    subtitles = level("SUBTITLES", "fix", SUBTITLES_LEVELS, "check", "the subtitle check of an import runs as check")
+    subtitles = level("SUBTITLES", "deep", SUBTITLES_LEVELS, "check", "the subtitle check of an import runs as check")
     maps = {key: path_map(key, env.get(key, "")) for key in ("PATH_MAP", *MAP_KEYS.values())}   # {key: (pairs, error)}
     apps = {app: AppSettings(env.get(f"{app.upper()}_URL", f"http://127.0.0.1:{port}"), api_key(f"{app.upper()}_API_KEY"),
                              env.get(f"{app.upper()}_DIR") or f"/var/lib/{app}", maps[f"{app.upper()}_PATH_MAP"][0], app,
