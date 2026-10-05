@@ -181,14 +181,21 @@ speech. It runs in the deep analysis and with `--sub-time`.
 
 1. AMG spots live captions in its one-part-a-minute listening. The lines run late, and by amounts that keep changing.
 2. AMG listens to the whole audio and finds where the first word of each line is spoken. A speaker's name before a line,
-   such as `>> Reporter:`, is never spoken, so it does not count. Neither do the lines of a roll-up caption that repeat
-   the line before.
+   such as `>> Reporter:`, is never spoken, so it does not count. Neither do the lines of roll-up captions that repeat
+   the line before. In roll-up captions, each new line pushes the line before it up, so each line shows twice.
 3. Speech comes in the order of the lines, so a first word heard out of that order counts for nothing.
 4. A line moves to its first word when it sits a full second or more off it. The 2 lines on each side must sit off the
    same way. So one line that Whisper heard wrong never moves alone.
 5. A line whose first word AMG did not hear lies between the lines around it, and moves when they prove where it goes.
-6. Every other line stays, and lines never change order. A moved line ends where the next line starts, at most. It still
-   shows half a second, or its old length when that was shorter.
+6. Every other line stays, and lines never change order. The starts then stay, and only the ends change. A line that
+   ran up to the next line still does, so it ends where the next line now starts. A line with a pause after it keeps
+   its length, and ends where the next line starts at most. So no new pause opens between lines. Two lines show at once
+   only when they start at the same time. That happens when they did in the file, or when both moved to the file's
+   start.
+
+A line now shows only until the next line starts. So a line can show for a fraction of a second when the next line
+moved much further than it did. A line that stays can show for about 10 ms, when the moved line after it starts just
+after it.
 
 When the listening stops part way, the lines past that point stay, and a later `--sub-check` takes the file again. When
 a fifth of the lines or fewer stay out of sync, nothing posts. Else one alert says how many lines moved and how many

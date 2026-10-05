@@ -79,7 +79,10 @@ cues, and each has its own checks.
 - Live caption timing. `subsync.check_live()` checks the first and the last rule of each cue that `live_moves()`
   moves. Its own evidence is its own anchor, or a span between two anchors. A cue moved by its anchor ends nearer it.
   A cue moved between anchors ends nearer every point of the span when the span proved the move. It ends inside the
-  span when the anchors around it moved the same way.
+  span when the anchors around it moved the same way. `remux.time_plan()` checks the ends with `subsync.live_ends()`.
+  A cue of the block, or the cue just before it, never ends past its next later new start, the first new start after
+  its own. A cue that ran back to back with the next one ends there. So the move opens no gap and adds no overlap.
+  Cues on one new start, as cues clamped to 0, may show together until the next later new start.
 - Foreign subtitle timing. `subsync.nearer()` checks that a fix of `layout_fix()` never lowers the share of the
   speech that the lines show over. `subsync.check_kept()` checks a partial shift: the order of the lines, kept runs
   only at the file's ends, and the core's edge, the first and last moved line with a speech start at the fix, where

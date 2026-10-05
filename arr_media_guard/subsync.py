@@ -1412,8 +1412,8 @@ def evidence(late, hushed_late, words, onset_new, onset_old, on, at_block, hushe
 
 
 # The safety rules of a block move (docs/development.md, "Safety self-checks"). AMG_INVARIANTS=1 checks them on every
-# result. blocks() checks own evidence and nearer its speech at its end, and remux.time_plan() checks the order. The
-# tests turn it on. Off, no check runs.
+# result. blocks() checks own evidence and nearer its speech at its end, and remux.time_plan() checks the order and the
+# ends of a live block. The tests turn it on. Off, no check runs.
 INVARIANTS = os.environ.get("AMG_INVARIANTS") == "1"
 NEAR = 0.01   # seconds of rounding that the nearer-its-speech check allows against each line. A shift keeps ms, and ASS keeps cs.
 
@@ -1509,6 +1509,27 @@ def ordered(rows, case):
     for (s0, a0, n0), (s1, a1, n1) in zip(rows, rows[1:]):
         if s0 < s1 and (n0 > n1 or n0 == n1 > 0 and a0 < a1):
             broken("order", s1, f"it starts at {n1} s, and the cue at {s0} s before it at {n0} s", case)
+
+
+def live_ends(rows, ass, case):
+    """Check the live ends rule, see INVARIANTS, on rows [(start, end, new start, new end, live)] of one track's
+    remux.time_plan(). end is the end before the move, and live is true for a cue of a live block. Take a cue of a live
+    block, or the cue just before one. Its next cue is the one with the next later start, and its next later new start
+    is the first new start after its own. The cue never ends past its next later new start. When it ran back to back
+    with its next cue, its end at or past that cue's start within 1 ms, 1 cs on ASS, it ends there. So the move opens no
+    gap and adds no overlap. Cues on one new start may show together until the next later new start, as cues that start
+    together in the file, or cues clamped to 0. Raises Broken."""
+    rows, slack = sorted(rows), 0.01 if ass else 0.001
+    news = sorted({r[2] for r in rows})
+    nxt = [next((r for r in rows[k + 1:] if r[0] > rows[k][0]), None) for k in range(len(rows))]
+    for (s, e, a, n, live), r in zip(rows, nxt):
+        top = news[bisect.bisect_right(news, a)] if a < news[-1] else None
+        if r is None or top is None or not (live or r[4]):
+            continue
+        if n > top + 0.0005:
+            broken("live ends", s, f"it ends at {n} s, past the next later new start at {top} s", case)
+        if e >= r[0] - slack - 1e-9 and n < top - 0.0005:
+            broken("live ends", s, f"it ran back to back with the next cue, and now ends at {n} s, {top - n:.3f} s before the next later new start", case)
 
 
 def fixed_ms(t, fix):

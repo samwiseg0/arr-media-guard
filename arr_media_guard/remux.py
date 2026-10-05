@@ -397,33 +397,47 @@ def time_plan(cues, fix, blocks, ends=None, ass=False):
     rounded to ms, in "keep": a cue with no evidence of its own stays, see subsync.mover(). Each start takes the shift
     of subsync.shift_of(): its own shift on a live-captioned track, see subsync.live_moves(), or the shift the block's
     "clamp" names, so it stops one centisecond short of the cue next to it, see subsync.clamped(). A cue of a "kept"
-    block, see subsync.keep_blocks(), keeps its start and end, or its flash end, whatever the fix. ends are the new ends
-    of flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does. A cue
-    a live block moves ends at the next later new start at most, as live captions end where the next line starts. It
-    still shows subsync.FLASH seconds or its planned length, the less, so no cue turns into a flash. A few cues then
-    show over the next one, by under half a second on live tracks. A
-    start stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an ASS
-    time rounds to them, and an ASS end stays 1 cs after its start. With subsync.INVARIANTS, subsync.ordered() checks
-    the order of the new starts."""
+    block, see subsync.keep_blocks(), keeps its start and end, or its flash end, whatever the fix, unless a live block
+    follows it, see below. ends are the new ends of flash_plan() in the same order, or None. A cue's end takes its new
+    end first, then moves as its start does.
+
+    Live captions show each line until the next one starts, and their cues move by different times. So a block with
+    "shifts", see subsync.live_moves(), changes the ends of its cues, moved or in its "keep". It changes the end of the
+    cue just before the block too, even one of a "kept" block or another block. That never happens in production,
+    because a live block holds every cue of its track. A cue's next cue is the one with the next later start, and its
+    next later new start is the first new start after its own. A cue that ran back to back with its next cue ends at
+    its next later new start. Back to back means its end, the flash end if any, lies at or past the next cue's start,
+    within 1 ms, 1 cs on ASS. Any other cue keeps its length and ends at its next later new start at most. So no cue
+    shows past the next later new start, and no gap opens where the file had none. Cues on one new start show together
+    until the next later new start. Those are cues that start together in the file, and cues clamped to 0.
+
+    A start stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an
+    ASS time rounds to them, and an ASS end stays 1 cs after its start. With subsync.INVARIANTS, subsync.ordered()
+    checks the order of the new starts, and subsync.live_ends() the ends of a live block."""
     step = 10 if ass else 1   # ms
     at = lambda t, shift: round(((subsync.moved(t * 1000, fix) if fix else t * 1000) - shift * 1000) / step) * step
-    out, live = [], []
+    out = []
     for k, (s, e, text) in enumerate(cues):
         b = subsync.mover(blocks, s)
         if b is not None and b.get("kept"):   # a run a partial shift keeps, see subsync.keep_blocks(): its own times
             out.append((s, text, e, s, ends[k] if ends else e))
-            live.append(False)
             continue
         shift = subsync.shift_of(b, s) if b else 0
         a = max(0, at(s, shift))
         out.append((s, text, e, a / 1000, max(at(ends[k] if ends else e, shift), a + step) / 1000))
-        live.append(bool(b) and "shifts" in b)
+    live = [any("shifts" in b and b["from"] <= s < b["to"] for b in blocks or ()) for s, *_ in cues]   # a cue of a live block
     if any(live):
-        later = sorted({a for *_, a, _ in out}) + [float("inf")]
-        out = [(s, text, e, a, max(min(n, later[bisect.bisect_right(later, a)]), a + min(n - a, subsync.FLASH), a + step / 1000) if moved else n)
-               for (s, text, e, a, n), moved in zip(out, live)]
-    if subsync.INVARIANTS:   # the order rule
-        subsync.ordered([(s, max(0, at(s, 0)) / 1000, a) for s, _, _, a, _ in out], {"cues": cues, "fix": fix, "blocks": blocks, "ends": ends, "ass": ass, "plan": out})
+        heads, near = {s: a for s, _, _, a, _ in out}, {s for (s, *_), x in zip(cues, live) if x}   # cues that start together keep one start
+        later, news = sorted(heads), sorted(set(heads.values())) + [float("inf")]
+        for k, (s, text, e, a, n) in enumerate(out):
+            j, top = bisect.bisect_right(later, s), news[bisect.bisect_right(news, a)]   # the next cue, and the next later new start
+            if j < len(later) and top < float("inf") and (live[k] or later[j] in near):
+                out[k] = (s, text, e, a, top if (ends[k] if ends else e) >= later[j] - step / 1000 - 1e-9 else min(n, top))
+    if subsync.INVARIANTS:   # the order rule, and the ends of a live block
+        case = {"cues": cues, "fix": fix, "blocks": blocks, "ends": ends, "ass": ass, "plan": out}
+        subsync.ordered([(s, max(0, at(s, 0)) / 1000, a) for s, _, _, a, _ in out], case)
+        if any(live):
+            subsync.live_ends([(s, ends[k] if ends else e, a, n, x) for k, ((s, _, e, a, n), x) in enumerate(zip(out, live))], ass, case)
     plan = Plan(out)
     plan.blocks = blocks
     return plan if any(abs(a - s) + abs(b - e) > 0.0005 for s, _, e, a, b in out) else None

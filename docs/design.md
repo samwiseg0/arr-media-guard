@@ -1820,13 +1820,28 @@ library would take weeks.
   cue next to it changes. When the cue that stays has no anchor, it takes the place nearest its place between anchors
   that is still nearer every speech up to the bound the next cue gives. When the cue that moves has its own anchor, it
   stops a centisecond after the cue that stays, when that is still nearer its anchor. Else the move stays too.
-  `remux.time_plan()` takes the block's `shifts`, one per start, and ends each moved cue at the next later new start at
-  most, as live captions end where the next cue starts. A moved cue still shows half a second (`FLASH`) or its old
-  length, the less, so no cue turns into a flash. A few moved cues then show over the next one, by a fraction of a
-  second. A floor of 1 second let many more overlap, and three cues showed at once. The plan, `set_ends()`, the proof
-  and the order check are those of a block. With `AMG_INVARIANTS=1`, `subsync.check_live()` checks own evidence and
-  nearer its speech for each moved cue. The loop that keeps the cue order leaves two cues that both stay on one
-  centisecond as the file has them, and it stops after 8 steps a cue at most, with no move.
+  `remux.time_plan()` takes the block's `shifts`, one per start. The starts then stay, and only the ends change, for
+  each cue of the block, moved or staying, and the cue just before it. A cue's next cue is the one with the next later
+  start. Its next later new start is the first new start after its own. Two cues ran back to back when the first one's
+  end lies at or past the next start, within 1 ms (1 cs on ASS). Such a cue ends at its next later new start. Any
+  other cue keeps its length and ends at its next later new start at most. Cues on one new start show together until
+  the next later new start. Those are cues that start together in the file, and cues clamped to 0. Ending a cue at the
+  new start of a tied next cue would show it for 1 ms.
+
+  In 2.4.0 to 2.5.1 each moved cue kept its old length, capped at the next new start, and showed half a second at
+  least. Cues move by different times, so a gap opened wherever the next cue moved less. On a 43-minute news episode
+  of roll-up captions, 1501 of 1505 pairs of cues ran back to back. After the move, 579 did. Its gaps left 617 seconds
+  with no caption, against 42 seconds in the file, and 44 cues showed over the next one. The cue that
+  stays never took the cap, so the first cue showed 3.7 s over the second. The rule now keeps the 1501 pairs back to
+  back, keeps its 4 gaps, and adds no overlap. A cue ends up short when the next cue moved much more. On that episode,
+  51 cues show under half a second, against 30 in the file, and the shortest shows 20 ms. A cue that stays shows about
+  10 ms when the cue after it stops a centisecond after it. No minimum length applies, because a minimum brings the
+  overlaps back.
+
+  The plan, `set_ends()`, the proof and the order check are those of a block. With `AMG_INVARIANTS=1`,
+  `subsync.check_live()` checks own evidence and nearer its speech for each moved cue, and `subsync.live_ends()`
+  checks the ends. The loop that keeps the cue order leaves two cues that both stay on one centisecond as the file has
+  them, and it stops after 8 steps a cue at most, with no move.
 
   A hearing that stops part way, as a Whisper run that fails after a yield, leaves the cues past it where they are.
   Their place between anchors would rest on the lag of anchors far away. The track then counts as not fixed, and the

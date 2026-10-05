@@ -1071,7 +1071,9 @@ SUB_CHECKS = {
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
     "garbled_repair": {"version": 1, "fixes": {}},
     "flash": {"version": 1, "fixes": {}},              # lines that flash by too fast to read
-    "block_timing": {"version": 1, "fixes": {}},       # Subtitle block timing and Live caption timing
+    "block_timing": {"version": 2, "fixes": {}},       # Subtitle block timing and Live caption timing. Version 2 changes
+                                                       # only the ends of live captions. A recheck of a file 1 moved
+                                                       # finds its lines on their speech and moves none again.
 }
 SUB_FINDINGS = ("mismatch", "unknown", "fix", "off", "steps", "unfixable", "cut", "live", "unread")   # the words of sub_found()
 SUB_RUNS = {"import": ("subtitle_match", "reference_timing", "flash")}   # the checks each run of process() makes

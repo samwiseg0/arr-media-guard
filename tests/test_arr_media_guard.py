@@ -12101,25 +12101,93 @@ def test_time_plan_keeps_the_cues_a_block_keeps():
 
 
 def test_time_plan_gives_each_cue_of_a_live_block_its_own_shift():
-    """The block of a live-captioned track moves each cue by its own shift, and a cue it keeps stays. A moved cue ends at
-    the next later new start at most, as live captions do, and the cue that stays keeps its end. blocks_moved() names
-    the range of over 3 moves. A sweep row in the block takes the median shift of the cues that start in its window."""
+    """The block of a live-captioned track moves each cue by its own shift, and a cue it keeps stays. The cues ran back
+    to back, so each one, moved or kept, ends at the next cue's new start. blocks_moved() names the range of over 3
+    moves. A sweep row in the block takes the median shift of the cues that start in its window."""
     cues = [(10.0 * i, 10.0 * i + 10.0, f"line {i}") for i in range(1, 7)]
     live = {"from": 10.0, "to": 61.0, "shift": 8.0, "shifts": {10.0: 8.0, 20.0: 9.5, 40.0: 7.0, 50.0: 8.5, 60.0: 6.0}, "keep": [30.0], "live": True}
     plan = hook.time_plan(cues, None, [live])
-    assert [p[3:] for p in plan] == [(2.0, 10.5), (10.5, 20.5), (30.0, 40.0), (33.0, 41.5), (41.5, 51.5), (54.0, 64.0)], plan
+    assert [p[3:] for p in plan] == [(2.0, 10.5), (10.5, 30.0), (30.0, 33.0), (33.0, 41.5), (41.5, 54.0), (54.0, 64.0)], plan
     assert hook.blocks_moved(plan) == "5 cues moved -9.50 s to -6.00 s, each by its own time"
     row = {"at": 5.0, "words": 15, "overlap": 0.9, "cues": 3, "offset": 9.0, "off": 9.0}
     assert hook.arr_subsync.after_blocks([row], [live], None)[0]["off"] == -0.5
 
 
-def test_a_moved_live_cue_keeps_a_reading_floor_under_the_end_cap():
-    """Live captions end where the next new start lies, but a cue that was readable stays readable. The cue at 20 s
-    showed 3 s, and the next cue lands 0.2 s after it, so it shows FLASH seconds, over the next cue. The cue at 30 s
-    showed 0.4 s, under the floor, so it keeps its 0.4 s."""
+def test_a_live_cue_with_a_gap_after_it_keeps_its_length_up_to_the_next_start():
+    """Each cue had a gap after it, so it keeps its length and ends at the next cue's new start at most. The cue at
+    20 s showed 3 s, and the next cue lands 0.2 s after it, so it ends there. No cue shows over the next one."""
     cues = [(10.0, 13.0, "a"), (20.0, 23.0, "b"), (30.0, 30.4, "c"), (40.0, 41.0, "d")]
     live = {"from": 10.0, "to": 41.0, "shift": 10.0, "shifts": {10.0: 8.0, 20.0: 10.0, 30.0: 19.8, 40.0: 29.5}, "keep": [], "live": True}
-    assert [p[3:] for p in hook.time_plan(cues, None, [live])] == [(2.0, 5.0), (10.0, 10.5), (10.2, 10.6), (10.5, 11.5)]
+    assert [p[3:] for p in hook.time_plan(cues, None, [live])] == [(2.0, 5.0), (10.0, 10.2), (10.2, 10.5), (10.5, 11.5)]
+
+
+# A roll-up caption track: each cue repeats the line before and adds one, and each ends where the next one starts.
+ROLL_UP = [(1.198, 9.627, "[ MUSIC ]"), (9.627, 10.891, "[ MUSIC ]\n>> THE TOWN COUNCIL MET"),
+           (10.891, 11.759, ">> THE TOWN COUNCIL MET\nON TUESDAY TO TALK"), (11.759, 12.66, "ON TUESDAY TO TALK\nABOUT THE NEW BRIDGE"),
+           (12.66, 13.462, "ABOUT THE NEW BRIDGE\nAND WHO WILL PAY FOR IT."), (13.462, 15.0, "AND WHO WILL PAY FOR IT."),
+           (20.0, 21.3, ">> GOOD EVENING."), (21.3, 22.999, ">> GOOD EVENING.\nWE BEGIN TONIGHT"), (23.0, 24.498, "WE BEGIN TONIGHT\nDOWNTOWN."),
+           (24.5, 26.0, "DOWNTOWN.")]
+ROLL_SHIFTS = [None, 3.667, 3.391, None, 0.5, 1.2, 2.0, 1.0, 0.5, 0.4]   # None: the cue stays
+
+
+def roll_up_block(cues):
+    """The live block of live_moves() over cues with ROLL_SHIFTS."""
+    return {"from": cues[0][0], "to": cues[-1][0] + 1.0, "shift": 1.2, "shifts": {c[0]: v for c, v in zip(cues, ROLL_SHIFTS) if v is not None},
+            "keep": [c[0] for c, v in zip(cues, ROLL_SHIFTS) if v is None], "live": True}
+
+
+@pytest.mark.parametrize("ass", [False, True])
+def test_live_roll_up_captions_end_where_the_next_line_starts(ass):
+    """The first cue stays, and the next one moves 3.7 s, past its end. The first cue still ends where the next one now
+    starts, so the two never show at once. The cue before the cue that stays at 11.76 s ends at that cue's start. A
+    gap of 5 s after the cue at 13.46 s stays a gap. The cue at 21.3 s ended 1 ms (1 cs on ASS) before the next cue, so
+    it ran back to back, and it ends at that cue's new start. The cue at 23 s ended 2 ms (2 cs) before the next cue, so
+    it keeps its length. ASS keeps centiseconds."""
+    cues = ROLL_UP
+    if ass:
+        cues = [(round(s, 2), round(e, 2), t) for s, e, t in ROLL_UP]
+        cues[7:9] = [(21.3, 22.99, cues[7][2]), (23.0, 24.48, cues[8][2])]
+    plan = hook.time_plan(cues, None, [roll_up_block(cues)], ass=ass)
+    want = [(1.198, 5.96), (5.96, 7.5), (7.5, 11.759), (11.759, 12.16), (12.16, 12.262), (12.262, 13.8), (18.0, 20.3), (20.3, 22.5),
+            (22.5, 23.998), (24.1, 25.6)]
+    if ass:
+        want = [(round(a, 2), round(e, 2) if e != 23.998 else 23.98) for a, e in want]
+    assert [p[3:] for p in plan] == want, plan
+
+
+def test_live_ends_keep_lines_shown_together_and_reach_the_cues_around_the_block():
+    """The block holds the cues from 10 to 40 s. The cue before it ran back to back with the cue at 10 s, which moves
+    to 8 s, so it ends there. Two lines that start together at 14 s stay, show together, and end at the next new start.
+    The block's last cue ends at the start of the cue after the block. Two cues outside it keep their times, though
+    they show at once, as in the file."""
+    cues = [(2.0, 4.0, "a"), (3.5, 10.0, "b"), (10.0, 14.0, "c"), (14.0, 18.0, "two lines, top"), (14.0, 18.0, "two lines, bottom"),
+            (18.0, 35.0, "d"), (35.0, 40.0, "e"), (40.0, 45.0, "f"), (44.0, 46.0, "g")]
+    live = {"from": 10.0, "to": 40.0, "shift": 2.0, "shifts": {10.0: 2.0, 18.0: 3.0, 35.0: 1.0}, "keep": [14.0], "live": True}
+    assert [p[3:] for p in hook.time_plan(cues, None, [live])] == [(2.0, 4.0), (3.5, 8.0), (8.0, 14.0), (14.0, 15.0), (14.0, 15.0), (15.0, 34.0),
+                                                                   (34.0, 40.0), (40.0, 45.0), (44.0, 46.0)]
+
+
+@pytest.mark.parametrize("ass", [False, True])
+def test_live_cues_clamped_to_0_show_together_until_the_first_later_start(ass):
+    """The speech of four cues lies before the file's start, so each starts at 0. They ran back to back, so each shows
+    until the first later new start, at 1 s, and none shows for only 1 ms. A cue with a pause after it keeps its length
+    inside that span. ASS gives the same times."""
+    cues = [(3.0, 5.0, "one"), (5.0, 7.0, "two"), (7.0, 9.0, "three"), (9.0, 11.0, "four"), (11.0, 13.0, "five")]
+    live = {"from": 3.0, "to": 12.0, "shift": 7.0, "shifts": {3.0: 3.0, 5.0: 5.0, 7.0: 7.0, 9.0: 9.0, 11.0: 10.0}, "keep": [], "live": True}
+    assert [p[3:] for p in hook.time_plan(cues, None, [live], ass=ass)] == [(0.0, 1.0)] * 4 + [(1.0, 3.0)]
+    cues = [(2.0, 2.5, "a"), (4.0, 6.0, "b"), (6.0, 8.0, "c")]
+    live = {"from": 2.0, "to": 7.0, "shift": 4.0, "shifts": {2.0: 2.0, 4.0: 4.0, 6.0: 5.0}, "keep": [], "live": True}
+    assert [p[3:] for p in hook.time_plan(cues, None, [live], ass=ass)] == [(0.0, 0.5), (0.0, 1.0), (1.0, 3.0)]
+
+
+def test_the_live_ends_rule_catches_an_overlap_and_a_new_gap():
+    """The ends 2.5.1 wrote for ROLL_UP break the live ends rule, see subsync.INVARIANTS. The first cue kept its end
+    past the next new start. The second ran back to back with the third and now ends 0.28 s before it."""
+    rows = [(1.198, 9.627, 1.198, 9.627, True), (9.627, 10.891, 5.96, 7.224, True), (10.891, 11.759, 7.5, 8.368, True)]
+    with pytest.raises(hook.arr_subsync.Broken, match="rule live ends broken at the cue at 1.198 s: it ends at 9.627 s, past the next later new start"):
+        hook.arr_subsync.live_ends(rows, False, {})
+    with pytest.raises(hook.arr_subsync.Broken, match="rule live ends broken at the cue at 9.627 s: it ran back to back with the next cue, and now ends at 7.224 s"):
+        hook.arr_subsync.live_ends(rows[1:], False, {})
 
 
 def test_time_plan_moves_a_clamped_cue_part_of_the_way():
