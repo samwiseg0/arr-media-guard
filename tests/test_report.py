@@ -47,6 +47,7 @@ SILENT = "the audio is silent at all 3 places checked"
 RESTORED = {"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None}
 NOTHING_BACK = {"name": "Radarr", "came": [], "linked": True, "own_copy": True, "others": 0, "stayed": "the recycle bin copy changed since its check"}
 LANGS = {"a1": "eng", "a2": "eng", "s1": "eng", "s2": "spa", "s3": "eng"}   # the language of each track place, see report.track_langs()
+IMPORT = {"name": "Check", "value": "Import check", "inline": True}   # the inline field of an alert of an import
 
 # (finding, alert title, color, text in the done tense). LANGS names the track languages.
 FINDINGS = [
@@ -57,9 +58,9 @@ FINDINGS = [
     ({"kind": "duration", "why": "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong length."},
      "Wrong length in the file", "amber", "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong "
      "length."),
-    ({"kind": "episode", "imported": [["S04E15", "Ship Voyage"]], "said": "the release's NFO", "title": "Squidtastic Voyage/That's No Lady",
+    ({"kind": "episode", "imported": [["S04E15", "Boat Trip"]], "said": "the release's NFO", "title": "Splashy Trip/That's No Duck",
       "names": "S04E23 and S04E27"}, "Maybe the wrong episode", "amber",
-     "Imported as S04E15 \"Ship Voyage\". The release's NFO calls it \"Squidtastic Voyage/That's No Lady\", which is S04E23 and S04E27."),
+     "Imported as S04E15 \"Boat Trip\". The release's NFO calls it \"Splashy Trip/That's No Duck\", which is S04E23 and S04E27."),
     ({"kind": "episode", "imported": [["S01E02", "Overnight"]], "said": "the release name", "title": "Anxious Times at Show Alpha",
       "names": "S01E03"}, "Maybe the wrong episode", "amber",
      "Imported as S01E02 \"Overnight\". The release name calls it \"Anxious Times at Show Alpha\", which is S01E03."),
@@ -236,7 +237,7 @@ SUB_LINES = [
     ({"code": "stays", "track": "s1", "why": "the words differ", "gone": True, "result": "subtitle remux failed: mkvmerge exited 2",
      "kept_back": None, "flags_off": True, "block": {"code": "remux"}, "hardlinked": False},
      "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, "
-     "because rewriting the file failed (mkvmerge exited 2). Turned off their default and forced flags.",
+     "because rewriting the file failed. Turned off their default and forced flags.",
      "The English subtitles (track 1) don't match what's said in the audio. --apply would remove them."),
     ({"code": "stays", "track": "s1", "why": "the words differ", "gone": True,
      "result": "subtitle remux skipped, over the 30 GB repack cap: remove track 3", "kept_back": None, "flags_off": True, "block": {"code": "cap",
@@ -298,8 +299,8 @@ SUB_LINES = [
      "Subtitle tracks 1 and 3 (English) are late by 2.5 s at 22:46 and 1.7 s at 23:01. They were left as they are.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": True, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
       "block": {"code": "remux"}, "hardlinked": False},
-     "The Spanish subtitles (track 2) show garbled characters, but the fix failed, because rewriting the file failed (mkvmerge exited 2). The "
-     "file was left as it is.", "The Spanish subtitles (track 2) show garbled characters. --apply would remux the file."),
+     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The file was left as it is.",
+     "The Spanish subtitles (track 2) show garbled characters. --apply would remux the file."),
     ({"code": "garbled", "tracks": ["s1", "s3"], "repair": True, "flags_off": False},
      "Subtitle tracks 1 and 3 (English) show garbled characters. SUBTITLES is set to check, so they were left as they are.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True},
@@ -350,8 +351,8 @@ SUB_LINES = [
      "beside the video as F.spa.garbled.txt. The original file is kept at /k/F.mkv.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
       "names": ["F.spa.garbled.txt"], "block": {"code": "remux"}, "hardlinked": False},
-     "The Spanish subtitles (track 2) show garbled characters, but the fix failed, because rewriting the file failed (mkvmerge exited 2). The "
-     "file was left as it is.", "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. "
+     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The file was left as it is.",
+     "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. "
      "--apply would take them out of the file and keep their text beside the video as F.spa.garbled.txt."),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "kept_back": "keep_days"},
      "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. They're still in the "
@@ -527,7 +528,7 @@ def test_the_embed_target_is_one_embed_per_finding():
     language, audio = h.render(decision(), "embed")
     assert {k: v for k, v in language.items() if k != "timestamp"} == {
         "title": "Wrong audio language", "description": "The audio is **Portuguese**, but it should be English.", "color": h.COLORS["amber"],
-        "fields": [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}], "footer": {"text": "arr-media-guard on host1"}}
+        "fields": [IMPORT, {"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}], "footer": {"text": "arr-media-guard on host1"}}
     assert (audio["title"], audio["color"], audio["description"]) == (
         "Broken audio", h.COLORS["red"], "The audio is silent at all 3 places checked.\nThe limit of 10 re-grabs a day was reached, so the file was "
                                          "kept.")
@@ -703,7 +704,12 @@ def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
     ([["track:=2", "en-US", "eng", "language"]], "eng", ("Language tag changed", "Wrote the language tag of the **English audio (track 1)** in its "
                                                                              "standard form.")),
     ([["track:=2", 0, 1, "flag-forced"], ["track:=4", 0, 1, "flag-forced"]], "eng",
-     ("Forced flags changed", "Turned the forced flag off for the **English audio (track 1)** and the **English subtitles (track 1)**."))])
+     ("Forced flags changed", "Turned the forced flag off for the **English audio (track 1)** and the **English subtitles (track 1)**.")),
+    ([["track:=2", 1, None, "flag-original"]], "jpn",
+     ("Original language flag changed", "Marked the **Japanese audio (track 1)** as the original language.")),
+    ([["track:=2", 1, None, "flag-original"], ["track:=4", 0, 1, "flag-original"]], "eng",
+     ("Original language flags changed", "Marked the **English audio (track 1)** as the original language. Marked the **English subtitles "
+                                         "(track 1)** as not the original language."))])
 def test_a_track_edit_says_each_kind_it_made_and_only_those(edits, after, want):
     """A language tag edit alone is no change of the default tracks. The title follows the kinds of edit."""
     rec = decision(edits=edits, findings=[], after=[{"sel": "track:=2", "pos": "a1", "lang": after, "default": True},
@@ -736,7 +742,8 @@ def test_an_alert_whose_text_fails_posts_a_plain_sentence(sent):
     rec = decision(findings=[{"kind": "runtime", "listed": 62}])   # no runs
     assert h.alert_findings(rec, 1) == ["sent"]
     (e,) = sent
-    assert (e["title"], e["description"], e["fields"]) == ("Wrong runtime", h.UNTOLD, [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}])
+    assert (e["title"], e["description"], e["fields"]) == ("Wrong runtime", h.UNTOLD, [IMPORT, {"name": "Film A (1979)", "value": "Film A.mkv",
+                                                                                                 "inline": False}])
     assert "AMG" in e["description"] and not re.search(r"\w+(Error|Exception)\b|no text", e["description"])
     assert h.render(rec, "log")["alerts"] == ["runtime: no text: KeyError: 'runs'"]
 
@@ -874,20 +881,256 @@ def test_an_embed_bolds_the_names_and_escapes_their_markdown():
                                 "original file at /k/F\\_1.mkv.")
 
 
+def track(i, role="full", name="", lang="eng", **kw):
+    """A made-up track of the decision log, see logs.track_log()."""
+    return dict(dict(i=i, lang=lang, tag=lang, conf=1.0, role=role, default=0, forced=role == "forced", sdh=role == "sdh", ev=12.0, ch=None,
+                     codec="SubRip/SRT" if i[0] == "s" else "AC-3", name=name, heard=None), **kw)
+
+
+LONG_TITLE = ("English commentary by the director and the producer of the film, recorded in 2004 for the anniversary edition "
+              "[Dolby Digital +] (2.0)")   # 150 characters of a made-up title
+# (track, its name). Each shape names a track as a player lists it, with its own title only when that adds something.
+NAMES = [
+    (track("s1"), "the English subtitles (track 1)"),
+    (track("s3", "sdh", "English (SDH)"), "the English SDH subtitles (track 3)"),
+    (track("s2", "forced", "Forced"), "the English forced subtitles (track 2)"),
+    (track("s5", "forced", "Signs & Songs"), 'the English forced subtitles (track 5, "Signs & Songs")'),
+    (track("s2", "forced", "Full"), 'the English forced subtitles (track 2, "Full")'),   # the title differs from the role AMG found
+    (track("s4", "dub", "English Dubtitle"), "the English dub subtitles (track 4)"),
+    (track("s1", "full", "PGS"), "the English subtitles (track 1)"),   # a title of the codec alone
+    (track("s1", "full", "S_TEXT/UTF8"), "the English subtitles (track 1)"),
+    (track("s6", "full", LONG_TITLE), 'the English subtitles (track 6, "English commentary by the director and…")'),
+    (track("a4", "commentary", LONG_TITLE), "the English commentary audio (track 4)"),   # a commentary title never shows
+    (track("a1", "main", "AC-3 5.1"), "the English audio (track 1)"),
+    (track("a3", "description", "Described Video"), 'the English audio description (track 3, "Described Video")'),
+    (track("a2", "main", "Español", lang="spa"), "the Spanish audio (track 2)"),
+    (track("a2", "main", "Español"), 'the English audio (track 2, "Español")'),   # the title names another language
+    (track("s7", "full", "**Big** [x](http://e.example) _u_ `c` |p| <@1> \x02x\x07"),
+     'the English subtitles (track 7, "Big x u c p @1 x")'),   # markup, links and control characters go
+    (track("s8", "full", 'Director "Cut"'), "the English subtitles (track 8, \"Director 'Cut'\")"),
+    (track("s9", "sdh", "English", lang="und"), "the SDH subtitles (track 9, \"English\")"),
+]
+
+
+@pytest.mark.parametrize("x, want", NAMES)
+def test_a_track_is_named_by_its_language_role_and_a_title_that_adds_something(x, want):
+    """A tester asked for the track title, to match a track to the player's list. Owner 2026-10-06: the language and the
+    role name a track, and its own title follows in quotes only when it adds something, cut at about 40 characters."""
+    assert h.unmarked(h.track_name(x["i"], x["lang"], x["i"][1:], x)) == want
+    assert len(h.shown_title(x) or "") <= h.TITLE_MAX + 1 and not re.search(r"[\x00-\x1f*_~`|\[\]<>]", h.shown_title(x) or "")
+
+
+@pytest.mark.parametrize("title", ["English", "english", "ENG", "en", "SRT", "SubRip", "English [PGS]", "English (SRT)", "Forced", "SDH",
+                                   "English (SDH)", "English - SDH", "Stereo", "AC-3 5.1", "Full", "Default", "English 2.0 AAC 128 kbps",
+                                   "DTS-HD MA 7.1", "English CC", "Subtitles", "[English]", "S_TEXT/UTF8", ""])
+def test_a_title_that_repeats_the_language_codec_role_or_flags_shows_nothing(title):
+    """A title of the track's language, its codec, its role or its flags only, in any case or brackets, adds nothing. The
+    role words count when the track has that role or flag."""
+    role = "forced" if "forced" in title.lower() else "sdh" if re.search("sdh|cc", title, re.I) else "full"
+    assert h.shown_title(track("s1", role, title)) is None
+
+
+@pytest.mark.parametrize("title, want", [("https://e.example/x", None), ("www.e.example", None), ("<HTTPS://E.example>", None),
+                                         ("Signs & Songs https://e.example/s?a=1", "Signs & Songs"), ("Songs (www.e.example)", "Songs"),
+                                         ("English [https://e.example]", None), ("ht\u200btps://e.example Songs", "ht Songs")])
+def test_a_title_drops_a_bare_url(title, want):
+    """Discord makes a bare URL a link, and a release can plant one in a track title. The URL goes, and a title with
+    nothing left shows nothing."""
+    assert h.shown_title(track("s1", "full", title)) == want
+
+
+def test_every_output_names_a_track_alike():
+    """The issue alert, the change post, the decision log line and a failed flag edit name a track by its role and title.
+    A track the remux removed is "track N of the original file", and a later one takes its number after the run."""
+    before = [track("s1", "sdh", "English SDH"), track("s2", "full", "Signs & Songs"), track("s3", "forced")]
+    rec = decision(tracks=before[1:], subremux={"done": True, "removed": ["s1"], "tracks_before": before, "result": "subtitles remuxed"},
+                   findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "kept": "/k/F.mkv"},
+                                                            {"code": "stays", "track": "s3", "why": "x", "gone": False, "result": None,
+                                                             "kept_back": "check", "flags_off": False}]}])
+    (e,) = h.render(rec, "embed")
+    assert e["description"].startswith("The **English SDH subtitles (track 1 of the original file)** don't match"), e["description"]
+    assert "The **English forced subtitles (track 2)** don't match" in e["description"], e["description"]
+    log = h.render(rec, "log")["alerts"][0]
+    assert "The English SDH subtitles (track 1) don't match" in log and "The English forced subtitles (track 3) don't match" in log, log
+    after = [{"pos": "s1", "sel": "track:=1", "lang": "eng", "title": "Signs & Songs", "default": 1, "role": "forced", "forced": True}]
+    edited = decision(after=after, edits=[["track:=1", 1, 0, "flag-default"]], findings=[], result="edited")
+    assert h.unmarked(h.edit_change(edited, {"flags": set()})[1]) == \
+        'Turned the default flag on for the English forced subtitles (track 1, "Signs & Songs").'
+    failed = {"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": ["s1 eng"]}
+    (e,) = h.render(dict(edited, findings=[failed]), "embed")
+    assert e["description"].endswith('its default tracks are the **English forced subtitles (track 1, "Signs & Songs")**.'), e["description"]
+
+
+def test_tracks_with_a_role_or_a_title_keep_their_own_names():
+    """Two plain English tracks share one name. A role or a title gives each track its own."""
+    langs = h.Langs(s1="eng", s2="eng")
+    langs.facts = {"s1": track("s1"), "s2": track("s2")}
+    assert h.unmarked(h.subs_name(["s1", "s2"], langs)) == "subtitle tracks 1 and 2 (English)"
+    langs.facts = {"s1": track("s1"), "s2": track("s2", "sdh")}
+    assert h.unmarked(h.subs_name(["s1", "s2"], langs)) == "the English subtitles (track 1) and the English SDH subtitles (track 2)"
+
+
 def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
     """A library record: the file name in an edit error holds "KS Rover Vs. Moped", and the label of another show holds
     markdown. The embed breaks no line inside a fact, and escapes the markdown of the field too. The decision line
     keeps its plain text."""
     f = {"kind": "edit", "error": "mkvpropedit failed: Error: The file 'KS Rover Vs. Moped.mkv' is not a Matroska file.", "unread": None,
          "on": ["a1 eng"]}
-    rec = decision(findings=[f], label="M*A*S*H S01E01", path="/tv/M_A_S_H.mkv")
+    rec = decision(findings=[f], label="S*T*A*R Show S01E01", path="/tv/S_T_A_R.mkv")
     (e,) = h.render(rec, "embed")
     assert e["description"] == ("Couldn't change which tracks play by default.\nMkvpropedit failed: Error: The file 'KS Rover Vs. Moped.mkv' is "
                                 "not a Matroska file.\nThe file still opens, and its default tracks are the **English audio (track 1)**.")
-    assert e["fields"] == [{"name": "M\\*A\\*S\\*H S01E01", "value": "M\\_A\\_S\\_H.mkv", "inline": False}]
+    assert e["fields"] == [IMPORT, {"name": "Stopped at", "value": "Writing the file", "inline": True},
+                           {"name": "S\\*T\\*A\\*R Show S01E01", "value": "S\\_T\\_A\\_R.mkv", "inline": False}]
     assert h.render(rec, "log")["alerts"] == ["edit: Couldn't change which tracks play by default. Mkvpropedit failed: Error: The file 'KS Rover "
                                               "Vs. Moped.mkv' is not a Matroska file. The file still opens, and its default tracks are the "
                                               "English audio (track 1)."]
+
+
+# The step where the fix of each golden stopped, by its place in FINDINGS, ACTIONS and SUB_LINES, as the Stopped at field
+# shows it. Every other golden tried no fix, or its fix worked, so it shows only the Check field.
+STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file", 22: "Writing the file",
+                        23: "Writing the file", 24: "Writing the file", 25: "Writing the file", 28: "Finding the shift"},
+           "actions": {5: "Replacing the file", 8: "Replacing the file", 10: "Replacing the file", 11: "Replacing the file",
+                       15: "Replacing the file", 16: "Replacing the file", 19: "Replacing the file"},
+           "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file", 9: "Writing the file",
+                         12: "Finding the shift", 13: "Testing the fix", 14: "Testing the fix", 15: "Writing the file", 16: "Writing the file",
+                         20: "Finding the shift", 21: "Finding the shift", 22: "Finding the shift", 23: "Writing the file",
+                         25: "Testing the fix", 32: "Finding the shift", 33: "Finding the shift", 34: "Finding the shift",
+                         35: "Finding the shift", 38: "Writing the file", 40: "Finding the shift"}}
+
+
+def test_every_alert_code_has_its_step():
+    """Each finding kind, action code and subtitle sentence code names its step, so a new alert kind cannot skip the
+    Stopped at field. A step is a name of FIX_STEPS, None for no fix tried, or a function of the facts."""
+    assert set(h.FINDING_STEPS) == set(h.FINDINGS) and set(h.ACTION_STEPS) == set(h.ACTIONS) and set(h.LINE_STEPS) == set(h.SUB_LINES)
+    assert all(v is None or v in h.FIX_STEPS or callable(v) for m in (h.FINDING_STEPS, h.ACTION_STEPS, h.LINE_STEPS) for v in m.values())
+    assert 4 <= len(h.FIX_STEPS) <= 7 and set(h.CHECKS) == {"hook", "deep_analysis", "recheck", "backfill", "worker"}
+
+
+def test_each_alert_names_the_step_where_its_fix_stopped():
+    """Owner 2026-10-05: "it would be nice if the notification would tell you in which stage did it fail". A doubt, a
+    check that only reports, a fix a setting turned off, a fix that worked and a dry run name no step."""
+    got = {(g, i): h.stopped_at(f, "done") for g, i, f in every_alert()}
+    want = {(g, i): STOPPED[g].get(i) for g, i, _ in every_alert()}
+    assert got == want, {k: (got[k], want[k]) for k in got if got[k] != want[k]}
+    assert all(h.stopped_at(f, "planned") is None for *_, f in every_alert())
+
+
+@pytest.mark.parametrize("lines, want", [
+    ([dict(LIVE, hearing_stopped=True)], "Hearing the speech"),
+    ([dict(LIVE, flags_off=False)], None),
+    ([{"code": "off", "track": "s1", "why": "x", "unfixed": 2.0, "would": {"offset": 2.0, "rate": "1/1"}}], None),   # the layout fix alerts only
+    ([{"code": "sidecar", "name": "F.en.srt", "why": "x", "kept": None, "left": "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"}],
+     None),
+    ([{"code": "sidecar_left", "name": "F.en.srt", "why": "x", "left": "[Errno 13] Permission denied", "action": "retime"}], "Writing the file"),
+    ([{"code": "check_times", "track": "s1", "why": "x", "fix": {"offset": 2.0, "rate": "1/1"}},
+      {"code": "not_retimed", "tracks": ["s2"], "result": "subtitle remux failed: mkvmerge exited 2", "block": None},
+      {"code": "off", "track": "s3", "ref": None, "why": "x", "offsets": [1.0, 3.0], "unfixed": None}], "Finding the shift\nWriting the file"),
+    # one track at two steps counts at the furthest one, as a deep analysis of a roll-up track showed
+    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 2.8}, {"code": "sweep", "far": [["s1", 438.0, 1.6]]}],
+     "Testing the fix"),
+    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 2.8}, {"code": "sweep", "far": [["s2", 438.0, 1.6]]}],
+     "Finding the shift\nTesting the fix")])
+def test_a_subtitle_alert_names_the_steps_of_its_sentences_in_job_order(lines, want):
+    """Each subtitle counts at the furthest step its sentences name, so one track shows one step. Other subtitles may
+    add theirs, one a line, in job order."""
+    assert h.stopped_at({"kind": "subtiming", "lines": lines}, "done") == want
+
+
+def test_the_stage_fields_say_no_internal_word_and_give_no_advice():
+    """The field names and values are plain words. The steps face the instruction test too. The field name and the
+    check names are nouns, as "Import check", where "Import" names the event and asks nothing of the viewer."""
+    assert not [s for s in ("Check", "Stopped at", *h.CHECKS.values(), *h.FIX_STEPS) if INTERNAL.search(s)]
+    assert not [s for s in h.FIX_STEPS if INSTRUCTION.search(s)]
+
+
+# A deep analysis that found no shift to test, a failed rewrite, and a doubt
+NO_FIT = {"kind": "subtiming", "lines": [{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 2.8}]}
+REWRITE = {"kind": "subtiming", "lines": [{"code": "not_retimed", "tracks": ["s1"], "block": None,
+                                           "result": "subtitle remux failed: an event of the extracted text is not in the track"}]}
+
+
+@pytest.mark.parametrize("source, finding, check, step", [
+    ("hook", DOUBT, "Import check", None), ("deep_analysis", NO_FIT, "Deep analysis", "Testing the fix"),
+    ("recheck", REWRITE, "Recheck", "Writing the file"), ("backfill", FINDINGS[16][0], "Command line run", "Converting to MKV"),
+    (None, DOUBT, None, None)])
+def test_an_alert_names_its_check_and_step_beside_each_other_above_the_item(source, finding, check, step):
+    """The owner's design: two inline fields under the text and above the item, Check and Stopped at. An alert whose
+    fix never ran shows only Check. A record with no source shows neither and still posts."""
+    rec = decision(**({"source": source} if source else {}), findings=[finding])
+    if not source:
+        del rec["source"]
+    (e,) = h.render(rec, "embed")
+    item = {"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}
+    assert e["fields"] == [{"name": "Check", "value": check, "inline": True}] * bool(check) + \
+        [{"name": "Stopped at", "value": step, "inline": True}] * bool(step) + [item]
+
+
+@pytest.mark.parametrize("source, check", [("worker", "Worker start"), ("backfill", "Command line run")])
+def test_a_stopped_conversion_names_the_check_that_found_it(source, check):
+    """The worker reports a conversion a stopped run left when it starts, and a --convert run does too. No import found
+    it. A conversion that finished waits only for the app to take the new file, so it stopped at that swap."""
+    for state, step in (("held", "Converting to MKV"), ("converted", "Replacing the file")):
+        (e,) = h.render(decision(source=source, findings=[dict(FINDINGS[16][0], state=state)]), "embed")
+        assert [(f["name"], f["value"]) for f in e["fields"][:2]] == [("Check", check), ("Stopped at", step)]
+
+
+DRIFT = {"rate": "1001/1000", "offset": -0.11}   # a DVD subtitle that drifts, about 1.3 s late by the end of a 23-minute episode
+
+
+@pytest.mark.parametrize("fix, want", [
+    ({"rate": "1001/1000", "offset": 0.02}, "are in sync at the start and about 1.4 s late by the end"),
+    ({"rate": "1000/1001", "offset": 1.38}, "are about 1.4 s late at the start and in sync by the end"),
+    ({"rate": "1000/1001", "offset": 1.33}, "are about 1.3 s late at the start and in sync by the end"),   # 0.049 s early by the end
+    ({"rate": "1000/1001", "offset": 1.44}, "are about 1.4 s late at the start and about 0.1 s late by the end")])   # 0.061 s
+def test_an_offset_under_a_twentieth_of_a_second_reads_in_sync(fix, want):
+    """A copy reviewer: "about 0.0 s late at the start" says nothing. An offset under IN_SYNC reads "in sync" at the start
+    and at the end, in the check alert, the layout alert and the change post."""
+    line = {"code": "check_times", "track": "s1", "why": "x", "fix": fix, "duration": 1380}
+    want_all = f"The English subtitles (track 1) {want}. SUBTITLES is set to check, so they were left as they are."
+    assert h.unmarked(h.sub_line(line, "done", LANGS)) == want_all
+    would = {"code": "off", "track": "s1", "ref": None, "why": "x", "unfixed": fix["offset"], "would": fix, "duration": 1380}
+    said = h.unmarked(h.sub_line(would, "done", LANGS))
+    assert "0.0 s" not in said and ("in sync" in said) == ("in sync" in want), said
+    rec = dict(decision(), file_duration=1380, tracks=[{"i": "s1", "lang": "eng"}], subremux={"done": True, "fixed": ["s1"]},
+               subtime={"s1": {"verdict": "match", "timing": {"fix": fix, "why": "x"}}})
+    assert h.unmarked(h.retime_change(rec, {"live": set()})[1]).startswith(f"The English subtitles (track 1) {want.replace('are', 'were', 1)}")
+
+
+def test_a_drift_says_where_it_starts_and_where_it_ends():
+    """A copy reviewer: "about 0.1 s early at the start and drifted over time" hid a drift of more than a second. The
+    sentence names the offset at the end of the file too, from the fix and the length of the file."""
+    assert h.at_end(DRIFT, 1380) == pytest.approx(1.27) and h.at_end({"rate": "1/1", "offset": 2.0}, 1380) is None
+    line = {"code": "check_times", "track": "s1", "why": "x", "fix": DRIFT, "duration": 1380}
+    assert h.unmarked(h.sub_line(line, "done", LANGS)) == ("The English subtitles (track 1) are about 0.1 s early at the start and about "
+                                                           "1.3 s late by the end. SUBTITLES is set to check, so they were left as they are.")
+    would = {"code": "off", "track": "s1", "ref": None, "why": "x", "unfixed": -0.11, "would": DRIFT, "duration": 1380}
+    assert h.unmarked(h.sub_line(would, "done", LANGS)) == ("The English subtitles (track 1) seem about 0.1 s early against the speech at the "
+                                                            "start and about 1.3 s late by the end. They were left as they are.")
+    rec = dict(decision(), file_duration=1380, tracks=[{"i": "s1", "lang": "eng"}], subremux={"done": True, "fixed": ["s1"]},
+               subtime={"s1": {"verdict": "match", "timing": {"fix": DRIFT, "why": "x"}}})
+    assert h.unmarked(h.retime_change(rec, {"live": set()})[1]) == ("The English subtitles (track 1) were about 0.1 s early at the start and "
+                                                                    "about 1.3 s late by the end. Retimed them to match the speech.")
+
+
+def test_an_alert_with_both_stage_fields_fits_the_embed_limit(monkeypatch):
+    """The fields count toward Discord's limit. The cut takes the longest value, the item's, so the check and the step
+    stay whole."""
+    long = decision(source="deep_analysis", label="Film " + "A" * 300, path="/m/" + "F" * 3000 + ".mkv", findings=[REWRITE])
+    size = lambda e: len(e["title"]) + len(e["description"]) + len(e["footer"]["text"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])
+    for limit in (h.EMBED_MAX, 1500):
+        monkeypatch.setattr(h, "EMBED_MAX", limit)
+        (e,) = h.render(long, "embed")
+        assert size(e) <= limit and e["fields"][:2] == [{"name": "Check", "value": "Deep analysis", "inline": True},
+                                                        {"name": "Stopped at", "value": "Writing the file", "inline": True}]
+
+
+def test_a_change_post_names_no_check_and_no_step(sent, settings):
+    """Change posts stay as they were: the item field alone."""
+    settings(discord_posts="all")
+    changed()
+    assert sent and all([f["name"] for f in e["fields"]] == ["Film A (1979)"] for e in sent)
 
 
 SHOW_ALPHA = {"kind": "episode", "imported": [["S01E02", "Overnight"]], "said": "the release name", "title": "Anxious Times at Show Alpha",
@@ -901,7 +1144,7 @@ def show_alpha(**kw):
                     findings=[SHOW_ALPHA], **kw)
 
 
-PLAIN_FIELD = [{"name": "Show Alpha (2023) S01E02", "value": ALPHA_FILE, "inline": False}]   # the field with no link
+PLAIN_FIELD = [IMPORT, {"name": "Show Alpha (2023) S01E02", "value": ALPHA_FILE, "inline": False}]   # the fields with no link
 
 
 @pytest.mark.parametrize("app, label, slug, finding, base, url", [
@@ -914,7 +1157,7 @@ def test_an_alert_links_the_item_to_its_page_in_the_app(settings, app, label, sl
     settings(**{app: {"link": base}})
     rec = decision(app=app, label=label, path=f"/media/{ALPHA_FILE}", ids={"slug": slug}, findings=[finding])
     (e,) = h.render(rec, "embed")
-    assert e["fields"] == [{"name": "​", "value": f"[{label}]({url})\n{ALPHA_FILE}", "inline": False}]
+    assert e["fields"] == [IMPORT, {"name": "​", "value": f"[{label}]({url})\n{ALPHA_FILE}", "inline": False}]
     plain = json.dumps(h.render(rec, "log")["alerts"]) + h.render(rec, "logfmt") + h.render(rec, "cli")
     assert "](" not in plain and "http" not in plain
 
@@ -939,7 +1182,8 @@ def test_a_link_keeps_only_a_clean_host_port_and_path(settings, base, url):
     link leaves the field as before, and the alert still renders."""
     settings(sonarr={"link": base})
     (e,) = h.render(show_alpha(), "embed")
-    assert e["fields"] == ([{"name": "​", "value": f"[Show Alpha (2023) S01E02]({url})\n{ALPHA_FILE}", "inline": False}] if url else PLAIN_FIELD)
+    assert e["fields"] == ([IMPORT, {"name": "​", "value": f"[Show Alpha (2023) S01E02]({url})\n{ALPHA_FILE}", "inline": False}] if url
+                           else PLAIN_FIELD)
     assert not [x for x in ("admin", "pa55", "k3y", "apikey", "top") if x in json.dumps(e)]
 
 
@@ -952,22 +1196,22 @@ def test_an_item_with_no_slug_alerts_as_before(monkeypatch, settings):
     for ids in (None, {}, {"slug": None}, {"slug": ""}):
         rec = decision(**({} if ids is None else {"ids": ids}), findings=[{"kind": "language", "want": "English", "has": ["por"]}])
         assert h.alert_findings(rec, 1) == ["sent"]
-        assert sent.pop()["fields"] == [{"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}]
+        assert sent.pop()["fields"] == [IMPORT, {"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}]
 
 
 def test_a_title_with_markdown_and_brackets_keeps_its_link_whole(settings):
     """A ")" or "]" in a title never ends the link early, and a "*" never starts a bold span. The slug is percent-encoded.
     A title whose brackets do not pair gets no link, because Discord would end the link at the lone bracket."""
     settings(radarr={"link": MOVIES})
-    label = "Who Framed *Roger* [Rabbit] (1988) :)"
-    e = h.render(decision(label=label, path="/m/Roger_Rabbit.mkv", ids={"slug": "roger (1988) [x]/y"}), "embed")[0]
-    assert e["fields"] == [{"name": "​", "value": f"[Who Framed \\*Roger\\* \\[Rabbit\\] (1988) :)]({MOVIES}/movie/"
-                                                       "roger%20%281988%29%20%5Bx%5D%2Fy)\nRoger\\_Rabbit.mkv", "inline": False}]
+    label = "Who Moved *Otto* [Otter] (1988) :)"
+    e = h.render(decision(label=label, path="/m/Otto_Otter.mkv", ids={"slug": "otto (1988) [x]/y"}), "embed")[0]
+    assert e["fields"] == [IMPORT, {"name": "​", "value": f"[Who Moved \\*Otto\\* \\[Otter\\] (1988) :)]({MOVIES}/movie/"
+                                                       "otto%20%281988%29%20%5Bx%5D%2Fy)\nOtto\\_Otter.mkv", "inline": False}]
     for label in ("Foo [ Bar (2001)", "Foo ] Bar [ (2001)", "Foo [[ Bar ] (2001)"):
         e = h.render(decision(label=label, path="/m/Foo.mkv", ids={"slug": "1"}), "embed")[0]
-        assert e["fields"] == [{"name": label, "value": "Foo.mkv", "inline": False}]
-    assert h.markdown(f'Two. Lines. {h.link("Mr. Robot S01E01", "http://h/series/mr-robot")}: OK') == \
-        "Two.\nLines.\n[Mr. Robot S01E01](http://h/series/mr-robot): OK"   # a link span never breaks at a full stop
+        assert e["fields"] == [IMPORT, {"name": label, "value": "Foo.mkv", "inline": False}]
+    assert h.markdown(f'Two. Lines. {h.link("Dr. Robo S01E01", "http://h/series/dr-robo")}: OK') == \
+        "Two.\nLines.\n[Dr. Robo S01E01](http://h/series/dr-robo): OK"   # a link span never breaks at a full stop
 
 
 def test_an_edit_error_keeps_its_reason_after_a_long_path():
@@ -1024,18 +1268,78 @@ def hunter_posts():
     return [x for x in dict.fromkeys(out) if " " in x and not any(x != y and x in y for y in out)]
 
 
-def test_no_alert_says_an_internal_word_or_tells_the_viewer_what_to_do():
+def module_texts(name):
+    """Every text with a space in it of the module file name, as a string or an f-string, with a placeholder read as {}.
+    A part of an f-string counts too."""
+    tree = ast.parse(open(os.path.join(ROOT, "arr_media_guard", name)).read())
+    text = lambda n: "".join(x.value if isinstance(x, ast.Constant) else "{}" for x in n.values) if isinstance(n, ast.JoinedStr) else n.value
+    return [t for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) or isinstance(n, ast.Constant) and isinstance(n.value, str)
+            for t in [text(n)] if " " in t]
+
+
+# The subtitle sentences that name why a subtitle remux did not run, see report.remux_why()
+REWRITES = [x for x, *_ in SUB_LINES if x.get("result")]
+
+
+def sidecar_left(tmp_path, settings, monkeypatch, errors):
+    """The sidecar_left sentence of a sidecar whose new ends do not fit its text, once for each error that
+    remux.set_ends() may raise, see subtitles.sidecar_fix(). Each entry keeps its error for the decision log."""
+    video, side = tmp_path / "Film (2001).mkv", tmp_path / "Film (2001).en.srt"
+    cues = [(10.0 + 2 * i, 10.1 + 2 * i, f"Line {i}") for i in range(30)]
+    fmt = lambda t: f"00:00:{int(t):02d},{round(t * 1000) % 1000:03d}"
+    side.write_text("".join(f"{i + 1}\n{fmt(a)} --> {fmt(b)}\n{t}\n\n" for i, (a, b, t) in enumerate(cues)))
+    settings(keep_days=7, log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
+    monkeypatch.setattr(h, "originals_root", lambda p: str(tmp_path / ".kept"))
+    sides = {s["name"]: s for s in h.sidecar_subs(str(video))}
+    sync = {side.name: {"verdict": "match", "why": "", "timing": {"fix": None, "why": "in time"}}}
+    out = []
+    for error in errors:
+        def refuse(*a, error=error):
+            raise RuntimeError(error)
+        monkeypatch.setattr(h, "set_ends", refuse)
+        (e,) = h.sidecar_fix(sides, sync, True, "radarr", "sub_time", ends={side.name: h.flash_plan(cues)})
+        assert (e["result"], e["error"]) == ("left", h.mask(error)[:300]) and side.read_text().startswith("1\n00:00:10,000"), e
+        out.append(h.unmarked(h.sub_line({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]},
+                                         "done", LANGS)))
+    return out
+
+
+def test_no_alert_says_an_internal_word_or_tells_the_viewer_what_to_do(tmp_path, settings, monkeypatch):
     """Every Discord alert kind, title and text in the done tense, with every action and every subtitle sentence, says
     what is wrong in a viewer's words, and what the program did. So does every post of the subtitle hunter. A tool's
-    error text passes through as it is."""
+    error text passes through as it is, except the error of a subtitle remux: every text of remux.py and proof.py, as
+    that error, reads "rewriting the file failed", and the decision log keeps it. So does every text of remux.py as the
+    error of a sidecar whose new times do not fit its text."""
     hunter = hunter_posts()
     assert len(hunter) >= 20 and "Old file left by an earlier run" in hunter, hunter
     said = hunter + [" ".join([h.title(f)[0], *(x for x in h.texts(f, "done", LANGS) if x)]) for f, *_ in FINDINGS]
     said += [" ".join([h.title(dict(f, action=a))[0], h.texts(dict(f, action=a), "done")[1]]) for f in [{"kind": "audio", "certain": SILENT}]
              for a, *_ in ACTIONS]
     said += [h.unmarked(h.sub_line(x, "done", LANGS)) for x, *_ in SUB_LINES] + [h.unmarked(h.sub_line(x, "done")) for x, *_ in SUB_LINES]
+    said += [h.unmarked(h.track_name(x["i"], x["lang"], x["i"][1:], x)) for x, _ in NAMES]   # the names of tracks, see track_name()
+    errors = module_texts("remux.py") + module_texts("proof.py")
+    assert len(errors) >= 100 and len(REWRITES) >= 5, (len(errors), len(REWRITES))
+    rewrites = [h.unmarked(h.sub_line(dict(x, result=f"subtitle remux failed: {e}"), "done", LANGS)) for x in REWRITES for e in errors]
+    plain = lambda s: re.search(r"(because|, but) rewriting the file failed\.", s) and "failed, because rewriting" not in s
+    assert all(map(plain, rewrites)), [s for s in rewrites if not plain(s)][:3]
+    sides = sidecar_left(tmp_path, settings, monkeypatch, module_texts("remux.py"))
+    assert set(sides) == {"The subtitles in Film (2001).en.srt flash by too fast to read, but the file was left as it is, because its new ends do "
+                          "not fit its text."}, sorted(set(sides))[:3]
+    said += rewrites + sides
     assert {f["kind"] for f, *_ in FINDINGS} == set(h.FINDINGS) and not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)]
     assert not [s for s in said if INSTRUCTION.search(s)]
+
+
+def test_the_sub_time_report_names_the_word_check_and_the_sweep_fit():
+    """The reason column of --sub-time keeps the word check's reason when the sweep's verdict replaced it, and the reason
+    the sweep fit refused, so the report shows why the times changed or stayed."""
+    rows = {"s1": {"verdict": "match", "why": "the heard words match", "timing": {"fix": DRIFT, "why": "the sweep's 20 windows fit a fix",
+                                                                                 "word_check": "the cues are off by different amounts"}},
+            "s2": {"verdict": "match", "why": "the heard words match", "timing": {"fix": None, "piecewise": True, "offsets": [0.0, 1.2],
+                                                                                 "why": "the cues are off", "sweep_fit": "two sweep windows sit off"}}}
+    text = h.sub_time_report(dict(decision(result="no change"), subtime=rows), "done").splitlines()
+    assert text[1].endswith("| the sweep's 20 windows fit a fix; word check: the cues are off by different amounts"), text
+    assert text[2].endswith("| times stay | the cues are off; sweep fit: two sweep windows sit off"), text
 
 
 def test_the_cli_target_is_the_backfill_line():

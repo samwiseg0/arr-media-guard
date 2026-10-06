@@ -525,7 +525,8 @@ def pending_recover(app, settle_them):
     """The pending conversions of app that no running process owns, see pending_edit(). A converted one gets the
     settle() a kill cut short, when settle_them. Any other stopped between the swap and the import: its original may
     still hide under held_name(), and its extras in hide_dir. Those are printed and logged for a person, posted once per
-    pending entry, and nothing moves. Returns the entries it reported.
+    pending entry, and nothing moves. Returns the entries it reported. Only a --convert run settles, so the post names
+    it as the check, and the worker's names the worker's start, see report.CHECKS.
 
     G5: the pid of an entry of another pid namespace, as of a container beside the host, means nothing here. So such
     an entry counts as owned while it is younger than JOB_MAX_AGE, and as stopped after that. A restart of a container
@@ -558,8 +559,8 @@ def pending_recover(app, settle_them):
         print(f"STRANDED {e.get('path')}: {note}", flush=True)
         logs.log(dict(app=app, source="backfill", result="warning", path=e.get("path"), note=note))
         with contextlib.suppress(Exception):
-            logs.alert_findings(dict(app=app, label=os.path.basename(e.get("path") or k), path=e.get("path") or k,
-                             findings=[{"kind": "repack", "state": e.get("state"), "note": note}]), k)   # one post per pending entry
+            logs.alert_findings(dict(app=app, source="backfill" if settle_them else "worker", label=os.path.basename(e.get("path") or k),
+                                     path=e.get("path") or k, findings=[{"kind": "repack", "state": e.get("state"), "note": note}]), k)   # one post per pending entry
     return stranded
 
 

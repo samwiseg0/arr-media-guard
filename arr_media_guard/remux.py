@@ -350,15 +350,57 @@ PROP_EDITS = (("uid", "track-uid"), ("language_ietf", "language-ietf"), ("track_
               ("flag_visual_impaired", "flag-visual-impaired"), ("flag_text_descriptions", "flag-text-descriptions"))
 
 
-def props_fault(j, new, drop=()):
+# The Format line of the [Events] section that mkvextract writes for an ASS or SSA header without one, by codec. mkvmerge
+# reads it back into the header, see header_kept().
+EVENTS_FORMAT = {"S_TEXT/ASS": "Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text",
+                 "S_TEXT/SSA": "Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"}
+
+
+def header_kept(old, new, codec):
+    """Whether the codec private data new, in hex, keeps old after ended_track() for a track of codec. It must be the
+    same. A HandBrake ASS header ends in a NUL byte and has no [Events] section. mkvmerge drops the NUL and adds the
+    section, so such a header may also be old less that byte, then a blank line, "[Events]" and the Format line of
+    EVENTS_FORMAT. A section name matches in any case, as libass reads it, so an old header with "[events]" fails too.
+    Any other change fails."""
+    if new == old:
+        return True
+    try:
+        a, b = bytes.fromhex(old or ""), bytes.fromhex(new or "")
+    except ValueError:
+        return False
+    events = f"\r\n[Events]\r\nFormat: {EVENTS_FORMAT.get(codec)}\r\n\r\n".encode()
+    return codec in EVENTS_FORMAT and a.endswith(b"\0") and b"[events]" not in a.lower() and b == a[:-1] + events
+
+
+def grid_plan(plan, fix, codec):
+    """A time_plan() of the flash_plan() plan of a track of codec, with its fix, or None. Only an ASS or SSA track whose
+    starts fall between centiseconds gets one. ASS times are centiseconds, and the text round trip of ended_track()
+    puts each start on that grid. HandBrake writes starts in milliseconds, so each one moves up to 5 ms, and up to
+    about 9 ms against the stream's first packet. That is past the proof's TIME_SLACK for a track whose starts stay.
+    The time plan puts each start on the nearest centisecond, and the proof holds each start and end to the plan."""
+    if codec not in EVENTS_FORMAT or not any(round(s * 1000) % 10 for s, *_ in plan):
+        return None
+    return time_plan([(s, o, t) for s, t, o, _ in plan], fix, (), [n for *_, n in plan], ass=True)
+
+
+def grid_moved(plan, fix):
+    """The starts of the time_plan() plan of grid_plan() that the grid moved: its new start is more than half a ms off
+    the start the fix gives, at 0 or later, as time_plan() keeps it. A start the fix alone moved does not count."""
+    at = lambda s: max(0.0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
+    return sum(abs(a - at(s)) > 0.0005 for s, _, _, a, _ in plan)
+
+
+def props_fault(j, new, drop=(), ended=()):
     """Why the tracks of the remuxed probe new differ from those of j less the track ids in drop, or None: the type,
     codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, and the count of attachments
-    and chapters."""
+    and chapters. ended holds the track ids of j that ended_track() wrote again, whose codec private data passes
+    header_kept()."""
     j = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop])
     if checks.track_list(j) != checks.track_list(new): return f"the tracks changed from {checks.track_list(j)} to {checks.track_list(new)}"
     for a, b in zip(j.get("tracks") or [], new.get("tracks") or []):
         pa, pb = a.get("properties") or {}, b.get("properties") or {}
-        diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)]
+        diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)
+                and not (k == "codec_private_data" and a.get("id") in ended and header_kept(pa.get(k), pb.get(k), pa.get("codec_id")))]
         if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"
     for k in ("attachments", "chapters"):
         if len(j.get(k) or []) != len(new.get(k) or []): return f"the {k} changed from {len(j.get(k) or [])} to {len(new.get(k) or [])}"
@@ -521,7 +563,9 @@ def set_ends(text, ass, plan):
 def ended_track(path, j, tid, plan, folder, text=None):
     """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new times of plan, a
     time_plan() or a flash_plan(). mkvextract writes the track's text, set_ends() puts the times in, and mkvmerge reads
-    it back. That round trip keeps the packets and the ASS header byte for byte. The language goes in here, as ffmpeg
+    it back. That round trip keeps the packets and the ASS header byte for byte, with one exception. HandBrake ends each
+    ASS event and its header with a NUL byte and writes no [Events] section, and the round trip drops each NUL and
+    adds the section. prove() and header_kept() pass only that change. The language goes in here, as ffmpeg
     copies it. The flags and names come back later with mkvpropedit, see resub(). text takes the place of plan for a
     repair, see resub(): the new SubRip text, which needs no mkvextract, or a function of the extracted text."""
     p = next(t.get("properties") or {} for t in j.get("tracks") or [] if t.get("id") == tid)
@@ -699,8 +743,11 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     the repair's text and to the original's times, see prove().
 
     A track with new ends comes from its own input: mkvextract writes its text, set_ends() puts each new end in, and
-    mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, and the proof
-    holds each end to the plan.
+    mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, but for the
+    NUL bytes of a HandBrake ASS track, see ended_track(). The proof holds each end to the plan. An ASS track whose
+    starts fall between centiseconds goes in as a track in timed, with each start on the nearest centisecond, see
+    grid_plan(). Its log and what text stay those of new ends. info["starts_rounded"] counts the starts that the grid
+    moved off the time its fix gives, see grid_moved().
 
     A track in timed comes from its own input the same way, with every start and end of its plan. Its plan holds its
     fix and its flash ends, so it gets no -itsoffset or -itsscale. Its entries in fixes and ends only go to the log and
@@ -739,6 +786,11 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
                      + [f"track {i}: {repair_name(r)}" + (", default flag off" if r.get("default_off") else "") for i, r in recode.items()]
                      + [f"remove track {i}" for i in drop if i not in strip]
                      + [f"take out track {i}, its bytes to {os.path.basename(n)}" for i, n in names.items()])
+    codec = {t.get("id"): (t.get("properties") or {}).get("codec_id") for t in j.get("tracks") or []}
+    grid = {i: x for i, plan in ends.items() if i not in timed and (x := grid_plan(plan, fixes.get(i), codec.get(i)))}
+    if grid:   # the starts on the ASS grid, see grid_plan()
+        timed = {**timed, **grid}
+        info["starts_rounded"] = {str(i): grid_moved(x, fixes.get(i)) for i, x in grid.items()}
     why = repack_skip(path, st)
     if why:
         return "subtitle_remux_skipped", f"subtitle remux skipped, {why}: {what}", info
@@ -799,7 +851,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
             raise RuntimeError(f"mkvpropedit exited {e.returncode}: {config.mask((e.stdout + e.stderr).strip())[-300:]}")
         sw.sync()
         new = checks.mkvmerge(tmp)
-        fault = props_fault(j, new, drop)
+        fault = props_fault(j, new, drop, {*ends, *timed, *recode})   # the tracks of ended_track()
         if not fault:
             kept = [i for i in subs if i not in drop]
             refused, info["proof"] = proof.prove(path, tmp, [], folder, dropped=gone, absolute=True,

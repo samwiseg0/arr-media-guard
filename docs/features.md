@@ -2,8 +2,9 @@
 
 arr-media-guard (AMG) checks every file that Sonarr or Radarr imports or upgrades. In Docker the apps post to its
 *listener*, a small web server, through a **Webhook** connection, see [docker.md](docker.md). On a host they run it as a
-**Custom Script**. AMG puts each file in its *background queue*, answers the app at once, and checks the file from
-there. Imports always go first.
+**Custom Script**. Here *the app* is the Sonarr or Radarr that sent the file, and the *item* is its movie or series. AMG
+puts each file in its *background queue* and answers the app at once. Its *worker*, the AMG process that takes the
+queued jobs, then checks the file. Imports always go first.
 
 Most fixes change only track flags and language tags, in place, with `mkvpropedit`. A repair or a subtitle change writes
 the file again with the same video and audio, a *remux*. AMG never re-encodes. It checks the new file against the old
@@ -18,39 +19,70 @@ the language and the role of every audio and subtitle track, such as main, comme
 that play first by the [policy file](policy.md). It turns default flags on or off, turns forced flags off, and fixes
 language tags. When the tracks give mixed signs, it changes no flag and logs the file as undecided.
 
+## Original language flag
+
+Matroska has an *Original language* flag. It marks the tracks in the language the film or show was made in, as against
+a dub or a translation. Many releases leave it out, and some set it on a dub. At import, AMG sets the flag on each audio
+and subtitle track in the original language. It takes the flag off a track in another language that has it.
+
+- The original language is the one TMDB lists. When Radarr or Sonarr names another one, AMG changes no flag.
+- AMG changes the flag only on a track whose language it is sure of. A tag alone is not enough.
+  - Audio: the heard language must match the tag. When a subtitle's words matched the track at the import's subtitle
+    check, that match proves the language, and AMG hears nothing more. Else AMG hears the track with its language
+    detection, up to three 30-second samples, and caches the answer. A track whose tag and title name the same
+    language needs no hearing.
+  - Subtitles: AMG reads the text, and the language it reads must match the tag. A picture subtitle has no text, so
+    its flag stays.
+- When language detection is not installed or fails, no flag changes. The decision log says why.
+- An untagged track keeps its flag, unless AMG tags it in the same run. A commentary and an audio description keep
+  their flags. So does every track of a file TMDB does not know.
+- An edit of this flag alone does not ask Plex to read the file again, because Plex does not use the flag.
+- The edit is one more flag in the same `mkvpropedit` call, with the same undo line. The decision log shows it with the
+  other flag edits. With `DISCORD_POSTS=all` a change post says, for example, "Marked the **Japanese audio (track 2)**
+  as the original language." It never posts an alert.
+- Imports set it. A backfill or `--sub-check` with `--apply` sets it on the files it checks. A backfill skips a file
+  with one audio track, no subtitles and no tag to fix, so such a file keeps its flag. The deep analysis and a recheck
+  keep the flags the import set, so files imported before 2.7.0 change only in a backfill.
+
 ## Language detection
 
 A track can have no language tag, or a wrong one. *Language detection* is a speech model, Whisper, that hears an audio
 track whose language is in doubt. The Docker image holds it, and on a host it is optional. For subtitles, AMG counts
 common words in the text. An untagged subtitle takes the language of its text. An untagged audio track takes the heard
-language when the film's original language or TMDB agrees. A default or forced subtitle whose text reads as another
-language gets a new tag, when a second sign agrees. Else an alert says its language may be wrong. When no audio speaks
-that language, it also stops playing by default. This runs at import and in the backfill.
+language when the item's original language, or a spoken language TMDB lists, agrees. A default or forced subtitle whose
+text reads as another language than its tag gets a new tag, when a second sign agrees. Else an alert says its language
+may be wrong. When no main audio track speaks the language its text reads as, AMG also turns off its default and forced
+flags. This runs at import and in the backfill.
 
 ## Subtitle match
 
 A subtitle can belong to another episode, or show its lines early or late. At import, AMG hears two short parts of the
 audio, one early and one late, and more when needed. It compares the words with each text subtitle in the language of
-the audio. That covers subtitles in the file and `.srt` files beside it, called *sidecars*. This needs language
-detection.
+the audio. That covers subtitles in the file and `.srt` files beside it, called *sidecars*. This compare is the *word
+check*. It needs language detection.
 
-- A track whose words do not match leaves the file in a remux. Such a sidecar moves to the folder where AMG keeps old
-  files. When AMG cannot remove a track, it stops the track playing by default and alerts.
+- AMG takes a subtitle track whose words do not match out of the file, in a remux. A sidecar that does not match moves
+  into `.<NAME>-originals`, the folder of [kept originals](regrabs.md#kept-originals). When AMG cannot remove a track,
+  it stops the track playing by default and alerts.
 - A subtitle early or late by one amount gets new times. So does one made for another frame rate, which drifts.
+- The *deep analysis*, a slower subtitle check after the import, also fixes a drift. It hears one part of the audio in
+  each minute. A few parts heard wrong do not block the fix, see [subtitles.md](subtitles.md#drift-timing).
+- Roll-up captions repeat the lines above each new line. AMG times each caption by its new line. So a roll-up track in
+  sync no longer gets a false "late" alert, see [subtitles.md](subtitles.md#roll-up-captions).
 - A text subtitle whose lines flash by too fast to read gets lines that stay on screen longer.
-- A subtitle AMG cannot hear, in another language or made of pictures, is timed against one whose words matched. An
-  import does this while its time limit allows.
+- A subtitle in another language, or one made of pictures, has no words AMG can compare with the speech. AMG times it
+  against one whose words matched. An import does this while its time limit allows.
 
-`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the *deep analysis*, a slower subtitle check after each import. It
-hears much more of the audio. It waits in the background queue, and runs only while no import waits. `--sub-check`
-checks a library and `--sub-time` single files, see [subtitles.md](subtitles.md).
+`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears much more of the
+audio. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
+`--sub-time` single files, see [subtitles.md](subtitles.md).
 
 ### Subtitle block timing
 
 Sometimes only part of a subtitle is out of sync. A release might have a scene cut or added, so the lines before it are
-fine and the lines after it show a few seconds early or late. AMG listens to the audio, finds the stretch of lines that
-is off, and moves only those lines to where the words are spoken. Lines that are already in sync stay where they are,
-and lines never change order.
+fine and the lines after it show a few seconds early or late. AMG listens to the audio and finds the stretch of lines
+that is off, a *block*. It moves only those lines to where the words are spoken. Lines that are already in sync stay
+where they are, and lines never change order.
 
 Two separate signs from the audio check the stretch. One is the words AMG hears. The other is the moments where speech
 starts after a pause. When they disagree, nothing moves. When too few such moments are found, the words alone decide,
@@ -61,9 +93,10 @@ runs in the deep analysis, and when you run `--sub-time` on a file, see
 ### Live caption timing
 
 Live captions are typed during a broadcast. Each line shows some seconds after it is spoken, by a different amount each
-time. AMG spots such a track by its changing delay. It hears the whole audio and moves each line to where its first word
-is spoken. A line it cannot place stays, and lines never change order. It runs in the deep analysis and with
-`--sub-time`. When over a fifth of the lines stay out of sync, an alert says how many moved, see
+time. AMG spots such a track by its changing delay. A delay that grows or shrinks steadily is a drift instead. One fix
+for the whole track corrects a drift, see [Drift timing](subtitles.md#drift-timing). It hears the whole audio and moves
+each line to where its first word is spoken. A line it cannot place stays, and lines never change order. It runs in the
+deep analysis and with `--sub-time`. When over a fifth of the lines stay out of sync, an alert says how many moved, see
 [subtitles.md](subtitles.md#live-caption-timing).
 
 ### Foreign subtitle timing
@@ -103,8 +136,8 @@ way, and a conversion puts it into the new file with the right characters. The s
 
 An old muxer could store a subtitle track in the wrong character set, so Greek "Καλημέρα" shows as "ÊáëçìÝñá". When such
 *garbled* text reads as the track's language in the right character set, AMG writes it back readable in a remux. A
-sidecar with the same lines fills in lines the old muxer cut short. A track AMG cannot repair leaves the file, and an
-alert names `<name>.<language>.garbled.txt`, the file beside the video that holds its bytes. It runs in the deep
+sidecar with the same lines fills in lines the old muxer cut short. AMG takes a track it cannot repair out of the file.
+An alert names `<name>.<language>.garbled.txt`, the file beside the video that holds its bytes. It runs in the deep
 analysis and with `--sub-check` and `--sub-time`, see [subtitles.md](subtitles.md#garbled-subtitle-repair).
 
 ## Broken audio and corrupt video
@@ -113,8 +146,8 @@ At import, AMG decodes three samples of the audio that will play. It checks that
 with empty data, and decodes three short parts of it. A sure fault gets a second check from scratch. When that finds it
 too, AMG deletes the file through the app and marks the grab as failed, so the app searches again. This is a *re-grab*.
 When AMG is unsure, an alert such as "Audio may be broken" says why. `REGRAB` picks the faults that re-grab, and
-`REGRAB_CAP` allows 30 a day for each Sonarr or Radarr. When either stops a re-grab, an alert says so. See
-[regrabs.md](regrabs.md#re-grabs).
+`REGRAB_CAP` allows 30 a day by default for each Sonarr or Radarr instance. When either stops a re-grab, an alert says
+so. See [regrabs.md](regrabs.md#re-grabs).
 
 ## Restore after a bad upgrade
 
@@ -136,17 +169,18 @@ name. When it belongs to another episode, an alert "Maybe the wrong episode" nam
 ## Header repair
 
 A Matroska file can carry a wrong header, such as a wrong length or a missing seek index. It can also hold junk data at
-its end. A SubRip subtitle can run past the end of the video. After a video check finds no real damage, AMG repairs the
-file in a remux. It trims those lines, or removes a track made for another cut. Other subtitle formats cannot be
-trimmed, so an alert names them. It runs at import and in a backfill with `--apply`. `HEADER_REPAIR=false` turns it off.
+its end. A SubRip subtitle, the text format of `.srt` files, can run past the end of the video. After a video check
+finds no real damage, AMG repairs the file in a remux. It trims those lines, or removes a track made for another cut.
+Other subtitle formats cannot be trimmed, so an alert names them. It runs at import and in a backfill with `--apply`.
+`HEADER_REPAIR=false` turns it off.
 
 ## Conversion
 
 AMG can turn a file in another container, such as AVI, MP4, M4V, TS or WebM, into Matroska. The streams stay the same,
 and the sidecars go into the new file. A subtitle whose words do not match the audio stays out. AMG checks every stream
-of the new file, packet by packet, before the original goes. `CONVERT=true` turns it on for imports, and `--convert` for
-a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB` lists `damage`.
-Else the alert title ends "re-grab is off". See [commands.md](commands.md#convert-files-into-matroska).
+of the new file, packet by packet, before it removes the source file. `CONVERT=true` turns it on for imports, and
+`--convert` for a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB`
+lists `damage`. Else the alert title ends "re-grab is off". See [commands.md](commands.md#convert-files-into-matroska).
 
 ## Backfill and scans
 
@@ -173,11 +207,16 @@ On a host install, the first nightly audit of the new version queues them, and t
 The rechecks wait in the background queue, where every job waits. Imports always go first, then the deep analyses, then
 the rechecks, one at a time. A recheck repeats the check that saved the result, and never checks deeper. A file that
 only an import checked gets the import's subtitle checks again, and no more. `SUBTITLES` decides what a recheck may do,
-as for an import. At `check` it only alerts, and a later `--sub-check --apply` makes the fix. At `fix` or `deep` it
-fixes. At `off` it does nothing. It keeps the flags an earlier run set. Its fixes and alerts look like those of an
-import. `RECHECK_ON_UPDATE=false` turns it off.
+as for an import. At `check` it only alerts, and a later `--sub-check --apply` makes the fix. AMG posts an alert of
+one kind once for a file. So at `check`, a recheck posts nothing when an alert of the same kind posted for the file
+before. At `fix` or `deep` it fixes. At `off` it does nothing. It keeps the flags an earlier run set. Its fixes and
+alerts look like those of an import. `RECHECK_ON_UPDATE=false` turns it off.
 
-The recheck covers only files with a saved result. A file the subtitle check never saw needs one `--sub-check` run.
+The recheck covers only files with a saved result. A file the subtitle check never saw needs one `--sub-check` run. A
+recheck reaches only the results whose findings the new version can fix. A recheck of a result that an import or
+`--sub-check` saved runs at that depth. It does not listen to each minute of the audio, so it cannot make the drift fix
+of the deep analysis, see [Drift timing](subtitles.md#drift-timing). A file saved with no timing finding, such as a
+drift an older version called in sync, needs `arr-media-guard --sub-time <file> --apply`.
 `--backfill <instance> --sub-check --recheck` checks files again by hand, whatever their saved result says, see
 [commands.md](commands.md#dry-runs-and-the-backfill).
 
@@ -186,34 +225,61 @@ checks every file once more, and the update queues no recheck for them.
 
 ## Subtitle hunter
 
-Some foreign films have no English subtitle track. `arr-media-guard-subhunt radarr --ids 123` looks for another release
-of that Radarr film that has one. It downloads each candidate through SABnzbd, outside Radarr, and checks it. A download
-must have an English full or SDH subtitle track and working audio in the original language. Its runtime must be within
-10 percent of the listed one. With `--apply`, Radarr then imports it. A rejected download is deleted, and the old file
-stays. It needs `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, see the [settings](../README.md#subtitle-hunter) and
-[design.md](design.md#subtitle-hunter).
+Some foreign films have no English subtitle track. `arr-media-guard-subhunt radarr --ids 123`, with 123 the film's
+Radarr movie id, looks for another release of that film that has one. It downloads each candidate through SABnzbd,
+outside Radarr, and checks it. A download must have an English full or SDH subtitle track and working audio in the
+film's original language. Its runtime must be within 10 percent of the listed one. With `--apply`, Radarr then imports
+it. A rejected download is deleted, and the old file stays. It needs `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, see the
+[settings](../README.md#subtitle-hunter) and [design.md](design.md#subtitle-hunter).
 
 ## Alerts
 
 AMG posts a Discord alert for each problem it leaves unresolved, when `DISCORD_WEBHOOK` is set. A fix that failed, a fix
 a setting turned off, and a doubt all post, once for the same file. A problem AMG fixed goes to the decision log and
 syslog only. Examples are a re-grab, a removed or repaired subtitle, and new subtitle times. With `DISCORD_POSTS=all`,
-AMG also posts each change it makes to a file, unless an alert already says it. Imports and the deep analysis post. The
-backfill, `--sub-check` and `--sub-time` never post. A scan or the audit posts one summary when it finds a problem.
-`arr-media-guard --test-discord` posts a test message and prints Discord's answer.
+AMG also posts each change it makes to a file, unless an alert already says it. Imports, the deep analysis and the
+recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the worker starts or a `--convert`
+run finds it. The backfill, `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when
+it finds a problem. `arr-media-guard --test-discord` posts a test message and prints Discord's answer.
+
+Each alert shows two short fields side by side, under its text and above the item and file. **Check** names the check
+that found the problem. The checks are Import check, Deep analysis, Recheck, Worker start and Command line run. The last
+two find a conversion that a stop left unfinished, when the worker starts or in a `--convert` run. **Stopped at** names
+the step where AMG's fix stopped. The steps are the same for every kind of alert. A subtitle shows one step, the
+furthest its fix reached.
+
+| Stopped at | What it means |
+| --- | --- |
+| Converting to MKV | The conversion of the file to MKV failed or stopped part way. |
+| Hearing the speech | AMG could not hear enough of the speech to time the subtitles. |
+| Finding the shift | AMG heard the speech, but no one time shift fits the subtitles, as when parts of the file are off by different amounts. |
+| Testing the fix | AMG worked out new times or new text, but the result did not pass its check, so the subtitles stay as they were. |
+| Writing the file | The fix was ready, but writing it into the file failed or was skipped. AMG skips it when the file is larger than `REPACK_MAX_GB`, or the disk has less free space than twice the file's size. It also skips a file with a second hard link, such as the download client's copy. |
+| Replacing the file | A re-grab of the broken file, putting the old file back, or the app taking a converted file in place of the original did not finish. |
+
+Alerts name a track by its language and its role, as a player lists it: "the English SDH subtitles (track 3)". The roles
+are SDH, forced, dub, commentary and audio description. An alert adds the track's own title in quotes only when the
+title adds something, cut at about 40 characters. A title that only repeats the language, the codec or the role is not
+shown. AMG never changes a track's title in the file.
+
+An alert where AMG tried no fix shows only Check. That is a doubt, a check that only reports, or a fix that a setting or
+the daily re-grab limit turned off. A change post, the audit post and a scan summary have neither field. The alert of a
+TMDB key that failed has neither, and neither does the alert that the state store was broken and moved aside. Nor do the
+subtitle hunter's posts.
 
 With `SUBTITLES=deep`, each problem gets one alert. The import holds back its subtitle alerts, because the deep analysis
 checks those subtitles again. The deep analysis then posts once, and only what it still finds wrong. A subtitle problem
 it fixes gets no alert. With `DISCORD_POSTS=all` it gets the one post of the change. A held alert still posts when
-nothing judged its subtitles again. That happens after an error, after a failed hearing, or when `SUBTITLES` is `off` by
-then. With `HOOK_WORKERS` at 2 or more, it also posts when the deep analysis crashes three times. With `HOOK_WORKERS=1`,
-a deep analysis that crashes the worker runs again at the next start, and its held alert waits. A held alert waits with
-the deep analysis job in the background queue, so a restart keeps it. When the app renames or moves the file, the deep
-analysis asks the app where it is and checks it there. A held alert goes unposted only when the app replaced the file,
-or the app says it no longer has the file for that item. When the app lists the file where AMG cannot see it, as while a
-mount is down, the held alert posts. With `DISCORD_POSTS=all`, each change the import made posts once, such as a removed
-track or a flag it turned off. A held alert that posts names the change itself. Otherwise the change posts on its own.
-Every other alert of the import posts at once, such as wrong content, broken audio or video, and a failed flag change.
+nothing judged its subtitles again. That happens after an error, when AMG could not hear the audio, or when `SUBTITLES`
+is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` at 2 or more, it also posts when
+the deep analysis crashes three times. With `HOOK_WORKERS=1`, a deep analysis that crashes the worker runs again at the
+next start, and its held alert waits. A held alert waits with the deep analysis job in the background queue, so a
+restart keeps it. When the app renames or moves the file, the deep analysis asks the app where it is and checks it
+there. A held alert goes unposted only when the app replaced the file, or the app says it no longer has the file for
+that item. When the app lists the file where AMG cannot see it, as while a mount is down, the held alert posts. With
+`DISCORD_POSTS=all`, each change the import made posts once, such as a removed track or a flag it turned off. A held
+alert that posts names the change itself. Otherwise the change posts on its own. Every other alert of the import posts
+at once, such as wrong content, broken audio or video, and a failed flag change.
 
 ## Service checks
 

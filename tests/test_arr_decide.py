@@ -390,3 +390,72 @@ def test_the_decision_rules(monkeypatch):
         raise AssertionError("a first block with no timing line must raise")
     except ValueError:
         pass
+
+
+TABLE = decide.language_table("English language name | ISO 639-3 code | ISO 639-2 code | ISO 639-1 code\n-----+-----\n"
+                              "English | eng | eng | en\nJapanese | jpn | jpn | ja\nFrench | fre | fre | fr\nUndetermined | und | und |")
+
+
+def tracks(*ts):
+    """A mkvmerge -J probe of tracks (type, legacy tag, more properties), with UIDs 1, 2, 3 in order."""
+    return {"tracks": [{"type": typ, "properties": dict(language=lang, uid=k, **more)} for k, (typ, lang, more) in enumerate(ts, 1)]}
+
+
+def flags(j, heard=None, read=None, original="jpn", checked=None, notes=False):
+    """The Original language flag edits retag() plans, {selector: (new, old)}, and with notes its notes on the flag."""
+    r = decide.retag(j, heard, {original} if original else (), TABLE, read=read, original=original, checked=checked)
+    got = {e[0]: (e[1], e[2]) for e in r["edits"] if decide.prop(e) == decide.ORIGINAL_FLAG}
+    return (got, [n for n in r["notes"] if "original language flag" in n]) if notes else got
+
+
+def test_the_original_language_flag_marks_the_tracks_in_the_content_language(monkeypatch):
+    """Matroska: FlagOriginal is set if the track is in the content's original language. Owner 2026-10-06: hear before
+    flagging. An audio track needs its heard language, or a tag and title that agree. A subtitle needs its read text.
+    A tag alone is never enough, and every other track keeps its flag."""
+    monkeypatch.setattr(decide, "POLICY", decide.POLICY)
+    decide.set_policy(TEST_POLICY)
+    jpn = tracks(("audio", "jpn", {}))
+    # a tag alone: no edit, and the note says why. The heard language decides, from the flag's own hearing or the tag rules'.
+    assert flags(jpn, notes=True) == ({}, ["a1 jpn: the original language flag stays, because it was not heard"])
+    assert flags(jpn, checked={"a1": "jpn"}) == {"track:=1": (1, None)} == flags(jpn, heard={"a1": "jpn"})
+    assert flags(jpn, checked={"a1": "eng"}, notes=True) == ({}, ["a1 jpn: the original language flag stays, because heard eng, not jpn"])
+    # a tag and a title that agree are as sure as a heard language, the bar of min_confidence
+    assert flags(tracks(("audio", "jpn", {"track_name": "Japanese"}))) == {"track:=1": (1, None)}
+    assert flags(tracks(("audio", "eng", {"track_name": "Japanese"}))) == {}   # they disagree
+    # two audio tracks in the original language both get it. The English dub and subtitle stay, as their flag is right.
+    j = tracks(("audio", "jpn", {}), ("audio", "jpn", {"track_name": "Stereo"}), ("audio", "eng", {}), ("subtitles", "eng", {}),
+               ("subtitles", "jpn", {"forced_track": True, "track_name": "Signs"}))
+    assert flags(j, checked={"a1": "jpn", "a2": "jpn", "s2": "jpn"}) == {"track:=1": (1, None), "track:=2": (1, None), "track:=5": (1, None)}
+    # a subtitle needs its text read: a forced one too. A picture subtitle, or one whose text reads another language, keeps it.
+    assert flags(j, checked={"a1": "jpn", "a2": "jpn"}, notes=True)[1][-1] == "s2 jpn: the original language flag stays, because its text was not read"
+    assert flags(tracks(("subtitles", "jpn", {})), read={"s1": "eng"}) == {} and flags(tracks(("subtitles", "jpn", {})), read={"s1": "jpn"}) == {"track:=1": (1, None)}
+    # a dub marked original loses the flag only when heard as the other language. A right flag stays.
+    dub = tracks(("audio", "jpn", {"flag_original": True}), ("audio", "eng", {"flag_original": True}))
+    assert flags(dub) == {} and flags(dub, checked={"a2": "eng"}) == {"track:=2": (0, 1)} and flags(dub, checked={"a2": "jpn"}) == {}
+    # a commentary or an audio description keeps its flag, heard or not
+    assert flags(tracks(("audio", "jpn", {"flag_commentary": True}), ("audio", "eng", {"track_name": "Commentary", "flag_original": True}),
+                        ("audio", "jpn", {"flag_visual_impaired": True})), checked={"a1": "jpn", "a2": "eng", "a3": "jpn"}) == {}
+    # an untagged track, a mul or zxx track, and a film with no TMDB answer keep theirs
+    assert flags(tracks(("audio", "und", {}), ("subtitles", "und", {}), ("audio", "mul", {}), ("audio", "zxx", {})),
+                 checked={"a1": "jpn", "s1": "jpn", "a2": "jpn", "a3": "jpn"}) == {}
+    assert flags(tracks(("audio", "eng", {})), original=None, checked={"a1": "eng"}) == {}
+    # an und track the tag rules tag in the same run gets its flag in that run too: heard jpn, and jpn is the original
+    assert flags(tracks(("audio", "und", {})), heard={"a1": "jpn"}) == {"track:=1": (1, None)}
+    # a BCP 47 tag alone reads as eng beside ja. The tag rules hear it, and their heard language decides it.
+    ietf_only = tracks(("audio", "eng", {"language_ietf": "ja"}))
+    assert flags(ietf_only) == {} and flags(ietf_only, heard={"a1": "jpn"}) == {"track:=1": (1, None)}
+    # the tracks to hear and to read before the flag can change
+    assert decide.flag_checks(j, "jpn") == ({"a1", "a2"}, {"s2"}) and decide.flag_checks(j, None) == (set(), set())
+    assert decide.flag_checks(tracks(("audio", "jpn", {"track_name": "Japanese"})), "jpn") == (set(), set())   # tag and title agree
+    assert decide.flag_checks(dub, "jpn") == ({"a2"}, set())   # only the wrong 1 can change
+    # the content's language is TMDB's, when the app names none or the same one
+    assert decide.content_language("Japanese", {"original": "jpn"}) == "jpn" and decide.content_language(None, {"original": "jpn"}) == "jpn"
+    assert decide.content_language("English", {"original": "jpn"}) is None and decide.content_language("Japanese", None) is None
+    assert decide.content_language("Japanese", {"original": None, "unmapped": ["xx"]}) is None
+    # the edit verifies, and a missing flag reads as 0
+    after = tracks(("audio", "jpn", {"flag_original": True}), ("audio", "eng", {}))
+    assert decide.unapplied(after, [["track:=1", 1, None, decide.ORIGINAL_FLAG], ["track:=2", 0, 1, decide.ORIGINAL_FLAG]]) == []
+    assert decide.unapplied(after, [["track:=2", 1, None, decide.ORIGINAL_FLAG]]) == [["track:=2", 1, None, decide.ORIGINAL_FLAG]]
+    # the plan adds them with the default flags, and an audit reads their rule
+    d = decide.with_tags(decide.decide(j, "Japanese"), decide.retag(j, {}, {"jpn"}, TABLE, original="jpn", checked={"a1": "jpn", "a2": "jpn", "s2": "jpn"}))
+    assert d["edit_rules"][-3:] == ["original flag set"] * 3 and "original flag set" in decide.plan_class(d), d

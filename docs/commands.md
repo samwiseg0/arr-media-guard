@@ -28,12 +28,13 @@ imports, so the two never change one file at the same time. It takes the Matrosk
 with one audio track, no subtitle and a right language tag, which plays that track anyway.
 
 Run a large backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one file.
-A *canary* is a small sample, spread across the kinds of plan, that you apply first.
+A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them. A
+*canary* is a small sample, spread across the plan groups, that you apply first.
 
 ```
 arr-media-guard --backfill radarr --plan-out /root/radarr-plans.jsonl                        # dry run, one plan per line
-arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl                          # the plans, grouped by rule
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20   # 20 files across the classes
+arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl                          # the plans, by plan group
+arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20   # 20 files across plan groups
 arr-media-guard --audit radarr --since 2026-01-01T10:00                                      # check the canary's edits
 arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl               # the rest
 ```
@@ -52,9 +53,11 @@ arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtit
 arr-media-guard --backfill sonarr --ids 101 --sub-check --recheck   # the same, also the files checked before
 arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # time every subtitle of one file, dry
 arr-media-guard-subhunt radarr --ids 123                      # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
-arr-media-guard --audit radarr --since 24h --post             # the hook's edits of the last day, to Discord
+arr-media-guard --audit radarr --since 24h --post             # AMG's edits of the last day, to Discord
 ```
 
+- `--ids` takes the app's own ids: Radarr's movie id or Sonarr's series id, the `id` field of `/api/v3/movie` or
+  `/api/v3/series`. A TMDB, TVDB or IMDb id does not work.
 - `--paths` limits the backfill, `--convert` and `--sub-check` to the listed files. A scan refuses it.
 - `--limit N` stops after N files that need a change. A scan checks N files.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
@@ -76,8 +79,8 @@ library automatically" is off in Plex, the requests that follow soon after need 
 [design.md](design.md#plex).
 
 A file that a conversion renamed gets a scan of its folder instead, once per folder at the end of the run.
-`--plex-later` on a `--convert --apply` run lists those folders and scans none of them. `--plex-flush` then runs one
-Plex scan per library folder they sit in, instead of one per folder. It needs `PLEX_URL`.
+`--plex-later` on a `--convert --apply` run lists those folders and scans none of them. `--plex-flush` then sends one
+Plex scan per Plex library folder that holds them, instead of one scan per changed folder. It needs `PLEX_URL`.
 
 ## Scans
 
@@ -95,8 +98,8 @@ every run, with no setting. `CONVERT_MAX_FILES`, `CONVERT_WORKERS` and `REPACK_M
 
 ### Force a conversion
 
-Before the original goes, AMG checks the new file against it, stream by stream. It refuses a file it cannot prove has
-lost nothing, and the decision log holds the reason. When you checked the reason and accept it, name the file.
+Before AMG removes the source file, it checks the new file against it, stream by stream. It refuses a file it cannot
+prove has lost nothing, and the decision log holds the reason. When you checked the reason and accept it, name the file.
 
 ```
 arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"
@@ -125,8 +128,8 @@ link stays right. This needs no logged refusal.
 
 `--audit` reviews changes. With `--plan-from` it groups the plans of a dry run by the rule that made them. With
 `--since` it reviews the changes that imports and backfills with `--apply` made in that time. AMG keeps the decision
-lines for 14 days. `--source hook` or `--source backfill` takes only one of them. `--post` sends the summary to Discord
-when the audit found a problem.
+lines for 14 days. `--source hook` takes only the imports, and `--source backfill` only the backfills. `--post` sends
+the summary to Discord when the audit found a problem.
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 
@@ -137,7 +140,7 @@ arr-media-guard --audit sonarr --since 24h --post
 
 Add one line for each instance of `APP_INSTANCES`.
 
-Every audit with `--since`, with no `--apply`, also does this.
+Every audit with `--since` also does this, with no other option.
 
 - It removes the kept originals and the `KEEP_REPLACED` copies older than `KEEP_ORIGINALS_DAYS`. At 0 it removes every
   `KEEP_REPLACED` copy, and leaves the originals already kept.

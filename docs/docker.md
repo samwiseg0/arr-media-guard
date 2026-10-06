@@ -163,8 +163,8 @@ program with the paths AMG sees. Path maps work on a host install too.
 | `PLEX_PATH_MAP` | Plex. |
 | `PATH_MAP` | Every program whose own map is empty. |
 
-- Each pair is `PROGRAM_PATH:LOCAL_PATH`, both absolute, for example `/data:/media`. `|` joins the pairs. A path may
-  hold spaces.
+- Each pair is `APP_PATH:LOCAL_PATH`, or `PLEX_PATH:LOCAL_PATH` in `PLEX_PATH_MAP`, both absolute, for example
+  `/data:/media`. `|` joins the pairs. A path may hold spaces.
 - A map that is empty takes `PATH_MAP`, so one map serves every program that sees the same paths.
 - A pair matches whole folder names only, so `/mnt/TV` never matches `/mnt/TV Shows`.
 - When two pairs match, the longer one wins.
@@ -204,7 +204,8 @@ RADARR_PATH_MAP='/movies:/media/Movies'
 PLEX_PATH_MAP='/mnt/TV Shows:/media/TV|/mnt/Anime:/media/Anime|/mnt/Movies:/media/Movies'
 ```
 
-This container mounts `/srv/media` once. A rename never crosses two mounts, even on one file system.
+This container mounts `/srv/media` once. A restore puts a file back by a rename. A rename cannot cross from one mount to
+another, even when both mounts are on one file system.
 
 Give each app a recycle bin in a folder it mounts, such as `/mnt/TV/.recycle` in Sonarr and `/movies/.recycle` in
 Radarr. Both sit in `/srv/media`, so the maps above reach them, and a restore can rename a file back from the bin. With
@@ -220,7 +221,8 @@ waits. The listener starts the worker when a job waits, and looks again every mi
 
 - It takes a post only with the right user and password, and a body of at most 1 MiB.
 - It asks the app for the file by its id, and uses the path the app gives.
-- It refuses a file of another item, and an old file outside the item's folder or outside the recycle bin. Each refusal
+- It refuses a post that names a file of another item. For an upgrade it also checks the old file, the file the upgrade
+  replaced. It refuses one outside the item's folder, and a recycle bin copy outside the app's recycle bin. Each refusal
   gets a line in the decision log. It also refuses Sonarr's **On Import Complete** event, which names no single file.
 - It puts an import in the background queue even when the app's API does not answer, or this container does not see the
   file yet. One warning line says so. The worker then tries again, after a minute at first and at most an hour apart,

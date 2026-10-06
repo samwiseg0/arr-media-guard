@@ -9,7 +9,8 @@ Some releases of English films carry a foreign default audio track, and Plex pla
 This file says what each rule does and why it exists. The README covers the install, the env file
 and the app connection. policy.md covers the policy file.
 
-- A *job* is one imported file. The hook queues it, and a *worker* runs it.
+- A *job* is one file that waits in the background queue, for an import, a deep analysis or a recheck. AMG queues it,
+  and a *worker* runs it.
 - To *hear* a track is to let language detection name its spoken language.
 - A *certain fault* proves that a file is broken and leads to a re-grab. A *doubt* only alerts.
 - A *re-grab* deletes a broken file through the app, monitors its items again and marks the grab
@@ -121,6 +122,43 @@ The undo restores both tags, with a second `language-ietf` edit or a `--delete l
 needed. Plex shows the BCP 47 tag, else the legacy tag, and it shows `und` audio as English. Hearing
 is slow, so a first backfill over many `und` tracks can take hours. The cache makes later runs fast.
 
+## Original language flag
+
+Matroska's `FlagOriginal` is set when a track is in the content's original language. `decide.retag()` plans it with
+the language tags, as the mkvpropedit property `flag-original` (`decide.ORIGINAL_FLAG`). The content's original
+language is TMDB's, see `decide.content_language()`. When the app lists another original language for the item, or
+TMDB gives none or one with no 639-2 code, no flag changes.
+
+- Only the roles of `decide.ORIGINAL_ROLES` change: main audio, and full, SDH, forced and dub subtitles. A commentary
+  or an audio description is no part of the content's own speech, so its flag stays.
+- AMG must be sure of the track's language, by the bar of `min_confidence` (owner 2026-10-06, "hear before
+  flagging"). The track is tagged after this run, not `und`, `mul` or `zxx`, so an `und` track that the tag rules tag
+  gets its flag in the same run. A main audio track needs its heard language to name its
+  language after this run. With nothing heard, its tag and title must agree with no other signal against them, which
+  is `AGREE`. A subtitle needs the language read in its text to name its language. A tag alone never decides.
+- `decide.flag_checks()` names the tracks whose flag their tag would change. `process.languages()` adds those
+  subtitles to its text read. `process.flag_hearing()` runs after the subtitle check. A subtitle whose words matched
+  an audio track there (verdict `match`) proves that the track speaks its language, so that track needs no hearing,
+  and the decision line keeps it in `flag_matched` (owner 2026-10-06). A mismatch proves nothing. `checks.hear()`
+  hears each other track, up to three 30-second samples cached by the file, and the decision line keeps its answers in
+  `flag_heard`. What is matched, heard or read for the flag alone goes to `retag()` as `checked`, so it changes no tag
+  and no default flag. A missing install, a failed run or no time left gives no answer, so no flag changes, and a
+  note names the track.
+- A track tagged by its BCP 47 tag alone reads as `eng` beside it. The tag rules hear it, and that heard language
+  decides it.
+- A track in the original language gets 1. A 1 on a track in another language goes to 0. A right flag, and a missing
+  flag that would be 0, stay. An edit is `[selector, new, old, ORIGINAL_FLAG]`, with old `None` for a missing flag,
+  whose undo is `--delete flag-original`. `edit()` drops a no-op, and `unapplied()` verifies it, a missing flag
+  reading as 0. Its rules are `original flag set` and `original flag cleared`, so the audit groups them as other
+  flag edits.
+- An undecided or dropped plan gets none, as for the tags. The deep analysis, a recheck and `--sub-time` on a file
+  no app lists keep the flags, see `process.act()`. No recheck entry exists, so old files change only in a backfill.
+  `cli.selected()` leaves out a file with one audio track, no subtitles and no tag to fix, so a backfill never sets
+  its flag.
+- An edit of this flag alone queues no Plex analyze, see `process.changed()`. Plex does not read the flag, and most
+  imports get one. Any other edit queues the analyze as before.
+- The decision line's `tracks` shows each track's flag as `orig`, 1, 0 or `null`, as the run found it.
+
 ## Plex
 
 After an edit, Plex re-analyzes the one item that holds the file (`PUT
@@ -188,6 +226,30 @@ when a `header`, `cut` or `subtitle` finding of the file posts its cause. It pos
 `alert_result` says `log only` for each one that did not post. An alert whose text fails still posts, with its title
 and its file, and the sentence `report.UNTOLD` in place of the error. Its line in `alerts` keeps the error.
 
+**Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
+field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
+`hook`, `deep_analysis` and `recheck`. A conversion that a stopped run left has `worker` when the worker finds it as it
+starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names the step where
+the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its step from
+`ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see `LINE_STEPS`. Any
+other finding takes it from `FINDING_STEPS`. Each step there is a name, `None`, or a function of the facts. `None`
+means the program tried no fix: a doubt, a check that only reports, a fix that a setting or a limit turned off, and a
+dry run. A sidecar left in place names no step when its reason starts with a setting, see `report.SETTING_LEFT`. A
+live-captioned track whose hearing stopped part way carries `hearing_stopped`, see `subtitles.sub_findings()`. A
+conversion that finished, whose extras wait for the app to take the new file, stopped at Replacing the file. Each
+subtitle counts at the furthest step its sentences name, see `report.line_keys()`. Subtitles at different steps show
+one step a line, in the order of `FIX_STEPS`. A field with no value is left out, so an alert with no fix tried shows
+Check alone. A held alert keeps the fields the import gave it. A change post has neither field, see
+`report.fix_post()`. A test fails when a finding kind, action code or sentence code has no step.
+
+**Plain words.** A subtitle remux that failed reads "rewriting the file failed" in the alert, see
+`report.remux_why()`. The decision line keeps its error in `subremux.result`. A skip keeps its own reason, such as low
+space or a second hard link. A sidecar whose new times do not fit its text says so in `left`, and keeps the error in
+`error`, see `subtitles.sidecar_fix()`. A fix with a ratio names the offset at the start and at the end of the file,
+see `report.at_end()`. The end comes from the fix and the file's length. A `check_times` sentence, and an `off`
+sentence with `would`, carry that length as `duration`. A change post reads it from the record's `file_duration`. An
+offset under 0.05 seconds reads "in sync", see `report.about()`.
+
 **Every change.** With `DISCORD_POSTS=all`, `logs.alert_findings()` also posts each change of the run, see
 `report.render()` target `changes`. A finding of `report.fixes()` that the gate logs only keeps its alert's words and
 color. A change that no finding words posts in green, see `report.changes()`. That is a conversion to MKV, a file
@@ -211,28 +273,40 @@ at its old missing path or at a path this container does not see is not gone, so
 `--sub-check --apply` or `--sub-time --apply` remux gives the file a new inode too, so it counts as replaced. That run
 checked the subtitles itself. The alert also goes unposted when the job ran to its alerts and judged each subtitle the
 alert names, see `runner.judged()`. A verdict of `match`, `fit` or `mismatch` judges. The `unknown` of a failed hearing
-does not, and with no language model there is no verdict. A job whose remux or sidecar rewrite retimed, moved or removed
-those subtitles before an error counts too, see `runner.remuxed()`. Longer ends and a repaired text do not. Every other
-held alert posts through `logs.post_held()`, because nothing judged its subtitles again. That is an error, a failed
-hearing, no language model, `SUBTITLES=off`, a file the app moved during the run, or a third crash in
-`runner.requeue()`. When the import cannot queue the job, its held alerts post at once. With `DISCORD_POSTS=all`, a held
-finding keeps the change posts of what it says itself as `changes`, see `report.held_posts()`. That is a fix of its
-logged lines, such as a removed track, a flag it says was turned off, and the conversion it names. `report.said()`
-leaves them out of the import's change posts. `logs.held_changes()` posts them when the held alert goes unposted. It
-skips a flag edit that a posted alert of the deep analysis says already, as when the deep analysis finds the same
-mismatch. A held alert that posts names the change itself. So each change posts once. Every other kind posts at the
-import.
+does not, and with no language model there is no verdict. A held `subtiming` alert also needs the times of each subtitle
+judged again, see `runner.times_judged()`. That is a fix, "in time", steps, an offset left as it is, a fix the sweep did
+not confirm, lines that dense hearing moved, a remux that retimed the track, or a `mismatch`. A word check that matched
+the words but anchored too few cues to time them judged no times, so the alert posts. A job whose remux or sidecar
+rewrite retimed, moved or removed those subtitles before an error counts too, see `runner.remuxed()`. Longer ends and
+a repaired text do not. Every other held alert posts through `logs.post_held()`, because nothing judged its subtitles
+again. That is an error, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the run, or a
+third crash in `runner.requeue()`. When the import cannot queue the job, its held alerts post at once. With
+`DISCORD_POSTS=all`, a held finding keeps the change posts of what it says itself as `changes`, see
+`report.held_posts()`. That is a fix of its logged lines, such as a removed track, a flag it says was turned off, and
+the conversion it names. `report.said()` leaves them out of the import's change posts. `logs.held_changes()` posts them
+when the held alert goes unposted. It skips a flag edit that a posted alert of the deep analysis says already, as when
+the deep analysis finds the same mismatch. A held alert that posts names the change itself. So each change posts once.
+Every other kind posts at the import.
 
 **Track numbers.** Every post of a run names a subtitle by its place in the file after the run, see `report.number()`.
 A track the subtitle remux took out is "track 2 of the original file". The decision log and the CLI keep the places
 the check saw.
+
+**Track names.** A name says the language and the role, as a player lists the track: "the English SDH subtitles
+(track 3)", "the English commentary audio (track 4)", see `report.track_name()`. The role comes from the decision log
+entry of the track, see `logs.track_log()`. A full subtitle and a main audio track name no role. The track's own title
+follows the number in quotes when it adds something, see `report.shown_title()`. A title of the track's language, its
+codec, its role, its flags, numbers and lone letters only is left out, in any case or brackets. A commentary title never
+shows, because it may name people at length. Control, markdown and link characters go. A bare URL goes too, because
+Discord makes it a link and a release can plant one. A title over 40 characters is cut at a word with "…". Two tracks of
+one language share one name only when neither has a role or a title to name.
 
 **Format.** A template marks the names to look for and the key fact of an alert, see `report.bold()`. The embed bolds
 them, and the decision log, the CLI and Loki show plain text. `logs.embed()` escapes each Discord markdown character
 (`\`, `*`, `_`, `~`, a backquote and `|`), so a name never breaks the format. A text of more than two sentences gets one
 sentence a line.
 
-**Link.** The embed's one field shows the item's name as a link to its page in the app, above the file name. Discord
+**Link.** The embed's item field shows the item's name as a link to its page in the app, above the file name. Discord
 shows no link in a field name, so the field name is then blank. The page is `/series/<titleSlug>` in Sonarr and
 `/movie/<titleSlug>` in Radarr, see `apps.App.page()`. The job takes the slug from the series or movie record it reads
 anyway, and the decision line keeps it in `ids.slug`. The base is `<KEY>_LINK` alone, because behind a reverse proxy
@@ -999,7 +1073,7 @@ long. A later Radarr upgrade can replace the hunted file, so run the hunter agai
 up the evidence for a wrong-content re-grab. A correct file must never be deleted. The hook runs the
 checks after the flag edit.
 
-- **Languages.** English, the app's original and TMDB's original are always right. TMDB's spoken
+- **Languages.** English, the item's original language as the app lists it, and TMDB's original are always right. TMDB's spoken
   languages are right when TMDB's original is not English. For an English original, audio in a
   spoken language counts as unknown.
 - **TMDB.** Each answer is cached for 30 days. A failed call pauses TMDB for 10 minutes, so an
@@ -1379,6 +1453,16 @@ in a half with no window goes unseen.
 Right tracks start their cues close to the first heard word, some a little before and some a little after. A fix keeps
 the median lead of right tracks, so a fixed copy lands within the spread of those leads, a few tenths of a second.
 
+*Roll-up captions* are closed captions that show each new line under the lines before it. Each cue repeats the lines
+above its new line, so its first words were spoken two or three lines earlier, 2 to 4 seconds before the cue shows. A
+cue timed by them reads seconds late, by a different time each cue. So every timing check reads a cue of a roll-up track
+by its new lines only, less a speaker's name such as `>> Reporter:` (`subsync.spoken()`). That covers the word check
+and its spans test, the line windows, the sweep, and the anchors of dense hearing. A track counts as roll-up when half
+its cues or more repeat lines of the cue before (`ROLLUP`). Roll-up tracks sat at 69% or more, other tracks at 30% or
+less. The most among them were paint-on captions, which show each line as it is typed. Other tracks keep their text,
+because a line said twice in a row there was spoken twice. A roll-up track that is off still reads off by its new lines,
+and gets its fix.
+
 - The track is in time when the cues at the file's start and end, and at every window, sit under 0.75 seconds off. So
   the drift is judged by the error it causes at the file's ends, where it is largest. Right tracks sat closer, and a
   24/23.976 drift of an 18-minute episode sat farther. A plain shift under 0.75 seconds is in time too. A right track
@@ -1412,13 +1496,66 @@ the median lead of right tracks, so a fixed copy lands within the spread of thos
   sweep's windows with 3 matched cues must sit at least as close to the fitted line as they sat to the audio before: as
   many within 0.3 seconds, and at a median distance no larger. A sweep that shows the track in time so blocks the fix,
   and so does a sweep that heard under 3 such windows. The track then keeps its times, with no alert, and a clean
-  sweep makes it a reference.
+  sweep makes it a reference. A fix the rows confirm must also raise the share of the sweep's matched cues in their
+  spans, see the last rule below. Its windows count as for the sweep's own fit (`subsync.sweep_pairs()`). A tie keeps
+  the times, and the sweep then times the track itself, as below.
+- `--sub-time` and the deep analysis also time a matched track from the sweep (`subsync.sweep_fit()`). That happens when
+  the word check left its times as they are, or its fix fails the sweep. The word check's windows must all sit within
+  0.3 seconds of one line, so one noisy window blocks a fix. A DVD subtitle that drifts at 1001/1000, with lines its
+  author timed up to half a second off, showed that. A sweep window counts as for block timing: 8 words heard, half of
+  them matched and 2 cues anchored. Each half of the file needs 3 such windows. Each gives a point, the median time of
+  its anchors and their median offset. The median of the slopes between every two points picks the ratio nearest it.
+  When its 95% interval from Kendall's rank test holds 0, the ratio is 1. The line of that ratio goes through the median
+  of all the anchors. On four drifting tracks measured with a larger speech model, that put 3 to 14 more lines within
+  half a second of their speech than the median of the points did.
+  - The track is in time when the line sits under 0.75 seconds off at the file's start and end.
+  - Two windows in a row 0.75 seconds or more off the line the same way are a step, and the sweep judges nothing.
+  - A ratio other than 1 needs each half of the file to drift. A half whose interval holds 0 and not the ratio sits
+    flat, as on each side of an edit, and the ratio would move lines that are in time.
+  - A plain offset needs a word check that did not find the track in time. Two windows near the ends measure one offset
+    well, and only a drift needs the windows between them.
+  - A fix needs 80% of the matched cues in their spans after it, and more of them than as they are. On a right roll-up
+    track, a few cues a window that the author timed off faked a slope of 30 ms a minute. The fix of 1001/1000 took
+    the share from 90% to 82%, and moved 130 lines in time out of half a second. The sweep must confirm a fix as
+    above, and its rows must not read as live captions.
+
+  The fix becomes the track's timing, and so does "in time" in place of a word-check fix that the sweep did not
+  confirm. The word check's why stays in `word_check`. So one noisy window does not block a fix. An "in time" in place
+  of steps or an offset the word check could not fix waits for dense hearing, see `subtitles.held_in_time()`. A short
+  block can lie in one sweep window or none, and the line through the median splits a step under 1.5 seconds into two
+  halves that each sit under 0.75 seconds off. So the sweep alone never clears such an alert. Each word-check window
+  keeps the offset of its anchors in `late`. The "in time" stands when dense hearing judged each window 0.75 seconds or
+  more off: the window lies in a part that is in line, or its lines lie in a block that dense hearing moved. Else the
+  word check's result and its alert stay, and `sweep_fit` names the places. A step the sweep finds, too few windows or
+  live captions keep the word check's result and its alert too, and `sweep_fit` says why, with the sweep's numbers in
+  `sweep`. An import hears no sweep, so its alert stays.
+
+  A fix of the sweep keeps the word check's timing in `word_timing`. Dense hearing then hears the whole file at the
+  fix, see `subtitles.sub_dense()`. Only the audio between the sweep's windows is new. That is about 155 windows for a
+  22-minute episode, and about 840 for a 2-hour film. `subsync.left_off()` names the parts that still sit 0.75 seconds
+  or more off over 6 windows or more. A part counts when it covers a quarter of the file, or when it runs from the
+  first window or to the last over 90 seconds. Such a part is a step that the fix moved the wrong way, so
+  `subtitles.checked_fix()` refuses the fix, and the word check's result and its alert come back. A word check in time
+  gets `unfixed` with no offset, so it alerts that the times are off. A shorter part in the middle keeps the fix. On
+  real drifting episodes such parts sat up to 1.18 seconds off for up to 2 minutes, where the author timed lines off,
+  and their long parts and their parts at a file end sat 0.6 seconds off at most. Known limit: the line of a ratio can
+  take up most of a step under about a second, so no long part sits 0.75 seconds off and the fix stands. The lines on
+  one side of the step then sit about half a second off. A step of 0.9 seconds on the last 40% of a real episode showed
+  it.
 - No ratio that fits is two offsets, a different cut, and the times stay. It alerts when the windows differ by 1
   second or more. A smaller step, as a right track can show, goes only to the decision log and the backfill report.
   Two ratios that fit and move the cues apart by more than 0.3 seconds at the file's ends give no fix and alert, a
   plain offset among them. Two windows cannot tell a plain offset from 24/23.976 when their offsets differ by half a
   second.
-- After the fix, 80 percent of the matched cues must fall inside their spans.
+- After the fix, 80 percent of the matched cues must fall inside their spans, and more of them than as they are
+  (`subsync.shares()`). A tie keeps the times, and the offset alerts as one the word check could not fix. Without the
+  deep analysis no sweep judges that alert again, so it posts even for a right track. An import and a `--sub-check`
+  backfill count the matched cues of the word check's own windows, `--sub-time` and the deep analysis those of the
+  sweep. On a right track, the word check's line ran 0.757 seconds off at the file's start, 7 ms past 0.75 seconds, and
+  1001/1000 fit its three windows. That fix moved 107 lines in time out of half a second. The sweep put 96% of its
+  matched cues in their spans as they were, and 83% after the fix. On a real drift the share rose from 66% to 90%. Known
+  limit: a cue that shows for its whole line keeps its heard words inside its span through a move of about a second. A
+  smaller fix of such cues cannot raise the share, so they keep their times.
 
 A rule that every matched cue agrees within 0.3 seconds fails on right tracks. Right tracks start their cues 0.9
 seconds early to 1.5 seconds late against the speech, so the rule takes the window medians and 80 percent of the cues.
@@ -1500,10 +1637,16 @@ out, and the track needs 20 such cues. Half its short cues must also end over tw
 A sign drawn frame by frame, or a karaoke line, runs straight into its next event, so it never flashes. Right text
 tracks show their median cue for a second or more, and a flash track for about a seventh of a second. Only a cue under
 0.5 seconds gets a new end: the next cue's start less two frames (0.083 s), at most the start plus twice the reading
-time, 3 seconds at least and 7 at most. The reading time counts the visible characters, 17 a second. A cue only gets
-longer. A built-in track gets its new ends in
-the remux of "Actions": mkvextract writes its text, the ends go in, and mkvmerge reads it back, which keeps each packet
-and the ASS header byte for byte. The proof then holds each end to the plan. A sidecar is written again, and its
+time, 3 seconds at least and 7 at most. The reading time counts the visible characters, 17 a second. A flash fix never
+shortens a cue. A built-in track gets its new ends in the remux of "Actions": mkvextract writes its text, the ends go
+in, and mkvmerge reads it back, which keeps each packet and the ASS header byte for byte. HandBrake ends each ASS event
+and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The round trip drops those NUL
+bytes and adds the section. The proof compares each packet that ended in a NUL without that one byte, and names their
+count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section and its Format line. Any
+other change of a byte fails. The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake
+writes starts in milliseconds. The round trip puts each start on the centisecond grid, up to 5 ms away. So such a track
+gets one plan of every start and end, with each start on the nearest centisecond, and the proof holds both to it. The
+log counts in `starts_rounded` the starts the grid moved off the time of the fix. A sidecar is written again, and its
 original is kept. A fix goes to the log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUBTITLES=check`
 keeps the ends and alerts. A WebVTT track that flashes is reported and never rewritten. Imports, `--sub-check`,
 `--sub-time` and the deep analysis run it.
@@ -1776,14 +1919,17 @@ library would take weeks.
   author's spread is the size of Whisper's noise.
 
   The trigger reads the sweep rows that count, see "Subtitle block timing". At least 10 rows count. Their median
-  offset against the audio is 0.3 seconds late or more. Half of them lie 0.4 seconds or more from their median "off"
-  against the fitted line. Live captions always trail the speech. Each logged track was verified by hand first. Its
+  offset against the audio is 0.3 seconds late or more. Half of them lie 0.4 seconds or more from a line through their
+  median "off" against the fitted line. That line follows the ratio their slope picks, as in the fit of the sweep, so a
+  straight drift at a frame-rate ratio leaves little and goes to that fix, never to per-cue moves. Two such drifts sat
+  0.49 and 0.54 seconds from their median, and 0.23 and 0.37 seconds from their line. Live captions always trail the
+  speech. Each logged track was verified by hand first. Its
   last cue lay near the end of the file, and its text read as its tagged language. Its word check matched, and two
   windows heard again matched its lines. Of the verified tracks that were not live captions, none passed. Half their
-  rows lay within 0.26 seconds of the median, and those of the live ones 0.49 seconds or more. Roll-up captions, which
-  repeat the last line at the top of the next cue, let few rows match 2 cues. So 5 rows are enough when each sits 3
-  seconds or more late. No row of a verified right track sat 2.5 seconds late. A false trigger costs the hearing. The
-  gate below then moves few cues of a right track, because a lone anchor off never moves.
+  rows lay within 0.26 seconds of the median, and those of the live ones 0.49 seconds or more. Rows 3 seconds or more
+  late tell live captions from a right track or a drift with fewer rows, so 5 such rows are enough. No row of a
+  verified right track sat 2.5 seconds late. A false trigger costs the hearing. The gate below then moves few cues of a
+  right track, because a lone anchor off never moves.
 
   `subtitles.sub_dense()` hears the whole audio track of such a track in dense windows, past `BLOCK_HEAR`. The windows
   take the track's cues moved by its fix, then by the median "off" of its sweep rows against the fitted line. So they

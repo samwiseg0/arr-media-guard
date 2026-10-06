@@ -249,12 +249,15 @@ def test_a_late_track_with_mistimed_cues_is_not_moved():
 
 @pytest.mark.parametrize("offset, fixed", [(0.7, False), (0.8, True)])
 def test_min_shift_decides_between_in_time_and_a_fix(offset, fixed):
-    """A right track sits a little off the heard words. Under MIN_SHIFT, 0.75 s, it is in time. Over it, the times get a
-    fix, and the fixed cues come back where they were: CUE_LEAD keeps the lead of a right track."""
+    """A right track sits a little off the heard words. Under MIN_SHIFT, 0.75 s, it is in time. Over it, the fit gives a
+    fix, and the fixed cues come back where they were: CUE_LEAD keeps the lead of a right track. Each cue here shows
+    for its whole line, so a move of 0.8 s keeps every heard line in its span. The share does not rise, and an import
+    keeps the times, see timing()."""
     track = cues(RIGHT, offset=offset)
-    t = run(track)["timing"]
+    t = s.check(heard([EARLY, LATE]), track, "eng", DURATION, gain=False)["timing"]
     assert (t["fix"] is not None) == fixed and (fixed or t["why"] == "in time"), t
     assert not fixed or back(track, t["fix"]) < 0.02, t
+    assert not fixed or run(track)["timing"]["unfixed"] == t["fix"]["offset"]
 
 
 def test_a_fix_needs_enough_cues_in_each_window():
@@ -457,10 +460,12 @@ def test_a_fit_must_hold_at_the_file_ends():
 @pytest.mark.parametrize("rate", [Fraction(24000, 25025), Fraction(24, 25), Fraction(1000, 1001)])
 def test_the_inverse_ratios_get_their_fix(rate):
     """A subtitle timed for a faster video: 23.976/25, 24/25 and 23.976/24. Each cue time is that ratio of its time on
-    the audio, and the middle window confirms it."""
+    the audio, and the middle window confirms it. 23.976/24 moves these cues 0.95 s at most in the windows, and each
+    shows for its whole line. So the share in spans does not rise, and an import keeps the times, see timing()."""
     track = cues(RIGHT, rate=rate)
-    fix = run(track, starts=(EARLY, MIDDLE, LATE))["timing"]["fix"]
+    fix = s.check(heard([EARLY, MIDDLE, LATE]), track, "eng", DURATION, gain=False)["timing"]["fix"]
     assert Fraction(fix["rate"]) == rate and back(track, fix) < 0.05, fix
+    assert run(track, starts=(EARLY, MIDDLE, LATE))["timing"]["fix"] == (None if rate == Fraction(1000, 1001) else fix)
 
 
 def test_a_cut_of_a_second_never_gets_a_ratio_fix():
@@ -530,6 +535,33 @@ def test_agree_is_the_floor_of_a_fix(off, fixed):
     fix = s.timing(got, track, 1000)
     assert (fix["fix"] is not None) == fixed, fix
     assert fixed or "under 80%" in fix["why"], fix
+
+
+def leaned(i):
+    """Seconds line i of a right track sits off where the word check hears it, on the line of 1001/1000 through -0.69 s
+    at 72 s. The lines near the word check's windows at 67 s and 866 s and in its middle part lean, every other line is
+    in time. The line then runs 0.757 s off at the file's start, 7 ms past MIN_SHIFT."""
+    a = FIRST + GAP * i
+    return -0.685 + 0.001 * (a - 72) if any(lo <= a <= hi for lo, hi in ((40, 100), (370, 570), (840, 900))) else 0.0
+
+
+@pytest.mark.parametrize("trk, gain, fix", [
+    (cues(RIGHT, where=leaned), False, {"rate": "1001/1000", "offset": -0.757}),
+    (cues(RIGHT, where=leaned), True, None),
+    (cues(RIGHT, rate=Fraction(1001, 1000), offset=0.5), True, {"rate": "1001/1000", "offset": 0.5})])
+def test_a_fix_must_put_more_matched_cues_in_their_spans(trk, gain, fix):
+    """The word check's line through a right track that leans where its windows lie runs just past MIN_SHIFT, and
+    1001/1000 fits the three windows. Every matched cue falls in its span as it is and after the fix, so with gain, as
+    an import judges, the times stay with the offset in "unfixed". A real drift from +0.5 s puts 64% of the matched cues
+    in their spans as they are and all of them after the fix, so it gets the fix."""
+    stop = s.decide.STOPWORDS.get("eng", frozenset())
+    first = s.windows(trk, DURATION, stop)
+    ask = s.check(heard(first), trk, "eng", DURATION, gain=gain)["timing"]["confirm"]
+    middle = [round(s.moved(m * 1000, ask) / 1000, 1) for m in s.windows(trk, DURATION, stop, parts=s.middle(ask, DURATION))]
+    t = s.check(heard(first + middle), trk, "eng", DURATION, gain=gain)["timing"]
+    assert t["fix"] == fix and t["spans"] == ([0.643, 1.0] if fix and fix["offset"] > 0 else [1.0, 1.0]), t
+    assert fix or (t["unfixed"] == -0.757 and t["why"].endswith("100% of the matched cues in their spans, but 100% sit in them as they are, "
+                                                                "so the times stay")), t
 
 
 def test_drift_windows_lie_where_each_far_ratio_puts_the_speech():
@@ -3118,7 +3150,7 @@ def test_live_reads_a_sweep_late_by_a_different_time_each_minute():
 
 
 def test_live_takes_fewer_rows_when_each_sits_far_late():
-    """Roll-up captions let few rows count. 7 rows from 7 to 11 s late, scattered, look live-captioned. One row under
+    """Rows far late tell live captions with fewer rows. 7 rows from 7 to 11 s late, scattered, look live-captioned. One row under
     LIVE_FAR late, or under LIVE_FEW rows, does not."""
     late = [11.1, 11.0, 9.1, 9.6, 7.0, 8.9, 9.1]
     assert s.live(sweep_of(late)) == {"lag": 9.1, "off": 9.1, "scatter": 0.5, "rows": 7}
@@ -3159,6 +3191,69 @@ def test_roll_up_captions_anchor_on_their_new_line():
     out = landed(roll, got)
     assert all(m and abs(t - AT[i]) <= 0.4 for i, (t, m) in enumerate(out)), [(i, round(t - AT[i], 2)) for i, (t, m) in enumerate(out) if abs(t - AT[i]) > 0.4][:5]
     assert s.rolled([(0, 1, "A b\\Nc d"), (1, 2, "c d\\Ne f"), (2, 3, "e f"), (3, 4, "x\ny\nz"), (4, 5, "y\nz\nw")]) == ["A b\\Nc d", "e f", "e f", "x\ny\nz", "w"]
+
+
+def rolled_up(trk, label=lambda i: "", pop=()):
+    """trk as 3-line roll-up captions: each cue shows the two lines before its own, which were spoken before it. label(i)
+    puts a speaker's name before line i in every cue that shows it. The lines in pop show alone, as pop-on captions."""
+    said = [label(i) + x for i, (_, _, x) in enumerate(trk)]
+    return [(a, b, said[i] if i in pop else "\\N".join(said[max(0, i - 2):i + 1])) for i, (a, b, _) in enumerate(trk)]
+
+
+def test_every_timing_check_reads_a_roll_up_cue_by_its_new_line():
+    """Roll-up captions in time by their new lines, with a speaker's name before some lines and a stretch of pop-on
+    captions. The first words of each cue were spoken two lines earlier, about 5 s before it. The word check, the sweep
+    and the block timing read each cue by its new line, so the track is in time and nothing moves."""
+    trk = rolled_up(track(), label=lambda i: ">> Reporter: " if i % 7 == 0 else "", pop=scenes(5, 8))
+    assert s.spoken(trk)[1][2] == RIGHT[1] and s.spoken(trk)[7][2].split() == [">>"] + RIGHT[7].split() and s.spoken(trk)[61][2] == RIGHT[61]
+    r = s.check(hear([EARLY, LATE]), trk, "eng", LENGTH)
+    assert r["verdict"] == "match" and r["timing"]["fix"] is None and r["timing"]["why"] == "in time", r["timing"]
+    rows, parts, got = timed(trk)
+    assert all(abs(w["offset"]) < s.TOLERANCE for w in rows if w["offset"] is not None) and s.live(rows) is None, rows
+    assert not got["blocks"] and not parts, (parts, got)
+
+
+@pytest.mark.parametrize("offset", [2.0, -1.5, 1.0])
+def test_a_roll_up_track_off_by_one_shift_gets_its_times_back(offset):
+    """A roll-up track that is really off still reads off by its new lines, and the fix brings each cue back to its
+    speech. A fix under LINE_SHIFT needs two more windows on its line, and they read the new lines too."""
+    trk = rolled_up(track(offset=offset), label=lambda i: ">> Mira: " if i % 5 == 0 else "")
+    t = s.check(hear([EARLY, LATE]), trk, "eng", LENGTH)["timing"]
+    assert t["fix"]["rate"] == "1/1" and abs(t["fix"]["offset"] - offset) < 0.1, t
+    assert max(abs(s.moved(round(a * 1000), t["fix"]) / 1000 - b) for (a, _, _), (b, _, _) in zip(trk, track())) < 0.1
+    ws = [round(AT[k] + LEAD - 0.5, 1) for k in (LINES // 3, 2 * LINES // 3)]   # a window at a third and one at two thirds
+    assert s.needs_line(t["fix"], LENGTH) or offset == 2.0
+    assert s.on_line(hear(ws), trk, "eng", t["fix"], [(a, None) for a in ws])
+
+
+def test_a_block_of_a_roll_up_track_moves_to_the_speech_of_its_new_lines():
+    """Two minutes of a roll-up track sit 1.5 s late. Dense hearing anchors each cue by its new line, so only those
+    cues move, each to its speech."""
+    where = scenes(10, 13)
+    trk = rolled_up(track(late=lambda i: 1.5 if i in where else 0.0))
+    rows, parts, got = timed(trk)
+    assert len(got["blocks"]) == 1 and abs(got["blocks"][0]["shift"] - 1.5) <= 0.1, got
+    lands(trk, None, got, where)
+
+
+def test_a_roll_up_track_in_time_with_heavy_author_scatter_keeps_its_times():
+    """Each new line shows up to 0.6 s before or after its speech, by its own amount, as a captioner's hand times it.
+    Nothing moves: no fix, no block and no live moves."""
+    r = random.Random(7)
+    err = [round(r.gauss(0, 0.35), 2) for _ in RIGHT]
+    trk = rolled_up(track(late=lambda i: max(-0.6, min(0.6, err[i]))))
+    assert s.check(hear([EARLY, LATE]), trk, "eng", LENGTH)["timing"]["fix"] is None
+    rows, parts, got = timed(trk)
+    assert not got["blocks"] and s.live(rows) is None, got
+
+
+def test_a_track_that_only_now_and_then_repeats_a_line_keeps_its_text():
+    """A pop-on track whose cue repeats the last line of the cue before, as a line said twice, and paint-on captions that
+    show each line as it grows, both under ROLLUP of their cues, keep their text. Their repeats were spoken."""
+    trk = [(a, b, (RIGHT[i - 1] + "\\N" if i % 10 == 0 and i else "") + x) for i, (a, b, x) in enumerate(track())]
+    assert s.spoken(trk) is trk
+    grow = [(t, t + 0.2, " ".join(x.split()[:k + 1])) for (t, _, x) in track()[:50] for k in range(len(x.split()))]
+    assert s.spoken(sorted(grow)) == sorted(grow)
 
 
 def test_a_hearing_that_stopped_part_way_moves_no_cue_past_it():
@@ -3275,3 +3370,206 @@ def test_check_live_refuses_a_move_that_nothing_proves():
     s.check_live(trk, to, agree, {})
     with pytest.raises(s.Broken, match="outside the heard windows"):
         s.check_live(trk, to, dict(agree, heard=[(0.0, said[10] - 3.0)]), {})
+
+
+# --- the fit of the sweep ---------------------------------------------------------------------------------------------
+
+DRIFT = Fraction(1001, 1000)
+
+
+def minutes(trk, noise=0.2, mute=(), delay={}):
+    """The heard windows of the sweep of trk, one a minute at its densest cues, as sub_sweep() picks them."""
+    ws = [w for m in range(int(LENGTH // 60) + 1) for w in s.windows(trk, LENGTH, parts=((m * 60 / LENGTH, min(1.0, (m + 1) * 60 / LENGTH)),))]
+    return hear(ws, noise, mute=mute, delay=delay)
+
+
+def shifted(windows, by):
+    """windows with the words of the window at each place k of by heard by[k] seconds later, as Whisper's error does."""
+    return [dict(w, words=[[round(t + by.get(k, 0.0), 2), x] for t, x in w["words"]]) for k, w in enumerate(windows)]
+
+
+def fixed_at(trk, fix):
+    """How far each cue of trk starts from the speech of its line after fix."""
+    return [s.moved(round(a * 1000), fix) / 1000 - AT[i] for i, (a, _, _) in enumerate(trk)]
+
+
+def test_slope_takes_the_median_slope_and_its_interval():
+    """Points on a line with one far off: the slope is the line's, and the interval holds it. Points scattered around
+    a flat line give an interval that holds 0, so ratio_of() picks 1."""
+    pts = [(60.0 * k, 0.001 * 60 * k + (5.0 if k == 7 else 0.0)) for k in range(20)]
+    got, lo, hi = s.slope(pts)
+    assert got == pytest.approx(0.001) and lo <= 0.001 <= hi and s.ratio_of(pts) == DRIFT, (got, lo, hi)
+    r = random.Random(2)
+    flat = [(60.0 * k, r.gauss(0, 0.3)) for k in range(20)]
+    assert s.slope(flat)[1] <= 0 <= s.slope(flat)[2] and s.ratio_of(flat) == 1
+
+
+def heard_whole(trk, fix):
+    """(blocks(), left_off()) of trk after dense hearing of the whole file at fix, as sub_dense() hears a fix of the
+    sweep, with a speech onset at every line."""
+    there = [(s.moved(round(a * 1000), fix) / 1000, s.moved(round(b * 1000), fix) / 1000, x) for a, b, x in trk]
+    heard, timing = hear(s.dense(there, [(0.0, LENGTH)], LENGTH)), {"fix": fix}
+    got = s.blocks(heard, trk, "eng", timing, [(0.0, LENGTH)], onsets(every=True), None)
+    return got, s.left_off(heard, trk, "eng", timing, got, LENGTH)
+
+
+def test_a_long_part_left_off_at_the_end_refuses_a_fix_of_the_sweep():
+    """A track timed for 1001/1000 whose lines from line 280 on sit 1.2 s later still, as after an edit. At the drift's
+    own fix, dense hearing of the whole file finds a part 1 s off that runs to the last line. A part at a file's end
+    over 90 s is a step the fix cannot move, so checked_fix() refuses it."""
+    r = random.Random(7)
+    late = [r.gauss(0, 0.35) for _ in RIGHT]
+    trk = track(rate=DRIFT, offset=-0.3, late=lambda i: late[i] + (1.2 if i >= 280 else 0.0))
+    got, left = heard_whole(trk, {"rate": "1001/1000", "offset": -0.3})
+    assert got["blocks"] == [] and len(left) == 1 and left[0][1] >= AT[-1] and 0.9 <= left[0][2] <= 1.3, left
+
+
+def test_a_short_part_left_off_mid_file_keeps_a_fix_of_the_sweep():
+    """The same drift with 40 lines in the middle 1.1 s late, as an author timed a stretch. The part is under a quarter
+    of the file and touches no end, so the fix stands: real drifting tracks hold such stretches."""
+    r = random.Random(7)
+    late = [r.gauss(0, 0.35) for _ in RIGHT]
+    trk = track(rate=DRIFT, offset=-0.3, late=lambda i: late[i] + (1.1 if 180 <= i < 220 else 0.0))
+    _, left = heard_whole(trk, {"rate": "1001/1000", "offset": -0.3})
+    assert left == [], left
+    _, left = heard_whole(track(rate=DRIFT, offset=-0.3, late=lambda i: late[i]), {"rate": "1001/1000", "offset": -0.3})
+    assert left == [], left
+
+
+def test_a_step_that_the_ratio_absorbs_stays_a_known_limit():
+    """A right track whose last 160 lines sit 0.9 s early, with lines up to a second off at random. The sweep fits
+    1000/1001, whose line takes up most of the step, so no long part sits 0.75 s off and the fix stands. It moves lines
+    in time out of half a second. This pins the known limit of 2.7.0: a check that refuses it flips this test."""
+    r = random.Random(1)
+    late = [r.gauss(0, 0.45) for _ in RIGHT]
+    trk = track(late=lambda i: late[i] - (0.9 if i >= 240 else 0.0))
+    fit = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert fit["fix"] and fit["fix"]["rate"] == "1000/1001", fit
+    _, left = heard_whole(trk, fit["fix"])
+    wrong = sum(abs(a - AT[i]) <= 0.5 < abs(b) for i, ((a, _, _), b) in enumerate(zip(trk, fixed_at(trk, fit["fix"]))))
+    assert left == [] and wrong > 20, (left, wrong)
+
+
+def test_the_sweep_fits_a_drift_past_noisy_windows():
+    """A track timed for 1001/1000, 0.3 s early at its start, as a DVD drifts. Whisper hears two windows of the sweep a
+    second off, apart from each other, and three windows hear another episode, so they never count. Most windows sit
+    on one line, and the fix puts every cue within 0.25 s of its speech. The word check's two or three windows must
+    all sit within TOLERANCE of their line, so one such window there blocks a fix."""
+    trk = track(rate=DRIFT, offset=-0.3)
+    heard, other = shifted(minutes(trk), {4: 1.0, 12: -1.2}), " ".join(OTHER).split()
+    for k in (7, 8, 16):
+        heard[k] = dict(heard[k], words=[[t, other[40 * k + n]] for n, (t, _) in enumerate(heard[k]["words"])])
+    got = s.sweep_fit(heard, trk, "eng", LENGTH)
+    assert got["fix"] == {"rate": "1001/1000", "offset": pytest.approx(-0.3, abs=0.06)} and got["sweep"]["rate"] == "1001/1000", got
+    assert max(abs(x) for x in fixed_at(trk, got["fix"])) <= 0.25, got
+    assert s.live(s.sweep(heard, trk, "eng", got)) is None
+
+
+def test_the_sweep_fit_never_takes_a_step():
+    """A drift with a part of the file 1.5 s off, as after an edit. Two windows in a row sit off the line the same way,
+    so the sweep judges nothing: no fix, and no "in time" that would drop the word check's alert."""
+    trk = track(rate=DRIFT, offset=-0.3, late=lambda i: 1.5 if 150 <= i < 250 else 0.0)
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"].startswith("two sweep windows in a row"), got
+
+
+@pytest.mark.parametrize("late", [0.8, 1.2, 1.5])
+@pytest.mark.parametrize("first", [130, 200])
+def test_a_right_track_with_a_late_part_gets_no_ratio(late, first):
+    """A right track whose lines from first on sit late, as after an edit. Twenty windows of the sweep could pass a line
+    of 1001/1000 through its two parts, which would move every cue in time. The half of the file in time sits flat, so
+    no ratio stands, and the word check's alert stays."""
+    trk = track(late=lambda i: late if i >= first else 0.0)
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"] != "in time", got
+
+
+def test_one_window_off_the_line_is_no_step():
+    """A right track whose author put one stretch of lines 1 s late, inside one window of the sweep. The sweep finds
+    the track in time, so it may drop the alert of a word check that heard that window."""
+    trk = track(late=lambda i: 1.0 if 96 <= i < 100 else 0.0)
+    assert s.sweep_fit(minutes(trk), trk, "eng", LENGTH)["why"] == "in time"
+
+
+def test_a_plain_offset_needs_a_word_check_that_found_it_off():
+    """A track 1 s late everywhere. The sweep fixes it when the word check found it off or could not judge it, and
+    leaves it to the word check that found it in time: two windows near the ends measure one offset well."""
+    trk = track(offset=1.0)
+    assert s.sweep_fit(minutes(trk), trk, "eng", LENGTH)["fix"] == {"rate": "1/1", "offset": pytest.approx(1.0, abs=0.06)}
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH, plain=False)
+    assert got["fix"] is None and "the word check found them in time" in got["why"], got
+
+
+def test_a_drift_too_small_at_the_file_ends_is_in_time():
+    """A drift of 1001/1000 through the middle of the file moves its ends under MIN_SHIFT, so the sweep finds the
+    track in time."""
+    trk = track(rate=DRIFT, offset=-0.001 * LENGTH / 2)
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"] == "in time" and got["sweep"]["rate"] == "1001/1000", got
+
+
+def test_too_few_windows_in_a_half_give_no_sweep_fit():
+    trk = track(rate=DRIFT, offset=-0.3)
+    late = [w for w in minutes(trk) if w["at"] < LENGTH / 2 or w["at"] > LENGTH - 130]
+    got = s.sweep_fit(late, trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"].startswith(f"under {s.SWEPT} sweep windows"), got
+
+
+def roll_up(lines=range(LINES)):
+    """RIGHT as roll-up captions in the lines given: each cue shows its line under the two lines before it, from the
+    speech of its own line, and a speaker's name leads every fifth line. The other lines are pop-on."""
+    named = [f">> {x.split()[0]}: {x}" if i % 5 == 0 else x for i, x in enumerate(RIGHT)]
+    return [(a, b, "\\N".join(named[max(0, i - 2):i + 1]) if i in lines else x) for i, (a, b, x) in enumerate(track())]
+
+
+@pytest.mark.parametrize("lines", [range(LINES), range(200, LINES)], ids=["roll-up", "roll-up after pop-on"])
+def test_roll_up_captions_in_time_get_no_fix_from_the_sweep(lines):
+    """Roll-up captions in time by their new line, with speaker names, alone or after pop-on lines. Their first words
+    belong to the top line, said seconds before, so the sweep must not read them late and move them."""
+    trk = roll_up(lines)
+    assert s.sweep_fit(minutes(trk), trk, "eng", LENGTH)["fix"] is None
+
+
+def test_the_sweep_fit_reads_roll_up_captions_by_their_new_line():
+    """Roll-up captions in time by their new lines, with speaker names and a pop-on stretch, read in time to the sweep
+    fit. Read by their top lines, they would sit about 5 s late. The same captions 2 s late get a fix of 2 s."""
+    trk = rolled_up(track(), label=lambda i: ">> Reporter: " if i % 7 == 0 else "", pop=scenes(5, 8))
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"] == "in time" and abs(got["offset"]) < 0.1, got
+    late = rolled_up(track(offset=2.0))
+    assert s.sweep_fit(minutes(late), late, "eng", LENGTH)["fix"] == {"rate": "1/1", "offset": pytest.approx(2.0, abs=0.06)}
+
+
+def test_scene_lags_that_fake_a_slope_never_move_a_right_track():
+    """A right track with short cues, whose author put the lines of each scene late or early by its own amount, about
+    0.6 s at one sigma. The sweep's windows then lean like a drift of 1000/1001, and a fix of that ratio puts 86% of
+    the matched cues in their spans, over AGREE. As they are, 91% are, so the fix stands back. It would have moved 81
+    lines in time out of half a second."""
+    r = random.Random(252)
+    sig, show = r.choice((0.3, 0.45, 0.6)), r.choice((1.2, 1.6, 2.2))
+    lag = [r.gauss(0, sig) for _ in range(LINES // SCENE + 1)]
+    late = [lag[i // SCENE] + r.gauss(0, 0.15) for i in range(LINES)]
+    trk = track(late=lambda i: late[i], show=lambda i: show)
+    got = s.sweep_fit(minutes(trk), trk, "eng", LENGTH)
+    assert got["fix"] is None and got["why"].endswith("do as they are"), got
+    assert got["sweep"]["rate"] == "1000/1001" and s.AGREE <= got["sweep"]["spans"][1] < got["sweep"]["spans"][0], got
+
+
+def test_live_captions_with_a_drift_stay_live():
+    """Live captions 3 to 9 s late, by a different time each line, on audio that also drifts at 1001/1000. Their sweep
+    stays live-captioned against any line, so dense hearing moves each cue to its own speech, and no fix of the sweep
+    stands."""
+    trk = captioned(lag=lambda i: 6.0 + 3.0 * math.sin(i / 9) + 0.001 * AT[i])
+    heard = minutes(trk, 0.1)
+    assert s.live(s.sweep(heard, trk, "eng")) is not None
+    got = s.sweep_fit(heard, trk, "eng", LENGTH)
+    assert got["fix"] is None or s.live(s.sweep(heard, trk, "eng", got)) is not None, got
+
+
+def test_a_straight_drift_is_no_live_caption():
+    """Rows of a drift at 1001/1000 from 0.4 s early to 3.2 s late over an hour, each with a little noise. Around their
+    median they scatter as live captions do, but around their line they sit close."""
+    r = random.Random(5)
+    rows = sweep_of([round(-0.4 + 0.001 * (60.0 * k + s.WINDOW / 2) + r.gauss(0, 0.15), 2) for k in range(1, 61)])
+    med = sorted(w["off"] for w in rows)[30]
+    assert sorted(abs(w["off"] - med) for w in rows)[30] >= s.LIVE_SCATTER and s.live(rows) is None

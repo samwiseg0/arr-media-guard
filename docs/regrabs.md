@@ -1,8 +1,9 @@
 # Re-grabs, restores and kept originals
 
 When a file is broken, arr-media-guard (AMG) can delete it and have Sonarr or Radarr search for another copy. When the
-broken file was an upgrade, AMG can also put back the old file it replaced. Before AMG changes or replaces a file, it
-keeps the old one for a while, so you can undo the change. [design.md](design.md) has the rules behind each step.
+broken file was an upgrade, AMG can also put back the old file that the upgrade replaced. Before AMG changes or replaces
+a file, it keeps the old one for a while, so you can undo the change. [design.md](design.md) has the rules behind each
+step.
 
 ## Re-grabs
 
@@ -26,8 +27,9 @@ It deletes each one that is broken too. The files that check clean stay.
 - AMG leaves out a kind it does not know, and a blank value re-grabs nothing. `--selftest` fails on both.
 - The "Maybe the wrong episode" alert never re-grabs.
 
-`REGRAB_CAP` limits the re-grabs of each Sonarr or Radarr to 30 in 24 hours. Every kind counts toward the one limit, and
-one download counts once. Past the limit, AMG keeps the file and alerts. `0` turns every re-grab off.
+`REGRAB_CAP` limits the re-grabs of each Sonarr or Radarr instance to 30 in 24 hours by default. Every kind counts
+toward the one limit, and one download counts once. Past the limit, AMG keeps the file and alerts. `0` turns every
+re-grab off.
 
 A manual import has no grab to mark as failed. When it replaced a file and `RESTORE` is on, AMG deletes the broken file
 and puts the old one back. When no old file comes back, AMG asks the app to search, if the item was monitored. A manual
@@ -80,8 +82,9 @@ file that changed after the grab.
 
 When AMG replaces a file with a changed one, it keeps the old file as a *kept original*. That covers a header repair, a
 subtitle change in the file, and a `.srt` file that AMG moves aside or writes again. A conversion to MKV keeps the old
-file only when you forced it, or when it left a subtitle out. Every other conversion keeps nothing, because AMG checks
-every stream of the new file before the old one goes.
+file only when you forced it with `--force-convert`, or when it left a subtitle out. Every other conversion keeps
+nothing, because AMG checks every stream of the new file before the old one goes.
+[Force a conversion](commands.md#force-a-conversion) says how to force one.
 
 AMG keeps each one for `KEEP_ORIGINALS_DAYS` days, 7 by default.
 

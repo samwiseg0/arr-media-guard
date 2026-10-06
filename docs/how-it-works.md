@@ -4,6 +4,7 @@ This page follows one file from the moment Sonarr or Radarr imports it to the al
 each step, what arr-media-guard (AMG) checks and what it may change. [features.md](features.md) describes each check,
 and [design.md](design.md) the rules behind it. These words come up often.
 
+- *The app* is the Sonarr or Radarr that sent the file. The *item* is its movie or series.
 - A *job* is one file that waits for its check. It is an import, a deep analysis or a recheck.
 - The *listener* is AMG's small web server in Docker. The apps post to it through a **Webhook** connection. On a host,
   each app runs AMG as a **Custom Script** instead.
@@ -42,8 +43,9 @@ flowchart TD
 
 Each problem gets one Discord post. The import posts the problems it could not fix. With `SUBTITLES=deep`, the import
 holds its subtitle alerts, because the deep analysis checks the subtitles again. The deep analysis posts only what it
-still finds wrong. When it ends in an error or cannot judge the subtitles, the held alerts post then. With
-`DISCORD_POSTS=all`, each change AMG made to the file posts too. See [6. What you see](#6-what-you-see) and
+still finds wrong. When it ends in an error or cannot judge the subtitles, the held alerts post then. Each alert names
+the check that found the problem, and the step where the fix stopped. A held alert keeps the import's check and step.
+With `DISCORD_POSTS=all`, each change AMG made to the file posts too. See [6. What you see](#6-what-you-see) and
 [7. The deep analysis](#7-the-deep-analysis).
 
 ## 1. The app tells AMG about the file
@@ -111,7 +113,8 @@ A sure audio or video fault replaces every other change with a re-grab. Otherwis
 - **Re-grab.** A second check from scratch must find the same fault. AMG then deletes the broken files of the whole
   download through the app, such as the broken episodes of a season pack. It marks the grab as failed. For an upgrade it
   puts back the old file from the recycle bin, or from its own hard link, if it checks clean. `REGRAB` picks the kinds
-  of fault that re-grab, and `REGRAB_CAP` limits them to 30 a day for each app. See [regrabs.md](regrabs.md).
+  of fault that re-grab, and `REGRAB_CAP` limits them to 30 a day by default for each instance of an app. See
+  [regrabs.md](regrabs.md).
 - **Flag edit.** First a line with the full undo command goes to the decision log. Then `mkvpropedit` changes the
   default and forced flags and the language tags in place. AMG reads the file again to check every flag. It never edits
   a file with another hard link, because the edit would also change the download client's copy. See
@@ -135,9 +138,11 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
 - **Syslog.** A one-line summary of the same, tagged with `NAME`. In Docker it also goes to the container log. It names
   the job, as the listener's `queued` line does. See [monitoring.md](monitoring.md#syslog).
 - **Discord.** One alert for each problem the job left unresolved, to `DISCORD_WEBHOOK`. A problem AMG fixed, such as a
-  re-grab or a removed subtitle, goes to the decision log only. The same alert posts once for the same file. With
-  `DISCORD_POSTS=all`, each change AMG made to the file posts too. With `SUBTITLES=deep`, the subtitle alerts wait for
-  the deep analysis, see [7. The deep analysis](#7-the-deep-analysis). See [features.md](features.md#alerts).
+  re-grab or a removed subtitle, goes to the decision log only. The same alert posts once for the same file. Two fields
+  side by side name the check that found the problem and the step where the fix stopped. A step is, for example,
+  **Finding the shift** or **Writing the file**. With `DISCORD_POSTS=all`, each change AMG made to the file posts too.
+  With `SUBTITLES=deep`, the subtitle alerts wait for the deep analysis, see
+  [7. The deep analysis](#7-the-deep-analysis). See [features.md](features.md#alerts).
 - **Plex.** After a change, AMG asks Plex to read the item again, so Plex shows the new tracks. A new import is often
   not in Plex yet, so AMG looks for it for 10 minutes. The item's library must be idle on two checks 15 seconds apart,
   because a read during a Plex scan can crash Plex. After 30 minutes of a busy library, AMG leaves it to Plex's own
@@ -149,7 +154,8 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
 
 With `SUBTITLES=deep`, an import of a Matroska file with subtitles, or with a `.srt` beside it, puts a second job in the
 background queue. This *deep analysis* is the slower subtitle check of `--sub-time`. It reads the whole file and listens
-to much more of the audio. It can move a stretch of lines that is out of sync, and time live captions line by line. It
+to much more of the audio. It can fix a subtitle that drifts, move a stretch of lines that is out of sync, and time
+live captions line by line. It
 can also retime foreign subtitles by the speech, and repair garbled text. See [features.md](features.md#subtitle-match).
 
 It runs only while no import waits, and it stops between two steps when one arrives. It keeps the flags the import set,
@@ -159,14 +165,15 @@ stopped container left runs after the next start.
 
 The import posts no subtitle alert when a deep analysis follows. It keeps those alerts in the deep analysis job. The
 deep analysis checks the subtitles again and posts once, only what it still finds wrong. So a problem it fixes gets no
-alert. The kept alerts post when the deep analysis cannot judge the subtitles again. That happens after an error, a
-failed hearing, or with `SUBTITLES` set to `off` by then. They wait in the state store, so a restart keeps them. The
-decision line of the deep analysis names the import's job in `from`, so you can match the two lines.
+alert. The kept alerts post when the deep analysis cannot judge the subtitles again. That happens after an error, when
+AMG could not hear the audio, or with `SUBTITLES` set to `off` by then. They wait in the state store, so a restart keeps
+them. The decision line of the deep analysis names the import's job in `from`, so you can match the two lines.
 
 A *recheck* is another kind of job in the background queue. After an update, AMG queues one for each file whose saved
 subtitle check the new version can improve. It repeats that check on the file, and never checks deeper. It waits behind
-the imports and the deep analyses, and acts as the deep analysis does. `SUBTITLES` decides whether it fixes or only
-alerts. See [Recheck after an update](features.md#recheck-after-an-update).
+the imports and the deep analyses. Like the deep analysis, it keeps the flags an earlier run set and alerts only on
+subtitles. `SUBTITLES` decides whether it fixes or only alerts. See
+[Recheck after an update](features.md#recheck-after-an-update).
 
 ## The Test button and the start check
 
@@ -188,7 +195,7 @@ that is there and cannot be read, or a policy file that does not load. It only w
 | Job | What it does | On a host | In Docker |
 | --- | --- | --- | --- |
 | Audit | `--audit <instance> --since 24h --post` reviews the day's edits, from the plan AMG saved after each edit. It posts a list when one of the day's files has a problem. It writes one syslog line every night. | A systemd timer or cron, one line per instance. | The listener at `AUDIT_TIME`, for each instance whose API key reads. |
-| Clean up | Removes kept originals and grab links older than `KEEP_ORIGINALS_DAYS`. Turns on On Grab where `KEEP_REPLACED` needs it. | The audit, and the worker once a day. | The same. |
+| Clean up | Removes kept originals and the `KEEP_REPLACED` copies older than `KEEP_ORIGINALS_DAYS`. Turns on On Grab where `KEEP_REPLACED` needs it. | The audit, and the worker once a day. | The same. |
 | Log rotation | Rotates the decision log weekly, with compression. | logrotate. | The listener, after the audits. |
 | Recheck after an update | Queues a recheck of each file whose saved subtitle check the new version can improve, once per version. | The first audit of the version. The rechecks run after the next import starts the worker. | The listener, after the start check. |
 

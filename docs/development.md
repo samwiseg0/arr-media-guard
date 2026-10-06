@@ -189,6 +189,28 @@ only runs faster.
 
 A result of version 1 with `off` is stale. A result of version 1 without `off`, and every result of version 2, stays.
 
+A real case. HandBrake ends each ASS event with a NUL byte, and the versions before could not write new times into
+such a track. Version 2 of the flash check and version 3 of Subtitle block timing can. A result with `fix` does not
+say whether the fix was written, so each one gets a recheck. A recheck of a fix that was written finds nothing to move.
+
+```python
+"flash": {"version": 2, "fixes": {2: ["fix"]}},
+"block_timing": {"version": 3, "fixes": {3: ["fix"]}},
+```
+
+A second real case. Subtitle match 2 reads a roll-up caption by its new line, and the deep analysis fits a drift from
+its sweep. Both can fix or clear times that version 1 left off or in steps. Block timing 4 reads a straight drift as a
+drift, never as live captions. So a result with `live` is stale, and so is one whose sweep alerted.
+
+```python
+"subtitle_match": {"version": 2, "fixes": {2: ["off", "steps"]}},
+"block_timing": {"version": 4, "fixes": {3: ["fix"], 4: ["live", "off"]}},
+```
+
+Only results that flagged timing get a recheck. A result with no timing finding stays, even when the new version would
+now find a drift there. A recheck of an import's or a `--sub-check` result also runs at that depth. It hears no sweep,
+so it cannot reach the drift fix. Such a file needs `arr-media-guard --sub-time <file> --apply`.
+
 A new check goes into `SUB_CHECKS` and into `SUB_RUNS`. A result saved before it lacks the check, and reads as version
 0 with no findings. So `fixes = {1: None}` runs the new check on every file checked before. Without that entry those
 files stay as they are until they change.

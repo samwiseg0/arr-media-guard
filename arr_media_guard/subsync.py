@@ -173,19 +173,20 @@ def match_window(heard, fl, index):
             "offset": round(statistics.median(x[0] - t for t, x in pairs), 3) if pairs else None, "pairs": pairs}
 
 
-def check(heard, cues, lang, duration):
+def check(heard, cues, lang, duration, gain=True):
     """Whether the subtitle cues belong to the audio. heard is lid.listen()'s windows, [{"at": start, "words":
     [[seconds from start, word], ...]}]. cues is [(start, end, text)] in seconds, lang the subtitle's 639-2 language,
-    whose stopwords drop out, and duration the file's in seconds.
+    whose stopwords drop out, and duration the file's in seconds. gain goes to timing().
 
     Returns {"verdict": "match", "mismatch" or "unknown", "why", "windows": [{"at", "words", "overlap", "offset",
-    "cues"}], "timing": timing() of a match, else None}. A short phrase said again right after itself counts once, see
-    said(). A window inside a longer window heard later is the same audio, and the longer one stands for it. A window
-    with under MIN_WORDS heard content words names nothing, and the verdict needs two windows that do. All of those at
-    MATCH or more is a match. All at MISMATCH or less is a mismatch. Anything else is unknown. A track under
-    MIN_TRACK_CUES cues is unknown too."""
+    "cues", "late", and "secs" for a longer window}], "timing": timing() of a match, else None}. late is the median cue
+    start less heard time of the window's anchors, see anchors(), less CUE_LEAD, as sweep() gives it, or None under
+    MIN_CUES anchors. A short phrase said again right after itself counts once, see said(). A window inside a longer
+    window heard later is the same audio, and the longer one stands for it. A window with under MIN_WORDS heard content
+    words names nothing, and the verdict needs two windows that do. All of those at MATCH or more is a match. All at
+    MISMATCH or less is a mismatch. Anything else is unknown. A track under MIN_TRACK_CUES cues is unknown too."""
     stop = decide.STOPWORDS.get(lang, frozenset())
-    cues = unflashed(sorted(cues))   # the ends of a flash track say nothing, see flash(), so its spans take the new ends
+    cues = spoken(unflashed(sorted(cues)))   # the ends of a flash track say nothing, see flash(), so its spans take the new ends
     if len(cues) < MIN_TRACK_CUES:
         return {"verdict": "unknown", "why": f"the track holds {len(cues)} cues, under {MIN_TRACK_CUES}", "windows": [], "timing": None}
     fl = flat(cues, stop)
@@ -195,7 +196,9 @@ def check(heard, cues, lang, duration):
     end = lambda w: w["at"] + w.get("secs", WINDOW)
     heard = [w for w in heard if not any(x.get("secs", WINDOW) > w.get("secs", WINDOW) and x["at"] <= w["at"] and end(w) <= end(x) for x in heard)]
     got = [dict(match_window(said(w, stop), fl, index), at=w["at"], secs=w.get("secs", WINDOW)) for w in heard]
-    out = {"windows": [{"at": w["at"], "words": g["words"], "overlap": g["overlap"], "offset": g["offset"], "cues": len({x[1] for _, x in g["pairs"]})}
+    late = lambda e: round(statistics.median(c - t for t, c in e) - CUE_LEAD, 2) if len(e) >= MIN_CUES else None   # as sweep() rows
+    out = {"windows": [{"at": w["at"], "words": g["words"], "overlap": g["overlap"], "offset": g["offset"], "cues": len({x[1] for _, x in g["pairs"]}),
+                        "late": late(anchors(g["pairs"], cues)), **({"secs": w["secs"]} if w.get("secs", WINDOW) != WINDOW else {})}
                        for w, g in zip(heard, got)], "timing": None}
     few = sum(g["words"] < MIN_WORDS for g in got)
     got = sorted((g for g in got if g["words"] >= MIN_WORDS), key=lambda g: g["at"])   # in time order, for the ratio
@@ -203,7 +206,7 @@ def check(heard, cues, lang, duration):
     if len(got) < 2:
         return dict(out, verdict="unknown", why=f"{few} of {len(got) + few} windows hold under {MIN_WORDS} heard words")
     if all(g["overlap"] >= MATCH for g in got):
-        return dict(out, verdict="match", why=f"the heard words match the cues at {lap}", timing=timing(got, cues, duration))
+        return dict(out, verdict="match", why=f"the heard words match the cues at {lap}", timing=timing(got, cues, duration, gain))
     if all(g["overlap"] <= MISMATCH for g in got):
         return dict(out, verdict="mismatch", why=f"the heard words match the cues at {lap} at best")
     return dict(out, verdict="unknown", why=f"the heard words match the cues at {lap}, between {MISMATCH:.0%} and {MATCH:.0%} or apart")
@@ -226,7 +229,7 @@ def on_line(heard, cues, lang, fix, parts):
     MIN_CUES anchors, see anchors(), whose median sits within TOLERANCE of the line of fix, as fit() judges its windows.
     The longer window counts when the window heard too little. A part with no such window confirms nothing, so a
     window too thin to judge never lets a fix through."""
-    stop, cues = decide.STOPWORDS.get(lang, frozenset()), unflashed(sorted(cues))
+    stop, cues = decide.STOPWORDS.get(lang, frozenset()), spoken(unflashed(sorted(cues)))
     fl, index = flat(cues, stop), collections.defaultdict(list)
     for p, x in enumerate(fl):
         index[x[2]].append(p)
@@ -261,14 +264,29 @@ def agree(pairs, cues, rate, offset):
     return ok / len(by) if by else 0.0
 
 
-def timing(got, cues, duration):
+def shares(pairs, cues, fix):
+    """(the share of the matched cues in their spans as the cues are, the share after fix), see agree(). Both keep
+    CUE_LEAD. A fix must raise the share, see timing() and sweep_fit()."""
+    r = Fraction(fix["rate"])
+    return agree(pairs, cues, Fraction(1), CUE_LEAD), agree(pairs, cues, r, fix["offset"] + CUE_LEAD * float(r))
+
+
+def timing(got, cues, duration, gain=True):
     """fit() of the windows of got with MIN_CUES anchors or more, see anchors(). A window with fewer names no offset.
     When the other windows leave the fit short of evidence, "few" lists the start of each such window, for a longer
-    window."""
+    window. A fix holds "spans", see shares(). With gain, a fix must put more matched cues in their spans than the
+    cues have as they are, else the times stay with "unfixed". A right track whose line ran 7 ms past MIN_SHIFT at the
+    file's start got a fix of 1001/1000, which moved 107 lines in time out of half a second. --sub-time and the deep
+    analysis pass gain False, as their sweep's windows judge the fix, see subtitles.sub_sweep()."""
     ends = [anchors(g["pairs"], cues) for g in got]
     few = [g.get("at") for g, e in zip(got, ends) if len(e) < MIN_CUES]
-    r = fit([g for g, e in zip(got, ends) if len(e) >= MIN_CUES], [e for e in ends if len(e) >= MIN_CUES],
-            [p for g in got for p in g["pairs"]], cues, duration)
+    pairs = [p for g in got for p in g["pairs"]]
+    r = fit([g for g, e in zip(got, ends) if len(e) >= MIN_CUES], [e for e in ends if len(e) >= MIN_CUES], pairs, cues, duration)
+    if r["fix"]:
+        was, now = shares(pairs, cues, r["fix"])
+        r = dict(r, spans=[round(was, 3), round(now, 3)])
+        if gain and now <= was:
+            r = {"fix": None, "unfixed": r["fix"]["offset"], "spans": r["spans"], "why": f'{r["why"]}, but {was:.0%} sit in them as they are, so the times stay'}
     return dict(r, few=few) if few and not (r["fix"] or r.get("piecewise") or "unfixed" in r or r["why"] == "in time") else r
 
 
@@ -1061,7 +1079,7 @@ def sweep(heard, cues, lang, timing=None):
     "overlap", "cues": the matched cues whose first word matched, "offset": their median cue start less the heard time
     and CUE_LEAD, or None, "off": that offset less the fitted line there, or None}. The fitted line is the fix of
     timing, the word check's, else no offset. The rows only report."""
-    stop, cues = decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
+    stop, cues = decide.STOPWORDS.get(lang, frozenset()), spoken(sorted(cues))
     fl, index = flat(cues, stop), collections.defaultdict(list)
     for p, x in enumerate(fl):
         index[x[2]].append(p)
@@ -1077,6 +1095,107 @@ def sweep(heard, cues, lang, timing=None):
                      "off": None if o is None else round(o - (rate - 1) * (at + CUE_LEAD) - offset, 2)})
     return rows
 
+
+# The fit of the sweep (docs/design.md, "Subtitle match"). The word check fits its two or three windows, and every one
+# must sit within TOLERANCE of the line, so one noisy window blocks a fix. The sweep hears a window a minute, and its fit
+# follows most of them.
+SLOPE_CONF = 0.95   # the confidence of the interval of a sweep's slope, see slope(). An interval that holds 0 is no drift.
+
+
+def slope(points):
+    """(slope, low, high) of points [(t, y)]: the median of the slopes between every two points (Theil and Sen), and
+    the bounds of its SLOPE_CONF interval from Kendall's rank test. A few points far off move the median little."""
+    s = sorted((y2 - y1) / (t2 - t1) for k, (t1, y1) in enumerate(points) for t2, y2 in points[k + 1:] if t2 != t1)
+    n = len(points)
+    c = statistics.NormalDist().inv_cdf((1 + SLOPE_CONF) / 2) * math.sqrt(n * (n - 1) * (2 * n + 5) / 18)
+    return statistics.median(s), s[max(0, math.floor((len(s) - c) / 2) - 1)], s[min(len(s) - 1, math.ceil((len(s) + c) / 2))]
+
+
+def ratio_of(points):
+    """The frame-rate ratio of RATES whose drift points [(audio time, cue time less audio time)] follow: the one nearest
+    their slope, see slope(), or 1 when the interval of the slope holds 0."""
+    s, lo, hi = slope(points)
+    return Fraction(1) if lo <= 0 <= hi else min(RATES, key=lambda r: abs(float(r) - 1 - s))
+
+
+def sweep_pairs(heard, cues, lang):
+    """(cues read as sweep() reads them, see spoken(), the anchors of each window of heard that counts, the matched
+    pairs of those windows). A window counts when it heard MIN_WORDS words, matched MATCH of them and anchored 2 cues or
+    more, see anchors()."""
+    stop = decide.STOPWORDS.get(lang, frozenset())
+    cues = spoken(sorted(cues))
+    fl, index = flat(cues, stop), collections.defaultdict(list)
+    for p, x in enumerate(fl):
+        index[x[2]].append(p)
+    ends, pairs = [], []
+    for w in heard:
+        g = match_window(said(w, stop), fl, index)
+        e = anchors(g["pairs"], cues)
+        if g["words"] >= MIN_WORDS and g["overlap"] >= MATCH and len(e) >= 2:
+            ends.append(sorted(e))
+            pairs += g["pairs"]
+    return cues, ends, pairs
+
+
+def sweep_fit(heard, cues, lang, duration, plain=True):
+    """The times of a matched track from its sweep, in the form of fit(): {"fix": {"rate", "offset"} or None, "why",
+    "sweep": {"windows", "slope", "rate", "offset"}}, with "offset" too when the track is in time. heard is lid.listen()'s
+    windows of the sweep, see sweep(), cues the track's [(start, end, text)], lang its 639-2 language and duration the
+    file's. The why "in time" says the sweep found the cues in time. Any other why without a fix says the sweep could
+    not judge, and the word check's result stands.
+
+    A window counts as in sweep_pairs(): it heard MIN_WORDS words, matched MATCH of them and anchored 2 cues or more, see
+    anchors(). It gives a point: the median time of its anchors, and their median cue start less heard time. SWEPT
+    windows must count in each half of the file. The slope through the points, see slope(), picks the frame-rate ratio of
+    RATES nearest it. A slope whose interval holds 0 picks a plain offset. The line of that ratio goes through the median
+    of all the anchors, and the fix keeps CUE_LEAD, as in fit(). On four drifting tracks measured with a larger speech
+    model, that put more cues within 0.5 s of their speech than the median of the points did. With plain False, as when
+    the word check found the track in time, a plain offset gives no fix: two windows near the file's ends measure one
+    offset well, and only a drift needs the windows between them.
+
+    The track is in time when the line sits under MIN_SHIFT off at the file's start and end. Two windows in a row that
+    sit MIN_SHIFT or more off the line the same way are a part of the file that is off, a step, and the sweep then judges
+    nothing. So one noisy window never decides, and a step keeps the word check's alert. A ratio other than 1 also needs
+    each half of the file to drift: a half whose slope interval holds 0 and not the ratio sits flat, as on each side of
+    an edit, and the ratio would move its cues. A fix also needs AGREE of the matched cues of all the windows in their
+    spans after it, see agree(), and more of them than fall in their spans as the cues are. On a right roll-up track,
+    author scatter in a few cues a window faked a slope of 30 ms a minute, and a fix that passed AGREE took the share
+    from 90% to 82%. The caller checks the rows against the fix with sweep_confirms(), and with live(), whose live
+    captions get no fix."""
+    cues, ends, pairs = sweep_pairs(heard, cues, lang)
+    ends.sort(key=lambda e: statistics.median(t for t, _ in e))
+    at = [statistics.median(t for t, _ in e) for e in ends]
+    early = sum(a < duration / 2 for a in at)
+    if min(early, len(at) - early) < SWEPT:
+        return {"fix": None, "why": f"under {SWEPT} sweep windows in a half of the file anchored 2 cues"}
+    points = [(a, statistics.median(c - t for t, c in e)) for a, e in zip(at, ends)]
+    rate = ratio_of(points)
+    m = [statistics.median(c - float(rate) * t for t, c in e) for e in ends]   # each window's offset at the ratio
+    mid, name = statistics.median(c - float(rate) * t for e in ends for t, c in e), f"{rate.numerator}/{rate.denominator}"
+    offset = round(mid - CUE_LEAD * float(rate), 3)
+    facts = {"windows": len(at), "slope": round(slope(points)[0], 6), "rate": name, "offset": offset}
+    away = [x - mid for x in m]
+    if any(abs(x) >= MIN_SHIFT and abs(y) >= MIN_SHIFT and x * y > 0 for x, y in zip(away, away[1:])):
+        return {"fix": None, "why": f"two sweep windows in a row sit {MIN_SHIFT} s or more off the line of the others the same way", "sweep": facts}
+    if all(abs(mid + (float(rate) - 1) * t - CUE_LEAD) < MIN_SHIFT for t in (0.0, duration)):   # at ratio 1, as fit() judges
+        return {"fix": None, "why": "in time", "offset": round(mid - CUE_LEAD, 3), "sweep": facts}
+    if rate == 1 and not plain:
+        return {"fix": None, "why": f"the sweep puts the cues {offset:+.2f} s off and finds no drift, and the word check found them in time", "sweep": facts}
+    for half in (points[:early], points[early:]) if rate != 1 else ():   # a part in time, or off by one amount, as around an edit
+        _, lo, hi = slope(half)
+        if lo <= 0 <= hi and not lo <= float(rate) - 1 <= hi:
+            return {"fix": None, "why": f"a half of the file sits flat, so the ratio {name} would move cues that stay", "sweep": facts}
+    what = f"{offset:+.2f} s" + ("" if rate == 1 else f" and the ratio {name}")
+    shown, share = shares(pairs, unflashed(cues), {"rate": name, "offset": offset})
+    facts["spans"] = [round(shown, 3), round(share, 3)]
+    if share < AGREE:
+        return {"fix": None, "why": f"after a fix of {what} by the sweep, {share:.0%} of the matched cues fall in their spans, under {AGREE:.0%}", "sweep": facts}
+    if share <= shown:
+        return {"fix": None, "why": f"after a fix of {what} by the sweep, {share:.0%} of the matched cues fall in their spans, and {shown:.0%} do as "
+                                    "they are", "sweep": facts}
+    return {"fix": {"rate": name, "offset": offset},
+            "why": f"the sweep's {len(at)} windows fit a fix of {what}, and {share:.0%} of the matched cues fall in their spans, against {shown:.0%} "
+                   "as they are", "sweep": facts}
 
 
 # The block timing of the sweep (docs/design.md, "Subtitle match"). A part of a track can sit off while the rest is in
@@ -1183,6 +1302,39 @@ def dense(cues, parts, duration, stop=frozenset()):
         out += [a for a in (round(lo + k * span / n, 1) if n else round(lo, 1) for k in range(n + 1))
                 if bisect.bisect_left(ts, a + WINDOW + PAD) > bisect.bisect_left(ts, a - PAD)]
     return out
+
+
+def gaps(starts, duration):
+    """[(lo, hi)] of the audio between windows of WINDOW seconds at starts, each OVERLAP seconds into the windows at its
+    sides, from the file's start to its end. dense() hears them in full, so the windows heard already and the new ones
+    share OVERLAP seconds, as dense() windows do, and no audio is heard twice."""
+    edges = [0.0] + [x for s in sorted(starts) for x in (s + OVERLAP, s + WINDOW - OVERLAP)] + [duration]
+    return [(round(a, 1), round(b, 1)) for a, b in zip(edges[::2], edges[1::2]) if b > a]
+
+
+LEFT_SHARE = 0.25   # the share of the file a part left off covers, at least, before it refuses a fix of the sweep, see left_off()
+LEFT_END = 90.0     # seconds of a part left off at a file's end, at least, before it refuses a fix of the sweep
+LEFT_ROWS = 6       # windows of dense hearing a part left off holds at least, about 45 seconds: fewer give a median of noise
+
+
+def left_off(heard, cues, lang, timing, got, duration):
+    """[(from, to, off)] of the long parts of a track that still sit off after a fix of the sweep and its blocks, from
+    dense hearing of the whole file at that fix, see subtitles.sub_dense(). heard is that hearing, cues the track's
+    [(start, end, text)], timing its timing() with the fix, got its blocks() and duration the file's. Each window gives a
+    sweep() row, and a row in a block that moved loses the block's shift, see after_blocks(). A part is a run of
+    LEFT_ROWS rows or more that count, see trusted(), whose median sits MIN_SHIFT or more off the track's lean. It counts
+    when it covers LEFT_SHARE of the file, the shortest such run from each row, or when it runs from the first row or to
+    the last over LEFT_END seconds or more. That is a step that the fix moved the wrong way. A shorter part in the middle
+    is left alone, as an author's stretch: on real drifting tracks such parts sat up to 1.18 s off for up to 2 minutes,
+    and their long parts and their parts at a file end sat 0.6 s off at most. Parts in audio seconds, merged."""
+    rows, lean = trusted(after_blocks(sweep(heard, cues, lang, timing), got.get("blocks") or [], timing))
+    off, n = [r["off"] - lean for r in rows], len(rows)
+    span = lambda i, j: rows[j - 1]["at"] + WINDOW - rows[i]["at"]
+    runs = [(0, j) for j in range(LEFT_ROWS, n + 1) if span(0, j) >= LEFT_END] + [(i, n) for i in range(n - LEFT_ROWS + 1) if span(i, n) >= LEFT_END]
+    runs += [(i, next(j for j in range(i + LEFT_ROWS, n + 1) if span(i, j) >= LEFT_SHARE * duration)) for i in range(n - LEFT_ROWS + 1)
+             if span(i, n) >= LEFT_SHARE * duration]
+    out = [(rows[i]["at"], rows[j - 1]["at"] + WINDOW, statistics.median(off[i:j])) for i, j in runs if abs(statistics.median(off[i:j])) >= MIN_SHIFT]
+    return [[round(lo, 1), round(hi, 1), round(max((o for a, b, o in out if lo <= a and b <= hi), key=abs), 2)] for lo, hi in merged((a, b) for a, b, _ in out)]
 
 
 def spread(shift):
@@ -1663,7 +1815,7 @@ def blocks(heard, cues, lang, timing, parts, onsets=None, rows=None):
     may start before the end of a cue that stays. That cue keeps its times, and a player shows both lines while they
     overlap. With INVARIANTS, check_blocks() checks the result.
 """
-    stop, raw = decide.STOPWORDS.get(lang, frozenset()), sorted(cues)
+    stop, raw = decide.STOPWORDS.get(lang, frozenset()), spoken(sorted(cues))
     ons = []
     for o in sorted((o, ONSET_QUIET) if isinstance(o, (int, float)) else (o[0], o[1]) for o in onsets or ()):
         if ons and o[0] - ons[-1][0] < ONSET_TWICE:   # two reads of the same audio find one onset twice
@@ -2016,12 +2168,14 @@ def after_blocks(rows, blocks, timing, parts=()):
 # track whose sweep looks live-captioned, dense hearing hears the whole track, and each cue moves to its own speech.
 # Per-cue moves on other tracks stay out: there an author's jitter is the size of Whisper's noise.
 LIVE_ROWS = 10       # sweep rows that count a track needs before the sweep can call it live-captioned, see live()
-LIVE_FEW = 5         # sweep rows that count that are enough when each sits LIVE_FAR or more late. Roll-up captions, which
-                     # repeat the last line, let few rows match 2 cues.
+LIVE_FEW = 5         # sweep rows that count that are enough when each sits LIVE_FAR or more late. Rows that far late tell
+                     # live captions from a right track or a drift with fewer rows.
 LIVE_FAR = 3.0       # seconds late each of those rows sits at least. No row of a verified right track sat 2.5 s late.
 LIVE_LAG = 0.3       # seconds late its rows sit at their median at least: live captions trail the speech
-LIVE_SCATTER = 0.4   # seconds its rows sit from their median, at the median, at least. Logged tracks that were
-                     # not live captions sat at 0.26 s or less, and the live ones at 0.49 s or more.
+LIVE_SCATTER = 0.4   # seconds its rows sit from their line, at the median, at least, see live(). Logged tracks that
+                     # were not live captions sat at 0.26 s or less from their median, and the live ones at 0.49 s or
+                     # more from their line. Two drifts at 1001/1000 sat 0.23 and 0.37 s from theirs, and 0.49 and 0.54 s
+                     # from their median.
 LIVE_AGREE = 2.0     # seconds the two cues around a cue with no anchor sit off at least before it takes their shift on their word
                      # alone. With each anchor hidden in turn, the place between moving neighbours 1 s off was farther than the
                      # old start for about a third of the cues of a test track, and at 2 s for almost none.
@@ -2030,20 +2184,28 @@ LIVE_LEFT = 0.2      # the share of a track's cues that may stay off before the 
 LIVE_STEPS = 8       # steps per cue at most of the loop that keeps the cue order, see live_moves(). It needs 5 at most.
 LIVE_TWICE = 3.0     # seconds after a cue's anchor within which its first content word heard again may be its speech, see unsure()
 LABEL = re.compile(r"(^|\n|>>)([ \t]*)[^\W\d_][\w.'’-]*(?: [^\W\d_][\w.'’-]*)?:(?=\s)")   # a speaker's name before a line, never spoken
+ROLLUP = 0.5         # the share of a track's cues that repeat lines of the cue before, at or over which it is roll-up captions,
+                     # see spoken(). Roll-up tracks sat at 0.69 or more, other tracks at 0.3 or less, paint-on captions among them.
 
 
 def live(rows):
     """{"lag", "off", "scatter", "rows"} of a track whose sweep() rows look live-captioned, else None. The rows that
-    count, see trusted(), give it. lag is their median offset against the audio, off their median "off" against the
-    fitted line, and scatter the median distance of their "off" from off. A track looks live-captioned when LIVE_ROWS
-    rows count, lag is LIVE_LAG or more and scatter is LIVE_SCATTER or more. LIVE_FEW rows are enough when each of
-    them sits LIVE_FAR or more late. A fix for the whole track leaves the scatter. A right track, a track off by one
-    shift and a block leave little."""
+    count, see trusted(), give it. lag is their median offset against the audio, and off their median "off" against the
+    fitted line. scatter is the median distance of their "off" from a line through their median, at the frame-rate ratio
+    that their slope picks, see ratio_of(). A row's time is the middle of its window. A track looks live-captioned when
+    LIVE_ROWS rows count, lag is LIVE_LAG or more and scatter is LIVE_SCATTER or more. LIVE_FEW rows are enough when
+    each of them sits LIVE_FAR or more late. A fix for the whole track leaves the scatter. A right track, a track off by
+    one shift and a block leave little. So does a straight drift at a frame-rate ratio, which goes to the fix of
+    sweep_fit() and never to per-cue moves."""
     rows = trusted(rows)[0]
     if len(rows) < LIVE_FEW or len(rows) < LIVE_ROWS and min(r["offset"] for r in rows) < LIVE_FAR:
         return None
     lag, off = statistics.median(r["offset"] for r in rows), statistics.median(r["off"] for r in rows)
-    scatter = statistics.median(abs(r["off"] - off) for r in rows)
+    points = [(w["at"] + WINDOW / 2, w["off"]) for w in rows]
+    rise = float(ratio_of(points)) - 1   # seconds the line rises a second
+    z = [y - rise * t for t, y in points]   # each row against the line of the ratio
+    mid = statistics.median(z)
+    scatter = statistics.median(abs(x - mid) for x in z)
     return {"lag": round(lag, 2), "off": round(off, 2), "scatter": round(scatter, 2), "rows": len(rows)} \
         if lag >= LIVE_LAG and scatter >= LIVE_SCATTER else None
 
@@ -2059,6 +2221,17 @@ def rolled(cues):
         out.append("\n".join(lines[n:]) if n else c[2])
         last = said_by
     return out
+
+
+def spoken(cues):
+    """cues [(start, end, text)], sorted, with the text that is spoken at each cue. On a roll-up track, ROLLUP of its
+    cues or more repeat lines of the cue before, see rolled(). Each of its cues then keeps only its new lines, less a
+    speaker's name, see LABEL, so every timing check reads a cue by the words said when it shows. Other tracks keep
+    their text: a line said twice in a row there was spoken twice."""
+    texts = rolled(cues)
+    if sum(x != c[2] for x, c in zip(texts, cues)) < ROLLUP * len(cues):
+        return cues
+    return [(c[0], c[1], LABEL.sub(r"\1\2", x), *c[3:]) for c, x in zip(cues, texts)]
 
 
 def unsure(heard, at, texts, stop):

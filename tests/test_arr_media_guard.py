@@ -161,8 +161,10 @@ def env(tmp_path, monkeypatch, settings):
                 if t["properties"]["uid"] == uid and name.startswith("language"):   # both tags, the legacy one from mkvmerge's table
                     t["properties"].update(language_ietf=flag, **({} if name == "language-ietf" else {"language": hook.langs()[0].get(flag, flag)}))
                     if flag is None: del t["properties"]["language_ietf"]   # --delete language-ietf
+                elif t["properties"]["uid"] == uid and flag is None:   # --delete flag-original
+                    del t["properties"][{"flag-original": "flag_original"}[name]]
                 elif t["properties"]["uid"] == uid:
-                    t["properties"][{"flag-default": "default_track", "flag-forced": "forced_track"}[name]] = bool(int(flag))
+                    t["properties"][{"flag-default": "default_track", "flag-forced": "forced_track", "flag-original": "flag_original"}[name]] = bool(int(flag))
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     def fake_http(url, method="GET", body=None, headers=None, timeout=15):
@@ -623,7 +625,8 @@ def test_wrong_language_alerts_once(env):
     host, stamp = hook.CFG.instance, post["embeds"][0]["timestamp"]
     assert post == {"username": f"Radarr {host}", "allowed_mentions": {"parse": []}, "embeds": [{   # the whole payload
         "title": "Wrong audio language", "description": "The audio is **Portuguese**, but it should be English.", "color": hook.COLORS["amber"],
-        "fields": [{"name": "Film A (1979)", "value": "Film A (1979) WEBDL-1080p.mkv", "inline": False}],
+        "fields": [{"name": "Check", "value": "Import check", "inline": True}, {"name": "Film A (1979)", "value": "Film A (1979) WEBDL-1080p.mkv",
+                                                                                 "inline": False}],
         "footer": {"text": f"TMDB has no record of this item, so its language check was skipped · arr-media-guard on {host}"},
         "timestamp": stamp}]}, post
     assert stamp.endswith("+00:00")
@@ -1020,7 +1023,7 @@ def test_sonarr_alerts_go_to_the_same_webhook_as_sonarr(env, monkeypatch):
     hook.main([])
     (post,) = [b for m, u, b in env["http"] if m == "POST"]   # the same webhook, posted as Sonarr
     assert [u for m, u, b in env["http"] if m == "POST"] == ["https://discord.invalid/ops"]
-    assert post["username"] == f"Sonarr {hook.CFG.instance}" and post["embeds"][0]["fields"][0]["name"] == "Show S01E02"
+    assert post["username"] == f"Sonarr {hook.CFG.instance}" and post["embeds"][0]["fields"][-1]["name"] == "Show S01E02"
 
 
 @pytest.mark.parametrize("app", ["radarr", "sonarr"])
@@ -1036,7 +1039,8 @@ def test_an_import_alert_links_the_item_from_the_record_the_job_read(env, monkey
     hook.main([])
     (post,) = [b for m, u, b in env["http"] if m == "POST"]
     link = {"radarr": "[Film A (1979)](https://movies.media-host.test/movie/90001)", "sonarr": "[Show S01E02](https://tv.media-host.test/series/show)"}[app]
-    assert post["embeds"][0]["fields"] == [{"name": "\u200b", "value": f"{link}\nFilm A (1979) WEBDL-1080p.mkv", "inline": False}]
+    assert post["embeds"][0]["fields"] == [{"name": "Check", "value": "Import check", "inline": True},
+                                           {"name": "\u200b", "value": f"{link}\nFilm A (1979) WEBDL-1080p.mkv", "inline": False}]
     assert [r["ids"]["slug"] for r in log_lines(env) if r.get("findings")] == [{"radarr": "90001", "sonarr": "show"}[app]]
 
 
@@ -2271,15 +2275,16 @@ def test_a_failed_mkvpropedit_that_breaks_the_file_says_so(env, monkeypatch):
 
 
 
-def test_a_posted_alert_has_one_field_and_masks_the_secrets(env):
-    """alert_findings() posts one embed per finding, with the title and the file in one field. tests/test_report.py holds the
-    title and the color of each finding."""
+def test_a_posted_alert_names_its_step_and_masks_the_secrets(env):
+    """alert_findings() posts one embed per finding, with the step where its fix stopped and a field with the title and
+    the file. A record with no source names no check. tests/test_report.py holds the title and the color of each
+    finding."""
     rec = dict(app="radarr", label="Film A (1979)", path="/m/other.mkv",
                findings=[{"kind": "edit", "error": "It failed on https://discord.invalid/ops with plex-t0ken-1234.", "unread": None, "on": None}])
     assert hook.alert_findings(rec, 1) == ["sent"]
     e = env["http"][-1][2]["embeds"][0]
     color = hook.COLORS[hook.title(rec["findings"][0])[1]]   # the finding's own color
-    assert (e["color"], [(f["name"], f["value"]) for f in e["fields"]]) == (color, [("Film A (1979)", "other.mkv")])
+    assert (e["color"], [(f["name"], f["value"]) for f in e["fields"]]) == (color, [("Stopped at", "Writing the file"), ("Film A (1979)", "other.mkv")])
     assert "discord.invalid" not in json.dumps(e) and "plex-t0ken-1234" not in json.dumps(e) and "<DISCORD_WEBHOOK>" in e["description"]
 
 
@@ -2451,6 +2456,65 @@ def test_the_hook_clears_the_forced_flag_with_an_undo_and_plans_nothing_more(env
     assert env["files"][env["path"]] == dense(("eng", "English", True, True, 1500))
 
 
+@pytest.mark.parametrize("lid, flagged, note", [
+    ("missing", [], "it was not heard"), ("fails", [], "it was not heard"),
+    ("eng", ["track:=1", "track:=1"], None), ("spa", [], "heard spa, not eng")])
+def test_the_original_flag_waits_for_the_heard_language(env, monkeypatch, lid, flagged, note):
+    """Owner 2026-10-06: hear before flagging. An English film whose English audio has a bare tag: the language check
+    hears it first. A missing or failing check, or another heard language, makes no flag edit, and the decision line
+    says why. Never the tag alone. The second import of the flagged file plans nothing more."""
+    env["probe"] = dense(("eng", "English", True, True, 1500))
+    env["tmdb"] = dict(TMDB)
+    if lid != "missing":
+        monkeypatch.setattr(hook, "lid_ready", lambda: True)
+        monkeypatch.setattr(hook, "lid_run", lambda path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None:
+                            {"why": "lid.py exited 1: CUDA error"} if lid == "fails" or words else {"lang": lid, "prob": 0.98, "took": 3.0})
+    hook.main([])
+    rec = decided(env)
+    assert [e[0] for e in rec["edits"] if hook.arr_decide.prop(e) == hook.arr_decide.ORIGINAL_FLAG] == flagged[:1], rec["edits"]
+    why = {"missing": "language detection is not installed", "fails": "lid.py exited 1: CUDA error"}.get(lid)
+    assert rec["flag_heard"]["a1"] == dict(rec["flag_heard"]["a1"], lang=None if why else lid, why=why) and "heard" not in rec, rec
+    assert [n for n in rec["notes"] if n.startswith("a1 eng: the original")] == ([f"a1 eng: the original language flag stays, because {note}"] if note else [])
+    assert "s1 eng: the original language flag stays, because its text was not read" in rec["notes"]   # the fake text reads no language
+    hook.main([])   # the flag holds, so a second import plans nothing more for it
+    assert [e for e in log_lines(env)[-1].get("edits") or [] if hook.arr_decide.prop(e) == hook.arr_decide.ORIGINAL_FLAG] == []
+
+
+def heard_as(monkeypatch, lang):
+    """The language check hears every audio track as lang. The word check hears nothing."""
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "lid_run", lambda path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None:
+                        {"why": "no words in this test"} if words else {"lang": lang, "prob": 0.98, "took": 3.0})
+
+
+def test_an_und_track_heard_as_the_content_language_gets_its_tag_and_flag_in_one_run(env, monkeypatch, capsys):
+    """Review blocker: the flag tested the tag from before the run, so an und track the run tagged got its flag only on
+    the next run, and the nightly audit counted a further edit. Now the tag after the run counts."""
+    env["probe"], env["tmdb"] = dense(audio=(("und", ""),)), dict(TMDB)
+    heard_as(monkeypatch, "eng")
+    hook.main([])
+    rec = decided(env)
+    assert [(e[3], e[1]) for e in rec["edits"] if e[3] in ("language", "flag-original")] == [("language", "en"), ("flag-original", 1)], rec["edits"]
+    assert rec["recheck"] == {"edits": 0, "undecided": None, "invariants": []} and len(analyzes(env)) == 1   # a tag edit is still analyzed
+    hook.main([])   # the next import of the same file edits nothing
+    assert len(env["mkvpropedit"]) == 1 and log_lines(env)[-1]["outcome"] == "no_change"
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert "0 of them still have tracks to change." in capsys.readouterr().out
+
+
+def test_an_edit_of_the_original_flag_alone_queues_no_plex_analyze(env, monkeypatch):
+    """Coordinator 2026-10-06: Plex does not read the flag, and most imports get a flag edit. The Plex crash of
+    2026-09-25 involved AMG's analyze calls, so an edit of the flag alone asks Plex for nothing. Any other edit does."""
+    env["probe"], env["tmdb"] = dense(audio=(("eng", ""),)), dict(TMDB)
+    heard_as(monkeypatch, "eng")
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "edited" and rec["edits"] == [["track:=1", 1, None, "flag-original"]] and analyzes(env) == [], rec
+    assert rec["flag_heard"]["a1"]["lang"] == "eng" and [t["orig"] for t in rec["tracks"]] == [None]   # the tracks as the run found them
+    assert not hook.changed({"result": "edited", "edits": rec["edits"]}) and hook.changed({"result": "edited", "edits": [["track:=1", 0, 1]]})
+    assert hook.changed({"result": "edited", "edits": rec["edits"], "reasons": ["repacked"]})   # a conversion still counts
+
+
 def test_the_role_default_policy_is_valid_and_a_bad_one_is_refused():
     hook.arr_decide.set_policy(POLICY)
     for bad in ({k: v for k, v in POLICY.items() if k != "kids"}, dict(POLICY, audio=dict(POLICY["audio"], foreign=["origin"]))):
@@ -2480,6 +2544,8 @@ def test_a_missing_policy_alerts_once_and_skips(env, monkeypatch):
     assert [r["outcome"] for r in recs] == ["no_policy", "no_policy"] and env["mkvpropedit"] == []
     posts = [b for m, u, b in env["http"] if m == "POST"]
     assert len(posts) == 1 and posts[0]["embeds"][0]["title"] == hook.title({"kind": "policy"})[0]   # the policy alert
+    assert posts[0]["embeds"][0]["fields"][0] == {"name": "Check", "value": "Import check", "inline": True}   # no fix ran, so no step
+    assert [f["name"] for f in posts[0]["embeds"][0]["fields"]] == ["Check", "the policy file"]
     with pytest.raises(SystemExit):
         hook.main(["--backfill", "radarr"])
 
@@ -6820,7 +6886,7 @@ def test_a_dry_line_never_prints_none_when_the_remux_planned_nothing(env):
     (f,) = hook.sub_findings(rec, {"s1": {"why": "the words differ"}}, ["s1"])
     assert (f["kind"], f["lines"][0]["code"], f["lines"][0]["gone"], f["lines"][0]["block"]) == ("submatch", "stays", True, None)
     text = hook.alert_line(f, "planned")
-    assert "None" not in text and text.endswith("They're still in the file, because rewriting the file failed (x). --apply would turn their "
+    assert "None" not in text and text.endswith("They're still in the file, because rewriting the file failed. --apply would turn their "
                                                 "default and forced flags off."), text
 
 
@@ -8060,7 +8126,11 @@ def test_a_stranded_conversion_is_reported_and_nothing_moves(env, monkeypatch, c
     assert list(hook.pending_recover("radarr", True)) == ["radarr:1:ab"] and len([b for m, u, b in env["http"] if m == "POST"]) == 1
     hook.pending_edit("radarr:1:ab")
     hook.pending_edit("radarr:2:cd", entry)
-    assert list(hook.pending_recover("radarr", True)) == ["radarr:2:cd"] and len([b for m, u, b in env["http"] if m == "POST"]) == 2
+    assert list(hook.pending_recover("radarr", False)) == ["radarr:2:cd"] and len([b for m, u, b in env["http"] if m == "POST"]) == 2
+    # --convert settles and the worker does not, so each names its own check
+    stage = [b["embeds"][0]["fields"][:2] for m, u, b in env["http"] if m == "POST"]
+    assert stage == [[{"name": "Check", "value": check, "inline": True}, {"name": "Stopped at", "value": "Converting to MKV", "inline": True}]
+                     for check in ("Command line run", "Worker start")]
 
 
 @pytest.mark.parametrize("app_says, result", [("new", "completed"), ("nothing", "stranded")])
@@ -10293,6 +10363,33 @@ def test_a_subtitle_of_another_episode_loses_its_flags_and_alerts(env, monkeypat
     assert rec["recheck"]["edits"] == 0   # the re-plan after the edit keeps the track off
 
 
+def test_a_subtitle_whose_words_match_the_audio_proves_its_language_for_the_flag(env, monkeypatch):
+    """Owner 2026-10-06: a subtitle whose words matched an audio track at the word check proves that the track speaks its
+    language, so the flag needs no language check of its own. Only the word check hears the audio."""
+    english_film(env, ("eng", False, {}))
+    env["tmdb"] = dict(TMDB)
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    hook.main([])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "match" and rec["flag_matched"] == {"a1": "eng"} and "flag_heard" not in rec, rec
+    assert [e for e in rec["edits"] if e[3:] == ["flag-original"]][:1] == [["track:=2", 1, None, "flag-original"]], rec["edits"]
+    assert [(i, lang) for i, lang, _ in env["words"]] == [(0, "eng")]   # the word check alone heard the audio
+
+
+def test_a_mismatched_subtitle_proves_nothing_for_the_flag(env, monkeypatch):
+    """A subtitle of another episode matched nothing, so the audio gets the language check, which this test leaves without
+    an answer, and the flag stays."""
+    english_film(env, ("eng", False, {}))
+    env["tmdb"] = dict(TMDB)
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.OTHER)})
+    hook.main([])
+    rec = decided(env)
+    assert rec["subcheck"]["s1"]["verdict"] == "mismatch" and "flag_matched" not in rec
+    assert rec["flag_heard"]["a1"]["why"] == "no language hearing in these tests"
+    assert not [e for e in rec.get("edits") or [] if e[3:] == ["flag-original"]] and "a1 eng: the original language flag stays, because it was " \
+        "not heard" in rec["notes"], rec
+
+
 def test_a_matching_subtitle_keeps_its_flags(env, monkeypatch):
     japanese_film(env, ("eng", True, {}))
     hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
@@ -10588,7 +10685,7 @@ def test_an_overrun_after_a_removal_names_the_track_by_its_place_before_the_remu
     (f,) = [f for f in rec["findings"] if f["kind"] == "subtitle"]
     assert [x["track"] for x in f["tracks"]] == ["s2"], f
     assert [a for a in rec["alerts"] if a.startswith("subtitle: ")] == [
-        "subtitle: The English subtitles (track 2) keep going until 26:01, but the video and audio end at 23:52. They're in ASS format, which "
+        "subtitle: The English SDH subtitles (track 2) keep going until 26:01, but the video and audio end at 23:52. They're in ASS format, which "
         "can't be trimmed automatically, so they were left as they are."]
     assert [hook.place_before(p, gone) for p, gone in (("s1", []), ("s1", ["s1"]), ("s2", ["s1", "s3"]))] == ["s1", "s2", "s4"]
 
@@ -10679,6 +10776,7 @@ def test_subtitles_check_reports_a_wrong_track_and_sidecar_and_changes_nothing(e
     assert (e["result"], e["left"]) == ("left", "SUBTITLES is set to check")
     assert rec["alert_kinds"] == ["submatch"], rec
     assert [(x["code"], x["kept"], x["left"]) for x in rec["findings"][0]["lines"]] == [("sidecar", None, "SUBTITLES is set to check")]
+    assert hook.stopped_at(rec["findings"][0], "done") is None   # a setting kept the fix from running
 
 
 @pytest.mark.parametrize("level", ["check", "fix"])
@@ -10745,6 +10843,7 @@ def test_a_sidecar_with_no_place_to_keep_its_original_stays(env, monkeypatch, se
     assert rec["sidecars"][0]["result"] == "left" and os.path.exists(env["path"][:-4] + ".en.srt")
     line = rec["findings"][0]["lines"][0]
     assert (line["code"], line["kept"]) == ("sidecar", None) and line["left"].startswith("KEEP_ORIGINALS_DAYS is 0"), line
+    assert hook.stopped_at(rec["findings"][0], "done") is None
 
 
 def test_a_new_sidecar_undoes_the_backfill_skip(env, monkeypatch, tmp_path, capsys):
@@ -10899,6 +10998,7 @@ def test_convert_subs_leaves_out_what_does_not_match(monkeypatch, settings, tmp_
     info = {}
     hook.convert_subs(str(video), j, streams, hook.sidecar_subs(str(video)), talk.DURATION, True, str(tmp_path), info)
     assert (video.parent / "Film A (1979).en.srt").exists() and info["sidecars_unmatched"][0]["left"] == "KEEP_ORIGINALS_DAYS is 0"
+    assert hook.LINE_STEPS["converted_sidecar"](info["sidecars_unmatched"][0]) is None   # a setting, so the alert names no step
 
 
 @pytest.fixture(scope="module")
@@ -11754,6 +11854,159 @@ def test_the_sweep_judges_a_fix_only_by_the_windows_to_trust():
     assert hook.sweep_confirms(rows) is None
 
 
+def swept_film(env, monkeypatch, track):
+    """The word check of an English film with track as s1, as the deep analysis makes it, then its sweep. Returns (the
+    word check's timing, the timing after the sweep, the sweep rows)."""
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": track})
+    items = {"s1": ("eng", 0, track)}
+    sync = hook.sub_verdicts(env["path"], env["probe"], items, line=False)
+    before = sync["s1"]["timing"]
+    rows, _ = hook.sub_sweep(env["path"], env["probe"], items, sync)
+    return before, sync["s1"]["timing"], rows["s1"]
+
+
+def test_the_sweep_fixes_a_drift_that_one_slip_keeps_from_the_word_check(env, monkeypatch):
+    """A track timed for 1001/1000, 0.3 s early at its start, whose author put 14 lines 0.9 s late. The word check's
+    middle window hears those lines, so no ratio fits its windows, and it alerts steps. The sweep hears a window a
+    minute and fits the drift past them. Its rows then sit on the fix, and the word check's why stays in the log."""
+    track = talk.cues(talk.RIGHT, rate=Fraction(1001, 1000), offset=-0.3, where=lambda i: 0.9 if 128 <= i < 142 else 0.0)
+    before, t, rows = swept_film(env, monkeypatch, track)
+    assert before["fix"] is None and before["piecewise"], before
+    assert t["fix"] == {"rate": "1001/1000", "offset": pytest.approx(-0.3, abs=0.05)} and t["word_check"] == before["why"], t
+    assert t["why"].startswith("the sweep's 17 windows fit a fix of -0.30 s and the ratio 1001/1000") and hook.sweep_confirms(rows) is None, t
+    assert hook.sub_found({"subcheck": {"s1": {"verdict": "match", "timing": t}}})["subtitle_match"] == ["fix"]
+
+
+def test_a_word_check_fix_stands_only_when_the_sweep_puts_more_cues_in_their_spans(env, monkeypatch):
+    """The word check of --sub-time fits 1001/1000 to three tracks. A right track that leans on the line of -0.76 s only
+    where the word check hears it, see talk.leaned(): the sweep's rows sit in time, so the fix goes. A drift on that line
+    whose cues show for the whole line: the rows confirm the fix, but 99% of the sweep's matched cues fall in their spans
+    as they are and after it, so the times stay. A drift from +0.5 s: the fix takes the share from 62% to 99%."""
+    before, t, _ = swept_film(env, monkeypatch, talk.cues(talk.RIGHT, where=talk.leaned))
+    assert before["fix"] == {"rate": "1001/1000", "offset": -0.757} and t["fix"] is None and t["why"] == "in time", (before, t)
+    before, t, rows = swept_film(env, monkeypatch, talk.cues(talk.RIGHT, rate=Fraction(1001, 1000), offset=-0.757))
+    assert before["fix"] == {"rate": "1001/1000", "offset": -0.757} and t["fix"] is None and t["unfixed"] == -0.757, t
+    assert t["spans"] == [0.987, 0.987] and t["why"].endswith("but the sweep puts 99% of its matched cues in their spans after the fix and 99% as "
+                                                                "they are, so the times stay"), t
+    assert all(w["off"] == w["offset"] for w in rows), rows
+    before, t, _ = swept_film(env, monkeypatch, talk.cues(talk.RIGHT, rate=Fraction(1001, 1000), offset=0.5))
+    assert t["fix"] == before["fix"] == {"rate": "1001/1000", "offset": 0.5} and t["spans"] == [0.625, 0.988], t
+
+
+def test_the_sweep_holds_its_in_time_until_dense_hearing_judged_the_slip(env, monkeypatch):
+    """A track whose author put 8 lines 1.2 s late, where the word check's late window lies. The word check reads steps,
+    and the sweep, one window a minute, finds the track in time. One sweep window or none hears such a short block, so
+    the "in time" waits for dense hearing. It stands when the window off lies in a part dense hearing found in line, or
+    its lines lie in a block that dense hearing moved. Else the steps and their alert stay, and the log names the
+    window."""
+    track = talk.cues(talk.RIGHT, where=lambda i: 1.2 if 320 <= i < 328 else 0.0)
+    before, t, _ = swept_film(env, monkeypatch, track)
+    assert before["fix"] is None and (before.get("piecewise") or "unfixed" in before), before
+    assert t == dict(before, in_time=t["in_time"]) and t["in_time"]["why"] == "in time" and t["in_time"]["word_check"] == before["why"], t
+    off = [w for w in hook.sub_verdicts(env["path"], env["probe"], {"s1": ("eng", 0, track)}, line=False)["s1"]["windows"]
+           if w["late"] is not None and abs(w["late"]) >= 0.75]
+    assert len(off) == 1 and off[0]["late"] == pytest.approx(1.2, abs=0.2), off
+    mid, sync = off[0]["at"] + off[0].get("secs", 10.0) / 2, lambda: {"s1": {"verdict": "match", "windows": [off[0]], "timing": t}}
+    part = lambda in_line: {"lo": mid - 60, "hi": mid + 60, "in_line": in_line}
+    for found, stands in (({}, False), ({"s1": {"parts": [part(False)], "blocks": []}}, False), ({"s1": {"parts": [part(True)], "blocks": []}}, True),
+                          ({"s1": {"parts": [part(False)], "blocks": [{"from": mid + 1.2 - 15, "to": mid + 1.2 + 15, "shift": 1.2}]}}, True)):
+        got = hook.held_in_time(sync(), found)["s1"]["timing"]
+        assert (got == t["in_time"]) == stands and "in_time" not in got, (found, got)
+        assert hook.sub_found({"subcheck": {"s1": {"verdict": "match", "timing": got}}})["subtitle_match"] == ([] if stands else ["steps"]), got
+        assert stands or got["sweep_fit"] == f"the sweep puts the cues in time, but dense hearing did not find them in time at {mid // 60:.0f}:{mid % 60:04.1f}", got
+
+
+@pytest.mark.parametrize("where, posts", [(lambda i: 1.2 if 320 <= i < 328 else 0.0, []), (lambda i: 1.2 if i >= 260 else 0.0, ["Subtitles out of sync"])])
+def test_the_deep_analysis_clears_held_steps_only_where_it_judged_them(env, monkeypatch, settings, where, posts):
+    """The import holds a steps alert, and the deep analysis hears the file. 8 lines 1.2 s late lie in one word-check
+    window: dense hearing moves them as a block, so the steps alert goes and nothing posts. From line 260 on the lines
+    sit 1.2 s late: the sweep sees the step, and the alert posts once."""
+    settings(subtitles="deep")
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=where)})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None, strip=None: (
+        "subtitles_remuxed", "subtitles remuxed", {"warnings": None, "kept": "/kept/f.mkv"}) if apply else ("would_remux_subtitles", "x", {}))
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and [t for t, _ in posted(env)] == posts, (deep.get("result"), posted(env))
+
+
+def test_a_fix_of_the_sweep_is_heard_whole_and_written(env, monkeypatch, settings):
+    """A track timed for 1001/1000 whose author put 14 lines 0.9 s late, where the word check's middle window lies. The
+    deep analysis fits the drift from the sweep, hears the whole file at the fix, finds no long part off, and writes the
+    fix. Dense hearing heard only the audio between the sweep's windows, and the sweep's windows came from the cache."""
+    settings(subtitles="deep")
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, rate=Fraction(1001, 1000), offset=-0.3, where=lambda i: 0.9 if 128 <= i < 142 else 0.0)})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    calls = []
+    monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None, strip=None: calls.append(
+        {str(k): v for k, v in fixes.items()}) or (("subtitles_remuxed", "subtitles remuxed", {"warnings": None, "kept": "/kept/f.mkv"}) if apply else ("would_remux_subtitles", "x", {})))
+    hook.main([])
+    _, (deep,) = two_lines(env)
+    assert calls and list(calls[-1].values())[0]["rate"] == "1001/1000" and posted(env) == [], (calls, posted(env), deep.get("result"))
+    sweep, dense, again = [ws for _, _, ws in env["words"][-3:]]   # the deep analysis: its sweep, dense hearing, the sweep from the cache
+    assert again == sweep and all(a + 10.0 - 2.5 <= b or b + 10.0 - 2.5 <= a for a in dense for b in sweep), (sweep, dense)   # no audio twice
+
+
+@pytest.mark.parametrize("word, alert", [({"fix": None, "why": "in time"}, ["off"]),
+                                         ({"fix": None, "piecewise": True, "offsets": [0.1, 1.4], "why": "steps"}, ["steps"]),
+                                         ({"fix": {"rate": "1/1", "offset": 0.9}, "why": "a fix of +0.90 s"}, ["off"])])
+def test_a_long_part_left_off_refuses_the_fix_of_the_sweep(word, alert):
+    """Dense hearing of the whole file at a fix of the sweep left a part off from 10:51 to the end. The word check's
+    result comes back, with its alert. A word check in time alerts that the times stay off, and a fix of the word check
+    that the sweep did not confirm stays unconfirmed. The blocks go, and the rows sit off the audio again."""
+    fix = {"rate": "1001/1000", "offset": -0.3}
+    t = {"fix": fix, "why": "the sweep's 17 windows fit a fix", "sweep": {"windows": 17}, "word_check": word["why"], "word_timing": word}
+    sync, sweeps = {"s1": {"verdict": "match", "timing": t}}, {"s1": [{"at": 60.0, "words": 15, "overlap": 0.9, "cues": 3, "offset": 0.5, "off": 0.1}]}
+    found = {"s1": {"blocks": [{"from": 300.0, "to": 330.0, "shift": 1.0}], "parts": [], "whole": True, "left": [[651.2, 1222.6, 1.07]]}}
+    got = hook.checked_fix(sync, found, sweeps)["s1"]["timing"]
+    assert found == {} and sweeps["s1"][0]["off"] == 0.5 and got["fix"] is None and got["sweep"] == {"windows": 17}, got
+    assert got["sweep_fit"] == ("a fix of -0.30 s and the ratio 1001/1000 by the sweep was heard in full, and the lines at 10:51.2 to 20:22.6 sit +1.07 s "
+                                "off, so the times stay"), got
+    assert ("unconfirmed" in got) == bool(word["fix"]) and hook.sub_found({"subcheck": {"s1": {"verdict": "match", "timing": got}}})["subtitle_match"] == alert
+    found = {"s1": {"blocks": [], "parts": [], "whole": True, "left": []}}
+    sync = {"s1": {"verdict": "match", "timing": t}}
+    assert hook.checked_fix(sync, found, sweeps)["s1"]["timing"] is t and "s1" in found   # nothing long left: the fix stands
+
+
+def test_the_sweep_clears_steps_whose_windows_sit_under_the_shift(env, monkeypatch):
+    """A roll-up track read by its first words once alerted steps of +0.27, +0.52 and -0.54 s. Its windows differ by a
+    second, but none sits 0.75 s off, so the sweep's "in time" needs no part that dense hearing heard."""
+    t = {"fix": None, "piecewise": True, "offsets": [0.27, 0.52, -0.54], "why": "x", "in_time": {"fix": None, "why": "in time", "offset": 0.1}}
+    windows = [{"at": a, "late": x} for a, x in ((100.0, 0.27), (600.0, 0.52), (1100.0, -0.54))]
+    assert hook.held_in_time({"s1": {"verdict": "match", "windows": windows, "timing": t}}, {})["s1"]["timing"] == t["in_time"]
+
+
+def test_the_sweep_keeps_the_alert_of_a_real_step(env, monkeypatch):
+    """A right track whose lines from line 260 on sit 1.2 s late, as after an edit. The word check reads steps, and the
+    sweep cannot fit one line through both parts. The word check's result and its alert stay, and the log says why."""
+    track = talk.cues(talk.RIGHT, where=lambda i: 1.2 if i >= 260 else 0.0)
+    before, t, _ = swept_film(env, monkeypatch, track)
+    assert before["fix"] is None and t == dict(before, sweep_fit=t["sweep_fit"], sweep=t["sweep"]) and t["sweep_fit"] and t["sweep"]["windows"] >= 15, t
+    assert hook.sub_found({"subcheck": {"s1": {"verdict": "match", "timing": t}}})["subtitle_match"] in (["off"], ["steps"])
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_sweep_never_moves_a_right_track_with_heavy_author_scatter(env, monkeypatch, seed):
+    """A right track whose author timed each line up to about a second off, at random, 0.6 s at one sigma. Neither the
+    word check nor the sweep moves it."""
+    r = random.Random(seed)
+    late = [r.gauss(0, 0.6) for _ in talk.RIGHT]
+    _, t, _ = swept_film(env, monkeypatch, talk.cues(talk.RIGHT, where=lambda i: late[i]))
+    assert t["fix"] is None, t
+
+
+def test_the_sweep_fit_leaves_a_live_captioned_track_to_live_caption_timing(env, monkeypatch):
+    """Captions 3 to 9 s late, by a different time each line. The word check finds no fix, and the sweep's rows read
+    as live captions, so neither a fix nor "in time" takes the word check's place."""
+    lag = [6.0 + 3.0 * talk.math.sin(i / 9) for i in range(len(talk.RIGHT))]
+    before, t, rows = swept_film(env, monkeypatch, talk.cues(talk.RIGHT, where=lambda i: lag[i]))
+    assert t["fix"] is None and "word_check" not in t and hook.arr_subsync.live(rows), t
+
+
 def test_an_episode_the_app_lists_again_joins_the_unit_once(monkeypatch):
     monkeypatch.setattr(hook, "arr", lambda app, p: [{"id": 27, "episodeFileId": 70, "seriesId": 5, "runtime": 22}] * 2)
     out = hook.unit_files("sonarr", [], {"owner": "5", "file_id": "70", "episode_ids": "27", "path": "/tv/S01E02.mkv"})
@@ -12029,6 +12282,7 @@ def test_resub_lengthens_flash_ends_and_keeps_text_starts_and_the_ass_header(pic
     fix = {"rate": "25025/24000", "offset": 1.0}
     _, result, info = hook.resub(path, j, os.stat(path), True, {2: fix}, (), {2: plans["s1"], 3: plans["s2"]})
     assert result == "subtitles remuxed" and [(e["stream"], e.get("ended")) for e in info["proof"] if e.get("ended")] == [("subtitle 2", 20), ("subtitle 3", 20)]
+    assert "starts_rounded" not in info and not any(e.get("timed") for e in info["proof"]), "an ASS track on the centisecond grid keeps its ends path"
     new = REAL_MKVMERGE(path)
     assert new["tracks"][3]["properties"]["codec_private_data"] == j["tracks"][3]["properties"]["codec_private_data"]
     assert [t["properties"].get("track_name") for t in new["tracks"]] == [t["properties"].get("track_name") for t in j["tracks"]]
@@ -12322,6 +12576,7 @@ def test_resub_moves_a_block_with_its_fix_and_flash_ends_in_one_plan(pic_mkv, tm
     new = REAL_MKVMERGE(path)
     assert [t["properties"]["uid"] for t in new["tracks"]] == [t["properties"]["uid"] for t in j["tracks"]]
     assert new["tracks"][3]["properties"]["codec_private_data"] == j["tracks"][3]["properties"]["codec_private_data"]
+    assert not any("nul_cut" in e for e in info["proof"]), "an mkvmerge ASS track has no NUL to cut"
     assert [t["properties"].get("track_name") for t in new["tracks"]] == [t["properties"].get("track_name") for t in j["tracks"]]
     got = hook.subtitle_cues(path, new, {"s1", "s2"})
     for p, tid in (("s1", 2), ("s2", 3)):
@@ -12359,6 +12614,202 @@ def test_the_proof_holds_each_start_and_end_to_the_time_plan(pic_mkv, tmp_path):
         stream, why = hook.prove(src, src, [], str(tmp_path), timed={0: plan[:k] + [(a, b)] + plan[k + 1:]})[0]
         assert stream is None and why == f"stream subtitle 2 times cue {k + 1} {plan[k][0]:.3f} to {plan[k][1]:.3f} s, and the plan {a:.3f} to {b:.3f} s", why
     assert "holds 20 timed cues, and the plan 19" in proved(src, src, [], str(tmp_path), timed={0: plan[:19]})[0]
+
+
+# --- HandBrake ASS tracks ---------------------------------------------------------------------------------------------
+# HandBrake ends each ASS event, and the ASS header, with a NUL byte, and its header has no [Events] section. The
+# fixtures are made up: a track written by hand, which ffmpeg copies beside a video, as HandBrake's muxer does.
+
+HB_HEAD = ("[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 640\r\nPlayResY: 360\r\n\r\n[V4+ Styles]\r\nFormat: Name, Fontname, Fontsize, "
+           "PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+           "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\nStyle: Default,Arial,28,&H00FFFFFF,&H000000FF,"
+           "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1\r\n").encode() + b"\0"
+HB_EVENTS = b"\r\n[Events]\r\nFormat: Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text\r\n\r\n"
+
+
+def hb_event(i, text=None, nul=True):
+    """The packet of ASS event i, as HandBrake writes it: its read order, 7 fields and its text, then a NUL byte."""
+    return f"{i - 1},0,Default,,0,0,0,,".encode() + (text if text is not None else f"Line {i}, with a comma\\Nnext".encode()) + (b"\0" if nul else b"")
+
+
+@pytest.fixture(scope="module")
+def hb_base(tmp_path_factory):
+    """A Matroska file of 42 seconds with video and AC-3 audio, which ffmpeg writes with no start offset."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvextract")):
+        pytest.skip("needs ffmpeg and mkvtoolnix")
+    path = tmp_path_factory.mktemp("hb") / "av.mkv"
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=42:size=160x90:rate=25", "-f", "lavfi", "-i",
+              "sine=frequency=440:duration=42", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "ac3", str(path)], check=True)
+    return path
+
+
+def hb_mkv(path, base, packets, private=HB_HEAD, ms=lambda i: 0, length=1500, cues=True):
+    """A Matroska file at path with the video and audio of base and one ASS track of codec private data private and of
+    packets, the bytes of the event that starts at 2 s, 4 s and so on, ms(i) ms later, each length ms long. The track
+    alone is written by hand, one Cluster an event, and ffmpeg copies it beside base's streams, so the file gets Cues.
+    With cues False, each Cues entry of the track names track 9 instead, so no entry indexes it."""
+    u = lambda i, v, n=4: el(i, v.to_bytes(n, "big"))
+    head = el(0x1A45DFA3, u(0x4286, 1, 1) + u(0x42F7, 1, 1) + u(0x42F2, 4, 1) + u(0x42F3, 8, 1) + el(0x4282, b"matroska") + u(0x4287, 4, 1)
+              + u(0x4285, 2, 1))
+    track = el(0xAE, u(0xD7, 1, 1) + u(0x73C5, 1) + u(0x83, 0x11, 1) + el(0x86, b"S_TEXT/ASS") + el(0x63A2, private) + el(0x22B59C, b"eng"))
+    clusters = b"".join(el(0x1F43B675, u(0xE7, 2000 * i + ms(i)) + el(0xA0, el(0xA1, b"\x81\x00\x00\x00" + data) + u(0x9B, length)))
+                        for i, data in enumerate(packets, 1))
+    raw = f"{path}.track.mkv"
+    with open(raw, "wb") as f:
+        f.write(head + el(0x18538067, el(0x1549A966, u(0x2AD7B1, 1000000)) + el(0x1654AE6B, track) + clusters))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(base), "-i", raw, "-map", "0", "-map", "1", "-c", "copy", "-write_crc32", "0", str(path)],
+             check=True)
+    os.remove(raw)
+    if not cues:   # CueTrack 3, the subtitle track, becomes 9 in each entry after the Cues element's ID
+        data = open(path, "rb").read()
+        at = data.index(b"\x1c\x53\xbb\x6b")
+        open(path, "wb").write(data[:at] + data[at:].replace(b"\xf7\x81\x03\xf1", b"\xf7\x81\x09\xf1"))
+    return str(path)
+
+
+def test_header_kept_takes_only_the_events_section_mkvmerge_adds():
+    """A header of ended_track() passes when it is the same, or the HandBrake header less its NUL with mkvmerge's
+    [Events] section. Any other change fails, and a track that ended_track() did not write keeps the old rule."""
+    old, ok = HB_HEAD.hex(), (HB_HEAD[:-1] + HB_EVENTS).hex()
+    assert hook.header_kept(old, old, "S_TEXT/ASS") and hook.header_kept(old, ok, "S_TEXT/ASS")
+    ssa = HB_HEAD[:-1] + b"\r\n[Events]\r\nFormat: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n\r\n"
+    assert hook.header_kept(old, ssa.hex(), "S_TEXT/SSA") and not hook.header_kept(old, ssa.hex(), "S_TEXT/ASS")
+    for why, new in (("the NUL kept", HB_HEAD + HB_EVENTS), ("no blank line after the section", HB_HEAD[:-1] + HB_EVENTS[:-2]),
+                     ("another Format line", HB_HEAD[:-1] + HB_EVENTS.replace(b"Actor", b"Name")), ("a byte more", HB_HEAD[:-1] + HB_EVENTS + b" "),
+                     ("a style changed", HB_HEAD[:-1].replace(b"Arial", b"Ariel") + HB_EVENTS), ("the NUL dropped alone", HB_HEAD[:-1]),
+                     ("a byte before the NUL changed", HB_HEAD[:-2] + b"\t" + HB_EVENTS)):
+        assert not hook.header_kept(old, new.hex(), "S_TEXT/ASS"), why
+    assert not hook.header_kept(HB_HEAD[:-1].hex(), ok, "S_TEXT/ASS"), "an old header with no NUL"
+    events = HB_HEAD[:-1] + HB_EVENTS + b"\0"
+    assert not hook.header_kept(events.hex(), (events[:-1] + HB_EVENTS).hex(), "S_TEXT/ASS"), "an old header with its own section"
+    lower = HB_HEAD[:-1] + b"\r\n[events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n\0"
+    assert not hook.header_kept(lower.hex(), (lower[:-1] + HB_EVENTS).hex(), "S_TEXT/ASS"), "an old header with [events] in lower case"
+    assert not hook.header_kept(old, ok, "S_TEXT/UTF8") and not hook.header_kept("zz", ok, "S_TEXT/ASS")
+    j = sub_probe(("eng", False, {"codec_id": "S_TEXT/ASS", "codec_private_data": old}))
+    new = copy.deepcopy(j)
+    new["tracks"][3]["properties"]["codec_private_data"] = ok
+    assert hook.props_fault(j, new, (), {3}) is None and hook.props_fault(j, new) == "track 3 changed its codec_private_data"
+    new["tracks"][3]["properties"]["codec_private_data"] = (HB_HEAD + HB_EVENTS).hex()
+    assert hook.props_fault(j, new, (), {3}) == "track 3 changed its codec_private_data"
+
+
+@pytest.mark.parametrize("ended", [range(20), (0, 1, 5, 19)])
+def test_resub_times_a_handbrake_ass_track(hb_base, tmp_path, settings, ended):
+    """A time plan of a HandBrake ASS track, a NUL at the end of every event or of some, goes through the text round
+    trip. The cues read without the NUL, so the plan pairs with mkvextract's text. The proof compares each packet that
+    held a NUL without it and counts them. Every other stream matches, the text stays, the times are the plan's, and the
+    header is the old one less its NUL with mkvmerge's [Events] section."""
+    path = hb_mkv(tmp_path / "hb.mkv", hb_base, [hb_event(i, nul=i - 1 in ended) for i in range(1, 21)])
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    cues = hook.subtitle_cues(path, j, {"s1"})["s1"]
+    assert [t for *_, t in cues] == [f"Line {i}, with a comma\\Nnext" for i in range(1, 21)], cues[:2]
+    plan = hook.time_plan(cues, {"rate": "1/1", "offset": 0.5}, [dict(BLOCK, **{"from": 10.0, "to": 20.0, "shift": 1.2})], ass=True)
+    _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    assert [(e["stream"], e.get("nul_cut"), e.get("timed")) for e in info["proof"]] == \
+        [("video 0", None, None), ("audio 1", None, None), ("subtitle 2", len(ended), 20)], info["proof"]
+    new = REAL_MKVMERGE(path)
+    assert bytes.fromhex(new["tracks"][2]["properties"]["codec_private_data"]) == HB_HEAD[:-1] + HB_EVENTS
+    got = hook.subtitle_cues(path, new, {"s1"})["s1"]
+    assert [(a, b, t) for a, b, t in got] == [(pytest.approx(x[3], abs=0.0015), pytest.approx(x[4], abs=0.0015), x[1]) for x in plan], got[:6]
+
+
+@pytest.mark.parametrize("old, new, why", [
+    (hb_event(3), hb_event(3, nul=False), None),
+    (hb_event(3, b"Li\0ne"), hb_event(3, b"Li\0ne", nul=False), None),
+    (hb_event(3, b"Li\0ne", nul=False), hb_event(3, b"Line", nul=False), "a NUL in the middle dropped"),
+    (hb_event(3, b"Li\0ne"), hb_event(3, b"Line", nul=False), "a NUL in the middle dropped, with one at the end"),
+    (hb_event(3, b"Line 3"), hb_event(3, b"Line 7", nul=False), "the byte before the NUL changed"),
+    (hb_event(3, b"Line 3\0"), hb_event(3, b"Line 3", nul=False), "two NUL bytes at the end"),
+    (hb_event(3, nul=False), hb_event(3), "a NUL added"),
+    (hb_event(3, b"Line 3"), hb_event(3, b"Line 3\0", nul=False), "the NUL kept in the new file"),
+])
+def test_the_proof_cuts_one_nul_at_the_very_end_of_a_packet(hb_base, tmp_path, old, new, why):
+    """The proof of a timed ASS stream compares a packet that ends in a NUL without that one byte. A NUL in the middle,
+    a second NUL, a NUL added or kept, and a changed byte beside it still fail. So does the cut packet of a stream the remux did
+    not write through the text round trip."""
+    src = hb_mkv(tmp_path / "src.mkv", hb_base, [hb_event(i) for i in (1, 2)] + [old] + [hb_event(i) for i in range(4, 21)])
+    tmp = hb_mkv(tmp_path / "tmp.mkv", hb_base, [hb_event(i, nul=False) for i in (1, 2)] + [new] + [hb_event(i, nul=False) for i in range(4, 21)])
+    plan = [(2.0 * i, 2.0 * i + 1.5) for i in range(1, 21)]
+    refused, proof = hook.prove(src, tmp, [], str(tmp_path), timed={0: plan})
+    entry = next(e for e in proof if e["stream"] == "subtitle 2")
+    if why is None:
+        assert refused is None and entry["nul_cut"] == 20 and entry["match"], (refused, entry)
+    else:
+        assert refused == (2, "the packet data of stream subtitle 2 (ass) differ") and not entry["match"], (why, refused)
+    if old.endswith(b"\0") and not new.endswith(b"\0"):
+        assert proved(src, tmp, [], str(tmp_path))[0] == "the packet data of stream subtitle 2 (ass) differ", "no time plan, no cut"
+
+
+def test_grid_plan_takes_only_ass_starts_between_centiseconds():
+    """An ASS or SSA flash plan whose starts fall between centiseconds becomes a time plan with each start on the
+    nearest one, its fix in it. A plan on the grid, or of a SubRip track, stays a flash plan."""
+    plan = [(2.237, "a", 2.537, 4.15), (4.0, "b", 4.3, 5.92), (6.234, "c", 6.534, 7.0)]
+    got = hook.grid_plan(plan, None, "S_TEXT/ASS")
+    assert [p[3:] for p in got] == [(2.24, 4.15), (4.0, 5.92), (6.23, 7.0)] and [p[:3] for p in got] == [(2.237, "a", 2.537), (4.0, "b", 4.3), (6.234, "c", 6.534)]
+    assert hook.grid_plan(plan, None, "S_TEXT/SSA") is not None and hook.grid_plan(plan, None, "S_TEXT/UTF8") is None
+    assert hook.grid_plan([(2.23, "a", 2.53, 4.15), (4.0, "b", 4.3, 5.92)], None, "S_TEXT/ASS") is None
+    fixed = hook.grid_plan(plan, {"rate": "1/1", "offset": 0.5}, "S_TEXT/ASS")
+    assert [p[3:] for p in fixed] == [(1.74, 3.65), (3.5, 5.42), (5.73, 6.5)], fixed
+    # The grid moved 2 starts, and the fix moved all 3. A fix of 3 ms takes the start on the grid off it, so the grid
+    # moves all 3. A fix of 3 s puts the first start before 0, where it stays at 0 by the fix, not by the grid.
+    moved = lambda off: hook.grid_moved(hook.grid_plan(plan, {"rate": "1/1", "offset": off}, "S_TEXT/ASS"), {"rate": "1/1", "offset": off})
+    assert hook.grid_moved(got, None) == moved(0.5) == 2 and moved(0.003) == 3 and moved(3.0) == 1
+
+
+@pytest.mark.parametrize("fix", [None, {"rate": "1/1", "offset": 0.5}])
+def test_flash_ends_of_millisecond_starts_go_on_the_ass_grid(hb_base, tmp_path, settings, fix):
+    """HandBrake writes ASS starts in ms, and the text round trip puts them on the centisecond grid, up to 9 ms apart
+    against the stream's first packet. So a flash fix of such a track goes in as a time plan with each start on the
+    nearest centisecond, its fix too, and the proof holds each start and end to it. The what text and the log stay
+    those of new ends."""
+    path = hb_mkv(tmp_path / "hb.mkv", hb_base, [hb_event(i) for i in range(1, 21)], ms=lambda i: i * 37 % 100, length=150)
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    plan = hook.flash_check(path, j, [])["s1"]
+    assert sum(round(s * 1000) % 10 != 0 for s, *_ in plan) == 18, plan[:3]
+    args = (path, j, os.stat(path), False, {2: fix} if fix else {}, (), {2: plan})
+    assert hook.resub(*args)[1] == "would remux subtitles: " + ("track 2: +0.500 s; " if fix else "") + "track 2: new ends for 20 of 20 cues"
+    _, result, info = hook.resub(*args[:3], True, *args[4:])
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    assert info["ends"] == {"2": 20} and info["starts_rounded"] == {"2": 18} and "timed" not in info, info   # the fix moves none off the grid
+    assert [(e["stream"], e.get("timed"), e.get("ended"), e.get("retimed"), e.get("nul_cut")) for e in info["proof"]] == \
+        [("video 0", None, None, None, None), ("audio 1", None, None, None, None), ("subtitle 2", 20, None, None, 20)], info["proof"]
+    off = fix["offset"] if fix else 0
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert [round(a * 100, 6) % 1 for a, _, _ in got] == [0] * 20 and all(abs(a - (s - off)) <= 0.005 + 1e-9 for (a, _, _), (s, *_) in zip(got, plan)), got[:3]
+    assert [b for _, b, _ in got] == [pytest.approx(round(n - off, 2), abs=0.0005) for *_, n in plan] and [t for *_, t in got] == [t for _, t, *_ in plan]
+
+
+def test_a_whole_track_retime_keeps_the_nul_of_a_handbrake_track(hb_base, tmp_path, settings):
+    """A fix alone moves the track with -itsoffset in ffmpeg's copy, which keeps every byte. So the NUL bytes and the
+    header stay, and the proof cuts nothing."""
+    path = hb_mkv(tmp_path / "hb.mkv", hb_base, [hb_event(i) for i in range(1, 21)])
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    _, result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": 0.5}})
+    assert result == "subtitles remuxed" and all(e["match"] and "nul_cut" not in e for e in info["proof"]), (result, info)
+    assert REAL_MKVMERGE(path)["tracks"][2]["properties"]["codec_private_data"] == j["tracks"][2]["properties"]["codec_private_data"]
+
+
+@pytest.mark.parametrize("end", [True, False])
+def test_a_cueless_track_with_a_nul_inside_a_cue_is_refused(hb_base, tmp_path, settings, end):
+    """No Cues entry indexes the track, so its cues come from the whole-file read, whose text stops at a NUL. A NUL
+    inside a cue then cuts its text, and mkvextract cuts it the same way, so the plan pairs and the remux writes the
+    cut text. The proof alone refuses it, a NUL at the end cut or not, and the file stays as it was."""
+    path = hb_mkv(tmp_path / "hb.mkv", hb_base, [hb_event(i, b"Li\0ne %d" % i, nul=end) for i in range(1, 21)], cues=False)
+    settings(keep_days=0)
+    j, was = REAL_MKVMERGE(path), open(path, "rb").read()
+    hook.FULL.clear()
+    assert hook.subtitle_cues(path, j, {"s1"}) == {}
+    cues = hook.subtitle_cues(path, j, {"s1"}, full=True)["s1"]
+    assert [t for *_, t in cues] == ["Li"] * 20, cues[:2]
+    plan = hook.time_plan(cues, {"rate": "1/1", "offset": 0.5}, [dict(BLOCK, **{"from": 10.0, "to": 20.0, "shift": 1.2})], ass=True)
+    _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
+    assert result == "subtitle remux failed: the packet data of stream subtitle 2 (ass) differ", result
+    assert [(e["stream"], e.get("nul_cut"), e["match"]) for e in info["proof"] if e["stream"].startswith("sub")] == [("subtitle 2", 20 if end else None, False)]
+    assert open(path, "rb").read() == was
 
 
 def test_a_sidecar_with_a_block_is_written_with_the_plan(tmp_path, settings, monkeypatch):
@@ -12461,6 +12912,7 @@ def test_subtitles_check_reports_a_flash_sidecar_and_leaves_it(env, monkeypatch,
     (e,) = rec["sidecars"]
     assert (e["action"], e["result"], e["left"]) == ("lengthen", "left", "SUBTITLES is set to check"), rec["sidecars"]
     assert rec["alert_kinds"] == ["subtiming"] and open(side, newline="").read() == flash_srt() and not os.path.exists(tmp_path / ".kept")
+    assert hook.stopped_at(rec["findings"][0], "done") is None
 
 
 def test_a_flash_sidecar_is_rewritten_and_its_original_kept(env, monkeypatch, settings, tmp_path):
@@ -12484,6 +12936,7 @@ def test_a_flash_sidecar_is_rewritten_and_its_original_kept(env, monkeypatch, se
     hook.main([])
     rec = [r for r in log_lines(env) if r.get("outcome")][-1]
     assert rec["sidecars"][0]["result"] == "left" and rec["alert_kinds"] == ["subtiming"] and open(side, newline="").read() == flash_srt(), rec
+    assert hook.stopped_at(rec["findings"][0], "done") is None   # KEEP_ORIGINALS_DAYS 0 kept the fix from running
 
 
 def flash_film(env, monkeypatch, fails=False):
@@ -12848,7 +13301,8 @@ def test_a_layout_mismatch_only_alerts_and_its_lift_is_logged(env, monkeypatch, 
     would = s2["timing"]["would"]
     assert got == [] and "subremux" not in rec and s2["timing"]["fix"] is None and would["rate"] == "1/1" and 1.9 < would["offset"] < 2.1, s2
     assert rec["findings"][1] == {"kind": "subtiming", "lines": [{"code": "off", "track": "s2", "ref": None, "why": s2["timing"]["why"], "offsets": None,
-                                                                  "unfixed": would["offset"], "layout": True, "would": would}]}, rec["findings"]
+                                                                  "unfixed": would["offset"], "layout": True, "would": would,
+                                                                  "duration": rec["file_duration"]}]}, rec["findings"]   # see report.at_end()
     assert f"The French subtitles (track 2) seem about {would['offset']:.1f} s late against the speech, except 4 lines at the start or end. They were left as they are." in out, out
 
 
@@ -15485,6 +15939,26 @@ def test_a_deep_analysis_that_judged_nothing_posts_the_held_alert(env, monkeypat
     assert deep["held_result"] == ["sent"] and posted(env) == [SEEM_POST], (deep, posted(env))
 
 
+@pytest.mark.parametrize("deep_timing, held", [
+    ({"fix": None, "few": [100.0], "why": "under two windows hold 3 cues whose first words matched",
+      "sweep_fit": "under 3 sweep windows in a half of the file anchored 2 cues"}, "sent"),
+    ({"fix": None, "why": "in time"}, "checked again"),
+    ({"fix": None, "unconfirmed": {"rate": "1/1", "offset": 2.4}, "why": "x"}, "checked again")])
+def test_a_held_timing_alert_posts_when_the_deep_analysis_times_nothing(env, monkeypatch, settings, deep_timing, held):
+    """The import holds "about 2.4 s late". The deep word check matches the words, but too few of its windows anchor 3
+    cues, so it times nothing, and the sweep and dense hearing move nothing. Its verdict judged the words and not the
+    times, so the held alert posts. A deep timing in time, or one with a fix it did not confirm, judged the times."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    again = dict(LATE, timing=deep_timing)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
+        k: dict(LATE if line else copy.deepcopy(again), audio=0, starts=[]) for k in items if k == "s1"})
+    block_stand_ins(env, monkeypatch, found=(), rows={"s1": [dict(w, offset=0.1, off=0.1) for w in LATE_ROWS]})
+    hook.main([])
+    first, (line,) = two_lines(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and line["held_result"] == [held], line
+    assert posted(env) == ([SEEM_POST] if held == "sent" else []), posted(env)
+
+
 def test_a_deep_analysis_that_fixed_the_subtitles_and_then_errs_posts_nothing_stale(env, monkeypatch, settings):
     """The deep analysis moved the block in its remux, then its subtitle cache write failed. The error line keeps the
     remux, and the held alert of that track goes unposted, because the remux fixed it."""
@@ -16186,7 +16660,7 @@ def test_a_new_version_makes_stale_only_the_results_it_names(env, monkeypatch):
     is stale. A version with no entry, as a speed or wording change, keeps every result, and None names every one."""
     monkeypatch.setitem(hook.SUB_CHECKS, "foreign_timing", {"version": 2, "fixes": {2: ["off"]}})
     assert hook.sub_fixed(saved(foreign_timing=["off", "mismatch"])) == ["foreign_timing"]
-    assert hook.sub_fixed(saved(foreign_timing=["fix"])) == [] and hook.sub_fixed(saved(subtitle_match=["off"])) == []
+    assert hook.sub_fixed(saved(foreign_timing=["fix"])) == [] and hook.sub_fixed(saved(reference_timing=["off"])) == []
     later = saved(foreign_timing=["off"])
     later["checks"]["foreign_timing"]["version"] = 2   # checked by version 2 already
     assert hook.sub_fixed(later) == []
@@ -16329,7 +16803,8 @@ def test_a_recheck_of_an_import_result_checks_no_deeper_than_the_import(env, mon
     hook.main([])
     cache = os.path.join(hook.CFG.state_dir, "lid.sqlite")
     assert hook.arr_lid.verdict_get(cache, env["path"])[0]["mode"] == "import" and got == []
-    monkeypatch.setitem(hook.SUB_CHECKS, "flash", {"version": 2, "fixes": {2: None}})
+    v = hook.SUB_CHECKS["flash"]["version"] + 1   # a new version of the flash check
+    monkeypatch.setitem(hook.SUB_CHECKS, "flash", {"version": v, "fixes": {v: None}})
     assert hook.queue_rechecks() == 1
     name, = hook.deep_analysis_queued()
     assert hook.job_of(name)["recheck"] == "import"
@@ -16339,7 +16814,7 @@ def test_a_recheck_of_an_import_result_checks_no_deeper_than_the_import(env, mon
     rec = [r for r in log_lines(env) if "schema" in r][-1]
     assert rec["source"] == "recheck" and got == [] and reads == [] and not rec.get("speech"), (got, reads, rec.get("subtime"))
     r = hook.arr_lid.verdict_get(cache, env["path"])[0]
-    assert r["mode"] == "import" and set(r["checks"]) == set(hook.SUB_RUNS["import"]) and r["checks"]["flash"]["version"] == 2, r
+    assert r["mode"] == "import" and set(r["checks"]) == set(hook.SUB_RUNS["import"]) and r["checks"]["flash"]["version"] == v, r
 
 
 def test_a_movie_whose_file_record_names_another_path_is_skipped(env, monkeypatch, settings):
@@ -16423,6 +16898,44 @@ def test_each_registry_entry_names_real_findings_and_versions():
             assert found is None or (isinstance(found, list) and found and set(found) <= set(hook.SUB_FINDINGS)), (c, v, found)
     assert {c for run in hook.SUB_RUNS.values() for c in run} == set(hook.SUB_CHECKS)
     assert set(hook.sub_found({})) == set(hook.SUB_CHECKS)
+    assert hook.SUB_CHECKS["flash"]["fixes"][2] == hook.SUB_CHECKS["block_timing"]["fixes"][3] == ["fix"]   # the HandBrake ASS fix
+
+
+def test_a_fix_that_could_not_write_a_handbrake_track_gets_a_recheck():
+    """2.6.0 saved block_timing 2 and flash 1. A block or flash fix it found, written or not, says fix, and the next
+    versions write a HandBrake ASS track. So a result with fix is stale, and a clean one stays. Block timing 4 makes a
+    result with live or off stale too, see test_a_drift_or_steps_the_sweep_can_fix_get_a_recheck(). A result of the new
+    versions stays."""
+    def old(block, flash=(), mode="deep"):
+        r = saved(mode, flash=list(flash), block_timing=list(block))
+        r["checks"]["flash"]["version"] = 1
+        if "block_timing" in r["checks"]:
+            r["checks"]["block_timing"]["version"] = 2
+        return r
+    assert hook.sub_fixed(old(["fix"])) == ["block_timing"] and hook.sub_fixed(old(["fix", "live"])) == ["block_timing"]
+    assert hook.sub_fixed(old([])) == []
+    assert hook.sub_fixed(old([], ["fix"])) == ["flash"] and hook.sub_fixed(old([], ["fix"], "import")) == ["flash"]
+    assert hook.sub_fixed(old([], ["off"])) == [] and hook.sub_fixed(old([], ["off"], "import")) == []
+    new = old(["fix", "live"], ["fix"])
+    new["checks"]["flash"]["version"], new["checks"]["block_timing"]["version"] = hook.SUB_CHECKS["flash"]["version"], hook.SUB_CHECKS["block_timing"]["version"]
+    assert hook.sub_fixed(new) == []
+
+
+def test_a_drift_or_steps_the_sweep_can_fix_get_a_recheck():
+    """Subtitle match 2 reads a roll-up caption by its new line, and the deep analysis fits a drift from its sweep. Both
+    can fix or clear times that version 1 left off or in steps, so such a result is stale, an import's too. A result
+    with a fix, or a clean one, stays. Block timing 4 reads a straight drift as a drift, never as live captions, so a
+    result with live is stale, and so is one whose sweep alerted. Only results that flagged timing get a recheck. A
+    result in time with no finding stays, even when its sweep would now find a drift."""
+    for mode in ("import", "sub_check", "deep"):
+        assert hook.sub_fixed(saved(mode, subtitle_match=["steps"])) == hook.sub_fixed(saved(mode, subtitle_match=["off"])) == ["subtitle_match"]
+        assert hook.sub_fixed(saved(mode, subtitle_match=["fix"])) == hook.sub_fixed(saved(mode, subtitle_match=["unknown"])) == hook.sub_fixed(saved(mode)) == []
+    assert hook.sub_fixed(saved("deep", block_timing=["live"])) == hook.sub_fixed(saved("deep", block_timing=["off"])) == ["block_timing"]
+    assert hook.sub_fixed(saved("sub_check", block_timing=["live"])) == []   # --sub-check never makes block timing
+    now = saved("deep", subtitle_match=["steps"], block_timing=["live"])
+    for c in now["checks"]:
+        now["checks"][c]["version"] = hook.SUB_CHECKS[c]["version"]
+    assert hook.sub_fixed(now) == []
 
 
 def test_the_recheck_queueing_runs_once_per_version_and_again_after_a_failed_app(env, monkeypatch, settings, capsys):
@@ -16821,6 +17334,8 @@ def test_a_live_track_whose_hearing_stopped_part_way_stays_pending(env, monkeypa
     rec = last_decided(env)
     assert rec["subcheck"]["s1"]["verdict"] == "match" and rec["blocks"]["s1"]["live"].get("failed") == (failed or None), rec
     assert cache[env["path"]] == (os.stat(env["path"]).st_mtime_ns, bool(failed)), cache
+    found = [f for f in rec.get("findings") or [] if any(x["code"] == "live" for x in f.get("lines") or [])]   # its alert names the step that stopped
+    assert [hook.stopped_at(f, "done") for f in found] == (["Hearing the speech"] if failed else []), found
 
 
 def test_a_repaired_track_whose_ends_flash_stays_pending_until_they_are_fixed(env, monkeypatch, settings, tmp_path, garbled_av):

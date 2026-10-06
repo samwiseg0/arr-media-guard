@@ -165,7 +165,7 @@ def no_stop():
 
 
 def flags(j):
-    return [dict({k: t[k] for k in ("pos", "sel", "lang", "title", "default", "role")}, forced=t["flagged"]) for t in decide.classify(j)]
+    return [dict({k: t[k] for k in ("pos", "sel", "lang", "title", "default", "role", "original")}, forced=t["flagged"]) for t in decide.classify(j)]
 
 
 def queue_dir():
@@ -262,6 +262,17 @@ def judged(rec, keys):
     return bool(keys) and all({seen(k).get("verdict"), (seen(k).get("layout") or {}).get("verdict")} & set(JUDGED) for k in keys)
 
 
+def times_judged(rec, k):
+    """Whether the run of rec judged the times of subtitle k again, for a held timing alert, see held_after(). Its
+    timing reached a fix, "in time", steps, an offset it left (unfixed) or a fix it did not confirm, or dense hearing
+    moved its lines, or its remux retimed it. A subtitle that does not match the audio is judged by that, and its own
+    alert says so. A word check that matched but timed too few windows judged no times, so the held alert posts."""
+    r = {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}.get(k) or {}
+    t = r.get("timing") or {}
+    return (r.get("verdict") == "mismatch" or bool(t.get("fix")) or t.get("why") == "in time" or any(x in t for x in ("piecewise", "unfixed", "unconfirmed"))
+            or bool(((rec.get("blocks") or {}).get(k) or {}).get("blocks")) or k in remuxed(rec))
+
+
 def remuxed(rec):
     """The subtitles that a finished subtitle remux or a sidecar rewrite of the run of rec retimed, moved to their speech
     or removed, by their place before that remux, see process.subtitle_checks() and process.after_edit(). Longer ends
@@ -296,18 +307,20 @@ def gone_for_good(job, rec):
 def held_after(job, rec):
     """What became of the alerts the import held for the deep analysis job, see queue_deep_analysis(), as the decision
     record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(). A job
-    that judged each subtitle a held alert names posted what it still found in its place, see judged(). Verdicts reach
-    rec only when the run reached its alerts, because every step after the subtitle checks runs. A job whose remux
-    changed those subtitles before an error counts too, see remuxed(). A dropped alert still posts the changes it keeps,
-    see logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing. Every other held
-    alert posts now, because nothing judged its subtitles again. That is an error, a failed hearing, SUBTITLES off, or
-    a file the app moved during the run, or one the app lists where this container does not see it."""
+    that judged each subtitle a held alert names posted what it still found in its place, see judged(). A held timing
+    alert also needs the times of each subtitle judged again, see times_judged(). Verdicts reach rec only when the run reached
+    its alerts, because every step after the subtitle checks runs. A job whose remux changed those subtitles before an
+    error counts too, see remuxed(). A dropped alert still posts the changes it keeps, see logs.held_changes(). A flag
+    edit that a posted alert of the job says already posts nothing. Every other held alert posts now, because nothing
+    judged its subtitles again. That is an error, a failed hearing, a word check that timed nothing, SUBTITLES off, or a
+    file the app moved during the run, or one the app lists where this container does not see it."""
     app, out = job["app"], []
     if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
     said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or [] if report.posts(f, rec)))
     for h in job["held"]:
-        if judged(rec, h.get("keys")):   # only a run that reached its alerts holds verdicts, see process.STEPS
+        timing = h["kind"] != "subtiming" or all(times_judged(rec, k) for k in h["keys"])   # a timing alert needs the times judged too
+        if judged(rec, h.get("keys")) and timing:   # only a run that reached its alerts holds verdicts, see process.STEPS
             out += logs.held_changes(app, [h], "checked again", said)
         elif rec.get("outcome") == "error" and h.get("keys") and set(h["keys"]) <= remuxed(rec):
             out += logs.held_changes(app, [h], "fixed before the error")
@@ -1459,7 +1472,7 @@ def run_job(name, pending, shared=False, claimed=False):
             rec.update(outcome="job_stale", result="dropped, the job is older than a day")
         elif decide.POLICY is None:   # alert once per distinct error, then skip. The file keeps its flags.
             rec.update(outcome="no_policy", result=f"skipped, no policy: {config.POLICY_ERROR}")
-            policy = dict(app=app, label="the policy file", path=config.CFG.policy_file, findings=[{
+            policy = dict(app=app, source="hook", label="the policy file", path=config.CFG.policy_file, findings=[{
                 "kind": "policy", "file": config.CFG.policy_file, "error": config.POLICY_ERROR, "action": {"code": "no_policy", "file": os.path.basename(path)}}])
             rec["alert_result"] = logs.alert_findings(policy, hashlib.sha1((config.POLICY_ERROR or "").encode()).hexdigest())
         else:

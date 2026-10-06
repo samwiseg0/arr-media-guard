@@ -91,10 +91,11 @@ def audio_summary(certain, doubts, samples):
 
 
 def track_log(ts):
-    """The classification of every track, for the decision log. i is the track's position (a1, s3)."""
+    """The classification of every track, for the decision log. i is the track's position (a1, s3), and orig its Original
+    language flag as the probe found it: 1, 0, or None when the file holds none."""
     return [{"i": t["pos"], "lang": t["lang"], "tag": t["tag"], "conf": t["conf"], "role": t["role"], "default": t["default"],
              "forced": t["forced_flag"], "sdh": t["sdh"], "ev": None if t["events"] is None else round(t["events"], 2), "ch": t["ch"],
-             "codec": t["codec"], "name": t["title"], "heard": t.get("heard")} for t in ts]
+             "codec": t["codec"], "name": t["title"], "heard": t.get("heard"), "orig": t.get("original")} for t in ts]
 
 
 def app_name(app):
@@ -111,12 +112,13 @@ EMBED_MAX = 5900   # Discord refuses an embed whose texts add up to more than 60
 
 
 def embed(app, title, description, color, fields, footer=None):
-    """A Discord embed: title, one or two sentences, the fields that have a value, a footer and a timestamp. The
-    description is in Discord markdown, with its bold spans and its lines, see report.markdown(). The field names and
-    values have their markdown escaped too. The longest field values are cut until all texts fit under Discord's
-    6000-character limit."""
+    """A Discord embed: title, one or two sentences, the fields that have a value, a footer and a timestamp. A field is
+    (name, value), or (name, value, True) for one that Discord shows beside the next. The description is in Discord
+    markdown, with its bold spans and its lines, see report.markdown(). The field names and values have their markdown
+    escaped too. The longest field values are cut until all texts fit under Discord's 6000-character limit."""
     e = {"title": title[:256], "description": report.markdown(description)[:2000], "color": config.COLORS[color],
-         "fields": [{"name": report.escaped(str(k))[:256], "value": report.escaped(str(v))[:1024], "inline": False} for k, v in fields if v],
+         "fields": [{"name": report.escaped(str(k))[:256], "value": report.escaped(str(v))[:1024], "inline": bool(i and i[0])}
+                    for k, v, *i in fields if v],
          "footer": {"text": footer or f"{config.CFG.name} on {config.CFG.instance}, {app_name(app).split()[0]}"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
     size = lambda: len(e["title"]) + len(e["description"]) + len(e["footer"]["text"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])

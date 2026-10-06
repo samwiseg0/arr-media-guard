@@ -25,10 +25,11 @@ A decision line holds:
   `held for the deep analysis`. The deep analysis checks it again and posts what it still finds.
 - `held_result`, on a deep analysis line whose import held alerts, what became of each one. That is `checked again`,
   `fixed before the error`, `dropped with the file`, or what its post gave. A held alert posts when nothing judged its
-  subtitles again, as after an error, a failed hearing, or with `SUBTITLES` set to `off`. With `DISCORD_POSTS=all`, an
-  alert that also named a change of the import adds `, change` and what each post of that change gave. `said by the deep
-  analysis` there means a posted alert of the deep analysis named that flag change already. When the import could not
-  queue the deep analysis, its alerts post at once, and a `warning` line holds their `held_result`.
+  subtitles again. That happens after an error, when AMG could not hear the audio, or with `SUBTITLES` set to `off`.
+  With `DISCORD_POSTS=all`, an alert that also named a change of the import adds `, change` and what each post of that
+  change gave. `said by the deep analysis` there means a posted alert of the deep analysis named that flag change
+  already. When the import could not queue the deep analysis, its alerts post at once, and a `warning` line holds their
+  `held_result`.
 - `change_result`, with `DISCORD_POSTS=all` only, what the post of each change to the file gave. That is `sent`, why the
   post failed, or `skipped` while Discord asked AMG to wait. A change whose text could not be built posted nothing, and
   its entry starts `no text:`. A run that changed nothing has an empty list.
@@ -47,11 +48,11 @@ also goes to the container log. Loki reads these keys, so they stay as they are.
 | `arr` | the app |
 | `source` | what made the line: `hook` for an import, `backfill` for the backfill and the other commands, `deep_analysis`, `audit`, `audio_scan`, `video_scan` or `subhunt` |
 | `outcome` | the outcome code |
-| `class` | the kind of plan, as a short code |
+| `class` | the plan group, the [item class](policy.md#keys) and the rules of the plan, or a state such as `undecided`, `dropped`, `no change` or `repacked` |
 | `edits` | the number of flag edits |
 | `reasons` | the reason codes, comma-separated |
 | `alerts` | the alert kinds, comma-separated |
-| `tmdb` | the TMDB code, or `not_asked` |
+| `tmdb` | what the TMDB lookup gave: `found`, `no_record`, `tmdb_unavailable` or `tmdb_token_rejected`, or `not_asked` |
 | `label` | the item, else the file name, else the job name |
 | `id` | the id of the decision line |
 | `job` | the name of the job in the background queue, the same name the `queued ... as <job>` line of the container log shows. Empty for a line no job made, as in a backfill. |

@@ -173,10 +173,13 @@ def refresh(ctx, duration=True):
 
 
 def changed(rec, repack=True):
-    """Whether the run of rec changed its file: a flag edit, one a wrong-content re-grab followed too, or a remux that
-    replaced it. repack False leaves out a conversion, as --sub-time does."""
-    return "edited" in (rec.get("result"), rec.get("edit_result")) or bool(
-        {*config.REPAIRED, *(["repacked"] if repack else [])} & set(rec.get("reasons", [])))
+    """Whether the run of rec changed its file in a way Plex reads, so Plex analyzes it again: a flag edit, one a
+    wrong-content re-grab followed too, or a remux that replaced it. repack False leaves out a conversion, as --sub-time
+    does. An edit of the Original language flag alone does not count, because Plex does not read that flag."""
+    edits = rec.get("edits") or []
+    flag_only = bool(edits) and all(decide.prop(e) == decide.ORIGINAL_FLAG for e in edits)
+    return ("edited" in (rec.get("result"), rec.get("edit_result")) and not flag_only) \
+        or bool({*config.REPAIRED, *(["repacked"] if repack else [])} & set(rec.get("reasons", [])))
 
 
 def start(ctx):
@@ -315,6 +318,10 @@ def languages(ctx):
     pre = decide.retag(j, table=checks.langs()) if mkv else {"ask": set(), "to_read": set()}
     ask = pre["ask"]   # the tracks whose tag only a heard language can change
     doubt = {t["pos"] for t in d["tracks"] if t["kind"] == "a" and t["role"] == "main" and t["conf"] < decide.AGREE} if lid_when else set()
+    # The Original language flag changes only on a heard language or a read text, see decide.retag(). A run that keeps
+    # the flags, see act(), needs neither. The audio waits for the word check, see flag_hearing().
+    ctx.content_lang = decide.content_language(ctx.original, ctx.asked[0]) if mkv and ctx.app and not ctx.background else None
+    ctx.flag_hear, flag_read = decide.flag_checks(j, ctx.content_lang)
     if (lid_when or ask) and decide.duration(j) >= config.LID_MIN_SECONDS and not ctx.background:   # the import heard the language
         if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock and an edit never queues behind it
             fcntl.flock(ctx.lock, fcntl.LOCK_UN)
@@ -330,15 +337,16 @@ def languages(ctx):
         if ctx.shared:
             ctx.shared.reshare(ctx.st)
     known, said = checks.item_languages(ctx.original, ctx.asked[0])
-    read = {}
+    checked, read = {}, {}   # checked: read for the Original language flag alone, see decide.retag()
     if mkv:   # the subtitles a player shows by itself, and those whose tag the text can change
         shown = decide.defaults(d["edits"])
         want = pre["to_read"] | {t["pos"] for t in d["tracks"] if t["kind"] == "s" and (shown.get(t["sel"], t["default"]) or t["forced_flag"])}
-        got_text = subtitles.subtitle_read(path, j, want) if want else {}
+        got_text = subtitles.subtitle_read(path, j, want | flag_read) if want | flag_read else {}
         if got_text:
             rec["read"] = {p: {"lang": x[0], "conf": x[1], "why": x[2]} for p, x in got_text.items()}
-        read = {p: x[0] for p, x in got_text.items() if x[0]}
-        tags = decide.retag(j, got, known, checks.langs(), said, read)
+        read = {p: x[0] for p, x in got_text.items() if x[0] and p in want}
+        checked |= {p: x[0] for p, x in got_text.items() if x[0] and p not in want}
+        tags = decide.retag(j, got, known, checks.langs(), said, read, ctx.content_lang, checked)
     lang = {t["pos"]: t["lang"] for t in d["tracks"]}
     fix = {p: x for p, x in (tags or {}).get("set", {}).items() if x != lang.get(p)}   # a new tag the decision does not read yet
     heard = {**fix, **got} if lid_when else fix   # outside those reasons a heard language counts only when the tag changes
@@ -348,6 +356,7 @@ def languages(ctx):
     if tags:
         d = decide.with_tags(d, tags)
     ctx.d, ctx.heard, ctx.got, ctx.tags, ctx.known, ctx.said, ctx.read, ctx.wrong = d, heard, got, tags, known, said, read, wrong
+    ctx.checked = checked if mkv else {}
 
 
 def subtitle_checks(ctx):
@@ -381,10 +390,13 @@ def subtitle_checks(ctx):
                 for k, r in sync.items():   # a fix stands only when the sweep confirms it
                     t, rows = r.get("timing") or {}, rec["sweep"].get(k) or []
                     if t.get("fix") and (why := subtitles.sweep_confirms(rows)):
-                        sync[k] = dict(r, timing={"fix": None, "unconfirmed": t["fix"], "swept": True, "why": f'{t["why"]}, but {why}'})
+                        sync[k] = dict(r, timing={"fix": None, "unconfirmed": t["fix"], "swept": True, "why": f'{t["why"]}, but {why}',
+                                                  **({"sweep_fit": t["sweep_fit"]} if "sweep_fit" in t else {})})
                         rec["sweep"][k] = [dict(w, off=w["offset"]) for w in rows]   # no line is fitted now, so each row sits off the audio
                 found, dense = subtitles.sub_dense(path, j, {k: items[k] for k, r in sync.items() if r["verdict"] == "match" and k in items},
                                                    rec["sweep"], sync, deep=ctx.background)
+                subtitles.held_in_time(sync, found)   # an "in time" of the sweep in place of steps waits for dense hearing
+                subtitles.checked_fix(sync, found, rec["sweep"])   # a fix of the sweep stands only when dense hearing of the file at it finds nothing off
                 if found:
                     rec["blocks"], rec["sweep_facts"]["dense"] = found, dense
                 for k, b in found.items():   # the rows of a part that dense hearing heard in time were noise, so they never alert
@@ -509,8 +521,9 @@ def subtitle_checks(ctx):
                 ctx.hp = checks.header_of(path, ctx.j) or ctx.hp
             gone = set(remove) | set(strip)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
             ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
+            ctx.checked = subtitles.renumber(ctx.checked, gone)
             unmatched = set(subtitles.renumber(dict.fromkeys(unmatched), gone))
-            ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read)
+            ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)
     stay = sorted({p for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others and r["verdict"] == "mismatch"}
                   - set((rec.get("subremux") or {}).get("removed") or []))
     if stay and not subtitles.sub_fixes(ctx.source):   # the tracks that stay, by their place before any remux, see report.KEPT_BACK
@@ -524,6 +537,34 @@ def subtitle_checks(ctx):
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
     ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves, ctx.recode = fixes, remove, ends, flashy, moves, side_moves, recode
     ctx.strip, ctx.later = strip, later
+
+
+def flag_hearing(ctx):
+    """The language check of the main audio tracks whose Original language flag their tag would change, see
+    decide.flag_checks(). A subtitle whose words matched an audio track at the word check proves that the track speaks
+    its language, the one the check heard it in. Such a track needs no hearing, and "flag_matched" logs it. A mismatch
+    proves nothing. lid.py hears the rest, after the subtitle check, and "flag_heard" logs its answers. A missing
+    install, a failed run or no time left gives no answer, so their flag stays. The flag edits are then planned
+    again."""
+    if not ctx.content_lang or not ctx.flag_hear:
+        return
+    rec, lang = ctx.rec, {t["pos"]: t["lang"] for t in ctx.d["tracks"] if t["kind"] == "a"}
+    matched = {f'a{r["audio"] + 1}' for r in ctx.sync.values() if r.get("verdict") == "match" and r.get("audio") is not None}
+    proven = {p: lang[p] for p in sorted(matched & ctx.flag_hear) if p in lang}
+    rest = ctx.flag_hear - set(proven) - set(ctx.got) - set(ctx.checked)
+    if proven:
+        rec["flag_matched"] = proven
+    heard = {}
+    if rest and decide.duration(ctx.j) >= config.LID_MIN_SECONDS:
+        if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock, as in languages()
+            fcntl.flock(ctx.lock, fcntl.LOCK_UN)
+        heard, rec["flag_heard"] = checks.hear(ctx.path, ctx.j, ctx.d, ctx.original, only=rest)
+        if ctx.shared:
+            ctx.shared.reshare(ctx.st)
+    if proven or heard:
+        ctx.checked = {**ctx.checked, **proven, **heard}
+        ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)
+        ctx.d = decide.with_tags(decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched), ctx.tags)
 
 
 def deep_drop(ctx):
@@ -638,7 +679,7 @@ def act(ctx):
                 ", and only a subtitle verdict changes a flag"
         rec = ctx.rec = edit(rec, ctx.j, edits, ctx.apply, replan=lambda after: decide.with_tags(
             decide.decide(after, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched),
-            decide.retag(after, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read)))
+            decide.retag(after, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)))
         # An abstained or dropped decision has no edits of its own, and its reason stays in "undecided" or "dropped". It
         # names the result only when nothing changed, so an edit of a subtitle verdict keeps "edited" and its Plex analyze.
         if d.get("undecided") and rec["outcome"] == "no_change":
@@ -776,7 +817,7 @@ def alerts(ctx):
         rec["alert_result"] = logs.alert_findings(rec, ctx.size, ctx.held)
 
 
-STEPS = (start, conversion, header, languages, subtitle_checks, deep_drop, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
+STEPS = (start, conversion, header, languages, subtitle_checks, flag_hearing, deep_drop, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
 
 
 def content_finding(ev):
@@ -810,8 +851,9 @@ def file_alerts(d, file_checks, meta, original, item):
 
 
 def propedit_args(edits, i):
-    """mkvpropedit arguments that set the property of each edit (flag-default, flag-forced, language or language-ietf) to
-    its new (i=1) or old (i=2) value. None deletes the property: a track that had no BCP 47 tag gets none back on undo."""
+    """mkvpropedit arguments that set the property of each edit (flag-default, flag-forced, flag-original, language or
+    language-ietf) to its new (i=1) or old (i=2) value. None deletes the property: a track that had no BCP 47 tag or no
+    Original language flag gets none back on undo."""
     return [a for e in edits for a in (("--edit", e[0], "--delete", decide.prop(e)) if e[i] is None
                                        else ("--edit", e[0], "--set", f"{decide.prop(e)}={e[i]}"))]
 
@@ -820,7 +862,8 @@ def edit(rec, j, edits, apply, replan=None):
     """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result.
     replan(after) plans the edited file again. Its edit count and the invariants of the new state go in "recheck",
     which the audit reads instead of probing the file again."""
-    edits = [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG) or decide.unapplied(j, [e])]   # never a no-op flag edit
+    edits = [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG)
+             or decide.unapplied(j, [e])]   # never a no-op flag edit
     if not edits:
         return dict(rec, outcome="no_change", result="no change")
     path = rec["path"]

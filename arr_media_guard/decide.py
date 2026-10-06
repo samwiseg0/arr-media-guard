@@ -16,7 +16,8 @@ A decision has four steps. Each step reads general signals, so a new case needs 
 3. On conflicting signals decide() abstains. The plan is empty and "undecided" names the reason.
 4. invariants() checks the final state of every plan. A plan that breaks one is dropped, and "dropped" says why.
 
-An edit is [selector, new, old] for a default flag. An edit that clears a forced flag carries FORCED_FLAG as a fourth item.
+An edit is [selector, new, old] for a default flag. An edit that clears a forced flag carries FORCED_FLAG as a fourth item,
+and an edit of the Original language flag ORIGINAL_FLAG, see retag().
 
 POLICY is the policy file (POLICY_FILE), JSON. The hook passes it to set_policy() at start.
 docs/design.md explains the rules behind it.
@@ -68,6 +69,10 @@ POLICY = None
 POLICY_KEYS = ("kids", "audio", "subtitles", "sparse_events", "forced_flag_events", "density_min_minutes", "min_confidence", "forced_clear")
 FORCED_CLEAR_KEYS = ("events", "english_only_audio", "reference_ratio")
 FORCED_FLAG = "flag-forced"   # the mkvpropedit property of an edit that clears a forced flag
+ORIGINAL_FLAG = "flag-original"   # the mkvpropedit property of an edit of the Original language flag, see retag()
+# The roles whose Original language flag retag() sets or clears. A commentary or an audio description is no part of the
+# content's own speech, so its flag stays as it is.
+ORIGINAL_ROLES = {"a": ("main",), "s": ("full", "sdh", "forced", "dub")}
 
 
 def set_policy(policy):
@@ -146,6 +151,7 @@ def classify(j, heard=None):
     dub) and commentary. A subtitle is forced by a "forced" or signs title, by density under POLICY["sparse_events"],
     or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. "conflict" is (kind, sentence)
     when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
+    original is the track's Original language flag: 1, 0, or None when the file holds none.
     heard maps an audio track's position ("a2") to the language lid.py heard on it, see language(). It may also map a
     subtitle position to the language retag() gives it from its text.
     """
@@ -155,11 +161,11 @@ def classify(j, heard=None):
         if p is not None:   # mkvmerge -J. A missing default flag means default, as in the Matroska spec.
             kind = {"audio": "a", "subtitles": "s"}.get(t.get("type"))
             f = dict(lang=p.get("language"), title=p.get("track_name"), ch=p.get("audio_channels"), default=p.get("default_track", True),
-                     forced=p.get("forced_track"), comment=p.get("flag_commentary"), described=p.get("flag_visual_impaired"),
+                     forced=p.get("forced_track"), comment=p.get("flag_commentary"), described=p.get("flag_visual_impaired"), original=p.get("flag_original"),
                      sdh=p.get("flag_hearing_impaired"), uid=p.get("uid"), codec=t.get("codec"), events=events_per_minute(j, p) if kind == "s" else None)
         else:               # ffprobe
             kind = {"audio": "a", "subtitle": "s"}.get(t.get("codec_type")); d = t.get("disposition") or {}; tg = t.get("tags") or {}
-            f = dict(lang=tg.get("language"), title=tg.get("title"), ch=t.get("channels"), default=d.get("default"), forced=d.get("forced"),
+            f = dict(lang=tg.get("language"), title=tg.get("title"), ch=t.get("channels"), default=d.get("default"), forced=d.get("forced"), original=d.get("original"),
                      comment=d.get("comment"), described=d.get("visual_impaired"), sdh=d.get("hearing_impaired"), uid=None, codec=t.get("codec_name"), events=None)
         if not kind: continue
         n[kind] += 1; title = f["title"] or ""; ev = f["events"]
@@ -184,6 +190,7 @@ def classify(j, heard=None):
         out.append(dict(kind=kind, sel=sel, pos=f"{kind}{n[kind]}", uid=f["uid"], tag=tag, lang=lang, conf=conf, lang_why=why, title=title,
                         ch=f["ch"] or 0, codec=f["codec"], default=int(bool(f["default"])), role=role, extra=role in ("commentary", "description"),
                         forced=forced, forced_flag=bool(f["forced"]), flagged=bool(f["forced"]) or titled_forced, sdh=sdh, events=ev, heard=h,
+                        original=None if f["original"] is None else int(bool(f["original"])),
                         conflict=("dense_forced_flag", f"{kind}{n[kind]} is flagged forced but has {ev:.1f} events a minute") if dense_flag
                         else ("sparse_full_title", f"{kind}{n[kind]} is titled or flagged full or SDH but has {ev:.1f} events a minute")
                         if full_title and sparse else None))
@@ -191,7 +198,8 @@ def classify(j, heard=None):
 
 
 def prop(e):
-    """The Matroska property an edit sets: flag-default, or FORCED_FLAG for an edit that carries it."""
+    """The Matroska property an edit sets: flag-default, or the property it carries as its fourth item, such as
+    FORCED_FLAG or ORIGINAL_FLAG."""
     return e[3] if len(e) > 3 else "flag-default"
 
 
@@ -480,7 +488,7 @@ def lang_key(x):
     return min(codes(x) or {x})
 
 
-def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
+def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, original=None, checked=None):
     """The language tag edits of one mkvmerge -J probe (docs/design.md, "Language tags"), as {"edits", "rules", "notes",
     "reasons", "set", "ask", "to_read", "mismatch", "wrong"}. heard maps an audio track's position to the language lid.py
     heard, and read a subtitle track's position to the language text_language() read in its text. known holds the
@@ -501,7 +509,19 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
     names another language. to_read holds the subtitle tracks not read yet whose tag a read language may change: an und
     tag, or two signals that disagree. mismatch holds a sentence for each read subtitle whose text reads another
     language than its tag while the tag stays, and wrong maps its position to the read language, for decide(). It counts
-    only when text_language() can name the tagged language."""
+    only when text_language() can name the tagged language.
+
+    original is the content's original language, see content_language(). With it, a track of ORIGINAL_ROLES whose
+    language AMG is sure of gets the Original language flag: 1 when that language is the original one. A flag of 1 on a
+    track in another language goes to 0. A flag already right, and a missing flag that would be 0, stay. The track
+    must be tagged after this run, not und, mul or zxx, so an und track this run tags gets its flag in the same run.
+    AMG is sure of a main audio track when its heard language names its language
+    after this run, or, with nothing heard, its tag and title agree and no other signal names another language. That
+    is AGREE, the bar of POLICY["min_confidence"]. A tag alone is not enough, so process.languages() hears such a track
+    first, see flag_checks(). AMG is sure of a subtitle when the language read in its text names its language after
+    this run. A picture subtitle has no text to read. A track AMG is not sure of keeps its flag, and a note says why.
+    checked maps more tracks to the language heard or read for the flag alone, so they change no tag and no other
+    finding."""
     legacy_of, ietf_of = table
     key = lang_key
     known, spoken, tags = {key(x) for x in known if x}, {key(x) for x in spoken if x}, language_tags(j)
@@ -555,11 +575,55 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None):
             out["notes"].append(f'{pos} {tag}{"/" + ietf if ietf else ""} -> {value}: {why}')
             code = rule.replace(" ", "_")
             out["reasons"] += [] if code in out["reasons"] else [code]
+        now = out["set"].get(pos, tag)   # the track's language after this run
+        want = int(key(now) == key(original or ""))
+        if original and t["role"] in ORIGINAL_ROLES[t["kind"]] and now not in UNTAGGED | KEEP_TAGS \
+                and want != (t["original"] or 0) and (want or t["original"]):   # the flag would change
+            seen = h or (checked or {}).get(pos)
+            if seen:
+                sure = key(seen) == key(now)
+            else:   # a main audio track whose tag and title agree, see flag_checks()
+                sure = main and not split and len(votes) == 1 and len(next(iter(votes.values()))[1]) >= 2
+            if sure:
+                rule = "original flag set" if want else "original flag cleared"
+                out["edits"].append([t["sel"], want, t["original"], ORIGINAL_FLAG])
+                out["rules"].append(rule)
+                out["notes"].append(f'{pos} {now}: original language flag {t["original"]} -> {want}, the content is {original}')
+                out["reasons"] += [] if rule.replace(" ", "_") in out["reasons"] else [rule.replace(" ", "_")]
+            else:
+                why = (f"heard {seen}" if main else f"the text reads {seen}") + f", not {now}" if seen else \
+                    "it was not heard" if main else "its text was not read"
+                out["notes"].append(f'{pos} {now}: the original language flag stays, because {why}')
         if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in readable and key(out["set"].get(pos, tag)) != key(h):
             out["mismatch"].append(f"subtitle track {pos[1:]} is tagged {lang_name(tag)}, but its text reads as {lang_name(h)}")
             out["wrong"][pos] = h
             out["reasons"] += [] if "subtitle_text_mismatch" in out["reasons"] else ["subtitle_text_mismatch"]
     return out
+
+
+def flag_checks(j, original):
+    """(the main audio tracks to hear, the subtitles to read) before retag() may change their Original language flag, as
+    positions: the tracks of ORIGINAL_ROLES whose flag their tag would change. A main audio track whose tag and title
+    agree needs no hearing. original is content_language(), and with none no flag changes."""
+    hear, read = set(), set()
+    for t in classify(j) if original else ():
+        want = int(lang_key(t["tag"]) == lang_key(original))
+        if t["role"] not in ORIGINAL_ROLES[t["kind"]] or t["tag"] in UNTAGGED | KEEP_TAGS or want == (t["original"] or 0) \
+                or not (want or t["original"]):
+            continue
+        if t["kind"] == "s":
+            read.add(t["pos"])
+        elif t["conf"] < AGREE:
+            hear.add(t["pos"])
+    return hear, read
+
+
+def content_language(original, expected):
+    """The content's original language for the Original language flag, as a 639-2 code: TMDB's, when the app names none
+    or the same one. original is the app's name for it, expected content.expected_languages(). None when TMDB is
+    unknown, names no 639-2 language, or names another language than the app."""
+    tmdb, app = (expected or {}).get("original"), {lang_key(c) for c in codes(original)}
+    return tmdb if tmdb and (not app or lang_key(tmdb) in app) else None
 
 
 def with_tags(plan, tags):
@@ -576,6 +640,7 @@ def unapplied(after, edits):
     ts, tags = {t["sel"]: t for t in classify(after)}, language_tags(after)
     def shows(e, t):
         if prop(e) in (LANG_EDIT, LANG_IETF): return e[1] in tags[t["pos"]]
+        if prop(e) == ORIGINAL_FLAG: return (t["original"] or 0) == e[1]
         return (t["default"] if prop(e) == "flag-default" else int(t["forced_flag"])) == e[1]
     return [e for e in edits if e[0] not in ts or not shows(e, ts[e[0]])]
 

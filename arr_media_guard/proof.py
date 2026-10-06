@@ -191,22 +191,28 @@ class ReadFailed(RuntimeError):
         self.path = path
 
 
-def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
+def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), nul=()):
     """One read of path through ffmpeg with -c copy, -copyinkf and -copyts. No stream is decoded, only timed text becomes
     SubRip. -copyinkf keeps the frames before the first keyframe, which a copy drops by default in both files.
     With raw True the text streams are SubRip already and their packets are written as they are, because ffmpeg's
     SubRip decoder drops a cue whose text starts with a line break. raw may also hold the stream indexes to write so.
     maps lists ffprobe stream indexes. bsf maps a stream index to the bitstream filter its packets go through first.
-    opts are input options, such as -ignore_editlist 1.
+    opts are input options, such as -ignore_editlist 1. nul lists the stream indexes of maps whose packets each lose one
+    NUL byte at their very end, if they hold one, before their md5 counts. HandBrake ends each ASS event so, and
+    mkvmerge drops that byte, see remux.ended_track(). The same read writes the packets of each such stream as they
+    are, and their bytes must hash to ffmpeg's md5s. A packet of one byte keeps it.
     Returns ({stream index: count (packets with data), empty (packets without), bytes, digest (sha256 over their md5s),
     start and end in seconds, times (the time of each packet with data, in file order), ends (its time plus its
-    duration), md5s (their md5s, 16 bytes each) and sizes}, {stream index in texts: its SubRip text}). A timeout raises,
-    and an ffmpeg error raises ReadFailed."""
+    duration), md5s (their md5s, 16 bytes each) and sizes, and for a stream of nul nul_cut, the count of packets that
+    lost a NUL}, {stream index in texts: its SubRip text}). A timeout raises, and an ffmpeg error raises ReadFailed."""
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
     if maps:
         argv += [a for i in maps for a in ("-map", f"0:{i}")] + ["-c", "copy", "-copyinkf"]   # frames before the first keyframe too
         argv += [a for k, i in enumerate(maps) if bsf.get(i) for a in (f"-bsf:{k}", bsf[i])] + ["-f", "framemd5", out]
+    raw_of = {i: os.path.join(folder, f"{uuid.uuid4().hex}.bin") for i in nul if i in maps}   # the packets of a nul stream, as they are
+    for i, f in raw_of.items():
+        argv += ["-map", f"0:{i}", "-c", "copy", "-copyinkf", "-f", "data", f]
     for i, f in srt.items():
         argv += ["-map", f"0:{i}", "-c:s", "copy" if raw is True or i in (raw or ()) else "srt", "-f", "srt", f]
     r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
@@ -218,7 +224,10 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
                        r"h264_mp4toannexb|pcm_rechunk)\b", line)]
     if r.returncode or bad:
         raise ReadFailed(path, f"ffmpeg did not read {os.path.basename(path)} cleanly: {config.mask(chr(10).join(bad) or r.stderr.strip())[-200:]}")
-    tb, stats = {}, {}
+    tb, stats, data, at = {}, {}, {}, {}
+    for i, f in raw_of.items():
+        with open(f, "rb") as fh:
+            data[i], at[i] = fh.read(), 0
     with open(out) if maps else contextlib.nullcontext([]) as lines:
         for line in lines:
             if line.startswith("#tb "):
@@ -229,7 +238,14 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
                 k, dts, pts, dur, size = int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4])
                 pts = pts if abs(pts) < 1 << 62 else dts   # AVI video has a decode time only
                 s = stats.setdefault(maps[k], {"count": 0, "empty": 0, "bytes": 0, "digest": hashlib.sha256(), "rest": hashlib.sha256(),
-                                               "start": None, "end": None, "times": [], "ends": [], "md5s": bytearray(), "sizes": array.array("L")})
+                                               "start": None, "end": None, "times": [], "ends": [], "md5s": bytearray(), "sizes": array.array("L"),
+                                               **({"nul_cut": 0} if maps[k] in data else {})})
+                if size and maps[k] in data:   # the packet as it is, then one NUL byte less at its very end
+                    b, at[maps[k]] = data[maps[k]][at[maps[k]]:at[maps[k]] + size], at[maps[k]] + size
+                    if hashlib.md5(b).hexdigest() != p[5]:
+                        raise ReadFailed(path, f"the packets ffmpeg wrote of stream {maps[k]} differ from the ones it hashed")
+                    if size > 1 and b.endswith(b"\0"):
+                        size, p[5], s["nul_cut"] = size - 1, hashlib.md5(b[:-1]).hexdigest(), s["nul_cut"] + 1
                 if size:
                     s["but_last"], s["last"], s["last_pts"] = s["digest"].copy(), size, round(pts * tb[k], 3) if abs(pts) < 1 << 62 else None
                     if s["count"]:   # rest: every packet but the first, but_ends: every one but the first and the last
@@ -245,6 +261,8 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=()):
                 if abs(pts) < 1 << 62:   # AV_NOPTS_VALUE has no time
                     s["start"] = min(pts * tb[k], s["start"] if s["start"] is not None else float("inf"))
                     s["end"] = max(s["end"] or 0, (pts + dur) * tb[k])
+    if any(at[i] != len(b) for i, b in data.items()):
+        raise ReadFailed(path, "ffmpeg wrote more packet bytes of a stream than it hashed")
     for s in stats.values():
         s.update(digest=s["digest"].hexdigest(), start=round(s["start"] or 0, 3), end=round(s["end"] or 0, 3))
         s["but_last"] = s["but_last"].hexdigest() if "but_last" in s else None
@@ -319,7 +337,10 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     maps the k-th subtitle stream of src to [(start, end)] of each of its packets in seconds, from a time plan of
     remux.time_plan(): its packets must match, and each start and end must be the planned one within TIME_SLACK. A
     stream in ended or timed whose original holds a cue with no duration is refused: its end is not known, and the
-    plan's end for it is made up. recoded maps the k-th subtitle stream of src, a SubRip track, to a function that
+    plan's end for it is made up. An ASS stream in ended or timed comes back through mkvextract and mkvmerge, which
+    drop the NUL byte HandBrake puts at the very end of each event. So each packet of the original that ends in a NUL
+    is compared without that one byte, see packet_hashes(), and the entry counts those packets in nul_cut. Any other
+    difference of a byte still refuses. recoded maps the k-th subtitle stream of src, a SubRip track, to a function that
     gives the cues of the new text from srt_blocks() of the original's text, see remux.resub(). The proof compares
     text then: the new stream must hold those cues, and they must keep the original's count and times."""
     fa, sa, _ = ff_streams(src)
@@ -327,6 +348,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped], media_streams(sb), fa.split(",")[0]
     by_sub = lambda m: {s["index"]: m[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in m}
     moved, lengthened, planned, recoded = by_sub(retimed or {}), by_sub(ended or {}), by_sub(timed or {}), by_sub(recoded or {})
+    nul = [s["index"] for s in a if s["codec_name"] in ("ass", "ssa") and (s["index"] in lengthened or s["index"] in planned)]   # see packet_hashes()
     pairs, proof = [], []
     captions = captions or {}
     for kind in ("video", "audio", "subtitle"):
@@ -348,7 +370,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     pool = concurrent.futures.ThreadPoolExecutor(2)   # both reads at once: the proof then takes about as long as the remux
     try:
         a_ = pool.submit(packet_hashes, src, [s["index"] for s, _ in packets], {i: f[0] for i, f in bsf.items() if f[0]},
-                         [s["index"] for s, _ in text], folder, timeout, raw=set(recoded))
+                         [s["index"] for s, _ in text], folder, timeout, raw=set(recoded), **({"nul": nul} if nul else {}))
         b_ = pool.submit(packet_hashes, tmp, [t["index"] for _, t in packets], {t["index"]: bsf[s["index"]][1] for s, t in packets
                                                                                  if bsf.get(s["index"], ("", ""))[1]},
                          [t["index"] for _, t in text] + [t["index"] for s, t, sc in pairs if sc], folder, timeout, raw=True)
@@ -366,7 +388,8 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         f = bsf.get(s["index"]) or (None, None)
         proof.append(dict(stream=name, codec=s["codec_name"], method="packets" + (f", original through {f[0]}" if f[0] else "")
                           + (f", new file through {f[1]}" if f[1] else ""),
-                          count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), hash=x["digest"][:16],
+                          count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), **({"nul_cut": x["nul_cut"]} if x.get("nul_cut") else {}),
+                          hash=x["digest"][:16],
                           match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
         xt, yt, xs, why, ycut, bad = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None), None   # bad: refused for its packets
         if s["index"] in moved:   # the times the fix gives, as mkvmerge --sync wrote them

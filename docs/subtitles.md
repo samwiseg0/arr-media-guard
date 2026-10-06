@@ -14,21 +14,23 @@ Set `SUBTITLES` in the env file. The default is `deep`.
 | --- | --- |
 | `off` | Nothing. |
 | `check` | It checks and alerts, and changes nothing. |
-| `fix` | It also takes out a subtitle of another episode, moves such a sidecar aside, gives new times to a subtitle that is early or late, and makes lines that flash stay on screen longer. |
+| `fix` | It also takes out a subtitle of another episode, moves such a sidecar into `.<NAME>-originals`, gives new times to a subtitle that is early or late, and makes lines that flash stay on screen longer. |
 | `deep` | `fix`, and then the deep analysis of the file. |
 
 - The *deep analysis* is a slower subtitle check after an import. It waits in the background queue and runs only while
-  no import waits. It also reads the subtitle tracks that the file's index leaves out, and listens to one part of the
-  audio in each minute. It times the subtitles the import could not, and moves a stretch of lines that is out of sync,
-  see [Subtitle block timing](#subtitle-block-timing). It times live captions line by line, see
+  no import waits. It also reads the subtitle tracks that the file's seek index does not list. Old mkvmerge versions
+  left them out, so only a read of the whole file finds their text. It listens to one part of the audio in each minute.
+  It times the subtitles the import could not, including one that drifts slowly out of sync, see
+  [Drift timing](#drift-timing). It moves a stretch of lines that is out of sync, see
+  [Subtitle block timing](#subtitle-block-timing). It times live captions line by line, see
   [Live caption timing](#live-caption-timing). It times subtitles in a language no audio track speaks, see
   [Foreign subtitle timing](#foreign-subtitle-timing). It also repairs garbled text, see
   [Garbled subtitle repair](#garbled-subtitle-repair).
 - An unknown level acts as `check`, and `--selftest` fails on it.
 - `--sub-check` and `--sub-time` do not read `SUBTITLES`. Without `--apply` they report, and with it they fix.
 
-In Docker, a deep analysis that a stopped container left runs after the next start. The listener starts a worker for it
-within a minute.
+In Docker, a deep analysis that a stopped container left runs after the next start. The listener starts the worker for
+it within a minute. The worker is the AMG process that runs the queued jobs.
 
 ## Check a library
 
@@ -39,8 +41,11 @@ arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtit
 arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
 ```
 
-`--sub-check` makes the checks of `--sub-time` except [Subtitle block timing](#subtitle-block-timing) and
-[Live caption timing](#live-caption-timing), which need much more listening.
+`--ids` takes the app's own ids, never TMDB or TVDB ids, see [commands.md](commands.md#dry-runs-and-the-backfill).
+
+`--sub-check` makes the checks of `--sub-time` except [Drift timing](#drift-timing),
+[Subtitle block timing](#subtitle-block-timing) and [Live caption timing](#live-caption-timing), which need much more
+listening.
 
 - It also takes a file that has only a sidecar to check.
 - A dry run prints each result and the change it would make. An apply acts as an import does.
@@ -66,12 +71,13 @@ arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv" --appl
 ```
 
 `--sub-time` makes every subtitle check on each file it names, as the deep analysis does, and ignores saved results. It
-times every subtitle it cannot hear against one whose words matched the audio. It listens to one part of the audio in
-each minute. Where a part sits out of sync, it listens to that stretch in full, see
+times every subtitle whose words it cannot compare with the speech against one whose words matched the audio. It listens
+to one part of the audio in each minute. Where a part sits out of sync, it listens to that stretch in full, see
 [Subtitle block timing](#subtitle-block-timing).
 
 - The file needs no app. For a path outside Sonarr and Radarr, such as a copy, AMG knows no original language. A
-  subtitle that does not match the audio then counts as wrong, unless the file also holds audio in another language.
+  subtitle that does not match the audio then counts as wrong. The exception is a file that also holds audio in a
+  language other than the subtitle's, because the subtitle may translate that audio.
 - With `--apply` and no app, AMG keeps every audio and subtitle flag. Only a subtitle that does not match the audio
   loses its default and forced flags.
 - Some old files have subtitle tracks that the file's index leaves out. AMG reads those tracks from the whole file. It
@@ -94,17 +100,19 @@ failed, or a sidecar stayed as it was.
 
 Each subtitle gets one line, with these columns.
 
-1. Its place in the file, such as `s3`, or the sidecar's name.
-2. The format, the language and the role: `full`, `sdh` or `dub`.
+1. Its place in the file, such as `s3` for the third subtitle track, or the sidecar's name.
+2. The format, the language and the role. `full` holds all dialogue. `sdh` holds all dialogue and the sounds, for deaf
+   and hard-of-hearing viewers. `dub` is a transcript of an English dub.
 3. How AMG judged it.
    - `words` means AMG compared it with the words heard in the audio. `a reference: in time`, `fixed` or `clean sweep`
      after it means AMG used it to time other subtitles.
    - `reference s1` means AMG timed it against `s1`. `reference, none` means no subtitle could time it.
    - `speech layout` means AMG judged it by where people speak, see [Foreign subtitle timing](#foreign-subtitle-timing)
      and [Incorrect subtitle identification](#incorrect-subtitle-identification).
-4. The result. The word check gives `match`, `mismatch` or `unknown`. A subtitle timed against another gives `fit` or
-   `weak` with a score, and a weak fit only reports. It can also give `unknown`, or `deferred` when an import ran out of
-   time. The speech gives `fit`, `mismatch` or `unknown` with a score.
+4. The result. The *word check*, the compare of the subtitle with the heard words, gives `match`, `mismatch` or
+   `unknown`. A subtitle timed against another gives `fit` or `weak` with a score, and a weak fit only reports. It can
+   also give `unknown`, or `deferred` when an import ran out of time. The speech gives `fit`, `mismatch` or `unknown`
+   with a score.
 5. The new times, as a shift in seconds and a frame-rate ratio, or `in time`. `2 lines kept` counts the lines at the
    start or end that keep their times.
 6. What AMG did, such as `none`, `retimed`, `removed`, `flags off`, `report only`, `alert only`, or the remux it would
@@ -117,7 +125,8 @@ The lines after them:
 - `sweep of s1` starts a table with one row for each part of the audio AMG listened to. A row gives the time and the
   number of words heard, and the share that matched the subtitle. It also gives the lines whose first word matched, and
   how far off they sit. A row marked `ALERT` belongs to a stretch where the subtitle sits 1 second or more off. That
-  stretch is large enough to alert. A row that is off but too small to alert says so, such as `one window alone`.
+  stretch is large enough to alert. A row that is off but too small to alert says so, such as `one window alone`. The
+  output calls each part a *window*.
 - A line such as `s1: 14 cues from 16:21 to 17:40 moved -1.42 s` names a stretch of lines that AMG moved, see
   [Subtitle block timing](#subtitle-block-timing). A dry run says `would move`. `not moved` means the remux failed, or
   the subtitle is WebVTT, which AMG never rewrites. Its end says whether the moments where speech starts agreed.
@@ -132,12 +141,59 @@ The lines after them:
 
 The decision log holds the results under `subcheck`, `subtime`, `flash`, `sweep`, `blocks`, `garbled` and `speech`.
 
+### Roll-up captions
+
+Roll-up captions are closed captions that show each new line under the lines before it. A line shows again in each
+caption until it rolls off the top, often two or three times. So the first words of a caption were spoken seconds
+before it shows. A check that timed a caption by them read the track as seconds late, and could alert that it was.
+
+AMG times each caption of such a track by its new line, which is spoken as the caption shows. A speaker's name before a
+line, such as `>> Reporter:`, does not count. A roll-up track in sync no longer gets a "late" alert. A roll-up track
+that is really out of sync still gets its fix, or its alert.
+
+### Drift timing
+
+A subtitle made for another frame rate drifts. Its lines start in sync, or nearly, and fall further behind or ahead as
+the file plays. A DVD subtitle can drift by about a second over an episode. The check of an import hears two or three
+short parts of the audio. One of them can fall on lines the subtitle's author timed badly. No single fix then fits
+them, and the import alerts that the subtitle is out of sync by different amounts.
+
+The deep analysis and `--sub-time` listen to one part of the audio in each minute. When most of those parts lie on one
+steady drift, AMG gives the subtitle new times for that drift. A few parts heard wrong do not stop it. When the parts
+show the subtitle in sync, the import's alert waits, because a short stretch out of sync can fall between two of them.
+AMG drops the alert only when its listening in full finds each part the import heard off in sync, or moves the lines
+there, see [Subtitle block timing](#subtitle-block-timing). A part counts as off at three quarters of a second or more.
+Else the import's alert posts. An alert of a drift says how far off the subtitle is at the start and at the end.
+
+- Two parts in a row can sit off the same way by three quarters of a second or more. They mark a stretch that is out
+  of sync, as after a scene cut. AMG then fixes nothing from this listening, and the import's alert stays.
+- When one half of the file sits steady, the subtitle does not drift, so AMG fixes nothing here either.
+- Live captions, whose delay keeps changing, never get this fix, see [Live caption timing](#live-caption-timing).
+- New times, from this listening or from the import, must make more lines show while their words are heard than the
+  lines do now. A tie keeps the times. On a subtitle in sync, a few lines its author timed off in the parts the import
+  heard can look like a drift of about a second, and this rule keeps every line where it is.
+- Known limit: when this rule keeps the times at an import, the import alerts that the subtitle is out of sync. With
+  `SUBTITLES` at `fix` or `check`, no deep analysis listens again, so that alert posts even for a subtitle in sync.
+- Before AMG writes the new times, it listens to the whole file at them. A part that still sits three quarters of a
+  second off counts when it covers a quarter of the file, or when it reaches the start or the end over 90 seconds or
+  more. Then the subtitle had a step and no drift, so AMG fixes nothing, and the import's alert stays. A shorter part
+  in the middle keeps the fix, because subtitle authors time such stretches off by hand.
+- Known limit: the new times of a drift can take up most of a step under about a second. AMG then gives the subtitle
+  drift times, and the lines on one side of the step end up about half a second off.
+- An import never makes this fix, because it listens to too few parts. It still fixes a frame-rate drift when a middle
+  part of the audio confirms it. A recheck of a result that an import or `--sub-check` saved runs at that depth. It does
+  not listen to each minute either, so it cannot make this fix.
+- A file an older version found in sync keeps that result. To time it again, run
+  `arr-media-guard --sub-time <file> --apply` on it, see
+  [Time the subtitles of one file](#time-the-subtitles-of-one-file).
+
 ### Subtitle block timing
 
 Sometimes only part of a subtitle is out of sync. A release might have a scene cut or added, so the lines before it are
 fine and the lines after it show a few seconds early or late. AMG listens to the audio, finds the stretch of lines that
-is off, and moves only those lines to where the words are spoken. Lines that are already in sync stay where they are,
-and lines never change order. It runs in the deep analysis, and with `--sub-time`. An import never does it.
+is off, and moves only those lines to where the words are spoken. The output calls such a stretch a *block*. Lines that
+are already in sync stay where they are, and lines never change order. It runs in the deep analysis, and with
+`--sub-time`. An import never does it.
 
 How AMG finds and moves a stretch:
 
@@ -179,10 +235,12 @@ Live captions are typed during a broadcast. Each line shows some seconds after i
 each time. One shift cannot fix that, and neither can a stretch. AMG moves each line of such a subtitle to its own
 speech. It runs in the deep analysis and with `--sub-time`.
 
-1. AMG spots live captions in its one-part-a-minute listening. The lines run late, and by amounts that keep changing.
+1. AMG spots live captions in its one-part-a-minute listening. The lines run late, and by amounts that keep changing. A
+   delay that grows or shrinks steadily is a drift instead. One fix for the whole track corrects a drift, see
+   [Drift timing](#drift-timing).
 2. AMG listens to the whole audio and finds where the first word of each line is spoken. A speaker's name before a line,
    such as `>> Reporter:`, is never spoken, so it does not count. Neither do the lines of roll-up captions that repeat
-   the line before. In roll-up captions, each new line pushes the line before it up, so each line shows twice.
+   the caption before, see [Roll-up captions](#roll-up-captions).
 3. Speech comes in the order of the lines, so a first word heard out of that order counts for nothing.
 4. A line moves to its first word when it sits a full second or more off it. The 2 lines on each side must sit off the
    same way. So one line that Whisper heard wrong never moves alone.
@@ -219,8 +277,8 @@ shows every line late or early by up to 5 minutes, or one made for another frame
   after a pause must confirm the new times in both halves of the file. Else nothing moves, and an alert says the
   subtitles seem late and that no fix lined them up.
 - **When it does not run.** A file shorter than 15 minutes gets no new times. Nor does a subtitle read only in part, see
-  [Long subtitle track handling](#long-subtitle-track-handling). A WebVTT subtitle never keeps lines at its ends, so
-  such a fix only alerts.
+  [Long subtitle track handling](#long-subtitle-track-handling). AMG never rewrites a WebVTT subtitle line by line. So
+  when a fix would keep lines at the start or end, a WebVTT subtitle gets only an alert.
 
 It runs in the deep analysis, and with `--sub-check` and `--sub-time`, with `--apply` for the change. It needs language
 detection, which also finds the speech. That costs about 40 CPU seconds for a 45-minute episode, and AMG keeps the
@@ -245,8 +303,9 @@ no gap get none either. It runs with Foreign subtitle timing, never at an import
 ### Garbled subtitle repair
 
 An old muxer could store a subtitle track in the wrong character set. Greek "Καλημέρα, φίλε μου" then shows as
-"ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. AMG checks each SubRip track for it in the deep analysis and with
-`--sub-check` and `--sub-time`, which read the whole file. An import does not. This check needs no language detection.
+"ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. AMG checks each SubRip track, the text format of `.srt` files, for it. It
+does that in the deep analysis and with `--sub-check` and `--sub-time`, which read the whole file. An import does not.
+This check needs no language detection.
 
 - AMG reads the track's own bytes in the right character set. When that text reads as the language of the track's tag,
   AMG writes the track back readable. It does that in one remux, which it checks line by line.
@@ -255,14 +314,14 @@ An old muxer could store a subtitle track in the wrong character set. Greek "Κ�
 - When more than 2 percent of the lines were cut short, AMG does not repair the track. Some character sets leave no
   trace of a cut, so the count can miss a few.
 - A letter that is already right stays, such as the "º" of "40.5ºC", or the "é" of "Café" in Cyrillic text.
-- The word check cannot read garbled text, so AMG repairs such a track and does not take it out. The next run checks the
-  repaired words and times.
+- The word check cannot read garbled text, so AMG repairs such a track and does not take it out. The saved result stays
+  pending, so the next `--sub-check` checks the repaired words and times.
 - A track read only in part gets an alert, and no repair.
 
-A garbled track that AMG cannot repair leaves the file, and AMG keeps the old file for `KEEP_ORIGINALS_DAYS`. Its bytes
-go beside the video as `<name>.<language>.garbled.txt`, for example `Film (2001).bul.garbled.txt`, and an alert names
-it. Players skip that file, and AMG never writes over a file. With `KEEP_ORIGINALS_DAYS` at 0, the track stays, and the
-alert says why.
+AMG takes a garbled track that it cannot repair out of the file, and keeps the old file for `KEEP_ORIGINALS_DAYS`. Its
+bytes go beside the video as `<name>.<language>.garbled.txt`, for example `Film (2001).bul.garbled.txt`, and an alert
+names it. Players skip that file, and AMG never writes over a file. With `KEEP_ORIGINALS_DAYS` at 0, the track stays,
+and the alert says why.
 
 To fix such a track by hand, open the `.garbled.txt` file in a subtitle editor that reads other character sets, such as
 Subtitle Edit. Pick the set that makes it readable, save it as a UTF-8 `.srt`, then add it back.
@@ -326,8 +385,8 @@ nothing.
 No app names the file, so the run keeps every flag. Only a subtitle whose words do not match the audio loses its default
 and forced flags. With `--apply`, a remux that AMG checks writes the new times, the new end times or the removal.
 
-The original stays as a hard link at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the mounted folder, and the
-output names that path.
+The file as it was before the change stays as a hard link at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the
+mounted folder. The output names that path.
 
 - `PUID:PGID` must be able to write in the mounted folder. When the dry run plans a remux and that folder is not
   writable, it names the folder, the uid and the gid.
