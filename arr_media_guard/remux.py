@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import bisect, contextlib, fractions, itertools, os, re, shutil, signal, subprocess, threading, time
+import contextlib, fractions, itertools, os, re, shutil, signal, subprocess, threading, time
 
-from . import checks, config, decide, logs, proof, runner, subsync, vault
+from . import align, checks, config, decide, logs, proof, runner, subsync, vault
 
 
 # The track properties a remux must keep, with the Matroska default of each. uid too, except on a track a trim replaced.
@@ -356,9 +356,35 @@ EVENTS_FORMAT = {"S_TEXT/ASS": "Layer, Start, End, Style, Actor, MarginL, Margin
                  "S_TEXT/SSA": "Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"}
 
 
+# The Matroska codec of HEVC video, whose codec private data is an hvcC record, see hvcc_cleared()
+HEVC = "V_MPEGH/ISO/HEVC"
+
+
+def hvcc_cleared(b):
+    """The hvcC record b with the array_completeness bit of each NAL array cleared, or None when b does not parse.
+    ffmpeg 7.1's Matroska muxer writes the hvcC again with that bit 0 and keeps every other byte. A 0 only says the
+    stream may hold more NAL units of the array's type, so the decoder reads the same video. The record holds 22 bytes
+    of fields, then a byte with the count of arrays. Each array has a byte with the bit and the NAL type, a 2-byte NAL
+    count, and each NAL after a 2-byte length."""
+    b, at = bytearray(b), 23
+    if len(b) < at or b[0] != 1:
+        return None
+    for _ in range(b[22]):
+        if at + 3 > len(b):
+            return None
+        b[at] &= 0x7f
+        count, at = int.from_bytes(b[at + 1:at + 3], "big"), at + 3
+        for _ in range(count):
+            if at + 2 > len(b):
+                return None
+            at += 2 + int.from_bytes(b[at:at + 2], "big")
+    return bytes(b) if at <= len(b) else None
+
+
 def header_kept(old, new, codec):
-    """Whether the codec private data new, in hex, keeps old after ended_track() for a track of codec. It must be the
-    same. A HandBrake ASS header ends in a NUL byte and has no [Events] section. mkvmerge drops the NUL and adds the
+    """Whether the codec private data new, in hex, keeps old for a track of codec. It must be the same. An HEVC
+    header may also be old with the array_completeness bits cleared, see hvcc_cleared(). After ended_track(), a
+    HandBrake ASS header ends in a NUL byte and has no [Events] section. mkvmerge drops the NUL and adds the
     section, so such a header may also be old less that byte, then a blank line, "[Events]" and the Format line of
     EVENTS_FORMAT. A section name matches in any case, as libass reads it, so an old header with "[events]" fails too.
     Any other change fails."""
@@ -368,6 +394,8 @@ def header_kept(old, new, codec):
         a, b = bytes.fromhex(old or ""), bytes.fromhex(new or "")
     except ValueError:
         return False
+    if codec == HEVC:
+        return b == hvcc_cleared(a)
     events = f"\r\n[Events]\r\nFormat: {EVENTS_FORMAT.get(codec)}\r\n\r\n".encode()
     return codec in EVENTS_FORMAT and a.endswith(b"\0") and b"[events]" not in a.lower() and b == a[:-1] + events
 
@@ -393,14 +421,15 @@ def grid_moved(plan, fix):
 def props_fault(j, new, drop=(), ended=()):
     """Why the tracks of the remuxed probe new differ from those of j less the track ids in drop, or None: the type,
     codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, and the count of attachments
-    and chapters. ended holds the track ids of j that ended_track() wrote again, whose codec private data passes
-    header_kept()."""
+    and chapters. The codec private data of an HEVC track, and of a track in ended, must pass header_kept(). ended holds
+    the track ids of j that ended_track() wrote again."""
     j = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop])
     if checks.track_list(j) != checks.track_list(new): return f"the tracks changed from {checks.track_list(j)} to {checks.track_list(new)}"
     for a, b in zip(j.get("tracks") or [], new.get("tracks") or []):
         pa, pb = a.get("properties") or {}, b.get("properties") or {}
+        own = a.get("id") in ended or pa.get("codec_id") == HEVC   # a header that header_kept() may pass
         diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)
-                and not (k == "codec_private_data" and a.get("id") in ended and header_kept(pa.get(k), pb.get(k), pa.get("codec_id")))]
+                and not (k == "codec_private_data" and own and header_kept(pa.get(k), pb.get(k), pa.get("codec_id")))]
         if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"
     for k in ("attachments", "chapters"):
         if len(j.get(k) or []) != len(new.get(k) or []): return f"the {k} changed from {len(j.get(k) or [])} to {len(new.get(k) or [])}"
@@ -427,85 +456,67 @@ def flash_plan(cues, ass=False):
 
 
 class Plan(list):
-    """The rows of a time_plan(), with the blocks it follows in blocks. So blocks_moved() counts each cue with its
-    block."""
+    """The rows of a time_plan(), with the kept blocks it follows in blocks. So blocks_moved() counts the cues they
+    keep."""
     blocks = ()
 
 
-def time_plan(cues, fix, blocks, ends=None, ass=False):
+def time_plan(cues, fix, blocks, ends=None, ass=False, starts=None):
     """A Plan [(start, text, old end, new start, new end)] of cues [(start, end, text)] in their order, or None when no
-    time moves. fix is a fix of subsync.timing(), or None. blocks are the blocks of subsync.blocks(). A cue starts at
-    moved(start, fix) less the shift of the block whose [from, to) holds its start, unless the block keeps that start,
-    rounded to ms, in "keep": a cue with no evidence of its own stays, see subsync.mover(). Each start takes the shift
-    of subsync.shift_of(): its own shift on a live-captioned track, see subsync.live_moves(), or the shift the block's
-    "clamp" names, so it stops one centisecond short of the cue next to it, see subsync.clamped(). A cue of a "kept"
-    block, see subsync.keep_blocks(), keeps its start and end, or its flash end, whatever the fix, unless a live block
-    follows it, see below. ends are the new ends of flash_plan() in the same order, or None. A cue's end takes its new
-    end first, then moves as its start does.
+    time moves. fix is a fix of subsync.timing(), or None, and a cue starts at moved(start, fix). ends are the new ends
+    of flash_plan() in the same order, or None. A cue's end takes its new end first, then moves as its start does.
 
-    Live captions show each line until the next one starts, and their cues move by different times. So a block with
-    "shifts", see subsync.live_moves(), changes the ends of its cues, moved or in its "keep". It changes the end of the
-    cue just before the block too, even one of a "kept" block or another block. That never happens in production,
-    because a live block holds every cue of its track. A cue's next cue is the one with the next later start, and its
-    next later new start is the first new start after its own. A cue that ran back to back with its next cue ends at
-    its next later new start. Back to back means its end, the flash end if any, lies at or past the next cue's start,
-    within 1 ms, 1 cs on ASS. Any other cue keeps its length and ends at its next later new start at most. So no cue
-    shows past the next later new start, and no gap opens where the file had none. Cues on one new start show together
-    until the next later new start. Those are cues that start together in the file, and cues clamped to 0.
+    blocks are the "kept" blocks of subsync.keep_blocks(): a cue whose start lies in one keeps its start and end, or its
+    flash end, whatever the fix. starts {place of a cue in start order: its new start} are the moves of the whole-file
+    timing, see subtitles.sub_whole(). Cues that start together keep their order in cues. Such a cue takes that start,
+    and align.ends() gives the new ends of the cues around the moves from their ends, the flash ends when there are
+    any.
 
     A start stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an
     ASS time rounds to them, and an ASS end stays 1 cs after its start. With subsync.INVARIANTS, subsync.ordered()
-    checks the order of the new starts, and subsync.live_ends() the ends of a live block."""
+    checks the order of the new starts."""
     step = 10 if ass else 1   # ms
-    at = lambda t, shift: round(((subsync.moved(t * 1000, fix) if fix else t * 1000) - shift * 1000) / step) * step
+    at = lambda t: round((subsync.moved(t * 1000, fix) if fix else t * 1000) / step) * step
+    new_starts, new_ends = {}, {}
+    if starts:   # the ends rule is align.ends(), on the lines in start order
+        order = sorted(range(len(cues)), key=lambda k: cues[k][0])
+        new_starts = {order[n]: x for n, x in starts.items()}
+        new_ends = {order[n]: x for n, x in align.ends([(cues[k][0], ends[k] if ends else cues[k][1], "") for k in order], starts).items()}
     out = []
     for k, (s, e, text) in enumerate(cues):
-        b = subsync.mover(blocks, s)
-        if b is not None and b.get("kept"):   # a run a partial shift keeps, see subsync.keep_blocks(): its own times
-            out.append((s, text, e, s, ends[k] if ends else e))
-            continue
-        shift = subsync.shift_of(b, s) if b else 0
-        a = max(0, at(s, shift))
-        out.append((s, text, e, a / 1000, max(at(ends[k] if ends else e, shift), a + step) / 1000))
-    live = [any("shifts" in b and b["from"] <= s < b["to"] for b in blocks or ()) for s, *_ in cues]   # a cue of a live block
-    if any(live):
-        heads, near = {s: a for s, _, _, a, _ in out}, {s for (s, *_), x in zip(cues, live) if x}   # cues that start together keep one start
-        later, news = sorted(heads), sorted(set(heads.values())) + [float("inf")]
-        for k, (s, text, e, a, n) in enumerate(out):
-            j, top = bisect.bisect_right(later, s), news[bisect.bisect_right(news, a)]   # the next cue, and the next later new start
-            if j < len(later) and top < float("inf") and (live[k] or later[j] in near):
-                out[k] = (s, text, e, a, top if (ends[k] if ends else e) >= later[j] - step / 1000 - 1e-9 else min(n, top))
-    if subsync.INVARIANTS:   # the order rule, and the ends of a live block
-        case = {"cues": cues, "fix": fix, "blocks": blocks, "ends": ends, "ass": ass, "plan": out}
-        subsync.ordered([(s, max(0, at(s, 0)) / 1000, a) for s, _, _, a, _ in out], case)
-        if any(live):
-            subsync.live_ends([(s, ends[k] if ends else e, a, n, x) for k, ((s, _, e, a, n), x) in enumerate(zip(out, live))], ass, case)
+        end = ends[k] if ends else e
+        if k in new_starts or k in new_ends:
+            a = max(0, round(new_starts.get(k, s) * 1000 / step) * step)
+            out.append((s, text, e, a / 1000, max(round(new_ends.get(k, end) * 1000 / step) * step, a + step) / 1000))
+        elif subsync.mover(blocks, s) is not None:   # a run a partial shift keeps, see subsync.keep_blocks(): its own times
+            out.append((s, text, e, s, end))
+        else:
+            a = max(0, at(s))
+            out.append((s, text, e, a / 1000, max(at(end), a + step) / 1000))
+    if subsync.INVARIANTS:   # the order rule
+        subsync.ordered([(s, max(0, at(s)) / 1000, a) for s, _, _, a, _ in out], {"cues": cues, "fix": fix, "blocks": blocks, "ends": ends, "ass": ass, "plan": out})
     plan = Plan(out)
     plan.blocks = blocks
     return plan if any(abs(a - s) + abs(b - e) > 0.0005 for s, _, e, a, b in out) else None
 
 
 def blocks_moved(plan, fix=None):
-    """How the time_plan() plan moves its cues past fix, the whole-track fix it holds, as "14 cues of 1 block moved
-    -1.42 s", or None when it moves none. Each cue counts with the block that moves it, see subsync.mover(), a cue that
-    moves part of the way too, see subsync.clamped(). A block gives its shift. A move under 0.05 s is the rounding of
-    ASS times. A live-captioned track moves each cue by its own time, so it gives the range, as "1203 cues moved
-    -18.20 s to -3.10 s, each by its own time". The runs of a partial shift that keep their times against the fix give
-    "12 cues kept their times"."""
-    runs = {}
-    for s, _, _, a, _ in sorted(plan, key=lambda p: p[0]):
-        b, d = subsync.mover(plan.blocks, s), a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
-        if b is not None and abs(d) > 0.05:
-            runs.setdefault(id(b), (b, []))[1].append(d)
-    kept = sum(len(ds) for b, ds in runs.values() if b.get("kept"))   # a run of a partial shift that keeps its times, see subsync.shifted()
-    runs = {k: v for k, v in runs.items() if not v[0].get("kept")}
-    if not runs:
+    """How the time_plan() plan moves its cues past fix, the whole-track fix it holds, as "82 lines moved -3.00 s", or
+    "300 lines moved -0.12 s to -2.98 s" when they move by different times, or None when it moves none. A move under
+    0.05 s is the rounding of ASS times. The runs of a partial shift that keep their times against the fix give "12
+    cues kept their times", see subsync.keep_blocks()."""
+    kept, moves = 0, []
+    for s, _, _, a, _ in plan:
+        d = a - max(0, subsync.moved(s * 1000, fix) / 1000 if fix else s)
+        if abs(d) > 0.05:
+            if subsync.mover(plan.blocks, s) is not None:
+                kept += 1
+            else:
+                moves.append(d)
+    if not moves:
         return f"{kept} cues kept their times" if kept else None
-    if any("shifts" in b for b, _ in runs.values()):
-        moves = sorted(d for _, ds in runs.values() for d in ds)
-        return f"{len(moves)} cues moved {moves[0]:+.2f} s to {moves[-1]:+.2f} s, each by its own time"
-    return (f"{sum(len(ds) for _, ds in runs.values())} cues of {len(runs)} block{'s' if len(runs) > 1 else ''} moved "
-            + ", ".join(f"{-b['shift']:+.2f} s" for b, _ in runs.values()))
+    lo, hi = min(moves), max(moves)
+    return f"{len(moves)} lines moved {lo:+.2f} s" + (f" to {hi:+.2f} s" if hi - lo >= 0.05 else "")
 
 
 def set_ends(text, ass, plan):

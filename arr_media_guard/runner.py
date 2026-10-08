@@ -3,7 +3,7 @@
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
 import collections, contextlib, dataclasses, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request
 
-from . import apps, checks, cli, config, content, convert, decide, logs, plex, process, regrab, report, store, subsync, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, judge, logs, plex, process, regrab, report, store, subsync, subtitles, vault
 
 
 def gated(f, op, wait=config.DEADLINE):
@@ -262,15 +262,18 @@ def judged(rec, keys):
     return bool(keys) and all({seen(k).get("verdict"), (seen(k).get("layout") or {}).get("verdict")} & set(JUDGED) for k in keys)
 
 
-def times_judged(rec, k):
-    """Whether the run of rec judged the times of subtitle k again, for a held timing alert, see held_after(). Its
-    timing reached a fix, "in time", steps, an offset it left (unfixed) or a fix it did not confirm, or dense hearing
-    moved its lines, or its remux retimed it. A subtitle that does not match the audio is judged by that, and its own
-    alert says so. A word check that matched but timed too few windows judged no times, so the held alert posts."""
+def times_judged(rec, k, spans=()):
+    """Whether the run of rec judged the times of subtitle k again, for a held timing alert, see held_after(). The timing
+    judge gave it an outcome other than unknown, see judge.outcomes(), and the run heard each place of spans again,
+    [[from, to]] seconds that the import's outcome left off, see judge.heard_again(). That outcome posts itself when
+    lines are still off. A subtitle that does not match the audio is judged by that, and its own alert says so. When
+    the whole-file timing judged nothing, as when its hearing stopped part way, the outcome is unknown, and the held
+    alert posts."""
     r = {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}.get(k) or {}
-    t = r.get("timing") or {}
-    return (r.get("verdict") == "mismatch" or bool(t.get("fix")) or t.get("why") == "in time" or any(x in t for x in ("piecewise", "unfixed", "unconfirmed"))
-            or bool(((rec.get("blocks") or {}).get(k) or {}).get("blocks")) or k in remuxed(rec))
+    if r.get("verdict") == "mismatch":
+        return True
+    o = (rec.get("subjudge") or {}).get(k) or {}
+    return o.get("state", "unknown") != "unknown" and all(judge.heard_again(rec, k, lo, hi) for lo, hi in spans or ())
 
 
 def remuxed(rec):
@@ -319,7 +322,7 @@ def held_after(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
     said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or [] if report.posts(f, rec)))
     for h in job["held"]:
-        timing = h["kind"] != "subtiming" or all(times_judged(rec, k) for k in h["keys"])   # a timing alert needs the times judged too
+        timing = h["kind"] != "subtiming" or all(times_judged(rec, k, (h.get("spans") or {}).get(k)) for k in h["keys"])   # the times judged too
         if judged(rec, h.get("keys")) and timing:   # only a run that reached its alerts holds verdicts, see process.STEPS
             out += logs.held_changes(app, [h], "checked again", said)
         elif rec.get("outcome") == "error" and h.get("keys") and set(h["keys"]) <= remuxed(rec):
@@ -424,7 +427,8 @@ def deep_analysis(name, pending, claimed=False):
     minutes. That read is kept by the file's size and mtime, so a file that changed is read again under the lock. It
     takes the lock shared, hears without it, and takes it exclusive before an edit, and it plans again when the file
     changed, as a backfill file does. When an import waits in the queue, it stops between two steps: after the
-    whole-file read, between two groups of its sweep, before each read and each fit of a track, and before a remux.
+    whole-file read, between two groups of windows of its whole-file hearing, during its speech and onset reads, before
+    each read and each fit of a track, and before a remux.
     The job goes back to the deep analysis queue, and its next run finds the words heard so far in the cache, and the
     whole-file read in the store. A track of that read that was cut short is a Cut again, see subtitles.Cut. A read
     kept by a version that did not mark such tracks is read again. A conversion of its own before the stop changed the
@@ -1288,6 +1292,9 @@ def job_process(name, w, sigmask):
     except SystemExit as ex:
         code = ex.code if isinstance(ex.code, int) else 1
     except BaseException as ex:   # its stderr may be /dev/null, so the line is its only trace. requeue() counts the crash.
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one: finished() raises it again
+            with contextlib.suppress(OSError):
+                os.write(w, json.dumps({"broken": str(ex)}).encode())
         with contextlib.suppress(Exception):
             logs.decision(dict(source="hook", job=name, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300],
                                trace=traceback.format_exc(limit=3)[-800:]), started)
@@ -1298,7 +1305,8 @@ def job_process(name, w, sigmask):
 def finished(name, status, out, pending):
     """Take the Plex analyze of a job process that exited, and TMDB's pause after a failure, so the next job processes
     skip TMDB the way one process would. A job still claimed goes back to the queue. An exit by SIGTERM is a stop, and
-    anything else is a crash."""
+    anything else is a crash. A broken safety rule in the job process raises subsync.Broken here, after the requeue, so
+    a test run sees it."""
     code = os.waitstatus_to_exitcode(status)
     try:
         res = json.loads(out) if out else {}
@@ -1310,6 +1318,8 @@ def finished(name, status, out, pending):
         content.DOWN.update(down)
     if store.read("SELECT 1 FROM jobs WHERE name = ? AND claimed = 1", name):
         requeue(name, None if code == 128 + signal.SIGTERM else f"died by signal {-code}" if code < 0 else f"exited {code}")
+    if res.get("broken"):   # after the requeue, so the job never stays claimed
+        raise subsync.Broken(res["broken"])
 
 
 def requeue(name, crash=None):

@@ -66,7 +66,6 @@ LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_lang
 SUB_TIMEOUT = 90       # seconds the subtitle check may hear one file, the model load included
 SPEECH_TIMEOUT = 1800  # seconds the speech read of one whole audio track may take at nice 19, see subtitles.sub_layout()
 SUB_MIN_SECONDS = 300  # a shorter file is never checked: its two windows would sit too close for a timing fit
-STEP_ALERT = 1.0       # seconds the windows of a piecewise result must differ by to alert. A smaller step goes to the log only.
 SUB_ROLES = ("full", "sdh", "dub")   # the subtitle roles the check takes. A forced or commentary track is never checked.
 # Languages written with no spaces between words. Their cue text reads as one long word, so the check can give no
 # verdict and never hears them.

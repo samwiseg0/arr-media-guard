@@ -523,7 +523,7 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None):
 def waits(gate, queue):
     """Another hearing waits for the host's model: it holds gate, the lid.turn.gate file of the hook, while it waits for
     its turn. Or an import job waits in the queue of queue, the hook's state store, or as a file in the queue folder
-    beside it. Either one makes the sweep yield, see sweep(). A store that does not read is no import."""
+    beside it. Either one makes sweep() yield. A store that does not read is no import."""
     if queue:
         folder = os.path.join(os.path.dirname(queue), "queue")   # the job files of a busy store, see runner.queue_job()
         if os.path.isdir(folder) and any(not n.startswith(".") for n in os.listdir(folder)):
@@ -546,9 +546,9 @@ def waits(gate, queue):
 
 
 def sweep(path, audio_index, starts, lang, group, secs=WORD_SECS, gate=None, queue=None, **kw):
-    """listen() over the windows of starts, group of them at a time, in this one process, for the sweep of --sub-time.
-    The model loads once, each group is one clip, and each group's words are cached as listen() caches them. Before
-    each group after the first it yields when another hearing or a job waits, see waits(): it returns what it heard,
+    """listen() over the windows of starts, group of them at a time, in this one process, for the hearings of --sub-time
+    and the deep analysis, such as the whole-file hearing. The model loads once, each group is one clip, and each
+    group's words are cached as listen() caches them. Before each group after the first it yields when another hearing or a job waits, see waits(): it returns what it heard,
     with "yielded", and the caller hears the rest later. Returns listen()'s answer over all windows, "cached" when
     every group was."""
     out = {"windows": [], "cached": True, "reused": 0, "took": 0.0, "profile": {}}
@@ -573,6 +573,41 @@ def words_get(cache, path, audio_index, model, lang, starts, secs=WORD_SECS):
                          (path, st.st_size, st.st_mtime_ns, audio_index, model, code(lang),
                           json.dumps([[round(s, 1), secs] for s in starts]))).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def windows_get(cache, path, audio_index, model, lang, grid=None, why=None):
+    """[{"at", "secs", "words"}] of every window the cache holds for path as it is now, stream audio_index, model and
+    language lang, in time order, whichever hearing heard it: the word check, an earlier deep analysis, or a run that
+    stopped part way. With grid, a set of (at, secs), only those windows count. A window that two hearings heard comes
+    once, from the first. A row or a window that does not read is left out on its own, and why, a list, gets the
+    reason once. It never raises and never creates the cache."""
+    bad = lambda x: why is not None and x not in why and why.append(x)
+    try:
+        st = os.stat(path)
+        if not os.path.exists(cache): return []
+        with closing(_db(cache)) as db, db:
+            rows = db.execute("SELECT words FROM words WHERE path=? AND size=? AND mtime_ns=? AND idx=? AND model=? AND lang=? ORDER BY at",
+                              (path, st.st_size, st.st_mtime_ns, audio_index, model, code(lang))).fetchall()
+    except (sqlite3.Error, OSError) as ex:
+        bad(f"the word cache does not read: {ex}")
+        return []
+    one = {}
+    for (x,) in rows:
+        try:
+            ws = json.loads(x)
+        except ValueError:
+            bad("a row of the word cache does not read")
+            continue
+        for w in ws if isinstance(ws, list) else ():
+            try:
+                key = (round(float(w["at"]), 1), float(w["secs"]))
+                words = [[float(t), str(v)] for t, v in w["words"]]
+            except (KeyError, TypeError, ValueError):
+                bad("a window of the word cache does not read")
+                continue
+            if grid is None or key in grid:
+                one.setdefault(key, dict(w, at=float(w["at"]), secs=key[1], words=words))
+    return [one[k] for k in sorted(one)]
 
 
 def jobs(path, spec, cache, model=MODEL, model_dir=MODEL_DIR):
@@ -620,9 +655,9 @@ def main(argv=None):
     ap.add_argument("--words", nargs="+", metavar="LANG START", help="the subtitle check: the words of a window from each START")
     ap.add_argument("--secs", type=float, default=WORD_SECS, help="the seconds of each --words window")
     ap.add_argument("--more", nargs="+", help="a second window per --words START, - for none, heard when its window hears too little")
-    ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the sweep, see sweep()")
-    ap.add_argument("--yield-gate", help="the sweep and the speech read yield while another hearing holds this gate file, see waits()")
-    ap.add_argument("--yield-queue", help="the sweep and the speech read yield while an import job waits in this state store, see waits()")
+    ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the whole-file hearing, see sweep()")
+    ap.add_argument("--yield-gate", help="sweep() and the speech read yield while another hearing holds this gate file, see waits()")
+    ap.add_argument("--yield-queue", help="sweep() and the speech read yield while an import job waits in this state store, see waits()")
     ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
     ap.add_argument("--speech", action="store_true", help="the spans of speech of the whole stream, for the speech layout check, see speech()")
     a = ap.parse_args(argv)

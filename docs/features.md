@@ -65,38 +65,53 @@ check*. It needs language detection.
   into `.<NAME>-originals`, the folder of [kept originals](regrabs.md#kept-originals). When AMG cannot remove a track,
   it stops the track playing by default and alerts.
 - A subtitle early or late by one amount gets new times. So does one made for another frame rate, which drifts.
-- The *deep analysis*, a slower subtitle check after the import, also fixes a drift. It hears one part of the audio in
-  each minute. A few parts heard wrong do not block the fix, see [subtitles.md](subtitles.md#drift-timing).
+  When the word check finds a subtitle off and no new times pass the checks, an alert says it seems off. An alert
+  posts only where AMG heard lines three quarters of a second or more off after its moves, see
+  [Timing outcome](design.md#timing-outcome). After a move, it says what moved and where lines are still off.
+- The *deep analysis*, a slower subtitle check after the import, listens to the whole audio and times every line. It
+  fixes a drift, a jump in the middle of the file, a stretch of lines out of sync and live captions, see
+  [Whole-file timing](subtitles.md#whole-file-timing).
 - Roll-up captions repeat the lines above each new line. AMG times each caption by its new line. So a roll-up track in
   sync no longer gets a false "late" alert, see [subtitles.md](subtitles.md#roll-up-captions).
 - A text subtitle whose lines flash by too fast to read gets lines that stay on screen longer.
 - A subtitle in another language, or one made of pictures, has no words AMG can compare with the speech. AMG times it
   against one whose words matched. An import does this while its time limit allows.
 
-`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears much more of the
-audio. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
+`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears the whole audio, about
+15 CPU minutes an hour of video. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
 `--sub-time` single files, see [subtitles.md](subtitles.md).
+
+### Mid-file jump timing
+
+A release can add or cut a moment of the video in the middle of a file. From that point on, every line of a subtitle
+shows the same amount earlier or later. That point is a *jump*. The deep analysis listens to the whole audio and finds
+the line where each jump starts. Each part of the subtitle between jumps that sits half a second or more off the speech
+moves onto it. It runs in the deep analysis and with `--sub-time`, see
+[subtitles.md](subtitles.md#mid-file-jump-timing).
+
+A fixed jump posts nothing. With `DISCORD_POSTS=all` the change post says how many lines moved, for example "Moved
+**230 lines** of the English subtitles (track 1) to their speech." A subtitle that AMG times against the speech or
+another subtitle, such as one in a language no audio track speaks, gets no jump fix. When its parts sit half a second
+or more apart, an alert says so, with the least and the most they sit off.
 
 ### Subtitle block timing
 
 Sometimes only part of a subtitle is out of sync. A release might have a scene cut or added, so the lines before it are
-fine and the lines after it show a few seconds early or late. AMG listens to the audio and finds the stretch of lines
-that is off, a *block*. It moves only those lines to where the words are spoken. Lines that are already in sync stay
-where they are, and lines never change order.
+fine and the lines after it show a few seconds early or late. AMG listens to the whole audio and finds the stretch of
+lines that is off, a *block*. It moves only those lines to where the words are spoken. Lines that are already in sync
+stay where they are, and lines never change order.
 
-Two separate signs from the audio check the stretch. One is the words AMG hears. The other is the moments where speech
-starts after a pause. When they disagree, nothing moves. When too few such moments are found, the words alone decide,
-and the stretch must sit a full second or more off. A line moves only when its own words are heard at the new place. It
-runs in the deep analysis, and when you run `--sub-time` on a file, see
-[subtitles.md](subtitles.md#subtitle-block-timing).
+A long block moves on the words AMG hears. A short one also needs the moments where speech starts after a pause to
+agree, or must sit further off. When those moments disagree, nothing moves. It runs in the deep analysis, and when you
+run `--sub-time` on a file, see [subtitles.md](subtitles.md#subtitle-block-timing).
 
 ### Live caption timing
 
 Live captions are typed during a broadcast. Each line shows some seconds after it is spoken, by a different amount each
-time. AMG spots such a track by its changing delay. A delay that grows or shrinks steadily is a drift instead. One fix
-for the whole track corrects a drift, see [Drift timing](subtitles.md#drift-timing). It hears the whole audio and moves
-each line to where its first word is spoken. A line it cannot place stays, and lines never change order. It runs in the
-deep analysis and with `--sub-time`. When over a fifth of the lines stay out of sync, an alert says how many moved, see
+time. AMG spots such a track by its changing delay. A delay that grows or shrinks steadily is a drift instead, which
+one fix corrects, see [Drift timing](subtitles.md#drift-timing). AMG hears the whole audio and moves each line to where
+its first word is spoken. A line it cannot place moves with the lines around it, or stays, and lines never change order.
+It runs in the deep analysis and with `--sub-time`. When lines stay out of sync, an alert says how many moved, see
 [subtitles.md](subtitles.md#live-caption-timing).
 
 ### Foreign subtitle timing
@@ -213,10 +228,12 @@ before. At `fix` or `deep` it fixes. At `off` it does nothing. It keeps the flag
 alerts look like those of an import. `RECHECK_ON_UPDATE=false` turns it off.
 
 The recheck covers only files with a saved result. A file the subtitle check never saw needs one `--sub-check` run. A
-recheck reaches only the results whose findings the new version can fix. A recheck of a result that an import or
-`--sub-check` saved runs at that depth. It does not listen to each minute of the audio, so it cannot make the drift fix
-of the deep analysis, see [Drift timing](subtitles.md#drift-timing). A file saved with no timing finding, such as a
-drift an older version called in sync, needs `arr-media-guard --sub-time <file> --apply`.
+recheck reaches only the results whose findings the new version can fix. 2.8.0 rechecks every result that the deep
+analysis or `--sub-time` saved, once, because its whole-file timing can fix any of them. A file with no text subtitle
+in the audio's language gets that recheck too, and hears nothing. A recheck of a result that an import or
+`--sub-check` saved runs at that depth. It never listens to the whole audio, so it cannot make the fixes of the deep
+analysis, see [Whole-file timing](subtitles.md#whole-file-timing). Such a file needs
+`arr-media-guard --sub-time <file> --apply`.
 `--backfill <instance> --sub-check --recheck` checks files again by hand, whatever their saved result says, see
 [commands.md](commands.md#dry-runs-and-the-backfill).
 
@@ -270,8 +287,8 @@ subtitle hunter's posts.
 With `SUBTITLES=deep`, each problem gets one alert. The import holds back its subtitle alerts, because the deep analysis
 checks those subtitles again. The deep analysis then posts once, and only what it still finds wrong. A subtitle problem
 it fixes gets no alert. With `DISCORD_POSTS=all` it gets the one post of the change. A held alert still posts when
-nothing judged its subtitles again. That happens after an error, when AMG could not hear the audio, or when `SUBTITLES`
-is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` at 2 or more, it also posts when
+nothing judged its subtitles again. That happens after an error, when AMG could not hear the audio or its listening
+stopped part way, or when `SUBTITLES` is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` at 2 or more, it also posts when
 the deep analysis crashes three times. With `HOOK_WORKERS=1`, a deep analysis that crashes the worker runs again at the
 next start, and its held alert waits. A held alert waits with the deep analysis job in the background queue, so a
 restart keeps it. When the app renames or moves the file, the deep analysis asks the app where it is and checks it

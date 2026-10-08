@@ -19,9 +19,10 @@ Set `SUBTITLES` in the env file. The default is `deep`.
 
 - The *deep analysis* is a slower subtitle check after an import. It waits in the background queue and runs only while
   no import waits. It also reads the subtitle tracks that the file's seek index does not list. Old mkvmerge versions
-  left them out, so only a read of the whole file finds their text. It listens to one part of the audio in each minute.
-  It times the subtitles the import could not, including one that drifts slowly out of sync, see
-  [Drift timing](#drift-timing). It moves a stretch of lines that is out of sync, see
+  left them out, so only a read of the whole file finds their text. It listens to the whole audio and times every line,
+  see [Whole-file timing](#whole-file-timing). It times the subtitles the import could not, including one that drifts
+  slowly out of sync, see [Drift timing](#drift-timing). It moves the lines that a jump in the middle of the file put
+  out of sync, see [Mid-file jump timing](#mid-file-jump-timing). It moves a stretch of lines that is out of sync, see
   [Subtitle block timing](#subtitle-block-timing). It times live captions line by line, see
   [Live caption timing](#live-caption-timing). It times subtitles in a language no audio track speaks, see
   [Foreign subtitle timing](#foreign-subtitle-timing). It also repairs garbled text, see
@@ -72,8 +73,7 @@ arr-media-guard --sub-time "/data/tv/Show A/Season 1/Show A - S01E02.mkv" --appl
 
 `--sub-time` makes every subtitle check on each file it names, as the deep analysis does, and ignores saved results. It
 times every subtitle whose words it cannot compare with the speech against one whose words matched the audio. It listens
-to one part of the audio in each minute. Where a part sits out of sync, it listens to that stretch in full, see
-[Subtitle block timing](#subtitle-block-timing).
+to the whole audio of each subtitle whose words match, and times every line, see [Whole-file timing](#whole-file-timing).
 
 - The file needs no app. For a path outside Sonarr and Radarr, such as a copy, AMG knows no original language. A
   subtitle that does not match the audio then counts as wrong. The exception is a file that also holds audio in a
@@ -104,8 +104,8 @@ Each subtitle gets one line, with these columns.
 2. The format, the language and the role. `full` holds all dialogue. `sdh` holds all dialogue and the sounds, for deaf
    and hard-of-hearing viewers. `dub` is a transcript of an English dub.
 3. How AMG judged it.
-   - `words` means AMG compared it with the words heard in the audio. `a reference: in time`, `fixed` or `clean sweep`
-     after it means AMG used it to time other subtitles.
+   - `words` means AMG compared it with the words heard in the audio. `a reference: in time` or `fixed` after it means
+     AMG used it to time other subtitles.
    - `reference s1` means AMG timed it against `s1`. `reference, none` means no subtitle could time it.
    - `speech layout` means AMG judged it by where people speak, see [Foreign subtitle timing](#foreign-subtitle-timing)
      and [Incorrect subtitle identification](#incorrect-subtitle-identification).
@@ -115,31 +115,31 @@ Each subtitle gets one line, with these columns.
    with a score.
 5. The new times, as a shift in seconds and a frame-rate ratio, or `in time`. `2 lines kept` counts the lines at the
    start or end that keep their times.
-6. What AMG did, such as `none`, `retimed`, `removed`, `flags off`, `report only`, `alert only`, or the remux it would
-   make.
+6. What AMG did, such as `none`, `retimed`, `lines moved`, `removed`, `flags off`, `report only`, `alert only`, or the
+   remux it would make.
 7. Why.
 
 The lines after them:
 
 - A `flash` line names a subtitle whose lines flash by, and the new end times of its first lines.
-- `sweep of s1` starts a table with one row for each part of the audio AMG listened to. A row gives the time and the
-  number of words heard, and the share that matched the subtitle. It also gives the lines whose first word matched, and
-  how far off they sit. A row marked `ALERT` belongs to a stretch where the subtitle sits 1 second or more off. That
-  stretch is large enough to alert. A row that is off but too small to alert says so, such as `one window alone`. The
-  output calls each part a *window*.
-- A line such as `s1: 14 cues from 16:21 to 17:40 moved -1.42 s` names a stretch of lines that AMG moved, see
-  [Subtitle block timing](#subtitle-block-timing). A dry run says `would move`. `not moved` means the remux failed, or
-  the subtitle is WebVTT, which AMG never rewrites. Its end says whether the moments where speech starts agreed.
-- A `no block` line names a stretch AMG listened to and left as it was, with each reason.
+- A line such as `s1: whole-file timing, 390 of 400 lines anchored, lag +0.40 s, scatter 0.12 s, 200 lines would move`
+  sums up the whole-file timing of a subtitle. An *anchored* line is one whose first spoken word AMG found in the audio.
+  The *lag* is how late the anchored lines sit, at their median. The *scatter* is how far they spread around the
+  timing AMG fitted, and `(live captions)` after it marks live captions. A dry run says `would move`. `not moved` means
+  the remux failed, or the subtitle is WebVTT, which AMG never rewrites.
+- A `whole segment` or `fine segment` line names a stretch of lines that sits half a second or more off. It gives the
+  first and the last anchored line, the anchors, the frame-rate ratio and how far off it sits. It ends with whether it
+  `moves` or `stays`, and the rule that decided. `whole` is the first pass over the file, and `fine` the second, which finds short
+  stretches.
+- A `still off` line names lines that sit three quarters of a second or more off after the moves, where and by how much.
 - A `garbled` line names a subtitle with garbled characters and where its right text comes from. It gives the language
   it reads as, how many lines were cut short, and what AMG did, see [Garbled subtitle repair](#garbled-subtitle-repair).
-- A `live captions` line names live captions timed line by line. It says how many lines moved, and how many stay out of
-  sync, see [Live caption timing](#live-caption-timing).
-- The last lines give the CPU time of the listening. A `speech read` line gives the time it took to find the speech for
-  [Foreign subtitle timing](#foreign-subtitle-timing).
+- The last lines give the CPU time of the listening. A `whole-file hearing` line names the windows AMG heard, their CPU
+  time, the windows that came from the cache, and why a step of the listening failed. A `speech read` line gives the
+  time it took to find the speech for [Foreign subtitle timing](#foreign-subtitle-timing).
 - A line that starts with `ALERT` names a problem, as its Discord alert words it.
 
-The decision log holds the results under `subcheck`, `subtime`, `flash`, `sweep`, `blocks`, `garbled` and `speech`.
+The decision log holds the results under `subcheck`, `subtime`, `flash`, `whole`, `whole_facts`, `garbled` and `speech`.
 
 ### Roll-up captions
 
@@ -151,114 +151,131 @@ AMG times each caption of such a track by its new line, which is spoken as the c
 line, such as `>> Reporter:`, does not count. A roll-up track in sync no longer gets a "late" alert. A roll-up track
 that is really out of sync still gets its fix, or its alert.
 
+### Whole-file timing
+
+The deep analysis and `--sub-time` listen to the whole audio behind each subtitle whose words match it, and time every
+line against it. An import never does this, because it takes minutes.
+
+1. AMG listens to the whole audio track in parts of 10 seconds, a new part every 7.5 seconds, so the parts overlap a
+   little. The output calls each part a *window*. AMG keeps each window it heard for the file. So a run that stopped
+   goes on where it stopped, and a second run listens to nothing new.
+2. AMG lines up the words of every subtitle line with the words it heard, in order, over the whole file. A line is
+   *anchored* where its first spoken word was heard. A line of song lyrics, a line shown for a split second, and two
+   lines in a row with the same words get no anchor. A speaker's name, such as `>> Reporter:`, does not count, and
+   neither do the repeated lines of [roll-up captions](#roll-up-captions).
+3. AMG fits one timing through the anchors. It is a chain of stretches. Each stretch sits off the speech by a steady
+   amount, or drifts at a frame-rate ratio. A new stretch starts only at a real change, such as a jump in the middle of
+   the file. A second pass looks for short stretches inside the first ones.
+4. A stretch that sits half a second or more off its speech moves onto it when the evidence is strong enough.
+   - A stretch of 30 anchored lines or more moves on the heard words alone.
+   - A shorter stretch moves when the moments where speech starts after a pause agree with the move. It never moves
+     when they disagree, or when it sits over 10 seconds off.
+   - On the heard words alone, a shorter stretch moves with 6 anchored lines a second or more off. It also moves with
+     15 anchored lines three quarters of a second or more off. 3 anchored lines 2 seconds or more off move when they
+     agree closely, as at a jump near the end of a file.
+5. A line with no anchor moves with its stretch when the anchored lines on both sides of it belong to that stretch.
+   They must lie within 15 seconds of it, unless the stretch holds 30 anchored lines or more. An anchored line moves
+   toward its own speech, and never past it. A line with no anchor moves no farther than the anchored lines next to
+   it. Lines never change order. Two lines stay half a
+   second apart, or as close as they were. A line that would start before the file's start stays.
+6. A moved line keeps how long it shows. It ends two frames before the next line starts, and shows half a second at
+   least, unless the next line starts sooner. Lines shown inside a long line do not count as its next line. A line
+   that ran up to the next line still does. So a move opens no gap, and puts no two lines on screen at once.
+
+After the moves, AMG fits the timing again where the lines now sit. 10 anchored lines in a row three quarters of a
+second or more off post an alert. So do 3 or more anchored lines 2 seconds or more off that agree closely. The alert
+says what moved and where lines are still off, see [Timing outcome](design.md#timing-outcome). A subtitle in sync, or
+fixed, posts nothing. Under 20 anchored lines AMG judges nothing, and under 10 it moves nothing.
+
+- A subtitle in the file gets the new times in one remux, which AMG checks line by line. A sidecar is written again,
+  and AMG keeps the old one. A WebVTT subtitle is never rewritten, so its moves only report.
+- When the listening stops part way, as when the speech model fails, AMG moves nothing and judges nothing. An alert
+  the import held then posts. The result stays pending, but nothing queues a new run. A later `--sub-time` or deep
+  analysis of the file goes on where the listening stopped.
+- The listening runs on the CPU. It costs about 15 CPU minutes an hour of video, about 5.5 for a 22-minute episode and
+  about 30 for a 2-hour film. The deep analysis gives way to an import between two pairs of windows.
+- Known limit: a line with no heard words moves no farther than the heard lines next to it. When one of them stays,
+  the line stays too, even when the stretch around it is off.
+- Known limit: a stretch of lines with no heard words right before a jump can move with the part after the jump.
+- Known limit: the speech model can hear a long stretch late. When too few moments where speech starts check it, AMG
+  moves that stretch.
+- Known limit: a stretch of 3 to 5 anchored lines off by under 2 seconds, or of 6 to 9 anchored lines off by under 1
+  second, posts nothing. It moves only when the moments where speech starts agree.
+
 ### Drift timing
 
 A subtitle made for another frame rate drifts. Its lines start in sync, or nearly, and fall further behind or ahead as
-the file plays. A DVD subtitle can drift by about a second over an episode. The check of an import hears two or three
-short parts of the audio. One of them can fall on lines the subtitle's author timed badly. No single fix then fits
-them, and the import alerts that the subtitle is out of sync by different amounts.
+the file plays. A DVD subtitle can drift by about a second over an episode. The deep analysis and `--sub-time` read a
+drift as one stretch at a frame-rate ratio. They move every line onto its speech, see
+[Whole-file timing](#whole-file-timing).
 
-The deep analysis and `--sub-time` listen to one part of the audio in each minute. When most of those parts lie on one
-steady drift, AMG gives the subtitle new times for that drift. A few parts heard wrong do not stop it. When the parts
-show the subtitle in sync, the import's alert waits, because a short stretch out of sync can fall between two of them.
-AMG drops the alert only when its listening in full finds each part the import heard off in sync, or moves the lines
-there, see [Subtitle block timing](#subtitle-block-timing). A part counts as off at three quarters of a second or more.
-Else the import's alert posts. An alert of a drift says how far off the subtitle is at the start and at the end.
+The check of an import hears two or three short parts of the audio. One of them can fall on lines the subtitle's
+author timed badly. No single fix then fits them, and the import alerts that the subtitle is out of sync by different
+amounts. A part is unsure when its heard words sit in sync and its line starts sit three quarters of a second or more
+off, 0.8 seconds or more apart. Lines shown early over a sound before their words do that, and so do the lines of a
+real stretch out of sync. An unsure part counts toward the import's alert. With `SUBTITLES=deep` the import holds that
+alert, and the deep analysis times every line. When every place the import heard off was heard again, and nothing is
+still off there, the alert does not post.
 
-- Two parts in a row can sit off the same way by three quarters of a second or more. They mark a stretch that is out
-  of sync, as after a scene cut. AMG then fixes nothing from this listening, and the import's alert stays.
-- When one half of the file sits steady, the subtitle does not drift, so AMG fixes nothing here either.
-- Live captions, whose delay keeps changing, never get this fix, see [Live caption timing](#live-caption-timing).
-- New times, from this listening or from the import, must make more lines show while their words are heard than the
-  lines do now. A tie keeps the times. On a subtitle in sync, a few lines its author timed off in the parts the import
-  heard can look like a drift of about a second, and this rule keeps every line where it is.
+- An import fixes a frame-rate drift when a middle part of the audio confirms it. Its new times must make more lines
+  show while their words are heard than the lines do now. A tie keeps the times. On a subtitle in sync, a few lines its
+  author timed off in the parts the import heard can look like a drift of about a second, and this rule keeps every
+  line where it is.
 - Known limit: when this rule keeps the times at an import, the import alerts that the subtitle is out of sync. With
   `SUBTITLES` at `fix` or `check`, no deep analysis listens again, so that alert posts even for a subtitle in sync.
-- Before AMG writes the new times, it listens to the whole file at them. A part that still sits three quarters of a
-  second off counts when it covers a quarter of the file, or when it reaches the start or the end over 90 seconds or
-  more. Then the subtitle had a step and no drift, so AMG fixes nothing, and the import's alert stays. A shorter part
-  in the middle keeps the fix, because subtitle authors time such stretches off by hand.
-- Known limit: the new times of a drift can take up most of a step under about a second. AMG then gives the subtitle
-  drift times, and the lines on one side of the step end up about half a second off.
-- An import never makes this fix, because it listens to too few parts. It still fixes a frame-rate drift when a middle
-  part of the audio confirms it. A recheck of a result that an import or `--sub-check` saved runs at that depth. It does
-  not listen to each minute either, so it cannot make this fix.
-- A file an older version found in sync keeps that result. To time it again, run
-  `arr-media-guard --sub-time <file> --apply` on it, see
-  [Time the subtitles of one file](#time-the-subtitles-of-one-file).
+  The same holds when the two parts the import hears at a third and at two thirds of the file refuse a small fix.
+- An alert of an import's drift says how far off the subtitle is at the start and at the end.
+- A recheck of a result that an import or `--sub-check` saved runs at that depth. It never listens to the whole file,
+  so it cannot make the fix of the deep analysis. To time such a file, run `arr-media-guard --sub-time <file> --apply`
+  on it, see [Time the subtitles of one file](#time-the-subtitles-of-one-file).
+
+### Mid-file jump timing
+
+A release can add or cut a moment of the video in the middle of a file. From that point on, every line of the subtitle
+shows the same amount earlier or later than the lines before it. The output calls that point a *jump*. Here a *part*
+is the run of lines between two jumps, or between a jump and the start or end of the file. The whole-file timing
+starts a new stretch at each jump. Each part that sits half a second or more off moves onto its speech, by the rules
+of [Whole-file timing](#whole-file-timing). A subtitle can hold any number of jumps. It runs in the deep analysis
+and with `--sub-time`. An import never does it.
+
+- Lines with no heard words between the last line heard before a jump and the first line heard after it stay where
+  they are.
+- A jump that moved posts nothing when no lines are still off. Else one alert says what moved and where lines are
+  still off. With `DISCORD_POSTS=all` the change post says how many lines moved.
+- A subtitle that AMG times against the speech or another subtitle gets no jump fix. When its parts sit half a second
+  or more apart, it alerts, see [Foreign subtitle timing](#foreign-subtitle-timing).
+- Known limit: a jump under half a second stays.
 
 ### Subtitle block timing
 
 Sometimes only part of a subtitle is out of sync. A release might have a scene cut or added, so the lines before it are
-fine and the lines after it show a few seconds early or late. AMG listens to the audio, finds the stretch of lines that
-is off, and moves only those lines to where the words are spoken. The output calls such a stretch a *block*. Lines that
-are already in sync stay where they are, and lines never change order. It runs in the deep analysis, and with
-`--sub-time`. An import never does it.
+fine and the lines after it show a few seconds early or late. The output calls such a stretch a *block*. The second
+pass of the whole-file timing finds it. AMG moves only those lines to where the words are spoken, by the rules of
+[Whole-file timing](#whole-file-timing). Lines that are already in sync stay where they are, and lines never change
+order. It runs in the deep analysis and with `--sub-time`. An import never does it.
 
-How AMG finds and moves a stretch:
-
-1. AMG listens to one part of the audio in each minute. A part where the subtitle sits half a second or more off marks a
-   stretch to look at. A stretch shorter than about a minute can fall between two parts, and then AMG misses it.
-2. AMG listens to that stretch in full, up to 2 minutes past it on each side. So it hears where the lines go back in
-   sync. When it still hears no edge, it listens up to 30 seconds further.
-3. At least 6 lines in a row must sit off by the same amount, while the lines around them are in sync. A stretch that
-   covers over half the file is no stretch. The whole subtitle is off then, and one shift for the whole subtitle fixes
-   it.
-4. Two separate signs from the audio check the stretch. One is the words AMG hears. The other is the moments where
-   speech starts after a pause. When they disagree, nothing moves. When too few such moments are found, the words alone
-   decide, and the stretch must sit a full second or more off.
-5. A line moves only with its own sign that it belongs to the stretch, such as its own words heard at the new place. A
-   line with no sign either way stays. A line whose move would pass a line that stays moves only part of the way. It
-   needs two of its own signs for that.
-
-- A moved line may overlap a line next to the stretch. That line keeps its times, and a player shows both lines for that
-  moment.
-- A subtitle in the file gets the new times in one remux, which AMG checks line by line. A sidecar is written again, and
-  AMG keeps the old one. A WebVTT subtitle is never rewritten, so its stretches only report.
-- A stretch that moved goes to the decision log only. A stretch that stays out of sync keeps its alert, which names
-  where the lines are off. A stretch that `--apply` could not move alerts that the subtitles need new times.
-
-Two kinds of wrong move remain, because nothing in the audio tells them from a real stretch.
-
-- Whisper, the speech model, can hear a whole stretch of a right subtitle early or late. When too few moments of speech
-  check it, a stretch heard a full second or more off moves on the words alone. On real right subtitles, the worst such
-  stretch measured sat about half a second off.
-- A line in sync between two stretches that are off the same way can move with them. That happens when its own words or
-  timing put it there.
-
-Listening to a stretch in full costs about 45 CPU seconds a minute of audio. AMG listens to 6 minutes at most for each
-audio track, about 4.5 CPU minutes. A file whose subtitles are in sync costs nothing more.
+- A block of 30 anchored lines or more moves on the heard words alone. A shorter block needs the moments where speech
+  starts to agree, or more distance on the heard words alone. A block over 10 seconds off stays, unless it holds 30
+  anchored lines. Such lines are more likely lines the audio does not hold, as a recap or another cut.
+- A block that moved posts nothing. A block that stays out of sync posts, and the alert names where the lines are off.
+  A block that `--apply` could not move alerts that the subtitles need new times.
 
 ### Live caption timing
 
 Live captions are typed during a broadcast. Each line shows some seconds after it is spoken, late by a different amount
-each time. One shift cannot fix that, and neither can a stretch. AMG moves each line of such a subtitle to its own
+each time. One shift cannot fix that, and neither can a stretch. AMG moves each line of such a subtitle onto its own
 speech. It runs in the deep analysis and with `--sub-time`.
 
-1. AMG spots live captions in its one-part-a-minute listening. The lines run late, and by amounts that keep changing. A
-   delay that grows or shrinks steadily is a drift instead. One fix for the whole track corrects a drift, see
-   [Drift timing](#drift-timing).
-2. AMG listens to the whole audio and finds where the first word of each line is spoken. A speaker's name before a line,
-   such as `>> Reporter:`, is never spoken, so it does not count. Neither do the lines of roll-up captions that repeat
-   the caption before, see [Roll-up captions](#roll-up-captions).
-3. Speech comes in the order of the lines, so a first word heard out of that order counts for nothing.
-4. A line moves to its first word when it sits a full second or more off it. The 2 lines on each side must sit off the
-   same way. So one line that Whisper heard wrong never moves alone.
-5. A line whose first word AMG did not hear lies between the lines around it, and moves when they prove where it goes.
-6. Every other line stays, and lines never change order. The starts then stay, and only the ends change. A line that
-   ran up to the next line still does, so it ends where the next line now starts. A line with a pause after it keeps
-   its length, and ends where the next line starts at most. So no new pause opens between lines. Two lines show at once
-   only when they start at the same time. That happens when they did in the file, or when both moved to the file's
-   start.
+1. The whole-file timing spots live captions by their anchors. When they sit over 0.6 seconds from the fitted timing at
+   their median, the lines are late by amounts that keep changing. A delay that grows or shrinks steadily is a drift,
+   which one stretch fits.
+2. Each anchored line moves onto its own speech.
+3. A line with no anchor moves by the smaller move of the anchored lines on each side, when both move the same way.
+   Else it stays.
+4. Lines never change order, and the rules of [Whole-file timing](#whole-file-timing) set the ends.
 
-A line now shows only until the next line starts. So a line can show for a fraction of a second when the next line
-moved much further than it did. A line that stays can show for about 10 ms, when the moved line after it starts just
-after it.
-
-When the listening stops part way, the lines past that point stay, and a later `--sub-check` takes the file again. When
-a fifth of the lines or fewer stay out of sync, nothing posts. Else one alert says how many lines moved and how many
-stay out of sync. At `SUBTITLES=check` it says the setting left them as they are. Listening to a whole track costs about
-1 CPU minute a minute of audio. The deep analysis gives way to an import between its parts.
+When no lines are still off after the moves, nothing posts. Else one alert says how many lines moved and how many
+stay out of sync. At `SUBTITLES=check` it says the setting left them as they are.
 
 ### Foreign subtitle timing
 
@@ -276,6 +293,10 @@ shows every line late or early by up to 5 minutes, or one made for another frame
 - **Checks.** After the move, every part of the subtitle must line up with the speech. The moments where speech starts
   after a pause must confirm the new times in both halves of the file. Else nothing moves, and an alert says the
   subtitles seem late and that no fix lined them up.
+- **A jump in the middle.** When two tenths of the lines or more sit half a second or more apart from the rest, AMG
+  moves nothing. It alerts that the subtitles line up with the speech at different times in different parts, and
+  gives the least and the most they sit off. A drift that no frame rate explains can alert the same way. So does a
+  subtitle that AMG times against another subtitle.
 - **When it does not run.** A file shorter than 15 minutes gets no new times. Nor does a subtitle read only in part, see
   [Long subtitle track handling](#long-subtitle-track-handling). AMG never rewrites a WebVTT subtitle line by line. So
   when a fix would keep lines at the start or end, a WebVTT subtitle gets only an alert.
@@ -403,6 +424,6 @@ Move-Item -Force ".arr-media-guard-originals\<UTC time>\Episode.mkv" "Episode.mk
 
 The exit codes are those of `--sub-time` above.
 
-The one-part-a-minute listening takes a few minutes of CPU. A 24-minute episode took about a minute on the test host. A
-stretch that sits out of sync adds more, see [Subtitle block timing](#subtitle-block-timing). The run was tested on
-Linux. Windows with Docker Desktop, and Apple Silicon, which runs the amd64 image under emulation, were not tested.
+Listening to the whole audio takes about 5.5 CPU minutes for a 22-minute episode, see
+[Whole-file timing](#whole-file-timing). The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon,
+which runs the amd64 image under emulation, were not tested.

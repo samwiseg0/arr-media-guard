@@ -9,7 +9,7 @@ alert kind. A finding the hook acted on holds the action, {"code": its code, **f
 finding code, ACTIONS one per action code, and SUB_LINES one per sentence of a subtitle alert."""
 import fractions, json, os, re, unicodedata
 
-from . import cli, config, content, decide, logs, regrab, subsync
+from . import config, content, decide, judge, logs, regrab, subsync
 
 TENSES = ("planned", "done")
 B, E = "\x02", "\x03"   # the ends of a bold span in the text of a template, see bold()
@@ -100,10 +100,26 @@ def amount(secs):
 
 
 def late_by(offs):
-    """The offsets of a subtitle from the audio, positive when it shows late: "2.5 s late", "1.2 s and 2.5 s late"."""
+    """The offsets of a subtitle from the audio, positive when it shows late: "2.5 s late", "1.2 s and 2.5 s late". An
+    amount that reads the same as one before it is said once."""
     if all(o > 0 for o in offs) or all(o <= 0 for o in offs):
-        return f'{and_list(amount(o) for o in offs)} {"late" if offs[0] > 0 else "early"}'
-    return and_list(late_by([o]) for o in offs)
+        return f'{and_list(dict.fromkeys(amount(o) for o in offs))} {"late" if offs[0] > 0 else "early"}'
+    return and_list(dict.fromkeys(late_by([o]) for o in offs))
+
+
+def line_count(n):
+    """A count of subtitle lines as a person says it: "1 line", "14 lines"."""
+    return f"{n} line" + ("" if n == 1 else "s")
+
+
+def stretch_words(x):
+    """Where the stretch x of judge.outcomes() lies, so its line count and its times name the same lines: "from 33:23 to
+    41:08", "from the start to 41:08" when it starts at the subtitle's first line, "from 33:23 on" when it runs to its
+    last line, or "at 6:20" when both ends read the same. A stretch that holds every line says no place, ""."""
+    a, b = content.hms(x["at"]), content.hms(x["to"])
+    if x.get("first"):
+        return "" if x.get("last") else f"from the start to {b}"
+    return f"from {a} on" if x.get("last") else f"at {a}" if a == b else f"from {a} to {b}"
 
 
 def lang_word(code):
@@ -521,12 +537,9 @@ def where(x):
     return f'Moved the file to {x["kept"]}.' if x.get("kept") else f'The file was left beside the video, because {x.get("left") or "this is a dry run"}.'
 
 
-IN_SYNC = 0.05   # seconds off under which a subtitle reads "in sync", where late_by() would say "0.0 s"
-
-
 def about(offset):
-    """An offset of a subtitle as a sentence says it: "about 1.3 s late" in bold, or "in sync" under IN_SYNC."""
-    return "in sync" if abs(offset) < IN_SYNC else bold("about " + late_by([offset]))
+    """An offset of a subtitle as a sentence says it: "about 1.3 s late" in bold, or "in sync" under subsync.IN_SYNC."""
+    return "in sync" if abs(offset) < subsync.IN_SYNC else bold("about " + late_by([offset]))
 
 
 def at_end(fix, duration):
@@ -549,21 +562,61 @@ def drift_words(fix, duration, drifts="drift"):
 def off_line(x, t):
     """A subtitle whose times are off and stay: off by different amounts in parts of the file, or by an offset that no
     fix lines up, see subsync.fit(). The speech layout check finds such parts as another version would have them, see
-    subsync.layout_fix()."""
+    subsync.layout_fix(). A drift that no check confirmed says where its line starts and ends, see drift_words().
+
+    "moved" words an outcome by its stretches, see judge.off_facts(). After a move it says what moved and where lines
+    are still off: the stretches that count their lines, from where to where, then the other places, a few named, more
+    counted. With nothing moved it says where lines are off, and that they were left as they are. One stretch that
+    holds every line reads as the whole subtitle off, never "in parts". A rest of the file no evidence judged says so.
+    An offset under subsync.IN_SYNC reads "in sync", so a span from one reads "up to" its other end."""
     vs = f' compared with {sub_name(x["ref"], x["langs"])}' if x.get("ref") else ""
     name = cap(sub_name(x["track"], x["langs"]))
+    lo, hi = sorted((min(x["offsets"]), max(x["offsets"])), key=abs) if x.get("offsets") else (None, None)
+    span = bold(f"up to {late_by([hi])}" if abs(lo) < subsync.IN_SYNC else f"between {late_by([lo, hi])}") if x.get("offsets") else None
+    if "moved" in x:
+        took, planned = bool(x["moved"] or x.get("fix")), t == "planned"
+        be = lambda n: ("would still be" if planned else "is still" if n == 1 else "are still") if took else "is" if n == 1 else "are"
+        edges = x["edges"]
+        whole = not took and not x["still"] and len(edges) == 1 and edges[0].get("first") and edges[0].get("last")
+        if x.get("fix"):
+            head = [f'{name} were {about(x["fix"]["offset"])}{drift_words(x["fix"], x.get("duration"), "drifted")}.',
+                    "--apply would retime them to match the speech." if planned else "Retimed them to match the speech."]
+        elif whole:
+            head, edges = [f'{name} are {about(edges[0]["late"])}.'], []
+        else:
+            head = [f'{name} {"were" if took else "are"} out of sync in parts of the file.']
+        n = x["moved"]
+        head += [f'{"--apply would move" if planned else "Moved"} {bold(line_count(n))} to {"its" if n == 1 else "their"} speech.'] if n else []
+        left = [" ".join(filter(None, (cap(line_count(e["lines"])), stretch_words(e), be(e["lines"]), about(e["late"])))) + "." for e in edges]
+        places = {}
+        for at, off in sorted(x["still"]):   # two word-check windows under 20 s apart are one place
+            ats = places.setdefault(about(off), [])
+            ats += [at] if not ats or at - ats[-1] >= 20 else []
+        left += [f'Lines {f"around {and_list(content.hms(a) for a in ats)}" if len(ats) <= 3 else f"in {len(ats)} places from {content.hms(ats[0])} to {content.hms(ats[-1])}"} '
+                 f'{be(2)} {off}.' for off, ats in places.items()]
+        rest = ["The rest of the file could not be checked."] if x.get("unchecked") else []
+        return " ".join(head + left + rest + ([] if took else ["They were left as they are."]))
     if x.get("offsets") and x.get("layout"):
-        lo, hi = min(x["offsets"]), max(x["offsets"])
-        return (f'{name} line up with the speech at different times in different parts of the file, {bold(f"between {late_by([lo])} and {late_by([hi])}")}. '
+        return (f'{name} line up with the speech at different times in different parts of the file, {span}. '
                 "They may be from another version, so they were left as they are.")
     if x.get("offsets"):
-        return (f'{name} are out of sync{vs} by different amounts in different parts of the file: {bold(late_by(x["offsets"]))}. One shift can\'t '
-                "fix that, so they were left as they are.")
+        if x.get("ref"):   # a reference gives ten slices, the word check three windows
+            amounts = f", {span}"
+        else:
+            far = [o for o in x["offsets"] if abs(o) >= subsync.IN_SYNC]
+            parts = ([late_by(far)] if all(o > 0 for o in far) or all(o < 0 for o in far) else list(dict.fromkeys(late_by([o]) for o in far))) * bool(far)
+            amounts = f': {bold(and_list(parts + ["in sync"] * (len(far) < len(x["offsets"]))))}'
+        return (f'{name} are out of sync{vs} by different amounts in different parts of the file{amounts}. One shift can\'t fix that, '
+                "so they were left as they are.")
     if x.get("would"):   # a fix of the speech layout that only alerts, see subsync.LAYOUT_FIX
         but = f', except {x["would"]["kept"]} line{"s" if x["would"]["kept"] > 1 else ""} at the start or end' if x["would"].get("kept") else ""
         return (f'{name} seem {about(x["would"]["offset"])} against the speech{drift_words(x["would"], x.get("duration"))}{but}. '
                 "They were left as they are.")
-    seem = f' seem {bold("about " + late_by([x["unfixed"]]))}{vs}' if x.get("unfixed") is not None else f" are out of sync{vs}"
+    drift = x.get("unconfirmed")   # a fix with a ratio that no check confirmed
+    if drift and drift["rate"] != "1/1":
+        seem = f' seem {about(drift["offset"])}{vs}{drift_words(drift, x.get("duration"))}'
+    else:
+        seem = f' seem {bold("about " + late_by([x["unfixed"]]))}{vs}' if x.get("unfixed") is not None else f" are out of sync{vs}"
     return f"{name}{seem}, but no fix lined them up well enough, so they were left as they are."
 
 
@@ -575,29 +628,8 @@ def check_times(x, t):
     return f'{cap(sub_name(x["track"], x["langs"]))} {off}. SUBTITLES is set to check, so they were left as they are.'
 
 
-def sweep_line(x, t):
-    """The parts of the file where the sweep heard a subtitle far off its fitted line. Tracks off at the same parts share
-    one sentence. Offsets that agree give one mean."""
-    rows, groups = {}, {}
-    for k, at, off in x["far"]:
-        rows.setdefault(k, []).append((at, off))
-    for k, r in rows.items():
-        groups.setdefault(tuple(r), []).append(k)
-    out = []
-    for r, ks in groups.items():
-        offs, name = [o for _, o in r], cap(subs_name(ks, x["langs"]))
-        mean = sum(offs) / len(offs)
-        if max(offs) - min(offs) <= max(0.5, 0.05 * abs(mean)) and all(o * mean > 0 for o in offs):
-            out.append(f'{name} are {bold("about " + late_by([mean]))} at {and_list(content.hms(a) for a, _ in r)}.')
-        elif all(o * mean > 0 for o in offs):
-            out.append(f'{name} are {"late" if mean > 0 else "early"} by {and_list(f"{amount(o)} at {content.hms(a)}" for a, o in r)}.')
-        else:
-            out.append(f'{name} are out of sync: {and_list(f"{late_by([o])} at {content.hms(a)}" for a, o in r)}.')
-    return " ".join(out) + " They were left as they are."
-
-
 def live_line(x, t):
-    """A live-captioned subtitle that its per-line timing left out of sync, see subsync.live_moves(): a setting kept it,
+    """A live-captioned subtitle that its per-line timing left out of sync, see align.per_line(): a setting kept it,
     or too many lines could not be timed. In a dry run, block says why --apply would skip the remux, see BLOCKS."""
     head = (f'{cap(sub_name(x["track"], x["langs"]))} run behind the speech by a different amount on each line, as live captions do. '
             f'On average they are {bold("about " + late_by([x["lag"]]))}.')
@@ -607,7 +639,7 @@ def live_line(x, t):
         return f"{head} None of their lines could be matched to the speech, so they were left as they are."
     did = f'--apply would move {x["moved"]} of {x["cues"]} lines' if t == "planned" else f'Moved {x["moved"]} of {x["cues"]} lines'
     skip = f' {block(x["block"])}' if t == "planned" and (x.get("block") or {}).get("code", "remux") != "remux" else ""
-    return f'{head} {did} to their speech. {x["left"]} lines could not be timed and were left as they are.{skip}'
+    return f'{head} {did} to their speech. {x["left"]} lines could not be timed.{skip}'
 
 
 NO_MATCH = "don't match what's said in the audio"
@@ -660,7 +692,6 @@ SUB_LINES = {
     "check_times": check_times,
     "check_flash": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} flash by too fast to read. Half the lines show for {x["median"]:.2f} s '
                                 "or less. SUBTITLES is set to check, so they were left as they are.",
-    "sweep": sweep_line,
     "garbled": garbled,
     "repaired": lambda x, t: f'{cap(subs_name(x["tracks"], x["langs"]))} showed garbled characters. Replaced them with the same '
                              "subtitles in readable characters" + (f' and kept the original file at {x["kept"]}.' if x.get("kept") else "."),
@@ -734,9 +765,8 @@ LINE_STEPS = {
     "removed": None, "converted_track": None, "repaired": None, "stripped": None, "layout": None, "check_times": None, "check_flash": None,
     "stays": lambda x: None if x.get("kept_back") else WRITE,
     "sidecar": sidecar_step, "converted_sidecar": sidecar_step, "sidecar_left": sidecar_step,
-    "off": lambda x: SHIFT if x.get("offsets") else None if x.get("would") else TEST,   # see off_line()
+    "off": lambda x: SHIFT if x.get("offsets") or "moved" in x else None if x.get("would") else HEAR if x.get("unheard") else TEST,   # see off_line()
     "not_retimed": WRITE,
-    "sweep": SHIFT,
     "garbled": lambda x: None if x.get("kept_back") else WRITE if "result" in x else None if x["repair"] and not x["flags_off"] else TEST,
     "live": lambda x: None if not x["flags_off"] else HEAR if x.get("hearing_stopped") else SHIFT,
 }
@@ -787,16 +817,16 @@ def kept(facts):
 
 def said(rec):
     """What the posted alerts of rec say of its changes already, so no change post says it again: "flags", the places
-    after the run of the tracks whose default and forced flags an alert says were turned off, "live", the places of the
-    live captions whose lines an alert says were moved, and "converted", whether a subtitle sentence names the
-    conversion to MKV."""
-    langs, out = track_langs(rec, after=True), {"flags": set(), "live": set(), "converted": False}
+    after the run of the tracks whose default and forced flags an alert says were turned off, "moved", the places of the
+    tracks whose moved lines an alert counts, live captions or parts moved to their speech, and "converted", whether a
+    subtitle sentence names the conversion to MKV."""
+    langs, out = track_langs(rec, after=True), {"flags": set(), "moved": set(), "converted": False}
     for f in rec.get("findings") or []:
         told = tells(f, langs)
         out["converted"] |= told["converted"]
         if posts(f, rec):
             out["flags"] |= told["flags"]
-            out["live"] |= told["live"]
+            out["moved"] |= told["moved"]
     return out
 
 
@@ -806,7 +836,7 @@ def tells(f, langs):
     lines = f.get("lines") or []
     return {"flags": {n.split(" ")[0] for n in f.get("muted") or []}   # see FINDINGS sublang
             | {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")},
-            "live": {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off")},
+            "moved": {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off") or x["code"] == "off" and "moved" in x},
             "converted": any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)}
 
 
@@ -821,7 +851,7 @@ def held_posts(rec, f, t):
     flags = [e for e in rec.get("edits") or [] if decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and not e[1]
              and (after.get(e[0]) or {}).get("pos") in told["flags"]]
     out = [{"post": fix_post(rec, dict(f, lines=fixed), t)}] if fixed else []
-    none = {"flags": set(), "live": set(), "converted": False}
+    none = {"flags": set(), "moved": set(), "converted": False}
     for head, step, of, more in (("Converted to MKV", conversion_change, told["converted"] and rec, {}),
                                  ("Tracks changed", edit_change, flags and dict(rec, edits=flags), {"flags": sorted(told["flags"])})):
         try:
@@ -841,6 +871,19 @@ def named(rec, f):
         if not logged(x):
             out |= line_keys(x)
     return sorted(f"s{number(p, langs)}" if re.fullmatch(r"s\d+", p) else p for p in out)
+
+
+def named_spans(rec, f):
+    """{subtitle as named() names it: [[from, to] seconds of each stretch its timing outcome left off]} of the timing
+    finding f of rec, see judge.outcomes(). A held timing alert keeps them, so the deep analysis drops it only after it
+    heard those places again, see runner.times_judged()."""
+    langs, outs, out = track_langs(rec, after=True), rec.get("subjudge") or {}, {}
+    for x in f.get("lines") or []:
+        if not logged(x):
+            for p in line_keys(x):
+                k = f"s{number(p, langs)}" if re.fullmatch(r"s\d+", p) else p
+                out.setdefault(k, []).extend([s["at"], s["to"]] for s in (outs.get(p) or {}).get("off") or ())
+    return {k: v for k, v in out.items() if v}
 
 
 def line_keys(x):
@@ -874,27 +917,27 @@ def repair_change(rec, told):
 def retime_change(rec, told):
     """The subtitles whose times the run of rec changed, one sentence or two each: a shift of the whole track, lines
     moved to their speech, and ends made longer. A track counts when the remux ran, a sidecar when it was rewritten. A
-    partial shift says how many lines kept their times. Live captions whose alert says so already are left out."""
+    partial shift says how many lines kept their times. Moved lines that an alert counts already are left out, see said()."""
     rm, langs = rec.get("subremux") or {}, track_langs(rec, after=True)
     timing = {**(rec.get("subcheck") or {}), **(rec.get("subtime") or {})}
     sides = [e["name"] for e in rec.get("sidecars") or [] if e.get("result") == "retimed"]
     done = rm if rm.get("done") else {}
     shift, moved, ended = (list(done.get(k) or []) + sides for k in ("fixed", "timed", "ended"))
-    moved = [k for k in moved if k not in told["live"]]
+    shift, moved = ([k for k in ks if k not in told["moved"]] for ks in (shift, moved))   # the alert of the track says it
     out = []
     for k in dict.fromkeys(shift + moved + ended):
         name, line = cap(sub_name(k, langs)), []
         fit = ((timing.get(k) or {}).get("timing") or {}) if k in shift else {}
-        fix, b = fit.get("fix"), (rec.get("blocks") or {}).get(k) if k in moved else None
+        fix, e = fit.get("fix"), (rec.get("whole") or {}).get(k) if k in moved else None   # see subtitles.sub_whole()
         f = (rec.get("flash") or {}).get(k) if k in ended else None
         if fix:
             drift = drift_words(fix, rec.get("file_duration"), "drifted")
             line.append(f'{name} were {about(fix["offset"])}{drift}. Retimed them to match the speech.')
             if fit.get("kept"):   # a partial shift, see subsync.layout_fix()
                 line.append(f'Kept the times of {fit["kept"]} line{"s" if fit["kept"] > 1 else ""} at the start or end.')
-        if b:
-            n = b["live"]["moved"] if b.get("live") else sum(x["cues"] for x in b.get("blocks") or [])
-            line.append(f'Moved {bold(f"{n} line" + ("" if n == 1 else "s"))} of {sub_name(k, langs)} to their speech.')
+        if e:
+            n = judge.lines_moved(e)
+            line.append(f'Moved {bold(line_count(n))} of {sub_name(k, langs)} to {"its" if n == 1 else "their"} speech.')
         if f and f.get("lengthened"):
             line.append(f'{name} flashed by too fast to read. Made {f["lengthened"]} of their lines stay on screen longer.')
         out += line or [f"Retimed {sub_name(k, langs)} to match the speech."]
@@ -1022,7 +1065,7 @@ def sub_text(rec, t):
         fix = (r.get("timing") or {}).get("fix")
         out.append(f'{p} {r["verdict"]}{" " + laps if laps else ""}' + (f' fix {fix["offset"]:+.2f} s {fix["rate"]}' if fix else "")
                    + ("" if r["verdict"] == "match" else f' ({r["why"]})')
-                   + (f' (times stay: {x["why"]})' if (x := r.get("timing") or {}).get("piecewise") or "unfixed" in x or "unconfirmed" in x else ""))
+                   + (f' (times stay: {(r.get("timing") or {}).get("why")})' if judge.still_off((rec.get("subjudge") or {}).get(p) or {"state": "unknown"}) else ""))
     out += [f'{k} flashes, {f["lengthened"]} of {f["cues"]} ends ' + ("need a fix, WebVTT: report only" if f.get("report_only") else "lengthened")
             for k, f in sorted((rec.get("flash") or {}).items())]
     out += [f'{k} garbled, {g["why"]}' + (f', {repair_how(g)}' if g.get("sidecar") else "") for k, g in sorted((rec.get("garbled") or {}).items())]
@@ -1051,8 +1094,8 @@ def cli_line(rec, t):
 
 def sub_time_report(rec, t):
     """The report of --sub-time on one file: its result, then one line per subtitle with its place or sidecar name,
-    codec, language, role, method, verdict, offset and ratio, and action, then the rows of the sweep, the blocks of the
-    dense hearing and the parts it left, and the alerts."""
+    codec, language, role, method, verdict, offset and ratio, and action, then the whole-file timing of each subtitle
+    and the segments it found off, its hearing, and the alerts."""
     rm, done = rec.get("subremux") or {}, {e["name"]: e for e in rec.get("sidecars") or []}
     pending = remux_column(rec, t)[:100]   # the action of a track the remux planned for
     tracks = {x["i"]: x for x in rm.get("tracks_before") or rec.get("tracks") or []}   # the places the check named
@@ -1069,7 +1112,7 @@ def sub_time_report(rec, t):
             act = f'sidecar {done[p]["result"]}' + (f': {done[p]["left"]}' if done[p].get("left") else "") \
                 + (f' ({done[p]["error"]})' if done[p].get("error") else "")   # see subtitles.sidecar_fix()
         elif p in (rm.get("remove") or []) or p in (rm.get("fixed") or []) or p in (rm.get("timed") or []):
-            act = ("removed" if p in (rm.get("remove") or []) else "retimed" if p in (rm.get("fixed") or []) else "blocks moved") if rm.get("done") else pending
+            act = ("removed" if p in (rm.get("remove") or []) else "retimed" if p in (rm.get("fixed") or []) else "lines moved") if rm.get("done") else pending
         elif r["verdict"] == "mismatch":
             act = "flags off" if not r.get("held") else "none, held"
         elif (r.get("layout") or {}).get("verdict") == "mismatch":   # see subsync.LAYOUT_ACTION
@@ -1077,9 +1120,9 @@ def sub_time_report(rec, t):
         elif r["verdict"] == "weak":
             act = "report only"
         else:
-            act = "times stay" if fix or x.get("piecewise") or "unfixed" in x or "unconfirmed" in x else "none"
+            act = "times stay" if judge.still_off((rec.get("subjudge") or {}).get(p) or {"state": "unknown"}) else "none"   # see judge.outcomes()
         why = ((x.get("why") if x and x.get("why") != "in time" else r.get("why")) or "") \
-            + "".join(f"; {name}: {x[k]}" for k, name in (("word_check", "word check"), ("sweep_fit", "sweep fit")) if x.get(k))   # see subtitles.sub_sweep()
+            + (f'; word check: {x["word_check"]}' if x.get("word_check") else "")   # see subtitles.sub_whole()
         verdict = r["verdict"] + (f' {r["score"]:.2f}' if r.get("score") is not None else "")
         method = ("words" + (f', a reference: {rec["references"][p]}' if p in (rec.get("references") or {}) else "")) if p not in (rec.get("subtime") or {}) \
             else f'reference {r["reference"]}' if r.get("reference") else "reference, none"
@@ -1100,33 +1143,18 @@ def sub_time_report(rec, t):
         act = ("repaired" if rm.get("done") else pending) if k in (rm.get("recoded") or []) else \
             (f'taken out, its bytes in {rm["stripped"][k]}' if rm.get("done") else pending) if k in (rm.get("stripped") or {}) else "none"
         out.append(f'  {k} | garbled | {repair_how(g)} | {g["lang"] or "-"} | {g["cut"]} of {g["cues"]} cues cut | {act} | {g["why"]}')
-    for k, rows in sorted((rec.get("sweep") or {}).items()):
-        cut = ((rec.get("sweep_facts") or {}).get("cut") or {}).get(k)   # see subtitles.Cut
-        out.append(f"  sweep of {k}: {len(rows)} windows, {sum(w['overlap'] >= subsync.MATCH for w in rows)} match"
-                   + (f", none past {content.hms(cut)}, where the read of its cues stopped, so no cue moves alone" if cut is not None else ""))
-        steps, alerts = cli.sweep_steps(rows), cli.sweep_alerts(rows)
-        share = f"in a step of {len(steps)} of the {len(cli.sweep_trusted(rows))} windows that heard {subsync.MIN_CUES} cues"
-        out += [f'    {content.hms(w["at"])} words {w["words"]} overlap {w["overlap"]:.0%} cues {w["cues"]} offset '
-                + ("-" if w["offset"] is None else f'{w["offset"]:+.2f} s')
-                + (f' ALERT {w["off"]:+.2f} s off the fitted line' if id(w) in alerts else
-                   f' {w["off"]:+.2f} s off the fitted line, ' + (share if id(w) in steps else "one window alone")
-                   if cli.sweep_far(w) else "") for w in rows]
-    for k, b in sorted((rec.get("blocks") or {}).items()):   # a block moves in the remux or in the sidecar's rewrite, see process.subtitle_checks()
+    for k, e in sorted((rec.get("whole") or {}).items()):   # the whole-file timing, see subtitles.sub_whole()
         planned = k in (rm.get("timed") or []) or k in done
         landed = (k in (rm.get("timed") or []) and rm.get("done")) or (done.get(k) or {}).get("result") == "retimed"
         verb = "moved" if landed else "would move" if planned and t == "planned" else "not moved"
-        if b.get("live"):   # one line for a live-captioned track, see subsync.live_moves()
-            f = b["live"]
-            lags = (", moves of " + ", ".join(f"{-x:+.2f} s" for x in f["lags"]) + " at the 10th, 50th and 90th percentile") if f["lags"] else ""
-            out.append(f'  {k}: live captions, {f["moved"]} of {f["cues"]} cues {verb}, {f["own"]} by their own anchor, {f["between"]} between '
-                       f'anchors that prove the move and {f["agree"]} between anchors that agree{lags}; {f["stayed"]} stay, {f["left"]} of them off or unproved, '
-                       + ("fixed" if f["fixed"] else "not fixed, the hearing stopped part way" if f.get("failed") else f"over {subsync.LIVE_LEFT:.0%}, not fixed")
-                       + "".join(f'; {x["why"]}' for x in b["parts"] if x.get("why")))
-            continue
-        out += [f'  {k}: {x["cues"]} cues from {content.hms(x["from"])} to {content.hms(x["to"])} {verb} {-x["shift"]:+.2f} s, '
-                f'{subsync.AGREE:.0%} of {x["anchors"]} heard cues agree within {x["spread"]:.2f} s{onset_text(x.get("onsets"))}' for x in b["blocks"]]
-        out += [f'  {k}: no block from {content.hms(x["lo"])} to {content.hms(x["hi"])}, {why}' for x in b["parts"] if x.get("why")
-                for why in dict.fromkeys(x.get("whys") or [x["why"]])]   # every reason the part moved nothing, once each
+        lag = f', lag {e["lag"]:+.2f} s' if e["lag"] is not None else ""
+        scatter = f', scatter {e["scatter"]:.2f} s' + (" (live captions)" if e["live"] else "") if e["scatter"] is not None else ""
+        out.append(f'  {k}: whole-file timing, {e["anchors"]} of {e["lines"]} lines anchored{lag}{scatter}, {judge.lines_moved(e)} lines {verb}'
+                   + (f'; the hearing stopped: {"; ".join(e["stopped"])}' if e.get("stopped") else ""))
+        out += [f'    {c["pass"]} segment, lines {c["first"]} to {c["last"]}, {c["anchors"]} anchors, rate {c["rate"]}, level {c["level"]:+.2f} s, '
+                f'{c["far"]:.2f} s off: {"moves" if c["moves"] else "stays"}, {c["why"]}' for c in e["curve"] if c["far"] >= subsync.TIMING["move"]]
+        out += [f'    still off: {x["last"] - x["first"] + 1} lines from {content.hms(x["at"])} to {content.hms(x["to"])} {x["late"]:+.2f} s'
+                for x in (e["judge"]["off"] if landed or planned and t == "planned" else e["before"])]
     if rec.get("full_read"):
         f = rec["full_read"]
         out.append(f'  whole-file read of {", ".join(f["tracks"])}: {f["took"]} s, {f["cpu"]} CPU s' + (f'; {f["why"]}' if f.get("why") else ""))
@@ -1137,15 +1165,11 @@ def sub_time_report(rec, t):
         out.append(f'  speech read of audio track {f["audio"] + 1}: ' + (f["why"] if f.get("why") else "from the cache" if f.get("cached") else
                                                                        f'{f.get("cpu", 0)} CPU s, {f.get("took", 0)} s')
                    + (f'; speech onsets: {f["onsets"]["cpu"]} CPU s, {f["onsets"]["took"]} s' if f.get("onsets") else ""))
-    if rec.get("sweep_facts"):
-        f = rec["sweep_facts"]
-        cost = "sweep: words from the cache" if f.get("runs") and f.get("cached") == f["runs"] else f'sweep cost: {f["cpu"]} CPU s, {f["took"]} s'
-        out.append(f'  {cost}' + "".join(f"; no words from {x}" for x in f["failed"]))
-        if f.get("dense"):
-            g = f["dense"]
-            cache = "; words from the cache" if g.get("runs") and g.get("cached") == g["runs"] else ""
-            out.append(f'  dense hearing of {g["windows"]} windows and the speech onsets: {g["cpu"]} CPU s, {g["took"]} s{cache}'
-                       + "".join(f"; no words from {x}" for x in g["failed"]) + "".join(f"; no speech onsets: {x}" for x in g.get("onset_why") or []))
+    for idx, f in sorted((rec.get("whole_facts") or {}).items()):   # the whole-file hearing, see subtitles.whole_heard()
+        cost = "words from the cache" if not f["windows"] else f'{f["windows"]} new windows, {f["cpu"]} CPU s, {f["took"]} s'
+        out.append(f'  whole-file hearing of audio track {idx + 1}: {cost}, {f["kept"]} windows from the cache' + "".join(f"; no words from {x}" for x in dict.fromkeys(f["failed"]))
+                   + (f'; no speech spans: {f["speech"]["why"]}' if (f.get("speech") or {}).get("why") else "")
+                   + "".join(f"; no speech onsets: {x}" for x in (f.get("onsets") or {}).get("onset_why") or []))
     out += [f"  ALERT {alert_line(f, t, track_langs(rec))}" for f in rec.get("findings") or []]
     return "\n".join(out)
 
@@ -1153,16 +1177,6 @@ def sub_time_report(rec, t):
 def repair_how(g):
     """How a garbled track's text is read right, see subtitles.garbled_tracks()."""
     return "its own text" + (f', {g["filled"]} cut cue{"s" if g["filled"] > 1 else ""} from {g["sidecar"]}' if g.get("sidecar") else "")
-
-
-def onset_text(o):
-    """What the speech onsets said of a block, see subsync.blocks(): they agree with Whisper, or there are too few, and
-    Whisper alone moves it from BLOCK_ALONE seconds."""
-    if not o:
-        return ""
-    if o.get("verdict") == "agree":
-        return f', speech onsets agree ({o["inside"]} in the block, {o["outside"]} around it)'
-    return f", few speech onsets, Whisper alone at {subsync.BLOCK_ALONE} s"
 
 
 def missed(rec):

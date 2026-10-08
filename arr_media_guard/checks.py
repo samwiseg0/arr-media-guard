@@ -771,7 +771,7 @@ def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None
     audio for the subtitle check. words is (language, window starts, seconds of each window, a second window per start
     or None): the run then gives the words of those windows for the subtitle check instead, see lid.listen(). then
     is a file of the subtitle check's hearings that a language check runs after its own, with the model loaded, see
-    lid.jobs(). yield_to is (the gate file, the state store or None) at which a sweep yields, see lid.waits().
+    lid.jobs(). yield_to is (the gate file, the state store or None) at which a hearing of many windows yields, see lid.waits().
     A run that must hear first waits for the host's turn at the model, see lid_turn(). timeout starts after that wait,
     and a job's time limit caps it then. A wait of a second or more comes back as "waited"."""
     if not lid_ready():
@@ -809,7 +809,7 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
     if words:
         argv += ["--words", words[0], *map(str, words[1]), "--secs", str(words[2] if len(words) > 2 else subsync.WINDOW)]
         argv += ["--more", *("-" if x is None else str(x) for x in words[3])] if len(words) > 3 and words[3] else []
-        argv += ["--group", str(words[4])] if len(words) > 4 and words[4] else []   # the sweep, see sub_sweep()
+        argv += ["--group", str(words[4])] if len(words) > 4 and words[4] else []   # the whole-file hearing, see subtitles.sweep_hear()
     elif speech:
         argv.append("--speech")
     else:

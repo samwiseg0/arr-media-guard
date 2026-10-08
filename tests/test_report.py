@@ -128,10 +128,9 @@ FINDINGS = [
     ({"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "the words differ", "by": "hook", "kept": "/k/Film.mkv"}]},
      "Wrong subtitles", "amber", "The English subtitles (track 1) don't match what's said in the audio. Removed them and kept the "
      "original file at /k/Film.mkv."),
-    ({"kind": "subtiming", "lines": [{"code": "check_flash", "track": "s1", "median": 0.25}, {"code": "sweep", "far": [["s1", 3600, 1.5]]}]},
+    ({"kind": "subtiming", "lines": [{"code": "check_flash", "track": "s1", "median": 0.25}]},
      "Subtitles out of sync", "amber", "The English subtitles (track 1) flash by too fast to read. Half the lines show for 0.25 s or less. "
-     "SUBTITLES is set to check, so they were left as they are. The English subtitles (track 1) are about "
-     "1.5 s late at 1:00:00. They were left as they are."),
+     "SUBTITLES is set to check, so they were left as they are."),
     ({"kind": "subtitle", "issue": ["a subtitle event runs to 26:01, past the video and the audio at 23:52"], "tracks": [{"track": "s2",
      "codec": "S_TEXT/ASCII", "end": 1561.0, "streams": 1432.0}]}, "Subtitles run past the end", "amber",
      "The Spanish subtitles (track 2) keep going until 26:01, but the video and audio end at 23:52. "
@@ -291,12 +290,6 @@ SUB_LINES = [
     ({"code": "check_flash", "track": "s1", "median": 0.254},
      "The English subtitles (track 1) flash by too fast to read. Half the lines show for 0.25 s or less. "
      "SUBTITLES is set to check, so they were left as they are.", None),
-    ({"code": "sweep", "far": [["s1", 3600.4, 1.5], ["s1", 3660.2, -1.25]]},
-     "The English subtitles (track 1) are out of sync: 1.5 s late at 1:00:00 and 1.2 s early at 1:01:00. They were left as they are.", None),
-    ({"code": "sweep", "far": [["s1", 257.8, 139.06], ["s1", 499.9, 138.87], ["s1", 725.2, 138.43], ["s1", 900.0, 138.68]]},
-     "The English subtitles (track 1) are about 2 min 19 s late at 4:17, 8:19, 12:05 and 15:00. They were left as they are.", None),
-    ({"code": "sweep", "far": [["s1", 1366.4, 2.54], ["s1", 1381.6, 1.66], ["s3", 1366.4, 2.54], ["s3", 1381.6, 1.66]]},
-     "Subtitle tracks 1 and 3 (English) are late by 2.5 s at 22:46 and 1.7 s at 23:01. They were left as they are.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": True, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
       "block": {"code": "remux"}, "hardlinked": False},
      "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The file was left as it is.",
@@ -326,19 +319,19 @@ SUB_LINES = [
      "version. They were left as they are.", None),
     ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True},
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed.",
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are."),
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed."),
     ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True, "block": {"code": "remux"}},
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed.",
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are."),
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed."),
     ({"code": "live", "track": "s1", "lag": 8.0, "moved": 300, "cues": 400, "left": 100, "flags_off": True, "block": {"code": "cap", "why": "over the 30 GB repack cap"}},
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are.",
+     "are about 8.0 s late. Moved 300 of 400 lines to their speech. 100 lines could not be timed.",
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
-     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed and were left as they are. "
+     "are about 8.0 s late. --apply would move 300 of 400 lines to their speech. 100 lines could not be timed. "
      "--apply would skip the remux, because the file is over the 30 GB repack cap. Raise REPACK_MAX_GB to remux it."),
     ({"code": "live", "track": "s1", "lag": 0.6, "moved": 0, "cues": 400, "left": 350, "flags_off": True},
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
@@ -358,8 +351,86 @@ SUB_LINES = [
      "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. They're still in the "
      "file, because KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original.", None),
     ({"code": "off", "track": "s2", "ref": None, "why": "the cues are off", "offsets": [2.05, 2.05, 10.05], "unfixed": None, "layout": True},
-     "The Spanish subtitles (track 2) line up with the speech at different times in different parts of the file, between 2.0 s late "
-     "and 10.1 s late. They may be from another version, so they were left as they are.", None),
+     "The Spanish subtitles (track 2) line up with the speech at different times in different parts of the file, between 2.0 s and "
+     "10.1 s late. They may be from another version, so they were left as they are.", None),
+    # A reference gives ten slices, so the alert names the least and the most off, of either sign.
+    ({"code": "off", "track": "s2", "ref": "s1", "why": "the cues are off", "offsets": [-0.2, -0.3, -0.2, -0.2, -0.3, -0.2, -1.1, -1.0, -1.1, -1.1],
+      "unfixed": None}, "The Spanish subtitles (track 2) are out of sync compared with the English subtitles (track 1) by different amounts in "
+     "different parts of the file, between 0.2 s and 1.1 s early. One shift can't fix that, so they were left as they are.", None),
+    ({"code": "off", "track": "s2", "ref": "s1", "why": "the cues are off", "offsets": [0.6, 0.1, 0.0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.4],
+      "unfixed": None}, "The Spanish subtitles (track 2) are out of sync compared with the English subtitles (track 1) by different amounts in "
+     "different parts of the file, between 0.6 s early and 0.6 s late. One shift can't fix that, so they were left as they are.", None),
+    # A drift that no check confirmed names both ends of its line. A plain shift keeps one number.
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": -0.68, "unconfirmed": {"rate": "1001/1000", "offset": -0.68},
+      "duration": 1380}, "The English subtitles (track 1) seem about 0.7 s early at the start and about 0.7 s late by the end, but no fix "
+     "lined them up well enough, so they were left as they are.", None),
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": -0.85, "unconfirmed": {"rate": "1/1", "offset": -0.85},
+      "duration": 1380}, "The English subtitles (track 1) seem about 0.8 s early, but no fix lined them up well enough, so they were left as "
+     "they are.", None),
+    # Moved parts that left lines at their edges say what moved and where lines are still off: from where to where, or
+    # from where on when a stretch runs to the last line.
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": [1.0, 0.0, 0.0], "unfixed": None,
+      "edges": [{"at": 846.0, "to": 870.5, "late": 1.0, "lines": 9}, {"at": 1001.5, "to": 1380.0, "late": -1.1, "lines": 3, "last": True}],
+      "still": [], "moved": 59}, "The English subtitles (track 1) were out of sync in parts of the file. Moved 59 lines to their speech. 9 lines "
+     "from 14:06 to 14:30 are still about 1.0 s late. 3 lines from 16:41 on are still about 1.1 s early.",
+     "The English subtitles (track 1) were out of sync in parts of the file. --apply would move 59 lines to their speech. 9 lines from "
+     "14:06 to 14:30 would still be about 1.0 s late. 3 lines from 16:41 on would still be about 1.1 s early."),
+    # A stretch from the first line counts the lines before its first heard line too, so it runs "from the start".
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "moved": 0, "edges": [{"at": 40.0, "to": 400.0, "late": 1.0, "lines": 121, "first": True}],
+      "still": []}, "The English subtitles (track 1) are out of sync in parts of the file. 121 lines from the start to 6:40 are about 1.0 s "
+     "late. They were left as they are.", None),
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "moved": 3, "edges": [{"at": 40.0, "to": 1250.0, "late": 1.2, "lines": 400, "first": True,
+                                                                                     "last": True}], "still": []},
+     "The English subtitles (track 1) were out of sync in parts of the file. Moved 3 lines to their speech. 400 lines are still about 1.2 s late.",
+     "The English subtitles (track 1) were out of sync in parts of the file. --apply would move 3 lines to their speech. 400 lines would still be "
+     "about 1.2 s late."),
+    # Places still off elsewhere: a few named, a row and a window under 20 s apart as one, more counted. Never "left as they are".
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": -1.1, "edges": [{"at": 131.0, "to": 160.0, "late": 1.0, "lines": 12}],
+      "still": [[812.0, 1.1], [820.0, 1.1], [906.0, 1.1], [1500.0, -0.9]], "moved": 44},
+     "The English subtitles (track 1) were out of sync in parts of the file. Moved 44 lines to their speech. 12 lines from 2:11 to 2:40 are still "
+     "about 1.0 s late. Lines around 13:32 and 15:06 are still about 1.1 s late. Lines around 25:00 are still about 0.9 s early.",
+     "The English subtitles (track 1) were out of sync in parts of the file. --apply would move 44 lines to their speech. 12 lines from 2:11 to 2:40 "
+     "would still be about 1.0 s late. Lines around 13:32 and 15:06 would still be about 1.1 s late. Lines around 25:00 would still be about "
+     "0.9 s early."),
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": [-1.1, 1.0], "unfixed": None, "edges": [],
+      "still": [[300.0, 1.2], [400.0, 1.2], [500.0, 1.2], [600.0, 1.2]], "moved": 1},
+     "The English subtitles (track 1) were out of sync in parts of the file. Moved 1 line to its speech. Lines in 4 places from 5:00 to "
+     "10:00 are still about 1.2 s late.", "The English subtitles (track 1) were out of sync in parts of the file. --apply would move 1 line to "
+     "its speech. Lines in 4 places from 5:00 to 10:00 would still be about 1.2 s late."),
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 1.0, "edges": [], "still": [], "moved": 30, "unchecked": True},
+     "The English subtitles (track 1) were out of sync in parts of the file. Moved 30 lines to their speech. The rest of the file could not be "
+     "checked.", "The English subtitles (track 1) were out of sync in parts of the file. --apply would move 30 lines to their speech. The rest "
+     "of the file could not be checked."),
+    # A part within IN_SYNC of the speech reads "in sync", never "0.0 s".
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": [-1.0, 0.0, 0.04], "unfixed": None},
+     "The English subtitles (track 1) are out of sync by different amounts in different parts of the file: 1.0 s early and in sync. One "
+     "shift can't fix that, so they were left as they are.", None),
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": [-1.1, 0.0, 1.6], "unfixed": None},
+     "The English subtitles (track 1) are out of sync by different amounts in different parts of the file: 1.1 s early, 1.6 s late and in "
+     "sync. One shift can't fix that, so they were left as they are.", None),
+    # A whole-track fix that left a stretch off says the fix, then where lines are still off.
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "moved": 0, "fix": {"rate": "1001/1000", "offset": -0.3}, "duration": 1380,
+      "edges": [{"at": 380.0, "to": 395.0, "late": 0.9, "lines": 14}], "still": []},
+     "The English subtitles (track 1) were about 0.3 s early at the start and about 1.1 s late by the end. Retimed them to match the speech. "
+     "14 lines from 6:20 to 6:35 are still about 0.9 s late.",
+     "The English subtitles (track 1) were about 0.3 s early at the start and about 1.1 s late by the end. --apply would retime them to match "
+     "the speech. 14 lines from 6:20 to 6:35 would still be about 0.9 s late."),
+    # Stretches heard off where nothing moved name where, and the lines were left as they are. One line is one line.
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "moved": 0, "edges": [{"at": 883.0, "to": 1060.0, "late": 1.1, "lines": 69}, {"at": 1200.2, "to": 1200.4, "late": -0.9, "lines": 1}],
+      "still": [[300.0, -0.8]]},
+     "The English subtitles (track 1) are out of sync in parts of the file. 69 lines from 14:43 to 17:40 are about 1.1 s late. 1 line at "
+     "20:00 is about 0.9 s early. Lines around 5:00 are about 0.8 s early. They were left as they are.", None),
+    # One stretch that holds every line is the whole subtitle off, never "in parts".
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "moved": 0, "edges": [{"at": 12.0, "to": 1300.0, "late": 7.0, "lines": 400, "first": True, "last": True}], "still": []},
+     "The English subtitles (track 1) are about 7.0 s late. They were left as they are.", None),
+    # Equal amounts are said once.
+    ({"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": [-0.5, -0.5, 0.0, 1.0], "unfixed": None},
+     "The English subtitles (track 1) are out of sync by different amounts in different parts of the file: 0.5 s early, 1.0 s late and in "
+     "sync. One shift can't fix that, so they were left as they are.", None),
+    # A slice in sync never reads "0.0 s", so the span runs up to its other end.
+    ({"code": "off", "track": "s2", "ref": "s1", "why": "the cues are off", "offsets": [-0.04, -0.12, -0.08, -0.04, -0.09, -0.11, -1.04, -0.96, -0.96, -0.93],
+      "unfixed": None}, "The Spanish subtitles (track 2) are out of sync compared with the English subtitles (track 1) by different amounts in "
+     "different parts of the file, up to 1.0 s early. One shift can't fix that, so they were left as they are.", None),
 ]
 
 def test_every_template_has_a_golden():
@@ -399,6 +470,7 @@ def test_a_language_has_its_english_name():
     assert [h.arr_decide.lang_name(c) for c in ("fre", "gle", "zho", "per", "und", None, "xyz")] == \
         ["French", "Irish", "Chinese", "Persian", "untagged", "untagged", "xyz"]
     assert h.arr_decide.lang_names(["eng", "jpn", "jap"], "or") == "English or Japanese" and h.late_by([2.54, -1.25]) == "2.5 s late and 1.2 s early"
+    assert h.late_by([0.52, 0.48, 1.0]) == "0.5 s and 1.0 s late" and h.late_by([-0.5, 0.5, -0.5]) == "0.5 s early and 0.5 s late"
 
 
 def test_a_template_that_fails_costs_only_its_text():
@@ -537,7 +609,7 @@ def test_the_embed_target_is_one_embed_per_finding():
 # The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
 # program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
 # track a conversion left out. Every other golden posts, a doubt and a failed restore too.
-LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10, 26, 27, 29}}
+LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10, 23, 24, 26}}
 SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "stripped")   # the sentences of a submatch finding
 
 
@@ -593,7 +665,7 @@ CHANGED = dict(
     subremux={"done": True, "fixed": ["s2"], "timed": ["s3"], "ended": ["s2"], "removed": ["s1"], "kept": "/k/Film A.mkv",
               "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}, {"i": "s3", "lang": "spa"}]},
     subcheck={"s2": {"verdict": "match", "timing": {"fix": {"offset": 2.5, "rate": "1/1"}}}},
-    blocks={"s3": {"blocks": [{"cues": 12}, {"cues": 3}]}}, flash={"s2": {"lengthened": 40, "cues": 300, "median": 0.5}},
+    whole={"s3": {"moves": {i: {"why": "curve"} for i in range(15)}}}, flash={"s2": {"lengthened": 40, "cues": 300, "median": 0.5}},
     edits=[["track:=1", 1, 0], ["track:=2", 0, 1], ["track:=3", 1, 0], ["track:=5", 0, 1, "flag-forced"], ["track:=1", "jpn", "und", "language"]],
     after=[{"sel": "track:=1", "pos": "a1", "lang": "jpn", "default": True}, {"sel": "track:=2", "pos": "a2", "lang": "eng", "default": False},
            {"sel": "track:=3", "pos": "s1", "lang": "eng", "default": True}, {"sel": "track:=5", "pos": "s2", "lang": "spa", "default": False}],
@@ -672,8 +744,11 @@ LIVE = {"code": "live", "track": "s3", "lag": 4.0, "moved": 900, "cues": 1200, "
 
 
 @pytest.mark.parametrize("kw, want", [
-    ({"subremux": dict(CHANGED["subremux"], fixed=[], ended=[]), "blocks": {"s3": {"blocks": [{"cues": 900}], "live": {"moved": 900}}},
+    ({"subremux": dict(CHANGED["subremux"], fixed=[], ended=[]), "whole": {"s3": {"moves": {i: {"why": "live"} for i in range(900)}, "live": True}},
       "edits": [], "findings": [{"kind": "subtiming", "lines": [LIVE]}]}, ["Subtitles out of sync"]),
+    ({"subremux": dict(CHANGED["subremux"], fixed=[], ended=[]), "whole": {"s3": {"moves": {i: {"why": "curve"} for i in range(59)}}}, "edits": [],
+      "findings": [{"kind": "subtiming", "lines": [{"code": "off", "track": "s3", "ref": None, "why": "x", "offsets": None, "unfixed": 1.0,
+                                                     "edges": [[823.5, 1.0, 9]], "still": [], "moved": 59}]}]}, ["Subtitles out of sync"]),
     ({"subremux": {}, "edits": [["track:=5", 0, 1], ["track:=5", 0, 1, "flag-forced"]],
       "findings": [{"kind": "submatch", "lines": [dict(STAYS, track="s2")]}]}, ["Wrong subtitles"]),
     ({"subremux": {}, "edits": [["track:=5", 0, 1], ["track:=1", 1, 0]],
@@ -682,8 +757,9 @@ LIVE = {"code": "live", "track": "s3", "lag": 4.0, "moved": 900, "cues": 1200, "
     ({"subremux": {}, "edits": [], "repack": CHANGED["repack"],
       "findings": [{"kind": "submatch", "lines": [{"code": "converted_track", "track": "s2", "why": "x", "kept": "/k/F.avi"}]}]}, ["Wrong subtitles"])])
 def test_a_fix_an_alert_says_posts_once(sent, settings, kw, want):
-    """A live caption alert says which lines moved, a stays or a language alert says which flags went off, and a track
-    a conversion left out names the conversion. Their change posts would say it twice."""
+    """A live caption alert says which lines moved, and so does an alert of moved parts with lines still off. A stays or
+    a language alert says which flags went off, and a track a conversion left out names the conversion. Their change
+    posts would say it twice."""
     settings(discord_posts="all")
     changed(**dict(dict(repack={}, header_repair={}), **kw))
     assert [e["title"] for e in sent] == want, described(sent)
@@ -729,8 +805,8 @@ def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings)
     settings(discord_posts="all")
     said = [h.unmarked(t + " " + x) for t, x in h.changes(decision(**CHANGED))] + [h.unmarked(t + " " + x) for t, x in h.REPAIRS.items()]
     assert not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)] and not [s for s in said if INSTRUCTION.search(s)]
-    got, rec = changed(blocks={"s3": {"blocks": [{}]}})
-    assert rec["change_result"] == ["sent"] * 3 + ["no text: Subtitles retimed: KeyError: 'cues'", "sent"]
+    got, rec = changed(whole={"s3": {"moves": {0: {}}}})
+    assert rec["change_result"] == ["sent"] * 3 + ["no text: Subtitles retimed: KeyError: 'why'", "sent"]
     assert described(sent) == [(t, d) for t, c, d in CHANGE_POSTS if t != "Subtitles retimed"]
     sent.clear()
     got, rec = changed(findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x"}]}])   # no kept
@@ -989,15 +1065,19 @@ def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
 
 # The step where the fix of each golden stopped, by its place in FINDINGS, ACTIONS and SUB_LINES, as the Stopped at field
 # shows it. Every other golden tried no fix, or its fix worked, so it shows only the Check field.
-STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file", 22: "Writing the file",
-                        23: "Writing the file", 24: "Writing the file", 25: "Writing the file", 28: "Finding the shift"},
+STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file",
+                        22: "Writing the file", 23: "Writing the file", 24: "Writing the file", 25: "Writing the file"},
            "actions": {5: "Replacing the file", 8: "Replacing the file", 10: "Replacing the file", 11: "Replacing the file",
                        15: "Replacing the file", 16: "Replacing the file", 19: "Replacing the file"},
-           "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file", 9: "Writing the file",
-                         12: "Finding the shift", 13: "Testing the fix", 14: "Testing the fix", 15: "Writing the file", 16: "Writing the file",
-                         20: "Finding the shift", 21: "Finding the shift", 22: "Finding the shift", 23: "Writing the file",
-                         25: "Testing the fix", 32: "Finding the shift", 33: "Finding the shift", 34: "Finding the shift",
-                         35: "Finding the shift", 38: "Writing the file", 40: "Finding the shift"}}
+           "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file",
+                         9: "Writing the file", 12: "Finding the shift", 13: "Testing the fix", 14: "Testing the fix",
+                         15: "Writing the file", 16: "Writing the file", 20: "Writing the file", 22: "Testing the fix",
+                         29: "Finding the shift", 30: "Finding the shift", 31: "Finding the shift", 32: "Finding the shift",
+                         35: "Writing the file", 37: "Finding the shift", 38: "Finding the shift", 39: "Finding the shift",
+                         40: "Testing the fix", 41: "Testing the fix", 42: "Finding the shift", 43: "Finding the shift",
+                         44: "Finding the shift", 45: "Finding the shift", 46: "Finding the shift", 47: "Finding the shift",
+                         48: "Finding the shift", 49: "Finding the shift", 50: "Finding the shift", 51: "Finding the shift",
+                         52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift"}}
 
 
 def test_every_alert_code_has_its_step():
@@ -1027,11 +1107,11 @@ def test_each_alert_names_the_step_where_its_fix_stopped():
     ([{"code": "check_times", "track": "s1", "why": "x", "fix": {"offset": 2.0, "rate": "1/1"}},
       {"code": "not_retimed", "tracks": ["s2"], "result": "subtitle remux failed: mkvmerge exited 2", "block": None},
       {"code": "off", "track": "s3", "ref": None, "why": "x", "offsets": [1.0, 3.0], "unfixed": None}], "Finding the shift\nWriting the file"),
-    # one track at two steps counts at the furthest one, as a deep analysis of a roll-up track showed
-    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 2.8}, {"code": "sweep", "far": [["s1", 438.0, 1.6]]}],
-     "Testing the fix"),
-    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": 2.8}, {"code": "sweep", "far": [["s2", 438.0, 1.6]]}],
-     "Finding the shift\nTesting the fix")])
+    # a moved part that left lines at its edge stopped at finding their shift
+    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": -1.0, "edges": [[846.0, -1.0, 4]], "still": [], "moved": 30}],
+     "Finding the shift"),
+    # a whole-file timing that judged nothing stopped at the hearing
+    ([{"code": "off", "track": "s1", "ref": None, "why": "x", "offsets": None, "unfixed": -0.68, "unheard": True}], "Hearing the speech")])
 def test_a_subtitle_alert_names_the_steps_of_its_sentences_in_job_order(lines, want):
     """Each subtitle counts at the furthest step its sentences name, so one track shows one step. Other subtitles may
     add theirs, one a line, in job order."""
@@ -1095,7 +1175,7 @@ def test_an_offset_under_a_twentieth_of_a_second_reads_in_sync(fix, want):
     assert "0.0 s" not in said and ("in sync" in said) == ("in sync" in want), said
     rec = dict(decision(), file_duration=1380, tracks=[{"i": "s1", "lang": "eng"}], subremux={"done": True, "fixed": ["s1"]},
                subtime={"s1": {"verdict": "match", "timing": {"fix": fix, "why": "x"}}})
-    assert h.unmarked(h.retime_change(rec, {"live": set()})[1]).startswith(f"The English subtitles (track 1) {want.replace('are', 'were', 1)}")
+    assert h.unmarked(h.retime_change(rec, {"moved": set()})[1]).startswith(f"The English subtitles (track 1) {want.replace('are', 'were', 1)}")
 
 
 def test_a_drift_says_where_it_starts_and_where_it_ends():
@@ -1110,7 +1190,7 @@ def test_a_drift_says_where_it_starts_and_where_it_ends():
                                                             "start and about 1.3 s late by the end. They were left as they are.")
     rec = dict(decision(), file_duration=1380, tracks=[{"i": "s1", "lang": "eng"}], subremux={"done": True, "fixed": ["s1"]},
                subtime={"s1": {"verdict": "match", "timing": {"fix": DRIFT, "why": "x"}}})
-    assert h.unmarked(h.retime_change(rec, {"live": set()})[1]) == ("The English subtitles (track 1) were about 0.1 s early at the start and "
+    assert h.unmarked(h.retime_change(rec, {"moved": set()})[1]) == ("The English subtitles (track 1) were about 0.1 s early at the start and "
                                                                     "about 1.3 s late by the end. Retimed them to match the speech.")
 
 
@@ -1330,16 +1410,17 @@ def test_no_alert_says_an_internal_word_or_tells_the_viewer_what_to_do(tmp_path,
     assert not [s for s in said if INSTRUCTION.search(s)]
 
 
-def test_the_sub_time_report_names_the_word_check_and_the_sweep_fit():
-    """The reason column of --sub-time keeps the word check's reason when the sweep's verdict replaced it, and the reason
-    the sweep fit refused, so the report shows why the times changed or stayed."""
-    rows = {"s1": {"verdict": "match", "why": "the heard words match", "timing": {"fix": DRIFT, "why": "the sweep's 20 windows fit a fix",
+def test_the_sub_time_report_names_the_word_check():
+    """The reason column of --sub-time keeps the word check's reason when the whole-file timing's replaced it, so the
+    report shows why the times changed or stayed."""
+    rows = {"s1": {"verdict": "match", "why": "the heard words match", "timing": {"fix": None, "why": "the whole-file timing moves 300 of 400 lines",
                                                                                  "word_check": "the cues are off by different amounts"}},
             "s2": {"verdict": "match", "why": "the heard words match", "timing": {"fix": None, "piecewise": True, "offsets": [0.0, 1.2],
-                                                                                 "why": "the cues are off", "sweep_fit": "two sweep windows sit off"}}}
-    text = h.sub_time_report(dict(decision(result="no change"), subtime=rows), "done").splitlines()
-    assert text[1].endswith("| the sweep's 20 windows fit a fix; word check: the cues are off by different amounts"), text
-    assert text[2].endswith("| times stay | the cues are off; sweep fit: two sweep windows sit off"), text
+                                                                                 "why": "the cues are off"}}}
+    off = h.outcome("off", off=[{"at": 300.0, "to": 310.0, "lines": None, "late": 1.2, "clock": "window"}])   # see judge.outcomes()
+    text = h.sub_time_report(dict(decision(result="no change"), subtime=rows, subjudge={"s2": off}), "done").splitlines()
+    assert text[1].endswith("| the whole-file timing moves 300 of 400 lines; word check: the cues are off by different amounts"), text
+    assert text[2].endswith("| times stay | the cues are off"), text
 
 
 def test_the_cli_target_is_the_backfill_line():

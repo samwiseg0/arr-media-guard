@@ -14,7 +14,9 @@ In these docs, *the app* is the Sonarr or Radarr that sent the file, and the *it
 - **Language detection.** An optional speech model, Whisper, hears an audio track whose language is in doubt.
 - **Subtitle match.** It finds a subtitle of another episode by its words, and retimes one that is early, late or
   drifting.
+- **Whole-file timing.** The deep analysis after an import listens to the whole audio and times every subtitle line.
 - **Subtitle block timing.** When only part of a subtitle is out of sync, it moves just those lines to their speech.
+- **Mid-file jump timing.** When a subtitle jumps out of sync in the middle of a file, it moves the lines after the jump.
 - **Live caption timing.** It moves each line of live captions to where it is spoken.
 - **Foreign subtitle timing.** It retimes subtitles in a language no audio track speaks, by where people speak.
 - **Incorrect subtitle identification.** It alerts on a foreign subtitle whose lines do not fit the speech.
@@ -363,7 +365,7 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import. See [docs/subtitles.md](docs/subtitles.md#levels). |
+| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio, about 15 CPU minutes an hour of video. See [docs/subtitles.md](docs/subtitles.md#levels). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
 | `HOOK_WORKERS` | `2` | Jobs the worker runs at once, each in a process of its own. `1` runs each job inside the worker. A season pack still runs at most this many. |

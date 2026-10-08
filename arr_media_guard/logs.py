@@ -171,7 +171,8 @@ def alert_findings(rec, size, held=None):
 
     held is a list when the deep analysis of the file follows this import, see process.alerts(). A finding of
     DEEP_KINDS that would post then goes into held as its kind, size and embed, the subtitles it names as "keys", see
-    report.named(), and gives HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
+    report.named(), with the places its timing outcome left off as "spans", see report.named_spans(), and gives
+    HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
     nothing judged those subtitles again, see runner.held_after(). With DISCORD_POSTS all, a held finding keeps the
     change posts of what it says itself in "changes", see report.held_posts(): a removed track, a flag it says was
     turned off, and the conversion it names. The change posts of rec leave those out, see report.said(). held_changes()
@@ -186,7 +187,9 @@ def alert_findings(rec, size, held=None):
             out.append("log only")
         elif held is not None and f["kind"] in DEEP_KINDS:
             changes = report.held_posts(rec, f, report.tense_of(rec)) if config.CFG.discord_posts == "all" else []
-            held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {})})
+            spans = report.named_spans(rec, f) if f["kind"] == "subtiming" else {}   # the places the deep analysis must hear again
+            held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {}),
+                         **({"spans": spans} if spans else {})})
             out.append(HOLD_RESULT)
         else:
             out.append(alert(rec["app"], f["kind"], rec["path"], size, e))

@@ -2,6 +2,7 @@
 # Copyright (C) 2026 samwiseg0
 """The bench tools in tools/bench: the synthetic cases and the truth score. Every case is made up."""
 import importlib.util
+import json
 import os
 import statistics
 
@@ -17,7 +18,7 @@ def tool(name):
     return mod
 
 
-synth, score = tool("synth"), tool("score")
+synth, score, regressions = tool("synth"), tool("score"), tool("regressions")
 
 
 def errors(case):
@@ -73,3 +74,14 @@ def test_the_score_counts_both_kinds_of_error():
     got = score.score(cues, truth)
     assert (got["fixed"], got["wrong"], got["before"]["within"], got["after"]["within"], got["unpaired"]) == (1, 1, 2, 2, 1)
     assert got["per_1000"]["wrong"] == 250.0
+
+
+def test_the_corpus_counts_name_each_case_that_changed(tmp_path, capsys):
+    rec = lambda c, *k, runs=(): json.dumps({"id": c, "kinds": list(k), "runs": [list(r) for r in runs]}) + "\n"
+    (tmp_path / "base.jsonl").write_text(rec("a", "wrong_text") + rec("b"))
+    (tmp_path / "new.jsonl").write_text(rec("a") + rec("b", "wrong_silence", runs=[(5, 9, 5, -1.1)]))
+    regressions.main([str(tmp_path / "new.jsonl"), "--base", str(tmp_path / "base.jsonl"), "--known", str(tmp_path / "known.json")])
+    out = capsys.readouterr().out
+    assert "2 cases, wrong_silence 1 (1 at 1.0 s or more), wrong_alert 0, wrong_text 0" in out
+    assert "  + wrong_silence b" in out and "  - wrong_text a" in out
+    assert json.loads((tmp_path / "known.json").read_text()) == {"b": ["wrong_silence"]}

@@ -23,8 +23,8 @@ import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = os.path.join(ROOT, "arr_media_guard")
-SCRIPT = ("apps", "checks", "cli", "config", "convert", "logs", "plex", "process", "proof", "regrab", "remux", "report", "runner",
-          "subtitles", "vault")   # the modules the script held, and report.py
+SCRIPT = ("apps", "checks", "cli", "config", "convert", "judge", "logs", "plex", "process", "proof", "regrab", "remux", "report", "runner",
+          "subtitles", "vault")   # the modules the script held, report.py and judge.py
 ALIASES = {"arr_decide": "decide", "arr_meta": "content", "arr_status": "health", "arr_subsync": "subsync", "arr_lid": "lid",
            "arr_serve": "serve"}   # the names of the modules beside the script
 sys.path.insert(0, ROOT)   # for arr_subhunt.py

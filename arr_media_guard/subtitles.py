@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The subtitle match check and the reads of the subtitle tracks."""
-import contextlib, fractions, json, os, re, resource, select, statistics, subprocess, tempfile, time, zlib
+import contextlib, fractions, json, math, os, re, resource, select, statistics, subprocess, tempfile, time, zlib
 
-from . import checks, cli, config, content, decide, logs, proof, remux, runner, store, subsync, vault
+from . import align, checks, config, content, decide, judge, logs, proof, remux, runner, store, subsync, vault
 
 
 def subtitle_ends(path, j, timeout, limit=None, lines=None):
@@ -55,8 +55,8 @@ class Cut(list):
     seconds, or FULL_WALL for full_read(). So the track goes on past its last cue here. A window
     past that cue holds none of the track's cues and could pair its words only with cues far away by chance. So no check
     judges such a window, see before_cut(). A remux rewrites every cue of a track, and a plan of new times or text
-    holds only the cues read. So a Cut track gets no plan of its own cues: no block, live, flash or garbled fix, see
-    sub_dense(), flash_check() and garbled_tracks(). A whole-track fix still moves every cue. Nor does it time another
+    holds only the cues read. So a Cut track gets no plan of its own cues: no whole-file timing, flash or garbled fix,
+    see sub_whole(), flash_check() and garbled_tracks(). A whole-track fix still moves every cue. Nor does it time another
     track, see sub_reference()."""
 
 
@@ -299,6 +299,12 @@ def side_cues(s):
         return []
 
 
+def same_cues(a, b):
+    """Whether two reads of a subtitle give the same cue starts, to the ms. A plan by the place of each line in start
+    order then pairs with the cues of either read, see remux.time_plan()."""
+    return sorted(round(c[0], 3) for c in a) == sorted(round(c[0], 3) for c in b)
+
+
 def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None):
     """{track position: use(its blocks)} for the tracks of codecs at the positions in want. mkvmerge and ffmpeg index
     every subtitle block in the Cues, so the read takes the Cues and then each block by its index entry, one small read
@@ -491,10 +497,12 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False, streams=Non
     and never fails the job. The job's time limit passes.
 
     With line, a fix that subsync.needs_line() names needs one more hearing: a window at a third and one at two
-    thirds of the file, which must both sit on the fitted line, see subsync.on_line(). Else the times stay, and
-    with deep, an import that queues a deep analysis, the deep analysis judges the fix with its sweep. Those windows never change the verdict.
-    With line, a fix must also raise the share of the word check's matched cues in their spans, see subsync.timing().
-    --sub-time and the deep analysis pass line False, as their sweep judges a fix, see sweep_confirms() and sub_sweep().
+    thirds of the file, which must both sit on the fitted line, see subsync.on_line(). Else the times stay with the
+    fix's offset in "unfixed", so they alert. With deep, an import that queues a deep analysis, the deep analysis judges
+    the times with its whole-file timing, and the import holds the alert for it. Those windows never change the
+    verdict. With line, a fix must also raise the share of the word check's matched cues in their spans, see
+    subsync.timing(). --sub-time and the deep analysis pass line False, as the whole-file timing takes the place of a
+    fix, see sub_whole().
 
     streams is where the video and the audio end, from the header probe of the caller. Without it, the hearing at a
     matched window's offset probes the header again, see checks.header_of()."""
@@ -594,7 +602,10 @@ def sub_verdicts(path, j, items, starts=None, line=True, deep=False, streams=Non
             for k in small:
                 t = res[k]["timing"]
                 if missed or not subsync.on_line(before_cut(heard, items[k][2]), items[k][2], lang, t["fix"], list(zip(ws, alt))):
-                    res[k] = dict(res[k], timing={"fix": None, "unconfirmed": t["fix"], "line": ws, "why": (
+                    # The times found off stay, so they alert. An import whose deep analysis follows holds the alert for it.
+                    # Line windows never heard get "unheard", so the alert names the hearing as the step that stopped.
+                    res[k] = dict(res[k], timing={"fix": None, "unconfirmed": t["fix"], "unfixed": t["fix"]["offset"], "line": ws,
+                                                  **({"unheard": True} if missed else {}), "why": (
                         f'{t["why"]}, but {"the windows at a third and two thirds of the file do not sit on its line" if not missed else missed}, so '
                         + ("the deep analysis judges it" if deep else "the times stay"))})
                 else:
@@ -695,18 +706,16 @@ def ref_sidecars(path, d):
     return {s["name"]: s for s in proof.sidecar_subs(path) if s["name"] not in words and proof.SIDECAR_FLAGS["forced"] not in s["flags"]}
 
 
-def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop=None, report=True, blocks=None):
+def sub_reference(path, j, d, sync, items, others, full=False, stop=None, report=True, whole=None):
     """({subtitle position or sidecar name: subsync.reference() result, with its codec, language and role},
-    {reference: "fixed", "in time" or "clean sweep"}) of the reference timing (docs/design.md, "Subtitle match"). It
-    takes the subtitles the word check does not read: a text or picture track in a SUB_ROLES role that sub_targets()
-    leaves out, and the sidecars others of ref_sidecars(). A reference is a track or sidecar of sync, the word check,
-    with a match whose times are in time or fixed. A match with too few anchors for a fix is one too when its rows of
-    sweeps are clean, see subsync.clean(). A track whose read was cut short is none, see Cut: its fit would rest on
-    its first part alone. Its cues come from items, sub_items(), and move into audio time first:
-    by its fix, or by its measured offset when it has none, the timing's for an in-time match, sweep_offset() for a
-    clean sweep. blocks {key: subsync.blocks() blocks} are the blocks dense hearing found, and a cue of the reference in
-    one moves by its shift too, as remux.time_plan() moves it. A block left in place sits off the rest, so the slices of
-    a right track would disagree and its fix would stay out.
+    {reference: "fixed" or "in time"}) of the reference timing (docs/design.md, "Subtitle match"). It takes the
+    subtitles the word check does not read: a text or picture track in a SUB_ROLES role that sub_targets() leaves out,
+    and the sidecars others of ref_sidecars(). A reference is a track or sidecar of sync, the word check, with a match
+    whose times are in time or fixed. A track whose read was cut short is none, see Cut: its fit would rest on its
+    first part alone. Its cues come from items, sub_items(), and move into audio time first: by its fix, or by its
+    measured offset when it has none, the timing's for an in-time match. whole {key: timing of sub_whole()} is the
+    whole-file timing, which judges a track in its place: a track it judged with no stretch off after its moves is a
+    reference, its cues where the moves put them.
 
     full reads a track the Cues do not index from the whole file, see full_read(). Once stop() is true, the time
     limit less SUB_RESERVE in an import, no track is read or fit, and each one left is "deferred" to the deep
@@ -714,15 +723,20 @@ def sub_reference(path, j, d, sync, items, others, sweeps=None, full=False, stop
     read, and report False gives ({}, {}) then."""
     refs, basis, dur = {}, {}, decide.duration(j)
     for k, r in sync.items():
-        t = r.get("timing") or {}
-        basis[k] = "fixed" if t.get("fix") else "in time" if t.get("why") == "in time" else \
-            "clean sweep" if ("few" in t or t.get("swept")) and subsync.clean((sweeps or {}).get(k) or [], dur) else None
+        t, e = r.get("timing") or {}, (whole or {}).get(k)
+        if e is not None:
+            basis[k] = None if not e["judge"]["judged"] or e["judge"]["off"] else "fixed" if e["moves"] else "in time"
+        else:
+            basis[k] = "fixed" if t.get("fix") else "in time" if t.get("why") == "in time" else None
         if r["verdict"] == "match" and basis[k] and k in items and not isinstance(items[k][2], Cut):
+            if e is not None:   # where the whole-file timing puts each line
+                sc = sorted(items[k][2], key=lambda c: c[0])
+                refs[k] = [(e["moves"][n]["start"], e["moves"][n]["end"], x) if n in e["moves"] else (a, b, x) for n, (a, b, x) in enumerate(sc)]
+                continue
             # The reference in audio time: moved by its fix, else by its own measured offset, which may reach MIN_SHIFT
             # while it is in time. So the target is judged, and moved, against the audio.
-            f = t.get("fix") or {"rate": "1/1", "offset": (t.get("offset") or 0.0) if basis[k] == "in time" else sweep_offset((sweeps or {}).get(k))}
-            late = lambda a: subsync.shift_of(blk, a) if (blk := subsync.mover((blocks or {}).get(k), a)) else 0.0   # a block's cues move by its shift
-            refs[k] = [(subsync.moved(a * 1000, f) / 1000 - late(a), subsync.moved(b * 1000, f) / 1000 - late(a), x) for a, b, x in items[k][2]]
+            f = t.get("fix") or {"rate": "1/1", "offset": (t.get("offset") or 0.0) if basis[k] == "in time" else 0.0}
+            refs[k] = [(subsync.moved(a * 1000, f) / 1000, subsync.moved(b * 1000, f) / 1000, x) for a, b, x in items[k][2]]
     if not (refs or report):
         return {}, {}
     codecs, targets = sub_codecs(j), sub_targets(j, d)
@@ -821,37 +835,15 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
 
 
 def swept_before(rec, ex):
-    """rec of a pass that followed Replan ex, with the sweep facts of the pass that raised it added to its own, the
-    dense hearing's too. The second pass finds the words in the cache, so its facts alone would hide what the first
-    pass heard."""
-    f, g = (ex.args[1] if len(ex.args) > 1 else None), rec.get("sweep_facts")
-    add = lambda g, f: dict(g, cpu=round(g["cpu"] + f["cpu"], 1), took=round(g["took"] + f["took"], 1), runs=g.get("runs", 0) + f.get("runs", 0),
-                            cached=g.get("cached", 0) + f.get("cached", 0), failed=g["failed"] + [x for x in f["failed"] if x not in g["failed"]])
+    """rec of a pass that followed Replan ex, with the facts of the whole-file hearing of the pass that raised it added
+    to its own, see sub_whole(). The second pass finds the words in the cache, so its facts alone would hide what the
+    first pass heard."""
+    f, g = (ex.args[1] if len(ex.args) > 1 else None) or {}, rec.get("whole_facts") or {}
+    add = lambda g, f: dict(g, windows=g["windows"] + f["windows"], cpu=round(g["cpu"] + f["cpu"], 1), took=round(g["took"] + f["took"], 1),
+                            runs=g["runs"] + f["runs"], cached=g["cached"] + f["cached"], failed=g["failed"] + [x for x in f["failed"] if x not in g["failed"]])
     if f and g:
-        rec["sweep_facts"] = dict(add(g, f), **({"dense": add(g["dense"], f["dense"])} if "dense" in f and "dense" in g else {}))
+        rec["whole_facts"] = {i: add(x, f[i]) if i in f else x for i, x in g.items()}
     return rec
-
-
-def sweep_confirms(rows):
-    """Why the sweep() rows of a track, fitted to its fix, do not confirm that fix, or None. The rows to trust, with an
-    offset and MIN_CUES cues, must sit at least as close to the fitted line as they sat to the audio before the fix: as
-    many within TOLERANCE, and at a median distance no larger. So a sweep that shows the track in time blocks a fix
-    that two windows asked for, and a sweep that heard under SWEPT such windows cannot confirm one."""
-    ok = [w for w in rows if w["off"] is not None and w["offset"] is not None and w["cues"] >= subsync.MIN_CUES]
-    if len(ok) < subsync.SWEPT:
-        return f"the sweep heard {len(ok)} windows to judge the fix by, under {subsync.SWEPT}, so the times stay"
-    near = lambda k: sum(abs(w[k]) <= subsync.TOLERANCE for w in ok)
-    far = lambda k: statistics.median(abs(w[k]) for w in ok)
-    if near("off") < near("offset") or far("off") > far("offset"):
-        return (f"the sweep puts {near('off')} of {len(ok)} windows within {subsync.TOLERANCE} s of the fix and {near('offset')} within it of "
-                f"the audio as they are, so the times stay")
-    return None
-
-
-def sweep_offset(rows):
-    """The median offset of the sweep() rows that heard MIN_WORDS words: where a clean sweep puts the track's cues."""
-    got = [w["offset"] for w in rows or [] if w["words"] >= subsync.MIN_WORDS and w["offset"] is not None]
-    return statistics.median(got) if got else 0.0
 
 
 class Yielded(Exception):
@@ -859,122 +851,12 @@ class Yielded(Exception):
     far stay cached, see deep_analysis()."""
 
 
-def sub_sweep(path, j, items, sync, deep=False):
-    """({subtitle position or sidecar name: subsync.sweep() rows}, facts) of the sweep of --sub-time and the deep
-    analysis over the tracks and sidecars of the word check, items of sub_items() (docs/design.md, "Subtitle match"). Each
-    minute of the file gets one window of subsync.WINDOW seconds at its densest cues, which sweep_hear() hears. deep
-    is the deep analysis, which yields to an import job in the queue. The rows change no time, and sub_dense() hears the
-    parts where they sit off. facts holds the CPU and wall seconds and why a hearing heard nothing. A track whose read
-    was cut short gets no row past its last cue, see Cut, and facts holds that cue's end in "cut".
-
-    A word-check fix that passes sweep_confirms() must also put more of the sweep's matched cues in their spans than
-    the cues have as they are, see subsync.shares(). Else the times stay with "unfixed", as at an import, see
-    subsync.timing(). The sweep's windows are many more than the word check's.
-
-    The sweep also judges the times of each track that matched and was read whole, when the word check left them as
-    they are or its fix fails sweep_confirms() or the share, see subsync.sweep_fit(). Its fix, or its "in time" in
-    place of a fix that the sweep did not confirm, goes into sync as the track's timing, with the word check's why in
-    "word_check", and the rows then sit against that fix. The fix must pass sweep_confirms(), and no fix and no "in time" stands on rows
-    that subsync.live() reads as live captions. A fix of the sweep keeps the word check's timing in "word_timing", and
-    waits for dense hearing of the whole file at it, see sub_dense() and checked_fix(). An "in time" in place of steps
-    or an offset the word check could not fix waits in the timing's "in_time" for dense hearing, see held_in_time().
-    Else the timing keeps the word check's result, and "sweep_fit" says why, with the sweep's numbers in "sweep"."""
-    dur, out, facts = decide.duration(j), {}, {"cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
-    for idx, (lang, cues) in sub_groups(items).items():
-        stop = decide.STOPWORDS.get(lang, frozenset())
-        ts = subsync.word_times(cues, stop)
-        starts = [w for m in range(int(dur // 60) + 1) for w in subsync.windows(cues, dur, stop, parts=((m * 60 / dur, min(1.0, (m + 1) * 60 / dur)),), ts=ts)]
-        heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "sweep")
-        for k, x in items.items():
-            if x[1] != idx:
-                continue
-            h, r = before_cut(heard, x[2]), sync.get(k) or {}
-            t = r.get("timing") or {}
-            out[k] = subsync.sweep(h, x[2], lang, t)
-            if r.get("verdict") != "match":
-                continue
-            if t.get("fix") and not sweep_confirms(out[k]):   # the rows confirm the word check's fix, so its share in spans decides
-                cs, _, pairs = subsync.sweep_pairs(h, x[2], lang)
-                was, now = subsync.shares(pairs, subsync.unflashed(cs), t["fix"])
-                if now > was:
-                    sync[k] = dict(r, timing=dict(t, spans=[round(was, 3), round(now, 3)]))
-                    continue
-                t = {"fix": None, "unfixed": t["fix"]["offset"], "spans": [round(was, 3), round(now, 3)],
-                     "why": f'{t["why"]}, but the sweep puts {now:.0%} of its matched cues in their spans after the fix and {was:.0%} as they are, so the times stay'}
-                r = sync[k] = dict(r, timing=t)
-                out[k] = [dict(w, off=w["offset"]) for w in out[k]]   # no line is fitted now
-            if isinstance(x[2], Cut):
-                continue
-            got = subsync.sweep_fit(h, x[2], lang, dur, plain=t.get("why") != "in time")
-            rows = subsync.sweep(h, x[2], lang, got) if got["fix"] else [dict(w, off=w["offset"]) for w in out[k]]   # against no fix
-            why = sweep_confirms(rows) if got["fix"] else None if got["why"] == "in time" else got["why"]
-            why = why or ("the sweep reads the track as live captions" if subsync.live(rows) else None)
-            if why:
-                sync[k] = dict(r, timing=dict(t, sweep_fit=why, **({"sweep": got["sweep"]} if "sweep" in got else {})))
-            elif not got["fix"] and (t.get("piecewise") or "unfixed" in t):   # dense hearing judges the windows off first, see held_in_time()
-                sync[k] = dict(r, timing=dict(t, in_time=dict(got, word_check=t.get("why"))))
-            elif got["fix"] or t.get("fix"):   # a fix waits for dense hearing of the whole file at it, see sub_dense()
-                sync[k], out[k] = dict(r, timing=dict(got, word_check=t.get("why"), **({"word_timing": t} if got["fix"] else {}))), rows
-    cut = {k: round(e, 1) for k, x in items.items() if (e := cut_end(x[2])) is not None}
-    return out, dict(facts, cut=cut) if cut else facts
-
-
-def held_in_time(sync, found):
-    """sync with each "in time" that sub_sweep() held in a timing's "in_time" settled, after dense hearing gave found,
-    sub_dense()'s. The word check's steps or offset can come from a short block that one sweep window hears or none, so
-    the sweep alone never clears them. The "in time" stands when dense hearing judged each word-check window that sat
-    MIN_SHIFT or more off, see subsync.check(): the window lies in a part that is in line, or its cues lie in a block that
-    dense hearing moved. Else the word check's result stands, and its "sweep_fit" names the windows left."""
-    for k, r in sync.items():
-        t = r.get("timing") or {}
-        if "in_time" not in t:
-            continue
-        got = found.get(k) or {}
-        place = lambda w: w["at"] + w.get("secs", subsync.WINDOW) / 2   # audio time, and place + late its cues' time
-        judged = lambda w: any(p.get("in_line") and p["lo"] <= place(w) <= p["hi"] for p in got.get("parts") or ()) or \
-            any(b["from"] <= place(w) + w["late"] < b["to"] for b in got.get("blocks") or ())
-        left = [w for w in r.get("windows") or () if w.get("late") is not None and abs(w["late"]) >= subsync.MIN_SHIFT and not judged(w)]
-        if not left:
-            sync[k] = dict(r, timing=t["in_time"])
-        else:
-            at = ", ".join(f"{place(w) // 60:.0f}:{place(w) % 60:04.1f}" for w in left)
-            sync[k] = dict(r, timing={**{x: v for x, v in t.items() if x != "in_time"}, "sweep": t["in_time"].get("sweep"),
-                                      "sweep_fit": f"the sweep puts the cues in time, but dense hearing did not find them in time at {at}"})
-    return sync
-
-
-def checked_fix(sync, found, sweeps):
-    """sync with each fix of the sweep checked by dense hearing of the whole file at that fix, see sub_dense(). The fix
-    stands, with the blocks that dense hearing moved, when no long part is left off, see subsync.left_off(). A long part
-    left off is a step that the fix moved the wrong way, and a hearing that stopped part way checked nothing past that.
-    Then the word check's result stands, the track's blocks go, and its rows sit off the audio again. A word-check fix
-    the sweep did not confirm stays unconfirmed. A word check that would not alert gets "unfixed": None, so the times
-    that stay off alert. A short part left off in the middle of the file keeps the fix and alerts nothing. found and
-    sweeps change in place too."""
-    for k, b in list(found.items()):
-        t = (sync.get(k) or {}).get("timing") or {}
-        if not b.get("whole") or not (b.get("left") or b.get("unheard")):
-            continue
-        w = dict(t["word_timing"])
-        if w.get("fix"):   # it failed the sweep, see sub_sweep()
-            w = {"fix": None, "unconfirmed": w["fix"], "swept": True, "why": f'{w["why"]}, but the sweep did not confirm it'}
-        alerts = (w.get("piecewise") and round(max(w["offsets"]) - min(w["offsets"]), 2) >= config.STEP_ALERT) or "unfixed" in w
-        mmss = lambda x: f"{x // 60:.0f}:{x % 60:04.1f}"
-        why = "the hearing stopped part way" if b.get("unheard") else "the lines at " + ", ".join(f"{mmss(lo)} to {mmss(hi)} sit {o:+.2f} s off" for lo, hi, o in b["left"])
-        sync[k] = dict(sync[k], timing=dict(w, **({} if alerts else {"unfixed": None}), sweep=t.get("sweep"),
-                                            sweep_fit=f'a fix of {t["fix"]["offset"]:+.2f} s and the ratio {t["fix"]["rate"]} by the sweep was heard in full, '
-                                                      f'and {why}, so the times stay'))
-        sweeps[k] = [dict(x, off=x["offset"]) for x in sweeps.get(k) or []]
-        del found[k]
-    return sync
-
-
 def sweep_hear(path, idx, j, lang, starts, facts, deep, what):
-    """The heard windows of starts, WINDOW seconds each, on audio idx, for sub_sweep() and sub_dense(). One lid.py
-    process hears them with the model loaded once, two windows a Whisper run, and caches each pair. Between two runs
-    it yields when an import's hearing waits for the model, and then hears the rest with its next turn. With deep it
-    raises Yielded when an import job waits in the queue. It adds its cost to facts. what names the windows in the
-    reason of Yielded."""
+    """The heard windows of starts, WINDOW seconds each, on audio idx, for whole_heard().
+    One lid.py process hears them with the model loaded once, two windows a Whisper run, and caches each pair. Between
+    two runs it yields when an import's hearing waits for the model, and then hears the rest with its next turn. With
+    deep it raises Yielded when an import job waits in the queue. It adds its cost to facts. what names the windows in
+    the reason of Yielded."""
     gate, heard, left = os.path.join(config.CFG.state_dir, "lid.turn.gate"), [], list(starts)
     while left:
         got = checks.lid_run(path, idx, j, (), config.SUB_TIMEOUT * (len(left) // 2 + 1), words=(lang, left, subsync.WINDOW, None, 2),
@@ -992,79 +874,99 @@ def sweep_hear(path, idx, j, lang, starts, facts, deep, what):
     return heard
 
 
-def sub_dense(path, j, items, sweeps, sync, deep=False):
-    """({subtitle position or sidecar name: subsync.blocks() result}, facts) of the dense hearing of --sub-time and the
-    deep analysis (docs/design.md, "Subtitle match"). items are the sub_items() of the tracks and sidecars that
-    matched, sweeps their sub_sweep() rows and sync the word check. subsync.suspects() gives the parts of a track whose
-    sweep rows sit off its fitted line. The tracks of one audio track share one hearing of all their parts, in the
-    subsync.dense() windows that hear each part in full. Those windows lie where the cues of the tracks are, each track
-    moved to the audio by its fix. It hears and yields as sub_sweep() does. Then subsync.blocks() finds the blocks of
-    each track in its own parts, with the speech onsets of the parts as a second clock, see onsets(). A track with no
-    part gets no entry, and a file with no part hears nothing. facts holds the windows, the CPU and wall seconds of the
-    hearing and the onsets, and why a hearing heard nothing or the onsets failed. The parts of one audio track hold
-    subsync.BLOCK_HEAR seconds in all, see heard_parts().
+WHOLE_ONSET_PART = 600.0   # seconds of one onset read of whole_heard(), well inside ONSET_TIMEOUT. The deep analysis
+                           # yields to a waiting import between two such reads.
 
-    A part whose edge the hearing did not see asks for a stretch past it, see subsync.further(). Those stretches come
-    from what BLOCK_HEAR leaves after the first hearing. A second hearing hears them all once, their onsets join the
-    others, and blocks() runs again for each track that asked, with its parts and its stretches. In the deep analysis an
-    import that waits goes first, before the second hearing.
 
-    A track whose timing is a fix of the sweep, see sub_sweep(), is heard whole at that fix, past the cap, and blocks()
-    takes the whole file as its one part. subsync.left_off() then names the long parts still off, see checked_fix(). Only
-    the audio between the sweep's windows is new, see subsync.gaps(), and the sweep's windows come from the cache. A
-    22-minute episode hears about 155 new windows, and a 2-hour film about 840.
+def whole_heard(path, j, idx, lang, deep=False):
+    """The evidence of the whole file for the timing engine: the heard windows and the speech onsets of ffmpeg audio
+    track idx of path, heard in language lang (docs/design.md, "Subtitle match"). The windows lie on
+    subsync.whole_grid(). The cache may hold some of them already, see lid.windows_get(), and subsync.whole_starts()
+    leaves those out, so no window is heard twice. A window off the grid, such as one of the import's word check, never
+    counts. sweep_hear() hears the rest, two a Whisper run, and caches each pair. A run that stopped part way goes on
+    where it stopped, and a run after a whole hearing hears nothing. lid.speech() reads the spans of speech, and
+    onsets() reads the onsets in parts of WHOLE_ONSET_PART seconds. With deep, an import job that waits stops each step,
+    and Yielded rises.
 
-    A track whose read was cut short gets no parts and no live moves, see Cut. A track whose sweep looks
-    live-captioned, see subsync.live(), gets no parts. Dense hearing hears the whole audio track instead, past the cap,
-    and subsync.live_moves() moves each of its cues to its own speech. For the choice of windows its cues move by its
-    fix, then by the median "off" of its sweep rows against the fitted line, so the windows lie where the speech is.
-    The other tracks of that audio track keep their parts and their blocks. A hearing that stopped part way leaves the
-    cues past it where they are, and the track's "live" facts then say "fixed": False and hold the reasons in
-    "failed"."""
-    dur, out, facts = decide.duration(j), {}, {"windows": 0, "cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
-    fix = lambda k: ((sync.get(k) or {}).get("timing") or {}).get("fix")
-    audio = lambda t, f: subsync.moved(t * 1000, f) / 1000 if f else t
+    Returns {"windows": [{"at", "secs", "words"}] of the grid in time order, "heard": [[lo, hi]] of the audio they
+    hold, "spans": [[lo, hi]] of speech or None when the read failed, "onsets": [(time, seconds of silence before it)],
+    "facts"}. facts holds the new windows, the windows from the cache in "kept", the CPU and wall seconds of the
+    hearing, why it failed in "failed", and why a cached window did not read in "cache". "speech" and "onsets" hold the
+    same of the two reads, with "why" and "onset_why". A failure never raises."""
+    dur, cache, bad = decide.duration(j), os.path.join(config.CFG.state_dir, "lid.sqlite"), []
+    grid = {(a, subsync.WINDOW) for a in subsync.whole_grid(dur)}
+    try:
+        from . import lid
+        held = lambda: lid.windows_get(cache, path, idx, lid.tag(lid.MODEL), lang, grid, bad)
+    except ImportError:
+        held = list
+    have = held()
+    starts = subsync.whole_starts(dur, have)
+    facts = {"windows": len(starts), "kept": len(have), "cpu": 0.0, "took": 0.0, "failed": [], "runs": 0, "cached": 0}
+    new = sweep_hear(path, idx, j, lang, starts, facts, deep, "whole") if starts else []
+    ws = {(round(w["at"], 1), float(w["secs"])): w for w in have + new + (held() if starts else [])}   # with the pairs of a run that failed part way
+    ws = [ws[k] for k in sorted(ws) if k in grid]
+    got = checks.lid_speech(path, idx, j, config.SPEECH_TIMEOUT, (None, store.path()) if deep else None)
+    if got.get("yielded"):
+        raise Yielded("an import waits, during the speech read")
+    spans = got["spans"] if isinstance(got.get("spans"), list) else None
+    facts["speech"] = dict({k: got[k] for k in ("cached", "took", "cpu") if k in got},
+                           **({} if spans is not None else {"why": config.mask(str(got.get("why") or "no spans"))[:200]}))
+    times, facts["onsets"] = [], {"cpu": 0.0, "took": 0.0}
+    for k in range(math.ceil(dur / WHOLE_ONSET_PART)):
+        if deep and runner.queued():
+            raise Yielded(f"an import waits, during the onset read at {content.hms(k * WHOLE_ONSET_PART)}")
+        times += onsets(path, j, idx, [(k * WHOLE_ONSET_PART, min((k + 1) * WHOLE_ONSET_PART, dur))], facts["onsets"])
+    if facts["onsets"].get("onset_why"):   # each part of a bad stream gives the same reason
+        facts["onsets"]["onset_why"] = list(dict.fromkeys(facts["onsets"]["onset_why"]))
+    if bad:
+        facts["cache"] = bad
+    return {"windows": ws, "heard": subsync.merged((w["at"], w["at"] + w["secs"]) for w in ws), "spans": spans, "onsets": sorted(times), "facts": facts}
+
+
+def sub_whole(path, j, items, sync, deep=False):
+    """({subtitle position or sidecar name: its timing}, {audio index: the facts of its hearing}) of the whole-file
+    timing of --sub-time and the deep analysis (docs/design.md, "Subtitle match"). items are the sub_items() of the
+    tracks and sidecars that matched, and sync the word check. whole_heard() hears each audio track once, in the
+    language the word check heard it in, and align.run() times each subtitle on it in the subtitle's own language. A
+    track whose read was cut short gets no timing, see Cut. With deep, an import that waits raises Yielded.
+
+    The timing takes the word check's place, so its fix never moves a line: the timing in sync gets "fix" None, its own
+    why, and the word check's why in "word_check". A track the timing does not judge, see align.judged(), keeps what
+    the word check found, its fix as "unconfirmed", and "unheard". When the hearing stopped part way, no line moves and
+    nothing is judged. Nothing queues a new run, so a later --sub-time or deep analysis goes on where it stopped.
+
+    A timing is align.run()'s result, its lines in start order, and "anchors" the count of anchored lines. "before" holds the stretches off with no move, "lag" the median seconds the
+    anchored lines sit late before any move, "lines" the subtitle's lines, "heard" the audio the windows hold, and
+    "stopped" why the hearing stopped part way, when it did."""
+    out, facts = {}, {}
     for idx, (lang, _) in sub_groups(items).items():
         keys = [k for k, x in items.items() if x[1] == idx and not isinstance(x[2], Cut)]   # see Cut
-        lives = {k: x for k in keys if (x := subsync.live(sweeps.get(k) or []))}
-        whole = [k for k in keys if k not in lives and fix(k) and "word_timing" in sync[k]["timing"]]   # a fix of the sweep, see sub_sweep()
-        parts = {k: subsync.suspects(sweeps.get(k) or [], dur) for k in keys if k not in lives and k not in whole}
-        if not lives and not whole and not any(parts.values()):
+        if not keys:
             continue
-        union, parts = heard_parts(parts, {k: sweeps.get(k) or [] for k in parts})
-        swept = sorted({r["at"] for k in whole for r in sweeps.get(k) or []})   # the sweep's windows, heard already
-        parts.update({k: [(0.0, dur)] for k in whole})
-        spots = [(0.0, dur)] if whole else union   # the parts of the other tracks, which alone read speech onsets, and a whole file
-        union = [(0.0, dur)] if lives else [tuple(x) for x in subsync.merged(union + subsync.gaps(swept, dur))] if whole else union   # heard whole
-        late = lambda k: lives[k]["off"] if k in lives else 0.0
-        cues, stop = sorted((audio(a, fix(k)) - late(k), audio(b, fix(k)) - late(k), x) for k in keys for a, b, x in items[k][2]), decide.STOPWORDS.get(lang, frozenset())
-        timing = lambda k: (sync.get(k) or {}).get("timing")
-        starts = subsync.dense(cues, union, dur, stop)
-        facts["windows"] += len(starts)
-        failed = len(facts["failed"])
-        heard = sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
-        if whole and not lives:   # the sweep's windows come from the cache, with the clips the sweep heard
-            heard = sorted(heard + sweep_hear(path, idx, j, lang, swept, facts, deep, "sweep"), key=lambda w: w["at"])
-        times = onsets(path, j, idx, spots, facts) if spots and any(parts.values()) else []   # live_moves() reads no onsets
-        out.update({k: subsync.live_moves(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), x) for k, x in lives.items()})
-        for k in lives if len(facts["failed"]) > failed else ():   # a hearing that stopped part way leaves the track not fixed
-            out[k]["live"].update(fixed=False, failed=facts["failed"][failed:])
-        out.update({k: subsync.blocks(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), ps, onsets=times, rows=sweeps.get(k) or [])
-                    for k, ps in parts.items() if ps})
-        for k in whole:   # what the fix and its blocks leave off, see checked_fix()
-            out[k].update(whole=True, left=subsync.left_off(heard, items[k][2], lang, timing(k), out[k], dur), **({"unheard": facts["failed"][failed:]}
-                                                                                                                     if len(facts["failed"]) > failed else {}))
-        more = subsync.further({k: out[k] for k, ps in parts.items() if ps and k not in whole}, union, dur)   # none past a whole track heard
-        if more:
-            if deep and runner.queued():
-                raise Yielded("an import waits, before the second dense hearing")
-            extra = subsync.unheard([tuple(x) for x in subsync.merged(x for xs in more.values() for x in xs)], union)   # heard once
-            starts = subsync.dense(cues, extra, dur, stop)
-            facts["windows"] += len(starts)
-            heard += sweep_hear(path, idx, j, lang, starts, facts, deep, "dense")
-            times = sorted(times + onsets(path, j, idx, extra, facts))
-            out.update({k: subsync.blocks(before_cut(heard, items[k][2]), items[k][2], lang, timing(k), [tuple(x) for x in subsync.merged(parts[k] + xs)], onsets=times,
-                                          rows=sweeps.get(k) or []) for k, xs in more.items()})
+        got = whole_heard(path, j, idx, lang, deep)
+        facts[idx] = got["facts"]
+        for k in keys:
+            cues = items[k][2]
+            sc = sorted(cues, key=lambda c: c[0])   # the engine takes the lines in start order, as remux.time_plan() pairs them
+            r = align.run(sc, got["windows"], got["onsets"], items[k][0])
+            at = r.pop("anchors")
+            if got["facts"]["failed"]:   # a hearing that stopped part way judges nothing and moves nothing
+                r.update(moves={}, judge={"judged": False, "anchors": len(at), "curve": [], "off": []}, stopped=got["facts"]["failed"])
+            before = [] if r.get("stopped") else align.judged(sc, at, {})["off"]
+            out[k] = e = dict(r, anchors=len(at), before=before, lines=len(cues),
+                              lag=round(statistics.median(sc[i][0] - t - align.LEAD for i, t in at.items()), 2) if at else None, heard=got["heard"])
+            t, n = (sync.get(k) or {}).get("timing") or {}, judge.lines_moved(e)
+            if e["judge"]["judged"]:
+                why = "in time" if not n and not e["judge"]["off"] else \
+                    f'the whole-file timing moves {n} of {len(cues)} lines' + (" as live captions, each onto its own speech" if e["live"] else "") if n else \
+                    f'the whole-file timing finds {sum(x["last"] - x["first"] + 1 for x in e["judge"]["off"])} lines off and moves none'
+                sync[k] = dict(sync[k], timing={"fix": None, "why": why, **({"word_check": t["why"]} if t.get("why") else {})})
+            else:
+                why = (f'the whole-file hearing anchored {len(at)} lines, under {subsync.TIMING["judge anchors"]}, so it judges no times'
+                       + (f', as the hearing stopped: {"; ".join(e["stopped"])}' if e.get("stopped") else ""))
+                sync[k] = dict(sync[k], timing={**{x: v for x, v in t.items() if x != "fix"}, "fix": None, "unheard": True, "why": why,
+                                                **({"unconfirmed": t["fix"]} if t.get("fix") else {}), **({"word_check": t["why"]} if t.get("why") else {})})
     return out, facts
 
 
@@ -1075,9 +977,9 @@ ONSETS = {}   # (path, size, mtime_ns, audio index, lo, hi) -> the onsets of one
 def onsets(path, j, idx, parts, facts=None):
     """The speech onsets in parts [(lo, hi)] of ffmpeg audio track idx of path, sorted, as [(onset, seconds of silence
     before it)] in seconds of the file. An onset is where ffmpeg's silencedetect at -25 dB ends a silence of 0.3 s or
-    more. A part that starts in a silence counts that silence from its own start. subsync.blocks() takes them as a
-    second clock beside Whisper's word times (docs/design.md, "Subtitle match"). It counts an onset that ends a silence
-    of 0.5 s or more, and checks that no other onset lies near it. A track with a centre channel is heard there,
+    more. A part that starts in a silence counts that silence from its own start. The whole-file timing takes them as a
+    second clock beside Whisper's word times, see align.vote() (docs/design.md, "Subtitle match"). It counts an onset
+    that ends a silence of subsync.ONSET_QUIET or more. A track with a centre channel is heard there,
     where the dialogue is, and another track as its mono mix. j is the mkvmerge -J probe, which gives the channel
     count. ffprobe names the layout of a track with 3 channels or more. Each part is one ffmpeg read at nice 19 and
     idle I/O. A silence that runs to the end of a part ends no speech there. facts gets the CPU and wall seconds, and
@@ -1112,7 +1014,7 @@ def onsets(path, j, idx, parts, facts=None):
     if facts is not None:
         c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
         facts.update(cpu=round(facts["cpu"] + c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, 1), took=round(facts["took"] + time.monotonic() - t0, 1),
-                     **({"onset_why": why} if why else {}))
+                     **({"onset_why": facts.get("onset_why", []) + why} if why else {}))
     return sorted(out)
 
 
@@ -1127,29 +1029,6 @@ def ffmpeg_layouts():
             text = subprocess.run(["ffmpeg", "-hide_banner", "-layouts"], capture_output=True, text=True, errors="replace", timeout=30).stdout
             LAYOUTS.update(re.findall(r"(?m)^(\S+)\s+([A-Z][A-Z0-9]*(?:\+[A-Z][A-Z0-9]*)+)\s*$", text or ""))
     return LAYOUTS
-
-
-def heard_parts(parts, rows):
-    """(the parts dense hearing hears, {key: its parts}) for parts {key: subsync.suspects()} of the tracks of one audio
-    track, whose sweep rows are rows {key: rows}. suspects() holds the parts of one track to BLOCK_HEAR seconds, and the
-    parts of tracks that differ could hear more together. So the parts merge, and they hold BLOCK_HEAR seconds in all.
-    The suspect rows are those of subsync.suspect_rows(), each track's against its own lean. The part with the row
-    farthest off comes first, as in suspects(). A part that does not fit in what is left keeps the stretch that fits,
-    see subsync.centred(). With under WINDOW seconds left it keeps none. A track's part keeps what of it is heard, and a
-    part with nothing heard gives (lo, lo), which blocks() names as the cap."""
-    sus = {}
-    for rs in rows.values():
-        for t, off in subsync.suspect_rows(rs).items():   # the tracks share their windows, so a time can be off in several
-            sus[t] = max(off, sus.get(t, 0.0))
-    far = lambda p: -max((o for t, o in sus.items() if p[0] <= t < p[1]), default=0.0)
-    union, left = [], subsync.BLOCK_HEAR
-    for lo, hi in sorted(subsync.merged(p for ps in parts.values() for p in ps if p[1] > p[0]), key=far):
-        if hi - lo > left:
-            lo, hi = (round(x, 1) for x in subsync.centred(lo, hi, sus, left))
-        union.append((lo, hi))
-        left -= hi - lo
-    heard = lambda p: next(((max(p[0], a), min(p[1], b)) for a, b in union if max(p[0], a) < min(p[1], b)), (p[0], p[0]))
-    return sorted(p for p in union if p[1] > p[0]), {k: [heard(p) for p in ps] for k, ps in parts.items()}
 
 
 def side_stats(path):
@@ -1173,10 +1052,14 @@ def side_stats(path):
 # for a change of speed or wording, keeps every older result. tests/test_arr_media_guard.py checks each entry against
 # SUB_FINDINGS and the version.
 SUB_CHECKS = {
-    "subtitle_match": {"version": 2, "fixes": {2: ["off", "steps"]}},   # the word check of a subtitle in an audio language,
-                                                       # and its fix. Version 2 reads a roll-up caption by its new line, and
-                                                       # the deep analysis fits a drift from its sweep. Both can fix or clear
-                                                       # times that version 1 left off or in steps.
+    "subtitle_match": {"version": 3, "fixes": {2: ["off", "steps"]}},   # the word check of a subtitle in an audio
+                                                       # language, and its fix. Version 2 reads a roll-up caption by its new
+                                                       # line, and the deep analysis of 2.7.0 fitted a drift. Both can fix or
+                                                       # clear times that version 1 left off or in steps. In version 3 the
+                                                       # whole-file timing takes the place of its fix in --sub-time and the
+                                                       # deep analysis, and block timing 5 rechecks those results. Alone,
+                                                       # at an import or --sub-check, it fixes no more than version 2, so
+                                                       # version 3 adds no entry.
     "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
@@ -1184,14 +1067,15 @@ SUB_CHECKS = {
     "flash": {"version": 2, "fixes": {2: ["fix"]}},    # lines that flash by too fast to read. Version 2 writes the new
                                                        # ends of a HandBrake ASS track, whose events end in a NUL byte.
                                                        # Version 1 failed there, and its result says fix.
-    "block_timing": {"version": 4, "fixes": {3: ["fix"], 4: ["live", "off"]}},   # Subtitle block timing and Live caption
-                                                       # timing. Version 2 changes only the ends of live captions. A recheck
-                                                       # of a file 1 moved finds its lines on their speech and moves none
-                                                       # again. Version 3 writes the plan of a HandBrake ASS track, as flash
-                                                       # 2. A result with fix gets a recheck, a written plan too, which then
-                                                       # moves nothing. Version 4 reads a straight drift as a drift, never as
-                                                       # live captions, and the sweep of a drift or a roll-up caption track
-                                                       # sits on its line.
+    "block_timing": {"version": 5, "fixes": {3: ["fix"], 4: ["live", "off"], 5: None}},   # the timing of the lines of
+                                                       # --sub-time and the deep analysis. Version 3 writes the plan of a
+                                                       # HandBrake ASS track, as flash 2, so a result with fix gets a
+                                                       # recheck. Version 4 reads a straight drift as a drift, never as live
+                                                       # captions. Version 5 hears the whole file and times every line, see
+                                                       # sub_whole(). It can fix a file that any older version checked, so
+                                                       # each older result gets one recheck. A result does not say whether
+                                                       # its file has a text subtitle in the audio's language, so a file with
+                                                       # none gets its recheck too, and no whole-file hearing runs for it.
 }
 SUB_FINDINGS = ("mismatch", "unknown", "fix", "off", "steps", "unfixable", "cut", "live", "unread")   # the words of sub_found()
 SUB_RUNS = {"import": ("subtitle_match", "reference_timing", "flash")}   # the checks each run of process() makes
@@ -1204,19 +1088,22 @@ def sub_found(rec):
     mismatch (it does not belong to the audio), unknown (no verdict), fix (new times or a repair, made or not), off
     (times off by one amount that stay), steps (times off by different amounts in parts of the file), unfixable
     (garbled text with no repair), cut (its read stopped part way) and live (live captions). Foreign subtitle timing
-    gives unread when the read of the speech failed, so it judged nothing. A clean check gives []."""
-    def words(verdict, t):
+    gives unread when the read of the speech failed, so it judged nothing. A clean check gives []. Off and steps come
+    from the outcome of the timing judge, see judge.outcomes(): lines still off after the moves, and off by different
+    amounts in different parts, see judge.steps()."""
+    outs = rec.get("subjudge") or {}
+    def words(k, verdict, t):
         return {w for w, on in (("mismatch", verdict == "mismatch"), ("unknown", verdict not in ("match", "fit", "mismatch")), ("fix", t.get("fix")),
-                                ("off", "unfixed" in t or "unconfirmed" in t), ("steps", t.get("piecewise"))) if on}
-    timed = (rec.get("subtime") or {}).values()
-    out = {"subtitle_match": [words(r.get("verdict"), r.get("timing") or {}) for r in (rec.get("subcheck") or {}).values()],
-           "reference_timing": [words(r.get("verdict"), r.get("timing") or {}) for r in timed if "layout" not in r],
-           "foreign_timing": [words(r["layout"].get("verdict"), r.get("timing") or {}) for r in timed if "layout" in r]
+                                ("off", k in outs and judge.still_off(outs[k])), ("steps", k in outs and judge.steps(outs[k]))) if on}
+    timed = (rec.get("subtime") or {}).items()
+    out = {"subtitle_match": [words(k, r.get("verdict"), r.get("timing") or {}) for k, r in (rec.get("subcheck") or {}).items()],
+           "reference_timing": [words(k, r.get("verdict"), r.get("timing") or {}) for k, r in timed if "layout" not in r],
+           "foreign_timing": [words(k, r["layout"].get("verdict"), r.get("timing") or {}) for k, r in timed if "layout" in r]
            + ([{"unread"}] if "why" in (rec.get("speech") or {}) else []),
            "garbled_repair": [{"cut" if g.get("capped") else "fix" if g.get("repair") else "unfixable"} for g in (rec.get("garbled") or {}).values()],
            "flash": [{"off" if f.get("report_only") else "fix"} for f in (rec.get("flash") or {}).values()],
-           "block_timing": [{w for w, on in (("fix", b.get("blocks")), ("live", b.get("live"))) if on} for b in (rec.get("blocks") or {}).values()]
-           + [{"off"} for rows in (rec.get("sweep") or {}).values() if cli.sweep_alerts(rows)]}
+           "block_timing": [{w for w, on in (("fix", judge.lines_moved(e)), ("live", e["live"])) if on} for e in (rec.get("whole") or {}).values()]
+           + [{"off"} for o in outs.values() if judge.still_off(o) and any(x["clock"] in ("whole", "live") for x in o["off"])]}
     return {k: sorted(set().union(*v)) for k, v in out.items()}
 
 
@@ -1295,8 +1182,8 @@ def raw_srt(raw):
 def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     """Act on the sidecars beside a Matroska file (docs/design.md, "Subtitle match"). A sidecar that does not match the
     audio moves into originals_root() as a kept original. A sidecar whose times need a fix, or whose cues flash, with
-    ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. A sidecar with
-    blocks, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
+    ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. A sidecar whose
+    lines move, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
     holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
     KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. A rewrite changes only the time lines and keeps every other byte,
     see raw_srt(). Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
@@ -1398,17 +1285,23 @@ def garbled_tracks(path, j, sides, full=False):
     return out
 
 
-def sub_findings(rec, sync, unmatched):
+def sub_findings(rec, sync, unmatched, starts=None):
     """The findings of the subtitle match check, each a list of sentence codes and facts, see report.SUB_LINES: one
     submatch finding for the tracks and sidecars that do not match the audio and the tracks whose text is garbled, and
     one subtiming finding for the tracks whose times are off and stay. unmatched holds the tracks, by their place
     before any remux, that stayed in the file and lost their flags instead. A line of a subtitle that the speech layout
     check found off, or whose times it could not fix, says layout. Such a subtitle whose verdict stays, see
     subsync.LAYOUT_ACTION, gets a layout line. A dry run also records what --apply would do with the file, see
-    remux_block()."""
+    remux_block().
+
+    The timing judge gives each subtitle of sync its outcome first, after the moves and the write, in rec["subjudge"],
+    see judge.outcomes(). starts are {subtitle: its sorted cue starts}, which count the lines of a stretch still off.
+    The timing sentences come from those outcomes alone, see judge.alert_lines()."""
     rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
     plan = {} if rec.get("apply", True) else remux_block(rec)
     flags_off, by = sub_fixes(rec.get("source")), "hook" if rec.get("source") in SUB_SOURCES else "run"
+    if outs := judge.outcomes(rec, sync, starts or {}, flags_off):
+        rec["subjudge"] = outs
     laid = lambda k: {"layout": True} if ((sync.get(k) or {}).get("layout") or {}).get("verdict") == "mismatch" else {}   # see sub_layout()
     for p in rm.get("removed") or []:
         wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept"), **laid(p)})
@@ -1440,40 +1333,10 @@ def sub_findings(rec, sync, unmatched):
         wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left")})
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
         wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept")})
-    # A live-captioned track gets one sentence in place of the sentences of its times and its sweep, and only when its
-    # lines stay out of sync: a setting kept them, or too many could not be timed, see subsync.live_moves(). A hearing
-    # that stopped part way adds hearing_stopped, see sub_dense(), so the alert names that step. When an apply's remux
-    # did not run, the not_retimed sentence alone says so. A dry run's live sentence says what --apply would do in
-    # place of the not_retimed sentence.
-    live = {k: b["live"] for k, b in (rec.get("blocks") or {}).items() if b.get("live")}
-    redo = set() if rm.get("done") else {*(rm.get("fixed") or []), *(rm.get("ended") or []), *(rm.get("timed") or [])}
-    said = set()
-    for k, f in sorted(live.items()):
-        if not (flags_off and f["fixed"]) and not (k in redo and rec.get("apply", True)):
-            said.add(k)
-            late.append({"code": "live", "track": k, "lag": (f.get("scan") or {}).get("lag") or (f["lags"] or [0.0])[1], "moved": f["moved"],
-                         "cues": f["cues"], "left": f["left"], "flags_off": flags_off, **({"block": plan.get("block")} if k in redo else {}),
-                         **({"hearing_stopped": True} if f.get("failed") else {})})
-    dur = {"duration": rec["file_duration"]} if rec.get("file_duration") else {}   # a fix with a ratio says where it ends, see report.at_end()
-    for p, r in sorted(sync.items()):
-        t = r.get("timing") or {}
-        if p in live:
-            continue
-        if (t.get("piecewise") and round(max(t["offsets"]) - min(t["offsets"]), 2) >= config.STEP_ALERT) or "unfixed" in t:
-            laid_out = (r.get("layout") or {}).get("verdict") == "fit"   # the speech layout timed it, see sub_layout()
-            late.append({"code": "off", "track": p, "ref": None if laid_out else r.get("reference"), "why": t["why"], "offsets": t.get("offsets"),
-                         "unfixed": t.get("unfixed"), **({"layout": True} if laid_out else {}), **({"would": t["would"], **dur} if t.get("would") else {})})
-    if redo - said:
-        late.append({"code": "not_retimed", "tracks": sorted(redo - said), "result": rm.get("result"), "block": plan.get("block")})
-    if not flags_off:
-        late += [{"code": "check_times", "track": p, "why": r["timing"]["why"], "fix": r["timing"]["fix"], **dur,
-                  **({"kept": r["timing"]["kept"]} if r["timing"].get("kept") else {})}
-                 for p, r in sorted(sync.items()) if (r.get("timing") or {}).get("fix")]
-        late += [{"code": "check_flash", "track": p, "median": f["median"]} for p, f in sorted((rec.get("flash") or {}).items())]
-    far = [[k, w["at"], w["off"]] for k, rows in sorted((rec.get("sweep") or {}).items()) if k not in live for w in rows if id(w) in cli.sweep_alerts(rows)]
-    if far:
-        late.append({"code": "sweep", "far": far})
-    return ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])
+    late += judge.alert_lines(rec, sync, flags_off, plan)
+    out = ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])
+    judge.check_outcome(rec, out)
+    return out
 
 
 def remux_block(rec):

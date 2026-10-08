@@ -42,4 +42,23 @@ KIND is `right`, `drift`, `step`, `block`, `scene` (each scene off by its own la
 speech onsets and a truth row per cue, all made up. `synth.window(case, start, seconds)` gives one heard window in the
 form of `lid.listen()`, for a harness that calls the timing functions of `subsync.py` directly.
 
+## The regression corpus
+
+`tests/test_regressions.py` runs every planted shape that a review of the timing check found, on every commit: blocks
+and steps through an import and its deep analysis (with a failed write, `DISCORD_POSTS=all` and a dry run), unsure
+word-check windows, held import alerts, and the jump finder's hostile shapes. Each case knows the lines it planted off
+and scores the outcome in kinds: `wrong_silence` (3 or more lines in a row 0.5 s or more off, and no alert),
+`wrong_alert` (an alert, and no such lines), `wrong_text` ("left as they are" after a move, "0.0 s", or the moved
+lines named twice), `wrong_move` (a line within 0.5 s of its speech moved 0.5 s or more off) and `broken` (a safety
+rule broke). `tests/fixtures/known_failures.json` lists the kinds each case fails today. A case passes only when its
+kinds match the list, so a new failure fails, and so does a case that stops failing until its entry leaves the list.
+
+```
+AMG_CORPUS_OUT=new.jsonl pytest -n 2 tests/test_regressions.py
+python tools/bench/regressions.py new.jsonl [--base old.jsonl] [--known tests/fixtures/known_failures.json]
+```
+
+`regressions.py` counts the cases per kind, names each case that gained or lost a kind against `--base`, and with
+`--known` writes the list from the run. Write it only when each change in it is the one the commit means to make.
+
 The tests of these tools are in `tests/test_bench.py`.

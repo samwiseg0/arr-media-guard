@@ -198,7 +198,7 @@ ask = ASKED[-1] if ASKED else {"ids": [], "fixes": {}, "timed": {}}
 tracks, cues = {}, {}
 for p, x in (rec.get("subcheck") or {}).items():
     t = x.get("timing") or {}
-    tracks[p] = {k: t.get(k) for k in ("fix", "unfixed", "piecewise", "offsets", "why", "sweep_fit")} | {"verdict": x.get("verdict")}
+    tracks[p] = {k: t.get(k) for k in ("fix", "unfixed", "piecewise", "offsets", "why", "word_check")} | {"verdict": x.get("verdict")}
     k = int(p[1:]) - 1 if p[:1] == "s" and p[1:].isdigit() else None
     if p in BASE and k is not None and k < len(ask["ids"]):
         tid = str(ask["ids"][k])

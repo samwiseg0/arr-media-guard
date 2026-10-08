@@ -292,8 +292,8 @@ def sub_summary(c, library):
 
 
 def sub_time(argv):
-    """--sub-time: the subtitle check of each Matroska file named by path, with the reference timing and the sweep
-    (docs/design.md, "Subtitle match"). It runs the check of --backfill --sub-check on the file, past its cached
+    """--sub-time: the subtitle check of each Matroska file named by path, with the reference timing and the whole-file
+    timing (docs/design.md, "Subtitle match"). It runs the check of --backfill --sub-check on the file, past its cached
     verdicts, and writes them to the cache. It is dry unless --apply is given, and it acts as a backfill does: the file
     lock, hide_dir, keep_dir, the proof, and a Plex analyze after an edit. Alerts print and never post. An app names
     the item only for its original language and the other inputs of the check, see App.library(). A path no app
@@ -302,7 +302,7 @@ def sub_time(argv):
     --apply then stops before any change, and a dry run says so. An app the user set up in part fails the same way, see
     no_key()."""
     ap = argparse.ArgumentParser(prog="arr-media-guard --sub-time", description="The subtitle check of each Matroska file, with the "
-                                 "reference timing and the sweep, past the cache. See docs/subtitles.md.")
+                                 "reference timing and the whole-file timing, past the cache. See docs/subtitles.md.")
     ap.add_argument("paths", nargs="+", metavar="PATH")
     ap.add_argument("--apply", action="store_true", help="make the changes. Without it the run is dry and changes nothing")
     a = ap.parse_args(argv)
@@ -376,34 +376,6 @@ def unheard(rec):
 
 SUB_TIME_MISSED = 3   # the exit code of --sub-time --apply when a change it planned did not happen, see report.missed()
 SUB_TIME_NO_FILE = 4   # the exit code of --sub-time when a path it was given holds no file
-
-
-def sweep_far(w):
-    """A row of the sweep that heard enough cues to trust and sits STEP_ALERT or more off the fitted line."""
-    return w["off"] is not None and w["cues"] >= subsync.MIN_CUES and abs(w["off"]) >= config.STEP_ALERT
-
-
-def sweep_trusted(rows):
-    """The sweep rows to trust: each gave an offset from MIN_CUES cues or more."""
-    return [w for w in rows if w["off"] is not None and w["cues"] >= subsync.MIN_CUES]
-
-
-def sweep_steps(rows):
-    """The ids of the sweep rows in a step: a far row, see sweep_far(), whose neighbour among the rows to trust is far
-    the same way. A part of the file that is off holds such windows in a row. One window alone is often a slip of
-    Whisper's word times, such as a word heard with the line before it, so it goes to the log only."""
-    ok = sweep_trusted(rows)
-    far = lambda k: 0 <= k < len(ok) and sweep_far(ok[k])
-    return {id(w) for k, w in enumerate(ok) if far(k) and any(far(n) and ok[n]["off"] * w["off"] > 0 for n in (k - 1, k + 1))}
-
-
-def sweep_alerts(rows):
-    """The ids of the sweep rows that alert: the steps of sweep_steps(), when they hold 3 rows or more, or every row to
-    trust, and at least a quarter of the rows to trust. A part of the file is then off, and nothing fixed it. Other steps
-    go to the log only, such as two windows near the end, or two stray windows of a sparse sweep. Nothing failed there,
-    and nothing can be done."""
-    steps, trusted = sweep_steps(rows), len(sweep_trusted(rows))
-    return steps if len(steps) >= min(3, trusted) and 4 * len(steps) >= trusted else set()
 
 
 def rescan_item(app, owner, keys):
@@ -845,5 +817,6 @@ def main(argv):
     else:
         try:
             runner.hook()
-        except Exception:   # hook mode never fails the import
-            pass
+        except Exception as ex:   # hook mode never fails the import
+            if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+                raise

@@ -346,6 +346,22 @@ def test_the_words_follow_an_edit_and_a_conversion(ears, tmp_path):
     assert arr_lid.listen(new, 1, [200.0, 1000.0], "eng", cache=cache)["cached"]
 
 
+def test_every_window_the_cache_holds_comes_once_in_time_order(ears):
+    """Two hearings heard the window at 200 s, each in its own pair. It comes once, from the first. Another language,
+    a file that changed and a cache that does not exist give none, and the look never creates the cache."""
+    calls, media, cache = ears
+    tag = arr_lid.tag(arr_lid.MODEL)
+    assert arr_lid.windows_get(cache, media, 1, tag, "eng") == [] and not os.path.exists(cache)
+    first = arr_lid.listen(media, 1, [1000.0, 200.0], "eng", cache=cache)["windows"]
+    arr_lid.listen(media, 1, [200.0, 600.0], "eng", cache=cache)
+    got = arr_lid.windows_get(cache, media, 1, tag, "eng")
+    assert [w["at"] for w in got] == [200.0, 600.0, 1000.0] and got[0] == first[1], got
+    assert arr_lid.windows_get(cache, media, 1, tag, "spa") == [] and arr_lid.windows_get(cache, media, 0, tag, "eng") == []
+    with open(media, "ab") as f:
+        f.write(b"y")
+    assert arr_lid.windows_get(cache, media, 1, tag, "eng") == []
+
+
 def test_the_verdict_cache_holds_the_pending_mark(tmp_path):
     media = tmp_path / "a.mkv"
     media.write_bytes(b"x")

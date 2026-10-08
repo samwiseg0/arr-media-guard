@@ -153,10 +153,10 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
 ## 7. The deep analysis
 
 With `SUBTITLES=deep`, an import of a Matroska file with subtitles, or with a `.srt` beside it, puts a second job in the
-background queue. This *deep analysis* is the slower subtitle check of `--sub-time`. It reads the whole file and listens
-to much more of the audio. It can fix a subtitle that drifts, move a stretch of lines that is out of sync, and time
-live captions line by line. It
-can also retime foreign subtitles by the speech, and repair garbled text. See [features.md](features.md#subtitle-match).
+background queue. This *deep analysis* is the slower subtitle check of `--sub-time`. It reads the whole file, listens
+to the whole audio and times every subtitle line against it. It can fix a subtitle that drifts or jumps in the middle of
+the file, move a stretch of lines that is out of sync, and time live captions line by line. It can also retime foreign
+subtitles by the speech, and repair garbled text. See [features.md](features.md#subtitle-match).
 
 It runs only while no import waits, and it stops between two steps when one arrives. It keeps the flags the import set,
 and it alerts only on subtitles. When the app renamed or moved the file, it checks the file at its new path. It drops

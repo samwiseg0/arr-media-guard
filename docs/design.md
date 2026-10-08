@@ -255,8 +255,8 @@ offset under 0.05 seconds reads "in sync", see `report.about()`.
 color. A change that no finding words posts in green, see `report.changes()`. That is a conversion to MKV, a file
 repair, retimed subtitles or a track edit. A track edit says each kind it made: default flags, forced flags and
 language tags. One fix posts once. A change that a posted alert already says is left out, see `report.said()`: lines a
-live caption alert moved, flags a `stays` or `sublang` alert turned off, and a conversion that a subtitle sentence
-names. After a re-grab deleted the file, only the re-grab posts, as in issues mode. A change whose text fails posts
+live caption alert moved, lines an alert of moved parts counts, flags a `stays` or `sublang` alert turned off, and a
+conversion that a subtitle sentence names. After a re-grab deleted the file, only the re-grab posts, as in issues mode. A change whose text fails posts
 nothing. Its line in `change_result` starts with `no text:`, and the other changes still post. These posts skip the
 marker, because a second run finds nothing left to change. `change_result` in the decision line keeps what each post
 gave.
@@ -274,9 +274,10 @@ at its old missing path or at a path this container does not see is not gone, so
 checked the subtitles itself. The alert also goes unposted when the job ran to its alerts and judged each subtitle the
 alert names, see `runner.judged()`. A verdict of `match`, `fit` or `mismatch` judges. The `unknown` of a failed hearing
 does not, and with no language model there is no verdict. A held `subtiming` alert also needs the times of each subtitle
-judged again, see `runner.times_judged()`. That is a fix, "in time", steps, an offset left as it is, a fix the sweep did
-not confirm, lines that dense hearing moved, a remux that retimed the track, or a `mismatch`. A word check that matched
-the words but anchored too few cues to time them judged no times, so the alert posts. A job whose remux or sidecar
+judged again, see `runner.times_judged()`. The timing judge gave each one an outcome other than unknown, see "Timing
+outcome", or the subtitle does not match the audio. That outcome posts itself when lines are still off. A word check that matched
+the words but anchored too few cues to time them judged no times. When the whole-file timing judged nothing either,
+the alert posts. A job whose remux or sidecar
 rewrite retimed, moved or removed those subtitles before an error counts too, see `runner.remuxed()`. Longer ends and
 a repaired text do not. Every other held alert posts through `logs.post_held()`, because nothing judged its subtitles
 again. That is an error, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the run, or a
@@ -359,7 +360,7 @@ The action codes are `regrabbed`, `restored` (a manual import's old file came ba
 `would_regrab`, `unconfirmed`, `capped`, `no_grab`, `failed`, `dry_run` and `no_policy`. The title of a re-grab says
 "old file restored" when the job's own old file came back. Each sentence of a `submatch` or `subtiming` finding has a
 code too: `removed`, `stays`, `sidecar`, `converted_sidecar`, `converted_track`, `sidecar_left`, `off`, `not_retimed`,
-`check_times`, `check_flash` and `sweep`. The codes are stable, and the words may change.
+`check_times`, `check_flash` and `live`. The codes are stable, and the words may change.
 
 ## Broken audio
 
@@ -596,8 +597,8 @@ see `runner.app_file()`. After a rename or a move, which queues no import, it go
 `file_moved` line. An edit in place keeps the inode, and the job goes on. It checks this when it starts, each time
 it takes the file lock, after its remux and after an error, because the app holds no lock. A change of its own never
 counts. A conversion of its own before a yield gives the job the new file's inode, size and mtime. The queue drains with
-no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its sweep hears
-two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
+no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its whole-file
+hearing hears two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
 job waits in the queue. It also stops for a waiting import job after the whole-file read, before each read and each fit
 of a track, after each 10 minutes of audio of the speech read, see "Incorrect subtitle identification", and before the
 remux. It then goes back to its queue. Its next run finds the words heard so far in the cache, and the whole-file read
@@ -689,7 +690,7 @@ reason codes come from the `say()` calls in
 out before each edit, so a crashed edit still has a record. A repack, a header repair and a subtitle
 remux each write a line before anything else runs, with the code of the step in `outcome`. A subtitle remux
 that changes no flag gives the decision line the outcome `subtitles_remuxed`, and its result names each change, as
-`subtitles remuxed: s2 retimed, s1 blocks moved`. When only sidecars changed, the outcome is `sidecars_changed`, as
+`subtitles remuxed: s2 retimed, s1 lines moved`. When only sidecars changed, the outcome is `sidecars_changed`, as
 `sidecars changed: Film.en.srt retimed`. Only a
 decision line has `schema`. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
@@ -1365,11 +1366,11 @@ ends at its BlockDuration. A sidecar and an MP4 track are read as SubRip text.
 track, or a PGS track redrawn every frame, can hold tens of thousands of blocks, so a lower cap cut real tracks short.
 The whole-file read of a track the Cues do not index keeps the same cap, and stops after 30 minutes (`FULL_WALL`). The
 read marks a track it cut short (`subtitles.Cut`). A block that gives no cue still counts toward the cap. The word
-check, the sweep and incorrect subtitle identification then judge no window and no speech past its last cue read. Such a
-window holds none of its cues, and its words paired by chance with cues far away, at offsets near -2,000 seconds.
-Incorrect subtitle identification judges such a track as a file that ends at its last cue read. A remux rewrites every
-cue of a track, and a plan of new times or text would hold only the cues read. So such a track gets no fix of its own
-cues: no block, live caption, flash or garbled fix. A whole-track fix of the word check or a reference still moves
+check and incorrect subtitle identification then judge no window and no speech past its last cue read. Such a window
+holds none of its cues, and its words paired by chance with cues far away, at offsets near -2,000 seconds. Incorrect
+subtitle identification judges such a track as a file that ends at its last cue read. A remux rewrites every cue of a
+track, and a plan of new times or text would hold only the cues read. So such a track gets no fix of its own cues: no
+whole-file timing, flash or garbled fix. A whole-track fix of the word check or a reference still moves
 every cue. Foreign subtitle timing gives such a track no fix: on a review's plants the lines past the read were in time
 again, and a whole-track fix moved them off. Nor does it time another
 track, because that fit would rest on its first part alone.
@@ -1457,7 +1458,7 @@ the median lead of right tracks, so a fixed copy lands within the spread of thos
 above its new line, so its first words were spoken two or three lines earlier, 2 to 4 seconds before the cue shows. A
 cue timed by them reads seconds late, by a different time each cue. So every timing check reads a cue of a roll-up track
 by its new lines only, less a speaker's name such as `>> Reporter:` (`subsync.spoken()`). That covers the word check
-and its spans test, the line windows, the sweep, and the anchors of dense hearing. A track counts as roll-up when half
+and its spans test, the line windows, and the anchors of the whole-file timing. A track counts as roll-up when half
 its cues or more repeat lines of the cue before (`ROLLUP`). Roll-up tracks sat at 69% or more, other tracks at 30% or
 less. The most among them were paint-on captions, which show each line as it is typed. Other tracks keep their text,
 because a line said twice in a row there was spoken twice. A roll-up track that is off still reads off by its new lines,
@@ -1490,72 +1491,34 @@ and gets its fix.
   hears too little gets a window of 24 seconds elsewhere in its part. Each of them must hold 3 matched cues and sit
   within 0.3 seconds of the fix's line. A window too thin to judge confirms nothing. These windows never change the
   verdict, and the hearing costs one more run of the model with two windows. A small fix they do not confirm is not
-  applied, with no alert. An import with the deep analysis on queues it, and the deep analysis judges the track. Else
-  only the decision log holds the fix. A check after a conversion picks the same windows again.
-- `--sub-time` and the deep analysis hear no such windows, because their sweep judges the fix. After the fix, the
-  sweep's windows with 3 matched cues must sit at least as close to the fitted line as they sat to the audio before: as
-  many within 0.3 seconds, and at a median distance no larger. A sweep that shows the track in time so blocks the fix,
-  and so does a sweep that heard under 3 such windows. The track then keeps its times, with no alert, and a clean
-  sweep makes it a reference. A fix the rows confirm must also raise the share of the sweep's matched cues in their
-  spans, see the last rule below. Its windows count as for the sweep's own fit (`subsync.sweep_pairs()`). A tie keeps
-  the times, and the sweep then times the track itself, as below.
-- `--sub-time` and the deep analysis also time a matched track from the sweep (`subsync.sweep_fit()`). That happens when
-  the word check left its times as they are, or its fix fails the sweep. The word check's windows must all sit within
-  0.3 seconds of one line, so one noisy window blocks a fix. A DVD subtitle that drifts at 1001/1000, with lines its
-  author timed up to half a second off, showed that. A sweep window counts as for block timing: 8 words heard, half of
-  them matched and 2 cues anchored. Each half of the file needs 3 such windows. Each gives a point, the median time of
-  its anchors and their median offset. The median of the slopes between every two points picks the ratio nearest it.
-  When its 95% interval from Kendall's rank test holds 0, the ratio is 1. The line of that ratio goes through the median
-  of all the anchors. On four drifting tracks measured with a larger speech model, that put 3 to 14 more lines within
-  half a second of their speech than the median of the points did.
-  - The track is in time when the line sits under 0.75 seconds off at the file's start and end.
-  - Two windows in a row 0.75 seconds or more off the line the same way are a step, and the sweep judges nothing.
-  - A ratio other than 1 needs each half of the file to drift. A half whose interval holds 0 and not the ratio sits
-    flat, as on each side of an edit, and the ratio would move lines that are in time.
-  - A plain offset needs a word check that did not find the track in time. Two windows near the ends measure one offset
-    well, and only a drift needs the windows between them.
-  - A fix needs 80% of the matched cues in their spans after it, and more of them than as they are. On a right roll-up
-    track, a few cues a window that the author timed off faked a slope of 30 ms a minute. The fix of 1001/1000 took
-    the share from 90% to 82%, and moved 130 lines in time out of half a second. The sweep must confirm a fix as
-    above, and its rows must not read as live captions.
+  applied. The times stay with the fix's offset in `unfixed`, so they alert. An import with the deep analysis on holds
+  that alert, and the deep analysis judges the track. A check after a conversion picks the same windows again.
+- `--sub-time` and the deep analysis hear no such windows. The whole-file timing hears the whole audio there and times
+  every line, see "Whole-file timing" below. It takes the place of the word check's fix, so that fix never moves a
+  line. The track's timing then holds the whole-file timing's own why, and the word check's why stays in
+  `word_check`. A track the whole-file timing does not judge, as when it anchored too few lines, keeps what the word
+  check found. Its fix moves nothing and stays in `unconfirmed`, and `unheard` marks it.
 
-  The fix becomes the track's timing, and so does "in time" in place of a word-check fix that the sweep did not
-  confirm. The word check's why stays in `word_check`. So one noisy window does not block a fix. An "in time" in place
-  of steps or an offset the word check could not fix waits for dense hearing, see `subtitles.held_in_time()`. A short
-  block can lie in one sweep window or none, and the line through the median splits a step under 1.5 seconds into two
-  halves that each sit under 0.75 seconds off. So the sweep alone never clears such an alert. Each word-check window
-  keeps the offset of its anchors in `late`. The "in time" stands when dense hearing judged each window 0.75 seconds or
-  more off: the window lies in a part that is in line, or its lines lie in a block that dense hearing moved. Else the
-  word check's result and its alert stay, and `sweep_fit` names the places. A step the sweep finds, too few windows or
-  live captions keep the word check's result and its alert too, and `sweep_fit` says why, with the sweep's numbers in
-  `sweep`. An import hears no sweep, so its alert stays.
-
-  A fix of the sweep keeps the word check's timing in `word_timing`. Dense hearing then hears the whole file at the
-  fix, see `subtitles.sub_dense()`. Only the audio between the sweep's windows is new. That is about 155 windows for a
-  22-minute episode, and about 840 for a 2-hour film. `subsync.left_off()` names the parts that still sit 0.75 seconds
-  or more off over 6 windows or more. A part counts when it covers a quarter of the file, or when it runs from the
-  first window or to the last over 90 seconds. Such a part is a step that the fix moved the wrong way, so
-  `subtitles.checked_fix()` refuses the fix, and the word check's result and its alert come back. A word check in time
-  gets `unfixed` with no offset, so it alerts that the times are off. A shorter part in the middle keeps the fix. On
-  real drifting episodes such parts sat up to 1.18 seconds off for up to 2 minutes, where the author timed lines off,
-  and their long parts and their parts at a file end sat 0.6 seconds off at most. Known limit: the line of a ratio can
-  take up most of a step under about a second, so no long part sits 0.75 seconds off and the fix stands. The lines on
-  one side of the step then sit about half a second off. A step of 0.9 seconds on the last 40% of a real episode showed
-  it.
-- No ratio that fits is two offsets, a different cut, and the times stay. It alerts when the windows differ by 1
-  second or more. A smaller step, as a right track can show, goes only to the decision log and the backfill report.
+  A word-check window is unsure when its heard words sit under 0.75 seconds off, its anchors sit 0.75 seconds or more
+  off, and the two lie 0.8 seconds or more apart, see `subsync.unsure_window()`. Two cues shown a second early over a
+  sound move the cue starts, and the words still sit in time. The steps stand, and "unsure" holds the fit of the other
+  windows for the decision log. With `SUBTITLES=deep` the import holds the alert, and the whole-file timing of the deep
+  analysis judges every line.
+- No ratio that fits is two offsets, a different cut, and the times stay. A window 0.75 seconds or more off posts, as
+  heard evidence does, see "Timing outcome". Steps whose windows each sit under that go only to the decision log and
+  the backfill report.
   Two ratios that fit and move the cues apart by more than 0.3 seconds at the file's ends give no fix and alert, a
   plain offset among them. Two windows cannot tell a plain offset from 24/23.976 when their offsets differ by half a
   second.
 - After the fix, 80 percent of the matched cues must fall inside their spans, and more of them than as they are
   (`subsync.shares()`). A tie keeps the times, and the offset alerts as one the word check could not fix. Without the
-  deep analysis no sweep judges that alert again, so it posts even for a right track. An import and a `--sub-check`
-  backfill count the matched cues of the word check's own windows, `--sub-time` and the deep analysis those of the
-  sweep. On a right track, the word check's line ran 0.757 seconds off at the file's start, 7 ms past 0.75 seconds, and
-  1001/1000 fit its three windows. That fix moved 107 lines in time out of half a second. The sweep put 96% of its
-  matched cues in their spans as they were, and 83% after the fix. On a real drift the share rose from 66% to 90%. Known
-  limit: a cue that shows for its whole line keeps its heard words inside its span through a move of about a second. A
-  smaller fix of such cues cannot raise the share, so they keep their times.
+  deep analysis nothing judges that alert again, so it posts even for a right track. The rule counts the matched cues
+  of the word check's own windows. On a right track, the word check's line ran 0.757 seconds off at the file's start,
+  7 ms past 0.75 seconds, and 1001/1000 fit its three windows. That fix moved 107 lines in time out of half a second.
+  Windows heard once a minute put 96% of the matched cues in their spans as they were, and 83% after the fix. On
+  a real drift the share rose from 66% to 90%. Known limit: a cue that shows for its whole line keeps its heard words
+  inside its span through a move of about a second. A smaller fix of such cues cannot raise the share, so they keep
+  their times. `--sub-time` and the deep analysis skip this rule, since the whole-file timing takes the fix's place.
 
 A rule that every matched cue agrees within 0.3 seconds fails on right tracks. Right tracks start their cues 0.9
 seconds early to 1.5 seconds late against the speech, so the rule takes the window medians and 80 percent of the cues.
@@ -1564,8 +1527,8 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 
 - A Matroska track that does not match leaves the file in a remux (`subtitle_mismatch_removed`), and a "Wrong subtitles"
   alert goes out. A track whose times need a fix gets them in the same remux (`subtitle_retimed`), so a file that needs
-  both is remuxed once. So do the blocks of `--sub-time` and the deep analysis (`subtitle_blocks_retimed`), see "Two
-  stages". The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
+  both is remuxed once. So do the moves of the whole-file timing (`subtitle_blocks_retimed`), see "Whole-file
+  timing". The remux runs under the exclusive lock, with the temp file in `.<NAME>-convert`. Its work files, the
   extracted text, the proof's reads and the cover attachments, go into a folder under `STATE_DIR`, never the system
   temp dir, which is often a small tmpfs. The trim, the damage read, the conversion and the video windows keep their
   work files there too. A worker that starts removes a work folder that a killed step left over a day ago. ffmpeg
@@ -1582,10 +1545,15 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   image attachment, such as a cover, as a picture stream and would write it as a video track. So the map leaves it
   out, and mkvpropedit adds it back with its name, type and UID. The new file must
   keep the type, codec and language of each kept track in order, its UID, its BCP 47 tag, the properties in
-  `KEEP_PROPS` (its name, flags and codec private data), and the count of attachments and chapters. The proof of
-  "Conversion" must pass with the retimed tracks' times as the fix moves them. It also holds each stream to its own
-  start time, so a remux that moved every stream fails. The file keeps its owner and mode, and the original is kept as
-  in "Kept originals".
+  `KEEP_PROPS` (its name, flags and codec private data), and the count of attachments and chapters. The codec private
+  data of HEVC video is its hvcC record. It holds the parameter sets and other units a decoder reads before the first
+  frame, one array per unit type. ffmpeg 7.1 writes it again with the array_completeness bit of each array cleared. A
+  1 says the stream holds no more units of that type, and a 0 says it may. So an HEVC header also passes as the old
+  one with those bits cleared. Any other change of a byte fails. ffmpeg also writes the track's colour elements from
+  the video stream, sets MaxBlockAdditionID to 0 and drops BitsPerChannel. `KEEP_PROPS` holds none of them, so they
+  pass. The proof of "Conversion" must pass with the retimed
+  tracks' times as the fix moves them. It also holds each stream to its own start time, so a remux that moved every
+  stream fails. The file keeps its owner and mode, and the original is kept as in "Kept originals".
 - A removal cannot be undone without the kept original. So with `KEEP_ORIGINALS_DAYS` 0, or when the remux or the
   proof fails, the track stays in the file. It gets the role `unmatched` instead, which no policy lists, so it never
   becomes a default. It loses its default and forced flags with mkvpropedit (`subtitle_audio_mismatch`), and the alert
@@ -1665,8 +1633,10 @@ weak fit, which only reports, and incorrect subtitle identification then judges 
 identification". A fit then pairs cue starts with reference starts in ten slices of the span, each at its own offset,
 and the rules of "Timing" judge the slices. Every slice must lie within 0.3 seconds of the fix, and a ratio needs a
 middle slice on its line. So a cut, in one step or in several, gives no fix and an alert, and the alert says the track
-disagrees with its reference. Five slices fixed more shifted copies of real tracks, but they let a cut in steps pass
-several times as often, so the fit keeps ten.
+disagrees with its reference. The alert posts when the slices differ by 1 second or more, or when two slices or more
+share an offset at least 0.5 seconds from the rest (`subsync.stepped()`), because no jump fix moves such a track. It
+names the least and the most the slices sit off, so a drift that no ratio fits reads right too. Five slices fixed more
+shifted copies of real tracks, but they let a cut in steps pass several times as often, so the fit keeps ten.
 
 - **Sparse slices.** A slice where the track or the reference starts under 6 cues is left out, such as the credits or
   a song only one side times. Chance pairs of so few starts can outvote the right offset. Each half of the span needs 3
@@ -1674,15 +1644,22 @@ several times as often, so the fit keeps ten.
 - **The slice search.** A slice searches its offset within 60 seconds of the whole track's offset, so a cut of up to a
   minute shows. A search over the whole 120 seconds let chance put a slice of a right track far off, which read as a
   cut. A peak more than 1 second from the track's offset must hold over 1.5 times the pairs of any other offset, else
-  the slice has no clear offset and the times stay. A peak at the track's offset needs no such margin, because a right
-  slice often holds a second peak one line away.
+  the slice has no clear offset. A peak at the track's offset needs no such margin, because a right slice often holds
+  a second peak one line away.
+- **A slice with no clear offset.** A slice that holds a cut pairs some lines at the offset before the cut and some at
+  the offset after it, so it often has no clear offset. It is left out, and the times stay. The other slices still
+  alert when they show the cut. When they all agree on one offset 0.75 seconds or more off, the alert names that
+  offset. When they do not alert, the left-out slices can. Each one's own peak needs 3 pairs. When 2 or more of those
+  peaks lie within 0.3 seconds of one offset, 0.75 seconds or more off, that offset joins the offsets of the other
+  slices (`subsync.WEAK`). So the alert names the parts that sit off, as for a cut the clear slices show. No fix takes
+  it. One such slice alone can be chance, or a scene one track leaves out.
 
 The reference is in audio time. A fixed reference moves by its fix. An in-time reference moves by its own measured
 offset, which can reach 0.75 seconds. So a target's offset to the audio is its offset to the reference plus the
-reference's offset, and a fix comes only when that total is 0.75 seconds or more. A block that dense hearing found in
-the reference moves by its shift first, as the remux moves it. A block left in place sits off the rest of the
-reference, so the slices of a right target disagree and its fix stays out. The fix moves the target to the
-audio. When a second reference also fits the target, the fix must give the same times against it at both ends of the
+reference's offset, and a fix comes only when that total is 0.75 seconds or more. In `--sub-time` and the deep
+analysis the whole-file timing judges a matched track in place of the word check. A track it judged with no stretch
+still off after its moves is a reference, with each line where the moves put it. A track with a stretch still off is
+none, because the slices of a right target would disagree with it. The fix moves the target to the audio. When a second reference also fits the target, the fix must give the same times against it at both ends of the
 file, else the times stay. A picture cue is a PGS display set with an object up to the next set, or a VobSub packet up
 to its stop command, and it ends 10 seconds after it starts at most. A PGS block is one small read of its first bytes.
 The fixes go into the one remux with the word check's. ffmpeg's copy of a PGS or VobSub track passes the proof, and a
@@ -1695,8 +1672,8 @@ import in an error, and the flag edit still runs. An import never reads a whole 
 is skipped, and the log says so under `unindexed`. With `SUBTITLES=deep`
 an import with a subtitle track or sidecar then queues a deep analysis of its file, see "How it runs". The deep
 analysis runs the check of `--sub-time` with the edits, the proof, the kept originals and the Plex analyze of an import,
-and it posts only its subtitle alerts. `--sub-check` adds the whole-file read and hears no sweep, because a sweep of a
-library would take weeks.
+and it posts only its subtitle alerts. `--sub-check` adds the whole-file read and never hears the whole file, because
+that hearing of a library would take weeks.
 
 - **The whole-file read.** Old mkvmerge versions wrote no cue entry for a subtitle block, and many files in a library
   come from them. For those tracks `--sub-check`, `--sub-time` and the deep analysis read the whole file once, with one
@@ -1707,300 +1684,113 @@ library would take weeks.
   and mtime, so a file that changed meanwhile is read again under the lock. A deep analysis that yields keeps the
   read in the store for its next run, and a track whose read was cut short stays marked as cut there. ffmpeg reads
   mkvmerge's WebVTT codec id as unknown, so such a track stays unread.
-- **The sweep.** `--sub-time` and the deep analysis hear one 10-second window a minute of each track the word check
-  reads, at its densest cues. The sweep builds the word list of a track once and picks each minute's window from it.
-  A track whose words do not match the audio gets no sweep. One lid.py process hears the windows with the model
-  loaded once, two windows a Whisper run, and each pair is cached like the other hearings. Three windows a run made
-  the encoder run twice in most runs, at more CPU per window. Each row gives the heard words, the overlap, the cues
-  whose first word matched and their offset. A row with 3 such cues and 1 second or more off the fitted line is in a step when
-  its neighbour among such rows is off 1 second or more the same way. A part of the file that is off holds such
-  windows in a row. The steps alert when they hold 3 rows or more, or every such row, and at least a quarter of such
-  rows. A part of the file is then off, and nothing fixed it. Other steps go to the log only, such as two windows near
-  the end, or two stray windows of a sparse sweep. So does one window alone, because Whisper can hear a word with the
-  line before it and move one window's offset by a second.
-  The sweep itself changes no time. Its rows name the parts for the dense hearing. A row whose window lies inside a
-  block that moves, with no cue there that stays, counts with the block's shift taken off, so it never alerts. A row
-  whose window crosses an edge of the block, or holds a cue that stays or moves part of the way, keeps its offset,
-  because cues there still sit off. In a part that dense hearing finds in time, a row counts at the part's median when 2 anchors or more lie in its
-  window. A row with fewer keeps its offset, because the hearing did not test it.
-- **Subtitle block timing.** A part of a track can sit off while the rest is in time, as after an edit. Subtitle block
-  timing moves such a part, a *block* of cues, to its speech. The sweep finds such a part, and dense hearing confirms it
-  (`subtitles.sub_dense()`). A sweep row counts when it heard 8 words, matched half of them or more and matched 2 cues.
-  A right track leans a little off its fitted line, so each row is measured from the track's lean, the median offset of
-  its rows that count. A row that sits 0.5 seconds or more off the lean is a suspect (`subsync.suspect_rows()`). One row
-  is enough, because the owner wants recall first, and the gate of `subsync.blocks()` decides every move. A part reaches
-  120 seconds before and after its suspect rows, or to the nearest row within 0.3 seconds of the lean when that is
-  nearer, so the hearing sees both edges. Parts that cover over half the file are a whole-track matter for the fit, and
-  the dense hearing takes none of them. The tracks of one audio track share one hearing of all their parts, in windows
-  of 10 seconds every 7.5 seconds where their cues are, each track moved to the audio by its fix (`subsync.dense()`). A
-  fix of minutes would else hear the wrong stretch. The hearing runs as the sweep does, with one process, two windows a
-  Whisper run, the same cache and the same yield to an import.
+- **Whole-file hearing.** `subtitles.whole_heard()` gives the whole-file timing the evidence of a whole audio track.
+  That is the words Whisper hears, the spans of speech and the speech onsets. It hears windows of 10 seconds on a fixed
+  grid, one every 7.5 seconds from the file's start (`subsync.whole_grid()`). The last window ends at the file's end.
+  Two windows go through Whisper in one run. Each second of the audio then lies 1.25 seconds or more inside a window.
+  Two windows that overlap split their shared audio at its middle, so each word comes from one window
+  (`align.heard()`). The cache keeps each pair of windows as Whisper hears it. A window of the grid that the cache
+  holds already is not heard again (`subsync.whole_starts()`, `lid.windows_get()`). A window off the grid never
+  counts, such as one of the word check. So a run that stopped goes on where it stopped, and a second run hears
+  nothing. A cached row that does not read drops alone, and the facts name it. A 22-minute episode hears about 180
+  windows. The spans of speech come from one read of the whole track, and the onsets from reads of 10 minutes each.
+  The deep analysis yields to an import between two pairs, during the read of the speech and between two onset reads.
 
-  The parts of one audio track hold 360 seconds of audio in all, for all its tracks together
-  (`subtitles.heard_parts()`). The parts with the rows farthest off come first. A part that does not fit in what is
-  left keeps the stretch that fits, centred on its row farthest off (`subsync.centred()`). `suspects()` first shrinks
-  its margins to 30 seconds on each side. When under 10 seconds are left, the part is not heard, and its why names the cap.
+  The hearing runs on the CPU of the container, at about 1.9 CPU seconds a window. That is about 15 CPU minutes an
+  hour of video, about 5.5 for a 22-minute episode and about 30 for a 2-hour film. The deep analysis of 2.7.0 spent
+  about 75 CPU seconds on an episode in time.
+- **Whole-file timing.** `subtitles.sub_whole()` times every line of each subtitle the word check matched. It hears
+  each audio track once, in the language the word check heard it in. `align.run()` then times each subtitle on those
+  words in the subtitle's own language, whose stopwords never align. It takes the lines in start order, in five steps.
 
-  A part can end before the hearing sees the edge of its block, with under 3 heard cues on the line past it. That part
-  then asks for 30 seconds more past that end (`subsync.further()`). A second hearing hears only the pieces of those
-  stretches that the first hearing did not hear (`subsync.unheard()`), in new windows that `dense()` lays over them,
-  and their onsets join the others. Each piece counts against what the 360 seconds leave after the first hearing, as
-  10 seconds at least, because `dense()` hears a shorter piece as one whole window. So both hearings together stay
-  within 360 seconds. A stretch cut short keeps its end at the part, and one under 10 seconds is not heard. `blocks()`
-  counts an onset that two reads found once. `blocks()` then runs again for each track that asked, with its parts and
-  its whole stretches. In the deep analysis an import that waits goes first, before the second hearing.
+  1. *Anchors* (`align.anchors()`). One alignment, in order, pairs the content words of every line with the content
+     words heard in the whole file. Only runs of 2 pairs or more count. A line anchors at the heard time of its first
+     content word. The anchor then steps back over the line's words before it, such as "so" or "the". It steps back while
+     each heard word before it is that word, under 1 second before the next. There is no search for an offset, so any
+     offset, drift or jump aligns. A roll-up line counts by its new line, and a speaker's name is never spoken. Three
+     kinds of line never anchor. A line shown under 0.05 seconds once paired with its neighbour's speech 3 seconds off.
+     A line of song lyrics never anchors, and neither do two lines in a row with the same content words.
+  2. *The curve* (`align.curve()`). A Viterbi fit puts one offset curve through the anchors. The curve is a chain of
+     segments. In each, a line's start is its speech times a frame-rate ratio, plus a level. The fit tries every ratio
+     of `subsync.RATES`, with levels 0.02 seconds apart. Each anchor costs its distance from its segment's line, 1
+     second at most, so an outlier costs no more than a second. A change of segment costs 5 seconds, and a ratio other
+     than 1 costs 2 more to enter. So only a real jump or drift starts a segment. A segment's level is the median of its
+     anchors off its ratio. The first pass fits the file's offset, drift and jumps. A second pass fits ratio 1, at a
+     change cost of 1 second, to the starts the first pass gives. It finds local blocks against them. The moves of the
+     two passes add up.
+  3. *The gate* (`align.plan()`, `align.gate()`). A segment moves when its first or last anchored line sits 0.5 seconds
+     or more off its speech, and its evidence passes one rule.
+     - A segment of 30 anchors or more moves on Whisper alone, at any distance.
+     - A smaller segment never moves when the speech onsets disagree, or when it sits over 10 seconds off. Lines that
+       far off their neighbours are more likely lines the audio does not hold, as a recap or another cut.
+     - It moves when the onsets agree.
+     - On Whisper alone, it moves with 6 anchors at a median of 1 second or more off, or with 15 anchors at 0.75
+       seconds. It also moves with 3 anchors 2 seconds or more off that lie within 0.15 seconds of its line. A jump
+       near a file end leaves such anchors. An author's scatter rarely puts 3 lines that far off together.
 
-  `subsync.blocks()` anchors each heard cue at its first spoken word (`subsync.heard_anchors()`). The match pairs the
-  cue's first content word. The anchor then steps back over the cue's words before it, such as "so" or "the", while
-  Whisper heard each of them as that word and under a second before the next. Leading stopwords put the first content
-  word late, and on right tracks this step took the largest median of 6 heard cues in a row from 0.63 to 0.30 seconds.
-  Four filters drop an anchor that would mislead. A cue that shows under 0.05 seconds never anchors, because a cue of
-  1 ms that repeats its neighbour's text paired with that neighbour's speech 3 seconds off. Two cues in a row with the
-  same words never anchor. A heard word that anchors two cues anchors neither. A cue that two overlapping windows time
-  over 0.3 seconds apart anchors in neither. Else a cue keeps the anchor heard farthest from its window's edges. The
-  first cue after 2.5 seconds with no cue never anchors either. Whisper times the first word after a silence early, so
-  such a cue reads late.
+     A segment moves its anchored lines. It also moves each line with no anchor whose anchored neighbours both lie in
+     it within 15 seconds of the line (`align.owners()`). In a segment of 30 anchors or more the distance does not
+     count. A file edge counts as a near neighbour.
 
-  The part's line is where its anchors near the fitted line sit, their median. So it follows a track that leans. A
-  block is a run of 6 anchored cues or more. 80 percent of them, the first and the last among them, lie within 0.3
-  seconds of their median, or within a quarter of the shift when that is more. So a block 2 seconds off agrees within
-  half a second, and its anchors still lie well off the line. None of them lies nearer the part's line than the block,
-  so a cue in time never joins a run. That median sits 0.5 seconds or more off the part's line, and 0.5 seconds or
-  more off the fitted line too. A block that fills most of a part can pull the part's line toward itself, and then
-  cues in time read 0.5 seconds off that line. The line beside the block, the median of the anchors on the line
-  nearest it, must lie within 0.15 seconds of the part's line. A block of the other sign next to it can pass for that
-  line, and the move then overshoots. The sweep rows outside every part give the track's lean, their median. The sweep
-  pairs a cue's first content word, and dense hearing steps back to the first word spoken, so the two read a track
-  apart by how its lines start, up to 0.35 seconds on the bench. The rows inside the parts, against the anchors of the
-  cues in their windows, measure that, and the lean takes it in. The part's line, the line beside the block and the
-  line on each side of it must lie within 0.3 seconds of that lean. The block must also sit 0.5 seconds off that lean.
-  A block of the other sign in the part can pull the part's line toward itself, and a few cues an author set 0.3 to
-  0.5 seconds late then read as a block. One side can sit off while the line of both sides passes. A long block can
-  fill a part, and both lines then sit on it. A block of the other sign beside it then moved by the sum of both
-  shifts.
+     The onsets are a second clock that does not use Whisper. `subtitles.onsets()` reads them with ffmpeg's
+     silencedetect at -25 dB, where a silence of 0.3 seconds or more ends. It reads the centre channel when the track
+     has one, because the dialogue is there, and else the mono mix. Only an onset after a silence of 0.5 seconds or
+     more counts. The offset between the two clocks is the median of onset less anchor (`align.onset_lead()`). It takes
+     the anchored lines with exactly one such onset within 1 second, and needs 10 of them. A line is timed at a place
+     when an onset lies within 0.15 seconds of where its speech starts there. Only lines that move over 0.3 seconds
+     count. The onsets agree when 20 percent of the segment's lines, and 3 at least, are timed where the move puts
+     them. That count must be twice the count where they sit, and arise by chance with a probability of 0.001 at most.
+     The chance comes from the same count 7 to 53 seconds from those places (`align.vote()`). The onsets disagree
+     when as many lines are timed where they sit, and enough to judge.
+  4. *The screen* (`align.short_of_speech()`, `align.apply_order()`, `align.ends()`). An anchored line moves toward its
+     own speech and never past it. A line with no anchor then moves the smaller of these moves of the anchored lines on
+     each side at most, and stays when one of them stays or moves the other way. No line crosses another. Two line starts stay 0.5 seconds apart after the moves, or
+     as far apart as they were. The line that moved toward the other yields, and never past its old start. A line cut
+     more than 1 second short of its move stays, so later lines never pile up behind it. A move that would start a
+     line before the file's start drops. A moved line keeps its length. It stops two frames, 0.083 seconds, before the
+     next new start, and shows 0.5 seconds at least, unless the next line starts sooner. The next line is the first
+     later line it did not show over (`align.after()`), so lines shown inside a long line do not count. A line that ended under 0.1
+     seconds before the next one, or ran 0.02 seconds into it, keeps that small gap. It runs up to the next new start
+     less the gap, for 7 seconds at most, or for its old length when that is longer. Only a line with no line shown
+     inside it grows that way. A long line with lines inside it stops two frames before its next line. So a move opens
+     no blank and stacks no lines.
+  5. *Live captions* (`align.per_line()`). The scatter is the median distance of the anchors from the first pass's
+     curve. At 0.6 seconds or more the subtitle is live captions, typed some seconds after the speech by a different
+     time each line. Each anchored line then moves onto its own speech. A line with no anchor moves by the smaller move
+     of the anchored lines on each side, when both move the same way, else it stays. Lines that would cross are cut
+     short instead of staying, as one line that stays would hold back every later line.
 
-  On each side, the 6 nearest anchors that lie nearer the part's line than the block test the edge. The side sits on
-  the line when 3 of them lie within 0.3 seconds of it, or when the median of the nearest 3, or of all 6, does. So one
-  chance pair, or one cue that Whisper heard far off, never hides the line. When 3 of them in a row sit 0.3 seconds or
-  more off the line the way of the block, before 3 lie on it, the run is part of a longer stretch off the line. That
-  edge is then not seen. A side with under 3 such anchors counts only when the part reaches the track's first or last
-  cue. Else the part asks for more hearing past that end, see above. The shift is the median of the block's anchors
-  less the median of the 6 nearest anchors on the part's line at each side, so the block keeps the lead of the cues
-  around it. The second clock below then decides whether the block moves. When its onsets agree, an anchor past the
-  block, farther from the line, does not count in the share that must agree, because Whisper hears some cues of a
-  block far off.
+  A track needs 10 anchored lines before any line moves. `align.judged()` then fits the curve again at the new starts,
+  at ratio 1, and names the stretches still off, see "Timing outcome". It judges nothing under 20 anchored lines.
 
-  A cue in time at the end of a block can read like the block, and a stray onset can confirm it. So an end of a run
-  must hold for more than one anchor. When the speech onsets agree, each end of the block moves in to its first heard
-  cue whose anchor lies within 0.15 seconds of the block, clearly off the line, and that one more thing puts there
-  too. It is an onset where the block puts the cue, the only onset within 1 second, with none where the cue sat. Or it
-  is the cue's heard words. Or it is an anchor 1.0 seconds or more off the line, beside the anchor of the next cue in,
-  which lies in the block the same way. On Whisper alone, the outermost heard cue at each end stays, unless an onset
-  puts it in the block that way, and so does each next one whose anchor sits under 1.0 seconds off the line. An end at
-  the file's start or end holds, as no cue in time lies beyond it.
+  The decision log keeps the timing of each subtitle in `whole`. It holds the segments of both passes, each with the
+  rule that decided it. It holds the scatter, the moves by each line's place in start order, and the judge. It also
+  holds the count of anchored lines, and the stretches off before any move in `before`. `lag` is the median lag of the
+  anchored lines, and `heard` the audio the windows hold. `stopped` says why the hearing stopped, when it did.
+  `whole_facts` holds the cost of each hearing. `remux.time_plan()` takes the new start of each moved line by its place
+  in start order. `align.ends()` gives the ends, from the flash ends when there are any. A built-in SubRip, ASS or SSA
+  track gets one plan of new times for every line, with its flash ends. `resub()` writes it through the text round
+  trip of the flash fix, with no `-itsoffset` (`subtitle_blocks_retimed`). The proof holds each start and end to the
+  plan. A sidecar is written
+  again with the plan when its text gives the lines the word check read. A WebVTT track is never rewritten, so its
+  moves only report.
 
-  A block moves toward the cues at one edge: after it when it sits late, and before it when it sits early. There a cue
-  of the block can sit past a cue in time, which then lies within the block's times, and Whisper pairs the words of
-  the two out of order. Only an onset tells them apart. So each cue within the shift and 0.3 seconds of the block's
-  outer cue at that edge, and that outer cue when the cue beyond it lies that near, needs an onset where the block
-  puts it. Whisper can read the shift up to 0.3 seconds short, so the window is that much wider. An onset within 0.3
-  seconds of two cue starts may be either cue's, so it times neither. The edge moves in past the last cue that has
-  none.
+  A hearing that stops part way, as a Whisper run that fails, judges nothing and moves nothing. The outcome is unknown,
+  so a held import alert posts, and the result stays pending. Nothing queues a new run. A later `--sub-time` or deep
+  analysis of the file goes on where the hearing stopped. A track
+  whose read was cut short gets no whole-file timing. With `AMG_INVARIANTS=1`, `align.check_plan()` checks every move,
+  see [development.md](development.md#safety-self-checks).
 
-  An edit leaves a mark between the last cue before it and the first cue after it. At the start of a block late by the
-  shift, a gap lies between them, and the move closes it to an overlap of two frames at most. At the start of a block
-  early by the shift, the two cues overlap, and the move ends that overlap to two frames at most. The end of a block
-  mirrors that. When such a pair lies within the first or the last 2 heard cues of the block, after the trims above,
-  the edge moves in to it. So a cue in time beside an edit never joins the block, even when its author set it as far
-  off.
-
-  Then each cue between the edges needs evidence of its own that it belongs to the block (`subsync.evidence()`). It is
-  the cue's anchor at the block's offset, or its heard words placed in the block. The words of the first cue after a
-  long silence read early, so that cue also needs an onset where the block puts it, with none where it sits. An onset
-  never counts without the cue's own words. Beside a block, `placed()` reads a cue in time as unsure, and a lone onset
-  where the block would put it is another sound as often as the cue's speech. A cue whose own anchor sits over 0.3
-  seconds off the block, though nearer it than the line, moves on its words only with an onset there. Between two blocks
-  of one sign, a cue in time whose words read like the block once moved on them while its anchor said otherwise. An
-  onset counts as a cue's own only when no cue next to it starts within 0.3 seconds of it, where either cue sits or
-  where the block puts it. A cue whose own evidence puts it on the line cuts the block there: its anchor nearer the
-  line, the anchor of a cue after a long silence, its heard words, or its own onset where it sits. A cut inside the run
-  sends each side back to be judged as a block of its own. A cut nearer an edge moves that edge in past it. A cue with
-  no evidence either way stays where it is. The block names it in `keep`, `unproved` counts it, and `remux.time_plan()`
-  leaves it. `time_plan()` keeps a start, not a cue, so a cue that starts with a cue that stays, as two lines shown at
-  once, stays too. A cue whose move would put it at, past or on the same centisecond as the cue next to it on the side
-  it moves toward moves only part of the way, to one centisecond short of that cue (`subsync.clamped()`). It needs two
-  pieces of its own evidence for that: its anchor, its heard words or its own onset where the block puts it. Else it
-  stays. A cue in time between two blocks of one sign showed why: its anchor alone read like the block, and the crossing
-  had kept it. The cue it stops short of stays, or moves part of the way itself. In dialogue whose lines start closer
-  than the shift, the cues after it then still have room, and they move all the way. The block records the shorter shift
-  in `clamp`, and `remux.time_plan()` takes it. The check of a crossing uses the times `time_plan()` writes, in
-  centiseconds. So the order of the cue starts never changes, and no two starts tie. The block's checks, such as its 3
-  heard cues, count only the cues that move all the way. On Whisper alone, a block with a cue that would pass a cue
-  outside its edges is refused. Whisper can read a whole stretch off, the cues in time beside the block among them, and
-  with no onsets the order is the only check left on the shift. A block needs 3 heard cues that move all the way. Two
-  blocks of the same sign a few cues apart showed why. A run joined them, and the cues in time between them, most of
-  them unheard, moved with the run. One residual is accepted. A cue in time between two blocks of one sign can move with
-  them when its own anchor, its words and both windows put it at the block's offset and no onset lies at either place.
-  Real noise draws such a cue now and then, and nothing tells it from the block's own cues, as nothing tells Whisper's
-  error from a block on Whisper alone. So can such a cue with only its words or only its anchor in the block. Asking
-  those for a second piece of evidence cost many of the cues fixed.
-
-  **Second clock.** Whisper's word times can run early or late over a whole stretch. On one right track they ran about
-  0.4 seconds early for over a minute, and 6 cues in a row agreed at 0.34 seconds off. So the speech onsets, a clock
-  that does not use Whisper, confirm a block before it moves. `subtitles.onsets()` reads them with ffmpeg's
-  silencedetect at -25 dB, where a silence of 0.3 seconds or more ends, each with the length of that silence. It reads
-  the centre channel when the track has one, because the dialogue is there, and else the mono mix. It runs only on the
-  parts of a file whose sweep found a part, after the dense hearing, one ffmpeg read at nice 19 and idle I/O for each
-  part. The audio of a whole episode costs about 10 CPU seconds, so the parts cost a few. The onsets of each part stay
-  in memory for the file as it is, so the second pass of a job that Replan runs again reads none twice. Only an onset
-  that ends a silence of 0.5 seconds or more counts.
-
-  The track's onset lead comes from the cues of the part around the block. Each of them takes the only onset within 1
-  second of its start, and the lead is the median of cue start less onset. The block's cues are then counted at two
-  places, from that lead: where the block puts them, and where they sat. A cue counts at a place when an onset lies
-  within 0.3 seconds of it, or within half the shift when that is less, so the two places never share an onset. Stray
-  onsets fall at both places alike, so the counts are weighed against each other. There are three outcomes.
-
-  - The onsets agree. 20 percent of the block's cues, and 3 at least, have an onset where the block puts them, and
-    twice as many as where they sat. The median of those onsets puts the block within 0.15 seconds of Whisper's shift,
-    0.5 seconds or more off the same way. As many of them lie within 0.15 seconds of where the block puts the cues,
-    because stray onsets scatter over the search and a block's own onsets cluster. That count must also be rare by
-    chance: the same count at the offsets of the reference fit's null, 7 to 53 seconds from those places within the
-    audio read, gives the mean count by chance, and as many or more must have a chance of 0.001 at most. Where lines
-    start on a regular pitch, those offsets can all fall between onsets and count none, so the rate of all onsets in
-    the audio read counts as well, whichever gives more. On real noise, 4 onsets of 13 cues on a right track that
-    Whisper heard 0.8 seconds early had a chance of 0.003. The block moves. The search at each place reaches 0.3
-    seconds, twice that bound, so onsets that cluster off Whisper's shift fail the test. In a fuzz case of a right
-    track that Whisper heard a second off, three stray onsets 0.11 to 0.21 seconds from Whisper's shift agreed under a
-    bound of 0.3 seconds.
-  - Too few. Under 3 cues around the block have an onset, or too few cues count at either place. The block moves
-    only at 1.0 seconds or more, on Whisper alone.
-  - The onsets disagree. As many cues count where they sat as where the block puts them, and enough to judge, or the
-    onsets count clearly and put the block elsewhere. Nothing moves, and the part's why gives both counts.
-
-  A failed read gives no onsets, so a block moves on Whisper alone then.
-
-  The edges come from the heard words. Among the cues between the last anchor on the line and the first anchor of the
-  block, an anchor nearer the line stays. An anchor that lies clearly in the block moves: within 0.3 seconds of it,
-  and 0.5 seconds or more off the part's line. Every other cue goes to the side where its heard words fit its times,
-  each word counted once. The words of the first cue after a long silence read early too, so they never put it in the
-  block. A cue that fits both sides, or has no heard word, stays where it is, and the block counts it in `edge_left` or
-  `edge_right`. A gap between cue starts alone never places an edge. At an edge in the middle of a scene, a gap rule
-  moved cues that were in time. Only the mark of an edit, see above, moves an edge by the cue times.
-
-  A part that dense hearing finds in time is in line. 12 heard cues or more anchor, and so do 70 percent of its cues
-  with words. They sit within 0.3 seconds of the line at their median. No 6 in a row sit 0.5 seconds off the part's
-  line, and no 3 in a row each sit 0.3 seconds off it the same way. The sweep rows there were noise, so a row with 2
-  anchors or more in its window takes the part's median as its offset and never alerts (`subsync.after_blocks()`). A
-  row with fewer keeps its offset and the alert rule above.
-  Any other part with no block names why in `blocks`, and its rows keep the alert rule above.
-
-  Two other designs were rejected. Per-line alignment of the whole file costs about 15 CPU minutes an episode, and on
-  a right track the author's spread of -0.23 to +0.48 seconds is the size of Whisper's noise. A block from the sweep
-  rows alone has no edge closer than a minute, and a row holds 1 to 3 cues that scatter by half a second on right
-  tracks. On right tracks the median of 6 anchored cues in a row reached 0.30 seconds against the line. On one right
-  track Whisper ran 0.4 seconds early over a stretch. A fuzz with such errors moved right tracks on Whisper alone at
-  0.7 seconds, so a block needs 1.0 on Whisper alone. The owner chose 0.5 when the speech onsets agree.
-
-  Dense hearing costs about 45 CPU seconds a minute of audio with the small model on one thread. A file whose sweep
-  finds a part pays at most about 4.5 CPU minutes for each audio track. A file whose sweep sits on the line pays
-  nothing.
-
-  A built-in SubRip, ASS or SSA track with blocks gets one plan of new times for each cue, `remux.time_plan()`, with
-  its fix and its flash ends. `resub()` writes it through the text round trip of the flash fix, with no `-itsoffset`,
-  and the proof holds each start and end to the plan (`subtitle_blocks_retimed`). A sidecar is written again with the
-  plan. The plan pairs with the cues in the order of the file's text. A WebVTT track is never rewritten, so its blocks
-  only report. A block that moves posts nothing. A planned block that did not move alerts as a failed retime.
-- **Live caption timing.** A captioner who types along with a live broadcast shows each cue some seconds after it is
-  spoken, by a different time each cue. The sweep of a live-captioned track sits several seconds late, each window by a
-  different time, with no steps. One shift moves the least late cues several seconds early, and blocks find no line to
-  measure against. So live caption timing moves each cue of a track whose sweep looks live-captioned to its own speech
-  (`subsync.live()`, `subsync.live_moves()`). Per-cue moves on other tracks stay out, because on a right track the
-  author's spread is the size of Whisper's noise.
-
-  The trigger reads the sweep rows that count, see "Subtitle block timing". At least 10 rows count. Their median
-  offset against the audio is 0.3 seconds late or more. Half of them lie 0.4 seconds or more from a line through their
-  median "off" against the fitted line. That line follows the ratio their slope picks, as in the fit of the sweep, so a
-  straight drift at a frame-rate ratio leaves little and goes to that fix, never to per-cue moves. Two such drifts sat
-  0.49 and 0.54 seconds from their median, and 0.23 and 0.37 seconds from their line. Live captions always trail the
-  speech. Each logged track was verified by hand first. Its
-  last cue lay near the end of the file, and its text read as its tagged language. Its word check matched, and two
-  windows heard again matched its lines. Of the verified tracks that were not live captions, none passed. Half their
-  rows lay within 0.26 seconds of the median, and those of the live ones 0.49 seconds or more. Rows 3 seconds or more
-  late tell live captions from a right track or a drift with fewer rows, so 5 such rows are enough. No row of a
-  verified right track sat 2.5 seconds late. A false trigger costs the hearing. The gate below then moves few cues of a
-  right track, because a lone anchor off never moves.
-
-  `subtitles.sub_dense()` hears the whole audio track of such a track in dense windows, past `BLOCK_HEAR`. The windows
-  take the track's cues moved by its fix, then by the median "off" of its sweep rows against the fitted line. So they
-  lie on the speech. The other tracks of that audio keep their parts and blocks. Each cue's anchor is its first spoken
-  word (`heard_anchors()`). A speaker's name before a cue's text, as `>> Reporter:`, is never spoken, so it leaves the
-  text first. So do the top lines of a roll-up cue that repeat the bottom lines of the cue before (`subsync.rolled()`).
-  They were spoken with that cue, and an anchor on them put each cue one line early. Live captions keep the order of the
-  speech, so only the longest run of anchors that rises with the cues counts (`subsync.rising()`). Then a cue moves in
-  one of three ways.
-
-  - By its own anchor, when it sits 1.0 seconds or more off it and the median of the 2 anchored cues on each side sits
-    0.5 seconds or more off the same way. A lone anchor off is Whisper's error or an author's slip more often than a
-    live caption. On a test track whose captions trail by about half a second, moves of 0.5 to 1.0 seconds went the
-    wrong way. They were cues after a silence, and Whisper times the first word after a silence early. So a move on
-    Whisper alone needs 1.0 seconds, as a block does. The speech onsets confirmed few such moves, so the hook reads none
-    for live captions. The tests use them to score the moves. An anchor whose first word was heard again up to d seconds
-    later may be the wrong one (`subsync.unsure()`), as with two "yeah" a second apart, or an "I'm" before a line the
-    captioner left out. Its cue moves to it only when that is nearer the later word too, so for an early cue or one late
-    by 2 d or more. Else it moves as a cue with no anchor. On that test track this stopped every move that a repeated
-    word sent the wrong way, at the cost of a few right ones.
-  - Between anchors, when the span proves it. Its speech lies between the anchors around it, 0.3 seconds wider for
-    Whisper's error. Its place sits at the same share of the way between their anchors as its start sits between
-    their cue starts. The move stands when that place is nearer every point of the span than the old start. For a
-    late cue, the old start then lies past the span's end by the distance from the place to that end or more. At the
-    first or the last anchor, the span is open on one side, and the cue takes the lag of the nearest anchored cue.
-  - Between anchors that move. The two cues around it move by their own anchors the same way, 2.0 seconds or more, and
-    it takes the place between them, when that place lies inside the heard windows. With each anchor hidden in turn,
-    that place was farther than the old start for about a third of the cues when the neighbours sat 1 second off, and
-    for almost none at 2 seconds. On captions late by more than their spacing, a cue that stays blocks every later
-    move that would pass it. So a cue there moves when it can.
-
-  A cue that starts with another cue stays, as two lines shown at once. A cue whose speech would lie before the file's
-  start starts at 0, and two such cues may tie there. A move that would put a cue at, past or on the centisecond of the
-  cue next to it changes. When the cue that stays has no anchor, it takes the place nearest its place between anchors
-  that is still nearer every speech up to the bound the next cue gives. When the cue that moves has its own anchor, it
-  stops a centisecond after the cue that stays, when that is still nearer its anchor. Else the move stays too.
-  `remux.time_plan()` takes the block's `shifts`, one per start. The starts then stay, and only the ends change, for
-  each cue of the block, moved or staying, and the cue just before it. A cue's next cue is the one with the next later
-  start. Its next later new start is the first new start after its own. Two cues ran back to back when the first one's
-  end lies at or past the next start, within 1 ms (1 cs on ASS). Such a cue ends at its next later new start. Any
-  other cue keeps its length and ends at its next later new start at most. Cues on one new start show together until
-  the next later new start. Those are cues that start together in the file, and cues clamped to 0. Ending a cue at the
-  new start of a tied next cue would show it for 1 ms.
-
-  In 2.4.0 to 2.5.1 each moved cue kept its old length, capped at the next new start, and showed half a second at
-  least. Cues move by different times, so a gap opened wherever the next cue moved less. On a 43-minute news episode
-  of roll-up captions, 1501 of 1505 pairs of cues ran back to back. After the move, 579 did. Its gaps left 617 seconds
-  with no caption, against 42 seconds in the file, and 44 cues showed over the next one. The cue that
-  stays never took the cap, so the first cue showed 3.7 s over the second. The rule now keeps the 1501 pairs back to
-  back, keeps its 4 gaps, and adds no overlap. A cue ends up short when the next cue moved much more. On that episode,
-  51 cues show under half a second, against 30 in the file, and the shortest shows 20 ms. A cue that stays shows about
-  10 ms when the cue after it stops a centisecond after it. No minimum length applies, because a minimum brings the
-  overlaps back.
-
-  The plan, `set_ends()`, the proof and the order check are those of a block. With `AMG_INVARIANTS=1`,
-  `subsync.check_live()` checks own evidence and nearer its speech for each moved cue, and `subsync.live_ends()`
-  checks the ends. The loop that keeps the cue order leaves two cues that both stay on one centisecond as the file has
-  them, and it stops after 8 steps a cue at most, with no move.
-
-  A hearing that stops part way, as a Whisper run that fails after a yield, leaves the cues past it where they are.
-  Their place between anchors would rest on the lag of anchors far away. The track then counts as not fixed, and the
-  report says the hearing stopped. The run stays pending in the subtitle cache, so a later `--sub-check` takes the file
-  again. A track counts as fixed when a fifth of its cues or fewer stay 1 second or more off, or stay with no anchor
-  around them. A fixed track posts nothing. Else one sentence names how many lines moved and how many stay. At
-  `SUBTITLES=check` it says the setting kept them. Its timing and sweep sentences give way to it. In a dry run it also
-  says why `--apply` would skip the remux, when it would. After a remux that failed, only the failed fix posts. The cost
-  is the dense hearing of the whole audio, about 1 CPU minute a minute of audio with the small model on one thread. The
-  deep analysis yields to an import between hearings.
-- **A clean sweep.** A match with too few anchors for a fix is a reference when its sweep is clean: in each half of the
-  file 3 windows or more heard 8 words and gave an offset, every window that heard 8 words matched at 50 percent or
-  more, and every such offset lies under 0.75 seconds.
+  The owner picked this method from a study of real and planted subtitles, scored against the speech a larger model
+  heard. The study set the values above. Known limits:
+  - A line with no anchor moves no farther than the anchored lines around it. So one anchored line that stays holds
+    its unheard neighbours back, even when the segment around them is off.
+  - A stretch of lines with no heard words right before a jump can move with the part after the jump. That happens
+    when one line in the stretch paired with words heard far away in the direction of the move.
+  - Whisper's word times can run late over a long stretch. With no speech onsets to check them, the timing reads that
+    as the subtitle off, and moves it.
+  - A stretch of 3 to 5 anchored lines off by under 2 seconds, or of 6 to 9 anchored lines off by under 1 second,
+    posts nothing. It moves only when the onsets agree.
 
 **--sub-time.** `arr-media-guard --sub-time PATH [PATH ...] [--apply]` runs all of it on each named file, past the cache,
 and writes the cache. It acts as a backfill does, with the file lock, `.<NAME>-convert`, `.<NAME>-originals`, the proof and a Plex
@@ -2026,6 +1816,52 @@ did.
 **Centre channel.** Whisper hears the mono mix of all channels. The centre channel alone kept the language verdicts,
 but a subtitle check lost its match where the centre channel was quiet and the mix still held the words. The mix
 stays.
+
+## Timing outcome
+
+The subtitle checks hear evidence and propose moves. The planner picks the moves (`process.subtitle_checks()`), and the
+remux or the sidecar rewrite writes them. Then the timing judge, `judge.outcomes()`, gives each subtitle one outcome
+from its evidence, and the alert words only that outcome (`judge.alert_lines()`). No other step decides whether a
+subtitle's times post. The decision log keeps each outcome in `subjudge`.
+
+The judge takes each piece of evidence to where the plan puts its lines. A plan takes effect when the run wrote it,
+or a dry run planned it. A write that failed, or that `SUBTITLES=check` left out, moves nothing. Two kinds of heard
+evidence give the stretches still off.
+
+- **The whole-file timing** of `--sub-time` and the deep analysis judges every line it anchored, see "Whole-file
+  timing". When its moves took effect, it reads the curve fitted again at the new starts, and else the lines where they
+  sit. A stretch still off is a segment of 10 anchors or more that sits 0.75 seconds or more off. Shorter runs posted
+  the scene lag of real tracks in time. So is a segment of 3 anchors or more that sits 2 seconds or more off, with its
+  anchors within 0.4 seconds of its line. A post edits nothing, so it takes looser evidence than a move. A stretch runs
+  from its earliest line to its latest, and sits off by its segment's level. It counts every line between its first
+  and last anchored line. A stretch that starts at the first anchored line starts at the subtitle's first line, because no
+  line before it was heard in time. One that ends at the last anchored line runs to the subtitle's last line the same
+  way (`judge.whole_stretches()`). When the timing judged nothing, the word check's own finding posts as a stretch of
+  the whole file. That is a fix no check confirmed, an offset no fix lined up, or steps.
+- **A word-check window** 0.75 seconds or more off is a stretch still off. An import has only these.
+
+Live captions keep the stretches of the whole-file timing, and their alert says how many lines moved and how many
+stay off (`judge.live_facts()`). A subtitle timed by a reference or by the speech layout keeps the rules of its fit.
+Slices that no ratio explains post when they sit 1 second or more apart, or when `subsync.stepped()` shows a jump. The
+speech layout drops the mark of such slices whenever `subsync.stepped()` shows no jump, as when one slice alone sits
+off at an end song. That subtitle then posts nothing. An offset no fix lined up posts. The thresholds sit in one table,
+`subsync.TIMING`.
+
+An outcome is one of five states. In time: nothing moved, and nothing sits off. Fixed: lines moved, and nothing sits
+off after the moves. Partly fixed: lines moved, and stretches still sit off. Off: nothing moved, and stretches sit off.
+Unknown: no evidence judged the times. Partly fixed and off post, and the others post nothing. A partly fixed alert
+says what moved and where lines are still off, and never that the lines were left as they are. It names each
+stretch from where to where, as "12 lines from 3:10 to 4:05". A stretch that runs to the last line reads "from 3:10
+on", and one that starts at the first line reads "from the start to 4:05". So the count and the times name the same
+lines, the unheard lines at a file end included. One stretch that holds every line reads as the whole subtitle off,
+never as "in parts". With `DISCORD_POSTS=all`, the count of moved lines is in the alert only. A failed write posts
+only its failure. A held import alert follows the outcome of the deep analysis, see "Alerts". It keeps the places its
+outcome left off, and the deep analysis drops it only after it heard each of them again (`judge.heard_again()`).
+
+`judge.check_outcome()` checks the outcomes under `AMG_INVARIANTS=1`, see [development.md](development.md#safety-self-checks).
+Known limits: lines with no heard words, such as a song, give the whole-file timing nothing to anchor. So a short
+stretch off among them posts nothing. A track only the speech layout timed has no cue starts, so the edges of its moves
+never alert.
 
 ## Incorrect subtitle identification
 
@@ -2113,20 +1949,23 @@ one line, and a ratio needs a middle slice on it. The fix keeps the lines 0.2 se
 verified right tracks. The moved lines must then fit again at ratio 1, within 0.3 seconds of that lead. A fix written
 this way sat a median of 0.05 seconds from the right times.
 
-The speech onsets are a second clock, as for a block in "Subtitle match". They come from silencedetect, and the spans of
+The speech onsets are a second clock, as for the whole-file timing in "Subtitle match". They come from silencedetect, and the spans of
 speech from VAD. One read takes the onsets of ten parts of up to 2 minutes, one in each tenth of the file, and only when
 some subtitle has a fix. In each half of the file, at least 3 cue starts must have an onset where the fix puts them,
 0.1 seconds after the start. That count must be twice the count where the cues sat, and rare by chance: a chance of
-0.001 at most. A block of "Subtitle match" also needs 20 percent of its cues. A whole track does not
+0.001 at most. A segment of the whole-file timing also needs 20 percent of its lines. A whole track does not
 (`subsync.LAYOUT_ONSET_SHARE`), because under a music bed silencedetect marks few onsets. Verified real shifts of about
 1 second drew onsets at 9 to 19 percent of their starts in a half, at a chance of 1 in a million or less, and the share
 rule left them off. A half that confirms where the cues sat, or too few onsets, leaves the times as they are, and the
 alert says the subtitles seem late. The onsets confirmed most fixes of shifted right tracks, and no fit of another
 episode's track.
 
-Slices at different offsets keep the times. When two slices or more share an offset at least 1 second from the rest,
-the alert says the subtitles may be from another version. One slice alone off alerts nothing: an end song that a few
-lines time did that on a right track.
+Slices at different offsets keep the times. When two slices or more share an offset at least 0.5 seconds from the rest,
+the alert says the subtitles may be from another version (`subsync.stepped()`, `subsync.TIMING["move"]`), with the least and
+the most the slices sit off (`subtitles.sub_findings()`). A mid-file jump leaves its slices that way, and so can a
+drift that no ratio fits. On a real foreign track two groups of slices sat just under a second apart, and the old
+edge of 1 second alerted nothing. One slice alone off alerts nothing: an end song that a few lines time did that on a
+right track.
 
 **The partial shift.** A step in the first or last tenth of the lines can pass every slice, because each slice holds a
 tenth of the speech. A subtitle of a cut with a longer or shorter opening has a cold open in time and the rest shifted.

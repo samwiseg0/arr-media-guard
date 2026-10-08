@@ -28,6 +28,8 @@ The hunter imports the package, and the package never imports the hunter.
 | `decide.py` | the flag decision rules |
 | `content.py` | the metadata checks, and `DEADLINE`, the job's time limit |
 | `subsync.py` | the word match, the timing fit and the speech layout of the subtitle check |
+| `align.py` | the whole-file timing of `--sub-time` and the deep analysis: the anchors, the offset curve and the moves |
+| `judge.py` | the timing outcome of each subtitle, after the moves and the write, and the record the alerts read |
 | `lid.py` | language detection. The venv in `LID_DIR` runs it by its path. |
 | `health.py` | `status.json` for a monitoring agent |
 | `store.py` | the state store, one SQLite file in `STATE_DIR` |
@@ -57,42 +59,73 @@ the package, with its own settings. Its `hook.name` reads and writes `name` in t
 ### Safety self-checks
 
 Safety self-checks are checks the code runs on its own results while the tests run. `AMG_INVARIANTS=1` turns them on,
-and [tests/conftest.py](../tests/conftest.py) sets it for the whole suite. Off, no check runs. A block move must keep
-three safety rules, see [Subtitle block timing](subtitles.md#subtitle-block-timing).
+and [tests/conftest.py](../tests/conftest.py) sets it for the whole suite. Off, no check runs. Each path that moves
+subtitle lines has its own rules.
 
-- Own evidence. A cue that a block moves has evidence of its own, by the rules of `subsync.evidence()`. Its anchor sits
-  at the block's offset, or its heard words lie in the block. After a long silence, or with its anchor over 0.3 seconds
-  off the block, its words alone do not move it. It also needs its own onset where the block puts it. Evidence that puts
-  it on the line keeps it where it is, and cuts the block there. A cue in a block's `keep`, or outside every block,
-  moves only by the whole-track fix.
-- Order. The order of cue starts never changes, and two starts that did not tie never tie. Two cues clamped to 0
-  seconds may tie, because no start lies before 0. A moved cue may still start before the end of a cue that stays.
-- Nearer its speech. A moved cue never ends up farther from its speech than it was. A cue with its own onset where it
-  sat stays. Its anchor breaks the rule only when it ends farther from two lines, each by more than 0.01 seconds. They
-  are the line the move uses and the part's line. The line the move uses is the line beside the block, or the track's
-  lean. So the real margin is 0.01 seconds plus the distance between the two lines. That is up to about 0.15 seconds
-  beside a block, and 0.3 seconds against the lean. The rule catches an overshoot, and the harnesses measure a wrong
-  move against the planted truth.
-
-`subsync.blocks()` checks the first and the last rule, and `remux.time_plan()` checks the order. Two other paths move
-cues, and each has its own checks.
-
-- Live caption timing. `subsync.check_live()` checks the first and the last rule of each cue that `live_moves()`
-  moves. Its own evidence is its own anchor, or a span between two anchors. A cue moved by its anchor ends nearer it.
-  A cue moved between anchors ends nearer every point of the span when the span proved the move. It ends inside the
-  span when the anchors around it moved the same way. `remux.time_plan()` checks the ends with `subsync.live_ends()`.
-  A cue of the block, or the cue just before it, never ends past its next later new start, the first new start after
-  its own. A cue that ran back to back with the next one ends there. So the move opens no gap and adds no overlap.
-  Cues on one new start, as cues clamped to 0, may show together until the next later new start.
+- Whole-file timing, see [Whole-file timing](subtitles.md#whole-file-timing). `align.check_plan()` checks every move
+  of `align.run()`. The quoted names are entries of `subsync.TIMING`.
+  - Order. No line crosses another. Two line starts stay "shown" apart, or as far apart as they were.
+  - Start. No line starts before the file's start.
+  - Stacked. A line never shows past the start of the line after it. The line after is the first later line that it
+    did not show over (`align.after()`). Lines shown inside a long line do not count. A line that ran up to the next
+    one within "touch" counts as not showing over it. The rule checks a pair only when the line's end or the start of
+    the line after changed. Lines keep their order, so no line then shows over any later line it did not show over.
+  - Speech. An anchored line moves toward its own speech and never past it.
+  - Shown. A moved line shows "shown" at least, unless it showed less before or the line after starts sooner.
+  - Ends. A line keeps its length, unless the line after makes it change. It grows to "shown" at most. When it ran up
+    to the line after and that is the next line in start order, it may grow to "end hold" or its old length.
+- The order of a time plan. `remux.time_plan()` checks the new starts with `subsync.ordered()`. The order of cue starts
+  never changes, and two starts that did not tie never tie. Two cues that the plan clamps to 0 seconds may tie, because
+  no start lies before 0.
 - Foreign subtitle timing. `subsync.nearer()` checks that a fix of `layout_fix()` never lowers the share of the
-  speech that the lines show over. `subsync.check_kept()` checks a partial shift: the order of the lines, kept runs
-  only at the file's ends, and the core's edge, the first and last moved line with a speech start at the fix, where
-  the stay votes have fallen over KEEP_SLACK under their peak. Every other moved line beyond it must be one the edge's
-  line passes by KEEP_PASS.
+  speech that the lines show over. `subsync.check_kept()` checks a partial shift. It checks the order of the lines,
+  kept runs only at the file's ends, and the core's edge. The edge is the first and last moved line with a speech
+  start at the fix. There the stay votes have fallen over KEEP_SLACK under their peak. Every other moved line beyond it
+  must be one the edge's line passes by KEEP_PASS.
+
+The timing outcome has its own rules, see `judge.check_outcome()` and [Timing outcome](design.md#timing-outcome). Each
+outcome is a sound record. A subtitle that posts nothing gets no timing sentence, and one whose lines are still off
+gets one. A sentence on lines that flash by too fast to read says
+nothing of the times, so it counts for neither rule. No sentence of a subtitle whose lines moved says they were left
+as they are. The judge reads the evidence, the plan and its write. Of an earlier stage it reads only the measures that
+came with the evidence, such as a reference fit's slices, so no flag outlives its facts.
 
 A broken rule raises `subsync.Broken`, which names the rule and the cue. An import job, a deep analysis job and a
-`--sub-time` file pass it up to the caller. When `AMG_INVARIANT_DUMP` names a folder, the case goes there first as
-JSON. It holds the inputs of the check, and for a block the arguments that call `blocks()` again.
+`--sub-time` file pass it up to the caller. Hook mode passes it up too, though it swallows every other error. A job
+process sends it to the worker through its pipe, and the worker raises it again, see `runner.finished()`. When
+`AMG_INVARIANT_DUMP` names a folder, the case goes there first as JSON. It holds the inputs of the check. For the
+whole-file timing that is the lines, the anchors and the moves.
+
+## How to add a check
+
+A check of the subtitle times adds evidence and proposals. It never decides whether a subtitle posts, and it never
+rewrites another check's keys. The timing judge, `judge.outcomes()`, decides that once, after the moves and the write.
+
+1. Hear or read what the check needs, and keep it in the decision record. That can be a heard window with its
+   offset, or a slice of a reference. The whole-file timing keeps its record of each subtitle in `rec["whole"]`, see
+   `subtitles.sub_whole()`.
+2. Propose a move when the check finds one, as a fix of the whole track, or new starts for `remux.time_plan()`. A gate
+   in `process.subtitle_checks()` decides which proposal the plan takes.
+3. Teach the judge to read the evidence. `judge.outcomes()` has one branch for each kind of subtitle. A subtitle the
+   whole-file timing timed goes to `judge.whole_outcome()`, and one only the word check read to
+   `judge.window_outcome()`. A subtitle timed by a reference or by the speech layout has its own branch. Add the
+   evidence to each branch it can reach.
+4. Read the evidence where the plan puts the lines, as `align.judged()` fits the curve again at the new starts. Give
+   each stretch still off its first and last line, and count its lines by their cue starts. Mark a stretch that holds
+   the first or the last line, as `judge.whole_stretches()` does. The alert words the place from these facts.
+5. Name the clock in `judge.CLOCKS`. Only one clock may decide a subtitle. The whole-file timing decides every
+   subtitle it judged, and the word check's windows decide only where it did not run. Nothing ranks a clock by itself.
+6. Teach `judge.heard_again()` the new evidence. The import holds a timing alert for the deep analysis, and the deep
+   analysis drops it only when it heard each held place again. A place that only the new check heard keeps the alert.
+7. Read every threshold from `subsync.TIMING`. A new meaning gets a new entry there, with its value once.
+8. Add the check's shapes to the regression corpus, `tests/test_regressions.py`, and a test to `tests/test_judge.py`.
+   `judge.check_outcome()` must pass on them. A case the check fixes leaves `tests/fixtures/known_failures.json` in the
+   same commit.
+9. Register the check in `subtitles.py`, see below. That is its `SUB_CHECKS` entry, the runs that make it in `SUB_RUNS`,
+   and its findings in `subtitles.sub_found()`. `sub_cache()` saves the findings of each check of `SUB_RUNS`, so a check
+   that `sub_found()` does not list raises a KeyError there. `sub_found()` files a subtitle still off under the check
+   that matched or timed it. It files it under `block_timing` too only when a stretch of the whole-file timing put it
+   off. Name where a new clock's stretches go.
 
 ## When a change can fix old files
 
@@ -198,18 +231,28 @@ say whether the fix was written, so each one gets a recheck. A recheck of a fix 
 "block_timing": {"version": 3, "fixes": {3: ["fix"]}},
 ```
 
-A second real case. Subtitle match 2 reads a roll-up caption by its new line, and the deep analysis fits a drift from
-its sweep. Both can fix or clear times that version 1 left off or in steps. Block timing 4 reads a straight drift as a
-drift, never as live captions. So a result with `live` is stale, and so is one whose sweep alerted.
+A second real case. Subtitle match 2 reads a roll-up caption by its new line, and the deep analysis of 2.7.0 fitted a
+drift. Both can fix or clear times that version 1 left off or in steps. Block timing 4 reads a straight drift as a
+drift, never as live captions. So a result with `live` is stale, and so is one whose timing alerted.
 
 ```python
 "subtitle_match": {"version": 2, "fixes": {2: ["off", "steps"]}},
 "block_timing": {"version": 4, "fixes": {3: ["fix"], 4: ["live", "off"]}},
 ```
 
-Only results that flagged timing get a recheck. A result with no timing finding stays, even when the new version would
-now find a drift there. A recheck of an import's or a `--sub-check` result also runs at that depth. It hears no sweep,
-so it cannot reach the drift fix. Such a file needs `arr-media-guard --sub-time <file> --apply`.
+A third real case. Block timing 5 hears the whole file and times every line. It can fix a file that any older
+version checked, so every older result of `--sub-time` and the deep analysis gets one recheck. A result does not say
+whether its file has a text subtitle in the audio's language. So a file with none gets its recheck too, and no
+whole-file hearing runs for it. Subtitle match 3 gives its fix's place to the whole-file timing in those runs. Alone,
+at an import or `--sub-check`, it fixes no more than version 2, so it adds no entry.
+
+```python
+"subtitle_match": {"version": 3, "fixes": {2: ["off", "steps"]}},
+"block_timing": {"version": 5, "fixes": {3: ["fix"], 4: ["live", "off"], 5: None}},
+```
+
+A recheck of an import's or a `--sub-check` result runs at that depth. It never hears the whole file, so it cannot
+reach the whole-file timing. Such a file needs `arr-media-guard --sub-time <file> --apply`.
 
 A new check goes into `SUB_CHECKS` and into `SUB_RUNS`. A result saved before it lacks the check, and reads as version
 0 with no findings. So `fixes = {1: None}` runs the new check on every file checked before. Without that entry those
