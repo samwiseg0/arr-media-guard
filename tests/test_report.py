@@ -96,7 +96,7 @@ FINDINGS = [
      "A conversion to MKV stopped partway, after it hid the original. The original may be hidden as /m/.F.avi.held, "
      "the new file is /m/F.mkv, and 0 extras may be hidden in .hide."),
     ({"kind": "header", "why": "the size changed from 1000 to 2000 bytes"}, "File repair failed", "amber",
-     "Couldn't repair the file, so it was left as it is. The size changed from 1000 to 2000 bytes."),
+     "Couldn't repair the file. The size changed from 1000 to 2000 bytes. The original file was not changed."),
     ({"kind": "cut", "why": "the video and audio stop at 21:11, but the listed runtime is 25 minutes, and the subtitles run to 23:05"},
      "File may be cut short", "amber", "The video and audio stop at 21:11, but the listed runtime is 25 minutes, and the subtitles run to "
      "23:05. The file may be cut short, or the subtitles may belong to another version. Nothing was changed."),
@@ -264,7 +264,7 @@ SUB_LINES = [
      "Subtitle track 1 of the original file doesn't match what's said in the audio, so the conversion to "
      "MKV left it out. The original file is kept at /k/F.mp4.", None),
     ({"code": "sidecar_left", "name": "F.en.srt", "why": "a fix of +2.00 s", "left": "SUBTITLES is set to check", "action": "retime"},
-     "The subtitles in F.en.srt are out of sync, but the file was left as it is, because SUBTITLES is set to check.", None),
+     "The subtitles in F.en.srt are out of sync, but AMG didn't change them, because SUBTITLES is set to check.", None),
     ({"code": "off", "track": "s2", "ref": None, "why": "the cues are off", "offsets": [2.55, 5.28], "unfixed": None},
      "The Spanish subtitles (track 2) are out of sync by different amounts in different parts of the file: "
      "2.5 s and 5.3 s late. One shift can't fix that, so they were left as they are.", None),
@@ -276,11 +276,11 @@ SUB_LINES = [
      "lined them up well enough, so they were left as they are.", None),
     ({"code": "not_retimed", "tracks": ["s1", "s3"], "result": "subtitle remux skipped, low space: 1.0 GB free for 8.0 GB: track 2: +2.000 s",
      "block": {"code": "remux"}}, "Subtitle tracks 1 and 3 (English) need new times, but the fix failed, because only 1.0 GB is free "
-     "for the 8.0 GB file. The file was left as it is.", "Subtitle tracks 1 and 3 (English) need new times. --apply would remux the file."),
+     "for the 8.0 GB file. The original file was not changed.", "Subtitle tracks 1 and 3 (English) need new times. --apply would remux the file."),
     ({"code": "not_retimed", "tracks": ["s1"],
      "result": "subtitle remux failed, the original changed: the app replaced or renamed the original during the subtitle remux",
      "block": {"code": "remux"}}, "The English subtitles (track 1) need new times, but the fix failed, because the app replaced or "
-     "renamed the file at the same time. The file was left as it is.",
+     "renamed the file at the same time. The original file was not changed.",
      "The English subtitles (track 1) need new times. --apply would remux the file."),
     ({"code": "check_times", "track": "s1", "why": "a fix of +2.00 s", "fix": {"offset": 2.0, "rate": "1/1"}},
      "The English subtitles (track 1) are about 2.0 s late. SUBTITLES is set to check, so they were left as they are.", None),
@@ -292,7 +292,7 @@ SUB_LINES = [
      "SUBTITLES is set to check, so they were left as they are.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": True, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
       "block": {"code": "remux"}, "hardlinked": False},
-     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The file was left as it is.",
+     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The original file was not changed.",
      "The Spanish subtitles (track 2) show garbled characters. --apply would remux the file."),
     ({"code": "garbled", "tracks": ["s1", "s3"], "repair": True, "flags_off": False},
      "Subtitle tracks 1 and 3 (English) show garbled characters. SUBTITLES is set to check, so they were left as they are.", None),
@@ -344,7 +344,7 @@ SUB_LINES = [
      "beside the video as F.spa.garbled.txt. The original file is kept at /k/F.mkv.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
       "names": ["F.spa.garbled.txt"], "block": {"code": "remux"}, "hardlinked": False},
-     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The file was left as it is.",
+     "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The original file was not changed.",
      "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. "
      "--apply would take them out of the file and keep their text beside the video as F.spa.garbled.txt."),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "kept_back": "keep_days"},
@@ -1403,8 +1403,8 @@ def test_no_alert_says_an_internal_word_or_tells_the_viewer_what_to_do(tmp_path,
     plain = lambda s: re.search(r"(because|, but) rewriting the file failed\.", s) and "failed, because rewriting" not in s
     assert all(map(plain, rewrites)), [s for s in rewrites if not plain(s)][:3]
     sides = sidecar_left(tmp_path, settings, monkeypatch, module_texts("remux.py"))
-    assert set(sides) == {"The subtitles in Film (2001).en.srt flash by too fast to read, but the file was left as it is, because its new ends do "
-                          "not fit its text."}, sorted(set(sides))[:3]
+    assert set(sides) == {"The subtitles in Film (2001).en.srt flash by too fast to read, but AMG didn't change them, because its new "
+                          "ends do not fit its text."}, sorted(set(sides))[:3]
     said += rewrites + sides
     assert {f["kind"] for f, *_ in FINDINGS} == set(h.FINDINGS) and not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)]
     assert not [s for s in said if INSTRUCTION.search(s)]

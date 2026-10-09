@@ -12046,7 +12046,7 @@ def test_a_failed_write_of_moved_parts_posts_only_the_failure(env, monkeypatch, 
     first, deep, _ = edge_film(env, monkeypatch, settings, lambda i: 1.0 if any(a <= i < b for a, b in blocks) else 0.0, write="fail")
     assert [x["code"] for f in deep["findings"] for x in f["lines"]] == ["not_retimed"], deep["findings"]
     assert [x.replace("**", "") for _, x in posted(env)] == ["The English subtitles (track 1) need new times, but rewriting the file failed. "
-                                                             "The file was left as it is."], posted(env)
+                                                             "The original file was not changed."], posted(env)
 
 
 @pytest.mark.parametrize("where", [lambda i: 1.2 if 320 <= i < 328 else 0.0, lambda i: 1.2 if i >= 260 else 0.0, lambda i: 1.2 if i >= 200 else 0.0])
@@ -12657,15 +12657,16 @@ def hb_base(tmp_path_factory):
     return path
 
 
-def hb_mkv(path, base, packets, private=HB_HEAD, ms=lambda i: 0, length=1500, cues=True):
-    """A Matroska file at path with the video and audio of base and one ASS track of codec private data private and of
-    packets, the bytes of the event that starts at 2 s, 4 s and so on, ms(i) ms later, each length ms long. The track
-    alone is written by hand, one Cluster an event, and ffmpeg copies it beside base's streams, so the file gets Cues.
-    With cues False, each Cues entry of the track names track 9 instead, so no entry indexes it."""
+def hb_mkv(path, base, packets, private=HB_HEAD, ms=lambda i: 0, length=1500, cues=True, codec=b"S_TEXT/ASS"):
+    """A Matroska file at path with the video and audio of base and one text track of codec, by default ASS, of codec
+    private data private (None for none) and of packets, the bytes of the event that starts at 2 s, 4 s and so on, ms(i)
+    ms later, each length ms long. The track alone is written by hand, one Cluster an event, and ffmpeg copies it beside
+    base's streams, so the file gets Cues. With cues False, each Cues entry of the track names track 9 instead, so no
+    entry indexes it."""
     u = lambda i, v, n=4: el(i, v.to_bytes(n, "big"))
     head = el(0x1A45DFA3, u(0x4286, 1, 1) + u(0x42F7, 1, 1) + u(0x42F2, 4, 1) + u(0x42F3, 8, 1) + el(0x4282, b"matroska") + u(0x4287, 4, 1)
               + u(0x4285, 2, 1))
-    track = el(0xAE, u(0xD7, 1, 1) + u(0x73C5, 1) + u(0x83, 0x11, 1) + el(0x86, b"S_TEXT/ASS") + el(0x63A2, private) + el(0x22B59C, b"eng"))
+    track = el(0xAE, u(0xD7, 1, 1) + u(0x73C5, 1) + u(0x83, 0x11, 1) + el(0x86, codec) + (el(0x63A2, private) if private is not None else b"") + el(0x22B59C, b"eng"))
     clusters = b"".join(el(0x1F43B675, u(0xE7, 2000 * i + ms(i)) + el(0xA0, el(0xA1, b"\x81\x00\x00\x00" + data) + u(0x9B, length)))
                         for i, data in enumerate(packets, 1))
     raw = f"{path}.track.mkv"
@@ -12812,6 +12813,119 @@ def test_the_proof_cuts_one_nul_at_the_very_end_of_a_packet(hb_base, tmp_path, o
         assert refused == (2, "the packet data of stream subtitle 2 (ass) differ") and not entry["match"], (why, refused)
     if old.endswith(b"\0") and not new.endswith(b"\0"):
         assert proved(src, tmp, [], str(tmp_path))[0] == "the packet data of stream subtitle 2 (ass) differ", "no time plan, no cut"
+
+
+def srt_line(i, br=b"\n"):
+    """The packet of SubRip cue i: two lines, joined by the line break br."""
+    return f"Line {i}".encode() + br + b"next"
+
+
+@pytest.mark.parametrize("br", [b"\n", b"\r\n"])
+def test_resub_times_a_subrip_track_whatever_its_line_breaks(hb_base, tmp_path, settings, br):
+    """A time plan of a SubRip track goes through the text round trip. mkvmerge may store each line break inside a cue
+    as LF or CRLF, so a track of either kind passes. The proof counts the packets whose line breaks changed in crlf.
+    Every other stream matches, and the times are the plan's."""
+    path = hb_mkv(tmp_path / "srt.mkv", hb_base, [srt_line(i, br) for i in range(1, 21)], private=None, codec=b"S_TEXT/UTF8")
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    cues = hook.subtitle_cues(path, j, {"s1"})["s1"]
+    plan = hook.time_plan(cues, None, (), starts=starts_of(cues, 10.0, 20.0, 1.2))
+    _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    entry = info["proof"][2]
+    assert entry["stream"] == "subtitle 2" and entry["timed"] == 20 and "crlf" not in info["proof"][1], info["proof"]
+    raw = hook.packet_hashes(path, [2], {}, [], str(tmp_path), 60, crlf=[2])[0][2]["raw_md5s"]
+    changed = sum(raw[k * 16:k * 16 + 16] != hashlib.md5(srt_line(k + 1, br)).digest() for k in range(20))
+    assert changed in (0, 20) and entry.get("crlf", 0) == changed, (changed, entry)   # 20 when this mkvmerge stores the other line break
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert [(a, b) for a, b, _ in got] == [(pytest.approx(x[3], abs=0.0015), pytest.approx(x[4], abs=0.0015)) for x in plan], got[:6]
+
+
+@pytest.mark.parametrize("old, new, why", [
+    (srt_line(3), srt_line(3, b"\r\n"), None),
+    (srt_line(3, b"\r\n"), srt_line(3), None),
+    (b"a\nb\nc", b"a\r\nb\nc", None),
+    (srt_line(3), srt_line(3, b"\r"), "a CR alone"),
+    (srt_line(3), srt_line(3, b"\r\n\r\n"), "a line break added"),
+    (srt_line(3), srt_line(3) + b"\r\n", "a line break added at the end"),
+    (srt_line(3), srt_line(7, b"\r\n"), "a byte changed"),
+    (srt_line(3) + b"\0", srt_line(3, b"\r\n"), "a NUL at the end dropped"),
+    (srt_line(3), b"Li\rne 3\nnext", "a CR added inside a line"),
+])
+@pytest.mark.parametrize("plan_of", ["timed", "ended"])
+def test_the_proof_takes_lf_for_crlf_in_a_timed_subrip_packet(hb_base, tmp_path, old, new, why, plan_of):
+    """The proof of a SubRip stream with a time plan or a flash plan compares each packet of both files with each CR LF
+    as one LF, and counts the packets that changed in crlf. A lone CR, a CR inside a line, a line break added, a
+    changed byte and a dropped NUL still fail. So does a changed line break in a stream that the remux did not write
+    through the text round trip, and in an ASS stream."""
+    mk = lambda name, third, br: hb_mkv(tmp_path / name, hb_base, [srt_line(i, br) for i in (1, 2)] + [third] + [srt_line(i, br) for i in range(4, 21)],
+                                         private=None, codec=b"S_TEXT/UTF8")
+    src, tmp = mk("src.mkv", old, b"\n"), mk("tmp.mkv", new, b"\r\n" if why is None else b"\n")
+    plan = [(2.0 * i, 2.0 * i + 1.5) for i in range(1, 21)]
+    given = {"timed": {0: plan}} if plan_of == "timed" else {"ended": {0: [e for _, e in plan]}}
+    refused, proof = hook.prove(src, tmp, [], str(tmp_path), **given)
+    entry = next(e for e in proof if e["stream"] == "subtitle 2")
+    if why is None:
+        assert refused is None and entry["match"] and entry["crlf"] == 19 + (old != new), (refused, entry)
+    else:
+        assert refused == (2, "the packet data of stream subtitle 2 (subrip) differ") and not entry["match"] and "crlf" not in entry, (why, refused, entry)
+    if why is None:
+        assert proved(src, tmp, [], str(tmp_path))[0] == "the packet data of stream subtitle 2 (subrip) differ", "no time plan, no LF for CRLF"
+        ass = lambda name, br: hb_mkv(tmp_path / name, hb_base, [hb_event(i, b"a" + br + b"b") for i in range(1, 21)])
+        assert proved(ass("a.mkv", b"\n"), ass("b.mkv", b"\r\n"), [], str(tmp_path), **given)[0] == \
+            "the packet data of stream subtitle 2 (ass) differ", "an ASS stream keeps its line breaks"
+
+
+def test_copy_fault_passes_only_the_decoder_lines_of_an_audio_or_video_stream():
+    """A line of the decoder of an audio or video stream passes, and a "Last message repeated" line after it. A muxer
+    line, a filter line, a plain error, the line of a codec the file does not hold, of a subtitle stream, and a repeat
+    line after a failed line fail."""
+    streams = [{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "eac3"},
+               {"codec_type": "subtitle", "codec_name": "subrip"}]
+    ok = ["[eac3 @ 0x5f50a1] exponent 25 is out-of-range", "[eac3 @ 0x5f50a1] error decoding the audio block", "    Last message repeated 2 times",
+          "[h264 @ 0x7ffe0] decode_slice_header error", ""]
+    assert hook.copy_fault("\n".join(ok), streams) == []
+    for line in ("[matroska @ 0x5f50a1] Starting new cluster due to timestamp", "[setts @ 0x5f50a1] bad", "Error opening output file",
+                 "[ac3 @ 0x5f50a1] error decoding the audio block", "[subrip @ 0x5f50a1] Invalid data", "[eac3 @ nowhere] text",
+                 "[matroska,webm @ 0x5f50a1] Unknown-sized element"):
+        assert hook.copy_fault("\n".join([ok[0], line, ok[1]]), streams) == [line], line
+    assert hook.copy_fault("Error\n    Last message repeated 1 times", streams) == ["Error", "    Last message repeated 1 times"]
+    # ffmpeg 7.1 names these decoders apart from their codec, as damaged files of each showed
+    for codec, kind, line in (("mp3", "audio", "[mp3float @ 0x5979] big_values too big"), ("dts", "audio", "[dca @ 0x5aa0] Reserved bit set"),
+                              ("av1", "video", "[libdav1d @ 0x6477] zero_bit out of range"),
+                              ("msmpeg4v3", "video", "[msmpeg4 @ 0x586f] I-frame too long, ignoring ext header"),
+                              ("mp2", "audio", "[mp2 @ 0x57fc] Header missing")):
+        assert hook.copy_fault(line, [{"codec_type": kind, "codec_name": codec}]) == [], codec
+        assert hook.copy_fault(line, streams) == [line], f"no {codec} stream in the file"
+
+
+def damaged_eac3(tmp_path, base):
+    """base, a Matroska file whose first stream is E-AC-3, with bytes 40 to 200 of its first frame set to 0xFF. The
+    E-AC-3 decoder then reads an exponent code out of range, and ffprobe prints its lines and nothing else."""
+    data = bytearray(open(base, "rb").read())
+    at = data.index(b"\x0b\x77")   # the first E-AC-3 frame: the audio comes first in the first Cluster
+    data[at + 40:at + 200] = b"\xff" * 160
+    path = tmp_path / "damaged.mkv"
+    path.write_bytes(data)
+    err = REAL_RUN(["ffprobe", "-v", "error", str(path)], capture_output=True, text=True).stderr.splitlines()
+    assert err and all(line.startswith("[eac3 @ ") for line in err), err
+    return str(path)
+
+
+def test_resub_passes_the_decoder_lines_of_a_damaged_audio_frame(tmp_path, settings):
+    """ffmpeg decodes a few frames while it opens a file, and the E-AC-3 decoder prints the damaged frame there. The
+    remux copies the stream, so the write passes, every packet matches, and the log keeps the lines in warnings."""
+    base, srt = tmp_path / "base.mkv", tmp_path / "s.srt"
+    srt.write_text("".join(f"{i}\n00:00:{i:02d},000 --> 00:00:{i:02d},800\nLine {i}\n\n" for i in range(1, 9)))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10", "-f", "lavfi", "-i",
+              "testsrc=duration=10:size=160x90:rate=25", "-i", str(srt), "-map", "0", "-map", "1", "-map", "2", "-c:a", "eac3",
+              "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:s", "srt", str(base)], check=True)
+    path = damaged_eac3(tmp_path, base)
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    _, result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": 0.5}})
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    assert info["warnings"] and all(line.startswith("[eac3 @ ") for line in info["warnings"].splitlines()), info["warnings"]
 
 
 def test_grid_plan_takes_only_ass_starts_between_centiseconds():

@@ -306,7 +306,7 @@ FINDINGS = {
     "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
     "damage": ("Damaged file", damage),
     "repack": ("Conversion to MKV failed", failed_repack),
-    "header": ("File repair failed", lambda f, t: f'Couldn\'t repair the file, so it was left as it is. {cap(f["why"])}.'),
+    "header": ("File repair failed", lambda f, t: f'Couldn\'t repair the file. {cap(f["why"])}. The original file was not changed.'),
     "cut": ("File may be cut short", lambda f, t: f'{cap(f["why"])}. The file may be cut short, or the subtitles may belong to another version. '
                                                  "Nothing was changed."),
     "subtitle": ("Subtitles run past the end", overrun),
@@ -660,7 +660,7 @@ def garbled(x, t):
         return f"{unsure} They're still in the file, because {KEPT_BACK[x['kept_back']]}."
     if "result" in x:
         return f"{name} {GARBLED}. {block(x['block'])}" if t == "planned" and x.get("block") else \
-            f"{name} {GARBLED}{fix_failed(x['result'])}. The file was left as it is."
+            f"{name} {GARBLED}{fix_failed(x['result'])}. The original file was not changed."
     if x["repair"] and not x["flags_off"]:
         return f"{name} {GARBLED}. SUBTITLES is set to check, so they were left as they are."
     return f"{name} {GARBLED}, but the right text couldn't be worked out for sure, so they were left as they are."
@@ -683,12 +683,12 @@ SUB_LINES = {
     "converted_sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {NO_MATCH}, so the conversion to MKV left them out. {where(x)}',
     "converted_track": lambda x, t: f'Subtitle track {x["track"][1:]} of the original file doesn\'t match what\'s said in the audio, so the '
                                     f'conversion to MKV left it out. The original file is kept at {x["kept"]}.',
-    "sidecar_left": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {SIDECAR_NEEDS.get(x.get("action"), "need new times")}, but the file '
-                                 f'was left as it is, because {x["left"]}.',
+    "sidecar_left": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {SIDECAR_NEEDS.get(x.get("action"), "need new times")}, but AMG '
+                                 f'didn\'t change them, because {x["left"]}.',
     "off": off_line,
     "not_retimed": lambda x, t: f'{cap(subs_name(x["tracks"], x["langs"]))} need new times'
                                 + (f'. {block(x["block"])}' if t == "planned" else
-                                   f'{fix_failed(x["result"])}. The file was left as it is.'),
+                                   f'{fix_failed(x["result"])}. The original file was not changed.'),
     "check_times": check_times,
     "check_flash": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} flash by too fast to read. Half the lines show for {x["median"]:.2f} s '
                                 "or less. SUBTITLES is set to check, so they were left as they are.",

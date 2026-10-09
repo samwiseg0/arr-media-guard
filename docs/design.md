@@ -242,13 +242,14 @@ one step a line, in the order of `FIX_STEPS`. A field with no value is left out,
 Check alone. A held alert keeps the fields the import gave it. A change post has neither field, see
 `report.fix_post()`. A test fails when a finding kind, action code or sentence code has no step.
 
-**Plain words.** A subtitle remux that failed reads "rewriting the file failed" in the alert, see
-`report.remux_why()`. The decision line keeps its error in `subremux.result`. A skip keeps its own reason, such as low
-space or a second hard link. A sidecar whose new times do not fit its text says so in `left`, and keeps the error in
-`error`, see `subtitles.sidecar_fix()`. A fix with a ratio names the offset at the start and at the end of the file,
-see `report.at_end()`. The end comes from the fix and the file's length. A `check_times` sentence, and an `off`
-sentence with `would`, carry that length as `duration`. A change post reads it from the record's `file_duration`. An
-offset under 0.05 seconds reads "in sync", see `report.about()`.
+**Plain words.** A subtitle remux that failed reads "rewriting the file failed" in the alert, see `report.remux_why()`,
+and ends with "The original file was not changed." A failed header repair and a failed garbled-text repair end with the
+same sentence. The decision line keeps its error in `subremux.result`. A skip keeps its own reason, such as low space or
+a second hard link. A sidecar whose new times do not fit its text says so in `left`, and keeps the error in `error`, see
+`subtitles.sidecar_fix()`. A fix with a ratio names the offset at the start and at the end of the file, see
+`report.at_end()`. The end comes from the fix and the file's length. A `check_times` sentence, and an `off` sentence
+with `would`, carry that length as `duration`. A change post reads it from the record's `file_duration`. An offset under
+0.05 seconds reads "in sync", see `report.about()`.
 
 **Every change.** With `DISCORD_POSTS=all`, `logs.alert_findings()` also posts each change of the run, see
 `report.render()` target `changes`. A finding of `report.fixes()` that the gate logs only keeps its alert's words and
@@ -1547,7 +1548,11 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   codec delay, as AAC, Opus, AC-3 or MP3 that ffmpeg wrote into Matroska has, that start at 0 moves the later cues of
   the track by the delay. The proof then refuses the remux, the file stays as it was, and the "subtiming" alert says
   the remux failed. A fix that moves no cue before 0 passes. mkvmerge moved AAC lace times by 2 ms in a Matroska to
-  Matroska remux, and the proof refused it, while ffmpeg keeps the times it reads.
+  Matroska remux, and the proof refused it, while ffmpeg keeps the times it reads. A line that ffmpeg prints fails
+  the remux, with one exception. ffmpeg decodes a few frames of each stream while it opens the file, and the decoder
+  of a damaged frame prints there, as in `[eac3 @ 0x...] error decoding the audio block`. The copy decodes nothing,
+  so a line whose name is the codec of an audio or video stream of the file passes. The log keeps it in the remux's
+  `warnings`. A muxer line, a filter line and a plain error still fail.
 - mkvpropedit then puts back the Segment UID, and each kept track's UID, BCP 47 tag, name and flags. ffmpeg reads an
   image attachment, such as a cover, as a picture stream and would write it as a video track. So the map leaves it
   out, and mkvpropedit adds it back with its name, type and UID. The new file must
@@ -1617,14 +1622,17 @@ shortens a cue. A built-in track gets its new ends in the remux of "Actions": mk
 in, and mkvmerge reads it back, which keeps each packet and the ASS header byte for byte. HandBrake ends each ASS event
 and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The round trip drops those NUL
 bytes and adds the section. The proof compares each packet that ended in a NUL without that one byte, and names their
-count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section and its Format line. Any
-other change of a byte fails. The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake
-writes starts in milliseconds. The round trip puts each start on the centisecond grid, up to 5 ms away. So such a track
-gets one plan of every start and end, with each start on the nearest centisecond, and the proof holds both to it. The
-log counts in `starts_rounded` the starts the grid moved off the time of the fix. A sidecar is written again, and its
-original is kept. A fix goes to the log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUBTITLES=check`
-keeps the ends and alerts. A WebVTT track that flashes is reported and never rewritten. Imports, `--sub-check`,
-`--sub-time` and the deep analysis run it.
+count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section and its Format line.
+mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as LF or CRLF. mkvmerge 92 stores
+CRLF, and a newer mkvmerge may store LF. So the proof compares each packet of a SubRip track that went through the round
+trip with each CRLF as LF, in both files, and names the count of packets that changed in `crlf`. A track that ffmpeg
+copies from the source file keeps the strict rule, also when `-itsoffset` moves it. Any other change of a byte fails.
+The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake writes starts in milliseconds. The
+round trip puts each start on the centisecond grid, up to 5 ms away. So such a track gets one plan of every start and
+end, with each start on the nearest centisecond, and the proof holds both to it. The log counts in `starts_rounded` the
+starts the grid moved off the time of the fix. A sidecar is written again, and its original is kept. A fix goes to the
+log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUBTITLES=check` keeps the ends and alerts. A WebVTT
+track that flashes is reported and never rewritten. Imports, `--sub-check`, `--sub-time` and the deep analysis run it.
 
 **Reference timing.** A text track in another language than the audio, Japanese, Chinese or Thai text, a PGS or VobSub
 track, and an `.srt` sidecar the word check leaves out get their times from a reference. A reference is a track or
