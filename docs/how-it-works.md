@@ -88,8 +88,12 @@ updates it saved. It then takes the jobs, oldest first. With `HOOK_WORKERS` abov
 
 The worker skips a job when an earlier re-grab of the same download deleted its file. When the file is not at its path,
 it asks the app, and follows a file the app moved or renamed. It drops a job whose file is gone, and a job older than a
-day. When the [policy file](policy.md) does not load, it skips the job, and one alert names the error. A job whose check
-crashes three times is dropped with an error line.
+day. At the start of each run of a job, it asks the app about the file. A job runs again when its file or its download
+changed, and that run asks too. It drops a job whose file the app deleted and replaced at the same path, as when the
+app imports one release twice. The newer import's job checks that file. With `HOOK_WORKERS=1` a job never runs again
+for a changed file, so a replace during the checks still reads the copy. When the [policy file](policy.md) does not
+load, it skips the job, and one alert names the error. A job whose check crashes three times is dropped with an error
+line.
 
 ## 4. AMG checks the file
 

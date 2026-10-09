@@ -213,11 +213,14 @@ def env(tmp_path, monkeypatch, settings):
             return calls.get("parse_cf", lambda title: {})(parse_qs(p.split("?", 1)[1])["title"][0])
         if p.startswith("qualityprofile/"):
             return calls.get("profile", {})
-        if p.startswith("moviefile/") and p not in calls["movies"]:   # the record a movie/<id> names, when a test set no other
-            return next((m["movieFile"] for k, m in calls["movies"].items() if k.startswith("movie/") and isinstance(m, dict)
-                         and (m.get("movieFile") or {}).get("id") == int(p.split("/")[1])), {})
+        if p.startswith("moviefile/") and p not in calls["movies"]:   # the record a movie/<id> names, when a test set no other.
+            fid = int(p.split("/")[1])   # A record no movie names belongs to the env's movie 7, as the job's file does.
+            return next(({"movieId": int(k[6:]), **m["movieFile"]} for k, m in calls["movies"].items() if k.startswith("movie/")
+                         and isinstance(m, dict) and (m.get("movieFile") or {}).get("id") == fid), {"id": fid, "movieId": 7})
         if p.startswith("extrafile?movieId="):   # Radarr's extra files of the movie, from calls["extra_rows"] as (path, file id, type)
             return [{"relativePath": r, "movieFileId": f, "type": t} for r, f, t in calls.get("extra_rows", lambda: [])()]
+        if isinstance(calls["movies"].get(p), Exception):   # an API error a test stored, such as a 404
+            raise calls["movies"][p]
         return calls["movies"][p]
     monkeypatch.setattr(hook, "arr", fake_arr)
     monkeypatch.setattr(hook, "PROFILES", {})
@@ -286,7 +289,8 @@ def queue(env):
 
 
 def as_sonarr(monkeypatch, env, series, eps):
-    monkeypatch.setattr(hook, "arr", lambda app, p: {"series/5": series, "episode?episodeFileId=9": eps}[p])
+    monkeypatch.setattr(hook, "arr", lambda app, p: {"series/5": series, "episode?episodeFileId=9": eps,
+                                                     "episodefile/9": {"id": 9, "seriesId": 5, "path": env["path"]}}[p])
     for k in ("radarr_eventtype", "radarr_movie_id", "radarr_moviefile_path"):
         monkeypatch.delenv(k)
     for k, v in (("sonarr_eventtype", "Download"), ("sonarr_series_id", "5"), ("sonarr_episodefile_id", "9"), ("sonarr_episodefile_path", env["path"])):
@@ -307,7 +311,7 @@ def titled_import(monkeypatch, env, release="Show.D.S04E15.1080p.WEB.H264-GRP", 
     def fake_arr(app, p):
         calls.append(p)
         return {"series/5": {"id": 5, "title": "Show D", "originalLanguage": {"name": "English"}}, "episode?episodeFileId=9": SHOW_EPS[:1],
-                "episode?seriesId=5": SHOW_EPS}[p]
+                "episode?seriesId=5": SHOW_EPS, "episodefile/9": {"id": 9, "seriesId": 5, "path": env["path"]}}[p]
     monkeypatch.setattr(hook, "arr", fake_arr)
     monkeypatch.setenv("sonarr_episodefile_scenename", release)
     if nfo is not None:
@@ -349,7 +353,8 @@ def test_a_failed_episode_list_leaves_the_other_checks(env, monkeypatch):
     def fake_arr(app, p):
         if p.startswith("episode?seriesId"):
             raise urllib.error.URLError("the app restarts")
-        return {"series/5": {"id": 5, "title": "Show D"}, "episode?episodeFileId=9": SHOW_EPS[:1]}[p]
+        return {"series/5": {"id": 5, "title": "Show D"}, "episode?episodeFileId=9": SHOW_EPS[:1],
+                "episodefile/9": {"id": 9, "seriesId": 5, "path": env["path"]}}[p]
     titled_import(monkeypatch, env, release="Show.D.S04E15.Ship.Voyage.1080p.WEB.H264-GRP")
     monkeypatch.setattr(hook, "arr", fake_arr)
     hook.main([])
@@ -432,7 +437,7 @@ def run_tester_import(monkeypatch, env, tmp_path, release=TESTER_RELEASE, nfo=TE
     own = [e for e in eps if (e["seasonNumber"], e["episodeNumber"]) == (4, 15)]
     as_sonarr(monkeypatch, env, {}, own)
     monkeypatch.setattr(hook, "arr", lambda app, p: {"series/5": {"id": 5, "title": "SpongeBob SquarePants"}, "episode?episodeFileId=9": own,
-                                                      "episode?seriesId=5": eps}[p])
+                                                      "episode?seriesId=5": eps, "episodefile/9": {"id": 9, "seriesId": 5, "path": env["path"]}}[p])
     folder = tmp_path / "downloads" / "complete" / release
     folder.mkdir(parents=True)
     if nfo:
@@ -1641,7 +1646,8 @@ def test_silent_audio_on_import_deletes_remonitors_and_fails_the_grab(env, monke
 
 
 def test_sonarr_regrab_remonitors_the_episodes(env, monkeypatch):
-    as_sonarr(monkeypatch, env, {"title": "Show", "originalLanguage": {"name": "English"}}, [{"seasonNumber": 1, "episodeNumber": 2, "runtime": 44}])
+    as_sonarr(monkeypatch, env, {"title": "Show", "originalLanguage": {"name": "English"}},
+              [{"id": 31, "seasonNumber": 1, "episodeNumber": 2, "runtime": 44}, {"id": 32, "seasonNumber": 1, "episodeNumber": 3, "runtime": 44}])
     real = hook.arr
     eps = [{"id": 31, "episodeFileId": 9}, {"id": 32, "episodeFileId": 9}]
     monkeypatch.setattr(hook, "arr", lambda app, p: GRAB if p.startswith("history?") else eps if p.startswith("episode?episodeIds") else real(app, p))
@@ -2137,7 +2143,9 @@ def pack(env, monkeypatch, tmp_path, broken, other=None):
             return [{"id": 100 + n, "seasonNumber": 1, "episodeNumber": n, "runtime": 22}]
         if p.startswith("episode?episodeIds="):
             return [{"id": int(i), "episodeFileId": int(i) + 100, "seriesId": other.get(int(i), 5)} for i in parse_qs(p.split("?", 1)[1])["episodeIds"]]
-        if p.startswith("episodefile/"): return {"id": int(p.split("/")[1]), "path": paths[int(p.split("/")[1])]}
+        if p.startswith("episodefile/"):
+            fid = int(p.split("/")[1])
+            return {"id": fid, "seriesId": other.get(fid - 100, 5), "path": paths[fid]}
         raise AssertionError(p)
     monkeypatch.setattr(hook, "arr", arr)
     bad = {paths[200 + n] for n in broken}
@@ -4282,6 +4290,61 @@ def test_a_moved_broken_file_is_regrabbed_by_its_new_path(env, monkeypatch):
     assert {a[a.index("-i") + 1] for a in env["ffmpeg"]} == {new} and len(env["ffmpeg"]) == 6   # the check and the second check
 
 
+@pytest.mark.parametrize("app, answer, outcome", [("radarr", 404, "file_gone"), ("sonarr", 404, "file_gone"), ("sonarr", [], "file_gone"),
+                                                  ("radarr", 500, "error"), ("sonarr", 500, "error")])
+def test_a_job_whose_file_record_the_app_deleted_drops_before_the_checks(env, monkeypatch, app, answer, outcome):
+    """A second import of the same release deleted the job's file record and wrote its file to the same path. The path
+    exists, so only the app can tell. The job asks it by the file id under the lock. It drops before the checks on a
+    404, or when no episode holds the file. Another API error drops nothing and ends as an error."""
+    fid = "moviefile/11"
+    if app == "sonarr":
+        as_sonarr(monkeypatch, env, {"title": "Show", "originalLanguage": {"name": "English"}}, [{"id": 31, "seasonNumber": 1, "episodeNumber": 2}])
+        monkeypatch.setenv("sonarr_episodefile_episodeids", "31")
+        fid = "episodefile/9" if answer != [] else "episode?episodeFileId=9"
+    monkeypatch.setenv("radarr_moviefile_id", "11")
+    real, held = hook.arr, []
+    def arr(a, p):
+        if p == fid:   # a second open of the lock file gets no flock while the job holds the file lock
+            with open(os.path.join(hook.CFG.state_dir, "lock"), "a") as other:
+                held.append(not free(other))
+        if p == fid and answer != []:
+            raise http_error(answer)
+        return answer if p == fid else real(a, p)
+    monkeypatch.setattr(hook, "arr", arr)
+    monkeypatch.setattr(hook, "process", lambda ctx: pytest.fail("the checks ran"))
+    hook.main([])
+    (rec,) = log_lines(env)
+    assert held == [True]
+    num = {"radarr": 11, "sonarr": 9}[app]
+    gone = "Sonarr file 9 holds episodes [] now" if answer == [] else f"{app.capitalize()} no longer has file {num}" if answer == 404 else None
+    assert rec["outcome"] == outcome and posted(env) == [] and env["writes"] == [] and queue(env) == [], rec
+    assert rec["note"] == f"{gone}. The app replaced the file at its path" if gone else rec["result"] == "error: HTTPError: HTTP Error 500: x"
+
+
+@pytest.mark.parametrize("before", [False, True])
+def test_a_job_process_drops_when_the_app_replaced_its_file(env, monkeypatch, before):
+    """One release imported twice. The second import deletes the first file record while the first job checks the
+    file, and writes a new file to the same path. The checks find the file changed, and the re-run under the
+    exclusive lock asks the app again. The record is gone, so the job drops with no re-grab and no alert. A record
+    gone before the first run drops the job at that run, under the shared lock."""
+    env["ffmpeg_out"] = [SILENCE]
+    grabbed(env, monkeypatch)
+    real_arr, real_run, gone = hook.arr, hook.subprocess.run, [env["path"]] if before else []
+    monkeypatch.setattr(hook, "arr", lambda app, p: (_ for _ in ()).throw(http_error(404)) if p == "moviefile/11" and gone else real_arr(app, p))
+    def run(argv, **kw):   # the second import replaces the file while the audio check reads it
+        if argv[0] == "ffmpeg" and not gone:
+            gone.append(env["path"])
+            os.remove(env["path"])
+            open(env["path"], "wb").write(b"y" * 90)   # its copy has begun
+        return real_run(argv, **kw)
+    monkeypatch.setattr(hook.subprocess, "run", run)
+    hook.run_job(enqueue(env, 0, env["path"], file_id="11", download_id="a1b2c3d4"), [], shared=True)
+    *warning, rec = log_lines(env)
+    assert [w["note"] for w in warning] == ([] if before else ["re-planned with the file lock exclusive: the file changed since the checks"])
+    assert (rec["outcome"], rec["note"]) == ("file_gone", "Radarr no longer has file 11. The app replaced the file at its path"), rec
+    assert env["writes"] == [] and posted(env) == [] and env["mkvpropedit"] == [] and gone
+
+
 # --- parallel job processes -----------------------------------------------------------------------
 
 def trace(what, **kw):
@@ -4914,7 +4977,7 @@ def mp4_movies(pool, monkeypatch, k):
         d = os.path.join(os.path.dirname(os.path.dirname(pool["path"])), f"Film {i}")
         os.makedirs(d, exist_ok=True)
         p = os.path.join(d, f"Film {i}.mp4"); open(p, "wb").write(b"x" * 1000)
-        old = {"id": 10 + i, "path": p, "quality": {"quality": {"id": 3, "name": "WEBDL-1080p"}, "revision": {"version": 1}},
+        old = {"id": 10 + i, "movieId": i, "path": p, "quality": {"quality": {"id": 3, "name": "WEBDL-1080p"}, "revision": {"version": 1}},
                "languages": [{"id": 1, "name": "English"}], "releaseGroup": "GRP", "sceneName": f"Film.{i}.2000.1080p.WEB-DL-GRP", "indexerFlags": 0,
                "customFormatScore": 25}
         pool["movies"][f"movie/{i}"] = dict(pool["movies"]["movie/7"], title=f"Film {i}", tmdbId=1000 + i, monitored=True, path=d,
@@ -7117,8 +7180,8 @@ def test_an_anime_batch_across_a_season_matches_the_absolute_numbers(env, monkey
 
 def mp4_import(env, monkeypatch, sidecars=(".en.srt", ".en.forced.srt")):
     """An MP4 import of Film A with its sidecars, file id 11 with a scene name. The fake Radarr takes a ManualImport:
-    the movie lists the imported path as file 12, or 13 when it is the original again. Returns (mp4, mkv) paths. The
-    hook's conversion of an import is on here."""
+    the movie lists the imported path as file 12, or 13 when it is the original again, and file 11 answers 404. Returns
+    (mp4, mkv) paths. The hook's conversion of an import is on here."""
     monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, convert=True))
     mp4 = env["path"][:-4] + ".mp4"
     os.replace(env["path"], mp4)
@@ -7128,7 +7191,7 @@ def mp4_import(env, monkeypatch, sidecars=(".en.srt", ".en.forced.srt")):
     env["probe"] = copy.deepcopy(NOT_MATROSKA["probe"])
     for i, t in enumerate(env["probe"]["tracks"]):
         t["id"] = i   # mkvmerge -J numbers the tracks
-    old = {"id": 11, "path": mp4, "quality": {"quality": {"id": 3, "name": "WEBDL-1080p"}, "revision": {"version": 1}},
+    old = {"id": 11, "movieId": 7, "path": mp4, "quality": {"quality": {"id": 3, "name": "WEBDL-1080p"}, "revision": {"version": 1}},
            "languages": [{"id": 1, "name": "English"}], "releaseGroup": "GRP", "sceneName": "Film.A.1979.1080p.NF.WEB-DL.DDP5.1.H.264-GRP",
            "indexerFlags": 0, "customFormatScore": 25}
     env["movies"]["movie/7"].update(monitored=True, path=os.path.dirname(mp4), movieFile={k: v for k, v in old.items() if k != "customFormatScore"})
@@ -7140,6 +7203,8 @@ def mp4_import(env, monkeypatch, sidecars=(".en.srt", ".en.forced.srt")):
         if p == "command" and body["name"] == "ManualImport" and env.get("app_takes", True):
             f = body["files"][0]
             env["movies"][f'movie/{f["movieId"]}']["movieFile"] = {"id": 13 if f["path"].endswith(".mp4") else 12, "path": f["path"]}
+            if f["movieId"] == 7:   # Film A's record 11 goes, as once a rescan dropped it, see relink()
+                env["movies"]["moviefile/11"] = http_error(404)
         if p == "moviefile/bulk":
             env["bulk"] = [dict(body[0], customFormatScore=25)]
     env["on_write"] = app_imports
@@ -7658,7 +7723,7 @@ def sonarr_mp4(env, monkeypatch, link):
     series = {"title": "Show", "originalLanguage": {"name": "English"}, "path": os.path.dirname(mp4)}
     eps = [{"id": 31, "seasonNumber": 1, "episodeNumber": 2, "runtime": 22, "monitored": True, "episodeFileId": 9},
            {"id": 32, "seasonNumber": 1, "episodeNumber": 3, "runtime": 22, "monitored": True, "episodeFileId": 9}]
-    files = {9: {"id": 9, "path": mp4, "quality": {"quality": {"id": 1}}, "languages": [{"id": 1}], "releaseGroup": "", "releaseType": "multiEpisode",
+    files = {9: {"id": 9, "seriesId": 5, "path": mp4, "quality": {"quality": {"id": 1}}, "languages": [{"id": 1}], "releaseGroup": "", "releaseType": "multiEpisode",
                  "indexerFlags": 0, "customFormatScore": 0}}
     as_sonarr(monkeypatch, env, series, eps)
     monkeypatch.setenv("sonarr_episodefile_path", mp4)
@@ -7906,7 +7971,7 @@ def test_a_name_that_loses_a_scoring_custom_format_refuses_the_conversion(env, m
         cf = ([] if film == "Film J" else [{"id": 2, "name": "Format B"}]) if title.endswith(".mkv") else [{"id": fid, "name": lost}]
         return {"customFormats": cf, "parsedMovieInfo": {"releaseGroup": None, "quality": {"quality": {"name": "Bluray-720p"}}}}
     env["parse_cf"] = parse
-    env["movies"]["moviefile/12"] = {"id": 12, "path": mkv, "customFormatScore": 2, "customFormats": [{"id": 2, "name": "Format B"}]}
+    env["movies"]["moviefile/12"] = {"id": 12, "movieId": 7, "path": mkv, "customFormatScore": 2, "customFormats": [{"id": 2, "name": "Format B"}]}
     hook.main([])
     rec = decided(env)
     if refused:
@@ -8131,8 +8196,8 @@ def test_a_stranded_conversion_is_reported_and_nothing_moves(env, monkeypatch, c
 @pytest.mark.parametrize("app_says, result", [("new", "completed"), ("nothing", "stranded")])
 def test_an_undo_reads_the_app_before_it_deletes(env, monkeypatch, app_says, result):
     """The import went through, then a read of the app failed. The undo reads the app again: it
-    lists the new file, so the conversion ends and the original goes. When the app does not answer at all, both files
-    stay under their names, and the store keeps the pending entry for a person."""
+    lists the new file, so the conversion ends with its file id and the original goes. When the app does not answer at
+    all, both files stay under their names, and the store keeps the pending entry for a person."""
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
     real_lists = hook.app_lists
     monkeypatch.setattr(hook, "app_lists", lambda *a: (_ for _ in ()).throw(ConnectionError("Radarr restarts")))
@@ -8142,7 +8207,7 @@ def test_an_undo_reads_the_app_before_it_deletes(env, monkeypatch, app_says, res
     rec = decided(env)
     assert rec["repack"]["restored"]["result"] == result, rec
     if result == "completed":
-        assert rec["outcome"] == "edited" and os.listdir(os.path.dirname(mkv)) == [os.path.basename(mkv)]
+        assert (rec["outcome"], rec["ids"]["file_id"]) == ("edited", 12) and os.listdir(os.path.dirname(mkv)) == [os.path.basename(mkv)]
     else:
         assert rec["outcome"] == "repack_failed" and "both stay for a person" in rec["result"]
         assert sorted(os.listdir(os.path.dirname(mkv))) == sorted([os.path.basename(mp4), os.path.basename(mkv)])
@@ -8290,6 +8355,103 @@ def test_a_lower_custom_format_score_puts_the_original_back(env, monkeypatch):
     assert os.listdir(os.path.dirname(mp4)) == [os.path.basename(mp4)]
     (line,) = open(os.path.join(hook.CFG.state_dir, "convert-radarr.txt")).read().splitlines()
     assert line.split("\t")[1] == "repack_failed"
+
+
+class Killed(BaseException):
+    """The end of a job process by SIGKILL, in a test."""
+
+
+@pytest.mark.parametrize("again, undo", [("replan", "undo"), ("crash", "undo"), ("replan", "failed"), ("crash", "failed"), ("crash", None)])
+def test_a_job_that_runs_again_after_a_conversion_asks_for_the_new_file_id(env, monkeypatch, again, undo):
+    """A job process converts an import. The app lists the new file as file 12. With undo its custom format score
+    falls, so the undo imports the original again as file 13. With failed that import command answers failed, but the
+    app lists the original as file 13 all the same. File 11 is gone in each case. Then the job runs again: a re-grab of
+    another file of its download ran meanwhile, or the job process died and went back to the queue. The re-run asks
+    the app for the new id at the path the conversion left, and checks that file."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    real, check, died = env["on_write"], hook.check_audio, []
+
+    def lower(app, p, method, body):
+        real(app, p, method, body)
+        if p == "moviefile/bulk" and undo:
+            env["bulk"] = [dict(body[0], customFormatScore=5)]
+        if p == "command" and body["name"] == "ManualImport":
+            undoes = body["files"][0]["path"] == mp4   # the undo's import
+            env["import_status"] = "failed" if undoes and undo == "failed" else "completed"
+            if undoes and again == "replan":
+                hook.store.put("unit", "radarr|a1b2c3d4", {"time": 0, "failed": True, "deleted": [99], "clean": [], "kind": "audio"})
+    env["on_write"] = lower
+
+    def audio(*a, **k):
+        if again == "crash" and not died:
+            died.append(a)
+            raise Killed
+        return check(*a, **k)
+    monkeypatch.setattr(hook, "check_audio", audio)
+    name = enqueue(env, 0, mp4, file_id="11", download_id="a1b2c3d4")
+    assert hook.claim(name)
+    if again == "crash":
+        with pytest.raises(Killed):
+            hook.run_job(name, [], shared=True, claimed=True)
+        hook.requeue(name, "died by signal 9")   # as finished() does
+        job = hook.job_of(name)
+        assert (job["file_id"], job["path"]) == (("13", mp4) if undo else ("12", mkv)) and hook.claim(name)
+    hook.run_job(name, [], shared=True, claimed=True)
+    rec = decided(env)
+    assert (rec["outcome"], str(rec["ids"]["file_id"]), rec["path"]) == ("edited", "12", mkv) and "audio" in rec, rec
+    imports = [w[2]["files"][0]["path"] for w in env["writes"] if w[1] == "command" and w[2]["name"] == "ManualImport"]
+    assert imports == ([mkv, mp4, mkv] if undo else [mkv]) and "moved_from" not in rec and queue(env) == []
+
+
+@pytest.mark.parametrize("then", ["crash", "regrab"])
+def test_an_undo_that_finds_the_new_file_listed_with_no_id_stores_the_new_path(env, monkeypatch, then):
+    """A job process converts an import. The read after the ManualImport fails, so the undo reads the app again. The app
+    lists the new file, so the conversion ends. The read of its file id fails too. The queue then holds the new path
+    and no file id. A re-run after a crash checks the new file. A re-grab has no file id to ask the app about, so it
+    deletes nothing."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    down, files, check, died = ConnectionError("Radarr restarts"), hook.ARR["radarr"].files, hook.check_audio, []
+    monkeypatch.setattr(hook, "app_lists", lambda *a: (_ for _ in ()).throw(down))
+    monkeypatch.setattr(hook.ARR["radarr"], "files", lambda owner, items, read=True: files(owner, items) if read else (_ for _ in ()).throw(down))
+    if then == "regrab":
+        silent(env, monkeypatch, mkv)
+        env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+
+    def audio(*a, **k):
+        if then == "crash" and not died:
+            died.append(a)
+            raise Killed
+        return check(*a, **k)
+    monkeypatch.setattr(hook, "check_audio", audio)
+    name = enqueue(env, 0, mp4, file_id="11", download_id="a1b2c3d4")
+    assert hook.claim(name)
+    if then == "crash":
+        with pytest.raises(Killed):
+            hook.run_job(name, [], shared=True, claimed=True)
+        hook.requeue(name, "died by signal 9")   # as finished() does
+        assert (hook.job_of(name)["file_id"], hook.job_of(name)["path"]) == (None, mkv) and hook.claim(name)
+    hook.run_job(name, [], shared=True, claimed=True)
+    rec = decided(env)
+    assert (rec["ids"]["file_id"], rec["path"]) == (None, mkv), rec
+    if then == "crash":
+        assert rec["outcome"] == "edited" and "audio" in rec, rec
+    else:
+        assert rec["repack"]["restored"]["result"] == "completed" and os.path.exists(mkv), rec
+        assert (rec["outcome"], action(env)[1]["code"]) == ("broken_audio", "no_grab"), rec
+    assert not [w for w in env["writes"] if w[0] == "DELETE"] and queue(env) == []
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_a_busy_store_at_the_save_of_the_new_file_id_never_stops_the_job(env, monkeypatch, shared):
+    """The store is busy when the conversion stores the new file id in the queue. The job goes on and checks the new
+    file."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    monkeypatch.setattr(hook, "put_job", lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
+    name = enqueue(env, 0, mp4, file_id="11", download_id="a1b2c3d4")
+    assert hook.claim(name)
+    hook.run_job(name, [], shared=shared, claimed=True)
+    rec = decided(env)
+    assert (rec["outcome"], rec["ids"]["file_id"], rec["path"]) == ("edited", 12, mkv) and "audio" in rec and queue(env) == [], rec
 
 
 def test_a_backfill_converts_from_its_plan_with_a_canary_and_a_cap(env, monkeypatch, settings, tmp_path, capsys):

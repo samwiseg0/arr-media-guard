@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks and the flag edit of one file, process(), with the metadata checks it runs."""
-import contextlib, dataclasses, fcntl, os, statistics, subprocess, time, uuid
+import contextlib, dataclasses, fcntl, os, sqlite3, statistics, subprocess, time, uuid
 
 from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, subsync, subtitles, vault
 
@@ -131,6 +131,7 @@ class Ctx:
     refresh(). path follows a conversion's new name."""
     app: str; path: str; label: str; original: str; runtime: object   # the file, and its item's original language and runtime
     mode: str = "import"; job: dict = None   # job is the queued hook job of an import
+    save: object = None   # stores job in the queue, see runner.run_job()
     apply: bool = True; post: bool = True   # post sends the alerts
     audio: bool = True; video: bool = True   # False skips a check the file already had with its download
     kids: bool = False; release: str = ""   # the item context of the decision
@@ -213,6 +214,17 @@ def conversion(ctx):
                                                            ctx.subs_on and subtitles.sub_fixes(ctx.source), decide.codes(ctx.original),
                                                            shared=bool(ctx.shared or ctx.pool), source=ctx.source)
     path = ctx.path
+    # A relink gives the file a new id: the new name, or the original that convert_undo() imported again. The new name
+    # always replaces the old id. Its id is None when an undo found the new name listed but could not read the id.
+    renamed = got == "repacked" and path != rec["path"]
+    fid = (rec["repack"]["relink"] if renamed else ((rec["repack"].get("restored") or {}).get("import") or {})).get("file_id")
+    if renamed or fid:
+        rec["ids"]["file_id"] = fid
+        if ctx.mode == "import":   # the queue gets the new id now, so a re-run asks the app for it after a Replan or a crash
+            job.update(path=path, file_id=str(fid) if fid else None)
+            if ctx.save:
+                with contextlib.suppress(sqlite3.Error):   # a busy store keeps the old id in the queue, and this run goes on
+                    ctx.save()
     if ctx.shared and ctx.apply and not ctx.pool:   # a hook job converted under the shared lock. The rest of the job runs exclusive.
         if got == "repacked":   # a re-run would lose the new file's record, so the job goes on, after the older jobs of its download
             ctx.shared.turn()
@@ -228,11 +240,8 @@ def conversion(ctx):
         ctx.rearm()   # convert() ran the remux with the time limit off, whatever came of it
     rec["container"] = container
     if got == "repacked":
-        if path != rec["path"]:   # the app lists the new name now, with a new file id
-            rec["path"], ctx.mkv, fid = path, True, rec["repack"]["relink"]["file_id"]
-            rec["ids"]["file_id"] = fid
-            if ctx.mode == "import":
-                job.update(path=path, file_id=str(fid))
+        if path != rec["path"]:   # the app lists the new name now, with the new file id above
+            rec["path"], ctx.mkv = path, True
         logs.log(dict(rec, outcome="repacked", result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
         if ctx.mode == "convert":   # the language backfill decides the flags later, from its own cache

@@ -617,7 +617,14 @@ inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending
 the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the
 app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
-by the file's id. A 404 or another item drops the job as `file_gone`. With `HOOK_WORKERS=1` the worker runs a deep
+by the file's id. A 404 or another item drops the job as `file_gone`. When the file is at its path, each run of the
+job asks the app by the file's id too. The run asks under the file lock before the checks, and a re-run after a re-plan
+asks again. A second import of one release can delete the job's file record and write its file to the same path. A 404
+or another item then drops the job as `file_gone` with no alert, and the note says the app replaced the file. The
+newer import's own job checks the new file. Another API error ends the job as an error. The `ManualImport` of a
+conversion gives the file a new id, and so does an undo that imports the original again. The queue keeps the new id
+when the app gives one, so a re-run asks the app for it. With `HOOK_WORKERS=1` a job holds the lock exclusive and never
+re-plans, so a replace during the checks still reads the copy. With `HOOK_WORKERS=1` the worker also runs a deep
 analysis in its own process, so no crash count covers it. A deep analysis that kills the worker runs again at the next
 start, and the subtitle alerts its import held wait. A count of starts would count each stop of the container too,
 because a stop ends the worker the same way.

@@ -8,7 +8,7 @@ from . import content, decide
 
 
 ENV_FILE = os.environ.get("ARR_MEDIA_GUARD_ENV", "/etc/arr-media-guard.env")
-BUDGET = 300          # seconds a hook run may take from the lock to mkvpropedit
+BUDGET = 300          # seconds a hook run may take from its item lookup to mkvpropedit. The file id check before it has only the API timeout.
 LOCK_WAIT = 3600      # seconds a hook waits for the lock, so a holder stuck on the NAS never blocks later imports forever
 DEADLINE = content.DEADLINE   # the job's time limit, see content.Deadline. run_job() starts it at BUDGET.
 APPS = {"radarr": 7878, "sonarr": 8989}   # each program, the name of its default instance, and its default port

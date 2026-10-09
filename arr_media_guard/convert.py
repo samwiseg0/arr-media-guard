@@ -384,6 +384,13 @@ def app_now(app, owner, items, tries=3):
     return None
 
 
+def listed_id(app, owner, items):
+    """The file id the app lists for the first of items now, or None when the app does not answer. It reads no file
+    record, see files()."""
+    with contextlib.suppress(Exception):
+        return next((f for _, f in apps.ARR[app].files(owner, items, read=False)[1].values()), None)
+
+
 def convert_undo(app, owner, old, items, path, new, held, hidden, lock, refused):
     """Undo a conversion that stopped after the new file was in place, by what the app lists now.
     Returns (result, info). "completed": the app lists the new file for every item and nothing refused it, so the
@@ -396,8 +403,7 @@ def convert_undo(app, owner, old, items, path, new, held, hidden, lock, refused)
     if listed and set(listed) == {new} and not refused:
         with contextlib.suppress(FileNotFoundError):
             os.remove(held)
-        with contextlib.suppress(Exception):   # the new file's record, which the failed relink() did not read
-            out["file_id"] = next((f for _, f in apps.ARR[app].files(owner, items, read=False)[1].values()), None)
+        out["file_id"] = listed_id(app, owner, items)   # the new file's record, which the failed relink() did not read
         return "completed", out
     if lock is not None:
         swap_lock(lock)
@@ -411,6 +417,8 @@ def convert_undo(app, owner, old, items, path, new, held, hidden, lock, refused)
         _, out["import"] = relink(app, owner, old, items, path)
         listed = out["listed"] = app_now(app, owner, items)
     if listed and set(listed) == {path}:
+        if "import" in out and not out["import"]["file_id"]:   # relink() gives no id when its command failed or the list did not settle
+            out["import"]["file_id"] = listed_id(app, owner, items)
         if new != path:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(new)

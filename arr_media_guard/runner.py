@@ -1435,9 +1435,10 @@ def webhook_job(name, job, claimed=False):
 
 def run_job(name, pending, shared=False, claimed=False):
     """Run one job of the queue, or a claimed one. Lock, process, log, queue a Plex lookup after an edit, then delete
-    the job. A file that is gone is asked for by its file id, see moved(). shared is a job process of coordinate(): the
-    checks hold the file lock shared, see process(). A job that raises Replan runs again here with the lock exclusive
-    from the start, after a log line that says why."""
+    the job. A file that is gone is asked for by its file id, see moved(). A file at its path is asked for too, under
+    the lock before the checks, and the job drops as file_gone when the app no longer has it. shared is a job process
+    of coordinate(): the checks hold the file lock shared, see process(). A job that raises Replan runs again here with
+    the lock exclusive from the start, after a log line that says why."""
     if name.startswith("deep-analysis-"):   # a job process of coordinate() runs a deep analysis job too
         return deep_analysis(name, pending, claimed)
     rec, want, started, path, again, run = dict(source="hook", job=name), None, time.time(), None, None, None
@@ -1497,6 +1498,11 @@ def run_job(name, pending, shared=False, claimed=False):
                     rec.update(outcome="deleted_with_download", fault=kind, result=f"skipped, deleted with its download for {report.FAULTS[kind][0]}")
                 elif not os.path.exists(path):
                     rec.update(outcome="file_gone", result="dropped, the file is gone", note="the file went while the job waited for the lock")
+                elif (listed := moved(app, dict(job, unseen=False)))[2]:   # the file is here, so moved() raises no Unseen
+                    # A second import of one release can delete the job's file record and write its file to the same path.
+                    # The newer import's own job checks that file. Each run of the job asks at its start, the re-run after
+                    # Replan too. A conversion stores the new file id it gets, see process.conversion().
+                    rec.update(outcome="file_gone", result="dropped, the file is gone", note=f"{listed[1]}. The app replaced the file at its path")
                 else:
                     config.DEADLINE.start(config.BUDGET)
                     label, original, runtime, want, kids, ctx = apps.ARR[app].item(int(job["owner"]), fid)
@@ -1504,7 +1510,7 @@ def run_job(name, pending, shared=False, claimed=False):
                            "slug": ctx.get("slug")}   # the slug links the alerts to the item, see apps.App.page()
                     run = process.Ctx(
                         app, path, label, original, runtime, job=job, audio=not (handled and kind == "audio"), video=not (handled and kind == "video"),
-                        kids=kids, release=job.get("release") or "", ids=ids, item=ctx, lock=lock,
+                        kids=kids, release=job.get("release") or "", ids=ids, item=ctx, lock=lock, save=lambda: put_job(name, job, claimed),
                         shared=shared and types.SimpleNamespace(exclusive=lambda st: exclusive(lock, path, st, name, job, unit), settle=lambda: settle(name),
                                                                 turn=lambda: wait_turn(name, job), reshare=lambda st: reshared(lock, path, st)))
                     rec = process.process(run)
