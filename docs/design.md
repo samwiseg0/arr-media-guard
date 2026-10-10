@@ -853,6 +853,14 @@ Three more differences pass, each with its own check:
 
 Any other lost packet fails, and the file keeps its original.
 
+**Known limitation: AAC priming with no edit list.** Some MP4 files, such as one iTunes purchase,
+store the AAC encoder priming as leading packets of zero length, and have no edit list. mkvmerge
+spaces those packets one frame apart and writes no codec delay. Every later audio packet then lands
+two frames (about 44 ms) late, and a player that follows timestamps plays the audio that far behind
+the video. The shared-time rule above allows one frame, so the proof refuses the conversion, and the
+file stays MP4. Do not force it, because the forced file keeps the shift. In 2026-10 one of 356 MP4
+and MOV files in one library had this shape.
+
 **Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
 whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
 --convert --apply --force-convert PATH [PATH ...]` takes only the listed files. The force is bound
