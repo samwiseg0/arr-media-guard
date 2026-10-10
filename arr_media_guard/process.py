@@ -44,7 +44,7 @@ def episode_title(app, item, nfo, release, path):
         eps = item.get("episodes") or apps.arr(app, f"episode?seriesId={item['series_id']}")
     except Exception as ex:
         return {"kind": "episode_title", "verdict": "unknown", "points": 0, "why": config.mask(f"the episode list did not read: {type(ex).__name__}: {ex}")[:200]}
-    return content.episode_title_verdict(title, eps, item.get("episode_ids") or (), name, [t for t, _ in item.get("titles") or ()], said,
+    return content.episode_title_verdict(title, eps, item.get("episode_ids") or (), [t for t, _ in item.get("titles") or ()], said,
                                           item.get("anime"))
 
 

@@ -1109,7 +1109,10 @@ checks after the flag edit.
   quality word or release flag, such as REPACK or a language in capitals. A flag in title case is a
   title word, as in "Internal Affairs". In a name all in capitals, only the flags right before the
   quality word are cut, so "FRENCH WEEK" stays. A tag may name one segment
-  of a DVD order, as S04E15a. In a name with no quality word, a last "-GROUP" is the group. The hook reads the NFO at the event and keeps the title in the job, because a usenet
+  of a DVD order, as S04E15a. In a name with no quality word, a last "-GROUP" is the group. An NFO
+  line with an episode tag, such as a MediaInfo "Title" line that holds the whole release name, gives
+  the words between the tag and the first quality word. It keeps a last "-word", because a title such
+  as "7-3-1" ends in one. The hook reads the NFO at the event and keeps the title in the job, because a usenet
   download folder can be gone when the worker runs. The Webhook gives the folder as
   `episodeFile.sourcePath`, and Sonarr's path map maps it. With a map set, the listener reads only
   under the map's local folders. An NFO counts only when it is a plain file whose name is the
@@ -1133,10 +1136,11 @@ checks after the flag edit.
   title that leaves out "Part Two". So does a title that holds the words of the file's own in a row,
   or whose words the file's own holds. Neither rule joins two parts of one story, such as "Versus the
   Ring" and "Versus the Ring Part 2", so a swap of two parts shows. A title that drops its part
-  number then alerts. When Sonarr imported the release to other numbers than its tag,
-  its scene numbering already maps the release's order, and the title says nothing. The alert names
-  the imported episode with Sonarr's title, then the episode the release's title belongs to, in
-  Sonarr's order, with its absolute number for anime.
+  number then alerts. The release's episode tag plays no part, even when Sonarr's scene numbering
+  imported the release to other numbers than its tag. Two releases can share one tag when a show
+  restarts its season numbers, and the scene numbering then sends the new episode to an old one. The alert
+  names the imported episode with Sonarr's title, then the episode the release's title belongs to,
+  in Sonarr's order, with its absolute number for anime.
 
 **The re-grab rule.** A re-grab needs two points. The wrong language scores one. So does a release
 name that names that language, for movies only. A short or long runtime scores one, and so does a
@@ -1619,10 +1623,17 @@ tracks show their median cue for a second or more, and a flash track for about a
 0.5 seconds gets a new end: the next cue's start less two frames (0.083 s), at most the start plus twice the reading
 time, 3 seconds at least and 7 at most. The reading time counts the visible characters, 17 a second. A flash fix never
 shortens a cue. A built-in track gets its new ends in the remux of "Actions": mkvextract writes its text, the ends go
-in, and mkvmerge reads it back, which keeps each packet and the ASS header byte for byte. HandBrake ends each ASS event
-and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The round trip drops those NUL
-bytes and adds the section. The proof compares each packet that ended in a NUL without that one byte, and names their
-count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section and its Format line.
+in, and mkvmerge reads it back, which keeps each packet and the ASS header byte for byte, with the changes below.
+HandBrake ends each ASS event and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The
+round trip drops those NUL bytes and adds the section. The proof compares each packet that ended in a NUL without that
+one byte, and names their count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section
+and its Format line. Each ASS packet starts with its ReadOrder, the event's place in the script. mkvmerge numbers the
+events from 0 in that order, and drops the spaces and tabs at the end of each event. HandBrake may skip a ReadOrder and
+end an event with a space. So the proof gives each packet of the original the rank of its ReadOrder, and cuts those
+spaces. The rank applies only when every ReadOrder of the track is a whole number written in digits alone, and no two
+are equal. Otherwise each packet must keep its ReadOrder. The proof names the counts of packets that changed in
+`read_order` and `space_cut`. The order of the events stays, and libass draws a line the same without its trailing
+spaces.
 mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as LF or CRLF. mkvmerge 92 stores
 CRLF, and a newer mkvmerge may store LF. So the proof compares each packet of a SubRip track that went through the round
 trip with each CRLF as LF, in both files, and names the count of packets that changed in `crlf`. A track that ffmpeg

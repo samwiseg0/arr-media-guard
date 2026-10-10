@@ -486,8 +486,10 @@ def release_episode_title(name):
 
 
 def nfo_episode_title(text):
-    """The episode title of a scene NFO, from its "Episode Title" line, else its "Title" line, or None. A value that
-    holds an episode tag gives the words after the tag."""
+    """The episode title of a scene NFO, from its "Episode Title" line, else its "Title" line, or None. A MediaInfo
+    "Title" line may hold the whole release name. A value with an episode tag gives the words between the tag and the
+    first QUALITY word. A last "-word" stays, unlike in release_episode_title(), because a title such as "7-3-1" ends
+    in one. A value with no letter or digit left gives None, so the release name gives the title."""
     found = {}
     for line in (text or "").splitlines():
         label, sep, value = line.partition(":")
@@ -496,7 +498,11 @@ def nfo_episode_title(text):
             found.setdefault(key != "title", value.strip(" .:\t"))
     value = found.get(True) or found.get(False)
     tag = value and EPISODE_TAG.search(value)
-    return (value[tag.end():].strip(" .-_") if tag else value) or None
+    if tag:
+        rest = value[tag.end():]
+        end = QUALITY.search(rest)
+        value = rest[:end.start() if end else None].strip(" .-_")
+    return value if value and re.search(r"[^\W_]", value) else None
 
 
 def title_key(text):
@@ -517,19 +523,6 @@ def title_keys(title, series=()):
         if k and k not in series:
             out.add(k)
     return out
-
-
-def tag_numbers(name):
-    """The numbers of the release name's episode tag: ("season", season, {episodes}), ("absolute", None, {numbers}) for a
-    bare E172 or a Part04, or None for a date or no tag."""
-    tag = EPISODE_TAG.search(name or "")
-    t = tag.group().lower() if tag else ""
-    if t.startswith("s"):
-        season, rest = re.match(r"s(\d+)(.*)", t).groups()
-        return "season", int(season), {int(n) for n in re.findall(r"\d+", rest)}
-    if t.startswith(("e", "part")):
-        return "absolute", None, {int(re.search(r"\d+", t).group())}
-    return None
 
 
 def covered(key, owners):
@@ -559,19 +552,17 @@ def parts(a, b):
     return base_a == base_b and part_a != part_b
 
 
-def episode_title_verdict(title, episodes, imported, release_name="", series_titles=(), said="the release name", anime=False):
+def episode_title_verdict(title, episodes, imported, series_titles=(), said="the release name", anime=False):
     """Whether the episode title of a release names another episode of the series than the file was imported as.
 
     title: release_episode_title() or nfo_episode_title(). episodes: Sonarr's episodes of the series. imported: the
-    ids of the file's episodes. release_name: the release, whose tag_numbers() Sonarr imported by. A title, or one of
-    its segments, matches an episode whose title has the same key. So do the titles that cover it, see covered(). The
-    verdict is one of these:
+    ids of the file's episodes. A title, or one of its segments, matches an episode whose title has the same key. So
+    do the titles that cover it, see covered(). The verdict is one of these:
     - "imported": a key is within TITLE_NEAR of an imported episode's title, or one holds the other's words in a row,
       such as a title that leaves out "Part Two", or "Inferno (4)" for "The Romans: Inferno (4)".
-    - "mapped": Sonarr imported the release to other numbers than its tag, through its scene numbering, which already
-      maps the release's own order. The title then follows the release's order, so it says nothing.
     - "other": the title matches another episode, one that no other episode shares the title with. A special counts
-      only for a special, because a special often repeats the title of a regular episode.
+      only for a special, because a special often repeats the title of a regular episode. The release's episode tag
+      plays no part. Sonarr's scene numbering can send a new episode to an old one with the same tag.
     - "none": no episode matches.
     said names where the title comes from, such as "the release's NFO". anime adds each episode's absolute number.
     Returns a signal of wrong_content_evidence(): {"kind", "verdict", "points", "why", "episodes", "names", "imported",
@@ -588,12 +579,9 @@ def episode_title_verdict(title, episodes, imported, release_name="", series_tit
             owners.setdefault(k, set()).add(e["id"])
     wanted |= {k for w in list(wanted) for k in covered(w, owners)}
     near = lambda a, b: not parts(a, b) and (difflib.SequenceMatcher(None, a, b).ratio() >= TITLE_NEAR or f" {a} " in f" {b} " or f" {b} " in f" {a} ")
-    tag, found = tag_numbers(release_name), []
+    found = []
     if any(near(k, o) for e in mine for o in title_keys(e.get("title"), series) for k in wanted):
         verdict = "imported"
-    elif tag and mine and not tag[2] & ({e.get("episodeNumber") for e in mine if tag[0] == "absolute" or e.get("seasonNumber") == tag[1]}
-                                          | {e.get("absoluteEpisodeNumber") for e in mine if tag[0] == "absolute"}):
-        verdict = "mapped"
     else:
         ids = {i for k in wanted for i in owners.get(k, ()) if len(owners[k]) == 1}
         special = any(e.get("seasonNumber") == 0 for e in mine)

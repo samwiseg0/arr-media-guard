@@ -574,9 +574,11 @@ def set_ends(text, ass, plan):
 def ended_track(path, j, tid, plan, folder, text=None):
     """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new times of plan, a
     time_plan() or a flash_plan(). mkvextract writes the track's text, set_ends() puts the times in, and mkvmerge reads
-    it back. That round trip keeps the packets and the ASS header byte for byte, with two exceptions. HandBrake ends each
+    it back. That round trip keeps the packets and the ASS header byte for byte, with four exceptions. HandBrake ends each
     ASS event and its header with a NUL byte and writes no [Events] section, and the round trip drops each NUL and
-    adds the section. mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as CRLF.
+    adds the section. mkvmerge numbers the ASS events from 0 in ReadOrder order, so the events of a track whose
+    ReadOrders skip a number, as HandBrake's may, take new ones. mkvmerge also drops the spaces and tabs at the end of
+    each ASS event. mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as CRLF.
     mkvmerge 92 does, and the mkvmerge of a source may store LF. prove() and header_kept() pass only those changes.
     The language goes in here, as ffmpeg copies it. The flags and names come back later with mkvpropedit, see resub().
     text takes the place of plan for a repair, see resub(): the new SubRip text, which needs no mkvextract, or a
@@ -780,10 +782,11 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
 
     A track with new ends comes from its own input: mkvextract writes its text, set_ends() puts each new end in, and
     mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, but for the
-    NUL bytes of a HandBrake ASS track and the line breaks of a SubRip cue, see ended_track(). The proof holds each end
-    to the plan. An ASS track whose starts fall between centiseconds goes in as a track in timed, with each start on the
-    nearest centisecond, see grid_plan(). Its log and what text stay those of new ends. info["starts_rounded"] counts
-    the starts that the grid moved off the time its fix gives, see grid_moved().
+    NUL bytes of a HandBrake ASS track, the ReadOrders of an ASS track, which become their ranks, the spaces and tabs
+    at the end of each ASS event, which go, and the line breaks of a SubRip cue, see ended_track(). The proof holds
+    each end to the plan. An ASS track whose starts fall between centiseconds goes in as a track in timed, with each
+    start on the nearest centisecond, see grid_plan(). Its log and what text stay those of new ends.
+    info["starts_rounded"] counts the starts that the grid moved off the time its fix gives, see grid_moved().
 
     A track in timed comes from its own input the same way, with every start and end of its plan. Its plan holds its
     fix and its flash ends, so it gets no -itsoffset or -itsscale. Its entries in fixes and ends only go to the log and

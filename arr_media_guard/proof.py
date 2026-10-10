@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The packet proof of a conversion and the damage checks of its original."""
-import array, concurrent.futures, contextlib, hashlib, json, os, re, shutil, subprocess, uuid
+import array, concurrent.futures, contextlib, hashlib, itertools, json, os, re, shutil, subprocess, uuid
 
 from . import checks, cli, config, content, convert, decide, runner, subsync
 
@@ -197,17 +197,20 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
     With raw True the text streams are SubRip already and their packets are written as they are, because ffmpeg's
     SubRip decoder drops a cue whose text starts with a line break. raw may also hold the stream indexes to write so.
     maps lists ffprobe stream indexes. bsf maps a stream index to the bitstream filter its packets go through first.
-    opts are input options, such as -ignore_editlist 1. nul lists the stream indexes of maps whose packets each lose one
-    NUL byte at their very end, if they hold one, before their md5 counts. HandBrake ends each ASS event so, and
-    mkvmerge drops that byte, see remux.ended_track(). The same read writes the packets of each such stream as they
-    are, and their bytes must hash to ffmpeg's md5s. A packet of one byte keeps it. crlf lists the stream indexes of
+    opts are input options, such as -ignore_editlist 1. nul lists the stream indexes of maps of ASS or SSA streams
+    whose packets change as the text round trip of remux.ended_track() changes them, before their md5 counts. Each
+    packet loses one NUL byte at its very end, if it holds one. HandBrake ends each ASS event so, and mkvmerge drops
+    that byte. A packet of one byte keeps it. Its ReadOrder becomes its rank, see read_ranks(), and its text loses the
+    spaces and tabs at its end, as mkvmerge drops them. The same read writes the packets of each such stream as they
+    are, and their bytes must hash to ffmpeg's md5s. crlf lists the stream indexes of
     maps whose packets count each CR LF as one LF before their md5 counts, in the same way. mkvmerge may store a line
     break of a SubRip cue either way, see remux.ended_track().
     Returns ({stream index: count (packets with data), empty (packets without), bytes, digest (sha256 over their md5s),
     start and end in seconds, times (the time of each packet with data, in file order), ends (its time plus its
-    duration), md5s (their md5s, 16 bytes each) and sizes, for a stream of nul nul_cut, the count of packets that
-    lost a NUL, and for a stream of crlf raw_md5s, the md5s of its packets as they are}, {stream index in texts: its
-    SubRip text}). A timeout raises, and an ffmpeg error raises ReadFailed."""
+    duration), md5s (their md5s, 16 bytes each) and sizes, for a stream of nul nul_cut, read_order and space_cut, the
+    counts of packets that lost a NUL, took another ReadOrder and lost spaces at their end, and for a stream of crlf
+    raw_md5s, the md5s of its packets as they are}, {stream index in texts: its SubRip text}). A timeout raises, and an
+    ffmpeg error raises ReadFailed."""
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
     if maps:
@@ -231,6 +234,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
     for i, f in raw_of.items():
         with open(f, "rb") as fh:
             data[i], at[i] = fh.read(), 0
+    rank = read_ranks(out, maps, {i: b for i, b in data.items() if i in nul}) if nul and maps else {}
     with open(out) if maps else contextlib.nullcontext([]) as lines:
         for line in lines:
             if line.startswith("#tb "):
@@ -242,14 +246,22 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
                 pts = pts if abs(pts) < 1 << 62 else dts   # AVI video has a decode time only
                 s = stats.setdefault(maps[k], {"count": 0, "empty": 0, "bytes": 0, "digest": hashlib.sha256(), "rest": hashlib.sha256(),
                                                "start": None, "end": None, "times": [], "ends": [], "md5s": bytearray(), "sizes": array.array("L"),
-                                               **({"nul_cut": 0} if maps[k] in data and maps[k] in nul else {}),
+                                               **(dict(nul_cut=0, read_order=0, space_cut=0) if maps[k] in data and maps[k] in nul else {}),
                                                **({"raw_md5s": bytearray()} if maps[k] in data and maps[k] in crlf else {})})
-                if size and maps[k] in data:   # the packet as it is, then one NUL byte less at its very end
+                if size and maps[k] in data:   # the packet as it is, then as the text round trip gives it
                     b, at[maps[k]] = data[maps[k]][at[maps[k]]:at[maps[k]] + size], at[maps[k]] + size
                     if hashlib.md5(b).hexdigest() != p[5]:
                         raise ReadFailed(path, f"the packets ffmpeg wrote of stream {maps[k]} differ from the ones it hashed")
-                    if maps[k] in nul and size > 1 and b.endswith(b"\0"):
-                        size, p[5], s["nul_cut"] = size - 1, hashlib.md5(b[:-1]).hexdigest(), s["nul_cut"] + 1
+                    if maps[k] in nul:
+                        c = b[:-1] if size > 1 and b.endswith(b"\0") else b
+                        s["nul_cut"] += len(c) < size
+                        if maps[k] in rank:
+                            old, _, rest = c.partition(b",")
+                            new = b"%d" % rank[maps[k]][int(old)]
+                            c, s["read_order"] = new + b"," + rest, s["read_order"] + (new != old)
+                        cut = c.rstrip(b" \t") or c
+                        s["space_cut"] += len(cut) < len(c)
+                        size, p[5] = len(cut), hashlib.md5(cut).hexdigest()
                     if maps[k] in crlf:
                         s["raw_md5s"] += bytes.fromhex(p[5])
                         lf = b.replace(b"\r\n", b"\n")
@@ -280,6 +292,30 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
         with open(f, encoding="utf-8", errors="replace") as fh:
             texts[i] = fh.read()
     return stats, texts
+
+
+def read_ranks(md5, maps, data):
+    """{stream index: {ReadOrder: its rank}} of each ASS or SSA stream of data, {stream index: its packets as they
+    are}, whose ReadOrders are unique integers. md5 is the framemd5 file of the read of maps that gives each packet's
+    size. ReadOrder is the first field of each packet. mkvextract writes the events in ReadOrder order, and mkvmerge
+    numbers the lines it reads from 0, so the text round trip of remux.ended_track() gives each event the rank of its
+    ReadOrder. HandBrake may skip a ReadOrder, so its events then take new ones. A stream whose ReadOrders repeat, or
+    hold anything but digits, gets no entry, and its packets must keep their ReadOrders."""
+    sizes = {i: [] for i in data}
+    with open(md5) as f:
+        for line in f:
+            if line[:1].isdigit():
+                p = line.split(",")
+                if maps[int(p[0])] in sizes and int(p[4]):
+                    sizes[maps[int(p[0])]].append(int(p[4]))
+    ranks = {}
+    for i, n in sizes.items():
+        ends = list(itertools.accumulate(n))
+        heads = [data[i][e - k:e].partition(b",") for e, k in zip(ends, n)]
+        orders = [int(h) for h, comma, _ in heads if comma and h.isdigit()]
+        if len(orders) == len(heads) and len(set(orders)) == len(orders):
+            ranks[i] = {x: r for r, x in enumerate(sorted(orders))}
+    return ranks
 
 
 def packet_text(srt, md5):
@@ -347,7 +383,11 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     stream in ended or timed whose original holds a cue with no duration is refused: its end is not known, and the
     plan's end for it is made up. An ASS stream in ended or timed comes back through mkvextract and mkvmerge, which
     drop the NUL byte HandBrake puts at the very end of each event. So each packet of the original that ends in a NUL
-    is compared without that one byte, see packet_hashes(), and the entry counts those packets in nul_cut. A SubRip
+    is compared without that one byte, see packet_hashes(), and the entry counts those packets in nul_cut. mkvmerge
+    also numbers the events from 0 in ReadOrder order and drops the spaces and tabs at the end of each event. So each
+    packet of the original is compared with the rank of its ReadOrder in its place, when its stream's ReadOrders are
+    unique integers, see read_ranks(), and without those spaces. The entry counts the packets whose ReadOrder changed
+    in read_order and those that lost spaces in space_cut. A SubRip
     stream in ended or timed comes back through the same round trip, and mkvmerge may store each line break of a cue as
     LF or CRLF. So each packet of both files is compared with each CR LF as one LF, and the entry counts the packets
     whose line breaks changed in crlf. Any other difference of a byte still refuses. recoded maps the k-th subtitle
@@ -402,7 +442,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         f = bsf.get(s["index"]) or (None, None)
         proof.append(dict(stream=name, codec=s["codec_name"], method="packets" + (f", original through {f[0]}" if f[0] else "")
                           + (f", new file through {f[1]}" if f[1] else ""),
-                          count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), **({"nul_cut": x["nul_cut"]} if x.get("nul_cut") else {}),
+                          count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), **{c: x[c] for c in ("nul_cut", "read_order", "space_cut") if x.get(c)},
                           hash=x["digest"][:16],
                           match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
         if proof[-1]["match"] and (n := sum(x["raw_md5s"][k:k + 16] != y["raw_md5s"][k:k + 16] for k in range(0, len(x.get("raw_md5s") or b""), 16))):

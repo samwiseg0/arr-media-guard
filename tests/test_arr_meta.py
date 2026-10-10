@@ -37,7 +37,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from arr_media_guard import content as M  # noqa: E402
-from arr_media_guard import config, store  # noqa: E402
+from arr_media_guard import config, process, store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -670,6 +670,27 @@ def test_the_nfo_gives_the_episode_title_line_first():
     assert M.nfo_episode_title("Release: Show.A.S04E15\nRuntime: 11 min\n") is None
 
 
+def test_an_nfo_title_line_with_the_whole_release_name_ends_at_the_quality_word():
+    """A MediaInfo dump's "Title" line can hold the whole release name. A last "-word" is no group there."""
+    nfo = "General\nComplete name : x.mkv\nTitle                    : www.Site.example - Show C S06E11 Wings for Sale 1080p HULU WEB-DL H264-GRP\n"
+    assert M.nfo_episode_title(nfo) == "Wings for Sale"
+    assert M.nfo_episode_title("Title : Show C S01E02 7-3-1\n") == "7-3-1"
+    assert M.nfo_episode_title("Episode Title : Part 2: Season 4 Finale\n") is None, "the cut leaves only a colon"
+
+
+@pytest.mark.parametrize("line, own", [
+    ("Title : Show C S02E01 Lantern Night Season 2", 2),   # another episode is "Lantern Night"
+    ("Title : Show C S02E02 Lantern Night S2", 3),
+    ("Title : Show C S02E09 Season 2 Lookback", 4),   # nothing is left, so no verdict
+])
+def test_a_quality_word_behind_the_tag_of_an_nfo_title_never_names_another_episode(line, own):
+    """A title may hold "Season 2" or "S2" behind its tag. The cut leaves the start of the file's own title, or nothing."""
+    eps = [ep(1, 1, 1, "Lantern Night"), ep(2, 2, 1, "Lantern Night Season 2"), ep(3, 2, 2, "Lantern Night S2"), ep(4, 2, 9, "Season 2 Lookback")]
+    item = {"series_id": 7, "episodes": eps, "episode_ids": [own], "titles": [("Show C", 2009)]}
+    v = process.episode_title("sonarr", item, M.nfo_episode_title(line), None, "/tv/Show C/a.mkv")
+    assert not v or v["verdict"] == "imported", v
+
+
 def test_title_keys_ignore_case_marks_and_the_series_name():
     assert M.title_key("That's No Lady & Co.!") == "thats no lady and co" and M.title_key("Café Noël") == "cafe noel"
     assert M.title_keys("Ship Voyage / No Lady Here", {"show a"}) == {"ship voyage no lady here", "ship voyage", "no lady here"}
@@ -685,61 +706,69 @@ SERIES = [ep(1, 4, 15, "A Rainy Day"), ep(2, 4, 21, "Ship Voyage"), ep(3, 4, 22,
           ep(9, 3, 25, "Robot Rescue"), ep(10, 3, 45, "Two Pups"), ep(11, 3, 46, "Three Pups")]
 
 
-@pytest.mark.parametrize("title, imported, release, verdict, found", [
-    ("Ship Voyage/No Lady Here", [1], "Show.A.S04E15.1080p", "other", [2, 3]),   # each segment matches on its own
-    ("Ship Voyage", [1], "Show.A.S04E15.Ship.Voyage.1080p", "other", [2]),
-    ("A Rainy Day", [1], "Show.A.S04E15.A.Rainy.Day.1080p", "imported", []),
-    ("Ship Voyage/A Rainy Day", [1], "Show.A.S04E15.1080p", "imported", []),   # one segment is the file's own
-    ("The Reunion Part 2", [4], "Show.A.S01E01.The.Reunion.Part.2.1080p", "imported", []),   # near the file's own title
-    ("Homecoming", [1], "Show.A.S04E15.Homecoming.1080p", "none", []),   # two episodes share it, so it names neither
-    ("Behind the Scenes", [1], "Show.A.S04E15.Behind.the.Scenes.1080p", "none", []),   # a special counts for a special only
-    ("A Rainy Day", [8], "Show.A.S00E04.A.Rainy.Day.1080p", "other", [1]),
-    ("Robot Rescue", [10, 11], "Show.A.S03E25.Robot.Rescue.1080p", "mapped", []),   # Sonarr mapped S03E25 to E45-E46
-    ("Robot Rescue", [10, 11], "Show.A.S03E45E46.Robot.Rescue.1080p", "other", [9]),   # a two-episode file
-    ("Nothing Like It", [1], "Show.A.S04E15.Nothing.Like.It.1080p", "none", []),
-    ("Ship Voyage and No Lady Here", [1], "Show.A.S04E15.Ship.Voyage.and.No.Lady.Here.1080p", "other", [2, 3]),   # two titles, no "/"
-    ("Ship Voyage No Lady Here", [1], "Show.A.S04E15.Ship.Voyage.No.Lady.Here.1080p", "other", [2, 3]),
-    ("And Ship Voyage", [1], "Show.A.S04E15.And.Ship.Voyage.1080p", "none", []),   # a connector never starts a title
-    ("Ship Voyage and", [1], "Show.A.S04E15.Ship.Voyage.and.1080p", "none", []),
-    ("Rainy", [1], "Show.A.S04E15.Rainy.1080p", "imported", []),   # words of the file's own title in a row, far under TITLE_NEAR
+@pytest.mark.parametrize("title, imported, verdict, found", [
+    ("Ship Voyage/No Lady Here", [1], "other", [2, 3]),   # each segment matches on its own
+    ("Ship Voyage", [1], "other", [2]),
+    ("A Rainy Day", [1], "imported", []),
+    ("Ship Voyage/A Rainy Day", [1], "imported", []),   # one segment is the file's own
+    ("The Reunion Part 2", [4], "imported", []),   # near the file's own title
+    ("Homecoming", [1], "none", []),   # two episodes share it, so it names neither
+    ("Behind the Scenes", [1], "none", []),   # a special counts for a special only
+    ("A Rainy Day", [8], "other", [1]),
+    ("Robot Rescue", [10, 11], "other", [9]),   # a two-episode file
+    ("Nothing Like It", [1], "none", []),
+    ("Ship Voyage and No Lady Here", [1], "other", [2, 3]),   # two titles, no "/"
+    ("Ship Voyage No Lady Here", [1], "other", [2, 3]),
+    ("And Ship Voyage", [1], "none", []),   # a connector never starts a title
+    ("Ship Voyage and", [1], "none", []),
+    ("Rainy", [1], "imported", []),   # words of the file's own title in a row, far under TITLE_NEAR
 ])
-def test_an_episode_title_names_another_episode_only_when_no_imported_one_matches(title, imported, release, verdict, found):
-    v = M.episode_title_verdict(title, SERIES, imported, release, ["Show A"])
+def test_an_episode_title_names_another_episode_only_when_no_imported_one_matches(title, imported, verdict, found):
+    v = M.episode_title_verdict(title, SERIES, imported, ["Show A"])
     assert (v["verdict"], v["episodes"], v["points"]) == (verdict, found, 0), v
+
+
+def test_a_title_names_another_episode_though_the_scene_numbering_moved_the_release():
+    """A show that numbers its seasons by year restarts the release's season numbers, so two releases carry S06E11.
+    Sonarr's scene numbering sends both to S2012E59, the first one's episode. The new one's title is S2026E11's."""
+    eps = [ep(1, 2012, 59, "Bargain Bin Blues"), ep(2, 2026, 11, "Wings for Sale"), ep(3, 2026, 12, "Rust and Rivets")]
+    item = {"series_id": 7, "episodes": eps, "episode_ids": [1], "titles": [("Show C", 2009)]}
+    v = process.episode_title("sonarr", item, None, "Show.C.S06E11.Wings.for.Sale.1080p.HULU.WEB-DL.H264-GRP", "/tv/Show C/a.mkv")
+    assert (v["verdict"], v["names"]) == ("other", "S2026E11"), v
+    assert v["why"] == 'imported as S2012E59 "Bargain Bin Blues". The release name calls it "Wings for Sale", which is S2026E11', v
 
 
 @pytest.mark.parametrize("title, own", [("Versus the Ring", "Versus the Ring Part 2"), ("The Claw (1)", "The Claw (2)")])
 def test_two_parts_of_one_story_never_name_each_other(title, own):
     """A swap of part 1 and part 2 shows, though the titles are near and one holds the other's words."""
     eps = [ep(1, 2, 22, title), ep(2, 2, 23, own)]
-    v = M.episode_title_verdict(title, eps, [2], "Show.A.S02E23.Title.720p")
+    v = M.episode_title_verdict(title, eps, [2])
     assert (v["verdict"], v["names"]) == ("other", "S02E22"), v
 
 
 def test_the_verdict_names_both_orders_and_the_absolute_number():
-    v = M.episode_title_verdict("Ship Voyage", SERIES, [1], "Show.A.S04E15.1080p", said="the release's NFO")
+    v = M.episode_title_verdict("Ship Voyage", SERIES, [1], said="the release's NFO")
     assert v["why"] == 'imported as S04E15 "A Rainy Day". The release\'s NFO calls it "Ship Voyage", which is S04E21', v
     assert (v["imported"], v["said"], v["title"]) == ([["S04E15", "A Rainy Day"]], "the release's NFO", "Ship Voyage"), v
-    v = M.episode_title_verdict("Ship Voyage/No Lady Here", SERIES, [1], "Show.A.S04E15.1080p")
+    v = M.episode_title_verdict("Ship Voyage/No Lady Here", SERIES, [1])
     assert v["names"] == "S04E21 and S04E22" and v["why"].endswith('The release name calls it "Ship Voyage/No Lady Here", which is S04E21 and '
                                                                    'S04E22'), v   # the alert names both
-    v = M.episode_title_verdict("Ship Voyage", [dict(SERIES[0], title=None), SERIES[1]], [1], "Show.A.S04E15.1080p")
+    v = M.episode_title_verdict("Ship Voyage", [dict(SERIES[0], title=None), SERIES[1]], [1])
     assert v["why"] == 'imported as S04E15. The release name calls it "Ship Voyage", which is S04E21', v   # Sonarr has no title for S04E15
-    v = M.episode_title_verdict("Ship Voyage/No Lady Here/Robot Rescue", SERIES, [1], "Show.A.S04E15.1080p")
+    v = M.episode_title_verdict("Ship Voyage/No Lady Here/Robot Rescue", SERIES, [1])
     assert v["names"] == "S03E25, S04E21 and S04E22", v
-    assert M.episode_title_verdict("Ship Voyage", SERIES, [], "Show.A.S04E15.1080p") is None   # no episode points to the file
+    assert M.episode_title_verdict("Ship Voyage", SERIES, []) is None   # no episode points to the file
     anime = [ep(1, 5, 10, "First Light", 120), ep(2, 5, 20, "Last Light", 130)]
-    v = M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p", anime=True)   # an absolute number
+    v = M.episode_title_verdict("Last Light", anime, [1], anime=True)   # an absolute number
     assert v["verdict"] == "other" and v["why"] == ('imported as S05E10 (absolute 120) "First Light". The release name calls it "Last Light", '
                                                     'which is S05E20 (absolute 130)'), v
-    assert M.episode_title_verdict("Last Light", anime, [1], "Show.B.E125.Last.Light.720p")["verdict"] == "mapped"
-    assert "absolute" not in M.episode_title_verdict("Last Light", anime, [1], "Show.B.E120.Last.Light.720p")["why"]   # a standard series
+    assert "absolute" not in M.episode_title_verdict("Last Light", anime, [1])["why"]   # a standard series
 
 
 def test_an_episode_title_never_adds_a_point():
     """The title alerts only. With a short runtime, its signal still leaves the evidence at one point, no re-grab."""
     tracks = [{"kind": "a", "role": "main", "lang": "eng", "conf": 1.0}]
-    sig = M.episode_title_verdict("Ship Voyage", SERIES, [1], "Show.A.S04E15.Ship.Voyage.1080p")
+    sig = M.episode_title_verdict("Ship Voyage", SERIES, [1])
     ev = M.wrong_content_evidence(tracks, "English", tmdb("eng", ["eng"], 0), {"seconds": 600, "trust": "agree"}, [50],
                                   "Show.A.S04E15.Ship.Voyage.1080p", "episode", 2012, [("Show A", 2012)], episode=sig)
     assert ev["signals"][-1] is sig and ev["points"] == 1 and not ev["regrab"] and "Ship Voyage" not in ev["why"], ev
@@ -818,5 +847,5 @@ GHOST_HOST = 133   # S04E15 in Sonarr's order. The releases below were found for
 def test_each_release_of_one_search_gets_its_verdict(name, want):
     """None: the name gives no title. Otherwise the verdict, with the episodes it names when it is "other"."""
     title = M.release_episode_title(name)
-    v = title and M.episode_title_verdict(title, SPONGE, [GHOST_HOST], name, ["SpongeBob SquarePants"])
+    v = title and M.episode_title_verdict(title, SPONGE, [GHOST_HOST], ["SpongeBob SquarePants"])
     assert (None if not v else (v["verdict"], v["names"]) if v["verdict"] == "other" else v["verdict"]) == want, (title, v)

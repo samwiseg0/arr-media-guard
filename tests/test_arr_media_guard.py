@@ -12641,9 +12641,18 @@ HB_HEAD = ("[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 640\r\nPlayResY: 36
 HB_EVENTS = b"\r\n[Events]\r\nFormat: Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text\r\n\r\n"
 
 
-def hb_event(i, text=None, nul=True):
-    """The packet of ASS event i, as HandBrake writes it: its read order, 7 fields and its text, then a NUL byte."""
-    return f"{i - 1},0,Default,,0,0,0,,".encode() + (text if text is not None else f"Line {i}, with a comma\\Nnext".encode()) + (b"\0" if nul else b"")
+def hb_event(i, text=None, nul=True, order=None):
+    """The packet of ASS event i, as HandBrake writes it: its read order (i - 1 or order), 7 fields and its text, then a
+    NUL byte."""
+    return f"{i - 1 if order is None else order},0,Default,,0,0,0,,".encode() + (text if text is not None else f"Line {i}, with a comma\\Nnext".encode()) + (b"\0" if nul else b"")
+
+
+SKIP = lambda i: i - 1 + (i > 5) + 2 * (i > 12)   # read orders that skip 5, 13 and 14, as HandBrake may write them
+
+
+def hb_events(text=lambda i: b"Line %d" % i, order=lambda i: i - 1, nul=True):
+    """The packets of ASS events 1 to 20, see hb_event(), with the text text(i) and the read order order(i)."""
+    return [hb_event(i, text(i), nul, order(i)) for i in range(1, 21)]
 
 
 @pytest.fixture(scope="module")
@@ -12788,6 +12797,25 @@ def test_resub_times_a_handbrake_ass_track(hb_base, tmp_path, settings, ended):
     assert [(a, b, t) for a, b, t in got] == [(pytest.approx(x[3], abs=0.0015), pytest.approx(x[4], abs=0.0015), x[1]) for x in plan], got[:6]
 
 
+def test_resub_times_a_handbrake_ass_track_with_skipped_read_orders_and_end_spaces(hb_base, tmp_path, settings):
+    """HandBrake may skip a read order and end an event with a space. The text round trip numbers the events from 0
+    and drops those spaces. The proof passes both and counts them in read_order and space_cut. The order, the text less
+    those spaces, and the times of the plan stay."""
+    spaced = lambda i: b"Line %d" % i + (b" " if i % 2 else b"")
+    path = hb_mkv(tmp_path / "hb.mkv", hb_base, hb_events(spaced, SKIP))
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    cues = hook.subtitle_cues(path, j, {"s1"})["s1"]
+    assert [t for *_, t in cues] == [spaced(i).decode() for i in range(1, 21)], cues[:2]
+    plan = hook.time_plan(cues, None, (), ass=True, starts=starts_of(cues, 10.0, 20.0, 1.2))
+    _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    entry = info["proof"][2]
+    assert (entry["stream"], entry["nul_cut"], entry["read_order"], entry["space_cut"], entry["timed"]) == ("subtitle 2", 20, 15, 10, 20), entry
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert [(a, b, t) for a, b, t in got] == [(pytest.approx(x[3], abs=0.0015), pytest.approx(x[4], abs=0.0015), x[1].rstrip(" ")) for x in plan], got[:6]
+
+
 @pytest.mark.parametrize("old, new, why", [
     (hb_event(3), hb_event(3, nul=False), None),
     (hb_event(3, b"Li\0ne"), hb_event(3, b"Li\0ne", nul=False), None),
@@ -12813,6 +12841,35 @@ def test_the_proof_cuts_one_nul_at_the_very_end_of_a_packet(hb_base, tmp_path, o
         assert refused == (2, "the packet data of stream subtitle 2 (ass) differ") and not entry["match"], (why, refused)
     if old.endswith(b"\0") and not new.endswith(b"\0"):
         assert proved(src, tmp, [], str(tmp_path))[0] == "the packet data of stream subtitle 2 (ass) differ", "no time plan, no cut"
+
+
+SWAP = lambda i: {2: 2, 3: 1}.get(i, i - 1)   # read orders out of time order, as mkvmerge keeps a script's own order
+
+
+@pytest.mark.parametrize("old, new, want", [
+    (hb_events(lambda i: b"Line %d" % i + (b" " if i % 2 else b""), SKIP), hb_events(nul=False), (20, 15, 10)),
+    (hb_events(lambda i: b"Line %d \t " % i), hb_events(nul=False), (20, 0, 20)),
+    (hb_events(order=SWAP), hb_events(order=SWAP, nul=False), (20, 0, 0)),
+    (hb_events(order=SKIP), hb_events(order=lambda i: {3: 3, 4: 2}.get(i, i - 1), nul=False), "two read orders swapped"),
+    (hb_events(order=SKIP), hb_events(order=SKIP, nul=False), "the skipped read orders kept"),
+    (hb_events(order=lambda i: 2 if i == 4 else i - 1), hb_events(nul=False), "a read order twice, so no rank"),
+    (hb_events(), hb_events(lambda i: b"Line3" if i == 3 else b"Line %d" % i, nul=False), "a space dropped inside the text"),
+    (hb_events(lambda i: b"Line %d\xc2\xa0" % i), hb_events(nul=False), "a no-break space dropped at the end"),
+    (hb_events(), hb_events(lambda i: b"Line %d" % i + (b" " if i == 3 else b""), nul=False), "a space added at the end"),
+])
+def test_the_proof_takes_the_read_orders_and_end_spaces_of_the_round_trip(hb_base, tmp_path, old, new, want):
+    """The proof of a timed ASS stream compares each packet with the rank of its read order in its place, when the
+    stream's read orders are unique integers, and without the spaces and tabs at its end, as the text round trip writes
+    it. A stream whose read orders run out of time order keeps them. Two read orders swapped, skipped ones kept, a read
+    order twice, a space dropped inside the text, a no-break space dropped and a space added still fail."""
+    src, tmp = hb_mkv(tmp_path / "src.mkv", hb_base, old), hb_mkv(tmp_path / "tmp.mkv", hb_base, new)
+    plan = [(2.0 * i, 2.0 * i + 1.5) for i in range(1, 21)]
+    refused, proof = hook.prove(src, tmp, [], str(tmp_path), timed={0: plan})
+    entry = next(e for e in proof if e["stream"] == "subtitle 2")
+    if isinstance(want, tuple):
+        assert refused is None and entry["match"] and tuple(entry.get(k, 0) for k in ("nul_cut", "read_order", "space_cut")) == want, (refused, entry)
+    else:
+        assert refused == (2, "the packet data of stream subtitle 2 (ass) differ") and not entry["match"], (want, refused)
 
 
 def srt_line(i, br=b"\n"):
