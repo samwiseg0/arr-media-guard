@@ -177,7 +177,9 @@ a `.plexignore`, so Plex never lists them. See [regrabs.md](regrabs.md#restore-a
 
 A release can hold another film or episode. After the flag edit of an import, AMG checks the file against TMDB and the
 app. It compares the audio language, the runtime, and the year and title in the release name. Each sign scores points,
-and two points mark the content as wrong. AMG re-grabs it only when `REGRAB` lists `content`. Else an alert "Wrong
+and two points mark the content as wrong. An episode's runtime counts as a sign when the file runs under 0.6 or over
+about 1.67 times its listed runtime. A long episode in an animated series is often a live-action remake that landed
+in the wrong slots. AMG re-grabs it only when `REGRAB` lists `content`. Else an alert "Wrong
 content, re-grab is off" names each sign. For an episode, AMG reads the episode title from the release's NFO file or
 name. When it belongs to another episode, an alert "Maybe the wrong episode" names both. That alert never re-grabs.
 

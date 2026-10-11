@@ -527,13 +527,14 @@ def movie_item(m, kids_profiles_by_id=None):
 
 def episode_item(s, eps, series_eps=None):
     """movie_item() for the episodes of one Sonarr file. ctx lists each episode's runtime, never their sum, because a
-    segment show lists every segment at the whole slot. series_eps, all episodes of the series, saves the title check
-    one list call per file, see episode_title()."""
+    segment show lists every segment at the whole slot. Its season is the first episode's, for the runtime check.
+    series_eps, all episodes of the series, saves the title check one list call per file, see episode_title()."""
     num = "".join(f'E{e["episodeNumber"]:02d}' for e in eps)
     label = f'{s["title"]} S{eps[0]["seasonNumber"]:02d}{num}' if eps else s["title"]
     want = {"guids": guids(s, ("tvdb", "tmdb", "imdb")), "title": s["title"], "show": True}
     ctx = {"ids": {"tmdb": s.get("tmdbId"), "tvdb": s.get("tvdbId")}, "year": s.get("year"),
-           "listed": [e.get("runtime") or 0 for e in eps], "titles": titles(s), "series_id": s.get("id"), "episode_ids": [e["id"] for e in eps if "id" in e],
+           "listed": [e.get("runtime") or 0 for e in eps], "season": eps[0].get("seasonNumber") if eps else None,
+           "titles": titles(s), "series_id": s.get("id"), "episode_ids": [e["id"] for e in eps if "id" in e],
            "anime": s.get("seriesType") == "anime", "slug": s.get("titleSlug"),
            **({"episodes": series_eps} if series_eps else {})}
     return (label, (s.get("originalLanguage") or {}).get("name"), episode_runtime(eps), want, decide.kids_title("sonarr", s.get("genres")),

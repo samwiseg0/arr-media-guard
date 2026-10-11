@@ -216,6 +216,35 @@ def test_runtime_verdict():
     assert M.runtime_verdict(tr(40), [44, 0], "", "episode") == "unknown"
 
 
+def test_an_episode_is_long_only_as_one_episode_of_a_regular_season():
+    """The long side mirrors the short one at 1 / EPISODE_SHORT, 50 minutes for a 30-minute listing. It needs a file of
+    one episode, a season above 0, a listing of 20 minutes or more and no edition or multi-cut word."""
+    tr = lambda minutes: {"seconds": minutes * 60, "trust": "agree"}
+    ep = lambda minutes, listed=(30,), name="Show.A.S01E05.1080p.WEB-DL", season=1: M.runtime_verdict(tr(minutes), list(listed), name, "episode", season)
+    assert (ep(49.9), ep(50.1), ep(70)) == ("ok", "long", "long")
+    assert (ep(18.1), ep(17.9)) == ("ok", "short")                                    # the short side stays at 0.6
+    assert ep(70, listed=(30, 30)) == "ok"                                              # two episodes in one file
+    assert ep(70, season=0) == "ok" and ep(70, season=None) == "ok"                     # a special, and no season known
+    assert ep(40, listed=(19,)) == "unknown"                                            # a listing under 20 minutes
+    assert ep(70, name="Show.A.S01E05.Extended.1080p.WEB-DL") == "ok" and ep(70, name="Show.A.S01E05.TV.Cut.720p") == "ok"
+    assert ep(70, name="Show.A.S01E05.2in1.1080p.WEB-DL") == "ok"                      # a multi-cut word
+    assert M.runtime_verdict({"seconds": None, "trust": "conflict"}, [30], "Show.A.S01E05.1080p", "episode", 1) == "unknown"
+    assert M.runtime_verdict(tr(70), 30, "Show.A.S01E05.1080p", "episode", 1) == "ok"  # a sum says nothing of the episode count
+    assert M.EPISODE_LONG == 1 / M.EPISODE_SHORT
+
+
+def test_a_long_episode_scores_one_point():
+    """A long episode alerts on its own, and a re-grab needs a second signal, here the wrong language."""
+    eng, ger = [{"kind": "a", "role": "main", "lang": "eng", "conf": 1.0}], [{"kind": "a", "role": "main", "lang": "ger", "conf": 1.0}]
+    ev = lambda tracks, season=1: M.wrong_content_evidence(tracks, "English", tmdb("eng", ["eng"], 0), {"seconds": 3000, "trust": "agree"}, [24],
+                                                           "Show.E.S01E03.Name.720p.WEB-DL", "episode", 2005, [("Show E", 2005)], season=season)
+    long = ev(eng)
+    assert (long["points"], long["regrab"], long["why"]) == (1, False, "it runs 50 minutes, but the listed runtime is 24 minutes"), long
+    assert [s["verdict"] for s in long["signals"] if s["kind"] == "runtime"] == ["long"]
+    assert (ev(ger)["points"], ev(ger)["regrab"]) == (2, True)
+    assert ev(eng, season=0)["points"] == 0
+
+
 def test_year_verdict():
     assert M.year_verdict("Film.C.2019.1080p.AMZN.WEB-DL", 2011, [("Film B", 2011)]) == "mismatch"
     assert M.year_verdict("Film.K.2018.1080p.HULU.WEB-DL", 2017, [("Film K", 2017)]) == "ok"          # one year off
@@ -231,6 +260,36 @@ def test_year_verdict():
     assert M.year_verdict("7.Show.C.S01E02.Name.1080p", 2011, []) == "unknown"
     assert M.year_verdict("", 2000, []) == "unknown"
     assert M.split_release("[Arabic]Film.F.2011.1080p") == ("Film F", 2011, "[Arabic].1080p")
+
+
+@pytest.mark.parametrize("name, verdict", [
+    ("Show.F.S2008E08.Lake.Week.2008.720p.HDTV.x264-GRP", "unknown"),   # a year-numbered season, a year in the episode title
+    ("Show F - s2008e08 - Lake Week 2008.mkv", "unknown"),               # Sonarr's own file name
+    ("Show.F.S07E08.Lake.Week.2008.720p.HDTV.x264-GRP", "unknown"),
+    ("Show.F.2003.S2008E08.Lake.Week.2008.720p", "ok"),                  # a year before the tag still counts
+    ("Show.F.1979.S2008E08.Lake.Week.720p", "mismatch"),
+    ("Show.F.2008.01.15.Lake.Week.720p.WEB.H264-GRP", "unknown"),        # a daily show's air date
+])
+def test_a_4_digit_season_tag_ends_the_title_position(name, verdict):
+    assert M.year_verdict(name, 2003, [("Show F", 2003)]) == verdict
+
+
+def test_an_s_word_of_3_or_4_digits_needs_an_episode_number_to_end_the_title():
+    """A model name in a title ("S500") is no season tag, so the year and language words after it stay readable."""
+    assert M.split_release("Film.B.S500.2010.720p.WEB") == ("Film B S500", 2010, ".720p.WEB")
+    assert M.split_release("Film.S1000.German.Story.1999.1080p.WEB-DL") == ("Film S1000 German Story", 1999, ".1080p.WEB-DL")
+    assert M.release_languages("Film.S1000.German.Story.1999.1080p.WEB-DL") == set()
+    assert M.release_episode_title("Show.S03E05.The.S1000.Engine.1080p") == "The S1000 Engine"
+
+
+def test_a_long_episode_of_a_year_numbered_season_scores_one_point():
+    """The year in the episode title is no year mismatch, so the long runtime alone never re-grabs."""
+    name, eng = "Show.F.S2008E08.Lake.Week.2008.720p.HDTV.x264-GRP", [{"kind": "a", "role": "main", "lang": "eng", "conf": 1.0}]
+    assert M.split_release(name) == ("Show F", None, "S2008E08.Lake.Week.2008.720p.HDTV.x264-GRP")
+    assert M.release_episode_title(name) == "Lake Week 2008"
+    ev = M.wrong_content_evidence(eng, "English", tmdb("eng", ["eng"], 0), {"seconds": 5400, "trust": "agree"}, [44], name, "episode",
+                                  2003, [("Show F", 2003)], season=2008)
+    assert (ev["points"], ev["regrab"]) == (1, False), ev
 
 
 def test_language_verdict():

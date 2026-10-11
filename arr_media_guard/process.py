@@ -22,7 +22,8 @@ def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=
     kind = "episode" if config.program(app) == "sonarr" else "special" if (expected or {}).get("special") else "movie"
     name = release or os.path.basename(path)
     args = (d["tracks"], original, expected, trusted, item.get("listed") or 0, name, kind, item.get("year"), item.get("titles") or ())
-    ev, other = content.wrong_content_evidence(*args, episode=episode_title(app, item, nfo, release, path) if kind == "episode" else None), None
+    ev, other = content.wrong_content_evidence(*args, episode=episode_title(app, item, nfo, release, path) if kind == "episode" else None,
+                                               season=item.get("season")), None
     if kind != "episode" and ev["points"] and trusted.get("seconds"):   # another film matters only for a movie with a point already
         other = content.other_film(name, ids.get("tmdb"), trusted["seconds"], token=token, cache=cache)
         if other:

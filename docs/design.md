@@ -1116,12 +1116,16 @@ checks after the flag edit.
 - **Duration.** A duration is trusted when two sources agree within 30 seconds or 2 percent. The
   sources are the header, the stream durations, the size over the bitrate, and the last video
   packet. A header that no other source confirms gets a duration alert only.
-- **Runtime.** A movie is short under 0.6 and long over 1.4 of its listing. An edition word such as
-  Extended or Director's Cut widens that to 0.5 and 2.0. A TV movie or a stand-up special gets 0.5
-  and 1.8. A multi-cut file is never long. An episode is judged on the short side only, and only
-  with a listing of 20 minutes or more.
-- **Year.** The check reads the years before SxxEyy or the first quality word. It skips a year that
-  belongs to a title and a daily show's air date. A year within one of an item year is ok.
+- **Runtime.** A movie counts as short when it runs under 0.6 of its listed runtime, and long over
+  1.4. An edition word such as Extended or Director's Cut widens that to 0.5 and 2.0. A TV movie or
+  a stand-up special gets 0.5 and 1.8. A file with several cuts in it is never long. An episode is
+  only checked when its listing is 20 minutes or more. It's short under 0.6 of the listing, and long
+  over about 1.67, which is 1 / 0.6. A file with several episodes is compared with the longest one,
+  and only on the short side. The long side also skips season 0 and release names with an edition
+  or multi-cut word. Double episodes, season 0 episodes and extended cuts often run long for real.
+- **Year.** The check reads the years before SxxEyy or the first quality word. A season tag can have
+  up to 4 digits, as in S2008E08, so a year in the episode title after it doesn't count. It skips a
+  year that belongs to a title and a daily show's air date. A year within one of an item year is ok.
 - **Episode title.** A release can follow another episode order than Sonarr, so a file can hold
   another episode with the right language and runtime. The title comes from the scene NFO beside
   the file Sonarr imported from, else from the release name between the episode tag and the first

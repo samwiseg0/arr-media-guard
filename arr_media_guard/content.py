@@ -6,7 +6,8 @@ whether the file is wrong enough to re-grab. The rule is that a correct file is 
 - expected_languages() asks TMDB which languages the item has, so a wrong original language in Radarr or Sonarr
   never reads as a wrong file.
 - trusted_duration() trusts a duration only when two sources in the file agree. A header may be off by hours.
-- runtime_verdict() and year_verdict() judge the file against the item.
+- runtime_verdict() and year_verdict() judge the file against the item. A file of one episode that runs far
+  over its listing reads as long, as a movie does.
 - episode_title_verdict() finds a release whose episode title names another episode of the series. It alerts only.
 - wrong_content_evidence() adds the signals up. A re-grab needs REGRAB_POINTS.
 
@@ -54,7 +55,8 @@ MIN_LISTED = 10                          # a listed runtime under this says noth
 SHORT, LONG = 0.6, 1.4                   # a movie, the band the hook alerted on before
 EDITION_SHORT, EDITION_LONG = 0.5, 2.0   # an edition word in the name. A TV cut may run near twice the listing.
 SPECIAL_SHORT, SPECIAL_LONG = 0.5, 1.8   # stand-up, a TV movie: the listing may count the broadcast slot
-EPISODE_SHORT = 0.6                      # an episode is judged on the short side only
+EPISODE_SHORT = 0.6                      # an episode is short under this
+EPISODE_LONG = 1 / EPISODE_SHORT         # and long over this, about 1.67, when runtime_verdict() judges the long side
 EPISODE_MIN_LISTED = 20                  # TVDB lists some short cartoons at a longer slot, so a short listing says little
 VERY_SHORT = 0.5                         # under half a feature-length movie listing is not the film. A special never
                                          # scores two on runtime, its listing may count the broadcast slot.
@@ -64,8 +66,10 @@ REGRAB_POINTS = 2
 EDITION = re.compile(r"extended|director'?s.?cut|(?<![a-z])(dc|cut|version|edition|restored)(?![a-z])|unrated|uncut|theatrical"
                      r"|special.?edition|final.?cut|imax|ultimate|redux|remastered", re.I)   # "TV.Cut" too
 MULTI_CUT = re.compile(r"(?<![0-9])[2-5].?in.?1(?![0-9])", re.I)   # "3in1": every cut in one file, the long side is not judged
-# The title position of a release name ends at the episode number or the first quality word.
-QUALITY = re.compile(r"(?<![a-z0-9])(s\d{1,2}(e\d{1,3})?|season.?\d+|\d{3,4}[pi]|4k|uhd|blu-?ray|bdrip|brrip|remux|web-?dl"
+# The title position of a release name ends at the episode number or the first quality word. A season tag has up
+# to 4 digits, as EPISODE_TAG reads it, so a year-numbered season (S2008E08) ends the title position too. An S word of
+# 3 or 4 digits needs an episode number, so a model name in a title ("S500") stays in the title.
+QUALITY = re.compile(r"(?<![a-z0-9])(s\d{1,2}(e\d{1,3})?|s\d{3,4}e\d{1,4}|season.?\d+|\d{3,4}[pi]|4k|uhd|blu-?ray|bdrip|brrip|remux|web-?dl"
                      r"|web-?rip|hdtv|dvdrip|hdrip|xvid|[xh].?26[45]|hevc)(?![a-z0-9])", re.I)
 # A year, never the year of a daily show's air date (2024.01.15) or of a season number (S2024E01).
 YEAR = re.compile(r"(?<![0-9a-z])(?:19|20)[0-9]{2}(?![0-9])(?![._ -][01][0-9][._ -][0-3][0-9])", re.I)
@@ -343,16 +347,18 @@ def trusted_duration(probe, size, last_packet=None):
             "sources": src, "header_ok": ok}
 
 
-def runtime_verdict(trusted, listed_minutes, release_name="", item_type="movie"):
+def runtime_verdict(trusted, listed_minutes, release_name="", item_type="movie", season=None):
     """"ok", "short", "long" or "unknown" for the trusted duration against the listed runtime.
 
-    item_type: "movie", "special" (stand-up, a TV movie, see expected_languages) or "episode". An episode is judged
-    on the short side only, because premieres and double episodes run long. For an episode, pass the listed
-    runtimes of the file's episodes: a multi-episode file is judged against the longest one, because a segment show
-    lists every segment at the whole slot. An edition word in the
-    release name widens the band, a multi-cut file ("3in1") is never long. Unknown when the duration is not trusted
-    or the listing is missing or under MIN_LISTED, EPISODE_MIN_LISTED for an episode.
+    item_type: "movie", "special" (stand-up, a TV movie, see expected_languages) or "episode". For an episode, pass
+    the listed runtimes of the file's episodes and their season. A multi-episode file is judged against the longest
+    one, because a segment show lists every segment at the whole slot. An episode is short under EPISODE_SHORT. It
+    is long over EPISODE_LONG only when the file holds one episode of a season above 0, and the release name has no
+    edition or multi-cut word. A multi-episode file, a season 0 episode or an extended cut may run long for real. An edition
+    word in a movie's release name widens the band, and a multi-cut file ("3in1") is never long. Unknown when the
+    duration is not trusted or the listing is missing or under MIN_LISTED, EPISODE_MIN_LISTED for an episode.
     """
+    one = isinstance(listed_minutes, (list, tuple)) and len(listed_minutes) == 1
     if isinstance(listed_minutes, (list, tuple)):
         listed_minutes = max(listed_minutes) if listed_minutes and all(listed_minutes) else 0
     secs = (trusted or {}).get("seconds")
@@ -360,7 +366,10 @@ def runtime_verdict(trusted, listed_minutes, release_name="", item_type="movie")
         return "unknown"
     r = secs / 60 / listed_minutes
     if item_type == "episode":
-        return "unknown" if listed_minutes < EPISODE_MIN_LISTED else "short" if r < EPISODE_SHORT else "ok"
+        if listed_minutes < EPISODE_MIN_LISTED:
+            return "unknown"
+        judged = one and (season or 0) > 0 and not EDITION.search(release_name or "") and not MULTI_CUT.search(release_name or "")
+        return "short" if r < EPISODE_SHORT else "long" if judged and r > EPISODE_LONG else "ok"
     short, long = (SPECIAL_SHORT, SPECIAL_LONG) if item_type == "special" else (SHORT, LONG)
     if EDITION.search(release_name or ""): short, long = min(short, EDITION_SHORT), max(long, EDITION_LONG)
     if MULTI_CUT.search(release_name or ""): long = float("inf")
@@ -614,11 +623,11 @@ def episode_name(e, anime=False):
 
 
 def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, release_name, item_type, item_year,
-                           alt_titles_years=(), other=None, episode=None):
+                           alt_titles_years=(), other=None, episode=None, season=None):
     """Each signal that the file holds the wrong content, its points, and whether they justify a re-grab.
 
     tracks: decide.classify() of the file. original: the app's original language. expected: expected_languages().
-    trusted: trusted_duration(). listed_minutes, release_name, item_type: see runtime_verdict(). item_year and
+    trusted: trusted_duration(). listed_minutes, release_name, item_type, season: see runtime_verdict(). item_year and
     alt_titles_years: see year_verdict(). other: other_film() for a movie. episode: episode_title_verdict() for an
     episode whose release names a title.
 
@@ -636,7 +645,7 @@ def wrong_content_evidence(tracks, original, expected, trusted, listed_minutes, 
     named = release_languages(release_name) & {t["lang"] for t in tracks if t["kind"] == "a" and t["role"] == "main"}
     if lv == "wrong" and movie and named:   # the uploader's label confirms the tag. A series may speak another language in some episodes.
         add("release_language", "wrong", 1, f"the release name says {decide.lang_names(named)}")
-    rv, secs = runtime_verdict(trusted, listed_minutes, release_name, item_type), (trusted or {}).get("seconds")
+    rv, secs = runtime_verdict(trusted, listed_minutes, release_name, item_type, season), (trusted or {}).get("seconds")
     shown = max(listed_minutes or [0]) if isinstance(listed_minutes, (list, tuple)) else listed_minutes
     tmdb_rt = (expected or {}).get("runtime") if movie else 0
     points = int(rv in ("short", "long"))

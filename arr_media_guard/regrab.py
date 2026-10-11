@@ -54,7 +54,7 @@ def content_probe(app, owner, original, kids, release, ctx, heard=None):
         config.DEADLINE.start(config.BUDGET)
         if f is not None and (other := apps.ARR[app].other(f, owner)):
             return None, {"skipped": other}
-        c = ctx if f is None else dict(ctx, listed=[e.get("runtime") or 0 for e in f["eps"]])
+        c = ctx if f is None else dict(ctx, listed=[e.get("runtime") or 0 for e in f["eps"]], season=(f["eps"] or [{}])[0].get("seasonNumber"))
         j = checks.mkvmerge(path)
         mkv = path.lower().endswith(".mkv")
         d = decide.decide(j, original, kids, release) if mkv else {"tracks": decide.classify(j), "reasons": []}

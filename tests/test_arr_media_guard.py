@@ -692,6 +692,20 @@ def test_sonarr_episode_uses_the_episode_runtime(env, monkeypatch):
     assert rec["findings"] == [{"kind": "runtime", "runs": "10:05", "listed": 62}]   # header and last packet agree
 
 
+@pytest.mark.parametrize("season", [2, 0])
+def test_sonarr_episode_far_over_its_listing_is_long_outside_season_0(env, monkeypatch, season):
+    """The item carries the season to the runtime check. A long episode alerts on the runtime point alone and never
+    re-grabs. A special of the same length says nothing."""
+    as_sonarr(monkeypatch, env, {"title": "Show D", "tvdbId": 90301, "originalLanguage": {"name": "English"}, "runtime": 24},
+              [{"seasonNumber": season, "episodeNumber": 3, "runtime": 24}])
+    env["probe"]["container"]["properties"]["duration"] = 3000 * 10**9
+    hook.main([])
+    (rec,) = [r for r in log_lines(env) if r.get("outcome") == "edited"]
+    runtime = [s for s in rec["evidence"]["signals"] if s["kind"] == "runtime"]
+    assert [s["verdict"] for s in runtime] == ["long" if season else "ok"] and not rec["evidence"]["regrab"]
+    assert rec.get("findings", []) == ([{"kind": "runtime", "runs": "50:00", "listed": 24}] if season else [])
+
+
 def test_reprobe_failure_keeps_the_undo_record(env, monkeypatch):
     probes = iter([copy.deepcopy(PORTUGUESE_DEFAULT)])
     def probe(p):
@@ -1025,6 +1039,7 @@ def test_the_hooks_own_grab_link_never_blocks_an_edit(env, monkeypatch, settings
 def test_sonarr_alerts_go_to_the_same_webhook_as_sonarr(env, monkeypatch):
     as_sonarr(monkeypatch, env, {"title": "Show", "originalLanguage": {"name": "English"}}, [{"seasonNumber": 1, "episodeNumber": 2, "runtime": 44}])
     env["probe"] = copy.deepcopy(NO_ENGLISH)
+    env["probe"]["container"]["properties"]["duration"] = 2640 * 10**9   # it runs as listed
     hook.main([])
     (post,) = [b for m, u, b in env["http"] if m == "POST"]   # the same webhook, posted as Sonarr
     assert [u for m, u, b in env["http"] if m == "POST"] == ["https://discord.invalid/ops"]
@@ -1041,6 +1056,7 @@ def test_an_import_alert_links_the_item_from_the_record_the_job_read(env, monkey
     if app == "sonarr":
         as_sonarr(monkeypatch, env, {"title": "Show", "titleSlug": "show", "originalLanguage": {"name": "English"}},
                   [{"seasonNumber": 1, "episodeNumber": 2, "runtime": 44}])
+        env["probe"]["container"]["properties"]["duration"] = 2640 * 10**9   # it runs as listed
     hook.main([])
     (post,) = [b for m, u, b in env["http"] if m == "POST"]
     link = {"radarr": "[Film A (1979)](https://movies.media-host.test/movie/90001)", "sonarr": "[Show S01E02](https://tv.media-host.test/series/show)"}[app]
@@ -2141,7 +2157,7 @@ def pack(env, monkeypatch, tmp_path, broken, other=None):
         if p.startswith("history?"): return {"records": records}
         if p.startswith("episode?episodeFileId="):
             n = int(p.rsplit("=", 1)[1]) - 200
-            return [{"id": 100 + n, "seasonNumber": 1, "episodeNumber": n, "runtime": 22}]
+            return [{"id": 100 + n, "seasonNumber": 1, "episodeNumber": n, "runtime": 120}]
         if p.startswith("episode?episodeIds="):
             return [{"id": int(i), "episodeFileId": int(i) + 100, "seriesId": other.get(int(i), 5)} for i in parse_qs(p.split("?", 1)[1])["episodeIds"]]
         if p.startswith("episodefile/"):
@@ -3230,6 +3246,16 @@ def test_a_file_of_another_series_stays_out_of_the_unit(env, monkeypatch, tmp_pa
     assert probe(paths[204], {"eps": [{"seriesId": 6, "runtime": 22}]}) == (None, {"skipped": "another series"})
 
 
+def test_the_probe_of_another_file_judges_its_own_episodes(env, monkeypatch):
+    """Another file of the unit gets the listing and the season of its own episodes, never the job's."""
+    seen = []
+    monkeypatch.setattr(hook, "metadata", lambda app, path, j, size, d, original, release, item, **k:
+                        seen.append(item) or {"evidence": {"regrab": False}, "trusted": {}})
+    probe = hook.content_probe("sonarr", "5", "English", False, "", {"listed": [22], "season": 1}, None)
+    probe(env["path"], {"eps": [{"seriesId": 5, "seasonNumber": 0, "runtime": 45}]})
+    assert [(c["listed"], c["season"]) for c in seen] == [([45], 0)]
+
+
 @pytest.mark.parametrize("case", ["no_grab", "capped", "unconfirmed"])
 def test_a_wrong_content_verdict_names_what_happened(env, monkeypatch, case):
     wrong_film(env, monkeypatch)
@@ -3375,8 +3401,8 @@ def test_an_in_place_conversion_lets_the_lock_go_like_a_renamed_one(env):
 
 def test_a_sonarr_repack_rescans_the_series(env, monkeypatch):
     mp4_named_mkv(env)
-    as_sonarr(monkeypatch, env, {"title": "Show F", "originalLanguage": {"name": "English"}, "runtime": 22},
-              [{"id": 91, "seasonNumber": 1, "episodeNumber": 5, "runtime": 22}])
+    as_sonarr(monkeypatch, env, {"title": "Show F", "originalLanguage": {"name": "English"}, "runtime": 120},
+              [{"id": 91, "seasonNumber": 1, "episodeNumber": 5, "runtime": 120}])
     hook.main([])
     assert env["writes"] == [("POST", "command", {"name": "RescanSeries", "seriesId": 5})] and decided(env)["reasons"][0] == "repacked"
 

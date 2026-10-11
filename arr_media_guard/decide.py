@@ -1004,6 +1004,7 @@ def checks(j, size, runtime, shorter_only=False):
     source. Otherwise a bitrate ceiling decides: 50 Mbit/s up to 1080p (the Blu-ray mux rate is 48), 150 above.
     runtime:  the file runs more than 40 percent off the listed runtime. Listed runtimes under 10 minutes are skipped.
     shorter_only (Sonarr) alerts only under 0.6 x the listed runtime, because double episodes and premieres run long.
+    A long episode needs content.runtime_verdict(), which knows the season, the episode count and a trusted duration.
     A broken duration suppresses the runtime alert, because the header is wrong, not the content.
     """
     dur, out = duration(j), []
