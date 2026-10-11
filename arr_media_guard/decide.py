@@ -58,6 +58,11 @@ FULL_TITLE = re.compile(r"\bsdh\b|\bcc\b|closed caption|\bfull\b", re.I)
 DUB_TITLE = re.compile(r"\bdub", re.I)
 FORCED_TITLE = re.compile(r"forced", re.I)
 COMMENT_TITLE = re.compile(r"comment|\bcmt\b|\bcomm\b", re.I)   # "Commentary", "cmt", "Director's Comm"
+# Text that is not the dialogue is commentary too: "Production Notes", "Trivia", "Info Text", "Fact Track", "Pop-up",
+# "Easter Eggs" and a title of "Notes" alone. SDH, CC or "full" in the title overrides these words, so "English CC
+# (pop-up)" stays SDH. "TL Notes" holds dialogue with translator notes.
+NOTES_TITLE = re.compile(r"production[ ._-]*notes?|^\W*notes\W*$|\btrivia\b|\binfo(rmation)?[ ._-]*text|\bfact[ ._-]*track|\bpop[ ._-]*ups?\b|"
+                         r"\beaster[ ._-]*eggs?\b", re.I)
 # How sure a track's language is. The tag and the title agree, the title names another language (the title wins), or the tag alone.
 AGREE, TITLE_WINS, TAG_ONLY = 1.0, 0.8, 0.6
 HEARD = 0.9   # lid.py heard another language than the tag and the title say. The heard language wins.
@@ -173,7 +178,7 @@ def classify(j, heard=None):
         tag = (f["lang"] or "und").lower()
         h = (heard or {}).get(f"{kind}{n[kind]}")
         lang, conf, why = language(tag, title_language(title, kind), h)
-        comment = bool(f["comment"] or COMMENT_TITLE.search(title))
+        comment = bool(f["comment"] or COMMENT_TITLE.search(title) or (NOTES_TITLE.search(title) and not FULL_TITLE.search(title)))
         described = bool(f["described"] or re.search(r"descri", title, re.I) or re.search(r"\bAD\b|DVS", title))
         titled_forced = bool(FORCED_TITLE.search(title))
         signs = titled_forced or bool(SIGNS_TITLE.search(title) and not FULL_TITLE.search(title))

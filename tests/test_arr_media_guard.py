@@ -10597,6 +10597,30 @@ def test_sub_targets_take_the_text_tracks_a_viewer_would_use():
     # the audio that plays is the one heard when two main tracks speak the language
     j = sub_probe(("eng", False, {}), audio=(("eng", False), ("eng", True)))
     assert hook.sub_targets(j, hook.arr_decide.decide(j, "English")) == {"s1": ("eng", 1)}
+    # a production notes track is commentary, so only the dialogue track is checked
+    j = sub_probe(("eng", False, {}), ("eng", False, {"track_name": "Production Notes"}), audio=(("eng", True),))
+    assert hook.sub_targets(j, hook.arr_decide.decide(j, "English")) == {"s1": ("eng", 0)}
+
+
+def notes_probe():
+    """An English film with an English picture track, a Spanish text track and a notes track of each kind."""
+    pgs = {"codec_id": "S_HDMV/PGS"}
+    return sub_probe(("eng", False, pgs), ("eng", False, dict(pgs, track_name="Production Notes")), ("spa", False, {}),
+                     ("spa", False, {"track_name": "Trivia"}), audio=(("eng", True),))
+
+
+def test_the_reference_timing_skips_a_notes_track(env):
+    """A notes track is commentary, so the reference timing never times it."""
+    j = notes_probe()
+    assert set(hook.sub_reference(env["path"], j, hook.arr_decide.decide(j, "English"), {}, {}, {})[0]) == {"s1", "s3"}
+
+
+def test_the_layout_check_skips_a_notes_track(env, monkeypatch):
+    """A notes track is commentary, so the speech layout check never reads it."""
+    j = notes_probe()
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {p: talk.show(12, n=170) for p in want})
+    monkeypatch.setattr(hook, "lid_speech", lambda path, index, j, timeout, yield_to=None: {"spans": talk.voice(REF), "cached": False, "took": 1.0})
+    assert set(hook.sub_layout(env["path"], j, hook.arr_decide.decide(j, "English"), {}, {})[0]) == {"s3"}
 
 
 def test_a_subtitle_of_another_episode_loses_its_flags_and_alerts(env, monkeypatch):
@@ -10962,6 +10986,19 @@ def test_no_kept_original_means_no_removal(env, monkeypatch, settings, tmp_path)
     assert got == [] and rec["edits"] == [["track:=10", 0, 1]] and "subtitle_audio_mismatch" in rec["reasons"], rec
     (line,) = rec["findings"][0]["lines"]
     assert (line["code"], line["gone"], line["kept_back"]) == ("stays", False, "keep_days"), line
+
+
+def test_a_production_notes_track_stays_in_the_file(env, monkeypatch, settings):
+    """A disc's production notes track shows trivia, so its words never match the speech. It is commentary: the word
+    check leaves it out, and nothing removes it or turns its flags off."""
+    english_film(env, ("eng", False, {}), ("eng", False, {"track_name": "Production Notes"}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT), "s2": talk.cues(talk.OTHER)})
+    monkeypatch.setattr(hook, "resub", lambda *a, **kw: pytest.fail("no remux"))
+    settings(keep_days=7)
+    hook.main([])
+    rec = decided(env)
+    assert set(rec["subcheck"]) == {"s1"} and rec["subcheck"]["s1"]["verdict"] == "match", rec["subcheck"]
+    assert not rec.get("subremux") and not rec.get("edits") and "subtitle_audio_mismatch" not in rec["reasons"] and not rec.get("alert_kinds"), rec
 
 
 def test_a_retime_and_a_removal_share_one_remux(env, monkeypatch, settings, tmp_path):

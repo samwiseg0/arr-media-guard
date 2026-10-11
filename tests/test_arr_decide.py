@@ -99,6 +99,29 @@ def test_the_decision_rules(monkeypatch):
         ["track:a1", 0, 1], ["track:a2", 1, 0]]
     assert decide.classify(ff(("audio", "eng", "DVS", 2, 1, 0, 0)))[0]["role"] == "description"
     assert decide.classify(ff(("audio", "eng", "Adventure", 2, 1, 0, 0)))[0]["role"] == "main"
+    # text that is not the dialogue is commentary: production notes, trivia, pop-up facts. Its words never match the speech.
+    notes = ("Production Notes", "Info Text", "Infotext", "Trivia Track", "Fact Track", "Pop-up Facts", "Easter Eggs", "Notes")
+    assert [(t["role"], t["extra"]) for t in decide.classify(ff(*[("subtitle", "eng", n, 0, 0, 0, 0) for n in notes]))] == [("commentary", True)] * len(notes)
+    assert decide.classify(ff(("audio", "eng", "Trivia Track", 2, 0, 0, 0)))[0]["role"] == "commentary"
+    # dialogue with "notes" or "track" in a longer title keeps its role
+    dialogue = ("English (TL Notes)", "Full Subtitles + TL notes", "main track", "Soundtrack subtitle", "Sing-a-long", "for main audio",
+                "Information", "Signs & Songs")
+    assert [t["role"] for t in decide.classify(ff(*[("subtitle", "eng", n, 0, 0, 0, 0) for n in dialogue]))] == ["full"] * 7 + ["forced"]
+    # each title as a subtitle and as an audio track. A word that only contains a notes word ("Trivial", "Lollipop",
+    # "Artifact") keeps the role, and SDH or CC in the title wins over the notes words.
+    notes = ("Notes", "Notes:", "[Notes]", "notes.", "Production Note", "Production Notes", "Pop Up Video", "Pop-Up Video", "Popup", "Pop-Ups",
+             "K-Pop Up Close", "Info Text", "Infotext", "Information Text", "Trivia", "Trivia (Forced)", "Fact Track", "Easter Eggs",
+             "Easter Egg Guide", "Fun & Trivia", "Easter.Eggs.2023.1080p.WEB", "Pop.Up.S01E01.1080p", "The.Trivia.Hour.S02E03",
+             "Commentary-free", "No Commentary", "Text Commentary")
+    kept = {"sdh": ("Pop-on CC", "English CC (pop-up)", "SDH", "English SDH"), "forced": ("Songs & Signs", "Signs & Songs", "Signs", "Forced"),
+            "full": ("TL Notes", "English (TL Notes)", "Notes (English)", "English Notes", "Notes - English", "Producer's Notes", "Director's Notes",
+                     "Liner Notes", "Notes from the Underground", "Notes on a Scandal", "Lollipop Upgrade", "Info", "Information", "Trivial",
+                     "Trivial.Matters.S01E01.720p", "Fun Facts", "Factoids", "Artifact Track", "Easter Parade", "Annotations", "Anmerkungen",
+                     "Curiosidades", "Anecdotes", "Nerd Track", "English", "Japanese", "Tagalog", "Português (Brasil)", "Français", "Deutsch",
+                     "中文", "Full")}
+    want = {n: ("commentary", "commentary") for n in notes} | {n: (r, "main") for r, ns in kept.items() for n in ns}
+    role = lambda kind, n: decide.classify(ff((kind, "eng", n, 2, 0, 0, 0)))[0]["role"]
+    assert {n: (role("subtitle", n), role("audio", n)) for n in want} == want
     # English only as commentary (flag or title): the wrong language, nothing changes
     d = decide.decide(ff(("audio", "por", "", 6, 1, 0, 0), ("audio", "eng", "", 2, 0, 0, 1)), "English")
     assert d["edits"] == [] and d["wrong_language"], d
@@ -435,6 +458,9 @@ def test_the_original_language_flag_marks_the_tracks_in_the_content_language(mon
     # a commentary or an audio description keeps its flag, heard or not
     assert flags(tracks(("audio", "jpn", {"flag_commentary": True}), ("audio", "eng", {"track_name": "Commentary", "flag_original": True}),
                         ("audio", "jpn", {"flag_visual_impaired": True})), checked={"a1": "jpn", "a2": "eng", "a3": "jpn"}) == {}
+    # a production notes track keeps its flag, and the dialogue track in the same language gets it
+    assert flags(tracks(("subtitles", "eng", {}), ("subtitles", "eng", {"track_name": "Production Notes"})), read={"s1": "eng", "s2": "eng"},
+                 original="eng") == {"track:=1": (1, None)}
     # an untagged track, a mul or zxx track, and a film with no TMDB answer keep theirs
     assert flags(tracks(("audio", "und", {}), ("subtitles", "und", {}), ("audio", "mul", {}), ("audio", "zxx", {})),
                  checked={"a1": "jpn", "s1": "jpn", "a2": "jpn", "a3": "jpn"}) == {}

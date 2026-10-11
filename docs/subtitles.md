@@ -6,6 +6,10 @@ detection*, the speech model in the Docker image, which on a host is an optional
 the level `SUBTITLES` sets. `--sub-check` runs it over a library, and `--sub-time` on single files. A `.srt` file beside
 the video is a *sidecar*, and AMG checks it too. [design.md](design.md#subtitle-match) has the rules behind each check.
 
+The check skips commentary tracks. A track of production notes, trivia or pop-up facts counts as commentary, because its
+text is not what people say. AMG never removes one for not matching the speech.
+An audio track with such a title counts as commentary too.
+
 ## Levels
 
 Set `SUBTITLES` in the env file. The default is `deep`.

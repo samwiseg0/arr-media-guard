@@ -34,12 +34,16 @@ only a policy change. A decision has four steps.
   tagged `eng` is French. An audio title drops a word before Dub, Score or Sub, so "UK Dub /
   Japanese Score" names no language. A heard language that agrees raises the track to 1.0. One that
   disagrees replaces the language at 0.9.
-- **Audio role.** Main, commentary ("Commentary", "cmt", "Comm") or description ("AD", "DVS"). Only
-  a main track plays first.
+- **Audio role.** Main, commentary or description ("AD", "DVS"). Only a main track plays first.
+  "Commentary", "cmt" or "Comm" in the title makes a track commentary. So does a *notes title*, which has
+  "Production Notes", "Trivia", "Info Text", "Fact Track", "Pop-up" or "Easter Eggs", or is just "Notes".
 - **Subtitle role.** Commentary, dub transcript ("English (dub)", "Dubtitle"), forced, SDH or full.
   A "forced" or signs title (signs, songs, foreign parts, alien, titles only) makes a track forced.
   So does a forced flag, or a density under `sparse_events` (1.5 events a minute). "SDH", "CC" or
   "full" in the title overrides the signs words.
+- **Notes titles.** A notes title makes an audio or a subtitle track commentary, so the subtitle check leaves it
+  alone. "SDH", "CC" or "full" in the title overrides the notes words. The word "notes" inside a longer title, as in
+  "TL Notes", keeps the track's role.
 - **Density.** The events a minute come from mkvmerge's statistics tags. They count only when
   mkvmerge wrote the file and it runs `density_min_minutes` (15) or more. A PGS count is halved,
   because PGS stores two frames per subtitle. A forced flag counts only under `forced_flag_events`
