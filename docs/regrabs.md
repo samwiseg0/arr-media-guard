@@ -8,11 +8,12 @@ step.
 ## Re-grabs
 
 A *re-grab* deletes a broken file through the app and marks its grab as failed, so the app searches for another copy. It
-runs at import, and for burned-in subtitles in the burned-in subtitle check after it. Before it deletes anything, AMG
-checks the file a second time from scratch, and the second check must find the same fault. AMG then checks the other
-files of the same download, such as the other episodes of a season pack. It deletes each one that is broken too. The
-files that check clean stay. A burned-in subtitle re-grab is the one exception. It judges one file. Each file of the
-download that the import's quick check flagged, or could not sort, gets a full check of its own.
+runs at import. For burned-in subtitles it runs later, when the full check in the background confirms them. Before it
+deletes anything, AMG checks the file a second time from scratch, and the second check must find the same fault. AMG
+then checks the other files of the same download, such as the other episodes of a season pack, and deletes each one
+that is broken too. The files that check clean stay. Burned-in subtitles are the one exception. That re-grab covers one
+file, because every file of the download that the quick check flagged, or could not sort, gets a full check of its
+own.
 
 `REGRAB` lists the kinds of fault that re-grab, joined by commas. The default is `audio,video`.
 
@@ -22,7 +23,7 @@ download that the import's quick check flagged, or could not sort, gets a full c
 | `video` | The video is cut short or damaged. |
 | `content` | The file holds another film or episode, by the TMDB and runtime checks, see [features.md](features.md#wrong-content). |
 | `damage` | A conversion to MKV shows that the source file is damaged. |
-| `burned_in` | Subtitles in a language other than English are drawn into the picture, and a second check on other frames agrees, see [features.md](features.md#burned-in-subtitles). Text in the language of the audio or of the item re-grabs each movie or episode once. |
+| `burned_in` | Subtitles in a language other than English are burned into the picture, and a second check on other frames agrees, see [features.md](features.md#burned-in-subtitles). When the text is in the language of the audio, or of the movie or show itself, AMG re-grabs each movie or episode only once. |
 
 - A kind that `REGRAB` leaves out still gets the second check. The file then stays, and the alert title ends "re-grab is
   off".

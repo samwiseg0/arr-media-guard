@@ -12,9 +12,8 @@ and [design.md](design.md) the rules behind it. These words come up often.
 - The *worker* is the AMG process that takes the jobs and checks the files.
 - The *state store* is a small database, `STATE_DIR/state.sqlite`. It holds the background queue and AMG's other
   records.
-- The *background queue* is the line of jobs in the state store. Imports always go first, then the burned-in subtitle
-  checks, then the deep analyses, then the rechecks. Every job but an import runs only while no import waits, one at a
-  time.
+- The *background queue* is the line of jobs in the state store. Imports always go first. After them come the burned-in
+  subtitle checks, the deep analyses and the rechecks, one at a time and only while no import waits.
 - The *decision log* is the file `LOG` names. It gets a line for each file AMG checks.
 - A *remux* writes a file again with the same video and audio. AMG never re-encodes.
 - A *re-grab* deletes a broken file through the app and marks the grab as failed, so the app searches again.
@@ -39,8 +38,8 @@ flowchart TD
     alerts --> log["Decision log and syslog"]
     hold --> log
     log --> plex["Plex reads the changed file again"]
-    log -->|"BURNED_IN on, and the quick check flagged the file or could not tell"| burn["The burned-in subtitle check, while no import waits"]
-    burn --> burnalert["Discord: one alert on a change or a doubt, the decision log for the rest"]
+    log -->|"BURNED_IN on, and the quick check flagged the file or could not tell"| burn["The full burned-in subtitle check, while no import waits"]
+    burn --> burnalert["Discord: one alert for a change or a doubt, everything else to the decision log"]
     log -->|"SUBTITLES=deep"| deep["The deep analysis, while no import waits"]
     deep --> deepalert["Discord: one alert for each subtitle problem still left, nothing for a problem it fixed"]
 ```
@@ -185,15 +184,15 @@ run set and alerts only on subtitles. `SUBTITLES` decides whether it fixes or on
 
 ## 8. The burned-in subtitle check
 
-Each import ends with a quick check for subtitles drawn into the picture. It listens to a few parts of the audio and
-looks at frames there, and it changes nothing. A file it flags, or cannot tell, gets the full check in the background
-queue, before its deep analysis. That check looks at frames across the whole file and reads the language of the lines.
-Before any change, a second check on other frames must agree. With English subtitles burned in and audio in another
-language, AMG then turns off the English subtitle tracks, so the lines never show twice. With subtitles in another
-language burned in, it re-grabs the file when `REGRAB` lists `burned_in`. A change or a doubt posts one alert. Other
-results post nothing and go to the decision log. These are English text over English audio, a partial burn-in, a check
-with too little speech and a file with no burned-in subtitles. `BURNED_IN` turns the check off or makes it alert only.
-See [features.md](features.md#burned-in-subtitles).
+Each import ends with a quick check for subtitles burned into the picture. It listens to a few parts of the audio,
+looks at the frames there, and changes nothing. When it flags the file, or cannot tell, the file gets the full check in
+the background queue, before its deep analysis. The full check looks at frames across the whole file and reads the
+language of the lines. AMG changes nothing unless a second check on other frames agrees. When English subtitles are
+burned in and the audio is in another language, AMG turns off the English subtitle tracks, so the lines do not show
+twice. When the burned-in subtitles are in another language, AMG re-grabs the file if `REGRAB` includes `burned_in`. A
+change or a doubt posts one alert. Everything else only goes to the decision log. That covers English text over English
+audio, a partial burn-in, too little speech to judge, and a file with no burned-in subtitles. `BURNED_IN` can turn the
+check off or make it alert only. See [features.md](features.md#burned-in-subtitles).
 
 ## The Test button and the start check
 

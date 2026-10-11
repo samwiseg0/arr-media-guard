@@ -183,44 +183,43 @@ name. When it belongs to another episode, an alert "Maybe the wrong episode" nam
 
 ## Burned-in subtitles
 
-Some releases have subtitles drawn into the picture. These *burned-in* subtitles always show, and no player can turn
-them off. A Japanese film with English subtitles burned in then shows the English lines twice when the English
-subtitle track plays too. A release with Chinese subtitles burned in shows lines most viewers cannot read.
+Some releases have subtitles *burned in*, drawn into the picture itself. A Japanese film with English subtitles burned
+in shows each line twice when an English subtitle track is on too. A release with Chinese subtitles burned in shows text
+that most viewers cannot read.
 
-Each import gets a quick check. AMG listens to ten short parts of the audio and looks at frames inside and between the
-speech. Subtitles show while people speak, so a file with text in the speech frames and little in the quiet ones is
-flagged. The quick check changes nothing. A flagged file, or one the quick check cannot tell, waits in the background
-queue for the full check. That one finds the speech in the whole audio, looks at 40 frames in speech and 40 in quiet
-parts with a text detector, and reads the language of the lines. HDR video always gets the full check, because the
-quick check misses text on it. So does a Matroska file without cues, its seek index, which the quick check cannot read
-fast.
+Every import gets a quick check. AMG listens to ten short parts of the audio and looks at frames during speech and
+during quiet moments. Subtitles show while people talk, so a file with text mostly during speech gets flagged. The quick
+check never changes anything. When it flags a file, or cannot tell, the file waits in the background queue for the full
+check. The full check finds the speech in the whole audio, runs a text detector on 40 frames during speech and 40 in
+quiet parts, and reads the language of the lines. HDR video always gets the full check, because the quick check misses
+text on it. So does an MKV file without cues, its seek index, because the quick check cannot seek in it fast.
 
-- Every full burn-in whose language AMG reads gets a second check on other frames. When it disagrees, or cannot tell,
-  the alert says the problem was not confirmed, and nothing changes.
-- English subtitles burned in, audio in another language, and both checks agree: AMG turns off the default and forced
-  flags of each English subtitle track that is on, so only the burned-in lines show. An alert says what is burned in
-  and what changed. A file that is not MKV keeps its flags, and the alert says so.
-- Subtitles in another language burned in, and both checks agree: AMG re-grabs the file, as for broken audio, when
-  `REGRAB` lists `burned_in`. Else the alert title ends "re-grab is off".
-- Subtitles in the language of the audio or of the film itself, as Chinese text on a Chinese film: AMG re-grabs the
-  movie or episode once. Every release may carry them, so when the next copy has them too, AMG alerts and keeps it.
-- Text whose language AMG cannot read, or English text when the audio has no language tag: an alert, and nothing
-  changes.
-- English subtitles over English audio, burned-in lines for only part of the speech, or none: the decision log only.
-  Partial burn-ins are mostly translated signs or lines in another language, which viewers want.
+- **A second look.** When AMG finds a full burn-in and can read its language, it checks again on different frames. If
+  the second check disagrees, or cannot tell, AMG changes nothing and the alert says the problem was not confirmed.
+- **English subtitles over audio in another language.** AMG turns off the default and forced flags of every English
+  subtitle track that is on, so only the burned-in lines show. The alert says what is burned in and what changed. AMG
+  edits flags only in MKV files, so a file in another container keeps its flags, and the alert says so.
+- **Subtitles in another language.** AMG re-grabs the file, the same way as for broken audio, when `REGRAB` includes
+  `burned_in`. Otherwise the alert title ends with "re-grab is off".
+- **The title's own language.** Some movies and shows have subtitles in their own language in every release, such as
+  Chinese text on a Chinese film. AMG re-grabs these once. If the next copy has them too, AMG keeps it and alerts.
+- **Alert only.** AMG only alerts when it cannot read the language of the text, or when English text shows over audio
+  with no language tag.
+- **Log only.** English subtitles over English audio, burned-in text during only part of the speech, and files with no
+  burned-in subtitles only go to the decision log. Partial burn-ins are mostly translated signs or lines in another
+  language, which viewers want to see.
 
-`BURNED_IN=check` alerts and changes nothing, and `off` turns the check off. AMG marks a file whose English subtitles it
-turned off. The deep analysis, a recheck, a flag backfill, `--sub-check --apply` and `--sub-time` keep them off while
-the file stays the same. A new copy of the film or episode clears the mark.
-`arr-media-guard --burn-in <file>` runs both checks by hand and changes nothing, see
-[commands.md](commands.md#check-for-burned-in-subtitles).
+`BURNED_IN=check` only alerts, and `off` turns the check off. When AMG turns off English subtitles, it marks the file.
+The deep analysis, rechecks, flag backfills, `--sub-check --apply` and `--sub-time` then keep them off. A new copy of
+the movie or episode clears the mark. To check a file by hand, run `arr-media-guard --burn-in <file>`. It changes
+nothing, see [commands.md](commands.md#check-for-burned-in-subtitles).
 
-The check runs in the language detection install, with three text models of 24.6 MB. The Docker image holds them, and a
-host install fetches them, see the [README](../README.md#install-on-a-host). The quick check takes about 8 to 15 CPU
-seconds for an SD to 1080p file, and about 50 for a 4K remux. On a test host it added about 2 to 10 seconds to an
-import. On a busy host it can add up to about 80 seconds for a 4K file. The full check runs before the deep analysis, so
-it reads the speech of the whole audio itself. Its medians are about 44 CPU seconds for an SD file, 100 for 720p, 160
-for 1080p, and 11 minutes for a 4K remux. A second pass reads the speech from the cache.
+The check uses the language detection install and three text models of 24.6 MB. The Docker image includes them, and a
+host install fetches them, see the [README](../README.md#install-on-a-host). The quick check uses about 8 to 15 CPU
+seconds for an SD to 1080p file, and about 50 for a 4K remux. In testing it added 2 to 10 seconds to an import, and up
+to about 80 seconds for a 4K file on a busy host. The full check runs before the deep analysis, so it reads the speech
+of the whole audio itself. It takes a median of about 44 CPU seconds for an SD file, 100 for 720p, 160 for 1080p and 11
+minutes for a 4K remux. The second look reuses the speech the first one read.
 
 ## Header repair
 
@@ -260,8 +259,8 @@ arr-media-guard: recheck: this version can improve the subtitle check of 12 file
 
 On a host install, the first nightly audit of the new version queues them, and they run after the next import.
 
-The rechecks wait in the background queue, where every job waits. Imports always go first, then the burned-in subtitle
-checks, then the deep analyses, then the rechecks, one at a time. A recheck repeats the check that saved the result,
+The rechecks wait in the background queue with every other job. Imports always go first. After them come the burned-in
+subtitle checks, the deep analyses and the rechecks, one at a time. A recheck repeats the check that saved the result,
 and never checks deeper. A file that only an import checked gets the import's subtitle checks again, and no more.
 `SUBTITLES` decides what a recheck may do, as for an import. At `check` it only alerts, and a later
 `--sub-check --apply` makes the fix. AMG posts an alert of one kind once for a file. So at `check`, a recheck posts

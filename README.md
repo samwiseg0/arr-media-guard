@@ -26,8 +26,8 @@ In these docs, *the app* is the Sonarr or Radarr that sent the file, and the *it
 - **Broken files.** It deletes a file with broken audio or corrupt video, so Sonarr or Radarr searches again. It can put
   back the old file that the upgrade replaced.
 - **Wrong content.** It alerts when a file holds another film or another episode.
-- **Burned-in subtitles.** It turns off English subtitles that repeat lines burned into the picture, and can re-grab a
-  release with burned-in subtitles in another language.
+- **Burned-in subtitles.** When a film in another language has English subtitles burned into the picture, it turns
+  off the English subtitle tracks. It can also re-grab a release whose burned-in subtitles are in another language.
 - **Repairs.** It repairs a wrong Matroska header. It can convert other containers, such as AVI or MP4, into Matroska.
 - **Backfill and scans.** It fixes and scans the files you already have, and audits its own edits.
 - **Subtitle hunter.** A command of its own replaces a Radarr film that has no English subtitle with a release that
@@ -37,8 +37,8 @@ In these docs, *the app* is the Sonarr or Radarr that sent the file, and the *it
 
 ## Requirements
 
-- Docker. The image holds Python, the tools, language detection and its model, and the text models of the burned-in
-  subtitle check. It is for amd64. An arm64 image is not published yet.
+- Docker. The image includes Python, the tools, language detection with its speech model, and the text models for the
+  burned-in subtitle check. It is for amd64. An arm64 image is not published yet.
 - Sonarr 4 and Radarr 6. These are the versions it is tested with.
 - Optional: Plex, a Discord webhook, and a TMDB API read token.
 
@@ -48,7 +48,7 @@ On a host, it needs these instead of Docker:
 - `mkvtoolnix` and `ffmpeg`, for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`. It is tested with mkvtoolnix 92
   and ffmpeg 7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so AMG refuses every header repair with it.
 - Optional: the language detection venv, about 450 MB, and its model, 464 MB. It needs Python 3.13 on x86_64 or aarch64,
-  because its pinned wheels are built for CPython 3.13. The burned-in subtitle check runs in the same venv, with three
+  because its pinned wheels are built for CPython 3.13. The burned-in subtitle check uses the same venv, plus three
   text models of 24.6 MB.
 
 ## Install in Docker
@@ -146,9 +146,9 @@ sudo touch /opt/arr-media-guard-lid/ready
 ```
 
 `--fetch` downloads the pinned models once and checks the sha256 of each. `lid.py` fetches the speech model, and
-`burnin.py` the text models of the burned-in subtitle check. AMG uses language detection only when `ready` exists.
-Remove `ready` before you change the venv, and create it again after. Without the text models the burned-in subtitle
-check does not run, and `--selftest` says so while `BURNED_IN` is on.
+`burnin.py` fetches the text models for the burned-in subtitle check. AMG uses language detection only when `ready`
+exists, so remove `ready` before you change the venv, and create it again after. Without the text models the burned-in
+subtitle check does not run, and `--selftest` tells you so while `BURNED_IN` is on.
 
 ## Add it to Sonarr and Radarr
 
@@ -373,7 +373,7 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 | Key | Default | What it does |
 | --- | --- | --- |
 | `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio, about 15 CPU minutes an hour of video. See [docs/subtitles.md](docs/subtitles.md#levels). |
-| `BURNED_IN` | `fix` | What the burned-in subtitle check does. `off`: nothing. `check`: alerts only. `fix`: also turns off the English subtitles of a file whose English subtitles are burned into the picture, when the audio is in another language. A file whose burned-in subtitles are in another language is re-grabbed when `REGRAB` lists `burned_in`. Both need a second check on other frames that agrees. An unknown value acts as `check`, and `--selftest` fails on it. See [docs/features.md](docs/features.md#burned-in-subtitles). |
+| `BURNED_IN` | `fix` | What the burned-in subtitle check does. `off`: nothing. `check`: alerts only. `fix`: also turns off the English subtitle tracks when English subtitles are burned into the picture and the audio is in another language. When the burned-in subtitles are in another language, AMG re-grabs the file if `REGRAB` includes `burned_in`. AMG changes a file only when a second check on other frames agrees. An unknown value acts as `check`, and `--selftest` fails on it. See [docs/features.md](docs/features.md#burned-in-subtitles). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
 | `HOOK_WORKERS` | `2` | Jobs the worker runs at once, each in a process of its own. `1` runs each job inside the worker. A season pack still runs at most this many. |
@@ -456,4 +456,5 @@ The track flags AMG set stay in your files. The decision log holds the undo of e
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE). The text models of the burned-in subtitle check are Apache-2.0, see [NOTICE](NOTICE).
+GPL-3.0. See [LICENSE](LICENSE). The text models of the burned-in subtitle check are under the Apache License 2.0,
+see [NOTICE](NOTICE).

@@ -74,11 +74,11 @@ arr-media-guard --audit radarr --since 24h --post             # AMG's edits of t
 
 ## Check for burned-in subtitles
 
-`--burn-in` runs the burned-in subtitle check on the files you name, as the check after an import runs it, see
-[features.md](features.md#burned-in-subtitles). It runs the quick check and the full check, and the second check when
-the full one finds subtitles it can read. It prints one line per file with what it found, and what the check after an
-import would do with the current settings, from that check's own decision. It changes no file, posts nothing, and
-queues nothing. Each file gets a decision line. It has no `--apply`.
+`--burn-in` runs the burned-in subtitle check on the files you name, the same way it runs after an import, see
+[features.md](features.md#burned-in-subtitles). It runs the quick check, the full check, and the second check when the
+full one finds subtitles it can read. For each file it prints one line with what it found, and what AMG would do after
+an import with your current settings. It changes no file, posts nothing and queues nothing. Each file gets a line in
+the decision log. There is no `--apply`.
 
 ```
 arr-media-guard --burn-in "/data/movies/Film A (2000)/Film A (2000).mkv"
@@ -89,8 +89,9 @@ arr-media-guard --burn-in --app sonarr --ids 101 102          # every file of th
 quick check flagged, Japanese audio, full burned-in subtitles in English, the second pass agrees, the job would turn off the English subtitles and alert | Film A (2000) | /data/movies/Film A (2000)/Film A (2000).mkv
 ```
 
-It needs the language detection install and the text models, and stops with the reason when they are missing. It runs
-at the lowest CPU and disk priority. A full check reads the whole audio of a file once, which takes minutes for a film.
+It needs the language detection install and the text models, and tells you what is missing when it cannot run. It
+runs at the lowest CPU and disk priority. The full check reads the whole audio of each file, so a film takes a few
+minutes.
 
 ## Plex after an apply
 
@@ -194,7 +195,7 @@ at most 10 seconds.
 | TMDB | always | TMDB's key check, with `TMDB_TOKEN`, else Radarr's key | TMDB did not answer, or it refused the key |
 | SABnzbd | `SABNZBD_API_KEY` is set | one slot of the queue, at `SABNZBD_URL` or the address Radarr saved | SABnzbd did not answer, it refused `SABNZBD_API_KEY`, or it refused the request, as from an address it does not let in |
 | Newznab indexer | `NEWZNAB_API_KEY` is set | `t=caps`, the indexer's list of features, at `NEWZNAB_URL` or the address Radarr saved | the indexer did not answer, or it refused `NEWZNAB_API_KEY` |
-| Burned-in subtitle check | `BURNED_IN` is not `off` | none. It looks for the language detection install, and checks the sha256 of each text model | the check cannot run, and why |
+| Burned-in subtitle check | `BURNED_IN` is not `off` | none. It checks that language detection is installed, and that each text model matches its sha256 | the check cannot run, and why |
 
 ```
 arr-media-guard: plex start check: ok
