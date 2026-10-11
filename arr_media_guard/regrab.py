@@ -116,7 +116,8 @@ def unit_files(app, records, job):
 
 # The outcome codes of the two results of report.FAULTS. A clean file of a damage unit has no code of its own.
 RESULT_CODES = {"audio": ("broken_audio", "audio_checked"), "content": ("wrong_content", "content_checked"),
-                "video": ("corrupt_video", "video_checked"), "damage": ("damaged_source", "other")}
+                "video": ("corrupt_video", "video_checked"), "damage": ("damaged_source", "other"),
+                "burned_in": ("burned_in_full", "burned_in_checked")}
 
 
 def regrab(app, job, fault, probe, kind="audio"):
@@ -128,9 +129,10 @@ def regrab(app, job, fault, probe, kind="audio"):
 
     fault is the certain fault found in the job's file. probe(path, f, fresh) checks a file from scratch and returns
     (its certain fault or None, log fields), see audio_probe(), content_probe(), video_probe() and damage_probe(). Every
-    second check passes fresh=True. kind is audio, content, video or damage. Every kind counts against the one
-    REGRAB_CAP of the app. A kind REGRAB does not list stops after the second check of the job's file and deletes
-    nothing.
+    second check passes fresh=True. kind is audio, content, video, damage or burned_in. Every kind counts against the
+    one REGRAB_CAP of the app. A kind REGRAB does not list stops after the second check of the job's file and deletes
+    nothing. burned_in judges the job's file alone. Each other file of the download that its quick check flagged, or could
+    not sort, gets a burn-in job of its own.
     """
     name, dry = apps.ARR[app].name, kind not in config.CFG.regrab
     records = []
@@ -153,6 +155,8 @@ def regrab(app, job, fault, probe, kind="audio"):
             return {"code": "would_regrab", "kind": kind}
         files = unit_files(app, records, job)
         broken = {int(job["file_id"])}
+        if kind == "burned_in":   # a flagged or unsorted file of the download has a burn-in job of its own, see runner.burn_in()
+            files = {fid: f for fid, f in files.items() if fid in broken}
         unit = unit or {"time": time.time(), "failed": False, "deleted": [], "clean": [], "kind": kind}
         for fid, f in files.items():
             if fid in broken or fid in unit["clean"] + unit["deleted"] or not os.path.exists(f["path"]):

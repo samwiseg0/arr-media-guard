@@ -53,6 +53,7 @@ os.environ["ARR_MEDIA_GUARD_LIB"] = FILES
 os.environ["ARR_MEDIA_GUARD_ENV"] = "/nonexistent/arr-media-guard.env"
 h = amg.load("arr_media_guard_serve")
 arr_serve = h.arr_serve
+h.CFG = dataclasses.replace(h.CFG, burned_in="off")   # no model of the burned-in subtitle check here, so its start check would warn
 
 with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     h.arr_decide.set_policy(json.load(_f))

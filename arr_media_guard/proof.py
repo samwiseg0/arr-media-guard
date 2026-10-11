@@ -671,7 +671,8 @@ def times_fault(name, codec, xt, yt, video=None):
     original share a time with a neighbour, a second check measures every time against the video's start, as the start
     check does. A packet that shares a time may move one frame, the median step of the original, and TIME_SLACK more
     for the rounding. Every other packet may move TIME_SLACK. An MP4 can give its first two AAC packets one time, and mkvmerge spaces them one frame apart.
-    The check then names the shared packets in shared."""
+    The check then names the shared packets in shared. The refusal says where the new file plays out of sync, from the
+    moves of the check that refused, see out_of_sync()."""
     if len(xt) != len(yt) or None in xt or None in yt:
         return (f"stream {name} ({codec}) has packets with no time", {"checked": False}) if None in xt + yt else \
             (f"stream {name} ({codec}) holds {len(yt)} timed packets in the new file, {len(xt)} in the original", {"checked": False})
@@ -690,9 +691,34 @@ def times_fault(name, codec, xt, yt, video=None):
         if all(d <= (frame if i in same else 0) + TIME_SLACK for i, d in enumerate(moves)):
             return None, check
     if worst > TIME_SLACK:
-        return (f"a packet of stream {name} ({codec}) moved {worst * 1000:.0f} ms against its stream's start, {at:.3f} s into the "
-                "original"), check
+        if "shared" not in check:   # the moves of the first check, each against its stream's first time
+            moves, frame, same, video = [abs((q - b[0]) - (p - a[0])) for p, q in zip(a, b)], 0, set(), (a[0], b[0])
+        out = [i for i, d in enumerate(moves) if d > (frame if i in same else 0) + TIME_SLACK]
+        return out_of_sync(name, codec, a, b, out, moves, same, video), check
     return None, check
+
+
+# Per stream kind: how the new file plays it, and what it plays against, see out_of_sync()
+SYNC_WORDS = {"audio": ("play the audio", "the video"), "video": ("show the video", "the audio"), "subtitle": ("show the subtitles", "the video")}
+
+
+def out_of_sync(name, codec, a, b, out, moves, same, zero):
+    """The refusal of times_fault(): when the new file would play stream name out of sync, then one technical line. a
+    and b hold the sorted times of the original and the new file, out the packets that moved more than they may, moves
+    how far each one moved, same the packets that share a time in the original, and zero the time in each file that
+    the moves count from. The span takes its times from b. mkvmerge starts the new file at 0, so b holds the times a
+    player shows. The span runs from the first moved packet to the last one, or to the end when the last packet moved
+    too. Moved packets with in-sync packets between them name the number of places. A span inside one second is "at"
+    that second. The detail names the first moved packet with a time of its own, else the first moved packet. Its time
+    is where that packet belongs in the new file. It is the packet's time in the original, moved from zero there to
+    zero in the new file."""
+    (verb, other), ms = SYNC_WORDS[name.split()[0]], f"{max(moves[i] for i in out) * 1000:.0f} ms"
+    first, last = (decide.clock(max(0, b[i])) for i in (out[0], out[-1]))
+    start, places = "the start" if first == "0:00" else first, 1 + sum(j > i + 1 for i, j in zip(out, out[1:]))
+    span = f"at {start}" if first == last else f"in {places} places between {start} and {last}" if places > 1 else \
+        f"from {start} to the end" if out[-1] == len(b) - 1 else f"from {start} to {last}"
+    k = next((i for i in out if i not in same), out[0])
+    return f"the MKV would {verb} {ms} out of sync with {other}, {span}. Detail: {name} ({codec}) moved {ms}, first at {a[k] - zero[0] + zero[1]:.3f} s"
 
 
 def stored_times(path, index, timeout):

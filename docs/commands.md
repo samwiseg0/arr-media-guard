@@ -52,6 +52,7 @@ arr-media-guard --backfill sonarr --convert --apply           # convert them, CO
 arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
 arr-media-guard --backfill sonarr --ids 101 --sub-check --recheck   # the same, also the files checked before
 arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # time every subtitle of one file, dry
+arr-media-guard --burn-in "/data/movies/Film A (2000)/Film A (2000).mkv"   # look for burned-in subtitles, report only
 arr-media-guard-subhunt radarr --ids 123                      # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
 arr-media-guard --audit radarr --since 24h --post             # AMG's edits of the last day, to Discord
 ```
@@ -70,6 +71,26 @@ arr-media-guard --audit radarr --since 24h --post             # AMG's edits of t
   `--apply` changes one file at a time, and `--convert --apply` converts `CONVERT_WORKERS` at a time.
 - `--canary` needs `--apply` and `--plan-from`.
 - The subtitle hunter's `--force` tries again a film that an earlier run gave up on, or whose import failed.
+
+## Check for burned-in subtitles
+
+`--burn-in` runs the burned-in subtitle check on the files you name, as the check after an import runs it, see
+[features.md](features.md#burned-in-subtitles). It runs the quick check and the full check, and the second check when
+the full one finds subtitles it can read. It prints one line per file with what it found, and what the check after an
+import would do with the current settings, from that check's own decision. It changes no file, posts nothing, and
+queues nothing. Each file gets a decision line. It has no `--apply`.
+
+```
+arr-media-guard --burn-in "/data/movies/Film A (2000)/Film A (2000).mkv"
+arr-media-guard --burn-in --app sonarr --ids 101 102          # every file of these series
+```
+
+```
+quick check flagged, Japanese audio, full burned-in subtitles in English, the second pass agrees, the job would turn off the English subtitles and alert | Film A (2000) | /data/movies/Film A (2000)/Film A (2000).mkv
+```
+
+It needs the language detection install and the text models, and stops with the reason when they are missing. It runs
+at the lowest CPU and disk priority. A full check reads the whole audio of a file once, which takes minutes for a film.
 
 ## Plex after an apply
 
@@ -173,6 +194,7 @@ at most 10 seconds.
 | TMDB | always | TMDB's key check, with `TMDB_TOKEN`, else Radarr's key | TMDB did not answer, or it refused the key |
 | SABnzbd | `SABNZBD_API_KEY` is set | one slot of the queue, at `SABNZBD_URL` or the address Radarr saved | SABnzbd did not answer, it refused `SABNZBD_API_KEY`, or it refused the request, as from an address it does not let in |
 | Newznab indexer | `NEWZNAB_API_KEY` is set | `t=caps`, the indexer's list of features, at `NEWZNAB_URL` or the address Radarr saved | the indexer did not answer, or it refused `NEWZNAB_API_KEY` |
+| Burned-in subtitle check | `BURNED_IN` is not `off` | none. It looks for the language detection install, and checks the sha256 of each text model | the check cannot run, and why |
 
 ```
 arr-media-guard: plex start check: ok
@@ -262,6 +284,7 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --backfill sonarr --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-audio ...` | `$EXEC --backfill sonarr --check-audio ...` | API, Media, Discord |
 | `arr-media-guard --backfill sonarr --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-video ...` | `$EXEC --backfill sonarr --check-video ...` | API, Media, Discord |
 | `arr-media-guard --sub-time PATH ... [--apply]` | `$RUN --sub-time /data/PATH ...` | `$EXEC --sub-time /data/PATH ...` | Media, LID. The API names the original language, and Plex gets the request after a change. It exits 0, 1 (with `--apply` an app lookup failed and nothing changed, or the policy file did not load), 2 (a wrong option), 3 (with `--apply` a planned change did not happen) or 4 (a path holds no file). |
+| `arr-media-guard --burn-in (PATH ... \| --app sonarr --ids ID ...)` | `$RUN --burn-in /data/PATH ...` | `$EXEC --burn-in /data/PATH ...` | Media, LID. With `--app`: API. |
 | `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | With `--since`: API, Media, Discord. With `--plan-from`: none. |
 | `arr-media-guard-subhunt radarr --ids ID ... [--apply] [--force]` | `$RUN arr-media-guard-subhunt radarr --ids ID ...` | `docker exec -it arr-media-guard arr-media-guard-subhunt radarr --ids ID ...` | API, Media, LID, Discord, `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, and SABnzbd and NZBHydra2 at the addresses Radarr has saved, or at `SABNZBD_URL` and `NEWZNAB_URL`. The download folder at SABnzbd's path, or in a pair of Radarr's path map. |
 

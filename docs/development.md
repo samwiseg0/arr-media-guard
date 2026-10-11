@@ -31,6 +31,7 @@ The hunter imports the package, and the package never imports the hunter.
 | `align.py` | the whole-file timing of `--sub-time` and the deep analysis: the anchors, the offset curve and the moves |
 | `judge.py` | the timing outcome of each subtitle, after the moves and the write, and the record the alerts read |
 | `lid.py` | language detection. The venv in `LID_DIR` runs it by its path. |
+| `burnin.py` | the burned-in subtitle check, `quick()` and `full()`. The venv in `LID_DIR` runs it by its path, as `lid.py`. |
 | `health.py` | `status.json` for a monitoring agent |
 | `store.py` | the state store, one SQLite file in `STATE_DIR` |
 
@@ -47,6 +48,8 @@ python -m pytest -q
 ```
 
 The tests need pytest. The tests on real media files need `ffmpeg` and `mkvtoolnix`, and skip without them.
+The media tests of the burned-in subtitle check in `tests/test_burnin.py` also need numpy, onnxruntime, PyAV and the
+text models, and skip without them.
 With pytest-xdist installed, `python -m pytest -q -n auto` runs them on every core, as CI does.
 
 The tests assert codes and fields. [tests/test_report.py](../tests/test_report.py) holds the golden text of each
@@ -77,6 +80,11 @@ subtitle lines has its own rules.
 - The order of a time plan. `remux.time_plan()` checks the new starts with `subsync.ordered()`. The order of cue starts
   never changes, and two starts that did not tie never tie. Two cues that the plan clamps to 0 seconds may tie, because
   no start lies before 0.
+- The burned-in subtitle mute. `decide.invariants()` keeps the only English subtitles on under audio in another
+  language. A burn-in job is the one exception. When two passes read English text burned into the picture, it turns
+  the English subtitles off, see [Burned-in subtitles](design.md#burned-in-subtitles). It marks the file first.
+  `process.mute_rule()` checks every flag edit. An edit that turns off the only English subtitles under such audio needs
+  the mark, and an edit of a marked file never turns an English subtitle on.
 - Foreign subtitle timing. `subsync.nearer()` checks that a fix of `layout_fix()` never lowers the share of the
   speech that the lines show over. `subsync.check_kept()` checks a partial shift. It checks the order of the lines,
   kept runs only at the file's ends, and the core's edge. The edge is the first and last moved line with a speech
@@ -199,6 +207,10 @@ An entry counts only for the results of runs that make the check, see `SUB_RUNS`
 each of those files gets a recheck after the update. Such a recheck makes only the import's checks, see below. An
 entry on `foreign_timing`, `garbled_repair` or `block_timing` never reaches an import's result.
 
+The burned-in subtitle check has no entry. It keeps no saved result, so no update rechecks old files for it. A release
+that wants to check old files for burned-in subtitles needs a queue of its own for that, see "Burned-in subtitles" in
+design.md.
+
 `test_each_registry_entry_names_real_findings_and_versions` fails when an entry names a word that is not in
 `subtitles.SUB_FINDINGS`, or a version above the check's `version`. Run the tests after each edit.
 
@@ -265,8 +277,9 @@ files stay as they are until they change.
   see `runner.queue_rechecks()`. On a host, the first nightly audit of the version does it. The version is the hash
   of the code, `config.VERSION`. The state store marks it as done once every app answered. After a stop part way, the
   next start queues the rest, and a file whose job waits or runs gets no second one.
-- A recheck is a job of the *background queue*, the jobs in the state store. Imports always go first, then the deep
-  analyses, then the rechecks. A deep analysis or a recheck runs only while no import waits, one at a time.
+- A recheck is a job of the *background queue*, the jobs in the state store. Imports always go first, then the
+  burned-in subtitle checks, then the deep analyses, then the rechecks. Every job but an import runs only while no
+  import waits, one at a time.
 - A recheck repeats the checks of the run that saved the result, and never checks deeper. A result of an import gets
   the import's subtitle checks only, with no read of the whole file, no Foreign subtitle timing and no Garbled
   subtitle repair. A result of `--sub-check`, `--sub-time` or the deep analysis gets that run's checks.

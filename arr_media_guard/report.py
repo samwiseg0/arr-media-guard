@@ -293,6 +293,31 @@ def quote(title):
     return bold(f'"{title}"')
 
 
+def burned(f, t):
+    """The burned-in subtitles of finding f, see runner.burn_act(), and what the program did with the subtitle tracks.
+    The action of a re-grab or of a second check that disagreed follows it, see ACTIONS."""
+    lang = "English" if f["english"] else decide.lang_name(f["lang"]) if f["english"] is False and f.get("lang") else None
+    what = f"{lang} subtitles" if lang else "subtitles in another language" if f["english"] is False else "subtitles"
+    head = f"The video has {bold(what + ' burned in')}"
+    if f["english"] is None:
+        return f"{head}, but their language couldn't be read. Nothing was changed."
+    if not f["english"]:
+        return f"{head}." + (" BURNED_IN is set to check, so the file was kept." if f.get("check") else "")
+    if not lang_word(f["audio"]):
+        return f"{head}, and the language of the audio is unknown, so nothing was changed."
+    head, tracks = f"{head}, and the audio is {lang_word(f['audio'])}.", subs_name(f.get("tracks") or [], f["langs"])
+    edit = f.get("edit")
+    if not f.get("tracks"):
+        return head
+    if f.get("check") or f.get("not_mkv"):
+        return f'{head} {"BURNED_IN is set to check" if f.get("check") else "The file isn't MKV"}, so {tracks} stay on.'
+    if edit == "edited":
+        return f"{head} Turned off the default and forced flags of {tracks}."
+    why = {"hardlinked": "the file has another hard link, such as the download client's copy", "read_only": "the file is read-only"}
+    failed = f"{head} Couldn't turn off {tracks}" + (f", because {why[edit]}." if edit in why else ".")
+    return f"{failed} {after(f)}".rstrip() if f.get("changed") else f"{failed} The original file was not changed."
+
+
 # The plain words of an edit result that a failed flag edit names, see process.edit()
 EDIT_ERRORS = {"VERIFY FAILED, flags did not change": "the edit ran, but the flags did not change"}
 # Per finding code: the alert title and the text. A fault with an action takes its title from FAULT_TITLES instead.
@@ -316,19 +341,27 @@ FINDINGS = {
     "policy": ("Policy file didn't load", lambda f, t: f'{bold(f["file"])} didn\'t load, so no tracks are changed until it\'s fixed. {f["error"]}'),
     "submatch": ("Wrong subtitles", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
     "subtiming": ("Subtitles out of sync", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
+    "burned_in": ("Burned-in subtitles", lambda f, t: burned(f, t)),
 }
 # The title of a certain fault the hook acted on. Its action code adds the end, see ACTIONS. Red, or amber when unconfirmed.
-FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Broken video", "damage": "Damaged file"}
+FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Broken video", "damage": "Damaged file", "burned_in": "Burned-in subtitles"}
 # Per fault kind: the result of a faulty file, of a clean one, and the words for the files a re-grab deleted.
 FAULTS = {"audio": ("broken audio", "audio checked", "broken files"), "content": ("wrong content", "content checked", "files with the wrong content"),
-          "video": ("corrupt video", "video checked", "corrupt files"), "damage": ("damaged source", "source checked", "damaged files")}
+          "video": ("corrupt video", "video checked", "corrupt files"), "damage": ("damaged source", "source checked", "damaged files"),
+          "burned_in": ("burned-in subtitles", "burned-in subtitles checked", "files with burned-in subtitles")}
 # The result of a wrong-content verdict per outcome code, so the result says what happened, see process.content_checks().
 VERDICTS = {"wrong_content": "wrong content", "would_regrab": "would re-grab", "wrong_content_unconfirmed": "wrong content unconfirmed",
             "regrab_capped": "re-grab capped", "regrab_no_grab": "no grab record", "regrab_failed": "re-grab failed"}
 
 
+def removed(a, upgrade=True):
+    """The file a re-grab deleted, as its alert names it: the broken file, or the broken upgrade when upgrade is True and
+    the old file came back. A burn-in is no fault of the file's data, so its re-grab drops "broken"."""
+    return f'the {"" if a.get("kind") == "burned_in" else "broken "}{"upgrade" if upgrade and a.get("came") else "file"}'
+
+
 def regrabbed(a, t):
-    what = "the broken upgrade" if a.get("came") else "the broken file"
+    what = removed(a)
     if a.get("failed_before"):
         return f'Deleted {what}. Its download was already marked as failed, so {a["name"]} is already searching for another copy.'
     if a["n"] == 1:
@@ -338,17 +371,22 @@ def regrabbed(a, t):
 
 
 # The faults each REGRAB kind re-grabs, for the text of a kind REGRAB leaves out
-REGRAB_WORDS = {"audio": "broken audio", "video": "broken video", "content": "wrong content", "damage": "damaged files"}
+REGRAB_WORDS = {"audio": "broken audio", "video": "broken video", "content": "wrong content", "damage": "damaged files",
+                "burned_in": "burned-in subtitles"}
 # Per action code: the end of a fault's alert title, and the text. Every text ends with the restore, see restored().
 ACTIONS = {
     "regrabbed": (", re-grabbed", regrabbed),
-    "searched": (", re-grabbed", lambda a, t: f'Deleted the broken file and asked {a["name"]} to search for another copy. It was a manual import, '
-                                              "so there was no grab to mark as failed."),
-    "restored": (", old file restored", lambda a, t: "Deleted the broken file. It was a manual import, so there was no grab to mark as failed, "
-                                                     f'and {a["name"]} won\'t search for another copy.'),
-    "deleted": ("", lambda a, t: "Deleted the broken file. Its item isn't monitored, so no search was started."),
+    "searched": (", re-grabbed", lambda a, t: f'Deleted {removed(a, False)} and asked {a["name"]} to search for another copy. It was a manual '
+                                              "import, so there was no grab to mark as failed."),
+    "restored": (", old file restored", lambda a, t: f"Deleted {removed(a, False)}. It was a manual import, so there was no grab to mark as "
+                                                     f'failed, and {a["name"]} won\'t search for another copy.'),
+    "deleted": ("", lambda a, t: f"Deleted {removed(a, False)}. Its item isn't monitored, so no search was started."),
     "would_regrab": (", re-grab is off", lambda a, t: f'Re-grabs for {REGRAB_WORDS[a["kind"]]} are off, so the file was kept.'),
     "unconfirmed": (", not confirmed", lambda a, t: "A second check didn't find the same problem, so the file was kept."),
+    # A second pass of the burned-in subtitle check that read another verdict, or too little speech, see runner.burn_plan()
+    "disagreed": (", not confirmed", lambda a, t: "A second check on other frames disagreed, so nothing was changed."),
+    "unsure": (", not confirmed", lambda a, t: "A second check on other frames couldn't tell, so nothing was changed."),
+    "once": ("", lambda a, t: "An earlier copy was already re-grabbed for this, so this copy was kept."),
     "capped": ("", lambda a, t: f'The limit of {a["cap"]} re-grabs a day was reached, so the file was kept.'),
     "no_grab": ("", lambda a, t: f'{a["name"]} has no record of grabbing it, so the file was kept.'),
     "failed": ("", lambda a, t: f'The {"restore" if a.get("manual") else "re-grab"} failed during {a["step"]}. {a["error"]}'[:300]),
@@ -387,7 +425,7 @@ def title(f):
     """(title, color) of the alert of finding f."""
     a = f.get("action")
     if f["kind"] in FAULT_TITLES and a:
-        return FAULT_TITLES[f["kind"]] + ACTIONS[action_code(a)][0], "amber" if a["code"] == "unconfirmed" else "red"
+        return FAULT_TITLES[f["kind"]] + ACTIONS[action_code(a)][0], "amber" if a["code"] in ("unconfirmed", "disagreed", "unsure", "once") else "red"
     if f["kind"] == "repack" and f.get("note"):   # a conversion that a stopped run left
         return "Stopped conversion", "amber"
     return FINDINGS[f["kind"]][0], "amber"
@@ -742,7 +780,7 @@ def item_embed(rec, head, text, color, note=None, more=()):
 # The check that found the problem of an issue alert, by the source of its record. A scan and the audit post a summary
 # of their own. worker is the worker's start, which reports a conversion a stopped run left, see convert.pending_recover().
 CHECKS = {"hook": "Import check", "deep_analysis": "Deep analysis", "recheck": "Recheck", "backfill": "Command line run",
-          "worker": "Worker start"}
+          "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
 # The steps where a fix can stop, in the order a job runs them, see stopped_at()
 CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "Hearing the speech", "Finding the shift", "Testing the fix",
                                                           "Writing the file", "Replacing the file")
@@ -751,11 +789,12 @@ CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "
 # finished, whose extras wait for the app to take the new file, stopped at the swap of the file in the app.
 FINDING_STEPS = {"language": None, "runtime": None, "duration": None, "episode": None, "content": None, "audio": None, "video": None,
                  "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "header": WRITE, "cut": None,
-                 "subtitle": None, "sublang": None, "edit": WRITE, "policy": None, "submatch": None, "subtiming": None}
+                 "subtitle": None, "sublang": None, "edit": WRITE, "policy": None, "submatch": None, "subtiming": None,
+                 "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None}
 # Per action code. A setting or the daily limit stops a re-grab before it starts, and so does a second check that did
 # not find the fault again.
 ACTION_STEPS = {"regrabbed": REPLACE, "searched": REPLACE, "restored": REPLACE, "deleted": REPLACE, "would_regrab": None, "unconfirmed": None,
-                "capped": None, "no_grab": REPLACE, "failed": REPLACE, "dry_run": None, "no_policy": None}
+                "disagreed": None, "unsure": None, "once": None, "capped": None, "no_grab": REPLACE, "failed": REPLACE, "dry_run": None, "no_policy": None}
 # The start of each reason for a sidecar left in place that a setting gives, see subtitles.sidecar_fix() and convert.convert_subs()
 SETTING_LEFT = (KEPT_BACK["check"], "KEEP_ORIGINALS_DAYS is 0")
 sidecar_step = lambda x: WRITE if x.get("left") and not x["left"].startswith(SETTING_LEFT) else None
@@ -835,7 +874,8 @@ def tells(f, langs):
     after the run with track_langs(after=True), else before its remux."""
     lines = f.get("lines") or []
     return {"flags": {n.split(" ")[0] for n in f.get("muted") or []}   # see FINDINGS sublang
-            | {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")},
+            | {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")}
+            | (set(f.get("tracks") or ()) if f.get("edit") == "edited" else set()),   # see burned()
             "moved": {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off") or x["code"] == "off" and "moved" in x},
             "converted": any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)}
 

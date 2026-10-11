@@ -86,7 +86,7 @@ def test_regrab_lists_the_kinds_that_regrab(tmp_path, text, kinds):
 def test_an_unknown_regrab_kind_is_left_out_and_fails_the_selftest(tmp_path):
     m = load(tmp_path, "REGRAB='audio,sound,video'\n")
     assert m.CFG.regrab == {"audio", "video"}   # the safest reading: only the kinds it knows
-    assert m.CFG.errors == ["REGRAB names sound, which is no re-grab kind, so it is left out. The kinds are audio, video, content, damage."]
+    assert m.CFG.errors == ["REGRAB names sound, which is no re-grab kind, so it is left out. The kinds are audio, video, content, damage, burned_in."]
     with pytest.raises(SystemExit) as ex:
         m.main(["--selftest"])
     assert "REGRAB names sound" in str(ex.value)
@@ -126,6 +126,28 @@ def test_an_env_file_that_sets_neither_key_runs_two_hook_workers_at_the_deep_lev
     assert (m.CFG.hook_workers, m.CFG.subtitles, m.CFG.errors) == (2, "deep", [])
     example = dict(env_lines(open(os.path.join(FILES, "examples", "arr-media-guard.env")).read()))
     assert (example["HOOK_WORKERS"], example["SUBTITLES"]) == ("'2'", "'deep'")
+
+
+@pytest.mark.parametrize("text, level", [("", "fix"), ("BURNED_IN='off'\n", "off"), ("BURNED_IN='Check'\n", "check"), ("BURNED_IN='fix'\n", "fix")])
+def test_burned_in_sets_the_burned_in_subtitle_check_and_fix_is_the_default(tmp_path, text, level):
+    """The default is fix, and the example env file holds it. burned_in is a re-grab kind that REGRAB leaves out by
+    default."""
+    m = load(tmp_path, text)
+    assert m.CFG.burned_in == level and m.CFG.errors == [] and "burned_in" not in m.CFG.regrab
+    assert dict(env_lines(open(os.path.join(FILES, "examples", "arr-media-guard.env")).read()))["BURNED_IN"] == "'fix'"
+    assert load(tmp_path, "REGRAB='audio,burned_in'\n").CFG.regrab == {"audio", "burned_in"}
+
+
+@pytest.mark.parametrize("level", ["off", "check", "fix"])
+def test_the_selftest_warns_when_burned_in_is_on_and_the_check_is_not_installed(tmp_path, capsys, level):
+    """The burned-in subtitle check needs its models. A setup without them still passes, and says why no import gets
+    the check. At off it says nothing."""
+    m = load(tmp_path, f"BURNED_IN='{level}'\nLID_DIR='{tmp_path / 'no-lid'}'\n")   # no install, on any test host
+    m.main(["--selftest"])
+    out = capsys.readouterr().out
+    warned = (f"warning: BURNED_IN is {level}, but language detection is not installed, and the burned-in subtitle check runs in its venv, "
+              "so no import gets the burned-in subtitle check" in out)
+    assert warned == (level != "off") and out.endswith("selftest ok\n"), out
 
 
 def test_an_unknown_subtitles_level_acts_as_check_and_fails_the_selftest(tmp_path):
@@ -283,7 +305,9 @@ WHOLE = "is not a whole number of {} or more, so it counts as {}."
     ("SUBTITLES=''", "subtitles", "check", "SUBTITLES '' is no level, so the subtitle check of an import runs as check. The levels are "
                                            "off, check, fix, deep."),
     ("REGRAB='sound'", "regrab", set(), "REGRAB names sound, which is no re-grab kind, so it is left out. The kinds are audio, video, "
-                                        "content, damage."),
+                                        "content, damage, burned_in."),
+    ("BURNED_IN='on'", "burned_in", "check", "BURNED_IN 'on' is no level, so the burned-in subtitle check only alerts. The levels are off, check, "
+                                             "fix."),
     ("PLEX_PATH_MAP='/a'", "plex_path_map", [], "PLEX_PATH_MAP takes pairs PLEX_PATH:LOCAL_PATH of absolute paths, joined by '|'. A pair "
                                                 "that is not one is left out.")])
 def test_each_parser_reads_a_bad_value_the_safest_way_and_the_selftest_names_it(tmp_path, line, field, value, error):

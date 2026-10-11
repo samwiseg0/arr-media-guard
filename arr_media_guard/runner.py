@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
-import collections, contextlib, dataclasses, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request
+import collections, contextlib, dataclasses, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request, uuid
 
 from . import apps, checks, cli, config, content, convert, decide, judge, logs, plex, process, regrab, report, store, subsync, subtitles, vault
 
@@ -198,12 +198,13 @@ def queued():
 
 
 def deep_analysis_queued():
-    """The names of the deep analysis and recheck jobs, see deep_name(). The deep analyses go first, so a new import's
-    waits behind no batch of rechecks. Then each kind runs the one queued longest ago first. json.dumps() writes the
-    key of a recheck as "recheck": with a space, and a value that holds the word escapes its quotes, so the test
-    matches the key alone, on any SQLite."""
+    """The names of the jobs of the background queue: the burn-in jobs, see burn_name(), then the deep analyses, then
+    the rechecks, see deep_name(). A burn-in job is short and may change what plays, and a deep analysis goes before
+    the rechecks, so a new import's jobs wait behind no batch of rechecks. Then each kind runs the one queued longest
+    ago first. json.dumps() writes the key of a recheck as "recheck": with a space, and a value that holds the word
+    escapes its quotes, so the test matches the key alone, on any SQLite."""
     return [n for n, in store.read("SELECT name FROM jobs WHERE claimed = 0 AND name LIKE 'deep-analysis-%' "
-                                   """ORDER BY instr(job, '"recheck": ') > 0, at, name""")]
+                                   f"ORDER BY name NOT LIKE '{BURN_PREFIX}%', " """instr(job, '"recheck": ') > 0, at, name""")]
 
 
 def job_of(name, claimed=False):
@@ -332,6 +333,33 @@ def held_after(job, rec):
     return out
 
 
+BURN_PREFIX = "deep-analysis-burnin-"   # the name of a burn-in job starts with the background queue's, see burn_name()
+GRAB_KEYS = ("owner", "file_id", "episode_ids", "download_id", "deleted", "recycled", "release")   # the import job's fields a re-grab reads
+
+
+def burn_name(path):
+    """The name of the burn-in job of path, see burn_in(). It starts as the name of a deep analysis job does, so every
+    rule of the background queue holds for it: it waits while an import waits, runs one at a time with the deep
+    analyses and rechecks, and yields to an import. A newer import of the path replaces a queued one."""
+    return f"{BURN_PREFIX}{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
+
+
+def queue_burn_in(job, rec, inputs):
+    """Queue the burn-in job of the file an import job checked, when the quick check of the import flagged it or could
+    not tell, see process.quick_check(). As a deep analysis job, it carries inputs, the decision inputs of the import
+    with its process.plan_inputs() in "plan", the file_key() of the file the import left, and the import's job in "from". It also carries the audio track the
+    quick check read, and in "grab" the fields of the import job that a re-grab reads, see
+    regrab.regrab(). Returns its name, or None. A file that is gone raises OSError."""
+    b, path = rec.get("burned_in") or {}, rec.get("path")
+    if b.get("result") not in ("flagged", "unsure"):
+        return None
+    name = burn_name(path)
+    store.write("INSERT OR REPLACE INTO jobs (name, at, job) VALUES (?, ?, ?)", name, time.time(), json.dumps(dict(
+        app=job.get("app"), path=path, ids=rec.get("ids") or {}, inputs=inputs, time=time.time(), key=file_key(os.stat(path)), audio=b.get("audio"),
+        quick=b["result"], grab={k: job.get(k) for k in GRAB_KEYS}, **({"from": rec["job"]} if rec.get("job") else {}))))
+    return name
+
+
 def deep_name(path):
     """The name of the job of the background queue for path, a deep analysis or a recheck. The worker runs a job of
     this name only while no import waits, one at a time."""
@@ -402,6 +430,301 @@ def deep_replaced(job):
     return None
 
 
+def follow(name, job, claimed, rec):
+    """(the job, how it drops or None) of the job name of the background queue, see deep_replaced(). A rename or a move
+    of the app queues no new import, so a job whose file is gone asks the app where it is, see app_file(). A moved file
+    gives the job its new path and key, in the store too, so a yield keeps them, and a file_moved line. rec takes the
+    new path. claimed is as in deep_analysis()."""
+    drop = deep_replaced(job)
+    if drop and drop["outcome"] == "file_gone":
+        try:
+            new, why, gone = app_file(job)
+        except Exception as ex:
+            new, why, gone = None, config.mask(f"the app was not asked where the file is: {type(ex).__name__}: {ex}")[:300], False
+        if new:
+            logs.log(dict(source=rec["source"], app=job["app"], job=name, result="file_moved", old_path=job["path"], path=new))
+            job, drop = dict(job, path=new, key=file_key(os.stat(new))), None
+            put_job(name, job, claimed)
+            rec["path"] = new
+        else:
+            drop.update(note=why, **({"app_said": "gone"} if gone else {}))
+    return job, drop
+
+
+def background(name, pending, claimed=False):
+    """Run the job name of the background queue: a burn-in job, see burn_in(), else a deep analysis or a recheck, see
+    deep_analysis()."""
+    return (burn_in if name.startswith(BURN_PREFIX) else deep_analysis)(name, pending, claimed)
+
+
+def burn_in(name, pending, claimed=False):
+    """One burn-in job (docs/design.md, "Burned-in subtitles"): the full burned-in subtitle check of the file of an
+    import whose quick check flagged it or could not tell, see queue_burn_in(), and what BURNED_IN does with the
+    verdict, see burn_act(). It runs in the background queue, ahead of the deep analyses, see deep_analysis_queued().
+    It follows a rename or a move of its file, and drops itself when the file is gone or replaced, as a deep analysis
+    does, see follow(). It drops itself at BURNED_IN off, and when the check is not installed. Its reads take no file
+    lock, so no import waits for them. It yields when an import waits in the queue, and goes back to its queue then, as
+    a deep analysis does. Its decision line has source burn_in."""
+    started, rec, job = time.time(), dict(id=uuid.uuid4().hex[:12], source="burn_in", job=name), {}
+    try:
+        job = job_of(name, claimed)
+        got = job.get("inputs") or {}
+        rec.update(app=job["app"], path=job["path"], apply=True, ids=job.get("ids") or {}, label=got.get("label") or os.path.basename(job["path"]))
+        job, drop = follow(name, job, claimed, rec)
+        why = process.burn_ready()
+        if drop:
+            rec.update(drop)
+        elif config.CFG.burned_in == "off":   # turned off after the job was queued
+            rec.update(outcome="burned_in_off", result="dropped, BURNED_IN is off")
+        elif why:
+            rec.update(outcome="burned_in_skipped", result=f"dropped, {why}")
+        else:
+            rec = burn_act(name, job, rec, pending, claimed)
+    except subtitles.Yielded as ex:
+        logs.log(dict(rec, result="yielded", note=str(ex)))
+        if claimed:   # back to the background queue, unless a newer import queued the path again meanwhile
+            requeue(name)
+        return
+    except Exception as ex:   # record it and go on: a background job never stops the worker
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+            raise
+        if job.get("path") and (drop := deep_replaced(job)):   # the app replaced or removed the file during the run
+            rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
+        else:
+            rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500], trace=traceback.format_exc(limit=3)[-800:])
+    if job.get("from"):   # the import job that queued it, so a reader can match the two lines
+        rec["from"] = job["from"]
+    rec = logs.decision(rec, started)
+    want = (job.get("inputs") or {}).get("want")
+    if want and os.path.exists(rec.get("path") or "") and process.changed(rec):
+        pending.append(plex.plex_after(rec["app"], "burn_in", rec, want))
+    drop_job(name, claimed)
+
+
+def burn_full(path, audio, duration, second=False, queue=None):
+    """burnin.full() of path on audio, see process.burn_audio(), through process.burn_run(). second picks other frames
+    than the first pass. It yields when an import waits in the queue of the store at queue, as the speech read of the
+    deep analysis does, and raises Yielded then. A run ends after BURN_TIMEOUT seconds."""
+    v = process.burn_run(path, audio["index"], duration, ["--full"] + ["--second"] * second, config.BURN_TIMEOUT, queue)
+    if v.get("yielded"):
+        raise subtitles.Yielded("an import waits, during the burned-in subtitle check")
+    return v
+
+
+def burn_words(v):
+    """The burned-in subtitles of the verdict v of burnin.full() for a result: "full burned-in subtitles in English". A
+    file with too little speech gets no verdict."""
+    if v["label"] in ("none", "unsure"):
+        return "no burned-in subtitles" if v["label"] == "none" else "no verdict on burned-in subtitles, too little speech"
+    lang = f' in {decide.lang_name(v["text_lang"])}' if v.get("text_lang") else " in another language" if v.get("english") is False else ""
+    return f'{v["label"]} burned-in subtitles{lang}'
+
+
+BURNED = "subtitles in another language are burned in"   # the fault of a burn-in re-grab, see regrab.regrab()
+BURN_ONCE = "burned_in_once"   # the store's ns of the items whose copy a burn-in in their own language re-grabbed once, see burn_plan()
+
+
+MUTED = "burned_in_muted"   # the store's ns of the files whose English subtitles a burn-in job turned off, see muted()
+
+
+def muted(path, st=None):
+    """Whether a burn-in job turned off the English subtitles of the file at path, see burn_act(). The mark in MUTED
+    holds the inode and the size of that file, st or its stat now. A new file at the path, as an import or an upgrade
+    puts there, has another inode or size, and clears the mark. A store that does not read gives False."""
+    try:
+        m = store.get(MUTED, path)
+        if not m:
+            return False
+        st = st or os.stat(path)
+        if [st.st_ino, st.st_size] == [m["ino"], m["size"]]:
+            return True
+        store.drop(MUTED, path)
+    except (OSError, sqlite3.Error):
+        pass
+    return False
+
+
+def mute_mark(path, before=None):
+    """Mark the file at path as muted, see muted(), with its stat now. With before, the stat of the file before an edit
+    or a remux of AMG's own, only a file whose mark matched before keeps it."""
+    with contextlib.suppress(OSError, sqlite3.Error):
+        if before is None or muted(path, before):
+            st = os.stat(path)
+            store.put(MUTED, path, {"ino": st.st_ino, "size": st.st_size})
+
+
+def burn_item(app, owner, episodes):
+    """The key of an item in BURN_ONCE: the episodes of a Sonarr file, else the movie owner."""
+    return f'{app}|episodes {",".join(map(str, sorted(episodes)))}' if episodes else f"{app}|movie {owner}"
+
+
+def burn_own(v, audio, original):
+    """Whether the text of the verdict v is in the language of the audio or the item's original language, as Chinese
+    text on a Chinese film. Every copy of such a film may have it burned in."""
+    return bool(decide.codes(v.get("text_lang")) & (decide.codes(audio) | decide.codes(original)))
+
+
+def burn_plan(first, audio, second=None, original=None, item=None):
+    """What the passes of burnin.full() found, see burn_passes(). audio is the language tag of the audio that plays
+    first, and original the item's original language. log: a partial, no or unsure verdict, or English text on English
+    audio. alert: text whose language the check cannot read, or English text on untagged audio. second: a full burn-in
+    whose text is English over audio in another language, or in another language. A second pass on other frames must
+    agree. mute: both read English text. regrab: both read text in another language. once: as regrab, but the text is
+    in the language of the audio or of the item, and an earlier copy of item was re-grabbed for it, see BURN_ONCE.
+    disagreed: the second pass read another verdict. unsure: it found too little speech."""
+    if first["label"] != "full":
+        return "log"
+    if first["english"] is None or (first["english"] and not decide.codes(audio)):
+        return "alert"
+    if first["english"] and "eng" in decide.codes(audio):
+        return "log"
+    if second is None:
+        return "second"
+    if second["label"] == "unsure":
+        return "unsure"
+    if second["label"] != "full" or second["english"] is not first["english"]:
+        return "disagreed"
+    if first["english"]:
+        return "mute"
+    return "once" if item and burn_own(first, audio, original) and store.get(BURN_ONCE, item) else "regrab"
+
+
+def burn_passes(path, audio, duration, original=None, item=None, first=None, queue=None, keep=None):
+    """({"first", "second"}, plan): the passes of the full check of path on audio, see process.burn_audio(), and
+    burn_plan(). A second pass runs only when the first asks for one. first is a first pass a yield kept, and keep(first)
+    stores it before the second pass starts, see burn_act(). queue is as in burn_full()."""
+    facts = {"first": first or burn_full(path, audio, duration, queue=queue)}
+    plan = burn_plan(facts["first"], audio["lang"], original=original, item=item)
+    if plan == "second":
+        if keep:
+            keep(facts["first"])
+        facts["second"] = burn_full(path, audio, duration, second=True, queue=queue)
+        plan = burn_plan(facts["first"], audio["lang"], facts["second"], original, item)
+    return facts, plan
+
+
+def burn_on(ts):
+    """The English subtitle tracks of ts, decide.classify() of a file, that are on: default or forced."""
+    return [t for t in ts if t["kind"] == "s" and "eng" in decide.codes(t["lang"]) and (t["default"] or t["forced_flag"])]
+
+
+def burn_step(plan, mkv, on):
+    """What the burn-in job does with plan at BURNED_IN and REGRAB, see burn_plan(): log, alert, mute, regrab or
+    regrab_off. mute needs fix, an MKV file and on, an English subtitle track that is on. regrab needs fix, and
+    regrab_off is a re-grab that REGRAB leaves out. Every other plan alerts, and so does a mute or a re-grab at check.
+    --burn-in prints it, see cli.burn_file()."""
+    fix = config.CFG.burned_in == "fix"
+    if plan == "log":
+        return "log"
+    if plan == "mute" and fix and mkv and on:
+        return "mute"
+    if plan == "regrab" and fix:
+        return "regrab" if "burned_in" in config.CFG.regrab else "regrab_off"
+    return "alert"
+
+
+# The class of a burn-in decision line per plan, see burn_act(). It names what the check found. The nightly audit lists
+# the class of an edited line.
+BURN_CLASSES = {"log": "burned-in subtitles, logged", "alert": "burned-in subtitles, alerted", "mute": "burned-in English subtitles over other audio",
+                "regrab": "burned-in subtitles in another language", "once": "burned-in subtitles, kept after one re-grab",
+                "disagreed": "burned-in subtitles, not confirmed", "unsure": "burned-in subtitles, not confirmed"}
+
+
+def burn_act(name, job, rec, pending, claimed=False):
+    """The full check of the burn-in job name, and what BURNED_IN does with its verdict, see burn_plan() and
+    burn_step(). It reads the audio that plays first from the file as it is now. A partial or no burn-in, and English
+    text on English audio, log only. Every full burn-in whose text it reads gets a second pass on other frames, at
+    check too, so check alerts on what fix would act on. A first pass the job keeps across a yield is not run again.
+    At fix, English text in both passes over audio in another language turns off the default and forced flags of each
+    English subtitle track that is on, through the flag edit of an import, see process.edit(), and alerts once. A file
+    that is not Matroska keeps its flags. Text in another language in both passes re-grabs the file as an import's
+    would be, with the cap, the kept copies and the restore of regrab.regrab(). Text in the language of the audio or the
+    item's original language re-grabs once per item, see BURN_ONCE. The next copy with it alerts and stays. A second
+    pass that disagrees or cannot tell alerts and changes nothing. The passes read with no file lock. The lock is held
+    shared to read the tracks, and exclusive only for the edit or the re-grab, after a check that the import's file is
+    still there. The other files of the download are checked by their own jobs. pending takes the Plex analyze of a
+    restored old file. Returns the decision record."""
+    app, path, got, grab = job["app"], job["path"], job.get("inputs") or {}, dict(job.get("grab") or {}, app=job["app"], path=job["path"])
+    ts, _, duration = process.burn_probe(path, checks.mkvmerge(path))
+    audio, mkv, fix = process.burn_audio(ts), path.lower().endswith(".mkv"), config.CFG.burned_in == "fix"
+    if not audio:
+        return dict(rec, outcome="burned_in_skipped", result="skipped, the file has no audio track")
+    item = burn_item(app, grab.get("owner"), regrab.job_episodes(grab))
+    facts, plan = burn_passes(path, audio, duration, got.get("original"), item, job.get("first"), store.path(),
+                              lambda first: put_job(name, dict(job, first=first), claimed))
+    facts = dict(facts, quick=job.get("quick"), audio=audio)
+    first, words = facts["first"], burn_words(facts["first"])
+    rec = dict(rec, outcome=f'burned_in_{first["label"]}', result=f"{words}, logged only", burned_in=dict(facts, plan=plan),
+               original=got.get("original"), kids=bool(got.get("kids")), release=got.get("release") or "", **{"class": BURN_CLASSES[plan]})
+    if plan == "log":
+        return rec
+    f = {"kind": "burned_in", "lang": first["text_lang"], "english": first["english"], "audio": audio["lang"],
+         **({"check": True} if plan in ("mute", "regrab") and not fix else {})}
+    rec["result"] = f"{words}, alerted" + (", BURNED_IN is check" if f.get("check") else "")
+    if plan == "mute":
+        with locked(shared=not (fix and mkv)):   # the tracks as they are now, and the edit
+            if drop := deep_replaced(job):
+                return dict(rec, **drop)
+            j = checks.mkvmerge(path)
+            ts = decide.classify(j)
+            on = burn_on(ts)
+            rec["tracks"], f["tracks"] = logs.track_log(ts), [t["pos"] for t in on]
+            if on and fix and not mkv:
+                f["not_mkv"] = True
+            elif burn_step(plan, mkv, bool(on)) == "mute":
+                edits = [[t["sel"], 0, 1] for t in on if t["default"]] + [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in on if t["forced_flag"]]
+                mute_mark(path)   # first, so the safety rule of the edit sees it, see process.mute_rule(). edit() carries it.
+                done = process.edit(rec, j, edits, True, replan=lambda after: kept_off(after, got), ts=ts)
+                rec = dict(done, outcome=rec["outcome"], edit_result=done["result"], result=f'{words}, {done["result"]}')
+                f["edit"] = done["outcome"]
+                if burn_changed(done, {t["sel"] for t in on}):   # mkvpropedit can fail and still write, see process.edit()
+                    f.update(changed=True, unread=done.get("after_error"),
+                             on=None if "after" not in done else [f'{t["pos"]} {t["lang"]}' for t in done["after"] if t["default"]])
+                elif done["outcome"] != "edited":   # the subtitles stay on, so nothing keeps them off
+                    try:
+                        store.drop(MUTED, path)
+                    except sqlite3.Error as ex:   # the alert still posts. A stale mark only stops later runs turning English subtitles on.
+                        rec["note"] = config.mask(f"the mark was not dropped: {type(ex).__name__}: {ex}")[:300]
+    elif plan == "regrab" and burn_step(plan, mkv, False) == "regrab_off":
+        f["action"] = {"code": "would_regrab", "kind": "burned_in"}
+        rec["result"] = f"{words}, re-grab would_regrab"
+    elif plan == "regrab" and fix:
+        with locked():   # a re-grab deletes the file
+            if drop := deep_replaced(job):
+                return dict(rec, **drop)
+            # The second pass ran before the lock, and an edit in place never changes the picture, so it is the second check.
+            f["action"] = dict(regrab.regrab(app, grab, BURNED, lambda p, other, fresh=False: (BURNED, {"burned_in": facts["second"]}), "burned_in"),
+                               kind="burned_in")
+        if f["action"]["code"] in ("regrabbed", "searched", "restored", "deleted") and burn_own(first, audio["lang"], got.get("original")):
+            try:   # the next copy with it stays
+                store.put(BURN_ONCE, item, {"path": path, "lang": first["text_lang"]})
+            except sqlite3.Error as ex:   # the alert still posts. The next copy with it is re-grabbed once more.
+                rec["note"] = config.mask(f"the re-grab of the item was not stored: {type(ex).__name__}: {ex}")[:300]
+        rec = regrab.restore_log(dict(rec, regrab=f["action"]["code"], result=f'{words}, re-grab {f["action"]["code"]}'), grab, pending, app)
+    elif plan in ("disagreed", "unsure", "once"):
+        f["action"] = {"code": plan}
+        rec["result"] = f'{words}, {"kept, an earlier copy was re-grabbed for it" if plan == "once" else "not confirmed by a second pass"}'
+    rec.update(findings=[f], alert_kinds=["burned_in"])
+    rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(path) if os.path.exists(path) else 0)
+    return rec
+
+
+def burn_changed(done, sels):
+    """Whether a flag edit of a burn-in job that failed, done from process.edit(), changed a flag of the tracks of sels
+    all the same, or left the file unread. The alert then says how the file was left, see report.burned()."""
+    if done["outcome"] not in ("edit_failed", "verify_failed"):
+        return False
+    was, now = ({t["sel"]: (t["default"], t["forced"]) for t in done.get(k) or []} for k in ("before", "after"))
+    return "after" not in done or any(was.get(s) != now.get(s) for s in sels)
+
+
+def kept_off(after, got):
+    """The plan of the file after the flag edit of a burn-in job, from the decision inputs of its import in got, see
+    process.replan(), less the edits that turn English subtitles on again, see process.muted_plan(). The mark keeps
+    them off, so the nightly audit counts no further edit for them, see process.edit() and cli.audit()."""
+    return process.muted_plan(process.replan(after, got["plan"]))
+
+
 def deep_waits():
     """Raise Yielded when an import job waits in the queue. The deep analysis asks between two steps, see deep_analysis()."""
     if queued():
@@ -436,20 +759,10 @@ def deep_analysis(name, pending, claimed=False):
     started, rec, want, job, ctx = time.time(), dict(source="deep_analysis", job=name), None, {}, None
     try:
         job = job_of(name, claimed)
-        app, path, got = job["app"], job["path"], job.get("inputs") or {}
-        rec.update(app=app, path=path, **({"source": "recheck"} if job.get("recheck") else {}))
-        if (drop := deep_replaced(job)) and drop["outcome"] == "file_gone":   # a rename or a move of the app queues no new import
-            try:
-                new, why, gone = app_file(job)
-            except Exception as ex:
-                new, why, gone = None, config.mask(f"the app was not asked where the file is: {type(ex).__name__}: {ex}")[:300], False
-            if new:   # the job goes on at the new path, and a yield keeps it
-                logs.log(dict(source=rec["source"], app=app, job=name, result="file_moved", old_path=path, path=new))
-                job, path, drop = dict(job, path=new, key=file_key(os.stat(new))), new, None
-                put_job(name, job, claimed)
-                rec["path"] = path
-            else:
-                drop.update(note=why, **({"app_said": "gone"} if gone else {}))
+        app, got = job["app"], job.get("inputs") or {}
+        rec.update(app=app, path=job["path"], **({"source": "recheck"} if job.get("recheck") else {}))
+        job, drop = follow(name, job, claimed, rec)
+        path = job["path"]
         if drop:
             rec.update(drop)
         elif job.get("recheck") and not subtitles.sub_on("recheck"):   # SUBTITLES went off after the job was queued
@@ -755,8 +1068,12 @@ def service_checks(until=0):
     PLEX_URL, discord with DISCORD_WEBHOOK, tmdb always, and sabnzbd and newznab each with its subtitle hunter key. Each
     check is one GET that changes nothing. None posts to Discord or sends a search. The listener's start check and
     --selftest run them after the apps. A service that does not answer is asked again every ASK_AGAIN seconds until
-    the monotonic time until. Two Radarr instances with the same result give one line."""
+    the monotonic time until. Two Radarr instances with the same result give one line. With BURNED_IN on, burned_in
+    says whether the burned-in subtitle check can run, see process.burn_ready()."""
     c, out = config.CFG, []
+    if c.burned_in != "off":
+        why = process.burn_ready()
+        out.append(("burned_in", why and f"BURNED_IN is {c.burned_in}, but {why}, so no import gets the burned-in subtitle check"))
     short = apps.ARR_TIMEOUT.set(TEST_TIMEOUT)   # the hunter's addresses come from Radarr
     try:
         if c.plex_url:
@@ -1157,8 +1474,8 @@ def worker(lock):
         deep = deep_analysis_queued()
         if jobs:
             run_job(jobs[0], pending)
-        elif deep:   # a deep analysis job only when no import waits
-            deep_analysis(deep[0], pending)
+        elif deep:   # a job of the background queue only when no import waits
+            background(deep[0], pending)
         plex.plex_pass(pending)
         if jobs or deep:
             continue
@@ -1439,8 +1756,8 @@ def run_job(name, pending, shared=False, claimed=False):
     the lock before the checks, and the job drops as file_gone when the app no longer has it. shared is a job process
     of coordinate(): the checks hold the file lock shared, see process(). A job that raises Replan runs again here with
     the lock exclusive from the start, after a log line that says why."""
-    if name.startswith("deep-analysis-"):   # a job process of coordinate() runs a deep analysis job too
-        return deep_analysis(name, pending, claimed)
+    if name.startswith("deep-analysis-"):   # a job process of coordinate() runs a job of the background queue too
+        return background(name, pending, claimed)
     rec, want, started, path, again, run = dict(source="hook", job=name), None, time.time(), None, None, None
     job = {}   # restore_log() reads it after an error too
     try:
@@ -1541,10 +1858,16 @@ def run_job(name, pending, shared=False, claimed=False):
     if edited and want:   # outside the file lock, so a slow Plex never holds up the next file
         pending.append(plex.plex_after(app, "hook", rec, want))
     held, deep = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
-    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match"
+    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", and its burn-in job
+        inputs = dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx, release=job.get("release") or "")
         with contextlib.suppress(OSError, sqlite3.Error):
-            deep = queue_deep_analysis(job, rec, dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx,
-                                                      release=job.get("release") or ""), held)
+            deep = queue_deep_analysis(job, rec, inputs, held)
+        try:
+            queue_burn_in(job, rec, dict(inputs, plan=process.plan_inputs(run)))
+        except (OSError, sqlite3.Error) as ex:   # a busy store, or the file went
+            with contextlib.suppress(OSError):
+                logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning",
+                              note=config.mask(f"the burned-in subtitle check of the file did not queue: {type(ex).__name__}: {ex}")[:300]))
     if held and not deep:   # a held alert is never lost
         with contextlib.suppress(OSError):
             logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning", held_result=logs.post_held(rec["app"], rec["path"], held),

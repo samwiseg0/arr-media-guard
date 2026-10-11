@@ -1,9 +1,10 @@
 # Docker
 
-The arr-media-guard (AMG) image holds everything AMG needs: its two commands, `ffmpeg`, `mkvtoolnix`, and language
-detection with its speech model. The build checks the model against a fixed checksum, and nothing downloads while AMG
-runs. Sonarr and Radarr post to AMG through a **Webhook** connection, so nothing goes into their containers. The
-published image is for amd64. An arm64 image is not published yet.
+The arr-media-guard (AMG) image holds everything AMG needs. That is its two commands, `ffmpeg`, `mkvtoolnix`, and
+language detection with its speech model and the text models of the burned-in subtitle check. The build checks each
+model against a fixed checksum, and nothing downloads while AMG runs. Sonarr and Radarr post to AMG through a
+**Webhook** connection, so nothing goes into their containers. The published image is for amd64. An arm64 image is not
+published yet.
 
 The README has the install steps. This page has the detail.
 

@@ -1,5 +1,6 @@
-# The arr-media-guard image: the two commands, their tools, the language detection venv and the pinned Whisper model. Nothing
-# downloads at run time. Build it from the repo root: docker build -f docker/Dockerfile -t arr-media-guard .
+# The arr-media-guard image holds the two commands, their tools, the language detection venv, the pinned Whisper model
+# and the text models of the burned-in subtitle check. Nothing downloads at run time. Build it from the repo root:
+# docker build -f docker/Dockerfile -t arr-media-guard .
 FROM debian:trixie-slim
 
 RUN apt-get update \
@@ -16,6 +17,12 @@ RUN python3 -m venv /opt/arr-media-guard-lid/venv \
         -r /opt/arr-media-guard/arr_lid.requirements.txt \
     && /opt/arr-media-guard-lid/venv/bin/python /opt/arr-media-guard/arr_media_guard/lid.py --fetch --model-dir /opt/arr-media-guard-lid/models \
     && touch /opt/arr-media-guard-lid/ready
+
+# The text models of the burned-in subtitle check, 24.6 MB (NOTICE). burnin.py --fetch downloads them at their pinned
+# revision and checks each sha256, so a wrong model fails the build. They sit in a layer of their own, so a change of
+# burnin.py keeps the venv layer above.
+COPY arr_media_guard/__init__.py arr_media_guard/burnin.py /opt/arr-media-guard/arr_media_guard/
+RUN /opt/arr-media-guard-lid/venv/bin/python -B /opt/arr-media-guard/arr_media_guard/burnin.py --fetch --model-dir /opt/arr-media-guard-lid/models
 
 # The bytecode is compiled here, because PYTHONDONTWRITEBYTECODE stops each run from writing it. merge_env.py writes the
 # env file of the image, which the start script copies into /config.

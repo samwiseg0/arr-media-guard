@@ -378,6 +378,63 @@ SUB_TIME_MISSED = 3   # the exit code of --sub-time --apply when a change it pla
 SUB_TIME_NO_FILE = 4   # the exit code of --sub-time when a path it was given holds no file
 
 
+def burn_command(argv):
+    """--burn-in: the burned-in subtitle check of each file named by path, or of each file of the items --ids names in
+    --app (docs/design.md, "Burned-in subtitles"). It runs the quick check, the full check, and the second pass where
+    the full check asks for one, see burn_file(). It prints one line per file, with what the burn-in job after an import
+    would do at the current settings. It changes no file, posts nothing, and writes one decision line per file."""
+    ap = argparse.ArgumentParser(prog="arr-media-guard --burn-in", description="The burned-in subtitle check of each file, as the "
+                                 "background check after an import runs it. It changes nothing. See docs/commands.md.")
+    ap.add_argument("paths", nargs="*", metavar="PATH")
+    ap.add_argument("--app", choices=sorted(config.CFG.apps), help="the instance whose items --ids names")
+    ap.add_argument("--ids", type=int, nargs="+", default=[], help="items of --app: movie ids for radarr, series ids for sonarr")
+    a = ap.parse_args(argv)
+    if bool(a.app) != bool(a.ids):
+        ap.error("--app and --ids go together")
+    if not (a.paths or a.ids):
+        ap.error("name a PATH, or --app and --ids")
+    if why := process.burn_ready():
+        sys.exit(f"--burn-in stops: {why}")
+    os.nice(19)   # it reads whole files on the NAS, so it yields to imports and to Plex
+    subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
+    work = [(None, os.path.abspath(p), os.path.basename(p), None, None) for p in a.paths]
+    if a.ids:   # the item of a file, for the one re-grab of a burn-in in its own language, see runner.BURN_ONCE
+        work += [(a.app, f["path"], info[0], info[1], runner.burn_item(a.app, f.get("movieId"), info[5].get("episode_ids") or ()))
+                 for f, info in apps.ARR[a.app].library(apps.app_list(a.app), set(a.ids))[0]]
+    for app, path, label, original, item in work:
+        started, rec = time.time(), dict(app=app, source="backfill", apply=False, label=label, path=path)
+        try:
+            rec.update(burn_file(path, original, item))
+        except Exception as ex:
+            rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
+        print(f'{rec["result"]} | {label} | {path}', flush=True)
+        logs.decision(rec, started)
+
+
+# What the burn-in job would do, per runner.burn_step(), as --burn-in prints it
+BURN_WOULD = {"log": "the job would log it only", "alert": "the job would alert", "mute": "the job would turn off the English subtitles and alert",
+              "regrab": "the job would re-grab it", "regrab_off": "the job would alert, re-grabs for burned-in subtitles are off"}
+BURN_SECOND = {"disagreed": "disagrees", "unsure": "could not tell", "once": "agrees, and an earlier copy was re-grabbed for it"}   # else agrees
+
+
+def burn_file(path, original=None, item=None):
+    """The fields of the decision line of --burn-in for path: the quick check, and the passes of the full check on the
+    audio that plays first, see runner.burn_passes(). The result says what the burn-in job would do, from the job's own
+    runner.burn_plan() and runner.burn_step(). original and item are the item's original language and its
+    runner.burn_item() key, when --app names it."""
+    ts, _, duration = process.burn_probe(path, checks.mkvmerge(path))
+    audio = process.burn_audio(ts)
+    if not audio:
+        return {"outcome": "burned_in_skipped", "result": "skipped, the file has no audio track"}
+    quick = process.burn_run(path, audio["index"], duration, ["--quick"], config.BURN_TIMEOUT)
+    facts, plan = runner.burn_passes(path, audio, duration, original, item)
+    step = runner.burn_step(plan, path.lower().endswith(".mkv"), bool(runner.burn_on(ts)))
+    would = "BURNED_IN is off, so the job would not run" if config.CFG.burned_in == "off" else BURN_WOULD[step]
+    agree = f', the second pass {BURN_SECOND.get(plan, "agrees")}' if "second" in facts else ""
+    return {"outcome": f'burned_in_{facts["first"]["label"]}', "burned_in": dict(facts, quick=quick, audio=audio, plan=plan),
+            "result": f'quick check {quick["result"]}, {decide.lang_name(audio["lang"]) if decide.codes(audio["lang"]) else "untagged"} audio, {runner.burn_words(facts["first"])}{agree}, {would}'}
+
+
 def rescan_item(app, owner, keys):
     """A backfill's rescan of one item, with no lock: settle_extras() when conversions of the item hid extras (keys),
     else one rescan that is sent and not waited for. Logs it and prints it."""
@@ -537,6 +594,8 @@ def audit(argv):
                     with runner.locked():
                         heard = {k: v["lang"] for k, v in (r.get("heard") or {}).items() if v.get("lang")}
                         d = decide.decide(checks.mkvmerge(path), r.get("original"), r.get("kids", False), r.get("release") or "", heard)
+                        if runner.muted(path):   # a burn-in job turned off the English subtitles, and they stay off
+                            d = process.muted_plan(d)
                 except Exception as ex:
                     add(further, config.mask(f"the re-probe failed: {type(ex).__name__}")[:100], r.get("label")); seen.append(("reprobe", r)); continue
                 check = {"edits": len(d["edits"]), "invariants": [c for c, _ in decide.invariants(d["tracks"], [], d["cls"], set(d["orig"]))]}
@@ -747,13 +806,14 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --backfill <instance> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --audit <instance> (--plan-from FILE | --since 24h|DATE) [--source hook|backfill] [--post]
   arr-media-guard --sub-time PATH [PATH ...] [--apply]
+  arr-media-guard --burn-in [PATH ...] [--app <instance> --ids ID ...]   the burned-in subtitle check, report only
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
   arr-media-guard --test-discord      post a test message to DISCORD_WEBHOOK and print Discord's answer
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
 <instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k.
---backfill, --audit and --sub-time print their options with --help, as in arr-media-guard --backfill --help.
+--backfill, --audit, --sub-time and --burn-in print their options with --help, as in arr-media-guard --backfill --help.
 README.md says how to install and connect it. docs/commands.md explains each mode, and docs/design.md how it works."""
 
 
@@ -807,6 +867,8 @@ def main(argv):
         plex.plex_flush(argv[1:])
     elif mode == ["--sub-time"]:
         sub_time(argv[1:])
+    elif mode == ["--burn-in"]:
+        burn_command(argv[1:])
     elif mode == ["--serve"]:
         from . import serve   # only this mode needs it
         serve.main(argv[1:])

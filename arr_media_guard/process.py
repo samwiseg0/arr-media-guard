@@ -91,6 +91,52 @@ def nfo_title(path):
     return content.nfo_episode_title(text)
 
 
+def burn_ready():
+    """Why the burned-in subtitle check cannot run, or None. It runs burnin.py in the venv of language detection, so it
+    needs that install, see checks.lid_ready(), and the models burnin.ready() checks. A host install without
+    burnin.py has no check."""
+    if not checks.lid_ready():
+        return "language detection is not installed, and the burned-in subtitle check runs in its venv"
+    try:
+        from . import burnin
+        ok, why = burnin.ready(os.path.join(config.CFG.lid_dir, "models"))
+    except ImportError:
+        return "the burned-in subtitle check is not installed"
+    except Exception as ex:   # the start check and an import go on without the check
+        return config.mask(f"its text models did not read: {type(ex).__name__}: {ex}")[:200]
+    return None if ok else why or "its text models did not pass their check"
+
+
+def burn_probe(path, j):
+    """(the tracks of decide.classify(), whether a video track is there, the duration) of path for the burned-in
+    subtitle check, from j, its mkvmerge -J probe. mkvmerge reads no track of an ASF or WMV file and no duration of an
+    AVI file, so ffprobe then gives what j lacks, see proof.ff_streams(). That run ends at the job's time limit, see
+    checks.run_bounded(). A failed ffprobe gives no track and duration 0, and the check then finds nothing."""
+    video = lambda tracks: any(t.get("type") == "video" for t in tracks)
+    if j.get("tracks") and decide.duration(j):
+        return decide.classify(j), video(j["tracks"]), decide.duration(j)
+    try:
+        _, streams, duration = proof.ff_streams(path)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        streams, duration = [], 0.0
+    if j.get("tracks"):
+        return decide.classify(j), video(j["tracks"]), duration
+    return (decide.classify({"streams": streams}), any(s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")
+                                                       for s in streams), duration)
+
+
+def burn_run(path, index, duration, flags, timeout, queue=None):
+    """The answer of burnin.py on ffmpeg audio stream index of path, in the venv of language detection, see
+    checks.lid_cli(): burnin.quick() with --quick, burnin.full() with --full. duration is burn_probe()'s. The run and
+    its ffmpeg end after timeout seconds. A full check yields when an import waits in the queue of the store at queue.
+    It takes no turn at the language model, so no hearing makes it yield. Raises RuntimeError with the reason when the
+    run gives no answer."""
+    got = checks.lid_cli(path, index, {"format": {"duration": duration}}, (), timeout, False, yield_to=(None, queue), burn=flags)
+    if "error" in got or "why" in got:
+        raise RuntimeError(got.get("error") or got["why"])
+    return got
+
+
 def tmdb_key_alert(app, code):
     """The ops embed "TMDB key not working", at most once a day per host, or None."""
     k = content.key_alert(code, token=config.CFG.tmdb_token, mark=report.bold)
@@ -169,7 +215,10 @@ def process(ctx):
 def refresh(ctx, duration=True):
     """Probe the file at the start and again after a step replaced it: its stat, its size and mkvmerge -J. The record
     takes the new size, mtime and duration. duration False keeps the record's duration, as after a subtitle remux."""
-    ctx.st = os.stat(ctx.path); ctx.size = ctx.st.st_size; ctx.j = checks.mkvmerge(ctx.path)
+    was, ctx.st = getattr(ctx, "st", None), os.stat(ctx.path)
+    if was:   # a remux of AMG's own keeps the mark of a burn-in job, see runner.muted()
+        runner.mute_mark(ctx.path, was)
+    ctx.size = ctx.st.st_size; ctx.j = checks.mkvmerge(ctx.path)
     ctx.rec.update(size=ctx.size, mtime=int(ctx.st.st_mtime), **({"file_duration": round(decide.duration(ctx.j))} if duration else {}))
 
 
@@ -196,6 +245,7 @@ def start(ctx):
     if ctx.apply and (ctx.mkv or ctx.conv):   # a SIGKILL during a repack leaves its temp file
         remux.sweep_repack_tmp(os.path.dirname(ctx.path), ctx.source)
     refresh(ctx)
+    ctx.muted = runner.muted(ctx.path, ctx.st)   # a burn-in job turned off the English subtitles, see decision_fields()
 
 
 def conversion(ctx):
@@ -581,6 +631,9 @@ def deep_drop(ctx):
 def decision_fields(ctx):
     """The decision in the record, and the plan of a dry run, see plan_record()."""
     rec, d = ctx.rec, ctx.d
+    if ctx.muted and (kept := muted_plan(d))["edits"] != d["edits"]:   # a run that keeps the flags plans none of these
+        d = ctx.d = kept
+        rec["flags_kept"] = "a burned-in subtitle check turned off the English subtitles, so they stay off"
     ctx.file_checks = decide.checks(ctx.j, ctx.size, ctx.runtime, shorter_only=config.program(ctx.app) == "sonarr")
     rec.update(notes=d["notes"], reasons=d.get("reasons", []), item_class=d.get("cls"), tracks=logs.track_log(d["tracks"]),
                undecided=d.get("undecided"), abstain=d.get("abstain"), dropped=d.get("dropped", []), invariants=d.get("invariants", []),
@@ -678,9 +731,7 @@ def act(ctx):
             set_by = "an earlier run set the flags" if ctx.recheck else "the import set the flags"
             rec["flags_kept"] = (set_by if ctx.app else "no app lists the file, so no original language is known") + \
                 ", and only a subtitle verdict changes a flag"
-        rec = ctx.rec = edit(rec, ctx.j, edits, ctx.apply, replan=lambda after: decide.with_tags(
-            decide.decide(after, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched),
-            decide.retag(after, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)))
+        rec = ctx.rec = edit(rec, ctx.j, edits, ctx.apply, replan=lambda after: muted_plan(replan(after, plan_inputs(ctx)), ctx.muted), ts=d["tracks"])
         # An abstained or dropped decision has no edits of its own, and its reason stays in "undecided" or "dropped". It
         # names the result only when nothing changed, so an edit of a subtitle verdict keeps "edited" and its Plex analyze.
         if d.get("undecided") and rec["outcome"] == "no_change":
@@ -765,7 +816,7 @@ def content_checks(ctx):
     """The metadata checks after the edit, and the re-grab of wrong content, see metadata(). The episode title comes
     from the NFO of the download folder, else from the NFO the app copied beside the video, see library_nfo_title()."""
     rec, job = ctx.rec, ctx.job
-    ctx.meta = None
+    ctx.meta = ctx.until = None   # until: the end of their limit, which quick_check() takes over
     # A re-grab may have deleted the file, or put a same-name old file back.
     if not ctx.background and os.path.exists(ctx.path) and os.stat(ctx.path).st_ino == ctx.st.st_ino:
         ctx.rearm()   # the checks get their own limit. The edit is done, so a timeout costs only the checks.
@@ -796,9 +847,59 @@ def content_checks(ctx):
         except Exception as ex:   # the edit is done, so a failure or the time limit costs only the checks
             rec["meta_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         finally:
+            ctx.until = config.DEADLINE.end
             config.DEADLINE.stop()
     if ctx.shared:   # every re-grab of this job is behind it
         ctx.shared.settle()
+
+
+def burn_audio(ts, edits=()):
+    """{"index": its ffmpeg audio index, "pos", "lang"} of the audio track that plays first, see decide.default_audio(),
+    for the burned-in subtitle check, or None for a file with no audio. ts is decide.classify() of the file. lang is the
+    track's tag, so a language the import only heard never turns subtitles off, see runner.burn_plan()."""
+    play = decide.default_audio(ts, edits)
+    return play and {"index": [t for t in ts if t["kind"] == "a"].index(play), "pos": play["pos"], "lang": play["tag"]}
+
+
+def quick_check(ctx):
+    """The quick burned-in subtitle check of an import whose file has a video track, in any container (docs/design.md,
+    "Burned-in subtitles"), see burnin.quick(). It runs after the import's own checks and edits, on the audio that plays
+    first. It only sorts the file and changes nothing. clean ends there. flagged and unsure queue the full check in the
+    background, see runner.queue_burn_in(). It gets the time the metadata checks left of their limit, see
+    content_checks(), and the run of burnin.py ends at that limit. With under QUICK_SECS left, or when the check fails,
+    the file is unsure. The decision line keeps the result in "burned_in". A file whose probe holds no track, as an ASF
+    or WMV file, or no duration, as an AVI file, gets them from ffprobe inside that limit, see burn_probe()."""
+    rec, tracks = ctx.rec, ctx.j.get("tracks")
+    if ctx.mode != "import" or config.CFG.burned_in == "off" or (tracks and not any(t.get("type") == "video" for t in tracks)):
+        return
+    try:   # a re-grab may have deleted the file, or put a same-name old file back
+        if os.stat(ctx.path).st_ino != ctx.st.st_ino:
+            return
+    except OSError:
+        return
+    edited = "edited" in (rec.get("outcome"), rec.get("edit_result"))
+    audio, why = burn_audio(ctx.d["tracks"], ctx.d["edits"] if edited else ()) if tracks else {}, burn_ready()   # {}: ffprobe tells below
+    if audio is None or why:
+        rec["burned_in"] = {"result": "skipped", "why": why or "the file has no audio track"}
+        return
+    left = ctx.until - time.monotonic() if ctx.until else 0
+    if left < config.QUICK_SECS:
+        rec["burned_in"] = dict(result="unsure", why=f"{max(left, 0):.0f} seconds of the time limit were left, and the quick check needs "
+                                                     f"{config.QUICK_SECS}", **({"audio": audio} if audio else {}))
+        return
+    config.DEADLINE.start(left)   # the ffprobe of burn_probe() ends at the import's limit too
+    try:
+        ts, video, duration = burn_probe(ctx.path, ctx.j)
+        audio = audio or burn_audio(ts)
+        if not (video and audio):   # an ASF or WMV file, whose tracks only ffprobe reads
+            rec["burned_in"] = {"result": "skipped", "why": f'the file has no {"audio" if video else "video"} track'}
+            return
+        rec["burned_in"] = dict(burn_run(ctx.path, audio["index"], duration, ["--quick"], config.DEADLINE.left()), audio=audio)
+    except Exception as ex:
+        rec["burned_in"] = dict(result="unsure", why=config.mask(f"the quick check failed: {type(ex).__name__}: {ex}")[:200],
+                                **({"audio": audio} if audio else {}))
+    finally:
+        config.DEADLINE.stop()
 
 
 def alerts(ctx):
@@ -819,7 +920,8 @@ def alerts(ctx):
         rec["alert_result"] = logs.alert_findings(rec, ctx.size, ctx.held)
 
 
-STEPS = (start, conversion, header, languages, subtitle_checks, flag_hearing, deep_drop, decision_fields, faults, act, after_edit, content_checks, alerts)   # process() runs them in this order
+STEPS = (start, conversion, header, languages, subtitle_checks, flag_hearing, deep_drop, decision_fields, faults, act, after_edit, content_checks,
+         quick_check, alerts)   # process() runs them in this order
 
 
 def content_finding(ev):
@@ -852,6 +954,57 @@ def file_alerts(d, file_checks, meta, original, item):
     return out
 
 
+def plan_inputs(ctx):
+    """The inputs of the decision of ctx's file as JSON, so a later run plans the file as this run did, see replan(). A
+    burn-in job keeps them, see runner.queue_burn_in()."""
+    return dict(original=ctx.original, kids=ctx.kids, release=ctx.release, heard=ctx.heard, spoken=ctx.spoken, wrong=ctx.wrong,
+                unmatched=sorted(ctx.unmatched), got=ctx.got, known=sorted(ctx.known), said=sorted(ctx.said), read=ctx.read,
+                content_lang=ctx.content_lang, checked=ctx.checked)
+
+
+def replan(after, p):
+    """The decision and the tag edits of after, the probe of an edited file, from p, the plan_inputs() of the run that
+    planned it. The import's check after its edit and a burn-in job's both use it."""
+    return decide.with_tags(decide.decide(after, p["original"], p["kids"], p["release"], p["heard"], p["spoken"], p["wrong"], set(p["unmatched"])),
+                            decide.retag(after, p["got"], set(p["known"]), checks.langs(), set(p["said"]), p["read"], p["content_lang"], p["checked"]))
+
+
+def muted_edits(edits, ts):
+    """edits less those that turn on an English subtitle track of ts, decide.classify() of the file, for a file whose
+    English subtitles a burn-in job turned off, see runner.muted()."""
+    english = {t["sel"] for t in ts if t["kind"] == "s" and "eng" in decide.codes(t["lang"])}
+    return [e for e in edits if not (e[0] in english and decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and e[1])]
+
+
+KEPT_OFF = "English subtitles kept off by the burned-in subtitle check"   # the last rule of a plan muted_plan() changed
+
+
+def muted_plan(plan, muted=True):
+    """plan, a decision of a file, less the edits muted_edits() leaves out when muted. When it leaves one out, the edit
+    rules name only the edits that are left, and the rules end with KEPT_OFF, so the class says why, see
+    decide.plan_class()."""
+    kept = muted_edits(plan["edits"], plan["tracks"]) if muted else plan["edits"]
+    if kept == plan["edits"]:
+        return plan
+    rules = [r for e, r in zip(plan["edits"], plan["edit_rules"]) if e in kept]
+    return dict(plan, edits=kept, edit_rules=rules, rules=sorted(set(rules)) + [KEPT_OFF])
+
+
+def mute_rule(path, ts, edits):
+    """The safety rule of the burned-in subtitle mute, see subsync.INVARIANTS and docs/development.md, "Safety
+    self-checks". decide.invariants() keeps the only English subtitles on under audio in another language. A burn-in job
+    is the one exception: it turns them off and marks the file, see runner.burn_act() and runner.muted(). So an edit that
+    turns them off needs the mark, and an edit of a marked file never turns an English subtitle on. ts is the tracks of
+    the plan, as decide.decide() or decide.classify() gives them. Raises subsync.Broken."""
+    mark, final = runner.muted(path), {t["sel"]: t["default"] for t in ts} | decide.defaults(edits)
+    a, english = decide.default_audio(ts, edits), [t for t in ts if t["kind"] == "s" and t["lang"] == "eng" and not t["extra"]]
+    if mark and muted_edits(edits, ts) != edits:
+        raise subsync.Broken("rule muted broken: the edit turns on English subtitles that a burn-in job turned off")
+    if a and a["lang"] != "eng" and any(t["default"] for t in english) and not any(final[t["sel"]] for t in english) and not mark:
+        raise subsync.Broken(f'rule only English subtitles off broken: the edit turns off the only English subtitles under {a["lang"]} '
+                             "audio, and no burn-in job marked the file")
+
+
 def propedit_args(edits, i):
     """mkvpropedit arguments that set the property of each edit (flag-default, flag-forced, flag-original, language or
     language-ietf) to its new (i=1) or old (i=2) value. None deletes the property: a track that had no BCP 47 tag or no
@@ -860,10 +1013,10 @@ def propedit_args(edits, i):
                                        else ("--edit", e[0], "--set", f"{decide.prop(e)}={e[i]}"))]
 
 
-def edit(rec, j, edits, apply, replan=None):
+def edit(rec, j, edits, apply, replan=None, ts=None):
     """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result.
     replan(after) plans the edited file again. Its edit count and the invariants of the new state go in "recheck",
-    which the audit reads instead of probing the file again."""
+    which the audit reads instead of probing the file again. ts is the tracks of the plan, for mute_rule()."""
     edits = [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG)
              or decide.unapplied(j, [e])]   # never a no-op flag edit
     if not edits:
@@ -877,11 +1030,14 @@ def edit(rec, j, edits, apply, replan=None):
         return dict(rec, outcome="dry_run", result="dry run")
     if not os.access(path, os.W_OK):
         return dict(rec, outcome="read_only", result="read-only, not edited")
+    if subsync.INVARIANTS:
+        mute_rule(path, ts or decide.classify(j), edits)
     with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
         config.DEADLINE.stop()
         logs.log(dict(rec, result="editing"))   # the undo record exists before the file changes
         e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
     checks.lid_carry(path, before)
+    runner.mute_mark(path, before)
     if e.returncode > 1:   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + (e.stdout + e.stderr).strip()[-300:])
         try:

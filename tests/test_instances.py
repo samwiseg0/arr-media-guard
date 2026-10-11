@@ -60,7 +60,7 @@ def g(tmp_path, monkeypatch):
                    f"APP_INSTANCES='sonarr-4k:sonarr'\nRADARR_DIR='{tmp_path / 'no-radarr'}'\n"
                    f"SONARR_URL='http://{HOSTS['sonarr']}'\nSONARR_API_KEY='{KEYS['sonarr']}'\nSONARR_PATH_MAP='/tv:{tmp_path / 'hd'}'\n"
                    f"SONARR_4K_URL='http://{HOSTS['sonarr-4k']}'\nSONARR_4K_API_KEY='{KEYS['sonarr-4k']}'\n"
-                   f"SONARR_4K_PATH_MAP='/tv:{tmp_path / 'uhd'}'\nREGRAB_CAP='1'\nKEEP_REPLACED='true'\n"
+                   f"SONARR_4K_PATH_MAP='/tv:{tmp_path / 'uhd'}'\nREGRAB_CAP='1'\nKEEP_REPLACED='true'\nBURNED_IN='off'\n"
                    "DISCORD_WEBHOOK='https://discord.invalid/hook'\nWEBHOOK_USER='guard'\nWEBHOOK_PASSWORD='s3cret'\n")
     monkeypatch.setenv("ARR_MEDIA_GUARD_ENV", str(env))
     monkeypatch.setenv("ARR_MEDIA_GUARD_LIB", FILES)

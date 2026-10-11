@@ -82,11 +82,21 @@ IMAGE = os.environ.get("ARR_MEDIA_GUARD_IMAGE") == "1"   # docker/Dockerfile set
 def here():
     """The place a line says this program runs: the container under the listener or in the image, else the script."""
     return "container" if SERVE or IMAGE else "script"
-REGRAB_KINDS = ("audio", "video", "content", "damage")   # broken audio, corrupt video, wrong content, a damaged source
+REGRAB_KINDS = ("audio", "video", "content", "damage", "burned_in")   # broken audio, corrupt video, wrong content, a damaged source,
+                                                                     # subtitles in another language burned into the video
 # What the subtitle check of an import does, docs/design.md, "Subtitle match". off: no check. check: it reads, reports
 # and alerts, and changes nothing. fix: it also removes, retimes and lengthens. deep: fix, and a deep analysis after the
 # import, see deep_analysis(). --sub-check and --sub-time ignore it, see sub_on() and sub_fixes().
 SUBTITLES_LEVELS = ("off", "check", "fix", "deep")
+# What the burned-in subtitle check does (docs/design.md, "Burned-in subtitles"). off: no check. check: it alerts and
+# changes nothing. fix: it also turns off the English subtitles of a file whose audio is in another language and whose
+# English subtitles are burned in, and re-grabs a file whose burned-in subtitles are in another language when REGRAB
+# lists burned_in. Both need two passes that agree, see runner.burn_plan().
+BURNED_IN_LEVELS = ("off", "check", "fix")
+QUICK_SECS = 90   # seconds of the time limit the quick burned-in subtitle check needs, see process.quick_check(). A 4K remux took
+                  # about 70 seconds in tests. With less left the file goes to the background check.
+BURN_TIMEOUT = 3600   # seconds one full burned-in subtitle check may take, see runner.burn_full(). burnin.py runs at nice 10, and
+                      # its speech read's ffmpeg at nice 19. The speech read of a 4K remux over a share took 8 to 11 minutes in tests.
 # What goes to DISCORD_WEBHOOK. issues: what arr-media-guard left unresolved, see report.posts(). all: also one post for
 # each change it made to a file, see report.changes().
 DISCORD_POSTS = ("issues", "all")
@@ -153,6 +163,7 @@ class Settings:
     header_repair: bool      # off: a header issue is logged and never remuxed
     repack_max: float        # REPACK_MAX_GB in bytes. A larger file that is not Matroska is skipped. A header repair too.
     subtitles: str           # one of SUBTITLES_LEVELS
+    burned_in: str           # one of BURNED_IN_LEVELS
     recheck_on_update: bool  # on: the first start of a new version queues a recheck of the files it can fix, see runner.queue_rechecks()
     convert: bool            # the hook's conversion of an import. A backfill converts with --convert only.
     convert_max: int         # CONVERT_MAX_FILES, the conversions one backfill run applies. Then it stops, for the NAS load.
@@ -284,6 +295,7 @@ def settings(path, environ=os.environ):
     regrab = kinds("REGRAB", "audio,video", REGRAB_KINDS)
     repack_max = number("REPACK_MAX_GB", 30, 0, "is no number, so the cap is {} GB and every remux is skipped.", cast=float) * 1e9
     subtitles = level("SUBTITLES", "deep", SUBTITLES_LEVELS, "check", "the subtitle check of an import runs as check")
+    burned_in = level("BURNED_IN", "fix", BURNED_IN_LEVELS, "check", "the burned-in subtitle check only alerts")
     maps = {key: path_map(key, env.get(key, "")) for key in ("PATH_MAP", *MAP_KEYS.values())}   # {key: (pairs, error)}
     apps = {app: AppSettings(env.get(f"{app.upper()}_URL", f"http://127.0.0.1:{port}"), api_key(f"{app.upper()}_API_KEY"),
                              env.get(f"{app.upper()}_DIR") or f"/var/lib/{app}", maps[f"{app.upper()}_PATH_MAP"][0], app,
@@ -324,7 +336,7 @@ def settings(path, environ=os.environ):
         convert=switch("CONVERT", False, "arr-media-guard converts no import"),
         recheck_on_update=switch("RECHECK_ON_UPDATE", True, "a new version queues a recheck of the files it can fix"),
         keep_days=number("KEEP_ORIGINALS_DAYS", 7, 7, "is not a whole number of 0 or more, so it counts as {}.", least=0),
-        repack_max=repack_max, subtitles=subtitles, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
+        repack_max=repack_max, subtitles=subtitles, burned_in=burned_in, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),
         hook_workers=hook_workers, errors=errors, apps=apps, from_env=tuple(sorted(env.taken)))
 

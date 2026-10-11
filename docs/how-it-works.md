@@ -5,14 +5,16 @@ each step, what arr-media-guard (AMG) checks and what it may change. [features.m
 and [design.md](design.md) the rules behind it. These words come up often.
 
 - *The app* is the Sonarr or Radarr that sent the file. The *item* is its movie or series.
-- A *job* is one file that waits for its check. It is an import, a deep analysis or a recheck.
+- A *job* is one file that waits for its check. It is an import, a burned-in subtitle check, a deep analysis or a
+  recheck.
 - The *listener* is AMG's small web server in Docker. The apps post to it through a **Webhook** connection. On a host,
   each app runs AMG as a **Custom Script** instead.
 - The *worker* is the AMG process that takes the jobs and checks the files.
 - The *state store* is a small database, `STATE_DIR/state.sqlite`. It holds the background queue and AMG's other
   records.
-- The *background queue* is the line of jobs in the state store. Imports always go first, then the deep analyses, then
-  the rechecks. A deep analysis or a recheck runs only while no import waits, one at a time.
+- The *background queue* is the line of jobs in the state store. Imports always go first, then the burned-in subtitle
+  checks, then the deep analyses, then the rechecks. Every job but an import runs only while no import waits, one at a
+  time.
 - The *decision log* is the file `LOG` names. It gets a line for each file AMG checks.
 - A *remux* writes a file again with the same video and audio. AMG never re-encodes.
 - A *re-grab* deletes a broken file through the app and marks the grab as failed, so the app searches again.
@@ -37,6 +39,8 @@ flowchart TD
     alerts --> log["Decision log and syslog"]
     hold --> log
     log --> plex["Plex reads the changed file again"]
+    log -->|"BURNED_IN on, and the quick check flagged the file or could not tell"| burn["The burned-in subtitle check, while no import waits"]
+    burn --> burnalert["Discord: one alert on a change or a doubt, the decision log for the rest"]
     log -->|"SUBTITLES=deep"| deep["The deep analysis, while no import waits"]
     deep --> deepalert["Discord: one alert for each subtitle problem still left, nothing for a problem it fixed"]
 ```
@@ -175,9 +179,21 @@ them. The decision line of the deep analysis names the import's job in `from`, s
 
 A *recheck* is another kind of job in the background queue. After an update, AMG queues one for each file whose saved
 subtitle check the new version can improve. It repeats that check on the file, and never checks deeper. It waits behind
-the imports and the deep analyses. Like the deep analysis, it keeps the flags an earlier run set and alerts only on
-subtitles. `SUBTITLES` decides whether it fixes or only alerts. See
+the imports, the burned-in subtitle checks and the deep analyses. Like the deep analysis, it keeps the flags an earlier
+run set and alerts only on subtitles. `SUBTITLES` decides whether it fixes or only alerts. See
 [Recheck after an update](features.md#recheck-after-an-update).
+
+## 8. The burned-in subtitle check
+
+Each import ends with a quick check for subtitles drawn into the picture. It listens to a few parts of the audio and
+looks at frames there, and it changes nothing. A file it flags, or cannot tell, gets the full check in the background
+queue, before its deep analysis. That check looks at frames across the whole file and reads the language of the lines.
+Before any change, a second check on other frames must agree. With English subtitles burned in and audio in another
+language, AMG then turns off the English subtitle tracks, so the lines never show twice. With subtitles in another
+language burned in, it re-grabs the file when `REGRAB` lists `burned_in`. A change or a doubt posts one alert. Other
+results post nothing and go to the decision log. These are English text over English audio, a partial burn-in, a check
+with too little speech and a file with no burned-in subtitles. `BURNED_IN` turns the check off or makes it alert only.
+See [features.md](features.md#burned-in-subtitles).
 
 ## The Test button and the start check
 
@@ -189,7 +205,8 @@ would keep nothing.
 
 In Docker, the listener runs a start check when it starts, and answers the apps meanwhile. It reads the
 [path maps](docker.md#path-maps) and runs the Test checks for each app with an API key. It turns on On Grab where
-`KEEP_REPLACED` needs it. It then checks Plex, Discord, TMDB, SABnzbd and the indexer where the setup uses them. It asks
+`KEEP_REPLACED` needs it. It then checks Plex, Discord, TMDB, SABnzbd and the indexer where the setup uses them, and
+whether the burned-in subtitle check can run. It asks
 an app or a service that does not answer again, for 2 minutes in all. A failed check prints a warning, and the listener
 keeps running. `--selftest` runs the same checks on the command line. It fails on a setting it cannot read, an env file
 that is there and cannot be read, or a policy file that does not load. It only warns about the apps and services.

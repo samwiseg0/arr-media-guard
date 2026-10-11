@@ -9,8 +9,8 @@ Some releases of English films carry a foreign default audio track, and Plex pla
 This file says what each rule does and why it exists. The README covers the install, the env file
 and the app connection. policy.md covers the policy file.
 
-- A *job* is one file that waits in the background queue, for an import, a deep analysis or a recheck. AMG queues it,
-  and a *worker* runs it.
+- A *job* is one file that waits in the background queue, for an import, a burn-in job, a deep analysis or a
+  recheck. AMG queues it, and a *worker* runs it.
 - To *hear* a track is to let language detection name its spoken language.
 - A *certain fault* proves that a file is broken and leads to a re-grab. A *doubt* only alerts.
 - A *re-grab* deletes a broken file through the app, monitors its items again and marks the grab
@@ -228,18 +228,18 @@ and its file, and the sentence `report.UNTOLD` in place of the error. Its line i
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
-`hook`, `deep_analysis` and `recheck`. A conversion that a stopped run left has `worker` when the worker finds it as it
-starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names the step where
-the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its step from
-`ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see `LINE_STEPS`. Any
-other finding takes it from `FINDING_STEPS`. Each step there is a name, `None`, or a function of the facts. `None`
-means the program tried no fix: a doubt, a check that only reports, a fix that a setting or a limit turned off, and a
-dry run. A sidecar left in place names no step when its reason starts with a setting, see `report.SETTING_LEFT`. A
-live-captioned track whose hearing stopped part way carries `hearing_stopped`, see `subtitles.sub_findings()`. A
-conversion that finished, whose extras wait for the app to take the new file, stopped at Replacing the file. Each
-subtitle counts at the furthest step its sentences name, see `report.line_keys()`. Subtitles at different steps show
-one step a line, in the order of `FIX_STEPS`. A field with no value is left out, so an alert with no fix tried shows
-Check alone. A held alert keeps the fields the import gave it. A change post has neither field, see
+`hook`, `burn_in`, `deep_analysis` and `recheck`. A conversion that a stopped run left has `worker` when the worker
+finds it as it starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names
+the step where the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its
+step from `ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see
+`LINE_STEPS`. Any other finding takes it from `FINDING_STEPS`. Each step there is a name, `None`, or a function of the
+facts. `None` means the program tried no fix: a doubt, a check that only reports, a fix that a setting or a limit turned
+off, and a dry run. A sidecar left in place names no step when its reason starts with a setting, see
+`report.SETTING_LEFT`. A live-captioned track whose hearing stopped part way carries `hearing_stopped`, see
+`subtitles.sub_findings()`. A conversion that finished, whose extras wait for the app to take the new file, stopped at
+Replacing the file. Each subtitle counts at the furthest step its sentences name, see `report.line_keys()`. Subtitles at
+different steps show one step a line, in the order of `FIX_STEPS`. A field with no value is left out, so an alert with
+no fix tried shows Check alone. A held alert keeps the fields the import gave it. A change post has neither field, see
 `report.fix_post()`. A test fails when a finding kind, action code or sentence code has no step.
 
 **Plain words.** A subtitle remux that failed reads "rewriting the file failed" in the alert, see `report.remux_why()`,
@@ -567,8 +567,8 @@ because a kill mid-write can break the header. A remux, its proof and its swap h
 the checks after a remux get a new 300 seconds. The limit is a deadline, `content.DEADLINE`. Each
 subprocess, HTTP call and lock wait under it ends at it, and a long read checks it between two
 blocks. It raises `content.OutOfTime`, because a network handler would swallow a TimeoutError. The
-metadata checks after the edit get a new 300 seconds. Every error is logged, and the import never
-sees one.
+metadata checks after the edit get a new 300 seconds. The quick burned-in subtitle check gets what they leave, see
+"Burned-in subtitles". Every error is logged, and the import never sees one.
 
 **The file lock.** Every job, backfill and scan takes `STATE_DIR/lock`. An import job waits an hour at most.
 Reads take it shared. An edit, a re-grab and a conversion's swap take it exclusive. Every taker
@@ -611,6 +611,13 @@ again. The job names the import's job in `from`, and its decision line and syslo
 subtitle alerts its import held for it, see "Alerts".
 It keeps every flag the import set, after a remux of its own too. Only a subtitle verdict changes a flag: a track whose
 words do not match the audio loses its default and forced flags.
+
+**Burn-in job.** An import whose quick burned-in subtitle check flags the file, or cannot tell, queues a burn-in job
+for it, see "Burned-in subtitles". It follows the rules of a deep analysis job. Its name comes from the path, and it
+holds the inode, size and mtime of the file. It follows a move, drops itself when the file is gone or replaced, and
+yields to an import. Its name starts as a deep analysis job's does, so it waits behind the imports and runs one at a
+time with the deep analyses and rechecks. The background queue runs the burn-in jobs first, then the deep analyses,
+then the rechecks. So the burn-in job of an import ends before its deep analysis starts.
 
 **Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
 job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
@@ -809,6 +816,9 @@ with data, and a digest over every packet. Where mkvmerge changes packets on pur
 filter brings both sides to the same bytes (`PROOF_BSF`). Each stream must start within 0.05
 seconds of where it started, and the video and audio must end within 1 second. Each packet time may
 move 2 ms at most, because a stream whose times jump back can pass the digest and still play late.
+A refusal of the times says when the MKV would play out of sync, such as "from 2:00 to the end" or
+"in 2 places between 0:10 and 1:49". Its times count from the start of the MKV, as a player shows
+them. Then it names the stream, how far it moved and the time of its first moved packet.
 Lacing is off, because ffmpeg reads the frames of a lace a few ms off. MP4 timed text becomes
 SubRip, and its cues must match.
 
@@ -858,8 +868,8 @@ store the AAC encoder priming as leading packets of zero length, and have no edi
 spaces those packets one frame apart and writes no codec delay. Every later audio packet then lands
 two frames (about 44 ms) late, and a player that follows timestamps plays the audio that far behind
 the video. The shared-time rule above allows one frame, so the proof refuses the conversion, and the
-file stays MP4. Do not force it, because the forced file keeps the shift. In 2026-10 one of 356 MP4
-and MOV files in one library had this shape.
+file stays MP4. The alert says the MKV would play the audio 44 ms out of sync with the video, from
+the start to the end. Do not force it, because the forced file keeps the shift.
 
 **Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
 whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
@@ -1209,6 +1219,7 @@ uses detection only when that file exists, so it never uses a half-built install
 python3 -m venv /opt/arr-media-guard-lid/venv
 /opt/arr-media-guard-lid/venv/bin/pip install --require-hashes --only-binary=:all: -r arr_lid.requirements.txt
 /opt/arr-media-guard-lid/venv/bin/python arr_media_guard/lid.py --fetch --model-dir /opt/arr-media-guard-lid/models
+/opt/arr-media-guard-lid/venv/bin/python arr_media_guard/burnin.py --fetch --model-dir /opt/arr-media-guard-lid/models
 touch /opt/arr-media-guard-lid/ready        # last
 ```
 
@@ -1618,8 +1629,8 @@ skips no file. The decision log holds each result in `subcheck`, the remux in `s
 
 A check is stale when its registry entry says a newer version can fix its findings, see
 [development.md](development.md#when-a-change-can-fix-old-files). After an update, `runner.queue_rechecks()` queues a
-recheck job of each stale file in the background queue, behind the imports and the deep analyses. A recheck makes the
-checks of the run that saved the result, and none deeper.
+recheck job of each stale file in the background queue, behind the imports, the burn-in jobs and the deep analyses. A
+recheck makes the checks of the run that saved the result, and none deeper.
 
 **Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.
 The check reads the CueDuration of each subtitle entry from the Cues, which mkvmerge and ffmpeg write, so it reads no
@@ -2055,6 +2066,90 @@ their times. The decision log then holds the fix under `would` in `timing`.
 **Cost.** A fix adds the onset read, about 1 CPU second a minute of the up to 20 minutes it reads. The votes and the
 checks cost under a second a track.
 
+## Burned-in subtitles
+
+A *burned-in* subtitle is drawn into the video frames, so no track flag turns it off. `burnin.py` finds dialogue
+subtitles in the picture. Its docstring describes the method. The hook runs it as a subprocess of the language detection
+venv, through `checks.lid_cli()`, as it runs `lid.py`. So each run gets its own process group, a timeout and the cleanup
+of the onnxruntime log. An answer with an error raises, see `process.burn_run()`. `process.burn_ready()` says why the
+check cannot run. The cause is no language detection install, no `burnin.py`, or a text model in `LID_DIR/models/ocr`
+that `burnin.ready()` finds missing or wrong. The listener's start check and `--selftest` warn with it while `BURNED_IN`
+is on. `BURNED_IN=off` runs nothing. `check` alerts and changes nothing. `fix`, the default, also makes the changes
+below.
+
+**Quick check.** Each import with a video track, in any container, runs `burnin.quick()` after its own checks and edits,
+see `process.quick_check()`. It hears the audio track that plays first after the edit. It reads 10 windows of 30 seconds
+of the audio, or 19 when the first ones hold too little speech, and looks at keyframes inside them. It only sorts the
+file into clean, flagged or unsure, and changes nothing. Clean ends there. Flagged and unsure queue the burn-in job. HDR
+video, with a PQ or HLG transfer, is unsure when the check finds it clean, because the check misses white text on it. A
+Matroska file without cues is unsure at once, with no window heard, because each seek in it reads the file up to that
+time. The check runs in the time the metadata checks left of their 300 seconds, and its run ends there. With under
+`QUICK_SECS` (90) left, or when the run fails, the file is unsure. The decision line keeps the result in `burned_in`.
+mkvmerge gives no duration for an AVI file and no track of an ASF or WMV file, so the check takes them from ffprobe,
+inside the same time limit, see `process.burn_probe()`.
+
+**Burn-in job.** The job carries the import's decision inputs, the audio track of the quick check, and in `grab` the
+fields of the import job that a re-grab reads. It runs `burnin.full()` with no file lock, so no import waits for it. It
+yields when an import job waits in the queue, between two parts of its speech read and after every 10 frames. A full
+check ends after `BURN_TIMEOUT` (3600) seconds. The speech spans come from `lid.speech()` and its cache, which the deep
+analysis shares. `runner.burn_plan()` gives the plan for the verdicts, and `runner.burn_step()` what the job does with it.
+The job reads the language of the audio from the track's tag in the file as it is now, so a language the import only
+heard never turns subtitles off. A full burn-in whose text the check reads gets a second pass, `full(second=True)`, on
+frames the first pass did not take. It runs at `check` too, so `check` alerts on what `fix` would act on. When an
+import waits during the second pass, the job keeps the first pass in the queue, and its next run reads only the second.
+
+| Verdict | At `check` | At `fix` |
+| --- | --- | --- |
+| none, partial or unsure | log | log |
+| full, English, audio English | log | log |
+| full, English, audio untagged | alert | alert |
+| full, language unknown | alert | alert |
+| full, English, audio in another language, both passes agree | alert | turn off the English subtitles, and alert |
+| full, another language, both passes agree | alert | a re-grab |
+| full, the second pass disagrees or cannot tell | alert | alert |
+
+**English subtitles off.** Under the file lock, exclusive at `fix`, the job reads the tracks again. It turns off the
+default and forced flags of each English subtitle track that is on, through `process.edit()`, with its undo line, its
+hard link check and its verify. The edit's `recheck` plans the file with the import's own decision inputs, which the job
+carries, see `process.replan()`. It leaves out the edits that would turn English subtitles on again, so the nightly audit
+counts no further edit for them. A file that is not Matroska keeps its flags, and the alert says so. A
+file with no English subtitle track on still alerts. The deep analysis and a recheck keep these flags, as they keep
+every flag. A failed edit that left the flags as they were says the original file was not changed. One that changed a
+flag all the same says which tracks play now. The tool's own words stay in the decision log.
+
+**The mark.** Before the edit the job marks the file in the store's `burned_in_muted` namespace, with its path, inode
+and size, see `runner.muted()`. A failed edit that changed nothing drops the mark. While the mark matches the file, a
+flag backfill, `--sub-check --apply` and `--sub-time` leave out every edit that turns an English subtitle on, see
+`process.muted_plan()`, and their line says so in `flags_kept`. The class of that line names the edits that are left,
+and ends with "English subtitles kept off by the burned-in subtitle check". A flag edit or a remux of AMG's own moves
+the mark to the new inode and size. A new file at the path, as an upgrade, has another inode or size and clears the
+mark. The nightly audit leaves the English subtitles of a marked file out of its further edits. The mark is the one
+exception to the rule that the only English subtitles stay on, see "Safety self-checks" in
+[development.md](development.md).
+
+**Re-grab.** When both passes read full text in another language, `regrab.regrab()` decides with kind `burned_in`,
+under the exclusive file lock. The second pass ran before the lock and is its second check. `REGRAB`, `REGRAB_CAP`, the
+kept copies and the restore apply as for an import. A `REGRAB` without `burned_in` alerts that re-grabs are off. The
+re-grab judges the job's file alone. Each other file of the download that its import's quick check flagged, or could
+not sort, gets a burn-in job of its own. A second pass that disagrees, or cannot tell, alerts as not confirmed and
+changes nothing.
+
+**One re-grab per item for its own language.** Every release may carry text in the language of the audio or of the
+item's original language. An example is Chinese text on a Chinese film. Such a burn-in re-grabs the movie or the
+episodes once. The store keeps that fact in the `burned_in_once` namespace, keyed by `runner.burn_item()`. The next copy
+with such a burn-in alerts and stays. A store too busy to keep the fact puts a note in the decision line, and the next
+copy is re-grabbed once more. Text in any other language follows the normal rule above.
+
+**One alert.** The job posts one alert of kind `burned_in`, once per file and size. A failed flag edit is part of that
+alert, never an "edit" alert of its own. With `DISCORD_POSTS=all`, no change post repeats the flags the alert names.
+
+**Drops.** Under each lock the job checks by the inode that the file is still the import's. It drops itself when the
+file is gone or replaced, and follows a move, as a deep analysis does, see "How it runs". A queued job also drops
+itself at `BURNED_IN=off`, or when the check is not installed.
+
+**Old files.** No saved result records the check, so an update rechecks no old file for it. `--burn-in` checks a file
+by hand and changes nothing, see [commands.md](commands.md#check-for-burned-in-subtitles).
+
 ## Status file
 
 The hook records two checks in `STATE_DIR/status.json`, the TMDB key and the policy file. A
@@ -2179,7 +2274,8 @@ app checks, so each warns once. Each API call of the Test checks waits at most 1
 app fails the Test fast.
 
 After the apps, the start check and `--selftest` check each other service the setup uses, see
-`runner.service_checks()`. A tester found that a wrong Plex URL or token stayed silent before. Each
+`runner.service_checks()`. With `BURNED_IN` on, the first line says whether the burned-in subtitle check can run, see
+"Burned-in subtitles". A tester found that a wrong Plex URL or token stayed silent before. Each
 check is one GET that changes nothing, and each prints one line. Plex lists its
 libraries with `PLEX_TOKEN`. Discord answers a GET of the webhook URL with the webhook's details, so
 the check proves the webhook and its token without a post. TMDB has a key check of its own. SABnzbd

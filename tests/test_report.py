@@ -135,6 +135,36 @@ FINDINGS = [
      "codec": "S_TEXT/ASCII", "end": 1561.0, "streams": 1432.0}]}, "Subtitles run past the end", "amber",
      "The Spanish subtitles (track 2) keep going until 26:01, but the video and audio end at 23:52. "
      "They're in a format that can't be trimmed automatically, so they were left as they are."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "edited"}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the audio is Japanese. Turned off the default and forced flags of the English subtitles "
+     "(track 1)."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1", "s3"], "check": True}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the audio is Japanese. BURNED_IN is set to check, so subtitle tracks 1 and 3 (English) stay "
+     "on."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "edit_failed"},
+     "Burned-in subtitles", "amber", "The video has English subtitles burned in, and the audio is Japanese. Couldn't turn off the English subtitles "
+     "(track 1). The original file was not changed."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "read_only", "result": "read-only, not edited"}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the audio is Japanese. Couldn't turn off the English subtitles (track 1), because the file "
+     "is read-only. The original file was not changed."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "not_mkv": True}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the audio is Japanese. The file isn't MKV, so the English subtitles (track 1) stay on."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "und"}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the language of the audio is unknown, so nothing was changed."),
+    ({"kind": "burned_in", "lang": None, "english": None, "audio": "jpn"}, "Burned-in subtitles", "amber",
+     "The video has subtitles burned in, but their language couldn't be read. Nothing was changed."),
+    ({"kind": "burned_in", "lang": "chi", "english": False, "audio": "jpn", "check": True}, "Burned-in subtitles", "amber",
+     "The video has Chinese subtitles burned in. BURNED_IN is set to check, so the file was kept."),
+    ({"kind": "burned_in", "lang": "chi", "english": False, "audio": "jpn", "action": {"code": "unconfirmed"}}, "Burned-in subtitles, not confirmed",
+     "amber", "The video has Chinese subtitles burned in."),
+    ({"kind": "burned_in", "lang": None, "english": False, "audio": "jpn", "action": {"code": "would_regrab", "kind": "burned_in"}},
+     "Burned-in subtitles, re-grab is off", "red", "The video has subtitles in another language burned in."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "edit_failed", "changed": True, "on": ["a1 jpn"]},
+     "Burned-in subtitles", "amber", "The video has English subtitles burned in, and the audio is Japanese. Couldn't turn off the English subtitles "
+     "(track 1). The file still opens, and its default tracks are the Japanese audio (track 1)."),
+    ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "hardlinked"}, "Burned-in subtitles", "amber",
+     "The video has English subtitles burned in, and the audio is Japanese. Couldn't turn off the English subtitles (track 1), because the file "
+     "has another hard link, such as the download client's copy. The original file was not changed."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -191,6 +221,15 @@ ACTIONS = [
      "code": "restored"}, "", "Deleted the broken file. It was a manual import, so there was no grab to mark as failed, and Radarr won't search "
      "for another copy. Also put back the old file of 1 more broken file from this download. The old file wasn't put back, because the recycle "
      "bin copy changed since its check."),
+    ({"code": "regrabbed", "name": "Radarr", "kind": "burned_in", "n": 1}, ", re-grabbed",
+     "Deleted the file and marked the grab as failed, so Radarr is searching for another copy."),
+    ({"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None,
+     "code": "restored", "kind": "burned_in"}, ", old file restored",
+     "Deleted the file. It was a manual import, so there was no grab to mark as failed, and Radarr won't search for another copy. Put back the "
+     "old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr picked it up again."),
+    ({"code": "disagreed"}, ", not confirmed", "A second check on other frames disagreed, so nothing was changed."),
+    ({"code": "unsure"}, ", not confirmed", "A second check on other frames couldn't tell, so nothing was changed."),
+    ({"code": "once"}, "", "An earlier copy was already re-grabbed for this, so this copy was kept."),
 ]
 
 
@@ -449,7 +488,7 @@ def test_each_finding_has_its_title_color_and_text(f, title, color, text):
 @pytest.mark.parametrize("a, end, text", ACTIONS)
 def test_each_action_has_its_title_and_text(a, end, text):
     f = {"kind": "audio", "certain": SILENT, "action": a}
-    assert h.title(f) == ("Broken audio" + end, "amber" if a["code"] == "unconfirmed" else "red")
+    assert h.title(f) == ("Broken audio" + end, "amber" if a["code"] in ("unconfirmed", "disagreed", "unsure", "once") else "red")
     assert h.texts(f, "done") == ("The audio is silent at all 3 places checked.", text)
     assert h.texts(f, "planned") == h.texts(f, "done")   # a re-grab runs only in an apply, so its words have one tense
 
@@ -609,7 +648,7 @@ def test_the_embed_target_is_one_embed_per_finding():
 # The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
 # program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
 # track a conversion left out. Every other golden posts, a doubt and a failed restore too.
-LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9}, "sub_lines": {0, 7, 10, 23, 24, 26}}
+LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9, 20, 21}, "sub_lines": {0, 7, 10, 23, 24, 26}}
 SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "stripped")   # the sentences of a submatch finding
 
 
@@ -1066,7 +1105,8 @@ def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
 # The step where the fix of each golden stopped, by its place in FINDINGS, ACTIONS and SUB_LINES, as the Stopped at field
 # shows it. Every other golden tried no fix, or its fix worked, so it shows only the Check field.
 STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file",
-                        22: "Writing the file", 23: "Writing the file", 24: "Writing the file", 25: "Writing the file"},
+                        22: "Writing the file", 23: "Writing the file", 24: "Writing the file", 25: "Writing the file",
+                        32: "Writing the file", 33: "Writing the file", 40: "Writing the file", 41: "Writing the file"},
            "actions": {5: "Replacing the file", 8: "Replacing the file", 10: "Replacing the file", 11: "Replacing the file",
                        15: "Replacing the file", 16: "Replacing the file", 19: "Replacing the file"},
            "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file",
@@ -1085,7 +1125,7 @@ def test_every_alert_code_has_its_step():
     Stopped at field. A step is a name of FIX_STEPS, None for no fix tried, or a function of the facts."""
     assert set(h.FINDING_STEPS) == set(h.FINDINGS) and set(h.ACTION_STEPS) == set(h.ACTIONS) and set(h.LINE_STEPS) == set(h.SUB_LINES)
     assert all(v is None or v in h.FIX_STEPS or callable(v) for m in (h.FINDING_STEPS, h.ACTION_STEPS, h.LINE_STEPS) for v in m.values())
-    assert 4 <= len(h.FIX_STEPS) <= 7 and set(h.CHECKS) == {"hook", "deep_analysis", "recheck", "backfill", "worker"}
+    assert 4 <= len(h.FIX_STEPS) <= 7 and set(h.CHECKS) == {"hook", "deep_analysis", "recheck", "backfill", "worker", "burn_in"}
 
 
 def test_each_alert_names_the_step_where_its_fix_stopped():

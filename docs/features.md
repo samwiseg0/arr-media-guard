@@ -181,6 +181,47 @@ and two points mark the content as wrong. AMG re-grabs it only when `REGRAB` lis
 content, re-grab is off" names each sign. For an episode, AMG reads the episode title from the release's NFO file or
 name. When it belongs to another episode, an alert "Maybe the wrong episode" names both. That alert never re-grabs.
 
+## Burned-in subtitles
+
+Some releases have subtitles drawn into the picture. These *burned-in* subtitles always show, and no player can turn
+them off. A Japanese film with English subtitles burned in then shows the English lines twice when the English
+subtitle track plays too. A release with Chinese subtitles burned in shows lines most viewers cannot read.
+
+Each import gets a quick check. AMG listens to ten short parts of the audio and looks at frames inside and between the
+speech. Subtitles show while people speak, so a file with text in the speech frames and little in the quiet ones is
+flagged. The quick check changes nothing. A flagged file, or one the quick check cannot tell, waits in the background
+queue for the full check. That one finds the speech in the whole audio, looks at 40 frames in speech and 40 in quiet
+parts with a text detector, and reads the language of the lines. HDR video always gets the full check, because the
+quick check misses text on it. So does a Matroska file without cues, its seek index, which the quick check cannot read
+fast.
+
+- Every full burn-in whose language AMG reads gets a second check on other frames. When it disagrees, or cannot tell,
+  the alert says the problem was not confirmed, and nothing changes.
+- English subtitles burned in, audio in another language, and both checks agree: AMG turns off the default and forced
+  flags of each English subtitle track that is on, so only the burned-in lines show. An alert says what is burned in
+  and what changed. A file that is not MKV keeps its flags, and the alert says so.
+- Subtitles in another language burned in, and both checks agree: AMG re-grabs the file, as for broken audio, when
+  `REGRAB` lists `burned_in`. Else the alert title ends "re-grab is off".
+- Subtitles in the language of the audio or of the film itself, as Chinese text on a Chinese film: AMG re-grabs the
+  movie or episode once. Every release may carry them, so when the next copy has them too, AMG alerts and keeps it.
+- Text whose language AMG cannot read, or English text when the audio has no language tag: an alert, and nothing
+  changes.
+- English subtitles over English audio, burned-in lines for only part of the speech, or none: the decision log only.
+  Partial burn-ins are mostly translated signs or lines in another language, which viewers want.
+
+`BURNED_IN=check` alerts and changes nothing, and `off` turns the check off. AMG marks a file whose English subtitles it
+turned off. The deep analysis, a recheck, a flag backfill, `--sub-check --apply` and `--sub-time` keep them off while
+the file stays the same. A new copy of the film or episode clears the mark.
+`arr-media-guard --burn-in <file>` runs both checks by hand and changes nothing, see
+[commands.md](commands.md#check-for-burned-in-subtitles).
+
+The check runs in the language detection install, with three text models of 24.6 MB. The Docker image holds them, and a
+host install fetches them, see the [README](../README.md#install-on-a-host). The quick check takes about 8 to 15 CPU
+seconds for an SD to 1080p file, and about 50 for a 4K remux. On a test host it added about 2 to 10 seconds to an
+import. On a busy host it can add up to about 80 seconds for a 4K file. The full check runs before the deep analysis, so
+it reads the speech of the whole audio itself. Its medians are about 44 CPU seconds for an SD file, 100 for 720p, 160
+for 1080p, and 11 minutes for a 4K remux. A second pass reads the speech from the cache.
+
 ## Header repair
 
 A Matroska file can carry a wrong header, such as a wrong length or a missing seek index. It can also hold junk data at
@@ -219,13 +260,14 @@ arr-media-guard: recheck: this version can improve the subtitle check of 12 file
 
 On a host install, the first nightly audit of the new version queues them, and they run after the next import.
 
-The rechecks wait in the background queue, where every job waits. Imports always go first, then the deep analyses, then
-the rechecks, one at a time. A recheck repeats the check that saved the result, and never checks deeper. A file that
-only an import checked gets the import's subtitle checks again, and no more. `SUBTITLES` decides what a recheck may do,
-as for an import. At `check` it only alerts, and a later `--sub-check --apply` makes the fix. AMG posts an alert of
-one kind once for a file. So at `check`, a recheck posts nothing when an alert of the same kind posted for the file
-before. At `fix` or `deep` it fixes. At `off` it does nothing. It keeps the flags an earlier run set. Its fixes and
-alerts look like those of an import. `RECHECK_ON_UPDATE=false` turns it off.
+The rechecks wait in the background queue, where every job waits. Imports always go first, then the burned-in subtitle
+checks, then the deep analyses, then the rechecks, one at a time. A recheck repeats the check that saved the result,
+and never checks deeper. A file that only an import checked gets the import's subtitle checks again, and no more.
+`SUBTITLES` decides what a recheck may do, as for an import. At `check` it only alerts, and a later
+`--sub-check --apply` makes the fix. AMG posts an alert of one kind once for a file. So at `check`, a recheck posts
+nothing when an alert of the same kind posted for the file before. At `fix` or `deep` it fixes. At `off` it does
+nothing. It keeps the flags an earlier run set. Its fixes and alerts look like those of an import.
+`RECHECK_ON_UPDATE=false` turns it off.
 
 The recheck covers only files with a saved result. A file the subtitle check never saw needs one `--sub-check` run. A
 recheck reaches only the results whose findings the new version can fix. 2.8.0 rechecks every result that the deep
@@ -254,16 +296,17 @@ it. A rejected download is deleted, and the old file stays. It needs `SABNZBD_AP
 AMG posts a Discord alert for each problem it leaves unresolved, when `DISCORD_WEBHOOK` is set. A fix that failed, a fix
 a setting turned off, and a doubt all post, once for the same file. A problem AMG fixed goes to the decision log and
 syslog only. Examples are a re-grab, a removed or repaired subtitle, and new subtitle times. With `DISCORD_POSTS=all`,
-AMG also posts each change it makes to a file, unless an alert already says it. Imports, the deep analysis and the
-recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the worker starts or a `--convert`
-run finds it. The backfill, `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when
-it finds a problem. `arr-media-guard --test-discord` posts a test message and prints Discord's answer.
+AMG also posts each change it makes to a file, unless an alert already says it. Imports, the burned-in subtitle check,
+the deep analysis and the recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the
+worker starts or a `--convert` run finds it. The backfill, `--sub-check` and `--sub-time` post nothing else. A scan or
+the audit posts one summary when it finds a problem. `arr-media-guard --test-discord` posts a test message and prints
+Discord's answer.
 
 Each alert shows two short fields side by side, under its text and above the item and file. **Check** names the check
-that found the problem. The checks are Import check, Deep analysis, Recheck, Worker start and Command line run. The last
-two find a conversion that a stop left unfinished, when the worker starts or in a `--convert` run. **Stopped at** names
-the step where AMG's fix stopped. The steps are the same for every kind of alert. A subtitle shows one step, the
-furthest its fix reached.
+that found the problem. The checks are Import check, Burned-in subtitle check, Deep analysis, Recheck, Worker start
+and Command line run. The last two find a conversion that a stop left unfinished, when the worker starts or in a
+`--convert` run. **Stopped at** names the step where AMG's fix stopped. The steps are the same for every kind of alert.
+A subtitle shows one step, the furthest its fix reached.
 
 | Stopped at | What it means |
 | --- | --- |
@@ -302,5 +345,5 @@ at once, such as wrong content, broken audio or video, and a failed flag change.
 
 When the listener starts, it checks each Sonarr and Radarr, and Plex, Discord, TMDB, SABnzbd and the indexer where the
 setup uses them. `--selftest` runs the same checks. Each check asks once and changes nothing. A service that does not
-answer, or refuses its key, gets a warning line that names it. AMG keeps running, see
-[commands.md](commands.md#service-checks).
+answer, or refuses its key, gets a warning line that names it. While `BURNED_IN` is on, it also checks that the
+burned-in subtitle check can run. AMG keeps running, see [commands.md](commands.md#service-checks).

@@ -1,0 +1,6 @@
+arr-media-guard. Copyright (C) 2026 samwiseg0. GPL-3.0, see LICENSE.
+
+The burned-in subtitle check uses three text models that the install downloads: the PP-OCRv4 mobile text detector,
+the ch_PP-OCRv4 recognizer and the en_PP-OCRv3 recognizer. They are PaddleOCR models
+(https://github.com/PaddlePaddle/PaddleOCR) as ONNX files from RapidOCR (https://huggingface.co/SWHL/RapidOCR), under
+the Apache License 2.0. LICENSES/Apache-2.0.txt holds its text. arr-media-guard does not change the models.

@@ -66,8 +66,9 @@ with open(os.path.join(FILES, "examples", "policy.json")) as _f:
     POLICY = json.load(_f)
 hook.arr_decide.set_policy(POLICY)
 hook.CFG = dataclasses.replace(hook.CFG, keep_days=0)   # a repack drops its original. The tests of the kept original switch it on.
-# One job at a time in the worker, and no deep analysis. A test of job processes or of the deep analysis sets its own.
-hook.CFG = dataclasses.replace(hook.CFG, hook_workers=1, subtitles="fix")
+# One job at a time in the worker, no deep analysis and no burned-in subtitle check. A test of job processes, of the
+# deep analysis or of the burned-in subtitle check sets its own.
+hook.CFG = dataclasses.replace(hook.CFG, hook_workers=1, subtitles="fix", burned_in="off")
 # mkvmerge's language table as `mkvmerge --list-languages` prints it, so no test runs mkvmerge for it
 LANGUAGES = ("English | eng | eng | en\nSpanish | spa | spa | es\nFrench | fre | fre | fr\nJapanese | jpn | jpn | ja\n"
              "Portuguese | por | por | pt\nChinese | chi | chi | zh\nUndetermined | und | und |\n")
@@ -7378,7 +7379,8 @@ def test_a_format_refusal_keeps_the_original(env, monkeypatch, settings, case):
     settings(regrab=set(hook.REGRAB_KINDS))
     env["repack_rc"], env["repack_out"] = 1, {"end skip": invalid_audio("00:09:58.806000000", "00:09:58.832000000"),
                                               "start skip": invalid_audio("00:00:00.412000000", "00:00:00.438000000")}.get(case, INVALID_AUDIO)
-    env["proof"] = ({"timestamps": (None, "a packet of stream video 0 (h264) moved 27 ms against its stream's start, 842.516 s into the original"),
+    env["proof"] = ({"timestamps": (None, "the MKV would show the video 27 ms out of sync with the audio, from 14:02 to 14:03. "
+                                    "Detail: video 0 (h264) moved 27 ms, first at 842.516 s"),
                      "edit list": (0, "stream video 0 (h264) holds 30918 packets in the new file, 30920 in the original"),
                      "cues": (None, "the mov_text stream 2 holds 471 cues in the new file, 483 in the original")}.get(case, REFUSED), [])
     if case == "temp file read":
@@ -9279,7 +9281,7 @@ def test_a_trimmed_first_frame_may_come_with_a_cut_last_frame(monkeypatch, tmp_p
 @pytest.mark.parametrize("case, fault", [
     ("cut frame, start moved", "stream audio 1 starts +0.500 s from the video in the new file, +0.000 s in the original"),
     ("edit list, start moved", "stream audio 1 starts +0.500 s from the video in the new file, +0.000 s in the original"),
-    ("times go back 0.3 s", "a packet of stream audio 1 (aac) moved 300 ms against its stream's start"),
+    ("times go back 0.3 s", "the MKV would play the audio 300 ms out of sync with the video, from the start to the end"),
     ("times 1 ms off", None),
     ("AVI audio drifts 26 ms", None),   # an AVI keeps no audio times, ffmpeg counts bytes, mkvmerge samples
 ])
@@ -9357,7 +9359,7 @@ def test_a_failed_time_check_reads_the_stored_times_again(monkeypatch, tmp_path,
         assert fault is None and proof[0]["match"] and times["reread"]["worst_ms"] < 1, (fault, times)
         assert ("edit_list" in proof[0]) == bool(extra)
     else:
-        assert fault.startswith("a packet of stream video 0 (h264) moved 42 ms") and 41 < times["reread"]["worst_ms"] < 43, fault
+        assert fault.startswith("the MKV would show the video 42 ms out of sync with the audio") and 41 < times["reread"]["worst_ms"] < 43, fault
 
 
 def packets_of(datas, times, step):
@@ -9467,8 +9469,8 @@ def test_audio_may_lose_junk_and_cut_frames_at_its_ends(monkeypatch, tmp_path, c
 
 @pytest.mark.parametrize("move, other, fault", [
     (1, 0, None),   # mkvmerge spaces the two packets of one time one frame apart
-    (2, 0, "a packet of stream audio 1 (aac) moved 43 ms against its stream's start"),
-    (1, 0.005, "a packet of stream audio 1 (aac) moved 26 ms against its stream's start"),   # and a later packet moves 5 ms
+    (2, 0, "the MKV would play the audio 43 ms out of sync with the video, at the start"),
+    (1, 0.005, "the MKV would play the audio 5 ms out of sync with the video, at 0:02"),   # and a later packet moves 5 ms
 ])
 def test_audio_packets_that_share_a_time_may_move_one_frame(monkeypatch, tmp_path, move, other, fault):
     """In an MP4 the first two AAC packets may carry one time. mkvmerge moves the first one a frame earlier. Against the
@@ -9499,7 +9501,75 @@ def test_video_packets_that_share_a_time_still_fail(monkeypatch, tmp_path):
     fake_proof_reads(monkeypatch, "mov,mp4,m4a,3gp,3g2,mj2", [{"index": 0, "codec_type": "video", "codec_name": "h264"}],
                      {0: packets_of(datas, old, frame)}, {0: packets_of(datas, new, frame)})
     got, proof = proved(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
-    assert (got or "").startswith("a packet of stream video 0 (h264) moved 42 ms") and "shared" not in proof[0]["times"], got
+    assert (got or "").startswith("the MKV would show the video 42 ms out of sync with the audio, at the start") and \
+        "shared" not in proof[0]["times"], got
+
+
+AAC_FRAME = 1024 / 48000   # one AAC frame at 48 kHz
+SYNC_MOVES = {"one packet": (1, {2813}, 0.005), "video": (0, range(1000, 2000), 0.027), "subtitle": (2, {12}, 0.12),
+              "late subtitle": (2, {12}, 0.12), "two places": (0, {*range(250, 500), *range(2500, 2750)}, 0.027),
+              "last packet": (1, {6999}, 0.03), "to the packet before the last": (1, range(2813, 6999), 0.005),
+              "inside 10 s": (0, range(1500, 1626), 0.027), "one packet between": (0, set(range(1500, 1626)) - {1560}, 0.027),
+              "two packets in one second": (1, {2813, 2815}, 0.005)}   # case: the stream, its moved packets, the move
+
+
+@pytest.mark.parametrize("case, fault", [
+    ("priming", "the MKV would play the audio 44 ms out of sync with the video, from the start to the end. Detail: audio 1 (aac) moved "
+     "44 ms, first at 0.020 s"),
+    ("step", "the MKV would play the audio 300 ms out of sync with the video, from 1:59 to the end. Detail: audio 1 (aac) moved 300 ms, "
+     "first at 119.701 s"),
+    ("one packet", "the MKV would play the audio 5 ms out of sync with the video, at 1:00. Detail: audio 1 (aac) moved 5 ms, first at "
+     "60.011 s"),
+    ("video", "the MKV would show the video 27 ms out of sync with the audio, from 0:40 to 1:19. Detail: video 0 (h264) moved 27 ms, "
+     "first at 40.000 s"),
+    ("subtitle", "the MKV would show the subtitles 120 ms out of sync with the video, at 1:00. Detail: subtitle 2 (hdmv_pgs_subtitle) "
+     "moved 120 ms, first at 60.000 s"),
+    ("late subtitle", "the MKV would show the subtitles 120 ms out of sync with the video, at 2:02. Detail: subtitle 2 "
+     "(hdmv_pgs_subtitle) moved 120 ms, first at 122.000 s"),
+    ("two places", "the MKV would show the video 27 ms out of sync with the audio, in 2 places between 0:10 and 1:49. Detail: video 0 "
+     "(h264) moved 27 ms, first at 10.000 s"),
+    ("last packet", "the MKV would play the audio 30 ms out of sync with the video, at 2:29. Detail: audio 1 (aac) moved 30 ms, first "
+     "at 149.312 s"),
+    ("to the packet before the last", "the MKV would play the audio 5 ms out of sync with the video, from 1:00 to 2:29. Detail: audio 1 "
+     "(aac) moved 5 ms, first at 60.011 s"),
+    ("inside 10 s", "the MKV would show the video 27 ms out of sync with the audio, from 1:00 to 1:05. Detail: video 0 (h264) moved "
+     "27 ms, first at 60.000 s"),
+    ("one packet between", "the MKV would show the video 27 ms out of sync with the audio, in 2 places between 1:00 and 1:05. Detail: "
+     "video 0 (h264) moved 27 ms, first at 60.000 s"),
+    ("two packets in one second", "the MKV would play the audio 5 ms out of sync with the video, at 1:00. Detail: audio 1 (aac) moved "
+     "5 ms, first at 60.011 s"),
+])
+def test_a_time_refusal_says_when_the_mkv_plays_out_of_sync(monkeypatch, tmp_path, case, fault):
+    """A refusal of the time check says in plain words when the MKV would play out of sync, then names the stream, the
+    move and the first moved packet. Its times count from the start of the MKV, as a player shows them. An MP4 holds
+    three AAC packets at 0 s and no edit list. mkvmerge spaces them one frame apart, so the audio plays two frames late
+    to the end. The detail names the first moved packet with a time of its own. A TS starts at 600 s, and its audio
+    times go back 0.3 s at 2 minutes. mkvmerge makes them continuous. One audio packet moves 5 ms. The video moves
+    27 ms for 40 s. One subtitle moves 120 ms, also in a subtitle stream that starts at 62 s. The video moves in two
+    places. The last packet alone moves, or every packet from 1:00 to the one before the last. The video moves for 5 s,
+    also with one packet in sync in the middle. Two audio packets move in one second. The alert of the MP4 gives the
+    refusal as its reason."""
+    monkeypatch.chdir(tmp_path)
+    cues = [62.0 + i * 5.0 for i in range(16)] if case == "late subtitle" else [i * 5.0 for i in range(30)]
+    old = {0: [i * 0.04 for i in range(3750)], 1: [i * AAC_FRAME for i in range(7003 if case == "priming" else 7000)], 2: cues}
+    stream, moved, by = SYNC_MOVES.get(case, (1, (), 0))
+    new = {k: [round(t + (by if k == stream and i in moved else 0), 3) for i, t in enumerate(v)] for k, v in old.items()}
+    if case == "priming":
+        old[1] = [0.0, 0.0, 0.0] + [(960 + i * 1024) / 48000 for i in range(7000)]
+    if case == "step":
+        old = {k: [600 + t - (0.3 if k == 1 and i >= 5625 else 0) for i, t in enumerate(v)] for k, v in old.items()}
+    data = lambda n: [bytes([i % 251]) * 8 for i in range(n)]
+    stats = lambda times: {k: packets_of(data(len(t)), t, 0.04) for k, t in times.items()}
+    fake_proof_reads(monkeypatch, "mov,mp4,m4a,3gp,3g2,mj2" if case == "priming" else "mpegts",
+                     [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                      {"index": 2, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"}], stats(old), stats(new))
+    got, proof = proved(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert got == fault, got
+    assert [p["match"] for p in proof] == [k != stream for k in range(3)], proof
+    if case == "priming":
+        assert hook.FINDINGS["repack"][1]({"container": "MP4/QuickTime", "why": got}, None) == (
+            "Couldn't convert the MP4/QuickTime file to MKV, so the original was kept. The MKV would play the audio 44 ms out of sync with "
+            "the video, from the start to the end. Detail: audio 1 (aac) moved 44 ms, first at 0.020 s.")
 
 
 SEI_UNIT = bytes.fromhex("4e0181010f80")   # a prefix SEI in the codec header
@@ -17284,3 +17354,947 @@ def test_a_garbled_track_that_flashes_and_cannot_be_repaired_is_taken_out(env, m
     assert (rec["subremux"]["codes"], rec["subremux"]["stripped"], rec["subremux"]["ended"]) == (["subtitle_garbled_removed"], {"s1": name}, []), rec["subremux"]
     assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {} and os.path.getsize(env["path"][:-4] + ".bul.garbled.txt") == 0
     assert [t for _, _, t in hook.srt_blocks(open(os.path.join(os.path.dirname(env["path"]), name), encoding="utf-8").read(), "\n")] == old_mux(scene("rus", 2), "cp1251")
+
+
+# --- the burned-in subtitle check (docs/design.md, "Burned-in subtitles") ---------------------------------------------
+
+QUICK = {"result": "flagged", "windows": 10, "speech_frames": 24, "silence_frames": 30,
+         "b": {"speech_share": 0.5, "silence_share": 0.0, "lift": 0.5, "spread": 7, "label": "full"}, "took": 8.0, "cpu": 9.5}
+
+
+def verdict(label="full", english=False, lang="chi", **kw):
+    """A verdict of burnin.full(), see common interface: the label, whether the text is English, and its language."""
+    return dict(label=label, english=english, text_lang=lang, script="latin" if lang in ("eng", "spa", None) else "cjk", speech_share=0.6,
+                silence_share=0.0, lift=0.6, spread=8, speech_frames=40, silence_frames=40, lines_read=12, second=False, spans_cached=True,
+                took=60.0, cpu=80.0, **kw)
+
+
+@pytest.fixture
+def burn(env, monkeypatch, settings):
+    """burnin.py as the tests see it. Its models and venv are not here, so burn_run(), the run of burnin.py, is a
+    stand-in. --quick gives burn["quick"], and --full gives the verdicts of burn["full"] in turn, the last one again.
+    An exception there is raised, and a function there is called for its verdict. Each call is in burn["calls"], and
+    the timeout of each --quick in burn["timeouts"]. burn["ready"] is what burn_ready() says. BURNED_IN is fix."""
+    calls = {"calls": [], "quick": dict(QUICK), "full": [verdict()], "ready": None, "timeouts": []}
+
+    def run(path, index, duration, flags, timeout, queue=None):
+        if flags == ["--quick"]:
+            calls["calls"].append(("quick", path, index, duration))
+            calls["timeouts"].append(timeout)
+            env["events"].append("quick")
+            v = calls["quick"]
+        else:
+            assert flags[0] == "--full" and timeout == hook.BURN_TIMEOUT
+            calls["calls"].append(("full", path, index, duration, "--second" in flags, None, queue))
+            v = calls["full"].pop(0) if len(calls["full"]) > 1 else calls["full"][0]
+        if isinstance(v, Exception):
+            raise v
+        return copy.deepcopy(v() if callable(v) else v)
+    monkeypatch.setattr(hook, "burn_run", run)
+    monkeypatch.setattr(hook, "burn_ready", lambda: calls["ready"])
+    settings(burned_in="fix")
+    return calls
+
+
+def burn_job(env):
+    """The queued burn-in job of the env file."""
+    return hook.job_of(hook.burn_name(env["path"]))
+
+
+def held_burn(monkeypatch):
+    """The burn-in jobs the worker takes, each recorded with its name and dropped, so a test of an import reads what it
+    queued."""
+    jobs = []
+    monkeypatch.setattr(hook, "burn_in", lambda n, pending, claimed=False: jobs.append(dict(hook.job_of(n, claimed), name=n)) or hook.drop_job(n, claimed))
+    return jobs
+
+
+def test_an_import_sorts_its_file_with_the_quick_check_after_its_edit_and_queues_the_full_check(env, burn, monkeypatch):
+    """The import turns the English audio on. The quick check then hears the audio that plays now, in the time the
+    metadata checks left, and changes nothing. A flagged file queues one burn-in job with what the full check and a
+    re-grab need. The worker runs it after the import."""
+    jobs, real, limits = held_burn(monkeypatch), hook.alert_findings, []
+    monkeypatch.setattr(hook, "alert_findings", lambda *a, **k: limits.append(hook.DEADLINE.end) or real(*a, **k))
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "edited" and env["mkvpropedit"] and env["events"].index("quick") > env["events"].index("mkvpropedit")
+    assert burn["calls"] == [("quick", env["path"], 1, 7200.0)] and burn["timeouts"] == [300.0] and limits == [None]   # the alerts run with no limit
+    assert rec["burned_in"] == dict(QUICK, audio={"index": 1, "pos": "a2", "lang": "eng"}), rec["burned_in"]
+    (job,) = jobs
+    assert (job["audio"], job["quick"], job["from"], job["inputs"]["label"]) == (rec["burned_in"]["audio"], "flagged", rec["job"], "Film A (1979)"), job
+    assert job["key"] == list(hook.file_key(os.stat(env["path"]))) and set(job["grab"]) == set(hook.GRAB_KEYS) and job["grab"]["owner"] == "7"
+    assert job["name"] == hook.burn_name(env["path"]) and hook.queued() == []
+
+
+@pytest.mark.parametrize("result, queued", [("clean", False), ("unsure", True)])
+def test_a_clean_file_ends_at_the_quick_check_and_an_unsure_one_gets_the_full_check(env, burn, monkeypatch, result, queued):
+    jobs = held_burn(monkeypatch)
+    burn["quick"] = dict(QUICK, result=result)
+    hook.main([])
+    assert decided(env)["burned_in"]["result"] == result and len(jobs) == queued
+
+
+def test_a_burn_in_job_that_does_not_queue_writes_a_warning(env, burn, monkeypatch):
+    def busy(*a):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(hook, "queue_burn_in", busy)
+    hook.main([])
+    (warn,) = [r for r in log_lines(env) if r.get("result") == "warning"]
+    assert warn["note"] == "the burned-in subtitle check of the file did not queue: OperationalError: database is locked", warn
+    assert decided(env)["burned_in"]["result"] == "flagged"
+
+
+def test_a_quick_check_with_too_little_time_left_or_that_fails_leaves_the_file_unsure(env, burn, monkeypatch):
+    """The metadata checks took most of their limit, so the quick check does not run. A second import's quick check
+    fails. Each import ends as it would, and each file gets the full check."""
+    jobs, real = held_burn(monkeypatch), hook.arr_meta.last_packet
+    monkeypatch.setattr(hook.arr_meta, "last_packet", lambda *a, **k: env["clock"].__setitem__(0, env["clock"][0] + 250) or real(*a, **k))
+    hook.main([])
+    first = [r for r in log_lines(env) if "schema" in r][-1]
+    assert burn["calls"] == [] and first["outcome"] == "edited" and first["burned_in"]["result"] == "unsure", first["burned_in"]
+    assert first["burned_in"]["why"] == "50 seconds of the time limit were left, and the quick check needs 90" and jobs[-1]["quick"] == "unsure"
+    monkeypatch.setattr(hook.arr_meta, "last_packet", real)
+    burn["quick"] = RuntimeError("no answer in 300 seconds")
+    hook.main([])
+    second = [r for r in log_lines(env) if "schema" in r][-1]
+    assert second["burned_in"]["why"] == "the quick check failed: RuntimeError: no answer in 300 seconds" and len(jobs) == 2 and jobs[-1]["quick"] == "unsure"
+    burn["quick"] = dict(QUICK)   # the metadata checks ran out of time, so no time is left
+    monkeypatch.setattr(hook.arr_meta, "last_packet", lambda *a, **k: env["clock"].__setitem__(0, env["clock"][0] + 301) or hook.DEADLINE.check())
+    hook.main([])
+    third = [r for r in log_lines(env) if "schema" in r][-1]
+    assert "meta_error" in third and third["burned_in"]["why"].startswith("0 seconds of the time limit") and len(jobs) == 3 and len(burn["calls"]) == 1
+
+
+def test_a_hardlinked_import_gets_the_quick_check_on_the_audio_that_still_plays(env, burn, monkeypatch):
+    """The edit would turn the English audio on, but a hard link keeps the file as it is, so the Portuguese audio plays."""
+    held_burn(monkeypatch)
+    os.link(env["path"], env["path"] + ".link")
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "hardlinked" and burn["calls"] == [("quick", env["path"], 0, 7200.0)] and rec["burned_in"]["audio"]["lang"] == "por"
+
+
+def test_only_an_import_runs_the_quick_check_and_never_on_a_file_a_re_grab_replaced(env, burn, monkeypatch, settings):
+    """A backfill and the deep analysis never sort a file. A file the app replaced during the metadata checks, as a
+    re-grab does, is not the file the import checked."""
+    jobs = held_burn(monkeypatch)
+    hook.process(hook.Ctx("radarr", env["path"], "Film A (1979)", "English", 120, mode="sub_check", apply=False, post=False))
+    settings(subtitles="deep")
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    settings(subtitles="fix")
+    assert burn["calls"] == [] and not [r for r in log_lines(env) if r.get("burned_in")]
+    real = hook.arr_meta.last_packet
+    def replace(p, **k):
+        os.replace(env["path"], env["path"] + ".tmp")
+        shutil.copy(env["path"] + ".tmp", env["path"])
+        return real(p, **k)
+    monkeypatch.setattr(hook.arr_meta, "last_packet", replace)
+    hook.main([])
+    assert burn["calls"] == [] and jobs == [] and "burned_in" not in [r for r in log_lines(env) if r.get("source") == "hook" and "schema" in r][-1]
+
+
+@pytest.mark.parametrize("how", ["off", "not installed", "no video", "no audio"])
+def test_an_import_skips_the_burned_in_check_when_it_is_off_not_installed_or_has_no_video(env, burn, settings, how):
+    if how == "no audio":
+        env["probe"]["tracks"] = [t for t in env["probe"]["tracks"] if t["type"] != "audio"]
+    elif how == "off":
+        settings(burned_in="off")
+    elif how == "not installed":
+        burn["ready"] = "the det model does not read: No such file or directory"
+    else:
+        env["probe"]["tracks"] = [t for t in env["probe"]["tracks"] if t["type"] != "video"]
+    hook.main([])
+    rec = decided(env)
+    assert burn["calls"] == [] and hook.deep_analysis_queued() == [] and rec["outcome"] == ("broken_audio" if how == "no audio" else "edited")
+    assert rec.get("burned_in") == {"not installed": {"result": "skipped", "why": "the det model does not read: No such file or directory"},
+                                    "no audio": {"result": "skipped", "why": "the file has no audio track"}}.get(how), rec.get("burned_in")
+
+
+def test_an_import_of_a_file_that_is_not_mkv_gets_the_quick_check_too(env, burn, monkeypatch, settings, tmp_path):
+    jobs = held_burn(monkeypatch)
+    mp4 = tmp_path / "media" / "Film A (1979)" / "Film A (1979).mp4"
+    mp4.write_bytes(b"x")
+    monkeypatch.setenv("radarr_moviefile_path", str(mp4))
+    settings(convert=False)
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "not_mkv" and burn["calls"] == [("quick", str(mp4), 0, 7200.0)] and [j["name"] for j in jobs] == [hook.burn_name(str(mp4))]
+
+
+def test_a_newer_import_of_the_path_replaces_the_queued_burn_in_job(env, burn):
+    rec = {"path": env["path"], "ids": {"app_id": "7"}, "job": "a.json", "burned_in": dict(QUICK, audio={"index": 0, "pos": "a1", "lang": "jpn"})}
+    first = hook.queue_burn_in({"app": "radarr"}, rec, INPUTS)
+    second = hook.queue_burn_in({"app": "radarr"}, dict(rec, job="b.json"), INPUTS)
+    assert first == second == hook.burn_name(env["path"]) and hook.deep_analysis_queued() == [first] and burn_job(env)["from"] == "b.json"
+    assert hook.queue_burn_in({"app": "radarr"}, dict(rec, burned_in=dict(QUICK, result="clean")), INPUTS) is None
+
+
+def plan_of(inputs):
+    """The process.plan_inputs() of an import with inputs that heard, read and matched nothing."""
+    return dict(original=inputs["original"], kids=inputs["kids"], release=inputs["release"], heard={}, spoken=None, wrong={}, unmatched=[],
+                got={}, known=sorted(hook.arr_decide.codes(inputs["original"])), said=[], read={}, content_lang=None, checked={})
+
+
+def queue_burn(env, path=None, age=0.0, **job):
+    """A burn-in job for path, the way an import queues one, age seconds old. inputs in job get their plan inputs."""
+    path = path or env["path"]
+    rec = {"path": path, "ids": {"app_id": "7", "file_id": "11"}, "job": "1-1.json",
+           "burned_in": dict(QUICK, audio={"index": 0, "pos": "a1", "lang": "jpn"})}
+    name = hook.queue_burn_in({"app": "radarr", "owner": "7", "file_id": "11", "download_id": "a1b2c3d4"}, rec, dict(INPUTS, plan=plan_of(INPUTS)))
+    if "inputs" in job:
+        job["inputs"] = dict(job["inputs"], plan=job["inputs"].get("plan") or plan_of(job["inputs"]))
+    data = dict(hook.job_of(name), **job)
+    hook.store.write("UPDATE jobs SET job = ?, at = ? WHERE name = ? AND claimed = 0", json.dumps(dict(data, time=data["time"] - age)),
+                     time.time() - age, name)
+    return name
+
+
+def burn_lines(env):
+    """The decision lines of the burn-in jobs."""
+    return [r for r in log_lines(env) if "schema" in r and r["source"] == "burn_in"]
+
+
+def test_the_background_queue_runs_imports_then_burn_in_jobs_then_deep_analyses_then_rechecks(env, burn, monkeypatch, settings):
+    """A burn-in job queued last still runs before an older deep analysis and recheck, and only once no import waits."""
+    settings(subtitles="deep")
+    other = os.path.join(os.path.dirname(env["path"]), "Film B.mkv")
+    shutil.copy(env["path"], other)
+    deep = queue_analysis(env, env["path"], age=300)
+    recheck = hook.deep_name(other)
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", recheck, time.time() - 400,
+                     json.dumps(dict(hook.job_of(deep), path=other, recheck="import")))
+    name = queue_burn(env)
+    enqueue(env, 1, env["path"])
+    assert hook.deep_analysis_queued() == [name, deep, recheck] and len(hook.queued()) == 1 and hook.waiting()
+    order = []
+    monkeypatch.setattr(hook, "run_job", lambda n, pending, **k: order.append("import") or hook.drop_job(n))
+    monkeypatch.setattr(hook, "burn_in", lambda n, pending, claimed=False: order.append("burn") or hook.drop_job(n, claimed))
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, claimed=False: order.append(hook.job_of(n, claimed).get("recheck") or "deep")
+                        or hook.drop_job(n, claimed))
+    run_worker()
+    assert order == ["import", "burn", "deep", "import"], order
+
+
+def test_a_burn_in_job_runs_the_full_check_on_the_audio_of_its_import_and_logs_the_verdict(env, burn):
+    """The job reads the file with no lock and yields to an import that waits in the queue. Its line names the import."""
+    name = queue_burn(env)
+    burn["full"] = [verdict("partial", True, "eng")]
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert burn["calls"] == [("full", env["path"], 0, 7200.0, False, None, hook.store.path())] and "lock" not in env["events"]
+    assert (rec["outcome"], rec["result"], rec["from"], rec["job"], rec["burned_in"]["quick"]) == (
+        "burned_in_partial", "partial burned-in subtitles in English, logged only", "1-1.json", name, "flagged"), rec
+    assert hook.deep_analysis_queued() == [] and posted(env) == []
+
+
+def test_a_burn_in_job_that_yields_after_a_move_keeps_the_new_path(env, burn, monkeypatch):
+    """The app moved the file. The job finds the new path, and its yield keeps it in the queue, so the next run asks
+    the app nothing."""
+    name = queue_burn(env)
+    new = env["path"][:-4] + " (renamed).mkv"
+    os.replace(env["path"], new)
+    asked = []
+    monkeypatch.setattr(hook, "app_file", lambda job: asked.append(job["path"]) or (new, None, False))
+    burn["full"] = [{"yielded": True, "took": 3.0}]
+    hook.background(name, [])
+    assert burn_job(env)["path"] == new and asked == [env["path"]]
+    burn["full"] = [verdict("none", None, None)]
+    hook.background(name, [])
+    assert asked == [env["path"]] and burn_lines(env)[0]["path"] == new
+
+
+def test_a_burn_in_job_yields_to_an_import_and_goes_back_to_its_queue(env, burn):
+    name = queue_burn(env)
+    burn["full"] = [{"yielded": True, "took": 3.0}]
+    hook.background(name, [])
+    assert hook.deep_analysis_queued() == [name] and [r["result"] for r in log_lines(env)] == ["yielded"]
+    assert hook.claim(name)   # a job process claimed it
+    hook.background(name, [], True)
+    assert hook.deep_analysis_queued() == [name] and not claimed() and burn_lines(env) == []
+
+
+@pytest.mark.parametrize("how", ["gone", "replaced", "moved", "off", "not installed"])
+def test_a_burn_in_job_follows_a_move_and_drops_itself_when_its_file_is_gone_replaced_or_the_check_is_off(env, burn, monkeypatch, settings, how):
+    name = queue_burn(env)
+    burn["full"] = [verdict("none", None, None)]
+    new = env["path"][:-4] + " (renamed).mkv"
+    if how == "off":
+        settings(burned_in="off")
+    elif how == "not installed":
+        burn["ready"] = "the burned-in subtitle check is not installed"
+    elif how == "replaced":
+        os.replace(env["path"], env["path"] + ".tmp")
+        shutil.copy(env["path"] + ".tmp", env["path"])
+    else:
+        os.replace(env["path"], new)
+    monkeypatch.setattr(hook, "app_file", lambda job: (new, None, False) if how == "moved" else (None, "Radarr no longer has file 11", True))
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    want = {"gone": "file_gone", "replaced": "file_replaced", "moved": "burned_in_none", "off": "burned_in_off", "not installed": "burned_in_skipped"}[how]
+    assert rec["outcome"] == want and bool(burn["calls"]) == (how == "moved") and hook.deep_analysis_queued() == [], rec
+    if how == "moved":
+        assert rec["path"] == new and burn["calls"][0][1] == new and [r["result"] for r in log_lines(env)][0] == "file_moved"
+
+
+@pytest.mark.parametrize("replaced", [False, True])
+def test_a_burn_in_job_that_fails_logs_an_error_or_drops_itself_when_the_app_replaced_its_file(env, burn, replaced):
+    name = queue_burn(env)
+    def fail(*a, **k):
+        if replaced:
+            os.replace(env["path"], env["path"] + ".tmp")
+            shutil.copy(env["path"] + ".tmp", env["path"])
+        raise RuntimeError("ffmpeg exited 1")
+    burn["full"] = [fail]
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert rec["outcome"] == ("file_replaced" if replaced else "error") and "RuntimeError: ffmpeg exited 1" in rec.get("note", rec["result"])
+    assert hook.deep_analysis_queued() == [] and posted(env) == []
+
+
+# --- what the burn-in job does with its verdict -------------------------------------------------------------------------
+
+JAPANESE = dict(INPUTS, original="Japanese", want={"guids": ["tmdb://90001"]})   # the inputs of a Japanese film's import
+
+
+def japanese_burn(env, *subs):
+    """A Japanese film with English subtitle tracks subs, (tag, default, more properties), as japanese_film(), and its
+    burn-in job. Returns the job's name."""
+    japanese_film(env, *subs)
+    return queue_burn(env, inputs=JAPANESE)
+
+
+def flags_of(env):
+    """(default, forced) of each subtitle track of the env file as it is now."""
+    return [(t["properties"]["default_track"], t["properties"]["forced_track"]) for t in hook.mkvmerge(env["path"])["tracks"] if t["type"] == "subtitles"]
+
+
+TURNED_OFF = ("The **video has English subtitles burned in**, and the audio is Japanese. Turned off the default and forced flags of the "
+              "**English subtitles (track 1)** and the **English forced subtitles (track 2, \"Signs\")**.")
+
+
+def test_english_burned_in_over_japanese_audio_turns_off_the_english_subtitles_and_alerts_once(env, burn, settings, capsys):
+    """The owner's rule: the burned-in English subtitles show, so the soft English subtitles stay off. The edit goes
+    through the import's flag edit, with its undo line and its check. One alert says what is burned in and what changed.
+    The nightly audit counts no further edit, and a second run of the job posts nothing more."""
+    name = japanese_burn(env, ("eng", True, {}), ("eng", False, {"forced_track": True, "track_name": "Signs"}), ("jpn", False, {}))
+    burn["full"] = [verdict("full", True, "eng")]
+    pending, ops, real = [], [], hook.fcntl.flock
+    hook.fcntl.flock = lambda f, op: (ops.append(op) if f.name.endswith("/lock") else None, real(f, op))[1]
+    try:
+        hook.background(name, pending)
+    finally:
+        hook.fcntl.flock = real
+    (rec,) = burn_lines(env)
+    assert env["mkvpropedit"] == [["--edit", "track:=10", "--set", "flag-default=0", "--edit", "track:=11", "--set", "flag-forced=0"]], env["mkvpropedit"]
+    assert flags_of(env) == [(False, False), (False, False), (False, False)] and rec["undo"][0] == "mkvpropedit" and ops[0] == hook.fcntl.LOCK_EX
+    assert (rec["outcome"], rec["edit_result"], rec["recheck"]) == ("burned_in_full", "edited", {"edits": 0, "undecided": None, "invariants": []}), rec
+    assert [e for e in log_lines(env) if e.get("result") == "editing"] and len(pending) == 1   # the undo line first, then a Plex analyze
+    (title, text), = posted(env)
+    assert title == "Burned-in subtitles" and text == TURNED_OFF.replace("The **video has English subtitles burned in**",
+                                                                         "The video has **English subtitles burned in**"), text
+    assert rec["burned_in"]["plan"] == "mute" and [c[4] for c in burn["calls"]] == [False, True] and "lock" in env["events"]
+    assert rec["class"] == "burned-in English subtitles over other audio"
+    hook.main(["--audit", "radarr", "--since", "24h", "--post"])
+    assert "0 of them still have tracks to change." in capsys.readouterr().out and len(posted(env)) == 1
+    hook.background(queue_burn(env, inputs=JAPANESE), [])   # the job again, as after a crash: nothing left to turn off, no second post
+    assert len(env["mkvpropedit"]) == 1 and len(posted(env)) == 1
+
+
+@pytest.mark.parametrize("how", ["deep", "recheck"])
+def test_the_deep_analysis_and_a_recheck_keep_the_flags_the_burn_in_job_turned_off(env, burn, settings, how):
+    """The decision of a Japanese film would turn the English subtitles on. The burn-in job turned them off, and a run
+    of the background queue after it only ever turns a flag off."""
+    settings(subtitles="deep")
+    name = japanese_burn(env, ("eng", True, {}), ("jpn", False, {}))
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(name, [])
+    assert flags_of(env) == [(False, False), (False, False)]
+    assert hook.arr_decide.decide(hook.mkvmerge(env["path"]), "Japanese")["edits"]   # the rules alone would turn them on again
+    deep = queue_analysis(env, env["path"], original="Japanese")
+    if how == "recheck":
+        hook.put_job(deep, dict(hook.job_of(deep), recheck="import"))
+    hook.background(deep, [])
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert rec["source"] == ("recheck" if how == "recheck" else "deep_analysis") and "flags_kept" in rec, rec
+    assert (rec["edit_rules"], rec["class"]) == ([], f"foreign original, original audio: {hook.KEPT_OFF}"), rec   # no edit turns them on
+    assert len(env["mkvpropedit"]) == 1 and flags_of(env) == [(False, False), (False, False)]
+
+
+@pytest.mark.parametrize("case, text", [
+    ("check", "The video has **English subtitles burned in**, and the audio is Japanese. BURNED\\_IN is set to check, so the **English "
+              "subtitles (track 1)** stay on."),
+    ("none on", "The video has **English subtitles burned in**, and the audio is Japanese."),
+    ("hardlinked", "The video has **English subtitles burned in**, and the audio is Japanese.\nCouldn't turn off the **English subtitles "
+                   "(track 1)**, because the file has another hard link, such as the download client's copy.\nThe original file was not changed."),
+    ("untagged", "The video has **English subtitles burned in**, and the language of the audio is unknown, so nothing was changed."),
+    ("unread", "The video has **subtitles burned in**, but their language couldn't be read. Nothing was changed.")])
+def test_a_burn_in_job_that_changes_no_flag_alerts_what_it_found(env, burn, settings, case, text):
+    name = japanese_burn(env, ("eng", case != "none on", {}))
+    burn["full"] = [verdict("full", None if case == "unread" else True, None if case == "unread" else "eng")]
+    if case == "check":
+        settings(burned_in="check")
+    elif case == "hardlinked":
+        os.link(env["path"], env["path"] + ".link")
+    elif case == "untagged":   # the import may have heard the audio as Japanese, but only a tag lets the job turn subtitles off
+        env["probe"] = sub_probe(("eng", True, {}), audio=(("und", True),))
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert env["mkvpropedit"] == [] and flags_of(env)[0] == (case != "none on", False) and posted(env) == [("Burned-in subtitles", text)], posted(env)
+    assert rec["alert_kinds"] == ["burned_in"] and (rec.get("edit_result") == "hardlinked, not edited") == (case == "hardlinked")
+
+
+def test_a_file_that_is_not_mkv_keeps_its_flags_and_alerts(env, burn, monkeypatch, tmp_path):
+    mp4 = tmp_path / "media" / "Film A (1979)" / "Film A (1979).mp4"
+    os.replace(env["path"], mp4)
+    japanese_film(env, ("eng", True, {}))
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(queue_burn(env, str(mp4), inputs=JAPANESE), [])
+    assert env["mkvpropedit"] == [] and posted(env) == [("Burned-in subtitles", "The video has **English subtitles burned in**, and the audio is "
+                                                         "Japanese. The file isn't MKV, so the **English subtitles (track 1)** stay on.")]
+
+
+def test_english_burned_in_over_english_audio_and_a_partial_burn_in_only_log(env, burn):
+    english_film(env, ("eng", True, {}))
+    for v in (verdict("full", True, "eng"), verdict("partial", False, "chi"), verdict("none", None, None), verdict("unsure", None, None)):
+        burn["full"] = [v]
+        hook.background(queue_burn(env), [])
+    lines = burn_lines(env)
+    assert [r["result"] for r in lines] == ["full burned-in subtitles in English, logged only", "partial burned-in subtitles in Chinese, logged only",
+                                            "no burned-in subtitles, logged only",
+                                            "no verdict on burned-in subtitles, too little speech, logged only"], [r["result"] for r in lines]
+    assert lines[-1]["outcome"] == "burned_in_unsure" and len(burn["calls"]) == 4 and {r["class"] for r in lines} == {"burned-in subtitles, logged"}
+    assert env["mkvpropedit"] == [] and not [p for p in posted(env) if "burned in" in p[1] and "English" in p[1] and "Japanese" not in p[1]]
+
+
+CHINESE = "The video has **Chinese subtitles burned in**."
+DISAGREED = "A second check on other frames disagreed, so nothing was changed."
+
+
+@pytest.mark.parametrize("case, title, text, writes", [
+    ("check", "Burned-in subtitles", f"{CHINESE} BURNED\\_IN is set to check, so the file was kept.", []),
+    ("doubt", "Burned-in subtitles, not confirmed", f"{CHINESE}\n{DISAGREED}", []),
+    ("check doubt", "Burned-in subtitles, not confirmed", f"{CHINESE}\n{DISAGREED}", []),
+    ("doubt english", "Burned-in subtitles, not confirmed", f"{CHINESE}\n{DISAGREED}", []),
+    ("doubt unsure", "Burned-in subtitles, not confirmed", f"{CHINESE}\nA second check on other frames couldn't tell, so nothing was changed.", []),
+    ("off", "Burned-in subtitles, re-grab is off", f"{CHINESE}\nRe-grabs for burned-in subtitles are off, so the file was kept.", []),
+    ("capped", "Burned-in subtitles", f"{CHINESE}\nThe limit of 0 re-grabs a day was reached, so the file was kept.", []),
+    ("regrab", None, None, [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+                            ("POST", "history/failed/2101", None)])])
+def test_subtitles_in_another_language_burned_in_get_a_second_pass_then_the_re_grab_of_an_import(env, burn, settings, case, title, text, writes):
+    """The second pass on other frames must agree. At fix the re-grab path of an import then decides, with REGRAB and
+    REGRAB_CAP. A re-grab posts nothing, because it fixed the problem. At check the second pass runs too, so the alert
+    says what fix would act on."""
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+    name = japanese_burn(env, ("eng", True, {}))
+    burn["full"] = [verdict(), {"doubt": verdict("partial", False, "chi"), "check doubt": verdict("partial", False, "chi"), "doubt english": verdict("full", True, "eng"),
+                                "doubt unsure": verdict("unsure", None, None)}.get(case, verdict())]
+    settings(burned_in="check" if "check" in case else "fix", regrab={"burned_in"} if case in ("regrab", "capped", "doubt unsure") else {"audio", "video"},
+             regrab_cap=0 if case == "capped" else 30)
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert [c[4] for c in burn["calls"]] == [False, True] and env["writes"] == writes, env["writes"]
+    assert posted(env) == ([] if title is None else [(title, text)]) and env["mkvpropedit"] == [], posted(env)
+    if case == "regrab":
+        assert (rec["regrab"], rec["findings"][0]["action"]["kind"], os.path.exists(env["path"])) == ("regrabbed", "burned_in", True), rec
+        assert hook.store.get("unit", "radarr|a1b2c3d4")["kind"] == "burned_in"
+
+
+def test_a_burn_in_re_grab_judges_its_own_file_and_leaves_the_other_files_of_the_download_to_their_jobs(env, burn, settings, monkeypatch):
+    """A season pack: the other episode of the download gets its own burn-in job, so the re-grab neither reads nor
+    deletes it. The second pass ran before the file lock, so the lock waits for no read."""
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+    other, real = env["path"][:-4] + " other.mkv", hook.unit_files
+    shutil.copy(env["path"], other)
+    monkeypatch.setattr(hook, "unit_files", lambda app, records, job: {**real(app, records, job), 12: {"path": other, "items": [8], "eps": [],
+                                                                                                         "runtime": 120, "owner": 7}})
+    name = japanese_burn(env, ("eng", True, {}))
+    settings(regrab={"burned_in"})
+    hook.background(name, [])
+    assert [c[1:5] for c in burn["calls"]] == [(env["path"], 0, talk.DURATION, False), (env["path"], 0, talk.DURATION, True)] and os.path.exists(other)
+    assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+                             ("POST", "history/failed/2101", None)] and burn_lines(env)[0]["regrab"] == "regrabbed", burn_lines(env)[0]["result"]
+
+
+def test_an_import_of_a_japanese_film_with_english_burned_in_ends_with_its_english_subtitles_off(env, burn, settings):
+    """The whole flow at SUBTITLES deep: the import turns the English subtitles on, the quick check flags the file, and
+    the burn-in job turns them off before the deep analysis runs. The deep analysis keeps them off. One post says what
+    is burned in and what changed, and DISCORD_POSTS all adds no post of the same change."""
+    settings(subtitles="deep", discord_posts="all")
+    japanese_film(env, ("eng", False, {}))
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.main([])
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [r["source"] for r in lines] == ["hook", "burn_in", "deep_analysis"], [r["source"] for r in lines]
+    assert lines[0]["outcome"] == "edited" and lines[1]["edit_result"] == "edited" and flags_of(env) == [(False, False)]
+    assert [m[-1] for m in env["mkvpropedit"]][-1] == "flag-default=0" and lines[1]["from"] == lines[0]["job"]
+    assert [t for t, _ in posted(env)] == ["Default tracks changed", "Burned-in subtitles"], posted(env)   # the import's own edit, then the burn-in
+
+
+@pytest.mark.parametrize("plan", ["mute", "regrab"])
+def test_a_burn_in_job_changes_nothing_when_the_app_replaced_its_file_during_the_check(env, burn, settings, plan):
+    """The check reads with no lock. Under the lock the job finds another file at the path, so it drops itself."""
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+    name = japanese_burn(env, ("eng", True, {}))
+    settings(regrab={"burned_in"})
+    def replaced(*a, **k):
+        if not os.path.exists(env["path"] + ".tmp"):
+            os.replace(env["path"], env["path"] + ".tmp")
+            shutil.copy(env["path"] + ".tmp", env["path"])
+        return verdict("full", True, "eng") if plan == "mute" else verdict()
+    burn["full"] = [replaced]
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert rec["outcome"] == "file_replaced" and env["mkvpropedit"] == [] and env["writes"] == [] and posted(env) == [], rec
+
+
+@pytest.mark.parametrize("writes", [False, True])
+def test_a_failed_flag_edit_of_a_burn_in_job_says_how_it_left_the_file(env, burn, monkeypatch, writes):
+    """mkvpropedit can fail before it writes, or after. The alert says the original was not changed only when the flags
+    read as they were. The tool's own words stay in the decision log."""
+    real = hook.subprocess.run
+    def fails(argv, **kw):
+        if argv[0] != "mkvpropedit":
+            return real(argv, **kw)
+        if writes:
+            real(argv, **kw)
+        return type("R", (), {"returncode": 2, "stdout": "Error: the file could not be opened for writing.", "stderr": ""})()
+    monkeypatch.setattr(hook.subprocess, "run", fails)
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(japanese_burn(env, ("eng", True, {})), [])
+    (rec,) = burn_lines(env)
+    end = ("The file still opens, and its default tracks are the **Japanese audio (track 1)**." if writes else "The original file was not changed.")
+    assert posted(env) == [("Burned-in subtitles", "The video has **English subtitles burned in**, and the audio is Japanese.\nCouldn't turn off "
+                            f"the **English subtitles (track 1)**.\n{end}")], posted(env)
+    assert rec["edit_result"].startswith("mkvpropedit failed: Error: the file could not be opened") and flags_of(env) == [(not writes, False)]
+    assert hook.muted(env["path"]) == writes   # a mute that never happened leaves no mark
+
+
+@pytest.mark.parametrize("mode", ["backfill", "sub_check", "sub_time"])
+def test_the_mark_of_a_burn_in_job_keeps_the_english_subtitles_off_until_a_new_file_comes(env, burn, mode):
+    """A flag backfill, --sub-check --apply and --sub-time decide from the policy, which turns the English subtitles of
+    a Japanese film on. The mark of the burn-in job keeps them off while the file is the one it edited. A new file at
+    the path clears it."""
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(japanese_burn(env, ("eng", True, {}), ("jpn", True, {})), [])
+    assert flags_of(env) == [(False, False), (True, False)] and hook.muted(env["path"])
+    run = lambda: hook.process(hook.Ctx("radarr", env["path"], "Film A (1979)", "Japanese", 120, mode=mode, apply=True, post=False))
+    rec = run()   # the run still turns the Japanese subtitles off, and its check after the edit counts no edit for the English
+    assert flags_of(env) == [(False, False), (False, False)] and rec["flags_kept"].startswith("a burned-in subtitle check") and hook.muted(env["path"])
+    assert rec["edit_result" if "edit_result" in rec else "outcome"] == "edited" and rec["recheck"]["edits"] == 0, rec.get("recheck")
+    os.replace(env["path"], env["path"] + ".tmp")   # an upgrade puts a new file at the path
+    shutil.copy(env["path"] + ".tmp", env["path"])
+    rec = run()
+    assert flags_of(env)[0] == (True, False) and "flags_kept" not in rec and not hook.muted(env["path"]) and not hook.store.items("burned_in_muted")
+
+
+def test_the_nightly_audit_probes_a_muted_file_with_its_mark(env, burn, capsys):
+    """A line with no check after its edit makes the audit probe the file again. The mark leaves the English subtitles
+    out of the further edits there too."""
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(japanese_burn(env, ("eng", True, {})), [])
+    hook.store.write("UPDATE decisions SET rec = json_remove(rec, '$.recheck')")
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    out = capsys.readouterr().out
+    assert "1 file changed since" in out and "0 of them still have tracks to change." in out, out
+
+
+def test_the_mark_follows_a_remux_and_a_flag_edit_of_amg_itself(env):
+    """A remux of AMG's own gives the file a new inode, and mkvpropedit may change its size. The mark moves with them."""
+    hook.mute_mark(env["path"])
+    before = os.stat(env["path"])
+    os.replace(env["path"], env["path"] + ".tmp")
+    shutil.copy(env["path"] + ".tmp", env["path"])
+    with open(env["path"], "ab") as f:
+        f.write(b"x")
+    hook.mute_mark(env["path"], before)   # as edit() and refresh() carry it
+    assert hook.muted(env["path"]) and hook.store.get("burned_in_muted", env["path"])["size"] == 1001
+    hook.mute_mark(env["path"], before)   # a stat that no longer matches carries nothing, and clears the mark
+    assert not hook.store.items("burned_in_muted")
+    hook.mute_mark(env["path"])
+    with open(env["path"], "ab") as f:   # the same inode with another size is another file
+        f.write(b"x")
+    assert not hook.muted(env["path"]) and not hook.store.items("burned_in_muted")
+    hook.mute_mark(env["path"])
+    ctx = types.SimpleNamespace(path=env["path"], st=os.stat(env["path"]), rec={})
+    os.replace(env["path"], env["path"] + ".tmp")   # a remux of AMG's own, see process.refresh()
+    shutil.copy(env["path"] + ".tmp", env["path"])
+    hook.refresh(ctx)
+    assert hook.muted(env["path"])
+
+
+def test_the_mark_follows_a_mute_whose_edit_changes_the_size(env, burn, monkeypatch):
+    """mkvpropedit may grow the header. The edit moves the mark to the new size."""
+    real = hook.subprocess.run
+    def grows(argv, **kw):
+        r = real(argv, **kw)
+        if argv[0] == "mkvpropedit":
+            with open(argv[1], "ab") as f:
+                f.write(b"x" * 10)
+        return r
+    monkeypatch.setattr(hook.subprocess, "run", grows)
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(japanese_burn(env, ("eng", True, {})), [])
+    assert burn_lines(env)[0]["edit_result"] == "edited" and hook.muted(env["path"])
+
+
+def test_the_safety_rule_takes_a_muted_english_track_only_with_the_mark(env):
+    """AMG_INVARIANTS: under Japanese audio no edit turns off the only English subtitles, unless a burn-in job marked the
+    file. An edit of a marked file never turns them on."""
+    ts = hook.arr_decide.classify(sub_probe(("eng", True, {})))
+    off = [["track:=10", 0, 1]]
+    with pytest.raises(hook.arr_subsync.Broken, match="rule only English subtitles off broken"):
+        hook.mute_rule(env["path"], ts, off)
+    hook.mute_mark(env["path"])
+    hook.mute_rule(env["path"], ts, off)
+    with pytest.raises(hook.arr_subsync.Broken, match="rule muted broken"):
+        hook.mute_rule(env["path"], hook.arr_decide.classify(sub_probe(("eng", False, {}))), [["track:=10", 1, 0]])
+    hook.mute_rule(env["path"], ts, [["track:=2", 0, 1]])   # another track's edit passes
+    assert hook.muted_edits([["track:=10", 1, 0, hook.arr_decide.FORCED_FLAG], ["track:=2", 1, 0]], ts) == [["track:=2", 1, 0]]
+    plan = {"edits": [["track:=10", 1, 0], ["track:=2", 1, 0]], "edit_rules": ["full English subtitle on", "audio switched"], "tracks": ts,
+            "rules": ["audio switched", "full English subtitle on"], "path": "foreign original, original audio"}
+    audio = dict(plan, edits=plan["edits"][1:], edit_rules=["audio switched"])   # no edit to leave out
+    assert hook.muted_plan(plan, False) is plan and hook.muted_plan(audio) is audio
+    assert hook.arr_decide.plan_class(hook.muted_plan(plan)) == f"foreign original, original audio: audio switched, {hook.KEPT_OFF}"
+    hook.store.drop("burned_in_muted")
+    hook.mute_rule(env["path"], hook.arr_decide.classify(sub_probe(("eng", True, {}), audio=(("eng", True),))), off)   # English audio: no mark needed
+    with pytest.raises(hook.arr_subsync.Broken, match="rule only English subtitles off broken"):   # and through the flag edit, with no mark
+        hook.edit({"path": env["path"]}, sub_probe(("eng", True, {})), off, True)
+
+
+def test_the_check_after_a_mute_plans_with_the_inputs_of_the_import(env, burn, monkeypatch):
+    """The whole flow through the queue: the import turns the English subtitles on, and the burn-in job turns them off.
+    The plan after each edit reads the same decision inputs, here TMDB's spoken languages and the original language,
+    so the nightly audit reads one count for both, see process.replan()."""
+    japanese_film(env, ("eng", False, {}))
+    env["tmdb"] = dict(TMDB, original="jpn", spoken=["jpn", "eng"])
+    burn["full"] = [verdict("full", True, "eng")]
+    seen = []
+    for name in ("decide", "retag"):
+        real = getattr(hook.arr_decide, name)
+        monkeypatch.setattr(hook.arr_decide, name, lambda j, *a, real=real, name=name, **k: seen.append((name, len(env["mkvpropedit"]), a, k)) or real(j, *a, **k))
+    hook.main([])
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [r["source"] for r in lines] == ["hook", "burn_in"] and lines[1]["edit_result"] == "edited" and len(env["mkvpropedit"]) == 2
+    after = lambda n: [x[::2] for x in seen if x[1] == n][:2]   # the decide() and retag() of the plan after edit n
+    assert after(1) == after(2) and after(1)[0][1][4] == ["eng", "jpn"], after(1)
+    assert lines[1]["recheck"] == {"edits": 0, "undecided": None, "invariants": []}, lines[1]["recheck"]
+
+
+def test_a_burn_in_job_turns_off_only_english_subtitles(env, burn):
+    name = japanese_burn(env, ("chi", True, {}), ("eng", True, {"forced_track": True}))
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(name, [])
+    assert env["mkvpropedit"] == [["--edit", "track:=11", "--set", "flag-default=0", "--edit", "track:=11", "--set", "flag-forced=0"]], env["mkvpropedit"]
+    assert flags_of(env) == [(True, False), (False, False)]
+
+
+@pytest.mark.parametrize("second, text", [
+    (verdict("partial", True, "eng"), DISAGREED), (verdict("none", None, None), DISAGREED), (verdict("full", False, "chi"), DISAGREED),
+    (verdict("full", None, None), DISAGREED), (verdict("unsure", None, None), "A second check on other frames couldn't tell, so nothing was changed.")])
+def test_english_burned_in_needs_a_second_pass_that_agrees_before_the_english_subtitles_go_off(env, burn, second, text):
+    """The owner's rule: the English subtitles go off only when two passes on other frames both read full English text.
+    Any other second pass alerts that the checks disagree, and changes nothing."""
+    name = japanese_burn(env, ("eng", True, {}))
+    burn["full"] = [verdict("full", True, "eng"), second]
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert [c[4] for c in burn["calls"]] == [False, True] and env["mkvpropedit"] == [] and flags_of(env) == [(True, False)]
+    assert posted(env) == [("Burned-in subtitles, not confirmed", "The video has **English subtitles burned in**, and the audio is Japanese.\n"
+                            + text)], posted(env)
+    assert rec["burned_in"]["plan"] in ("disagreed", "unsure") and rec["result"].endswith("not confirmed by a second pass")
+
+
+def test_a_burn_in_in_the_films_own_language_is_re_grabbed_once_and_the_next_copy_stays(env, burn, settings):
+    """The owner's rule: a Chinese film with Chinese text burned in may have it in every release. The first copy is
+    re-grabbed. The next copy with the same burn-in alerts and stays. Text in another language keeps the normal rule."""
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+    settings(regrab={"burned_in"})
+    japanese_film(env, ("eng", True, {}))
+    env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
+    hook.background(queue_burn(env, inputs=dict(INPUTS, original="Chinese")), [])
+    assert burn_lines(env)[-1]["regrab"] == "regrabbed" and hook.store.get("burned_in_once", "radarr|movie 7")["lang"] == "chi" and posted(env) == []
+    writes = list(env["writes"])
+    hook.background(queue_burn(env, inputs=dict(INPUTS, original="Chinese")), [])   # the next copy of movie 7
+    (rec,) = burn_lines(env)[1:]
+    assert env["writes"] == writes and rec["burned_in"]["plan"] == "once" and rec["class"] == "burned-in subtitles, kept after one re-grab"
+    assert posted(env) == [("Burned-in subtitles", f"{CHINESE}\nAn earlier copy was already re-grabbed for this, so this copy was kept.")]
+    env["files"][env["path"]] = sub_probe(("eng", True, {}), audio=(("jpn", True),))   # Chinese text over Japanese audio of a Japanese film
+    hook.background(queue_burn(env, inputs=JAPANESE), [])
+    assert burn_lines(env)[-1]["regrab"] == "regrabbed" and len(env["writes"]) > len(writes)
+
+
+def test_a_re_grab_that_did_not_happen_never_counts_as_the_one_for_the_item(env, burn, settings):
+    """A capped re-grab deleted nothing, so the next copy of the Chinese film may still be re-grabbed."""
+    env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+    settings(regrab={"burned_in"}, regrab_cap=0)
+    japanese_film(env, ("eng", True, {}))
+    env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
+    hook.background(queue_burn(env, inputs=dict(INPUTS, original="Chinese")), [])
+    assert burn_lines(env)[-1]["regrab"] == "capped" and hook.store.items("burned_in_once") == {}
+
+
+def test_a_burn_in_in_the_series_own_language_is_re_grabbed_once_per_episode(env, burn, settings, monkeypatch):
+    """The one re-grab counts per episode. Another episode of the series with the same burn-in is re-grabbed too. The
+    next copy of the first episode alerts and stays."""
+    grabs = []
+    monkeypatch.setattr(hook, "regrab", lambda app, grab, *a: grabs.append(grab["episode_ids"]) or {"code": "regrabbed", "name": "Sonarr"})
+    settings(regrab={"burned_in"})
+    japanese_film(env, ("eng", True, {}))
+    env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
+    for eps in ("31", "32", "31"):
+        grab = {"owner": "5", "file_id": "9", "episode_ids": eps, "download_id": "d759"}
+        hook.background(queue_burn(env, app="sonarr", grab=grab, inputs=dict(INPUTS, original="Chinese")), [])
+    assert grabs == ["31", "32"] and [r["burned_in"]["plan"] for r in burn_lines(env)] == ["regrab", "regrab", "once"]
+    assert set(hook.store.items("burned_in_once")) == {"sonarr|episodes 31", "sonarr|episodes 32"} and len(posted(env)) == 1
+
+
+@pytest.mark.parametrize("case", ["re-grab", "failed edit"])
+def test_a_busy_store_after_a_change_to_the_library_never_costs_the_alert(env, burn, settings, monkeypatch, case):
+    """The store writes after a re-grab or a failed flag edit come after the change. A store busy past its wait loses
+    the write. The decision line notes it and keeps what the job did, and the alert of the failed edit still posts."""
+    def busy(*a):
+        raise sqlite3.OperationalError("database is locked")
+    if case == "re-grab":
+        env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
+        settings(regrab={"burned_in"})
+        japanese_film(env, ("eng", True, {}))
+        env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
+        name = queue_burn(env, inputs=dict(INPUTS, original="Chinese"))
+        real = hook.store.put
+        monkeypatch.setattr(hook.store, "put", lambda ns, *a: busy() if ns == "burned_in_once" else real(ns, *a))
+    else:
+        name = japanese_burn(env, ("eng", True, {}))
+        burn["full"] = [verdict("full", True, "eng")]
+        os.link(env["path"], env["path"] + ".link")
+        monkeypatch.setattr(hook.store, "drop", busy)
+    hook.background(name, [])
+    (rec,) = burn_lines(env)
+    assert rec["note"].endswith("OperationalError: database is locked") and rec.get("outcome") != "error", rec
+    assert rec.get("regrab") == "regrabbed" if case == "re-grab" else posted(env)[0][0] == "Burned-in subtitles"
+
+
+@pytest.mark.parametrize("audio, original, own", [("chi", "English", True), ("jpn", "Chinese", True), ("jpn", "Japanese", False),
+                                                  ("und", None, False)])
+def test_text_in_the_language_of_the_audio_or_the_film_is_its_own(audio, original, own):
+    assert hook.burn_own(verdict(), audio, original) is own
+
+
+def test_a_yield_in_the_second_pass_keeps_the_first(env, burn):
+    """A yield during the second pass puts the job back with its first pass. The next run reads only the second."""
+    name = japanese_burn(env, ("eng", True, {}))
+    burn["full"] = [verdict("full", True, "eng"), {"yielded": True, "took": 3.0}]
+    hook.background(name, [])
+    assert [c[4] for c in burn["calls"]] == [False, True] and hook.deep_analysis_queued() == [name] and burn_lines(env) == []
+    assert burn_job(env)["first"]["label"] == "full"
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.background(name, [])
+    assert [c[4] for c in burn["calls"]] == [False, True, True] and burn_lines(env)[0]["edit_result"] == "edited"
+
+
+# --- --burn-in, the report-only command ------------------------------------------------------------------------------
+
+FLAGGED = "quick check flagged, Japanese audio, "
+
+
+@pytest.mark.parametrize("level, full, regrab, passes, line", [
+    ("fix", [verdict("full", True, "eng")], set(), 2, "full burned-in subtitles in English, the second pass agrees, the job would turn off the "
+                                                      "English subtitles and alert"),
+    ("check", [verdict("full", True, "eng")], set(), 2, "full burned-in subtitles in English, the second pass agrees, the job would alert"),
+    ("fix", [verdict("full", True, "eng"), verdict("partial", True, "eng")], set(), 2, "full burned-in subtitles in English, the second pass "
+                                                                                      "disagrees, the job would alert"),
+    ("fix", [verdict(), verdict()], set(), 2, "full burned-in subtitles in Chinese, the second pass agrees, the job would alert, re-grabs for "
+                                              "burned-in subtitles are off"),
+    ("fix", [verdict(), verdict()], {"burned_in"}, 2, "full burned-in subtitles in Chinese, the second pass agrees, the job would re-grab it"),
+    ("fix", [verdict(), verdict("none", None, None)], {"burned_in"}, 2, "full burned-in subtitles in Chinese, the second pass disagrees, the job "
+                                                                        "would alert"),
+    ("fix", [verdict(), verdict("unsure", None, None)], {"burned_in"}, 2, "full burned-in subtitles in Chinese, the second pass could not tell, "
+                                                                          "the job would alert"),
+    ("off", [verdict("partial", False, "chi")], set(), 1, "partial burned-in subtitles in Chinese, BURNED_IN is off, so the job would not run")])
+def test_burn_in_reports_the_check_of_a_file_and_changes_nothing(env, burn, settings, monkeypatch, capsys, level, full, regrab, passes, line):
+    """The command runs both checks, and the second pass where the full check asks for one, whatever BURNED_IN says. It
+    prints what the burn-in job would do, from the job's own decision, edits nothing, posts nothing, queues nothing, and
+    logs a dry decision line."""
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    japanese_film(env, ("eng", True, {}))
+    settings(burned_in=level, regrab=regrab)
+    burn["full"] = full
+    hook.main(["--burn-in", env["path"]])
+    assert capsys.readouterr().out == f"{FLAGGED}{line} | {os.path.basename(env['path'])} | {env['path']}\n"
+    (rec,) = [r for r in log_lines(env) if "schema" in r]
+    assert (rec["source"], rec["apply"], rec["burned_in"]["quick"]["result"]) == ("backfill", False, "flagged") and len(burn["calls"]) == passes + 1
+    assert env["mkvpropedit"] == [] and posted(env) == [] and env["writes"] == [] and hook.deep_analysis_queued() == []
+
+
+@pytest.mark.parametrize("case, line", [
+    ("none on", "Japanese audio, full burned-in subtitles in English, the second pass agrees, the job would alert"),
+    ("untagged", "untagged audio, full burned-in subtitles in English, the job would alert"),
+    ("not mkv", "Japanese audio, full burned-in subtitles in English, the second pass agrees, the job would alert")])
+def test_burn_in_says_the_job_only_alerts_when_it_has_no_subtitles_to_turn_off(env, burn, monkeypatch, capsys, tmp_path, case, line):
+    """The line follows the job: no English subtitle on, audio with no language tag, or a file that is not MKV."""
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    japanese_film(env, ("eng", case != "none on", {}))
+    path = env["path"]
+    if case == "untagged":
+        env["probe"] = sub_probe(("eng", True, {}), audio=(("und", True),))
+    elif case == "not mkv":
+        path = str(tmp_path / "media" / "Film A (1979)" / "Film A (1979).mp4")
+        os.replace(env["path"], path)
+    burn["full"] = [verdict("full", True, "eng")]
+    hook.main(["--burn-in", path])
+    assert capsys.readouterr().out.startswith(f"quick check flagged, {line} | "), capsys.readouterr()
+
+
+def test_burn_in_takes_the_files_of_app_ids_and_says_why_it_cannot_run(env, burn, settings, monkeypatch, capsys):
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "movieId": 7, "path": env["path"]})]
+    burn["full"] = [verdict("none", None, None)]
+    hook.main(["--burn-in", "--app", "radarr", "--ids", "7"])
+    out = capsys.readouterr().out
+    assert out.startswith("quick check flagged, Portuguese audio, no burned-in subtitles, the job would log it only | Film A (1979)"), out
+    env["files"][env["path"]]["tracks"] = [t for t in env["probe"]["tracks"] if t["type"] != "audio"]
+    hook.main(["--burn-in", env["path"]])
+    assert capsys.readouterr().out.startswith("skipped, the file has no audio track | ") and len(burn["calls"]) == 2
+    for argv in (["--burn-in"], ["--burn-in", "--ids", "7"], ["--burn-in", "--app", "radarr"]):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(argv)
+        assert ex.value.code == 2
+    burn["ready"] = "the burned-in subtitle check is not installed"
+    with pytest.raises(SystemExit, match="--burn-in stops: the burned-in subtitle check is not installed"):
+        hook.main(["--burn-in", env["path"]])
+
+
+def test_burn_in_by_app_id_knows_the_item_was_re_grabbed_once(env, burn, settings, monkeypatch, capsys):
+    """--app names the item, so the command reads the one re-grab of a burn-in in the film's own language."""
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    settings(regrab={"burned_in"})
+    env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Chinese"}
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "movieId": 7, "path": env["path"]})]
+    hook.store.put("burned_in_once", "radarr|movie 7", {"path": env["path"], "lang": "chi"})
+    hook.main(["--burn-in", "--app", "radarr", "--ids", "7"])
+    assert capsys.readouterr().out.startswith("quick check flagged, Chinese audio, full burned-in subtitles in Chinese, the second pass agrees, and an "
+                                              "earlier copy was re-grabbed for it, the job would alert | ")
+
+
+def test_burn_ready_needs_language_detection_and_the_models(env, monkeypatch, tmp_path):
+    """burnin.py runs in the venv of language detection, so a host without it has no check. With it, burnin.ready()
+    checks the models in LID_DIR/models. A host install without burnin.py has no check either."""
+    assert hook.burn_ready() == "language detection is not installed, and the burned-in subtitle check runs in its venv"
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    fake, asked = types.ModuleType("burnin"), []
+    fake.ready = lambda model_dir: asked.append(model_dir) or (False, "the det model does not read: No such file or directory")
+    monkeypatch.setitem(sys.modules, f"{hook._name}.burnin", fake)
+    monkeypatch.setattr(sys.modules[hook._name], "burnin", fake, raising=False)
+    assert hook.burn_ready() == "the det model does not read: No such file or directory" and asked == [os.path.join(hook.CFG.lid_dir, "models")]
+    fake.ready = lambda model_dir: (True, "")
+    assert hook.burn_ready() is None
+    fake.ready = lambda model_dir: (False, "")   # a failure with no reason still says the check cannot run
+    assert hook.burn_ready() == "its text models did not pass their check"
+    def broken(model_dir):
+        raise MemoryError("no room")
+    fake.ready = broken   # any error, so the start check and the import go on
+    assert hook.burn_ready() == "its text models did not read: MemoryError: no room"
+
+
+@pytest.mark.parametrize("level", ["off", "check", "fix"])
+@pytest.mark.parametrize("why", [None, "the det model does not read: No such file or directory"])
+def test_the_start_check_says_whether_the_burned_in_check_can_run(env, monkeypatch, settings, level, why):
+    """BURNED_IN check and fix both need the check. A ready install says ok, and off says nothing."""
+    settings(burned_in=level, plex_url="", discord_webhook="")
+    monkeypatch.setattr(hook, "burn_ready", lambda: why)
+    got = dict(hook.service_checks()).get("burned_in", "absent")
+    assert got == ("absent" if level == "off" else None if why is None else
+                   f"BURNED_IN is {level}, but {why}, so no import gets the burned-in subtitle check"), got
+
+
+def test_burn_run_runs_burnin_py_in_the_venv_of_language_detection(env, settings, tmp_path):
+    """A stand-in for the venv's Python prints its arguments as burnin.py would print its answer. A full check passes
+    the store whose queue makes it yield, and an answer with an error raises."""
+    lid = tmp_path / "lid"
+    (lid / "venv" / "bin").mkdir(parents=True)
+    (lid / "ready").touch()
+    py = lid / "venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\nif [ \"$2\" = /fail ]; then echo '{\"error\": \"RuntimeError: no keyframe decoded\"}'; exit 1; fi\n"
+                  "printf '{\"args\": \"%s\"}\\n' \"$*\"\n")
+    py.chmod(0o755)
+    settings(lid_dir=str(lid))
+    j = 600.0
+    script = os.path.join(os.path.dirname(hook.lid_cli.__code__.co_filename), "burnin.py")
+    real = hook.subprocess.Popen
+    got = hook.burn_run("/m/F.mkv", 1, j, ["--quick"], 60)["args"].split()
+    assert got == [script, "/m/F.mkv", "1", "600.0", "--cache", os.path.join(hook.CFG.state_dir, "lid.sqlite"), "--model-dir", str(lid / "models"),
+                   "--quick"], got
+    got = hook.burn_run("/m/F.mkv", 0, j, ["--full", "--second"], 60, hook.store.path())["args"].split()
+    assert got[-4:] == ["--full", "--second", "--yield-queue", hook.store.path()] and "--yield-gate" not in got, got
+    with pytest.raises(RuntimeError, match="no keyframe decoded"):
+        hook.burn_run("/fail", 0, j, ["--quick"], 60)
+    py.unlink()   # no venv: the run gives no answer, and says why
+    with pytest.raises(RuntimeError, match="FileNotFoundError"):
+        hook.burn_run("/m/F.mkv", 0, j, ["--quick"], 60)
+    assert hook.subprocess.Popen is real
+
+
+def ffprobe_bounds(env, monkeypatch, secs=0):
+    """The timeout of each ffprobe -show_streams run, as the fake host runs it. Each run takes secs on the clock."""
+    bounds, real = [], hook.subprocess.run
+    def run(argv, **kw):
+        if argv[0] == "ffprobe" and "-show_streams" in argv:
+            bounds.append(kw.get("timeout"))
+            env["clock"][0] += secs
+        return real(argv, **kw)
+    monkeypatch.setattr(hook.subprocess, "run", run)
+    return bounds
+
+
+def test_the_burned_in_check_reads_the_duration_from_ffprobe_when_mkvmerge_gives_none(env, burn, monkeypatch, settings, tmp_path, capsys):
+    """mkvmerge -J gives no duration for an AVI file. A check with no duration takes no frame, so ffprobe gives it, to
+    the quick check inside the import's time limit, to the burn-in job and to --burn-in."""
+    job = hook.burn_in
+    held_burn(monkeypatch)
+    avi = tmp_path / "media" / "Film A (1979)" / "Film A (1979).avi"
+    avi.write_bytes(b"x")
+    monkeypatch.setenv("radarr_moviefile_path", str(avi))
+    env["files"][str(avi)] = dict(copy.deepcopy(env["probe"]), container={"type": "AVI", "properties": {}})
+    settings(convert=False)
+    bounds, real = ffprobe_bounds(env, monkeypatch, 5), hook.arr_meta.last_packet
+    monkeypatch.setattr(hook.arr_meta, "last_packet", lambda *a, **k: env["clock"].__setitem__(0, env["clock"][0] + 200) or real(*a, **k))
+    hook.main([])
+    assert burn["calls"] == [("quick", str(avi), 0, 600.0)] and bounds == [100.0], (burn["calls"], bounds)   # the env's ffprobe says 600 s
+    assert burn["timeouts"] == [95.0]   # burnin.py gets what the ffprobe run left
+    burn["full"] = [verdict("none", None, None)]
+    monkeypatch.setattr(hook, "burn_in", job)
+    hook.background(queue_burn(env, str(avi)), [])
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--burn-in", str(avi)])
+    assert [c[3] for c in burn["calls"]] == [600.0, 600.0, 600.0, 600.0] and bounds[1:] == [120, 120], (burn["calls"], bounds)
+    assert hook.burn_probe(env["path"], env["probe"])[1:] == (True, 7200.0) and len(bounds) == 3
+
+
+def test_cover_art_is_no_video_track_for_the_check(env):
+    """ffprobe lists a cover picture as a video stream, with the attached_pic disposition."""
+    env["files"][env["path"]] = {"container": {}}   # mkvmerge reads no track, as of an ASF file
+    env["extra_streams"] = [{"index": 0, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+                            {"index": 1, "codec_type": "audio", "codec_name": "wmav2"}]
+    assert hook.burn_probe(env["path"], {"container": {}})[1:] == (False, 600.0)
+    env["extra_streams"][0]["disposition"] = {}
+    assert hook.burn_probe(env["path"], {"container": {}})[1:] == (True, 600.0)
+
+
+def test_an_asf_file_gets_its_tracks_for_the_quick_check_from_ffprobe(env, burn, monkeypatch, settings, tmp_path):
+    """mkvmerge recognizes an ASF or WMV file but reads no track of it. ffprobe gives the video, the audio and the
+    duration, so the import still sorts the file."""
+    jobs = held_burn(monkeypatch)
+    wmv = tmp_path / "media" / "Film A (1979)" / "Film A (1979).wmv"
+    wmv.write_bytes(b"x")
+    monkeypatch.setenv("radarr_moviefile_path", str(wmv))
+    env["files"][str(wmv)] = {"container": {"recognized": True, "supported": False, "type": "Windows Media (ASF/WMV)"}}
+    env["extra_streams"] = [{"index": 0, "codec_type": "video", "codec_name": "wmv2"},
+                            {"index": 1, "codec_type": "audio", "codec_name": "wmav2", "tags": {"language": "jpn"}}]
+    settings(convert=False)
+    hook.main([])
+    rec = decided(env)
+    assert burn["calls"] == [("quick", str(wmv), 0, 600.0)] and rec["burned_in"]["audio"] == {"index": 0, "pos": "a1", "lang": "jpn"}, rec.get("burned_in")
+    assert [j["name"] for j in jobs] == [hook.burn_name(str(wmv))]
+    env["extra_streams"] = env["extra_streams"][1:]   # no video: no check
+    hook.main([])
+    assert [r for r in log_lines(env) if "schema" in r][-1]["burned_in"] == {"result": "skipped", "why": "the file has no video track"}
