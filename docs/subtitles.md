@@ -33,6 +33,7 @@ Set `SUBTITLES` in the env file. The default is `deep`.
   [Garbled subtitle repair](#garbled-subtitle-repair).
 - An unknown level acts as `check`, and `--selftest` fails on it.
 - `--sub-check` and `--sub-time` do not read `SUBTITLES`. Without `--apply` they report, and with it they fix.
+  `--check` reads `SUBTITLES` as an import does, and fixes only with `--apply`.
 
 In Docker, a deep analysis that a stopped container left runs after the next start. The listener starts the worker for
 it within a minute. The worker is the AMG process that runs the queued jobs.

@@ -124,7 +124,7 @@ def regrab(app, job, fault, probe, kind="audio"):
     """A download is one unit. Check every file it imported, delete each faulty one, re-monitor their items, then
     mark the grab failed once. That order matters: the app searches at once, and a faulty file still on disk would
     make it reject the replacement as not an upgrade. Clean files stay. Returns the action, {"code", **facts}, which
-    report.ACTIONS words. code is regrabbed, would_regrab, unconfirmed, capped, no_grab or failed. The facts of a
+    report.ACTIONS words. code is regrabbed, would_regrab, check, unconfirmed, capped, no_grab or failed. The facts of a
     re-grab that put old files back come from restore_facts().
 
     fault is the certain fault found in the job's file. probe(path, f, fresh) checks a file from scratch and returns
@@ -133,7 +133,18 @@ def regrab(app, job, fault, probe, kind="audio"):
     one REGRAB_CAP of the app. A kind REGRAB does not list stops after the second check of the job's file and deletes
     nothing. burned_in judges the job's file alone. Each other file of the download that its quick check flagged, or could
     not sort, gets a burn-in job of its own.
+
+    The job of --check has no download, and its run changes nothing in the app, see cli.check(). It returns after the
+    second check, with check when an import would re-grab, else would_regrab as on an import. So no delete, failed mark,
+    search or restore can follow, whatever its caller does.
     """
+    if job.get("check"):
+        try:
+            if probe(job["path"], None, fresh=True)[0] != fault:
+                return {"code": "unconfirmed"}
+        finally:
+            config.DEADLINE.stop()
+        return {"code": "check" if kind in config.CFG.regrab else "would_regrab", "kind": kind}
     name, dry = apps.ARR[app].name, kind not in config.CFG.regrab
     records = []
     if job.get("download_id"):

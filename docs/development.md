@@ -10,7 +10,7 @@ The hunter imports the package, and the package never imports the hunter.
 
 | Module | What it holds |
 | --- | --- |
-| `cli.py` | `main()`, the backfill, `--sub-time`, the audit and the scans |
+| `cli.py` | `main()`, the backfill, `--sub-time`, `--check`, the audit and the scans |
 | `runner.py` | `hook()`, the Custom Script entry, the `Event` it and the listener read, the Test checks, the queue, the worker, the job processes and the file lock |
 | `process.py` | `process()`, the checks and the flag edit of one file |
 | `config.py` | the env file as `CFG`, the policy load, the tuning constants and `mask()` |

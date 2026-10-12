@@ -432,19 +432,19 @@ def lid_kept(path, index):
     return lid.kept_pcm(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, index)
 
 
-SUB_SOURCES = ("hook", "deep_analysis", "recheck")   # an import and the jobs of the background queue follow SUBTITLES
+SUB_SOURCES = ("hook", "deep_analysis", "recheck", "check")   # an import, the jobs of the background queue and --check follow SUBTITLES
 
 
 def sub_on(source, sub_check=False):
-    """The subtitle match check runs: on an import, in the deep analysis and in a recheck unless SUBTITLES is off, and
-    in a backfill only with --sub-check or --sub-time, whatever SUBTITLES says."""
+    """The subtitle match check runs: on an import, in the deep analysis, in a recheck and with --check unless SUBTITLES
+    is off, and in a backfill only with --sub-check or --sub-time, whatever SUBTITLES says."""
     return config.CFG.subtitles != "off" if source in SUB_SOURCES else sub_check
 
 
 def sub_fixes(source):
     """Whether the subtitle check may change the file: remove a track, retime, lengthen cues, move a sidecar or turn a
-    flag off. An import, the deep analysis and a recheck do at SUBTITLES fix or deep. --sub-check and --sub-time do with
-    --apply."""
+    flag off. An import, the deep analysis, a recheck and --check do at SUBTITLES fix or deep. --sub-check and --sub-time
+    do with --apply."""
     return source not in SUB_SOURCES or config.CFG.subtitles in ("fix", "deep")
 
 

@@ -19,8 +19,8 @@ LIB = tuple(f"arr_media_guard/{n}" for n in sorted(os.listdir(os.path.join(HOME,
     ("arr-media-guard-subhunt", "arr_subhunt.py")   # the code files besides the launcher, relative to HOME
 COLORS = {"red": 0xD64541, "amber": 0xF0A020, "green": 0x43B581}   # red: a re-grab fault. amber: other alerts. green: a change.
 # The outcome code of a wrong-content verdict per regrab() code, so the outcome says what happened: would_regrab only when
-# the grab record, the cap and the second check all passed. report.VERDICTS words each one.
-CONTENT_CODES = {"regrabbed": "wrong_content", "would_regrab": "would_regrab", "unconfirmed": "wrong_content_unconfirmed", "capped": "regrab_capped",
+# the grab record, the cap and the second check all passed, or when --check confirmed it. report.VERDICTS words each one.
+CONTENT_CODES = {"regrabbed": "wrong_content", "would_regrab": "would_regrab", "check": "would_regrab", "unconfirmed": "wrong_content_unconfirmed", "capped": "regrab_capped",
                  "no_grab": "regrab_no_grab", "failed": "regrab_failed", "restored": "wrong_content", "searched": "wrong_content",
                  "deleted": "wrong_content"}
 PLEX_WAITS = (0, 15, 30, 60, 120, 180, 195)   # seconds before each Plex lookup of a new import, 10 minutes in all

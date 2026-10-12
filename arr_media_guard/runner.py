@@ -630,7 +630,7 @@ BURN_CLASSES = {"log": "burned-in subtitles, logged", "alert": "burned-in subtit
                 "disagreed": "burned-in subtitles, not confirmed", "unsure": "burned-in subtitles, not confirmed"}
 
 
-def burn_act(name, job, rec, pending, claimed=False):
+def burn_act(name, job, rec, pending, claimed=False, post=True):
     """The full check of the burn-in job name, and what BURNED_IN does with its verdict, see burn_plan() and
     burn_step(). It reads the audio that plays first from the file as it is now. A partial or no burn-in, and English
     text on English audio, log only. Every full burn-in whose text it reads gets a second pass on other frames, at
@@ -643,15 +643,20 @@ def burn_act(name, job, rec, pending, claimed=False):
     pass that disagrees or cannot tell alerts and changes nothing. The passes read with no file lock. The lock is held
     shared to read the tracks, and exclusive only for the edit or the re-grab, after a check that the import's file is
     still there. The other files of the download are checked by their own jobs. pending takes the Plex analyze of a
-    restored old file. Returns the decision record."""
+    restored old file. Returns the decision record.
+
+    --check runs it in the foreground with check in grab and no name, see cli.check(). It never yields and keeps no
+    first pass in the queue. Its re-grab only says what an import would do, see regrab.regrab(), so it takes no lock.
+    Its dry run, apply False in rec, plans the mute and changes nothing. post False keeps the alert off Discord."""
     app, path, got, grab = job["app"], job["path"], job.get("inputs") or {}, dict(job.get("grab") or {}, app=job["app"], path=job["path"])
+    check, apply = grab.get("check"), rec.get("apply", True)
     ts, _, duration = process.burn_probe(path, checks.mkvmerge(path))
     audio, mkv, fix = process.burn_audio(ts), path.lower().endswith(".mkv"), config.CFG.burned_in == "fix"
     if not audio:
         return dict(rec, outcome="burned_in_skipped", result="skipped, the file has no audio track")
     item = burn_item(app, grab.get("owner"), regrab.job_episodes(grab))
-    facts, plan = burn_passes(path, audio, duration, got.get("original"), item, job.get("first"), store.path(),
-                              lambda first: put_job(name, dict(job, first=first), claimed))
+    facts, plan = burn_passes(path, audio, duration, got.get("original"), item, job.get("first"), None if check else store.path(),
+                              None if check else lambda first: put_job(name, dict(job, first=first), claimed))
     facts = dict(facts, quick=job.get("quick"), audio=audio)
     first, words = facts["first"], burn_words(facts["first"])
     rec = dict(rec, outcome=f'burned_in_{first["label"]}', result=f"{words}, logged only", burned_in=dict(facts, plan=plan),
@@ -660,9 +665,9 @@ def burn_act(name, job, rec, pending, claimed=False):
         return rec
     f = {"kind": "burned_in", "lang": first["text_lang"], "english": first["english"], "audio": audio["lang"],
          **({"check": True} if plan in ("mute", "regrab") and not fix else {})}
-    rec["result"] = f"{words}, alerted" + (", BURNED_IN is check" if f.get("check") else "")
+    rec["result"] = f"{words}, {'alerted' if post else 'not posted'}" + (", BURNED_IN is check" if f.get("check") else "")
     if plan == "mute":
-        with locked(shared=not (fix and mkv)):   # the tracks as they are now, and the edit
+        with locked(shared=not (fix and mkv and apply)):   # the tracks as they are now, and the edit
             if drop := deep_replaced(job):
                 return dict(rec, **drop)
             j = checks.mkvmerge(path)
@@ -673,14 +678,15 @@ def burn_act(name, job, rec, pending, claimed=False):
                 f["not_mkv"] = True
             elif burn_step(plan, mkv, bool(on)) == "mute":
                 edits = [[t["sel"], 0, 1] for t in on if t["default"]] + [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in on if t["forced_flag"]]
-                mute_mark(path)   # first, so the safety rule of the edit sees it, see process.mute_rule(). edit() carries it.
-                done = process.edit(rec, j, edits, True, replan=lambda after: kept_off(after, got), ts=ts)
+                if apply:   # first, so the safety rule of the edit sees it, see process.mute_rule(). edit() carries it.
+                    mute_mark(path)
+                done = process.edit(rec, j, edits, apply, replan=lambda after: kept_off(after, got), ts=ts)
                 rec = dict(done, outcome=rec["outcome"], edit_result=done["result"], result=f'{words}, {done["result"]}')
                 f["edit"] = done["outcome"]
                 if burn_changed(done, {t["sel"] for t in on}):   # mkvpropedit can fail and still write, see process.edit()
                     f.update(changed=True, unread=done.get("after_error"),
                              on=None if "after" not in done else [f'{t["pos"]} {t["lang"]}' for t in done["after"] if t["default"]])
-                elif done["outcome"] != "edited":   # the subtitles stay on, so nothing keeps them off
+                elif done["outcome"] != "edited" and apply:   # the subtitles stay on, so nothing keeps them off
                     try:
                         store.drop(MUTED, path)
                     except sqlite3.Error as ex:   # the alert still posts. A stale mark only stops later runs turning English subtitles on.
@@ -689,7 +695,7 @@ def burn_act(name, job, rec, pending, claimed=False):
         f["action"] = {"code": "would_regrab", "kind": "burned_in"}
         rec["result"] = f"{words}, re-grab would_regrab"
     elif plan == "regrab" and fix:
-        with locked():   # a re-grab deletes the file
+        with contextlib.nullcontext() if check else locked():   # a re-grab deletes the file
             if drop := deep_replaced(job):
                 return dict(rec, **drop)
             # The second pass ran before the lock, and an edit in place never changes the picture, so it is the second check.
@@ -705,7 +711,8 @@ def burn_act(name, job, rec, pending, claimed=False):
         f["action"] = {"code": plan}
         rec["result"] = f'{words}, {"kept, an earlier copy was re-grabbed for it" if plan == "once" else "not confirmed by a second pass"}'
     rec.update(findings=[f], alert_kinds=["burned_in"])
-    rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(path) if os.path.exists(path) else 0)
+    if post:
+        rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(path) if os.path.exists(path) else 0)
     return rec
 
 

@@ -268,9 +268,10 @@ def keepable(path, st):
     return None if os.access(where, os.W_OK) else f"{where} is not writable"
 
 
-def keep_original(path, note=None):
+def keep_original(path, note=None, stamp_of=None):
     """Keep path at <originals_root>/<UTC stamp>/<path from the mount> and return that path. The rename of the new file
     over path follows, so path is never missing. The keep holds the original for keep_days, see prune_originals().
+    stamp_of is a kept path whose stamp folder the keep takes, so a sidecar kept later stays with its original.
 
     The keep is a hard link, which needs no space. Where the file system refuses one (LINK_REFUSED: another file
     system, too many links, or a mount or a container that allows no link), it is a copy with the mode and times of
@@ -280,7 +281,8 @@ def keep_original(path, note=None):
     Every fix that replaces or moves a library file keeps it here first, so the links of path from a grab go stale."""
     kept_replaced(path)
     root = originals_root(path)
-    keep = os.path.join(root, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time())), os.path.relpath(path, os.path.dirname(root)))
+    stamp = os.path.relpath(stamp_of, root).split(os.sep)[0] if stamp_of else time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time()))
+    keep = os.path.join(root, stamp, os.path.relpath(path, os.path.dirname(root)))
     os.makedirs(os.path.dirname(keep), exist_ok=True)
     remember_folder(root)
     plex_ignore(root)

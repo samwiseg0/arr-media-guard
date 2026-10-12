@@ -293,6 +293,29 @@ def expected_languages(app, ids, token=None, cache="tmdb", now=None):
         return None
 
 
+KIDS_GENRE = {"Kids": "Children"}   # TMDB's series genre, as Sonarr names it from TVDB. The kids policy of Sonarr reads that name.
+
+
+def tmdb_item(kind, tid, season=None, token=None):
+    """TMDB's record of the film (kind movie) or the series (kind tv) tid, as Radarr's movie record or Sonarr's series
+    record, for --check --tmdb, see cli.check(). For a series, also the episodes of season, as Sonarr's episode records.
+    Their ids are TMDB's. One GET, with the key of expected_languages(), and no cache. Raises the error of the GET."""
+    d = _get(f"/{kind}/{tid}", token or radarr_token() or RADARR_TOKEN,
+             append_to_response="alternative_titles,external_ids" + (f",season/{season}" if kind == "tv" else ""))
+    date, ext, alt, lang = d.get("release_date") or d.get("first_air_date") or "", d.get("external_ids") or {}, d.get("alternative_titles") or {}, \
+        ISO1.get(d.get("original_language") or "")
+    rec = {"id": d["id"], "tmdbId": d["id"], "imdbId": d.get("imdb_id") or ext.get("imdb_id"), "tvdbId": ext.get("tvdb_id"),
+           "title": d.get("title") or d.get("name"), "originalTitle": d.get("original_title") or d.get("original_name"),
+           "year": int(date[:4]) if date[:4].isdigit() else None, "runtime": d.get("runtime") or 0,
+           "originalLanguage": {"name": decide.lang_name(lang)} if lang else None,
+           "genres": [KIDS_GENRE.get(g.get("name"), g.get("name")) if kind == "tv" else g.get("name") for g in d.get("genres") or []],
+           "studio": next((c.get("name") for c in d.get("production_companies") or []), None),
+           "alternateTitles": [{"title": t.get("title")} for t in alt.get("titles") or alt.get("results") or []]}   # a film's titles, a series' results
+    eps = [{"id": e.get("id"), "seasonNumber": e.get("season_number"), "episodeNumber": e.get("episode_number"), "title": e.get("name"),
+            "runtime": e.get("runtime") or 0} for e in (d.get(f"season/{season}") or {}).get("episodes") or []]
+    return rec, eps
+
+
 def last_packet(path, timeout=30):
     """Seconds to the last video packet: ffprobe seeks to the last index point and reads to the end. None when that
     fails. Video only, because a stray subtitle event may set the header an hour past the end of the film.

@@ -46,7 +46,7 @@ also goes to the container log. Loki reads these keys, so they stay as they are.
 | Key | Value |
 | --- | --- |
 | `arr` | the app |
-| `source` | what made the line: `hook` for an import, `backfill` for the backfill and the other commands, `deep_analysis`, `audit`, `audio_scan`, `video_scan` or `subhunt` |
+| `source` | what made the line: `hook` for an import, `check` for `--check`, `backfill` for the backfill and the other commands, `deep_analysis`, `audit`, `audio_scan`, `video_scan` or `subhunt` |
 | `outcome` | the outcome code |
 | `class` | the plan group, the [item class](policy.md#keys) and the rules of the plan, or a state such as `undecided`, `dropped`, `no change` or `repacked` |
 | `edits` | the number of flag edits |

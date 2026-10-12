@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-"""The command line: main(), the backfill, --sub-time, the audit and the scans."""
-import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, signal, sqlite3, subprocess, sys, threading, time, types, uuid
+"""The command line: main(), the backfill, --sub-time, --check, the audit and the scans."""
+import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, types, uuid
 
 from . import apps, checks, config, content, convert, decide, logs, plex, process, regrab, report, runner, store, subsync, subtitles, vault
 
@@ -47,7 +47,7 @@ def upgrade(lock, path, st):
     runner.same_file(path, st)
 
 
-def backfill_file(app, f, info, a, keep_plan, pool=None):
+def backfill_file(app, f, info, a, keep_plan, pool=None, job=None):
     """One file of a backfill, as (the seconds it took, the decision record), or None when its own tracks leave it out.
     The selection probe and the checks hold the file lock shared, so the workers of a dry run read side by side and an
     import never waits for a file's language detection. An edit takes the lock exclusive, see upgrade(). A file that
@@ -56,20 +56,30 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     lock, and its conversion runs under the shared lock, see convert(). A re-run converts under the exclusive lock.
     --convert takes every file that is not .mkv, so selected() does not apply. With --sub-check a file whose subtitle
     check is saved and asks for nothing more is skipped, and the result is "checked", unless --recheck is given, see
-    subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks."""
+    subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks.
+
+    job is the job of a --check run, see check(). The file then runs as an import, under an import's time limit, or as
+    the deep analysis after it when job holds deep. An apply posts its alerts when an app names the file. The caller
+    ends the time limit. job["run"] keeps the process.Ctx of the run, as runner.run_job() reads its own."""
     label, original, runtime, want, kids, ctx = info
     started, path, ids = time.time(), f["path"], file_ids(f, want, ctx)
-    mode = "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
-    run = lambda lock, shared, pool: process.process(process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=False, kids=kids,
-                                                                 release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock,
-                                                                 shared=shared, pool=pool, force=a.force.get(path)))
+    mode = ("deep" if job.get("deep") else "import") if job else "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
+    def run(lock, shared, pool):
+        if mode == "import":   # an import's time limit, as runner.run_job() starts it
+            config.DEADLINE.start(config.BUDGET)
+        c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=bool(job and app) and a.apply, kids=kids,
+                        release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
+                        force=a.force.get(path), job=job)
+        if job:
+            job["run"] = c
+        return process.process(c)
     try:
         with pool.slots if pool else contextlib.nullcontext():   # the slot first, so no lock waits for one
             try:
                 with runner.locked(shared=True) as lock:
                     if a.sub_check and not a.recheck and subtitles.sub_cached(path):   # --sub-time takes each file it names
                         return "checked"
-                    if not (a.sub_time or a.plan_from or a.convert or selected(path) or (a.sub_check and subtitles.side_stats(path))):
+                    if not (job or a.sub_time or a.plan_from or a.convert or selected(path) or (a.sub_check and subtitles.side_stats(path))):
                         return None
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: runner.reshared(lock, path, st)), pool)
@@ -79,7 +89,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None):
     except Exception as ex:
         if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
             raise
-        rec = dict(app=app, source="backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
+        rec = dict(app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error",
+                   result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, rec
 
 
@@ -378,6 +389,209 @@ SUB_TIME_MISSED = 3   # the exit code of --sub-time --apply when a change it pla
 SUB_TIME_NO_FILE = 4   # the exit code of --sub-time when a path it was given holds no file
 
 
+def check(argv):
+    """--check runs the checks and the decision of an import on each file named by path (docs/commands.md, "Check one
+    file"). Each file runs as an import of its own with no download, see backfill_file(). It runs under an import's time
+    limit, with the file lock shared for the checks and exclusive for an edit. Every check the settings turn on runs.
+    Then the full burned-in subtitle check and the deep analysis that an import queues run at once, see burn_later() and
+    deep_later(). The run is dry unless --apply is given, and a dry run changes nothing. A re-grab only says what an
+    import would do, see regrab.regrab(), so nothing deletes a file for a fault or searches. An apply edits the file as
+    an import does, keeps the original of a conversion, posts the alerts, and asks Plex to analyze the file as a
+    backfill does. The apps list the files, as for --sub-time. --app takes the item from that instance only, and the other
+    instances are asked for the paths it does not list. A path another instance lists fails, because it would run as a
+    file outside the library. The run takes the lowest CPU and disk priority, as a backfill does. A dry run writes no
+    status.json, see logs.NO_STATUS.
+
+    A path no app lists runs too, as an outside file, see process.Ctx. It gets no app write, and nothing posts without an
+    app. Its conversion writes the new file beside the original. Its item comes from --app and --id, or from --tmdb, see
+    outside_item(). Else it has none. The lines "not checked" name what an import would check and this run left out. A
+    path with no file, a path another instance lists, a lookup that fails, an item that does not read and a run that
+    ends in an error make the exit code 1. The other paths still run. --apply stops before any change when a lookup
+    failed and a path is left, as --sub-time does, because the file may be that app's."""
+    ap = argparse.ArgumentParser(prog="arr-media-guard --check", description="The checks and the decision of an import on each file. It is "
+                                 "dry unless --apply, and it never re-grabs. See docs/commands.md.")
+    ap.add_argument("paths", nargs="+", metavar="PATH")
+    ap.add_argument("--app", choices=sorted(config.CFG.apps), help="take the item from this instance only. With --id, the instance of the item. "
+                    "With --tmdb, the instance of the run when it takes TMDB's kind")
+    named = ap.add_mutually_exclusive_group()
+    named.add_argument("--id", type=int, help="the item of a path no app lists. It is a movie id for radarr and an episode id for sonarr, "
+                       "and needs --app")
+    named.add_argument("--tmdb", metavar="KIND/ID", help="the item of a path no app lists, from TMDB alone. KIND/ID is the end of TMDB's URL. "
+                       "A film is movie/ID, as movie/603. An episode is tv/ID/SEASON/EPISODE, as tv/1396/1/3 for season 1, episode 3")
+    ap.add_argument("--apply", action="store_true", help="edit the files as an import does, keep the original of a conversion, post the "
+                    "alerts and ask Plex to analyze. Without it the run is dry and changes nothing")
+    a = ap.parse_args(argv)
+    if a.id is not None and not a.app:
+        ap.error("--id needs --app")
+    if a.tmdb and not re.fullmatch(r"movie/\d+|tv/\d+/\d+/\d+", a.tmdb):
+        ap.error("--tmdb takes movie/ID or tv/ID/SEASON/EPISODE, as movie/603 or tv/1396/1/3")
+    a.sub_check, a.sub_time, a.recheck, a.plan_from, a.convert, a.force = False, False, False, None, False, {}
+    logs.NO_STATUS = not a.apply   # main() sets it back, and records the policy of an apply
+    os.nice(19)   # it hears and reads files on the NAS, so it yields to imports and to Plex
+    subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
+    checks.langs()
+    given, work, lookups, unasked = [os.path.abspath(p) for p in a.paths], [], [], []
+    left, failed = [p for p in given if os.path.isfile(p)], [f"no file at the path: {p}" for p in given if not os.path.isfile(p)]
+    for line in failed:
+        print(line, flush=True)
+    for app in sorted(config.CFG.apps, key=lambda x: x != a.app):   # --app first, then the others for the paths it does not list
+        try:
+            found = apps.ARR[app].library(apps.arr(app, apps.ARR[app].kind), paths=left)[0] if left else []
+        except FileNotFoundError as ex:   # no API key and no config.xml
+            if why := apps.no_key(app, ex):   # the user set the app up in part. One the user did not set up stays silent.
+                lookups.append(why)
+                unasked.append(app)
+                print(why, flush=True)
+            continue
+        except Exception as ex:   # an error, a timeout or a restart, so the app could not say what it lists
+            lookups.append(config.mask(f"the {app} lookup failed: {type(ex).__name__}: {ex}")[:200])
+            unasked.append(app)
+            print(lookups[-1], flush=True)
+            continue
+        left = [p for p in left if p not in {f.get("path") for f, _ in found}]
+        if a.app and app != a.app:   # with the wrong --app, the file would run as one outside the library, and convert beside itself
+            for f, _ in found:
+                failed.append(f"{app} lists it, so run it with --app {app}: {f['path']}")
+                print(failed[-1], flush=True)
+            continue
+        work += [(app, f, i, None) for f, i in found]
+        for f, _ in found if a.id is not None or a.tmdb else ():
+            print(f"{app} lists it, so the run takes {app}'s item and not {'--id' if a.tmdb is None else '--tmdb'}: {f['path']}", flush=True)
+    if (a.id is not None or a.tmdb) and len(left) > 1:
+        ap.error(f"--id and --tmdb name the item of one file, and no app lists {len(left)} of the paths")
+    if lookups and a.apply and left:
+        sys.exit(f"--check --apply stops, and nothing changed: {'; '.join(lookups)}")
+    failed += lookups
+    if left:
+        try:
+            app, fields, info = outside_item(a)
+        except Exception as ex:
+            failed += [config.mask(f"the item of {p} did not read: {type(ex).__name__}: {ex}")[:300] for p in left]
+            print("\n".join(failed[-len(left):]), flush=True)
+            left = []
+        else:   # what an import checks and this run leaves out, see NO_ITEM
+            out = ([] if app else list(NO_ITEM)) + list(TMDB_LEFT.get((a.tmdb or "").partition("/")[0], ()))
+    said = f"{', '.join(unasked)} could not be asked" if unasked else f"{a.app} does not list it" if a.app else "no app lists it"
+    for p in left:
+        print(f"{said}, so it runs {'as ' + info[0] if app else 'with no item'}: {p}", flush=True)
+        work.append((app, dict(fields, path=p), (info[0] or os.path.basename(p), *info[1:]), out))
+    skipped, burst = set(), {}   # plex_analyze()'s, as for --sub-time
+
+    def done(app, info, out, took, rec, what=""):
+        """The Plex analyze after a change, the decision line and the printed report of one run of a file."""
+        if a.apply and info[3] and config.CFG.plex_url and process.changed(rec):   # plex_find() finds only a file Plex lists
+            rec["plex"], rec["plex_reason"] = plex.plex_analyze(plex.plex_after(app, "check", rec, info[3]), skipped, burst=burst)
+        if out is not None:   # a file no app lists counts in no app's audit, see logs.decision()
+            rec["outside"] = True
+        rec = logs.decision(rec, time.time() - took)
+        print(what + report.check_report(rec, report.tense_of(rec)), flush=True)
+        if rec["outcome"] == "error":
+            failed.append(f'{rec["path"]}: {what}{rec["result"]}')
+    for app, f, info, out in work:
+        job = {"check": "listed" if out is None else "outside", "path": f["path"], "owner": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"),
+               "episode_ids": ",".join(map(str, info[5].get("episode_ids") or ()))}
+        took, rec = backfill_file(app, f, info, a, False, job=job)
+        config.DEADLINE.stop()
+        run = job.pop("run", None)
+        rec["not_checked"] = (out or []) + check_left(rec)
+        done(app, info, out, took, rec)
+        if run and "tracks" in rec:   # the decision ran, so an import would queue these, see runner.run_job()
+            for what, later in (("burned-in subtitle check, ", burn_later), ("deep analysis, ", deep_later)):
+                if got := later(app, f, info, a, job, rec, run):
+                    done(app, info, out, *got, what=what)
+    if failed:
+        sys.exit("--check did not check every file:\n  " + "\n  ".join(failed))
+
+
+def burn_later(app, f, info, a, job, rec, run):
+    """(seconds, decision record) of the full burned-in subtitle check that an import queues after its quick check, run
+    now as the burn-in job runs it, see runner.burn_act(), or None when the quick check of rec asks for none. run is the
+    process.Ctx of the check, so the job decides with its inputs. It runs dry and never re-grabs, as the check does."""
+    b = rec.get("burned_in") or {}
+    if b.get("result") not in ("flagged", "unsure"):
+        return None
+    started = time.time()
+    r = dict(id=uuid.uuid4().hex[:12], app=app, source="check", path=rec["path"], apply=a.apply, ids=rec.get("ids") or {}, label=rec.get("label"))
+    inputs = dict(label=info[0], original=info[1], kids=info[4], release=f.get("sceneName") or "", plan=process.plan_inputs(run))
+    try:
+        r = runner.burn_act(None, dict(app=app, path=rec["path"], inputs=inputs, quick=b["result"], grab=job), r, [], post=run.post)
+    except Exception as ex:
+        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+            raise
+        r.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
+    return time.time() - started, r
+
+
+def deep_later(app, f, info, a, job, rec, run):
+    """(seconds, decision record) of the deep analysis that an import queues for its file, see runner.deep_wanted(),
+    run now with the inputs of the check, as runner.deep_analysis() runs it, or None. It has no time limit. The alerts
+    that the check held for it post when it does not find them again, see runner.held_after()."""
+    if not runner.deep_wanted(rec):
+        return None
+    deep = dict(job, deep=True, path=rec["path"])
+    took, r = backfill_file(app, dict(f, path=rec["path"], id=(rec.get("ids") or {}).get("file_id")), info, a, False, job=deep)
+    if r["outcome"] == "error" and getattr(deep.get("run"), "rec", None):   # what the run changed before the error, as runner.deep_analysis() keeps it
+        r.update({k: deep["run"].rec[k] for k in ("subremux", "sidecars") if k in deep["run"].rec})
+    if run.held:
+        r["held_result"] = runner.held_after(dict(app=app, path=rec["path"], held=run.held), r)
+    return took, r
+
+
+# What an import checks and --check leaves out for a file no app lists, with no item, and with an item of --tmdb by its
+# kind, see outside_item(). The decision line keeps them in "not_checked", with those of check_left().
+NO_ITEM = ("the track flags and language tags, which need the original language of the item. Only a subtitle verdict turns a flag off",
+           "wrong content, with the runtime, too-long episode and episode title checks", "the audio language alert",
+           "the cut-file test of the audio check, which needs the item's runtime")
+TMDB_KIDS = "the kids quality profile, which only the app knows. The kids genres and studios count"
+TMDB_SEASONS = "the episode titles of the other seasons, so the episode title check compares the season's own"
+TMDB_LINK = "the link to the item in the app, which an alert gives"
+TMDB_LEFT = {"movie": (TMDB_KIDS, "the other release years Radarr knows, so the year check takes TMDB's year only", TMDB_LINK),
+             "tv": (TMDB_KIDS, TMDB_SEASONS, "the absolute episode numbers of an anime, which only Sonarr knows", TMDB_LINK)}
+NO_LID = "the language hearing and the subtitle checks against the audio, because language detection is not installed"
+NOT_CONVERTED = "the other checks of an import, which need the converted file"   # an .mkv that holds another container, see process.conversion()
+
+
+def check_left(rec):
+    """What an import checks and the --check run of rec left out, for its "not checked" lines. These are every check
+    after a conversion that did not run, the burned-in subtitle check when it could not run, an extra read of the audio
+    check that the time limit left out, the content checks that the time limit or an error stopped, and the checks that
+    need language detection when it is not installed."""
+    b = rec.get("burned_in") or {}
+    return ([NOT_CONVERTED] if "repack" in rec and "tracks" not in rec else []) \
+        + ([f'the burned-in subtitle check, because {b["why"]}'] if b.get("result") == "skipped" else []) \
+        + [x["error"] for x in (rec.get("audio") or {}).get("samples") or [] if not x.get("ran", True) and " skipped: " in (x.get("error") or "")] \
+        + ([f'wrong content and the runtime checks, which stopped: {rec["meta_error"]}'] if rec.get("meta_error") else []) \
+        + ([NO_LID] if not checks.lid_ready() else [])
+
+
+def outside_item(a):
+    """(app, file record fields, item as App.library() gives it) for each path of --check that no app lists. --app and
+    --id give the item of that instance, a movie id of Radarr or an episode id of Sonarr. --tmdb gives the item from
+    TMDB alone, see content.tmdb_item(), with --app as the app when its program takes that kind, else the program's default
+    instance. The app is then never asked.
+    With neither the path has no item, and the app is None. The fields name the item's id for the decision line. Every
+    call only reads."""
+    if a.id is not None:
+        x = apps.ARR[a.app]
+        if x.film:
+            return a.app, {"movieId": a.id}, x.item(a.id)
+        e = apps.arr(a.app, f"episode/{a.id}")
+        s = e["seriesId"]
+        return a.app, {"seriesId": s}, apps.episode_item(apps.arr(a.app, f"series/{s}"), [e], apps.arr(a.app, f"episode?seriesId={s}"))
+    if a.tmdb:
+        kind, tid, *ep = a.tmdb.split("/")
+        m, eps = content.tmdb_item(kind, tid, *ep[:1], token=config.CFG.tmdb_token or None)
+        prog = "radarr" if kind == "movie" else "sonarr"
+        app = a.app if config.program(a.app) == prog else prog
+        if kind == "movie":
+            return app, {}, apps.movie_item(m)
+        mine = [e for e in eps if e["episodeNumber"] == int(ep[1])]
+        if not mine:
+            raise LookupError(f"TMDB lists no episode {ep[1]} in season {ep[0]} of tv/{tid}")
+        return app, {}, apps.episode_item(m, mine, eps)
+    return None, {}, (None, None, 0, None, False, {"listed": 0})
+
+
 def burn_command(argv):
     """--burn-in: the burned-in subtitle check of each file named by path, or of each file of the items --ids names in
     --app (docs/design.md, "Burned-in subtitles"). It runs the quick check, the full check, and the second pass where
@@ -537,7 +751,7 @@ def audit(argv):
     g.add_argument("--plan-from", metavar="FILE", help="group the plans of a dry run by policy path and rule, and check the "
                    "invariants again")
     g.add_argument("--since", metavar="24h|DATE", help="read the decision log from this time on, 24h or an ISO date")
-    ap.add_argument("--source", choices=["hook", "backfill"], help="only the edits of the hook or of a backfill")
+    ap.add_argument("--source", choices=["hook", "backfill", "check"], help="only the edits of the hook, of a backfill or of --check")
     ap.add_argument("--post", action="store_true", help="post the summary to DISCORD_WEBHOOK, when there is anything to report")
     a = ap.parse_args(argv); app = a.app
     os.nice(19)
@@ -804,8 +1018,9 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --plex-flush <instance>
   arr-media-guard --backfill <instance> --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --backfill <instance> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
-  arr-media-guard --audit <instance> (--plan-from FILE | --since 24h|DATE) [--source hook|backfill] [--post]
+  arr-media-guard --audit <instance> (--plan-from FILE | --since 24h|DATE) [--source hook|backfill|check] [--post]
   arr-media-guard --sub-time PATH [PATH ...] [--apply]
+  arr-media-guard --check PATH [PATH ...] [--app <instance>] [--id ID | --tmdb KIND/ID] [--apply]
   arr-media-guard --burn-in [PATH ...] [--app <instance> --ids ID ...]   the burned-in subtitle check, report only
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
@@ -813,7 +1028,7 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
 <instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k.
---backfill, --audit, --sub-time and --burn-in print their options with --help, as in arr-media-guard --backfill --help.
+--backfill, --audit, --sub-time, --check and --burn-in print their options with --help, as in arr-media-guard --backfill --help.
 README.md says how to install and connect it. docs/commands.md explains each mode, and docs/design.md how it works."""
 
 
@@ -821,8 +1036,9 @@ def main(argv):
     mode = argv[:1]
     # A deploy tool may run --selftest on every dry run, which must change nothing on the host. So the selftest records
     # the policy only with ARR_MEDIA_GUARD_RECORD=1. Its record never moves last_hook_run.
+    # A dry run of --check writes no status.json, see check().
     armed = mode != ["--selftest"] or os.environ.get("ARR_MEDIA_GUARD_RECORD") == "1"
-    if mode in (["--selftest"], ["--backfill"], ["--audit"], ["--sub-time"]) and armed:
+    if (mode in (["--selftest"], ["--backfill"], ["--audit"], ["--sub-time"]) or mode == ["--check"] and "--apply" in argv) and armed:
         logs.status("policy", "failed" if decide.POLICY is None else "ok", config.POLICY_ERROR or "", touch=mode != ["--selftest"])
     if mode == ["--selftest"]:
         print(f"keys from the environment: {', '.join(config.CFG.from_env) or 'none'}")   # the names only, as a value may be a secret
@@ -857,7 +1073,7 @@ def main(argv):
         print("arr-media-guard: the subtitle hunter is a command of its own. Run arr-media-guard-subhunt with the same arguments.",
               file=sys.stderr)
         sys.exit(2)
-    elif mode in (["--backfill"], ["--audit"], ["--sub-time"]) and decide.POLICY is None and not {"-h", "--help"} & set(argv):
+    elif mode in (["--backfill"], ["--audit"], ["--sub-time"], ["--check"]) and decide.POLICY is None and not {"-h", "--help"} & set(argv):
         sys.exit(config.policy_help())
     elif mode == ["--backfill"]:
         backfill(argv[1:])
@@ -867,6 +1083,11 @@ def main(argv):
         plex.plex_flush(argv[1:])
     elif mode == ["--sub-time"]:
         sub_time(argv[1:])
+    elif mode == ["--check"]:
+        try:
+            check(argv[1:])
+        finally:
+            logs.NO_STATUS = False
     elif mode == ["--burn-in"]:
         burn_command(argv[1:])
     elif mode == ["--serve"]:

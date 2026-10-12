@@ -141,14 +141,15 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=()):
     return keep, [] if why else [(ids[n], text[n]["index"]) for n, _ in wrong]
 
 
-def convert_skip(app, path, new, st, ids):
+def convert_skip(app, path, new, st, ids, outside=False, keep=False):
     """(code, why) a conversion of the file st describes cannot run, or None: a hard link, the size cap or low space as
     for a repack, see repack_block(), no item id to import the new name with, or the .mkv name taken by another file.
-    Most conversions keep no original, so the keep check of a repack is left out. It writes nothing."""
-    code, why = remux.repack_block(path, st, keep=False)
+    Most conversions keep no original, so the keep check of a repack runs only with keep, as for one of --check. A file
+    outside the library needs no item id, see convert(). It writes nothing."""
+    code, why = remux.repack_block(path, st, keep=keep)
     if why:
-        return {"hardlinked": "repack_hardlinked", "cap": "repack_too_big", "space": "repack_low_space"}[code], why
-    if new != path and not ((ids or {}).get("app_id") and (apps.ARR[app].film or (ids or {}).get("file_id"))):
+        return {"hardlinked": "repack_hardlinked", "cap": "repack_too_big", "space": "repack_low_space", "keep": "repack_no_keep"}[code], why
+    if new != path and not outside and not ((ids or {}).get("app_id") and (apps.ARR[app].film or (ids or {}).get("file_id"))):
         return "not_matroska", "no item id, so the app cannot take the new name"
     if new != path and os.path.lexists(new):
         return "repack_name_taken", f"the name {os.path.basename(new)} is taken"
@@ -604,7 +605,8 @@ def held_name(path):
     return os.path.join(os.path.dirname(path), config.CFG.hide_dir, os.fsdecode(b"." + name + HELD))
 
 
-def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False, source="backfill"):
+def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False, source="backfill",
+            outside=False):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (code,
     result, info, the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not
@@ -644,7 +646,12 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
 
     sub runs the subtitle match check first, see convert_subs(): a sidecar that does not match the audio is moved aside,
     a built-in text track that does not match is left out of the remux, and a sidecar whose times need a fix is muxed
-    with new times. A conversion that leaves a track out keeps the original, as a forced one does. known holds the item's original languages, see sub_hold()."""
+    with new times. A conversion that leaves a track out keeps the original, as a forced one does. known holds the item's original languages, see sub_hold().
+
+    A conversion of --check, source check, keeps the original too, see cli.check(). The sidecars it muxed go to the kept
+    originals with it. outside is a file of --check that no app lists. Its conversion asks the app nothing. The new name
+    goes beside the original, and the original and its sidecars stay in place. A file whose new name is its own keeps
+    the original as any conversion of --check does."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -673,11 +680,13 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     else:
         why = None
     caps = [] if unreadable else [s for s in proof.media_streams(streams) if s.get("codec_name") in proof.CAPTIONS]
-    what = f"the container is {container}" + (", renamed to .mkv" if new != path else "") + (f", {len(subs)} sidecar subtitles" if subs else "") \
+    what = f"the container is {container}" + ((", a new .mkv beside it" if outside else ", renamed to .mkv") if new != path else "") \
+        + (f", {len(subs)} sidecar subtitles" if subs else "") \
         + (f", {len(caps)} CEA-608 caption tracks as SubRip" if caps else "")
-    why, old, items, cc, drop = why or convert_skip(app, path, new, st, ids), {}, {}, {}, []
+    check = source == "check" and not (outside and new != path)   # it keeps the original, see the swap below
+    why, old, items, cc, drop = why or convert_skip(app, path, new, st, ids, outside, check), {}, {}, {}, []
     said = lambda code, text: (code, text) if text else None
-    if not why and new != path:   # read-only: the app's record of the original, which the ManualImport copies
+    if not why and new != path and not outside:   # read-only: the app's record of the original, which the ManualImport copies
         old, items, home = apps.ARR[app].record(ids)
         why = said("repack_app_refused", app_refuses(path, old, items, home))
         if not why and not apps.ARR[app].film:   # the new name and the extras that go back must parse as this file's episodes
@@ -708,6 +717,9 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             return why[0], f"skipped, not matroska, {why[1]}: {what}", info, path
         return "would_repack", f"would repack: {what}", info, path
     tmp, held, state = remux.repack_tmp(path), held_name(path), "remux"
+    # The sidecars of --check go to the kept originals, in the stamp folder of the original. One with new times is kept
+    # already, see convert_subs().
+    kept_too = {s["path"] for s in subs if "mux" not in s} if check and config.CFG.keep_days else set()
     key, entry, hidden = f"{app}:{os.getpid()}:{uuid.uuid4().hex[:8]}", None, []   # the pending entry, and the hidden extras
     if shared:
         try:
@@ -745,7 +757,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             info["forced"] = fault
         size = sw.own()
         extras = []
-        if new != path:   # again, right before the swap and outside the exclusive lock: the app may have changed the file meanwhile
+        if new != path and not outside:   # again, right before the swap and outside the exclusive lock: the app may have changed the file meanwhile
             old, items, home = apps.ARR[app].record(ids)
             why = app_refuses(path, old, items, home)
             if why:
@@ -757,14 +769,21 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if lock is not None:   # the swap needs the lock exclusive. flock cannot upgrade in one step, see exclusive().
             swap_lock(lock)
             state = "locked"
-        # A forced conversion, or one that leaves a track out, keeps the original as a hard link. One move puts it back.
-        sw.check("the app replaced or renamed the original during the repack", info.get("forced") or info.get("forced_name") or drop)
+        # A forced conversion, one that leaves a track out, and one of --check keep the original as a hard link. One move
+        # puts it back. The original of a file outside the library stays at its own name.
+        keep = info.get("forced") or info.get("forced_name") or drop or (check and config.CFG.keep_days)
+        sw.check("the app replaced or renamed the original during the repack", keep and not (outside and new != path))
         sw.release()   # from here a stop waits for the swap and the job's end, as for mkvpropedit
         with runner.no_stop():
             if new == path:
                 vault.kept_replaced(path)   # no keep_original() before this rename, unless forced
                 os.replace(tmp, path)
                 if lock is not None:   # process() takes it again at the gate. Kept, it would deadlock a worker waiting there.
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            elif outside:   # no app lists the file, so none takes the new name. It goes beside the original.
+                os.link(tmp, new)   # fails when the name is taken meanwhile
+                os.remove(tmp)
+                if lock is not None:   # as above
                     fcntl.flock(lock, fcntl.LOCK_UN)
             else:
                 entry = dict(app=app, owner=ids["app_id"], items=sorted(items), path=path, new=new, held=held, old_id=old.get("id"), pid=os.getpid(),
@@ -800,8 +819,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
                 else:
                     pending_edit(key)
             state = "done"
-            for f in ([] if new == path else [held]) + [s["path"] for s in subs]:   # the sidecars are proven in the new file by their text
+            for f in [] if outside else ([] if new == path else [held]) + [s["path"] for s in subs]:   # the sidecars are proven in the new file by their text
                 try:
+                    if f in kept_too:
+                        info.setdefault("sidecars_kept", []).append(vault.keep_original(f, stamp_of=info.get("kept")))
                     os.remove(f)
                 except OSError as ex:
                     info.setdefault("left", []).append(config.mask(f"{f}: {ex}")[:200])
@@ -828,6 +849,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
                 pending_edit(key)
             for f in [s["path"] for s in subs]:
                 with contextlib.suppress(OSError):
+                    if f in kept_too:
+                        info.setdefault("sidecars_kept", []).append(vault.keep_original(f, stamp_of=info.get("kept")))
                     os.remove(f)
         elif undo == "stranded":
             pending_edit(key, dict(entry, state="stranded", error=config.mask(str(ex))[:200]))

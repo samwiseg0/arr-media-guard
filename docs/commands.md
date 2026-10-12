@@ -1,7 +1,7 @@
 # Commands
 
 arr-media-guard (AMG) checks each import by itself. These commands run its checks over the files you already have, or on
-single files. A backfill and `--sub-time` are dry unless you add `--apply`. A few commands act without it. The audit
+single files. A backfill, `--sub-time` and `--check` are dry unless you add `--apply`. A few commands act without it. The audit
 cleans up and turns on On Grab, `--plex-flush` asks Plex to scan, and `--test-discord` posts a message. `arr-media-guard
 --help` lists the commands, and `--help` after a command lists its options.
 
@@ -52,6 +52,7 @@ arr-media-guard --backfill sonarr --convert --apply           # convert them, CO
 arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
 arr-media-guard --backfill sonarr --ids 101 --sub-check --recheck   # the same, also the files checked before
 arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # time every subtitle of one file, dry
+arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv"      # every check of an import on one file, dry
 arr-media-guard --burn-in "/data/movies/Film A (2000)/Film A (2000).mkv"   # look for burned-in subtitles, report only
 arr-media-guard-subhunt radarr --ids 123                      # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
 arr-media-guard --audit radarr --since 24h --post             # AMG's edits of the last day, to Discord
@@ -71,6 +72,107 @@ arr-media-guard --audit radarr --since 24h --post             # AMG's edits of t
   `--apply` changes one file at a time, and `--convert --apply` converts `CONVERT_WORKERS` at a time.
 - `--canary` needs `--apply` and `--plan-from`.
 - The subtitle hunter's `--force` tries again a film that an earlier run gave up on, or whose import failed.
+
+## Check one file
+
+`--check` runs the checks of an import on each file you name, one file at a time. Use it to see what an import would do
+with a file, or to fix a file in place. Run it dry first, and read what it says. Then add `--apply`.
+
+```
+arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv"           # dry run: changes nothing
+arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --apply   # changes the file as an import does
+```
+
+- It runs each check that your settings turn on for an import. These are the audio and video checks, wrong content and
+  the runtime checks, and the burned-in subtitle check. It also runs the subtitle checks at `SUBTITLES` with the deep
+  analysis, and it sets the language tags and flags. It repairs a broken header, and converts at `CONVERT` with the
+  damage check.
+- An import queues the full burned-in subtitle check and the deep analysis to run later. `--check` runs them right after
+  the other checks, in the same way, and prints a line for each. They follow the same rules for a dry run and for
+  `--apply`. They never wait for an import. The deep analysis has no time limit, so a film can take many minutes.
+- Each file runs as an import of its own, with an import's 300-second time limit and the file lock. It takes every file
+  you name, also one that a backfill leaves out. It runs at the lowest CPU and disk priority, as a backfill does.
+- A dry run changes no file, posts nothing, asks Plex nothing and writes nothing to the app or to `status.json`.
+- For each file it prints the label and the whole result, then the plan and the alerts. The result of a converted file
+  starts with `repacked`. A `checked:` line gives the result of each check that ran. A `not checked:` line names each
+  check that an import runs and this run left out. A burned-in subtitle check with no models is one example. A full
+  decode of the audio that the time limit left out is another. The decision line keeps them in `not_checked`.
+- It never re-grabs. A file that an import would re-grab gets its second check, and the alert title ends "would
+  re-grab". For a kind that `REGRAB` leaves out, the title ends "re-grab is off", as on an import.
+- A dry run does not convert. It finds a damaged source only when ffprobe cannot read the file. An `.mkv` file that
+  holds another container then gets no other check, as on an import. A `not checked:` line says so.
+- The apps name the item of each file, as for `--sub-time`. `--app <instance>` takes the item from that instance only.
+  AMG still asks the other instances about a file it does not list. When another instance lists the file, AMG names
+  that instance and leaves the file out. With the wrong `--app`, the file would run as a file outside the library.
+- AMG names each path that holds no file, and leaves it out. It also names a lookup that fails. The other files still
+  run, and the exit code is then 1. When a lookup fails and a path is left that no app lists, `--apply` stops before
+  any change. The file may belong to that app.
+- A stop with Ctrl+C or SIGTERM during the deep analysis drops the alerts that the check held for it. The next run
+  posts them.
+- Each run gets a decision line with source `check`.
+
+### What `--apply` changes
+
+- It changes the file as an import does. It posts the alerts to Discord and asks Plex to analyze the file. After a remux
+  the app rescans the item.
+- A remux and a header repair keep the original in the kept originals, as on an import. So does a conversion, and the
+  app then takes the new name. The sidecar subtitles that the new file holds go to the kept originals too, beside the
+  original. An import deletes the original and those sidecars.
+- A conversion that cannot keep its original is skipped before the remux. The dry run says so too.
+- A sidecar subtitle that does not match the audio moves to the kept originals, as on an import.
+- The nightly audit removes the kept originals after `KEEP_ORIGINALS_DAYS`. At `0` AMG keeps nothing. A remux of the
+  subtitles then keeps every track. A conversion of a file that an app lists deletes the original and those sidecars,
+  as an import does.
+- Nothing else moves a file out of its folder. Only a conversion at `KEEP_ORIGINALS_DAYS=0` deletes a file.
+- The deep analysis holds the file lock exclusive for its remux, at the lowest priority, and never yields. Every import
+  waits until the remux ends.
+
+### A file outside the library
+
+A file that no app lists runs too, such as a copy in a scratch folder. `--apply` makes no app write. There is no
+rescan, no monitor and no import of a new name. Plex gets an analyze only for a file it lists.
+
+- A conversion writes the new `.mkv` beside the original, and the original stays where it is. A sidecar subtitle that
+  does not match the audio moves to the kept originals. The other sidecars stay beside the original, and the new file
+  holds them too. So a player that finds them beside the `.mkv` may list each one twice.
+- An `.mkv` file that holds another container converts under its own name. Its original goes to the kept originals.
+  At `KEEP_ORIGINALS_DAYS=0` AMG keeps nothing, so the original is gone.
+- A remux keeps the original in `.<NAME>-originals` at the top of the file's mount. When AMG cannot write there, it
+  takes the highest folder on the path that it can write.
+
+Such a file has no item, unless you name one. With no item, AMG knows no original language. So the flags and the
+language tags stay as they are, and only a subtitle verdict turns a flag off. Some checks need the item, so they do not
+run. These are wrong content, the runtime checks and the episode title check. The audio language alert and the
+cut-file test of the audio check need it too. With no item, no app names an alert. So AMG prints the alerts and posts
+nothing. Every other check runs.
+
+Name the item to run the other checks too. The `not checked:` lines name the checks that still need an item.
+
+```
+arr-media-guard --check /data/scratch/Film.mkv --app radarr --id 123   # Radarr's movie 123
+arr-media-guard --check /data/scratch/Show.S01E03.mkv --app sonarr --id 4567   # Sonarr's episode 4567
+arr-media-guard --check /data/scratch/Film.mkv --tmdb movie/603   # TMDB's film 603, with no app
+arr-media-guard --check /data/scratch/Show.S01E03.mkv --tmdb tv/1396/1/3   # TMDB's series 1396, season 1, episode 3
+```
+
+- Run it dry first. The line "no app lists it, so it runs as ..." names the item. Check that it is the right one, then
+  add `--apply`.
+- `--id` takes Radarr's movie id or Sonarr's episode id, and needs `--app`. The app gives the item as for a file it
+  lists.
+- `--tmdb` takes the end of TMDB's own URL. A film is `movie/603`. An episode is `tv/1396/1/3`, with the series, the
+  season and the episode number. It needs no app.
+- TMDB gives the title, the original title, the year, the original language, the runtime, the genres and the studio.
+  For an episode it also gives the title and the runtime. AMG asks TMDB with the key of the content checks,
+  `TMDB_TOKEN` or Radarr's.
+- With `--tmdb`, the run takes the instance of `--app` when it fits the kind. That is a Radarr for a film or a Sonarr
+  for an episode. Else it takes `radarr` for a film and `sonarr` for an episode. The alerts name that instance.
+- With `--tmdb`, the kids rule reads the genres and the studio. The kids quality profile does not count. TMDB's series
+  genre Kids counts as Sonarr's Children. The episode title check compares the titles of the episode's own season only.
+  The year check knows none of the other release years that Radarr lists. An anime has no absolute episode numbers,
+  and an alert has no link to the item in the app.
+- `--id` and `--tmdb` exclude each other. Each one names the item of one file. So only one of the paths may be a file
+  that no app lists. A file that an app lists keeps the app's own item, and the run prints one line that says so.
+- A file that no app lists counts in no app's nightly audit.
 
 ## Check for burned-in subtitles
 
@@ -149,9 +251,10 @@ link stays right. This needs no logged refusal.
 ## The audit
 
 `--audit` reviews changes. With `--plan-from` it groups the plans of a dry run by the rule that made them. With
-`--since` it reviews the changes that imports and backfills with `--apply` made in that time. AMG keeps the decision
-lines for 14 days. `--source hook` takes only the imports, and `--source backfill` only the backfills. `--post` sends
-the summary to Discord when the audit found a problem.
+`--since` it reviews the changes that imports, backfills and `--check` with `--apply` made in that time. A file that no
+app lists counts in no audit. AMG keeps the decision lines for 14 days. `--source hook` takes only the imports,
+`--source backfill` only the backfills, and `--source check` only `--check`. `--post` sends the summary to Discord when
+the audit found a problem.
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 
@@ -285,8 +388,9 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --backfill sonarr --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-audio ...` | `$EXEC --backfill sonarr --check-audio ...` | API, Media, Discord |
 | `arr-media-guard --backfill sonarr --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-video ...` | `$EXEC --backfill sonarr --check-video ...` | API, Media, Discord |
 | `arr-media-guard --sub-time PATH ... [--apply]` | `$RUN --sub-time /data/PATH ...` | `$EXEC --sub-time /data/PATH ...` | Media, LID. The API names the original language, and Plex gets the request after a change. It exits 0, 1 (with `--apply` an app lookup failed and nothing changed, or the policy file did not load), 2 (a wrong option), 3 (with `--apply` a planned change did not happen) or 4 (a path holds no file). |
+| `arr-media-guard --check PATH ... [--app sonarr] [--id ID \| --tmdb KIND/ID] [--apply]` | `$RUN --check /data/PATH ...` | `$EXEC --check /data/PATH ...` | Media, LID. The API names the item, and Plex and Discord get the requests of an apply. It exits 0, 1 (a path holds no file, another instance than `--app` lists it, a lookup failed, an item did not read, a check ended in an error, or the policy file did not load) or 2 (a wrong option, or `--id` or `--tmdb` with more than one path that no app lists). |
 | `arr-media-guard --burn-in (PATH ... \| --app sonarr --ids ID ...)` | `$RUN --burn-in /data/PATH ...` | `$EXEC --burn-in /data/PATH ...` | Media, LID. With `--app`: API. |
-| `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | With `--since`: API, Media, Discord. With `--plan-from`: none. |
+| `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill\|check] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | With `--since`: API, Media, Discord. With `--plan-from`: none. |
 | `arr-media-guard-subhunt radarr --ids ID ... [--apply] [--force]` | `$RUN arr-media-guard-subhunt radarr --ids ID ...` | `docker exec -it arr-media-guard arr-media-guard-subhunt radarr --ids ID ...` | API, Media, LID, Discord, `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, and SABnzbd and NZBHydra2 at the addresses Radarr has saved, or at `SABNZBD_URL` and `NEWZNAB_URL`. The download folder at SABnzbd's path, or in a pair of Radarr's path map. |
 
 - Every `sonarr` above takes `radarr` or the name of another instance too. The subtitle hunter takes a Radarr instance

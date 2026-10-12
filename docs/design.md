@@ -232,7 +232,7 @@ and its file, and the sentence `report.UNTOLD` in place of the error. Its line i
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
-`hook`, `burn_in`, `deep_analysis` and `recheck`. A conversion that a stopped run left has `worker` when the worker
+`hook`, `burn_in`, `deep_analysis`, `recheck` and `check`. A conversion that a stopped run left has `worker` when the worker
 finds it as it starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names
 the step where the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its
 step from `ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see
@@ -362,7 +362,8 @@ The tense is `planned` for a dry run and `done` for an apply, so a dry run says 
 line of a dry run says the same as its CLI line.
 
 The action codes are `regrabbed`, `restored` (a manual import's old file came back), `searched`, `deleted`,
-`would_regrab`, `unconfirmed`, `capped`, `no_grab`, `failed`, `dry_run` and `no_policy`. The title of a re-grab says
+`would_regrab`, `check` (`--check` confirmed a fault that an import would re-grab), `unconfirmed`, `capped`, `no_grab`,
+`failed`, `dry_run` and `no_policy`. The title of a re-grab says
 "old file restored" when the job's own old file came back. Each sentence of a `submatch` or `subtiming` finding has a
 code too: `removed`, `stays`, `sidecar`, `converted_sidecar`, `converted_track`, `sidecar_left`, `off`, `not_retimed`,
 `check_times`, `check_flash` and `live`. The codes are stable, and the words may change.
@@ -784,8 +785,12 @@ to run the undo of a file's last edit. A later import of the same item runs the 
 Every video file that is not Matroska becomes `<base>.mkv`, and so does a `.mkv` file that holds
 another container. `--backfill <app> --convert` converts the library. The hook converts an import
 only with `CONVERT=true`, except a `.mkv` file with another container, which always converts. The
-log calls a conversion a repack. A conversion keeps no original, except a forced one. It proves every
-stream first, and the app must list the new file before the original goes.
+log calls a conversion a repack. A conversion keeps no original, except a forced one and one of
+`--check`. A conversion of `--check` also keeps the sidecars that the new file holds, in the stamp folder of the
+original. It proves every stream first,
+and the app must list the new file before the original goes. A `--check` run on a file no app lists
+asks no app. It writes the new file beside the original, which stays with its sidecars. An `.mkv` file
+that holds another container converts under its own name, so its original goes to the kept originals.
 
 **Skips.** A skip writes nothing, and the file goes on `STATE_DIR/convert-<app>.txt`.
 
@@ -797,6 +802,8 @@ stream first, and the app must list the new file before the original goes.
   links extras by their parsed episodes
 - a new name that loses a custom format that scores, a file ffprobe cannot read, or an empty
   caption track
+- a conversion of `--check` with no place to keep the original. A dry run of `--check` and a file
+  no app lists never go on the list.
 
 **The remux.** A `.srt` beside the video that starts with its base name is muxed in, with its
 language, forced and hearing-impaired flags from the name. Its text can overrule the name's language,
@@ -2179,15 +2186,16 @@ the code always has a key now. A file's `found` and
 `ok` or `failed`. A check never recorded reads `unknown`. `since` is when the status last changed,
 and `checked` is the last check. `error` keeps the last error text after a recovery, cut to 200
 characters with anything that looks like a token replaced. `last_24h` counts each status over the
-last day. `last_hook_run` is the last write by a job, a backfill, `--sub-time`, an audit or the subtitle hunter.
+last day. `last_hook_run` is the last write by a job, a backfill, `--sub-time`, `--check --apply`, an audit or the
+subtitle hunter.
 
 Each write goes through a temp file and a rename under a lock, with mode 0644. A broken file starts
 fresh, and a failed write never stops a job. Give the state directory mode 0751 or wider, so the
 agent can open the file by name. No file there holds a secret.
 
-The policy status goes in at the start of each job and of each `--backfill`, `--sub-time`, `--audit` and
-`arr-media-guard-subhunt` run. `--selftest` records it only with `ARR_MEDIA_GUARD_RECORD=1` in its environment,
-and it never moves `last_hook_run`. So an install step can clear a policy problem, and a selftest
+The policy status goes in at the start of each job and of each `--backfill`, `--sub-time`, `--check --apply`,
+`--audit` and `arr-media-guard-subhunt` run. A dry run of `--check` writes no status. `--selftest`
+records it only with `ARR_MEDIA_GUARD_RECORD=1` in its environment, and it never moves `last_hook_run`. So an install step can clear a policy problem, and a selftest
 never hides a stopped audit. The TMDB status goes in only after a live TMDB answer. Useful alerts
 are these:
 

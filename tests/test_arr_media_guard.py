@@ -30,6 +30,7 @@ import dataclasses
 import datetime
 import fcntl
 import gc
+import glob
 import hashlib
 import io
 import json
@@ -117,7 +118,7 @@ def env(tmp_path, monkeypatch, settings):
              "plex_items": [plex_item("7101", "tmdb://90001", str(path))], "writes": [], "ffmpeg": [],
              "ffmpeg_out": ["[x] [info] n_samples: 1922128\n[x] [info] max_volume: -4.0 dB\n"], "syslog": [],
              "repacks": [], "durations": {False: 600.0, True: 600.02}, "mkv_probe": copy.deepcopy(NEW_MKV), "activities": [], "checks": [],
-             "windows": [], "window_out": [CLEAN_WINDOW],
+             "windows": [], "window_out": [CLEAN_WINDOW], "nice": [],
              "proof": (None, [{"stream": "video 0", "codec": "h264", "method": "packets", "count": 10, "hash": "0" * 16, "match": True}])}
     start = calls["clock"][0]
 
@@ -133,6 +134,7 @@ def env(tmp_path, monkeypatch, settings):
                 f.write(calls.get("cc_text", ""))
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         if argv[0] == "ionice":   # the backfill and the audit lower their own I/O priority
+            calls["nice"].append(argv)
             return None
         if argv[0] == "ffprobe" and "-show_streams" in argv:   # convert() looks for caption tracks: the fake file's tracks, plus calls["extra_streams"]
             probe = calls["files"].get(argv[-1], calls["probe"])
@@ -256,6 +258,7 @@ def env(tmp_path, monkeypatch, settings):
     monkeypatch.setattr(hook.subprocess, "run", fake_run)
     monkeypatch.setattr(hook, "http", fake_http)
     monkeypatch.setattr(hook.os, "fork", fake_fork)
+    monkeypatch.setattr(hook.os, "nice", calls["nice"].append)   # the test process keeps its priority
     monkeypatch.setattr(hook.os, "setsid", lambda: None)
     monkeypatch.setattr(hook.os, "dup2", lambda a, b: None)
     monkeypatch.setattr(hook.os, "_exit", fake_exit)
@@ -11106,7 +11109,7 @@ def test_the_conversion_checks_subtitles_only_where_it_may_fix(env, monkeypatch,
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     seen = []
     monkeypatch.setattr(hook, "convert", lambda app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False,
-                        source=None: seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
+                        source=None, outside=False: seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
     hook.main([])
     assert seen == [sub]
 
@@ -18361,3 +18364,703 @@ def test_an_asf_file_gets_its_tracks_for_the_quick_check_from_ffprobe(env, burn,
     env["extra_streams"] = env["extra_streams"][1:]   # no video: no check
     hook.main([])
     assert [r for r in log_lines(env) if "schema" in r][-1]["burned_in"] == {"result": "skipped", "why": "the file has no video track"}
+
+
+# --- --check, the checks of an import on one file -------------------------------------------------------------------
+
+def check_listed(env, monkeypatch, scene=""):
+    """Radarr lists the env's film as movie 7, with its file record as movie/7 holds it, else file 11 at the env's path.
+    Sonarr lists no series. scene is the record's scene name. Returns the app's GET calls as (app, path)."""
+    real, asked = hook.arr, []
+
+    def fake_arr(app, p):
+        asked.append((app, p))
+        if p == "series":
+            return []
+        if p == "movie":
+            m = env["movies"]["movie/7"]
+            return [dict(m, id=7, movieFile=dict(m.get("movieFile") or {"id": 11, "path": env["path"]}, sceneName=scene))]
+        return real(app, p)
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    return asked
+
+
+def checked(env):
+    """The decision lines of --check."""
+    return [r for r in log_lines(env) if "schema" in r and r["source"] == "check"]
+
+
+def test_check_dry_run_changes_nothing_and_says_what_an_import_would_do(env, monkeypatch, capsys):
+    """The env's film plays Portuguese first. An import would turn on the English track. The dry run plans that edit,
+    prints it as a backfill does, and logs a dry decision line. It edits nothing, posts nothing, asks Plex nothing and
+    writes nothing to the app. The audit of the day skips the line, as it skips a backfill's dry run."""
+    check_listed(env, monkeypatch)
+    hook.main(["--check", env["path"]])
+    (rec,) = checked(env)
+    assert (rec["outcome"], rec["apply"], rec["ids"]["file_id"]) == ("dry_run", False, 11) and rec["edits"], rec
+    assert env["mkvpropedit"] == [] and env["writes"] == [] and env["http"] == []
+    out = capsys.readouterr().out
+    assert out.startswith("Film A (1979): dry run | a1 1->0") and "audio" in rec and "video" in rec, out   # the import's own checks ran
+    assert "\n  checked: audio clean, video clean, wrong content: language unknown, runtime ok, year ok\n" in out
+    status = os.path.join(hook.CFG.state_dir, "status.json")
+    assert not os.path.exists(status)   # RR2 2026-10-12: a dry run writes no status.json
+    assert env["nice"] == [19, ["ionice", "-c3", "-p", str(os.getpid())]]   # the lowest CPU and disk priority, as a backfill
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert "0 files changed" in capsys.readouterr().out and os.path.exists(status)   # the next command records again
+
+
+def test_check_apply_edits_as_an_import_and_asks_plex_to_analyze(env, monkeypatch):
+    check_listed(env, monkeypatch)
+    hook.main(["--check", env["path"], "--apply"])
+    (rec,) = checked(env)
+    assert (rec["outcome"], rec["apply"]) == ("edited", True) and len(env["mkvpropedit"]) == 1, rec
+    assert os.path.exists(os.path.join(hook.CFG.state_dir, "status.json"))   # an apply records the policy, as --sub-time does
+    assert analyzes(env) == ["/library/metadata/7101/analyze"] and rec["plex_reason"] == "plex_analyze_sent"
+    assert env["writes"] == [] and env["events"].index("limit 300") < env["events"].index("mkvpropedit")   # under an import's time limit
+    hook.main(["--check", env["path"], "--apply"])
+    assert checked(env)[-1]["outcome"] == "no_change" and len(env["mkvpropedit"]) == 1
+
+
+def test_check_apply_records_a_broken_policy_and_a_dry_run_records_nothing(env, monkeypatch, capsys):
+    """RR3 2026-10-12: with no policy loaded, main() stops --check with the policy help. An apply records the failed
+    policy first, as --sub-time does. A dry run writes no status.json."""
+    monkeypatch.setattr(hook.arr_decide, "POLICY", None)
+    status = os.path.join(hook.CFG.state_dir, "status.json")
+    for apply in ([], ["--apply"]):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--check", env["path"], *apply])
+        assert str(ex.value) == hook.policy_help() and os.path.exists(status) == bool(apply) and not os.path.exists(hook.CFG.log)
+    with open(status) as f:
+        assert json.load(f)["checks"]["policy"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, RuntimeError])
+def test_check_that_stops_on_an_exception_leaves_status_json_on(env, monkeypatch, stop):
+    """RR3 2026-10-12: a dry run of --check writes no status.json. main() turns that off again, also after an
+    exception, so a later command of the same process records its status."""
+    check_listed(env, monkeypatch)
+    monkeypatch.setattr(hook, "backfill_file", lambda *a, **k: (_ for _ in ()).throw(stop("stopped")))
+    with pytest.raises(stop):
+        hook.main(["--check", env["path"]])
+    assert hook.NO_STATUS is False
+
+
+def check_fault(env, monkeypatch, kind, apply=True):
+    """A certain fault of kind in the film --check runs on, as the import tests make each one. A dry run converts
+    nothing, so its damage is the one ffprobe shows."""
+    if kind == "audio":
+        env["ffmpeg_out"] = [SILENCE]
+    elif kind == "video":
+        env["window_out"] = [BAD_WINDOW]
+    elif kind == "content":
+        env["probe"], env["tmdb"] = copy.deepcopy(NO_ENGLISH), dict(TMDB)
+    else:
+        damaged_import(env, monkeypatch, "mkvmerge" if apply else "ffprobe")
+    grabbed(env, monkeypatch)   # a grab record, as an import has. The job of --check never reads it.
+    return check_listed(env, monkeypatch, WRONG_RELEASE if kind == "content" else "")
+
+
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("kind", ["audio", "video", "content", "damage"])
+def test_check_never_regrabs_a_certain_fault_and_alerts_instead(env, monkeypatch, settings, capsys, kind, apply):
+    """Each fault an import re-grabs is checked a second time from scratch, then only reported: "would re-grab". No
+    delete, failed mark, search, re-monitor or restore. The apply posts the alert. The second check ends the time
+    limit, as a re-grab of an import does."""
+    check_fault(env, monkeypatch, kind, apply)
+    settings(regrab=set(hook.REGRAB_KINDS), restore=True)
+    path = env["movies"]["movie/7"].get("movieFile", {}).get("path") or env["path"]
+    real, limits = hook.regrab, []
+    monkeypatch.setattr(hook, "regrab", lambda *a, **k: (real(*a, **k), limits.append(hook.DEADLINE.end))[0])
+    hook.main(["--check", path] + (["--apply"] if apply else []))
+    (rec,) = checked(env)
+    (f,) = [f for f in rec["findings"] if f.get("action")]
+    assert (f["kind"], f["action"]) == (kind, {"code": "check", "kind": kind}) and env["writes"] == [] and os.path.exists(path), rec
+    assert limits == [None]
+    assert not hook.store.items("regrabs") and not hook.store.items("unit")
+    posts = [b for m, u, b in env["http"] if m == "POST"]
+    assert len(posts) == apply and (not apply or posts[0]["embeds"][0]["title"].endswith(", would re-grab")), posts
+    assert "An import would re-grab the file. --check never re-grabs, so it was kept." in capsys.readouterr().out
+    if kind == "content":
+        assert rec["outcome"] == "would_regrab" and rec["result"].startswith("would re-grab: ")
+
+
+def test_check_says_re_grab_is_off_for_a_kind_regrab_leaves_out(env, monkeypatch, settings):
+    check_fault(env, monkeypatch, "audio")
+    settings(regrab={"video"})
+    hook.main(["--check", env["path"]])
+    (f,) = [f for f in checked(env)[0]["findings"] if f.get("action")]
+    assert f["action"] == {"code": "would_regrab", "kind": "audio"} and env["writes"] == []
+
+
+def test_check_keeps_a_fault_the_second_check_does_not_find(env, monkeypatch):
+    check_fault(env, monkeypatch, "audio")
+    env["ffmpeg_out"] = [SILENCE] * 3 + [env["ffmpeg_out"][0].replace("-91.0", "-4.0")] * 3   # the second check hears sound
+    hook.main(["--check", env["path"], "--apply"])
+    (f,) = [f for f in checked(env)[0]["findings"] if f.get("action")]
+    assert f["action"] == {"code": "unconfirmed"} and env["writes"] == []
+
+
+def test_the_check_job_never_reaches_a_delete_or_a_restore(env, monkeypatch, settings):
+    """regrab() returns for a --check job before it reads a grab record, so no caller can delete, mark a grab failed or
+    put an old file back. The job here even names a download and the old files of an upgrade."""
+    grabbed(env, monkeypatch)
+    settings(regrab=set(hook.REGRAB_KINDS), restore=True)
+    probe = lambda path, f, fresh=False: ("silent", {})
+    for job in ({"check": "listed", "path": env["path"], "owner": "7", "file_id": "11", "download_id": "a1b2c3d4"},
+                {"check": "listed", "path": env["path"], "owner": "7", "file_id": "11", "deleted": "/m/old.mkv", "recycled": "/bin/old.mkv"}):
+        assert hook.regrab("radarr", job, "silent", probe) == {"code": "check", "kind": "audio"}
+    assert env["writes"] == []
+
+
+def test_check_names_a_path_with_no_file_and_runs_the_others(env, monkeypatch, capsys, tmp_path):
+    check_listed(env, monkeypatch)
+    gone = tmp_path / "gone.mkv"
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", str(gone), env["path"]])
+    assert f"no file at the path: {gone}" in capsys.readouterr().out and len(checked(env)) == 1
+    assert str(ex.value) == f"--check did not check every file:\n  no file at the path: {gone}"
+
+
+def test_check_app_takes_the_item_of_one_instance_and_fails_a_file_another_one_lists(env, monkeypatch, capsys):
+    """--app radarr asks only Radarr, which lists the file. With --app sonarr the file would run as one outside the
+    library, and its conversion would write the .mkv beside the MP4 in Radarr's folder. So the other instances are asked
+    for the paths Sonarr does not list. Radarr lists it, so the path fails and nothing changes (RR1 2026-10-12)."""
+    asked = check_listed(env, monkeypatch)
+    hook.main(["--check", env["path"], "--app", "radarr"])
+    assert {a for a, p in asked} == {"radarr"} and len(checked(env)) == 1
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    asked.clear()
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", mp4, "--app", "sonarr", "--apply"])
+    assert asked == [("sonarr", "series"), ("radarr", "movie")] and len(checked(env)) == 1, asked
+    assert os.path.exists(mp4) and not os.path.exists(mkv) and env["writes"] == [] and env["repacks"] == []
+    line = f"radarr lists it, so run it with --app radarr: {mp4}"
+    assert line in capsys.readouterr().out and str(ex.value) == f"--check did not check every file:\n  {line}"
+    with pytest.raises(SystemExit) as ex:   # a dry run fails the path too, so it never says what an outside file would do
+        hook.main(["--check", mp4, "--app", "sonarr"])
+    assert str(ex.value) == f"--check did not check every file:\n  {line}" and len(checked(env)) == 1
+
+
+def test_check_names_an_app_set_up_in_part_that_it_could_not_ask(env, monkeypatch, settings, tmp_path, capsys):
+    """RR3 2026-10-12: Sonarr has a URL of the user's own and no API key that reads. So the lookup cannot ask it, and a
+    path no app lists says so and fails the run. A Sonarr the user did not set up stays silent."""
+    loose = scratch_copy(env, tmp_path)
+    no_key = FileNotFoundError(2, "No such file or directory", "/config/config.xml")
+    monkeypatch.setattr(hook, "arr", lambda app, p: (_ for _ in ()).throw(no_key) if app == "sonarr" else [])
+    settings(sonarr={"url": "http://sonarr.invalid:8989"})
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", loose])
+    assert f"sonarr could not be asked, so it runs with no item: {loose}" in capsys.readouterr().out
+    assert "SONARR_URL is set, but the Sonarr API key does not read" in str(ex.value) and len(checked(env)) == 1
+    settings(sonarr={"url": "http://sonarr:8989"})   # as shipped
+    hook.main(["--check", loose])
+    assert f"no app lists it, so it runs with no item: {loose}" in capsys.readouterr().out and len(checked(env)) == 2
+
+
+def scratch_copy(env, tmp_path, name="Film A (1979).mkv", probe=None):
+    """A copy of the env's film outside every root folder and every Plex library, as in a scratch folder."""
+    p = tmp_path / "scratch" / name
+    p.parent.mkdir(exist_ok=True)
+    shutil.copy(env["path"], p)
+    if probe:
+        env["files"][str(p)] = copy.deepcopy(probe)
+    return str(p)
+
+
+def test_check_runs_a_file_no_app_lists_with_no_item_and_names_what_it_left_out(env, monkeypatch, capsys, tmp_path):
+    """Owner 2026-10-11: a file outside the library runs with no item. The checks that need none run, here the header
+    repair. The flags stay, as no original language is known, and the content checks and the language alert are left
+    out, though the file has no English audio. An apply repairs the file in place and makes no app write, no post and
+    no Plex request."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path, probe=NO_ENGLISH)
+    calls = header_issue(env, monkeypatch)
+    hook.main(["--check", loose, "--apply"])
+    (rec,) = checked(env)
+    assert (rec["app"], rec["path"], rec["header_repair"]["code"], rec["header_repair"]["rescan"]) == (None, loose, "header_repaired", "none, no app lists the file")
+    assert calls["repairs"] == [True] and env["mkvpropedit"] == [] and env["writes"] == [] and env["http"] == [], rec
+    assert "evidence" not in rec and "language" not in rec["alert_kinds"] and rec["not_checked"] == list(hook.NO_ITEM) + [hook.NO_LID]
+    out = capsys.readouterr().out
+    assert f"no app lists it, so it runs with no item: {loose}" in out and "\n  not checked: the audio language alert" in out, out
+
+
+def test_check_names_the_item_of_an_outside_file_by_app_and_id(env, monkeypatch, capsys, tmp_path):
+    """--app radarr --id 7 gives the copy Film A's item, so the flags change as on an import of it. The app gets no write
+    and Plex no request for a file it does not list."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    hook.main(["--check", loose, "--app", "radarr", "--id", "7", "--apply"])
+    (rec,) = checked(env)
+    assert (rec["app"], rec["label"], rec["outcome"], rec["ids"]["app_id"]) == ("radarr", "Film A (1979)", "edited", 7) and env["mkvpropedit"], rec
+    assert env["writes"] == [] and analyzes(env) == [] and rec["plex_reason"] == "plex_not_found" and rec["not_checked"] == [hook.NO_LID]
+    assert f"radarr does not list it, so it runs as Film A (1979): {loose}" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", loose, "--id", "7"])
+    assert ex.value.code == 2   # --id needs --app
+
+
+def tmdb_answers(monkeypatch, record):
+    """TMDB answers every GET with record. Returns the GETs as (path, append_to_response)."""
+    asked = []
+    monkeypatch.setattr(hook.arr_meta, "_get", lambda path, token, **q: asked.append((path, q.get("append_to_response"))) or copy.deepcopy(record))
+    return asked
+
+
+def test_check_names_the_item_of_an_outside_film_from_tmdb_alone(env, monkeypatch, tmp_path):
+    """--tmdb movie/90001 fills the item from TMDB: the title, the year, the original language and the runtime. The
+    flags change as for Radarr's item. No app is asked for the item, and none gets a write."""
+    asked = check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    tmdb = tmdb_answers(monkeypatch, {"id": 90001, "title": "Film A", "original_title": "Film A", "release_date": "1979-05-25", "runtime": 120,
+                                      "original_language": "en", "imdb_id": "tt9000001", "genres": [{"name": "Drama"}],
+                                      "alternative_titles": {"titles": [{"title": "Le Film A"}]}})
+    hook.main(["--check", loose, "--tmdb", "movie/90001", "--apply"])
+    (rec,) = checked(env)
+    assert (rec["app"], rec["label"], rec["original"], rec["outcome"]) == ("radarr", "Film A (1979)", "English", "edited") and env["mkvpropedit"], rec
+    assert tmdb == [("/movie/90001", "alternative_titles,external_ids")] and asked == [("radarr", "movie"), ("sonarr", "series")]
+    assert env["writes"] == [] and rec["not_checked"] == [*hook.TMDB_LEFT["movie"], hook.NO_LID] and rec["ids"]["guids"] == ["tmdb://90001", "imdb://tt9000001"]
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", loose, "--tmdb", "movie/90001", "--app", "radarr", "--id", "7"])
+    assert ex.value.code == 2   # --tmdb and --id exclude each other
+
+
+def test_check_runs_the_episode_title_check_from_the_tmdb_season(env, monkeypatch, tmp_path):
+    """--tmdb tv/5/4/15 names S04E15. The file's name says "Ship Voyage", the title TMDB gives S04E21 of the same
+    season, so the episode alert fires as on an import of Sonarr's item. TMDB's series genre Kids is Sonarr's Children,
+    a kids genre of the policy."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path, "Show.D.S04E15.Ship.Voyage.1080p.WEB.H264-GRP.mkv")
+    tmdb_answers(monkeypatch, {"id": 5, "name": "Show D", "original_name": "Show D", "first_air_date": "2001-01-01", "original_language": "en",
+                               "genres": [{"name": "Kids"}], "external_ids": {"tvdb_id": 7005}, "season/4": {"episodes": [
+                                   {"id": 31, "season_number": 4, "episode_number": 15, "name": "A Rainy Day", "runtime": 11},
+                                   {"id": 32, "season_number": 4, "episode_number": 21, "name": "Ship Voyage", "runtime": 11}]}})
+    hook.main(["--check", loose, "--tmdb", "tv/5/4/15"])
+    (rec,) = checked(env)
+    assert (rec["app"], rec["label"], rec["kids"]) == ("sonarr", "Show D S04E15", True) and "episode" in rec["alert_kinds"], rec
+    assert rec["not_checked"] == [*hook.TMDB_LEFT["tv"], hook.NO_LID] and env["writes"] == []
+    tmdb_answers(monkeypatch, {"id": 5, "name": "Show D", "season/4": {"episodes": []}})
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", loose, "--tmdb", "tv/5/4/15"])
+    assert "TMDB lists no episode 15 in season 4 of tv/5" in str(ex.value) and len(checked(env)) == 1
+    tmdb_answers(monkeypatch, {"id": 6, "title": "Film K", "genres": [{"name": "Kids"}, {"name": "Family"}]})   # Sonarr's name only
+    assert hook.arr_meta.tmdb_item("movie", 6)[0]["genres"] == ["Kids", "Family"]
+
+
+def not_matroska(env):
+    """NOT_MATROSKA's probe with its track ids, as mkvmerge -J numbers the tracks."""
+    probe = copy.deepcopy(NOT_MATROSKA["probe"])
+    for i, t in enumerate(probe["tracks"]):
+        t["id"] = i
+    return probe
+
+
+def test_check_converts_a_file_no_app_lists_beside_the_original(env, monkeypatch, settings, tmp_path, capsys):
+    """Owner 2026-10-12: outside the library a conversion writes the .mkv beside the original and leaves the original
+    and its sidecar in place. No app takes the new name, so no app gets a call. The checks run on the new file."""
+    check_listed(env, monkeypatch)
+    settings(convert=True, keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    mp4 = scratch_copy(env, tmp_path, "Film A (1979).mp4", probe=not_matroska(env))
+    side = mp4[:-4] + ".en.srt"
+    with open(side, "w") as f:
+        f.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    hook.main(["--check", mp4])
+    assert checked(env)[0]["outcome"] == "would_repack" and env["repacks"] == [] and not os.path.exists(mp4[:-4] + ".mkv")
+    assert checked(env)[0]["result"] == "would repack: the container is MP4/QuickTime, a new .mkv beside it, 1 sidecar subtitles"
+    hook.main(["--check", mp4, "--apply"])
+    rec, mkv = checked(env)[1], mp4[:-4] + ".mkv"
+    assert (rec["path"], rec["repack"]["rescan"], rec["ids"]["file_id"]) == (mkv, "none, no app lists the file", None), rec
+    assert open(mkv, "rb").read(4) == b"MKV!" and os.path.exists(mp4) and os.path.exists(side) and not os.path.exists(tmp_path / ".kept")
+    assert env["writes"] == [] and env["http"] == [] and "audio" in rec and not os.path.exists(os.path.join(os.path.dirname(mp4), hook.CFG.hide_dir))
+    assert f"\n  converted to Matroska at {mkv}, the original stays at {mp4}\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("named", [[], ["--app", "radarr", "--id", "7"]])
+def test_check_keeps_the_original_of_an_outside_mkv_that_holds_mp4(env, monkeypatch, settings, tmp_path, named):
+    """An .mkv that holds MP4 converts to its own name, so the original goes to the kept originals, also at CONVERT off."""
+    check_listed(env, monkeypatch)
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    loose = scratch_copy(env, tmp_path, probe=not_matroska(env))
+    before = open(loose, "rb").read()
+    hook.main(["--check", loose, "--apply"] + named)
+    (rec,) = checked(env)
+    assert rec["repack"]["kept"].startswith(str(tmp_path / ".kept")) and open(rec["repack"]["kept"], "rb").read() == before, rec
+    assert open(loose, "rb").read(4) == b"MKV!" and env["writes"] == [] and analyzes(env) == []
+
+
+@pytest.mark.parametrize("undo", [False, True])
+def test_check_apply_conversion_keeps_the_original_of_a_listed_file(env, monkeypatch, settings, tmp_path, capsys, undo):
+    """Owner 2026-10-12: a conversion of --check keeps the original in the kept originals for KEEP_ORIGINALS_DAYS, as a
+    header repair does. The sidecars it muxed go there too, with the original. One with new times is kept once, when
+    the subtitle check gave it the new times. The app takes the new name, as on an import. With undo, a read of the app
+    fails after the import, and the undo finds the app took the new file. The result starts with "repacked", because
+    the flag edit after it may change nothing."""
+    mp4, mkv = mp4_import(env, monkeypatch)
+    sides = [mp4[:-4] + ext for ext in (".en.srt", ".en.forced.srt")]
+    check_listed(env, monkeypatch)
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    real_relink = hook.relink   # the app takes a minute, so the sidecars are kept a minute after the original
+    monkeypatch.setattr(hook, "relink", lambda *a: env["clock"].__setitem__(0, env["clock"][0] + 60) or real_relink(*a))
+
+    def retimed(path, j, streams, subs, dur, apply, folder, info, known=()):   # the .en.srt gets new times, see convert_subs()
+        info["sidecars_kept"] = [hook.keep_original(sides[0])]
+        return [dict(s, mux=s["path"]) if s["path"] == sides[0] else s for s in subs], []
+    monkeypatch.setattr(hook, "convert_subs", retimed)
+    if undo:
+        monkeypatch.setattr(hook, "app_lists", lambda *a: (_ for _ in ()).throw(ConnectionError("Radarr restarts")))
+    before = open(mp4, "rb").read()
+    hook.main(["--check", mp4, "--apply"])
+    (rec,) = checked(env)
+    assert (rec["path"], rec["ids"]["file_id"]) == (mkv, 12) and not os.path.exists(mp4) and open(rec["repack"]["kept"], "rb").read() == before, rec
+    assert (rec["repack"].get("restored") or {}).get("result") == ("completed" if undo else None) and "left" not in rec["repack"], rec["repack"]
+    kept = rec["repack"]["sidecars_kept"]
+    assert sorted(map(os.path.basename, kept)) == sorted(map(os.path.basename, sides)) and not any(map(os.path.exists, sides)), rec["repack"]
+    assert os.path.dirname(kept[-1]) == os.path.dirname(rec["repack"]["kept"]), kept   # RR3: the forced one, kept after the relink
+    assert all(open(k).read() == "1\n00:00:01,000 --> 00:00:02,000\nHello\n" for k in kept)
+    assert [w[2]["name"] for w in env["writes"] if w[1] == "command"][:1] == ["ManualImport"]
+    out = capsys.readouterr().out
+    assert out.startswith(f'Film A (1979): repacked, {rec["result"]}') and rec["result"] != "repacked", out
+    assert f'\n  converted to Matroska at {mkv}, the original is kept at {rec["repack"]["kept"]}\n' in out
+
+
+@pytest.mark.parametrize("outside", [False, True])
+def test_check_conversion_at_keep_originals_days_0_keeps_nothing_and_says_nothing_of_it(env, monkeypatch, settings, tmp_path, capsys, outside):
+    """At KEEP_ORIGINALS_DAYS=0 a conversion of --check keeps no original and no sidecar it muxed, as an import does. The
+    line names no kept original. Outside the library an .mkv that holds MP4 converts under its own name, so its
+    original is gone too."""
+    check_listed(env, monkeypatch)
+    if outside:
+        path = new = scratch_copy(env, tmp_path, probe=not_matroska(env))
+    else:
+        path, new = mp4_import(env, monkeypatch)
+    settings(keep_days=0)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    hook.main(["--check", path, "--apply"])
+    (rec,) = checked(env)
+    assert open(new, "rb").read(4) == b"MKV!" and not os.path.exists(tmp_path / ".kept") and "kept" not in rec["repack"], rec
+    assert "sidecars_kept" not in rec["repack"] and not glob.glob(glob.escape(path[:-4]) + ".*.srt"), rec["repack"]
+    assert f'\n  converted to Matroska{"" if outside else " at " + new}\n' in capsys.readouterr().out
+
+
+def test_check_conversion_that_cannot_keep_the_original_stops_before_the_remux(env, monkeypatch, settings, tmp_path):
+    """RR1 2026-10-12: a conversion of --check keeps the original. With no place to keep it, the conversion is skipped
+    before the remux, in the dry run too, so the run never remuxes a film for nothing. A file outside the library that
+    converts beside itself keeps nothing, so it converts."""
+    loose = scratch_copy(env, tmp_path, "Film A (1979).mp4", probe=not_matroska(env))
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    check_listed(env, monkeypatch)
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook, "keepable", lambda p, st: "/m/.kept is not writable")
+    for apply in ([], ["--apply"]):
+        hook.main(["--check", mp4, *apply])
+    assert [(r["outcome"], r["result"].partition(": ")[0]) for r in checked(env)] == [("repack_no_keep", "skipped, not matroska, the original cannot be kept")] * 2
+    assert hook.audit_problem("convert", checked(env)[1]) == "the conversion to MKV was skipped, because the original couldn't be kept"
+    assert env["repacks"] == [] and os.path.exists(mp4) and not os.path.exists(mkv)
+    hook.main(["--check", loose, "--apply"])
+    assert checked(env)[-1]["path"] == loose[:-4] + ".mkv" and len(env["repacks"]) == 1
+
+
+def test_check_apply_stops_when_a_lookup_fails_and_a_path_is_left(env, monkeypatch, tmp_path, capsys):
+    loose = scratch_copy(env, tmp_path)
+    def fake_arr(app, p):
+        if app == "sonarr":
+            raise TimeoutError("timed out")
+        return []
+    monkeypatch.setattr(hook, "arr", fake_arr)
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--check", loose, "--apply"])
+    assert "--check --apply stops, and nothing changed: the sonarr lookup failed" in str(ex.value) and not os.path.exists(hook.CFG.log)
+    with pytest.raises(SystemExit):   # a dry run goes on, with no item
+        hook.main(["--check", loose])
+    assert f"sonarr could not be asked, so it runs with no item: {loose}" in capsys.readouterr().out and len(checked(env)) == 1
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_check_runs_the_deep_analysis_an_import_queues_right_after_its_checks(env, monkeypatch, settings, capsys, apply):
+    """Orchestrator 2026-10-12: at SUBTITLES=deep an import queues the deep analysis of its file. --check runs it right
+    after its own checks, with their inputs, and prints it. It runs in the foreground, so it never yields to an import
+    that waits. The check holds the subtitle alert for it, as an import does. The deep analysis moves the block of lines
+    to its speech, so nothing posts. A dry run plans the remux and changes nothing. No job goes to the queue."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    check_listed(env, monkeypatch)
+    monkeypatch.setattr(hook, "queued", lambda: ["an import"])
+    real, limits = hook.sub_whole, []   # the whole-file timing, which only the deep analysis runs here
+    monkeypatch.setattr(hook, "sub_whole", lambda *a, **k: limits.append(hook.DEADLINE.end) or real(*a, **k))
+    reads = []   # no read of the deep analysis yields, though an import waits
+    for name in ("sub_whole", "sub_layout", "sub_reference"):
+        monkeypatch.setattr(hook, name, lambda *a, _r=getattr(hook, name), _n=name, **k: reads.append((_n, k.get("deep"), k.get("stop"))) or _r(*a, **k))
+    hook.main(["--check", env["path"]] + (["--apply"] if apply else []))
+    first, deep = checked(env)
+    assert limits and set(limits) == {None}   # no time limit, as for the deep analysis of an import
+    assert {n for n, _, _ in reads} == {"sub_whole", "sub_layout", "sub_reference"} and all(d is not True and s is not hook.deep_waits for _, d, s in reads), reads
+    assert (first["alert_kinds"], first.get("alert_result")) == (["subtiming"], [hook.HOLD_RESULT] if apply else None), first
+    assert deep["subremux"]["codes"] == (["subtitle_blocks_retimed"] if apply else ["would_remux_subtitles"]), deep
+    assert deep.get("held_result") == (["checked again"] if apply else None) and posted(env) == [] and hook.store.read("SELECT name FROM jobs") == []
+    assert f'\ndeep analysis, Film A (1979): {deep["result"]}' in capsys.readouterr().out
+
+
+def test_check_deep_analysis_that_errs_after_its_remux_posts_nothing_stale(env, monkeypatch, settings):
+    """RR1 2026-10-12: the deep analysis moved the block to its speech, then failed. Its error line keeps the remux, as
+    the deep analysis of an import keeps it, so the alert the check held reads as fixed and does not post."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    check_listed(env, monkeypatch)
+    real = hook.sub_cache
+    monkeypatch.setattr(hook, "sub_cache", lambda path, rec, mode, app, pending: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
+                        if mode == "deep" else real(path, rec, mode, app, pending))
+    with pytest.raises(SystemExit):
+        hook.main(["--check", env["path"], "--apply"])
+    first, deep = checked(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and deep["outcome"] == "error" and deep["subremux"]["done"], deep
+    assert (deep["held_result"], posted(env)) == (["fixed before the error"], [])
+
+
+def test_check_deep_analysis_error_keeps_the_sidecar_fix_it_made(monkeypatch):
+    """RR3 2026-10-12: the error line of the deep analysis keeps what the run changed before the error, the sidecars
+    as the remux, as runner.deep_analysis() keeps them for an import. held_after() reads both."""
+    made = {"subremux": {"done": True}, "sidecars": [{"name": "Film A (1979).en.srt", "result": "retimed"}]}
+
+    def failed(app, f, info, a, burn, job):
+        job["run"] = types.SimpleNamespace(rec=dict(made, path=f["path"]))
+        return 1.0, {"outcome": "error", "result": "error: OSError: [Errno 5] Input/output error"}
+    monkeypatch.setattr(hook, "backfill_file", failed)
+    monkeypatch.setattr(hook, "deep_wanted", lambda rec: True)
+    took, r = hook.deep_later("radarr", {"path": "/m/a.mkv"}, None, None, {}, {"path": "/m/a.mkv"}, types.SimpleNamespace(held=[]))
+    assert {k: r.get(k) for k in made} == made, r
+
+
+def test_check_posts_once_what_its_deep_analysis_leaves_unresolved(env, monkeypatch, settings):
+    one_alert_film(env, monkeypatch, settings, "left")
+    check_listed(env, monkeypatch)
+    hook.main(["--check", env["path"], "--apply"])
+    first, deep = checked(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and deep["alert_result"] == ["sent"] and deep["held_result"] == ["checked again"], deep
+    assert [t for t, _ in posted(env)] == ["Subtitles out of sync"]
+
+
+@pytest.mark.parametrize("quick", ["flagged", "unsure"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_check_runs_the_full_burned_in_check_its_quick_check_asks_for(env, burn, monkeypatch, settings, capsys, apply, quick):
+    """Orchestrator 2026-10-12: the quick check flags the file or cannot tell, so an import queues the full check.
+    --check runs it right after its own checks, as the burn-in job runs it, and never yields. English text is burned in
+    over Japanese audio, so at fix the English subtitles go off and one alert says so. A dry run plans that, holds the
+    file lock shared only, and changes nothing. It keeps the mark of an earlier mute. No job goes to the queue."""
+    japanese_film(env, ("eng", True, {}))
+    burn["quick"], burn["full"] = dict(QUICK, result=quick), [verdict("full", True, "eng")]
+    check_listed(env, monkeypatch)
+    ops, kept = check_locks(monkeypatch), []
+    monkeypatch.setattr(hook, "put_job", lambda *a, **k: kept.append(a))   # a queued job keeps its first pass for a yield
+    if not apply:
+        hook.mute_mark(env["path"])
+    hook.main(["--check", env["path"]] + (["--apply"] if apply else []))
+    first, b = checked(env)
+    assert (first["burned_in"]["result"], b["burned_in"]["plan"], b["edit_result"]) == (quick, "mute", "edited" if apply else "dry run"), b
+    assert [(c[4], c[6]) for c in burn["calls"] if c[0] == "full"] == [(False, None), (True, None)] and hook.store.read("SELECT name FROM jobs") == []
+    assert kept == []
+    assert hook.muted(env["path"]) and ("EX" in ops) == apply and [t for t, _ in posted(env)] == ["Burned-in subtitles"] * apply, ops
+    assert f'\nburned-in subtitle check, Film A (1979): {b["result"]}' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_check_says_whether_the_burned_in_alert_posted(env, burn, monkeypatch, settings, apply):
+    """At BURNED_IN=check the full check only alerts. The result says "alerted" when the alert posts, with --apply, and
+    "not posted" in a dry run."""
+    japanese_film(env, ("eng", True, {}))
+    settings(burned_in="check")
+    burn["full"] = [verdict("full", True, "eng")]
+    check_listed(env, monkeypatch)
+    hook.main(["--check", env["path"]] + (["--apply"] if apply else []))
+    b = checked(env)[-1]
+    assert b["result"].endswith(("alerted" if apply else "not posted") + ", BURNED_IN is check"), b
+
+
+def test_check_never_regrabs_for_burned_in_subtitles(env, burn, monkeypatch, settings):
+    """Chinese text burned in over Japanese audio: the burn-in job of an import would re-grab the file. --check says so
+    and keeps the file, with no lock, delete or search."""
+    japanese_film(env, ("eng", True, {}))
+    settings(regrab={"burned_in"})
+    check_listed(env, monkeypatch)
+    real, locks = hook.locked, []
+    monkeypatch.setattr(hook, "locked", lambda shared=False, **k: locks.append(shared) or real(shared, **k))
+    hook.main(["--check", env["path"], "--apply"])
+    first, b = checked(env)
+    assert b["findings"][0]["action"] == {"code": "check", "kind": "burned_in"} and env["writes"] == [] and locks == [True], (b, locks)
+    assert [t for t, _ in posted(env)][-1] == "Burned-in subtitles, would re-grab"
+
+
+def check_locks(monkeypatch):
+    """The ops of each flock on the global file lock, as SH, EX or UN."""
+    ops, real = [], hook.fcntl.flock
+    names = {hook.fcntl.LOCK_SH: "SH", hook.fcntl.LOCK_EX: "EX", hook.fcntl.LOCK_UN: "UN"}
+    def flock(f, op):
+        if f.name.endswith("/lock"):
+            ops.append(names.get(op & ~hook.fcntl.LOCK_NB, op))
+        return real(f, op)
+    monkeypatch.setattr(hook.fcntl, "flock", flock)
+    return ops
+
+
+def test_check_dry_run_of_wrong_content_never_takes_the_lock_exclusive(env, monkeypatch):
+    """An import takes the file lock exclusive before a wrong-content re-grab deletes the file. --check deletes nothing,
+    so its dry run holds the lock shared only, and never waits for an edit or a backfill."""
+    check_fault(env, monkeypatch, "content")
+    ops = check_locks(monkeypatch)
+    hook.main(["--check", env["path"]])
+    (rec,) = checked(env)
+    assert rec["outcome"] == "would_regrab" and ops and "EX" not in ops and env["writes"] == [], (ops, rec)
+
+
+def test_check_outside_file_named_by_id_gets_no_rescan_after_a_header_repair(env, monkeypatch, tmp_path):
+    """--id names Radarr's item, and Radarr still does not list the file, so a repair asks for no rescan."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    header_issue(env, monkeypatch)
+    hook.main(["--check", loose, "--app", "radarr", "--id", "7", "--apply"])
+    (rec,) = checked(env)
+    assert rec["header_repair"]["rescan"] == "none, no app lists the file" and env["writes"] == [] and analyzes(env) == [], rec
+
+
+def test_check_tmdb_reads_with_the_users_tmdb_token(env, monkeypatch, settings, tmp_path):
+    check_listed(env, monkeypatch)
+    settings(tmdb_token="user-key")
+    loose = scratch_copy(env, tmp_path)
+    used = []
+    monkeypatch.setattr(hook.arr_meta, "_get", lambda path, token, **q: used.append(token) or {
+        "id": 90001, "title": "Film A", "release_date": "1979-01-01", "original_language": "en", "runtime": 120})
+    hook.main(["--check", loose, "--tmdb", "movie/90001"])
+    assert used == ["user-key"], used
+
+
+FILM_A = {"id": 90001, "title": "Film A", "original_title": "Film A", "release_date": "1979-05-25", "runtime": 120, "original_language": "en"}
+
+
+def test_check_of_a_file_no_app_lists_counts_in_no_audit(env, monkeypatch, tmp_path, capsys):
+    """--tmdb movie/... runs as Radarr, and the edit is real, but no app lists the file. The audit of Radarr leaves it
+    out, as it leaves out a file with no item."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    tmdb_answers(monkeypatch, FILM_A)
+    hook.main(["--check", loose, "--tmdb", "movie/90001", "--apply"])
+    hook.main(["--check", scratch_copy(env, tmp_path, "Film A copy.mkv"), "--apply"])
+    assert [(r["app"], r["outcome"], r["outside"]) for r in checked(env)] == [("radarr", "edited", True), (None, "no_change", True)]
+    capsys.readouterr()
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert "0 files changed" in capsys.readouterr().out
+
+
+def test_check_tmdb_runs_as_the_app_instance_of_its_kind(env, monkeypatch, tmp_path):
+    """--app names the instance of the run when its program takes TMDB's kind, else the program's default instance does."""
+    monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, apps=dict(hook.CFG.apps, **{"radarr-4k": hook.CFG.apps["radarr"]})))
+    monkeypatch.setitem(hook.ARR, "radarr-4k", hook.Radarr("radarr-4k"))
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    tmdb_answers(monkeypatch, FILM_A)
+    for app in ("radarr-4k", "sonarr"):
+        hook.main(["--check", loose, "--tmdb", "movie/90001", "--app", app])
+    assert [r["app"] for r in checked(env)] == ["radarr-4k", "radarr"]
+
+
+def test_check_says_the_apps_item_wins_over_a_named_one(env, monkeypatch, capsys):
+    check_listed(env, monkeypatch)
+    asked = tmdb_answers(monkeypatch, dict(FILM_A, id=90002, original_language="fr"))
+    hook.main(["--check", env["path"], "--tmdb", "movie/90002"])
+    (rec,) = checked(env)
+    assert (rec["app"], rec["ids"]["file_id"], asked) == ("radarr", 11, []), rec
+    assert f"radarr lists it, so the run takes radarr's item and not --tmdb: {env['path']}" in capsys.readouterr().out
+
+
+def test_check_names_one_item_for_one_file_only(env, monkeypatch, tmp_path):
+    check_listed(env, monkeypatch)
+    loose = [scratch_copy(env, tmp_path, n) for n in ("A.mkv", "B.mkv")]
+    for named in (["--tmdb", "movie/90001"], ["--app", "radarr", "--id", "7"]):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--check", *loose, *named])
+        assert ex.value.code == 2 and not os.path.exists(hook.CFG.log)
+
+
+def test_check_dry_run_adds_nothing_to_the_conversion_review_list(env, monkeypatch, settings, tmp_path):
+    """A hard-linked .mkv that holds MP4 cannot convert. A dry run, or a file no app lists, never lands on the list of
+    convert-<app>.txt. An apply on a file Radarr lists does, as an import does. So does none outside the library whose
+    original the run lost."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path, probe=not_matroska(env))
+    os.link(loose, loose + ".link")
+    for apply in ([], ["--apply"]):
+        hook.main(["--check", loose, *apply])
+    assert [r["outcome"] for r in checked(env)] == ["repack_hardlinked"] * 2
+    settings(convert=True)
+    mp4 = scratch_copy(env, tmp_path, "Film B.mp4", probe=not_matroska(env))
+    env["during_repack"] = lambda: os.remove(mp4)
+    with pytest.raises(SystemExit):
+        hook.main(["--check", mp4, "--apply"])
+    assert not os.path.exists(mp4) and not [n for n in os.listdir(hook.CFG.state_dir) if n.startswith("convert-")]
+    env["files"][env["path"]] = not_matroska(env)
+    os.link(env["path"], env["path"] + ".link")
+    hook.main(["--check", env["path"]])
+    assert not [n for n in os.listdir(hook.CFG.state_dir) if n.startswith("convert-")]
+    hook.main(["--check", env["path"], "--apply"])
+    assert [n for n in os.listdir(hook.CFG.state_dir) if n.startswith("convert-")] == ["convert-radarr.txt"]
+
+
+def test_check_of_a_file_with_no_item_posts_no_alert(env, monkeypatch, tmp_path):
+    """Owner 2026-10-12: with no item, no app names the alert, so it shows in the terminal only, also with --apply."""
+    check_listed(env, monkeypatch)
+    loose = scratch_copy(env, tmp_path)
+    env["ffmpeg_out"] = [SILENCE, env["ffmpeg_out"][0], env["ffmpeg_out"][0]]   # silent at one place of three: a doubt
+    hook.main(["--check", loose, "--apply"])
+    (rec,) = checked(env)
+    assert rec["alert_kinds"] == ["audio"] and "alert_result" not in rec and env["http"] == [], rec
+
+
+def test_check_names_each_check_it_could_not_run(env, monkeypatch, settings, capsys):
+    """The burned-in subtitle check without its models, and the full decode of the audio that the time limit left out,
+    print as "not checked". Language detection is installed here, so the checks that need it run."""
+    check_listed(env, monkeypatch)
+    settings(burned_in="fix")
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "burn_ready", lambda: "its text models did not pass their check")
+    skipped = "the full decode skipped: 4.2 GB needs about 42 s, and 10 s are left"
+    monkeypatch.setattr(hook, "check_audio", lambda *a, **k: (None, [], [{"kind": "full", "ran": False, "error": skipped}]))
+    hook.main(["--check", env["path"]])
+    (rec,) = checked(env)
+    assert rec["not_checked"] == ["the burned-in subtitle check, because its text models did not pass their check", skipped], rec
+    assert f"\n  not checked: {skipped}\n" in capsys.readouterr().out
+    monkeypatch.setattr(hook, "metadata", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("TMDB timed out")))
+    hook.main(["--check", env["path"]])
+    assert checked(env)[-1]["not_checked"][-1] == "wrong content and the runtime checks, which stopped: TimeoutError: TMDB timed out"
+
+
+def test_check_names_the_checks_that_wait_for_a_conversion(env, monkeypatch, settings, capsys):
+    """RR2 2026-10-12: an .mkv that holds MP4 converts first, and a dry run does not convert. So every other check waits
+    for the converted file, and one line says so. The deep analysis waits too, though a sidecar is beside the file."""
+    mp4_named_mkv(env)
+    check_listed(env, monkeypatch)
+    settings(subtitles="deep")
+    with open(env["path"][:-4] + ".en.srt", "w") as f:
+        f.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    hook.main(["--check", env["path"]])
+    (rec,) = checked(env)
+    assert rec["outcome"] == "would_repack" and rec["not_checked"] == [hook.NOT_CONVERTED, hook.NO_LID], rec
+    assert f"\n  not checked: {hook.NOT_CONVERTED}\n" in capsys.readouterr().out
+    monkeypatch.setattr(hook, "mkvmerge", lambda p: (_ for _ in ()).throw(OSError(5, "Input/output error")))
+    with pytest.raises(SystemExit):   # RR3: a file that does not read has no tracks, and no conversion waits
+        hook.main(["--check", env["path"]])
+    assert checked(env)[-1]["outcome"] == "error" and checked(env)[-1]["not_checked"] == [hook.NO_LID], checked(env)[-1]
+
+
+def test_check_prints_the_whole_result_and_the_checks_of_a_file_that_is_not_mkv(env, monkeypatch, settings, capsys):
+    """A backfill line cuts the result at 60 characters. --check prints the label, then the whole result. A file that is
+    not .mkv gets no flag edit, and the line names the checks that ran on it all the same."""
+    mp4, mkv = mp4_import(env, monkeypatch)
+    check_listed(env, monkeypatch)
+    hook.main(["--check", mp4])
+    out = capsys.readouterr().out
+    assert out.startswith("Film A (1979): would repack: the container is MP4/QuickTime, renamed to .mkv, 2 sidecar subtitles\n  checked: audio "), out
+    assert hook.NOT_CONVERTED not in checked(env)[0]["not_checked"]   # the checks ran on the MP4, as on an import
+    settings(convert=False)
+    hook.main(["--check", mp4])
+    out = capsys.readouterr().out
+    assert out.startswith("Film A (1979): skipped, not mkv\n  checked: audio clean, video clean, wrong content: "), out

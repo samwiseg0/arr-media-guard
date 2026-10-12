@@ -175,7 +175,15 @@ class Ctx:
     it, see reshared().
 
     The steps set the state they hand on, such as rec, the decision log record, and the probe j, st and size, see
-    refresh(). path follows a conversion's new name."""
+    refresh(). path follows a conversion's new name.
+
+    check is the "check" of job in a --check run, see cli.check(). That run is an import of one file with no download,
+    with source check. Its re-grabs only say what an import would do, in a dry run too, see regrab.regrab(). Its
+    conversion keeps the original, see convert.convert(). "listed" is a file an app lists. "outside" is one no app
+    lists. It gets no rescan, and its conversion writes the new file beside the original, because no app knows the file.
+    With no app it has no item either, so the content checks and the language alert are left out, and act() keeps the
+    flags. A deep analysis of --check runs in the foreground, see cli.check(), so it never yields to an import, and
+    yields is False."""
     app: str; path: str; label: str; original: str; runtime: object   # the file, and its item's original language and runtime
     mode: str = "import"; job: dict = None   # job is the queued hook job of an import
     save: object = None   # stores job in the queue, see runner.run_job()
@@ -193,8 +201,10 @@ class Ctx:
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f"no mode {self.mode}")
-        self.source = "recheck" if self.recheck else {"import": "hook", "deep": "deep_analysis"}.get(self.mode, "backfill")   # of the decision log
+        self.check = (self.job or {}).get("check")
+        self.source = "recheck" if self.recheck else "check" if self.check else {"import": "hook", "deep": "deep_analysis"}.get(self.mode, "backfill")   # of the decision log
         self.background = self.mode == "deep" or bool(self.recheck)
+        self.yields = self.background and not self.check   # it stops for an import that waits, see runner.deep_waits()
         self.depth = self.recheck or self.mode
 
     def rearm(self):
@@ -256,6 +266,7 @@ def conversion(ctx):
     rec, j, st, job = ctx.rec, ctx.j, ctx.st, ctx.job
     container = (j.get("container") or {}).get("type") or "Matroska"   # a probe without a type reads as Matroska
     ctx.unconverted = ctx.damaged = None
+    review = not ctx.check or (ctx.apply and ctx.check == "listed")   # the list to review by hand takes no dry --check run and no file no app lists
     if not ((ctx.mkv and container != "Matroska") or (not ctx.mkv and ctx.conv)):
         return
     if ctx.shared and ctx.apply and not ctx.pool and ctx.mode != "import":
@@ -263,12 +274,13 @@ def conversion(ctx):
     was = ctx.path
     got, result, rec["repack"], ctx.path = convert.convert(ctx.app, ctx.path, j, st, ctx.apply, rec["ids"], ctx.lock, ctx.pool, ctx.force,
                                                            ctx.subs_on and subtitles.sub_fixes(ctx.source), decide.codes(ctx.original),
-                                                           shared=bool(ctx.shared or ctx.pool), source=ctx.source)
+                                                           shared=bool(ctx.shared or ctx.pool), source=ctx.source, outside=ctx.check == "outside")
     path = ctx.path
     # A relink gives the file a new id: the new name, or the original that convert_undo() imported again. The new name
-    # always replaces the old id. Its id is None when an undo found the new name listed but could not read the id.
+    # always replaces the old id. Its id is None when an undo found the new name listed but could not read the id, and
+    # for a file outside the library, which no app relinks.
     renamed = got == "repacked" and path != rec["path"]
-    fid = (rec["repack"]["relink"] if renamed else ((rec["repack"].get("restored") or {}).get("import") or {})).get("file_id")
+    fid = ((rec["repack"].get("relink") or {}) if renamed else ((rec["repack"].get("restored") or {}).get("import") or {})).get("file_id")
     if renamed or fid:
         rec["ids"]["file_id"] = fid
         if ctx.mode == "import":   # the queue gets the new id now, so a re-run asks the app for it after a Replan or a crash
@@ -281,7 +293,7 @@ def conversion(ctx):
             ctx.shared.turn()
             runner.gated(ctx.lock, fcntl.LOCK_EX)
         else:   # the original stays. It and its download must still be as the checks found them, see exclusive().
-            if not os.path.exists(rec["path"]):   # exclusive() runs the job again, so the list keeps this run's result now
+            if not os.path.exists(rec["path"]) and review:   # exclusive() runs the job again, so the list keeps this run's result now
                 convert.convert_list(ctx.app, dict(rec, outcome=got, result=result))
             ctx.shared.exclusive(st)
         ctx.shared = False
@@ -291,7 +303,7 @@ def conversion(ctx):
         ctx.rearm()   # convert() ran the remux with the time limit off, whatever came of it
     rec["container"] = container
     if got == "repacked":
-        if path != rec["path"]:   # the app lists the new name now, with the new file id above
+        if path != rec["path"]:   # the app lists the new name now, with the new file id above, unless it is outside the library
             rec["path"], ctx.mkv = path, True
         logs.log(dict(rec, outcome="repacked", result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
@@ -311,10 +323,10 @@ def conversion(ctx):
     failed = None
     if got == "repack_failed":   # one embed, like a failed flag edit. A skip, a dry run or a changed original posts nothing.
         failed = {"kind": "repack", "container": container, "why": result.partition(": ")[2][:200]}
-    if not would:
+    if not would and review:
         convert.convert_list(ctx.app, rec)
     damage = rec["repack"].get("damage")
-    if damage and ctx.mode == "import" and ctx.apply:   # the original is damaged: it re-grabs like broken audio
+    if damage and ctx.mode == "import" and (ctx.apply or ctx.check):   # the original is damaged: it re-grabs like broken audio
         action = regrab.regrab(ctx.app, job, damage["fault"], proof.damage_probe(damage, j), "damage")
         rec.update(outcome="damaged_source", result=f"damaged source: {damage['fault']}", regrab=action["code"])
         ctx.damaged, failed = {"kind": "damage", "fault": damage["fault"], "line": damage["line"], "refusal": damage.get("refusal"), "action": action}, None
@@ -448,7 +460,7 @@ def subtitle_checks(ctx):
                 # The planner: the timing proposes the moves. Whether the times post is the timing judge's, after the
                 # write, see judge.outcomes().
                 rec["whole"], rec["whole_facts"] = subtitles.sub_whole(path, j, {k: items[k] for k, r in sync.items() if r["verdict"] == "match" and k in items},
-                                                                       sync, deep=ctx.background)
+                                                                       sync, deep=ctx.yields)
             if ctx.shared:
                 ctx.shared.reshare(ctx.st)
         for p in unindexed & set(sync):   # an import skips the track, and says why
@@ -457,14 +469,14 @@ def subtitle_checks(ctx):
             rec["subcheck"] = sync
     left = config.DEADLINE.left()   # an import reads and fits while its time limit leaves SUB_RESERVE
     deadline = time.monotonic() + left - config.SUB_RESERVE if left else None
-    stop = runner.deep_waits if ctx.background else (lambda: time.monotonic() > deadline) if deadline is not None else None
+    stop = runner.deep_waits if ctx.yields else (lambda: time.monotonic() > deadline) if deadline is not None else None
     if mkv and subs_on:   # the reference timing
         others = subtitles.ref_sidecars(path, d)
         timed_by, refs = subtitles.sub_reference(path, j, d, sync, items or {}, others, full=full, stop=stop, report=timing, whole=rec.get("whole"))
         if full and checks.lid_ready():   # the speech layout of the subtitles no word check reads and no reference fits
             if ctx.shared:   # the read of the whole audio track takes minutes for a film, so it runs without the file lock
                 fcntl.flock(ctx.lock, fcntl.LOCK_UN)
-            laid, rec_speech = subtitles.sub_layout(path, j, d, timed_by, others, stop, deep=ctx.background)
+            laid, rec_speech = subtitles.sub_layout(path, j, d, timed_by, others, stop, deep=ctx.yields)
             if ctx.shared:
                 ctx.shared.reshare(ctx.st)
             timed_by.update(laid)
@@ -544,7 +556,7 @@ def subtitle_checks(ctx):
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
     if fixes or remove or ends or moves or recode or strip:
-        if ctx.background:   # a remux of a film takes minutes, so an import that waits goes first
+        if ctx.yields:   # a remux of a film takes minutes, so an import that waits goes first
             runner.deep_waits()
         if ctx.shared and ctx.apply:
             raise runner.Replan("a subtitle needs a remux", rec.get("whole_facts"))   # the facts of the hearing this pass made
@@ -713,11 +725,11 @@ def act(ctx):
     if certain:
         rec.update(outcome="broken_audio", result=f"broken audio: {certain}")
         ctx.first.append({"kind": "audio", "certain": certain, "action": regrab.regrab(ctx.app, job, certain, regrab.audio_probe(
-            ctx.original, ctx.kids, ctx.release, ctx.runtime, ctx.heard, ctx.spoken)) if ctx.apply else {"code": "dry_run"}})
+            ctx.original, ctx.kids, ctx.release, ctx.runtime, ctx.heard, ctx.spoken)) if ctx.apply or ctx.check else {"code": "dry_run"}})
     elif vcertain:
         rec.update(outcome="corrupt_video", result=f"corrupt video: {vcertain}")
         ctx.first.append({"kind": "video", "certain": vcertain, "action": regrab.regrab(ctx.app, job, ctx.vfields["fault"], regrab.video_probe, "video")
-                          if ctx.apply else {"code": "dry_run"}})
+                          if ctx.apply or ctx.check else {"code": "dry_run"}})
     elif not ctx.mkv:   # a conversion that did not happen set the result already
         if not ctx.unconverted:
             rec.update(outcome="not_mkv", result="skipped, not mkv")
@@ -763,7 +775,8 @@ def after_edit(ctx):
     rec, d = ctx.rec, ctx.d
     # After the edit, so the app's disk scan never probes a header mkvpropedit is rewriting. A backfill sends one rescan
     # per item at the end of its run, because Sonarr's rescan of a large series is slow.
-    rescan_now = lambda: apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
+    rescan_now = lambda: "none, no app lists the file" if ctx.check == "outside" else \
+        apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
     if "repack" in rec and not ctx.unconverted and not rec["repack"].get("pending"):   # a pending one settles below, with no lock
         rec["repack"]["rescan"] = rescan_now()
     if rec.get("header_repair", {}).get("code") in config.REPAIRED:
@@ -822,6 +835,8 @@ def content_checks(ctx):
     if not ctx.background and os.path.exists(ctx.path) and os.stat(ctx.path).st_ino == ctx.st.st_ino:
         ctx.rearm()   # the checks get their own limit. The edit is done, so a timeout costs only the checks.
         try:
+            if ctx.check and not ctx.app:   # no item to judge the content against. The finally still hands on the time left.
+                return
             episode = ctx.app in apps.ARR and not apps.ARR[ctx.app].film   # metadata() reads an NFO title for an episode only
             nfo = (job or {}).get("nfo_title") or (library_nfo_title(ctx.path) if episode else None)
             meta = ctx.meta = metadata(ctx.app, ctx.path, ctx.j, ctx.size, ctx.d, ctx.original, ctx.release, ctx.item, asked=ctx.asked, nfo=nfo)
@@ -830,8 +845,8 @@ def content_checks(ctx):
             ev = meta["evidence"]
             if ctx.post and (k := tmdb_key_alert(ctx.app, meta["tmdb"])):
                 rec["key_alert"] = k
-            if ev["regrab"] and ctx.mode == "import" and ctx.apply and not (ctx.certain or ctx.vcertain):
-                if ctx.lock is not None:   # a re-grab deletes files, so it waits for an edit in progress
+            if ev["regrab"] and ctx.mode == "import" and (ctx.apply or ctx.check) and not (ctx.certain or ctx.vcertain):
+                if ctx.lock is not None and not ctx.check:   # a re-grab deletes files, so it waits for an edit in progress. --check deletes none.
                     # A backfill or the subtitle hunter can hold the lock far past BUDGET, so the wait has LOCK_WAIT.
                     wait = content.Deadline(config.LOCK_WAIT, f"stopped after {config.BUDGET} seconds")
                     if ctx.shared:   # and for the older jobs of its download, as the other exclusive steps do
@@ -910,7 +925,10 @@ def alerts(ctx):
     see logs.alert_findings() and runner.queue_deep_analysis()."""
     rec = ctx.rec
     try:
-        problems = ctx.first + file_alerts(ctx.d, ctx.file_checks, ctx.meta, ctx.original, ctx.item) + ctx.rest
+        found = file_alerts(ctx.d, ctx.file_checks, ctx.meta, ctx.original, ctx.item)
+        if ctx.check and not ctx.app:   # with no original language, audio in another language than English proves nothing
+            found = [f for f in found if f["kind"] != "language"]
+        problems = ctx.first + found + ctx.rest
     except Exception as ex:   # a finding must never cost the decision line or the Plex analyze of an edited file
         rec["alert_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         problems = ctx.first + ctx.rest

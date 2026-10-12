@@ -226,13 +226,16 @@ the audit and the rotation off. An old `last_hook_run` in `status.json` shows th
 ## Commands over your library
 
 The worker checks only new imports. Commands run the same checks over the files you already have. A backfill is dry
-unless you add `--apply`, and no command posts a change to Discord or re-grabs.
+unless you add `--apply`, and no command re-grabs. `--check --apply` posts the alerts of a file with an item. A scan
+and the audit with `--post` post a summary, and `--test-discord` posts a test message.
 
 - `--backfill <instance>` fixes the default tracks and language tags of the Matroska files the app lists. It skips a
   file with one audio track and no subtitle, which plays that track anyway. It runs at the lowest CPU and disk priority.
 - `--backfill <instance> --convert` converts the files that are not `.mkv`. `--sub-check` adds the subtitle check, and
   `--sub-time PATH` runs the full subtitle check of the deep analysis on single files. `--sub-check` skips a file whose
   saved result still holds, and `--recheck` checks it anyway.
+- `--check PATH` runs every check of an import on single files, with the burned-in subtitle check and the deep
+  analysis that the import queues. It says "would re-grab" where an import would re-grab.
 - `--check-audio` and `--check-video` scan every file much as an import checks it, and only read. A scan resumes over
   days, lists what it finds in `STATE_DIR`, and posts one summary when it finds a problem.
 
@@ -267,6 +270,6 @@ An import always applies its changes. Some settings make parts of it report only
 - A kind of fault that `REGRAB` leaves out still gets its second check. The alert title then ends "re-grab is off", and
   nothing is deleted.
 
-The backfill, `--sub-check` and `--sub-time` are dry unless you add `--apply`. A dry run reads and decides as an apply
+The backfill, `--sub-check`, `--sub-time` and `--check` are dry unless you add `--apply`. A dry run reads and decides as an apply
 would, and changes no file. Its decision line and its printed line say what `--apply` would do. See
 [commands.md](commands.md#dry-runs-and-the-backfill).

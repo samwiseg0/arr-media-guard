@@ -382,6 +382,7 @@ ACTIONS = {
                                                      f'failed, and {a["name"]} won\'t search for another copy.'),
     "deleted": ("", lambda a, t: f"Deleted {removed(a, False)}. Its item isn't monitored, so no search was started."),
     "would_regrab": (", re-grab is off", lambda a, t: f'Re-grabs for {REGRAB_WORDS[a["kind"]]} are off, so the file was kept.'),
+    "check": (", would re-grab", lambda a, t: "An import would re-grab the file. --check never re-grabs, so it was kept."),
     "unconfirmed": (", not confirmed", lambda a, t: "A second check didn't find the same problem, so the file was kept."),
     # A second pass of the burned-in subtitle check that read another verdict, or too little speech, see runner.burn_plan()
     "disagreed": (", not confirmed", lambda a, t: "A second check on other frames disagreed, so nothing was changed."),
@@ -780,7 +781,7 @@ def item_embed(rec, head, text, color, note=None, more=()):
 # The check that found the problem of an issue alert, by the source of its record. A scan and the audit post a summary
 # of their own. worker is the worker's start, which reports a conversion a stopped run left, see convert.pending_recover().
 CHECKS = {"hook": "Import check", "deep_analysis": "Deep analysis", "recheck": "Recheck", "backfill": "Command line run",
-          "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
+          "check": "Command line check", "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
 # The steps where a fix can stop, in the order a job runs them, see stopped_at()
 CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "Hearing the speech", "Finding the shift", "Testing the fix",
                                                           "Writing the file", "Replacing the file")
@@ -793,7 +794,7 @@ FINDING_STEPS = {"language": None, "runtime": None, "duration": None, "episode":
                  "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None}
 # Per action code. A setting or the daily limit stops a re-grab before it starts, and so does a second check that did
 # not find the fault again.
-ACTION_STEPS = {"regrabbed": REPLACE, "searched": REPLACE, "restored": REPLACE, "deleted": REPLACE, "would_regrab": None, "unconfirmed": None,
+ACTION_STEPS = {"regrabbed": REPLACE, "searched": REPLACE, "restored": REPLACE, "deleted": REPLACE, "would_regrab": None, "check": None, "unconfirmed": None,
                 "disagreed": None, "unsure": None, "once": None, "capped": None, "no_grab": REPLACE, "failed": REPLACE, "dry_run": None, "no_policy": None}
 # The start of each reason for a sidecar left in place that a setting gives, see subtitles.sidecar_fix() and convert.convert_subs()
 SETTING_LEFT = (KEPT_BACK["check"], "KEEP_ORIGINALS_DAYS is 0")
@@ -1115,13 +1116,13 @@ def sub_text(rec, t):
     return "; ".join(out) + (f" | {r}" if r else "")
 
 
-def cli_line(rec, t):
+def cli_line(rec, t, head=None):
     """The line of a backfill for one file: the result, the label, the plan, then what the run heard, repaired, checked,
-    forced and alerted."""
+    forced and alerted. head takes the place of the result and the label, see check_report()."""
     pos = {x["sel"]: x["pos"] for x in rec.get("before", [])}
     rp = rec.get("repack") or {}
     heard = ", ".join(f'{k} {v["lang"] or "no answer"}' for k, v in (rec.get("heard") or {}).items())
-    return (f'{rec["result"][:60]:<12} {rec.get("label")}' + (f" | {e}" if (e := edit_text(pos, rec.get("edits", []))) else "")
+    return ((head or f'{rec["result"][:60]:<12} {rec.get("label")}') + (f" | {e}" if (e := edit_text(pos, rec.get("edits", []))) else "")
             + (" | heard " + heard if heard else "")
             + (" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else "")
             + (" | subtitles " + sub_text(rec, t) if rec.get("subcheck") or rec.get("flash") or rec.get("garbled") else "")
@@ -1130,6 +1131,32 @@ def cli_line(rec, t):
             + (" | name forced: " + rp["forced_name"][:150] if rp.get("forced_name") else "")
             + (" | " + "; ".join(rec["notes"]) if rec.get("notes") else "")
             + (" | ALERT " + "; ".join(alert_line(f, t, track_langs(rec)) for f in rec["findings"]) if rec.get("findings") else ""))
+
+
+def check_report(rec, t):
+    """The report of --check on one file: the label and the whole result, then the rest of the line of a backfill, see
+    cli_line(). The result of a converted file starts with "repacked". Then a conversion and where the original is, the
+    checks that ran with a short result each, see check_ran(), and one line for each check the run left out, see
+    cli.check()."""
+    rp = rec.get("repack") or {}
+    where = f' at {rp["new_path"]}' if rp.get("new_path") else ""
+    kept = f', the original is kept at {rp["kept"]}' if rp.get("kept") else f', the original stays at {rp["old_path"]}' if rec.get("outside") and where else ""
+    ran = check_ran(rec)
+    return cli_line(rec, t, f'{rec.get("label")}: {"repacked, " if rp.get("new_size") else ""}{rec["result"]}') \
+        + (f"\n  converted to Matroska{where}{kept}" if rp.get("new_size") else "") \
+        + (f"\n  checked: {', '.join(ran)}" if ran else "") + "".join(f"\n  not checked: {x}" for x in rec.get("not_checked") or [])
+
+
+def check_ran(rec):
+    """The checks of an import that ran on the file of rec, each with a short result, as "audio clean" or "wrong
+    content: language right, runtime right". The subtitle checks and the header repair have their own column in
+    cli_line()."""
+    found = lambda x: "a certain fault" if x.get("certain") else f'{len(x["doubts"])} doubt{"s" * (len(x["doubts"]) != 1)}' if x.get("doubts") else "clean"
+    signals = (rec.get("evidence") or {}).get("signals") or []
+    b = rec.get("burned_in") or {}
+    return [f"{k} {found(rec[k])}" for k in ("audio", "video") if rec.get(k)] \
+        + (["wrong content: " + ", ".join(f'{x["kind"]} {x["verdict"]}' for x in signals)] if signals else []) \
+        + ([f'quick burned-in subtitle check {b["result"]}'] if b.get("result") not in (None, "skipped") else [])
 
 
 def sub_time_report(rec, t):

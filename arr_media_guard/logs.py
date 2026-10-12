@@ -39,9 +39,14 @@ def log_facts(rec, at):
     return at
 
 
+NO_STATUS = False   # True in a dry run of --check, which writes no status.json, see cli.check()
+
+
 def status(key, code, detail="", touch=True):
-    """Record one check for Zabbix in status.json. The time limit passes through. Any other failure logs a warning
-    line and never stops the job, because the status file is a signal only."""
+    """Record one check for Zabbix in status.json, unless NO_STATUS. The time limit passes through. Any other failure
+    logs a warning line and never stops the job, because the status file is a signal only."""
+    if NO_STATUS:
+        return
     try:
         _, note = health.record(config.CFG.state_dir, key, code, config.mask(detail or ""), touch=touch, flock=config.DEADLINE.lock)
     except (content.OutOfTime, TimeoutError):
@@ -76,9 +81,10 @@ KEPT_KEYS = ("app", "source", "apply", "outcome", "result", "edit_result", "labe
 def decision(rec, started):
     """Write one decision line for a file the hook, a backfill or an audit looked at, then its one-line summary to syslog,
     see report.render(). The summary says tmdb=not_asked when the run asked TMDB nothing, as in a conversion backfill.
-    The store keeps the KEPT_KEYS of the line."""
+    The store keeps the KEPT_KEYS of the line, under no app for a file no app lists, see cli.check(), so no audit of an
+    app counts it."""
     rec = report.render(dict(rec, took=round(time.time() - started, 2)), "log")
-    store.decided(log(rec), rec.get("app"), rec.get("path"), config.mask(json.dumps({k: rec[k] for k in KEPT_KEYS if k in rec})))
+    store.decided(log(rec), None if rec.get("outside") else rec.get("app"), rec.get("path"), config.mask(json.dumps({k: rec[k] for k in KEPT_KEYS if k in rec})))
     line = report.render(rec, "logfmt")
     to_syslog(line)
     return rec
@@ -285,6 +291,7 @@ BROKEN = {"inv_audio_not_policy_target": "the wrong audio language plays first",
 SKIPPED = {"header_repair_failed": "the file repair failed", "header_repair_skipped": "the file repair was skipped",
            "repack_failed": "the conversion to MKV failed", "repack_source_changed": "the app changed the file during the conversion to MKV",
            "repack_hardlinked": "the conversion to MKV was skipped, because the file has another hard link",
+           "repack_no_keep": "the conversion to MKV was skipped, because the original couldn't be kept",
            "not_matroska": "the file isn't MKV, so its tracks weren't changed"}
 AUDIT_CHARS = 1950   # the characters of the file list, under the 2000 that embed() keeps of a description
 
