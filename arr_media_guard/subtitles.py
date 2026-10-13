@@ -432,7 +432,7 @@ def lid_kept(path, index):
     return lid.kept_pcm(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, index)
 
 
-SUB_SOURCES = ("hook", "deep_analysis", "recheck", "check")   # an import, the jobs of the background queue and --check follow SUBTITLES
+SUB_SOURCES = ("hook", "deep_analysis", "recheck", "check", "backfill_job")   # an import, the jobs of the background queue and --check follow SUBTITLES
 
 
 def sub_on(source, sub_check=False):
@@ -1109,9 +1109,13 @@ def sub_found(rec):
 
 def sub_cache(path, rec, mode, app, pending):
     """Save the subtitle check of the run of rec, of mode, for path as it is now, see lid.verdict_put(): the version
-    and the findings of each check the run made (SUB_RUNS), the app and the sidecars. The rows are the saved results."""
+    and the findings of each check the run made (SUB_RUNS), the app and the sidecars. The rows are the saved results.
+    A result that asks for nothing keeps a saved result of a run with more checks that still holds, see sub_cached().
+    So the import check of a job a backfill queued keeps the deep analysis of a file it did not change."""
     with contextlib.suppress(ImportError):
         from . import lid
+        if not pending and any(sub_cached(path, r) for r in SUB_RUNS if set(SUB_RUNS[mode]) < set(SUB_RUNS[r])):
+            return
         found = sub_found(rec)
         lid.verdict_put(os.path.join(config.CFG.state_dir, "lid.sqlite"), path,
                         {"checks": {c: {"version": SUB_CHECKS[c]["version"], "found": found[c]} for c in SUB_RUNS[mode]}, "app": app, "mode": mode,
@@ -1133,19 +1137,20 @@ def sub_fixed(result):
     return [c for c in SUB_RUNS.get(r.get("mode"), ()) if stale(c)]
 
 
-def sub_cached(path):
+def sub_cached(path, run="sub_check"):
     """The subtitle check of path as it is now is saved and asks for nothing more, so a backfill with --sub-check
     skips the file. A dry run's result that asks for an action does not count, so an apply after it still acts. A
     sidecar that came, went or changed since counts as a change, so a new download from a program such as Bazarr is checked.
-    The result must come from a run that makes every check of --sub-check, with none of them stale, see sub_fixed().
-    So a result of an import, or of 2.4.0 and older, does not count, and the file is checked once more."""
+    The result must come from a run that makes every check of run, --sub-check or the deep analysis, with none of them
+    stale, see sub_fixed(). So for --sub-check a result of an import, or of 2.4.0 and older, does not count, and the
+    file is checked once more. For the deep analysis only a result of --sub-time or of a deep analysis counts."""
     try:
         from . import lid
     except ImportError:
         return False
     got = lid.verdict_get(os.path.join(config.CFG.state_dir, "lid.sqlite"), path)
     r = got[0] if got and not got[1] and isinstance(got[0], dict) else {}
-    return set(SUB_RUNS["sub_check"]) <= set(SUB_RUNS.get(r.get("mode"), ())) and not sub_fixed(r) and r.get("sidecars") == side_stats(path)
+    return set(SUB_RUNS[run]) <= set(SUB_RUNS.get(r.get("mode"), ())) and not sub_fixed(r) and r.get("sidecars") == side_stats(path)
 
 
 def sub_stale():

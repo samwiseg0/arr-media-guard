@@ -248,7 +248,8 @@ the names differ. The selftest only warns of it.
 Give the user of each app read access to the env file, and write access to `STATE_DIR` and `LOG`. Schedule the
 nightly audit for each instance, as `arr-media-guard --audit sonarr-4k --since 24h --post`.
 
-**What changes per instance.** Most commands take the instance name, as `--backfill sonarr-4k`. The decision log, the
+**What changes per instance.** Most commands take the instance name, as `--backfill sonarr-4k`. A backfill with no
+instance runs every instance in turn. The decision log, the
 syslog line and the alerts name the instance. Each instance has its own `REGRAB_CAP` count. A file that
 `KEEP_REPLACED` kept for one instance never serves another.
 
@@ -261,9 +262,9 @@ syslog line and the alerts name the instance. Each instance has its own `REGRAB_
 2. Press Test in each app's connection. Save runs it too. Test checks the policy, the app's API and its key, and each
    root folder of the app. A failed Test names what to fix. On a host the script answers `arr-media-guard: Test ok`, or
    exits 1 so the Test fails. In Docker, see [docs/docker.md](docs/docker.md#the-listener).
-3. Run a dry run on one file. It prints the planned edit and changes nothing:
+3. Run a dry run on one file. It prints what an import would do and changes nothing:
    ```
-   docker exec -it arr-media-guard arr-media-guard --backfill radarr --paths "/data/movies/Film A (2000)/Film A (2000).mkv"
+   docker exec -it arr-media-guard arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv"
    ```
    On a host, leave out `docker exec -it arr-media-guard`.
 
@@ -364,7 +365,7 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 | --- | --- | --- |
 | `HEADER_REPAIR` | `true` | Repair a Matroska file whose header is wrong, by writing it again with the same streams. `false`: leave the header as it is. |
 | `REPACK_MAX_GB` | `30` | The size limit in GB for a rewrite. AMG never rewrites a file larger than this: no header repair, no subtitle change in the file and no conversion. A value that is no number acts as `0`, so AMG rewrites no file, and `--selftest` fails on it. |
-| `CONVERT` | `false` | Convert each imported file whose name does not end in `.mkv` into Matroska. A backfill converts only with `--convert`. |
+| `CONVERT` | `false` | Convert each imported file whose name does not end in `.mkv` into Matroska. The jobs of a backfill with no pass flag convert as an import does, and keep no original, see [docs/commands.md](docs/commands.md#dry-runs-and-the-backfill). |
 | `CONVERT_MAX_FILES` | `200` | Conversions one `--convert --apply` run makes. |
 | `CONVERT_WORKERS` | `1` | Conversions a `--convert --apply` run makes at a time. |
 
@@ -372,7 +373,7 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio, about 15 CPU minutes an hour of video. See [docs/subtitles.md](docs/subtitles.md#levels). |
+| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio. It takes a median of about 5 minutes per hour of video, and one file in four takes 15 minutes or more per hour. The jobs of a backfill with no pass flag follow it as an import does, the deep analysis included. See [docs/subtitles.md](docs/subtitles.md#levels). |
 | `BURNED_IN` | `fix` | What the burned-in subtitle check does. `off`: nothing. `check`: alerts only. `fix`: also turns off the English subtitle tracks when English subtitles are burned into the picture and the audio is in another language. When the burned-in subtitles are in another language, AMG re-grabs the file if `REGRAB` includes `burned_in`. AMG changes a file only when a second check on other frames agrees. An unknown value acts as `check`, and `--selftest` fails on it. See [docs/features.md](docs/features.md#burned-in-subtitles). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |

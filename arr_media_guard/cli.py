@@ -47,7 +47,7 @@ def upgrade(lock, path, st):
     runner.same_file(path, st)
 
 
-def backfill_file(app, f, info, a, keep_plan, pool=None, job=None):
+def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
     """One file of a backfill, as (the seconds it took, the decision record), or None when its own tracks leave it out.
     The selection probe and the checks hold the file lock shared, so the workers of a dry run read side by side and an
     import never waits for a file's language detection. An edit takes the lock exclusive, see upgrade(). A file that
@@ -60,7 +60,9 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None):
 
     job is the job of a --check run, see check(). The file then runs as an import, under an import's time limit, or as
     the deep analysis after it when job holds deep. An apply posts its alerts when an app names the file. The caller
-    ends the time limit. job["run"] keeps the process.Ctx of the run, as runner.run_job() reads its own."""
+    ends the time limit. job["run"] keeps the process.Ctx of the run, as runner.run_job() reads its own. save stores job
+    in the queue after a conversion, see process.Ctx. A job a backfill queued yields to an import, see
+    runner.deep_analysis(), so subtitles.Yielded passes through."""
     label, original, runtime, want, kids, ctx = info
     started, path, ids = time.time(), f["path"], file_ids(f, want, ctx)
     mode = ("deep" if job.get("deep") else "import") if job else "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
@@ -69,7 +71,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None):
             config.DEADLINE.start(config.BUDGET)
         c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=bool(job and app) and a.apply, kids=kids,
                         release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
-                        force=a.force.get(path), job=job)
+                        force=a.force.get(path), job=job, save=save)
         if job:
             job["run"] = c
         return process.process(c)
@@ -87,7 +89,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None):
                 with runner.locked() as lock:
                     rec = subtitles.swept_before(run(lock, False, None), ex)
     except Exception as ex:
-        if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
+        if isinstance(ex, (subsync.Broken, subtitles.Yielded)):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
             raise
         rec = dict(app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error",
                    result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
@@ -118,23 +120,43 @@ def logged_refusals(paths):
     return out
 
 
-def backfill(argv):
+HALT = threading.Event()   # SIGTERM or Ctrl+C in a backfill sets it, so a run of several instances stops whole
+
+
+def unset(app):
+    """Whether the user did not set up the instance app, see apps.no_key(). A backfill of every instance skips it."""
+    try:
+        apps.api_key(app)
+    except FileNotFoundError as ex:
+        return not apps.no_key(app, ex)
+    except (OSError, AttributeError):   # app_list() fails on it, so the run names it
+        pass
+    return False
+
+
+def backfill_args(argv):
+    """The options of --backfill, checked, see backfill(). a.queue is True for a backfill that queues, see
+    backfill_queue(). main() reads it, because a dry run that queues writes no status.json."""
     ap = argparse.ArgumentParser(prog="arr-media-guard --backfill", description="Run the hook's checks and decision over the "
-                                 "app's library, at nice 19 and idle I/O priority. A backfill prints its alerts and never posts them.")
-    ap.add_argument("app", choices=sorted(config.CFG.apps))
+                                 "library of one instance, or of every instance in turn, at nice 19 and idle I/O priority. With no "
+                                 "pass flag and no plan option, --apply puts one job per file in the background queue. The worker runs "
+                                 "each as --check --apply runs a file, after the imports. Otherwise a backfill prints its alerts and "
+                                 "never posts them.")
+    ap.add_argument("app", nargs="?", choices=sorted(config.CFG.apps), help="the instance. With none the run takes every instance in turn")
     ap.add_argument("--apply", action="store_true", help="edit the files. Without it the run is dry and changes nothing")
     ap.add_argument("--ids", type=int, nargs="+", default=[], help="only these items: movie ids for radarr, series ids for sonarr")
-    ap.add_argument("--limit", type=int, default=0, help="stop after N files that need an edit. A scan checks N files")
+    ap.add_argument("--limit", type=int, default=0, help="stop after N files that need an edit. A scan checks N files, and a "
+                    "queue takes N files")
     scan_kind = ap.add_mutually_exclusive_group()
     scan_kind.add_argument("--check-audio", action="store_true", help="scan for broken audio. A scan never edits or re-grabs, "
                            "resumes where the last run stopped, and stops cleanly on SIGTERM or Ctrl+C")
     scan_kind.add_argument("--check-video", action="store_true", help="scan for corrupt video, as --check-audio does")
-    ap.add_argument("--restart", action="store_true", help="start a new pass of the scan")
+    ap.add_argument("--restart", action="store_true", help="start a new pass of the scan or of the queue")
     ap.add_argument("--workers", type=int, help="files at a time in a dry run or a scan, SCAN_WORKERS by default, and in a "
                     "--convert --apply, CONVERT_WORKERS by default. An apply edits one file at a time")
     ap.add_argument("--plan-out", metavar="FILE", help="write each file's plan as a JSON line")
     ap.add_argument("--plan-from", metavar="FILE", help="apply only to the files the plan of a dry run edits")
-    ap.add_argument("--canary", type=int, default=0, help="apply to N files of the plan, spread across its classes")
+    ap.add_argument("--canary", type=int, default=0, help="apply to N files of the plan per instance, spread across its classes")
     ap.add_argument("--only-undecided", action="store_true", help="take the files the plan left undecided, for language detection")
     ap.add_argument("--convert", action="store_true", help="convert the files that are not .mkv into Matroska")
     ap.add_argument("--plex-later", action="store_true", help="list the folders a conversion changed for --plex-flush")
@@ -143,8 +165,15 @@ def backfill(argv):
     ap.add_argument("--sub-check", action="store_true", help="run the subtitle match and timing check too")
     ap.add_argument("--paths", nargs="+", default=[], metavar="PATH", help="only these files")
     ap.add_argument("--recheck", action="store_true", help="with --sub-check, check each file again, whatever its saved result says")
-    a = ap.parse_args(argv); app, ids = a.app, set(a.ids)
+    ap.add_argument("--drop-queued", action="store_true", help="drop the jobs that a backfill queued and that wait or run, of the "
+                    "instance or of every instance, and do nothing else")
+    a = ap.parse_args(argv)
     a.sub_time = False   # see sub_time()
+    a.queue = not (a.convert or a.sub_check or a.check_audio or a.check_video or a.plan_out or a.plan_from)   # see backfill_queue()
+    if a.drop_queued:   # it runs no pass, so no check of the pass flags applies
+        return a
+    if not a.app and (a.ids or a.paths or a.force_convert):
+        ap.error("--ids, --paths and --force-convert need an instance, because ids and paths belong to one")
     if a.recheck and not a.sub_check:
         ap.error("--recheck needs --sub-check")
     if a.sub_check and (a.convert or a.check_audio or a.check_video):
@@ -163,23 +192,65 @@ def backfill(argv):
         ap.error("--only-undecided needs --plan-from, the dry run's plan file")
     if a.workers is not None and (a.workers < 1 or (a.workers > 1 and a.apply and not a.convert)):
         ap.error("--workers takes 1 or more, and more than 1 only in a dry run, a scan or --convert --apply")
+    return a
+
+
+def backfill(a):
+    """--backfill: backfill_app() for one instance, or for every instance in config.CFG.apps order. An instance that
+    fails ends with one line, and the run goes on to the next one and exits non-zero at the end. See backfill_args()."""
+    if a.drop_queued:
+        n = runner.drop_backfill(a.app)
+        print(f"dropped {n} job{'s' if n != 1 else ''} that a backfill queued", flush=True)
+        return
     os.nice(19)   # a full pass probes every file on the NAS, so it yields to imports and to Plex
     subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
+    HALT.clear()
+    todo = [a.app] if a.app else config.CFG.apps
+    a.plans = {app: plan_rows(a.plan_from, app) for app in todo} if a.plan_from else {}   # before --plan-out empties the file, which may be the same
+    if a.plan_out:   # as /config/plans/, which the docs name
+        os.makedirs(os.path.dirname(os.path.abspath(a.plan_out)), exist_ok=True)
+    failed, out = [], open(a.plan_out, "w") if a.plan_out else None   # one plan file for every instance
+    try:
+        for app in todo:
+            if HALT.is_set():
+                break
+            if not a.app and unset(app):
+                print(f"== {app}: not set up, skipped", flush=True)
+                continue
+            if not a.app:
+                print(f"== {app}", flush=True)
+            try:
+                backfill_app(app, a, out)
+            except (Exception, SystemExit) as ex:   # app_list() exits for an instance set up in part
+                if a.app or isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
+                    raise
+                why = config.mask(str(ex) if isinstance(ex, SystemExit) else f"{type(ex).__name__}: {ex}")[:300]
+                print(f"{app}: the backfill stopped: {why}", flush=True)
+                logs.log(dict(app=app, source="backfill", result="error", note=why))
+                failed.append(app)
+    finally:
+        if out: out.close()
+    if failed:
+        sys.exit(f"the backfill failed for {', '.join(failed)}")
+
+
+def backfill_app(app, a, out):
+    """The backfill of one instance. It writes the plans to out, the open --plan-out file or None."""
     if a.check_audio or a.check_video:
         a.workers = a.workers or config.CFG.scan_workers   # an explicit --workers wins over SCAN_WORKERS
         return scan(app, a, "audio" if a.check_audio else "video")
-    work, library = apps.ARR[app].library(apps.app_list(app), ids)   # (file, (label, original, runtime, Plex lookup, kids, metadata context)), all files
+    work, library = apps.ARR[app].library(apps.app_list(app), set(a.ids))   # (file, (label, original, runtime, Plex lookup, kids, metadata context)), all files
     # The app lists the files. Each file's own tracks select it, see selected(), because the app's stored mediaInfo goes
     # stale and can miss a subtitle track.
     unconverted = [w for w in work if not w[0]["path"].lower().endswith(".mkv")]   # --convert takes only these, docs/design.md, "Conversion"
-    work = [w for w in work if w[0]["path"].lower().endswith(".mkv")]
+    work = [w for w in work if a.queue or w[0]["path"].lower().endswith(".mkv")]   # a queue takes every file
     if a.convert:
         work = unconverted
         with contextlib.suppress(OSError):   # a new pass starts a new list of refused and failed conversions
             open(os.path.join(config.CFG.state_dir, f"convert-{app}.txt"), "w").close()
     if a.plan_from:   # only the files the dry run planned edits for, or left undecided. Each one is probed and planned again.
         listed = {w[0]["path"] for w in work}   # so a canary with --ids takes its sample from those items
-        plans = [r for r in plan_rows(a.plan_from, app) if r["path"] in listed
+        plans = [r for r in a.plans[app] if r["path"] in listed
                  and (r["undecided"] if a.only_undecided else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
@@ -188,6 +259,8 @@ def backfill(argv):
         for p in sorted(listed - {w[0]["path"] for w in work}):
             print(f"not in this run's work list, skipped: {p}", flush=True)
         work = [w for w in work if w[0]["path"] in listed]
+    if a.queue:
+        return backfill_queue(app, a, work)
     a.force = logged_refusals({w[0]["path"] for w in work}) if a.force_convert else {}   # path: the refusal a person checked, docs/design.md, "Conversion"
     for p in sorted(p for p, why in a.force.items() if not why):
         print(f"no proof refusal in the decision log, so {'it is not' if apps.ARR[app].film else 'only its name check is'} forced: {p}",
@@ -201,7 +274,7 @@ def backfill(argv):
         workers = a.workers or config.CFG.scan_workers
     print(f"{len(work)} {'files that are not .mkv' if a.convert else 'mkv files, each read for its own tracks'}, "
           f"{('APPLY' + (f', {workers} at a time' if workers > 1 else '')) if a.apply else f'dry run, {workers} at a time'}", flush=True)
-    counts, out, skipped, needed = {}, open(a.plan_out, "w") if a.plan_out else None, set(), 0   # skipped: plex_analyze()'s sections
+    counts, skipped, needed = {}, set(), 0   # skipped: plex_analyze()'s sections
     burst = {}   # plex_analyze()'s rows of idle checks, see plex_step()
     scans, rescans, settles, stop = {}, set(), {}, threading.Event()   # scans: folder -> plex_folder_job(), rescans and settles: per item, at the end
     if a.apply and a.convert:   # a stopped run left these
@@ -263,7 +336,6 @@ def backfill(argv):
         if a.limit and needed >= a.limit: stop.set()
         if stop.is_set() and not pool: break   # a pool lets its files in flight end, see backfill_files()
     if ex: ex.shutdown(cancel_futures=True)
-    if out: out.close()
     for owner in sorted(rescans):   # the size and media info follow the edits, and the record of a converted original goes
         rescan_item(app, owner, settles.get(owner))
     # After every file of the run is in place, with no lock and no worker. A --convert run takes only files that are not
@@ -276,6 +348,39 @@ def backfill(argv):
     print("summary:", json.dumps(counts))
     if a.sub_check:
         print(sub_summary(subs, library), flush=True)
+
+
+def backfill_queue(app, a, work):
+    """A backfill with no pass flag and no plan option (docs/commands.md, "Dry runs and the backfill"). Its apply puts one
+    job per file of work in the background queue, see runner.queue_listed(), and the worker runs each one as --check
+    --apply runs a file, see runner.deep_analysis(). A file with a job of its path that waits or runs keeps that job.
+    The pass takes the files in file id order and keeps its place in the state a scan keeps, see advance(). So --limit
+    N queues the next N files, and a run after the pass is done queues nothing. --restart starts a new pass. An --ids or
+    --paths run keeps a state of its own, which starts again when they change. A dry run writes no state, probes no
+    file and names the next files it would queue. Both print the count and the hours of video, from the runtime the
+    app lists."""
+    name = f"queue-{app}" + ("-ids" if a.ids or a.paths else "")
+    state, todo, order = pass_left(name, work, lambda w: w[0]["id"], a.restart, sorted(a.ids) + sorted(a.paths))
+    if not todo:
+        print(f"{app}: the pass is done, so nothing was queued. --restart starts a new pass.", flush=True)
+        return
+    n = minutes = 0
+    for f, info in todo:
+        if a.limit and n >= a.limit:
+            break
+        with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away, stays in the pass
+            got = runner.queue_listed(app, f, info, backfill=True) if a.apply else not runner.still_queued(runner.deep_name(f["path"]))
+            if got:
+                n, minutes = n + 1, minutes + info[2]
+                if not a.apply:
+                    print(f"would queue: {f['path']}", flush=True)
+            # The job of the path, queued now or before, takes the file. A recheck repeats only the subtitle check, so it does not.
+            if a.apply and store.read(f"SELECT 1 FROM jobs WHERE name = ? AND {runner.RECHECK} = 0", runner.deep_name(f["path"])):
+                advance(state, order, f["id"])
+                store.put("scan", name, state)
+    print(f"{app}: {n} file{'s' if n != 1 else ''} {'queued' if a.apply else 'to queue, dry run'}, {minutes / 60:.1f} hours of video, "
+          f"{len(set(order) - set(state['done']))} of {len(work)} files left in this pass. They wait in the background queue behind the "
+          "imports and run one at a time.", flush=True)
 
 
 def sub_count(c, rec, took):
@@ -425,7 +530,7 @@ def check(argv):
         ap.error("--id needs --app")
     if a.tmdb and not re.fullmatch(r"movie/\d+|tv/\d+/\d+/\d+", a.tmdb):
         ap.error("--tmdb takes movie/ID or tv/ID/SEASON/EPISODE, as movie/603 or tv/1396/1/3")
-    a.sub_check, a.sub_time, a.recheck, a.plan_from, a.convert, a.force = False, False, False, None, False, {}
+    vars(a).update(CHECK_ARGS)
     logs.NO_STATUS = not a.apply   # main() sets it back, and records the policy of an apply
     os.nice(19)   # it hears and reads files on the NAS, so it yields to imports and to Plex
     subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
@@ -488,8 +593,7 @@ def check(argv):
         if rec["outcome"] == "error":
             failed.append(f'{rec["path"]}: {what}{rec["result"]}')
     for app, f, info, out in work:
-        job = {"check": "listed" if out is None else "outside", "path": f["path"], "owner": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"),
-               "episode_ids": ",".join(map(str, info[5].get("episode_ids") or ()))}
+        job = check_job(f, info, out is not None)
         took, rec = backfill_file(app, f, info, a, False, job=job)
         config.DEADLINE.stop()
         run = job.pop("run", None)
@@ -501,6 +605,16 @@ def check(argv):
                     done(app, info, out, *got, what=what)
     if failed:
         sys.exit("--check did not check every file:\n  " + "\n  ".join(failed))
+
+
+CHECK_ARGS = dict(sub_check=False, sub_time=False, recheck=False, plan_from=None, convert=False, force={})   # what backfill_file() reads of a run of check()
+
+
+def check_job(f, info, outside=False):
+    """The job of --check for the file record f of App.library(), with its info, see backfill_file(). outside is a file
+    no app lists. A job a backfill queued runs with one too, see runner.deep_analysis()."""
+    return {"check": "outside" if outside else "listed", "path": f["path"], "owner": f.get("movieId") or f.get("seriesId"), "file_id": f.get("id"),
+            "episode_ids": ",".join(map(str, info[5].get("episode_ids") or ()))}
 
 
 def burn_later(app, f, info, a, job, rec, run):
@@ -668,7 +782,7 @@ def backfill_files(work, one, workers, stop, converted):
     thread that waits for the app's import leaves its slot to another file. SIGTERM or Ctrl+C sets stop, and the
     files in flight end first: a stop never cuts a remux, a swap, an import or mkvpropedit, and every file that ran gets
     its decision line. A process that ignores SIGINT keeps it ignored, as remux.Swap does."""
-    handlers = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)
+    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set())) for s in (signal.SIGTERM, signal.SIGINT)
                 if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN}
     try:
         if workers == 1:   # the file ends and writes its decision line. convert() handles a stop itself during the remux.
@@ -903,6 +1017,18 @@ def scan_file(kind, app, w, stop):
     return rec, certain, doubts, detail, started
 
 
+def pass_left(name, work, fid, new=False, ask=None):
+    """(the state of the pass name, a scan's or a queue's, the items of work left in it in file id order, a deque of the
+    ids above state["last"] for advance()). An item is left when its id fid(item) is above state["last"] and not in
+    state["done"]. new, no state, or another ask, the ids and paths of the run, starts a new pass."""
+    state = store.get("scan", name, {})
+    if new or not state or state.get("ask") != ask:
+        state = {"started": time.time(), "last": -1, "checked": 0, "done": [], "ask": ask}
+    done = set(state.setdefault("done", []))   # a state of a version before done holds none
+    todo = sorted((w for w in work if fid(w) > state["last"]), key=fid)
+    return state, [w for w in todo if fid(w) not in done], collections.deque(map(fid, todo))
+
+
 def advance(state, order, fid):
     """Count fid as checked in a scan state. order holds the pass's file ids above state["last"], in order, and last
     moves over every one of them that is checked. The ids checked above last wait in state["done"]. So a restart
@@ -947,18 +1073,16 @@ def scan(app, a, kind):
     # An --ids run keeps its own state and list, so it never moves the full pass or truncates its list. The store holds
     # where the pass stands and the problems it found. base.txt lists them for a person.
     name = f"{kind}-scan-{app}" + ("-ids" if a.ids else "")
-    base, state = os.path.join(config.CFG.state_dir, name), store.get("scan", name, {})
-    work, done = library(app, set(a.ids)), set(state.get("done", []))   # done: checked out of order, see advance()
-    todo = [w for w in work if w[0] > state.get("last", -1) and w[0] not in done]
-    if a.restart or a.ids or not state or not todo:
-        state, todo = {"started": time.time(), "last": -1, "checked": 0}, work
-        store.drop(name)   # a new pass starts a new list
-    state.setdefault("done", [])
-    order = collections.deque(w[0] for w in work if w[0] > state["last"])
+    base, work = os.path.join(config.CFG.state_dir, name), library(app, set(a.ids))
+    state, todo, order = pass_left(name, work, lambda w: w[0], a.restart or a.ids)
+    if not todo:   # the pass is done, so a new one starts
+        state, todo, order = pass_left(name, work, lambda w: w[0], True)
+    if not state["checked"]:   # a new pass starts a new list
+        store.drop(name)
     print(f"{kind} scan of {app}: {len(todo)} of {len(work)} files left in this pass, {a.workers} workers", flush=True)
     checked = found = gone = 0
     stop, left, running = threading.Event(), iter(todo[:a.limit] if a.limit else todo), {}
-    handlers = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
+    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set())) for s in (signal.SIGTERM, signal.SIGINT)}
     try:
         with concurrent.futures.ThreadPoolExecutor(a.workers) as pool:
             while True:
@@ -1009,12 +1133,14 @@ def scan(app, a, kind):
 HELP = """arr-media-guard: set the default audio and subtitle tracks of an imported mkv, and flag broken files.
 
   arr-media-guard                     run by Sonarr or Radarr as a Custom Script connection
-  arr-media-guard --backfill <instance> [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--plan-out FILE] [--workers N]
+  arr-media-guard --backfill [<instance>] [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--restart]   queue each file for the checks of an import
+  arr-media-guard --backfill [<instance>] --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]
   arr-media-guard --backfill <instance> --sub-check [--apply] [--ids ID ...] [--paths PATH ...]
-  arr-media-guard --backfill <instance> --apply --plan-from FILE [--canary N]
-  arr-media-guard --backfill <instance> --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
+  arr-media-guard --backfill [<instance>] --apply --plan-from FILE [--canary N]
+  arr-media-guard --backfill [<instance>] --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
   arr-media-guard --backfill <instance> --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]
   arr-media-guard --backfill <instance> --convert --apply --force-convert PATH [PATH ...] [--ids ID ...]
+  arr-media-guard --backfill [<instance>] --drop-queued   drop the jobs a backfill queued
   arr-media-guard --plex-flush <instance>
   arr-media-guard --backfill <instance> --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --backfill <instance> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
@@ -1027,7 +1153,9 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --test-discord      post a test message to DISCORD_WEBHOOK and print Discord's answer
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
-<instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k.
+<instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k. A backfill or a scan with no instance runs every
+instance. With no pass flag (--convert, --sub-check, --check-audio, --check-video) and no plan option (--plan-out,
+--plan-from), --apply queues each file the app lists. The worker runs each one as --check --apply, after the imports.
 --backfill, --audit, --sub-time, --check and --burn-in print their options with --help, as in arr-media-guard --backfill --help.
 README.md says how to install and connect it. docs/commands.md explains each mode, and docs/design.md how it works."""
 
@@ -1036,12 +1164,17 @@ def main(argv):
     mode = argv[:1]
     # A deploy tool may run --selftest on every dry run, which must change nothing on the host. So the selftest records
     # the policy only with ARR_MEDIA_GUARD_RECORD=1. Its record never moves last_hook_run.
-    # A dry run of --check writes no status.json, see check().
+    # A dry run of --check, or of a backfill that queues, writes no status.json, see check().
     armed = mode != ["--selftest"] or os.environ.get("ARR_MEDIA_GUARD_RECORD") == "1"
-    if (mode in (["--selftest"], ["--backfill"], ["--audit"], ["--sub-time"]) or mode == ["--check"] and "--apply" in argv) and armed:
+    a = backfill_args(argv[1:]) if mode == ["--backfill"] else None
+    dry = mode == ["--check"] and "--apply" not in argv or a and a.queue and not a.apply
+    if mode in (["--selftest"], ["--backfill"], ["--audit"], ["--sub-time"], ["--check"]) and armed and not dry:
         logs.status("policy", "failed" if decide.POLICY is None else "ok", config.POLICY_ERROR or "", touch=mode != ["--selftest"])
     if mode == ["--selftest"]:
         print(f"keys from the environment: {', '.join(config.CFG.from_env) or 'none'}")   # the names only, as a value may be a secret
+        if os.path.exists(store.path()):   # a selftest creates no store
+            with contextlib.suppress(sqlite3.Error):
+                print("background queue: {} jobs, {} of them queued by a backfill".format(*runner.backfill_jobs()))
         if config.CFG.errors:
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:
@@ -1076,7 +1209,7 @@ def main(argv):
     elif mode in (["--backfill"], ["--audit"], ["--sub-time"], ["--check"]) and decide.POLICY is None and not {"-h", "--help"} & set(argv):
         sys.exit(config.policy_help())
     elif mode == ["--backfill"]:
-        backfill(argv[1:])
+        backfill(a)
     elif mode == ["--audit"]:
         audit(argv[1:])
     elif mode == ["--plex-flush"]:

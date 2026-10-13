@@ -77,8 +77,8 @@ check*. It needs language detection.
 - A subtitle in another language, or one made of pictures, has no words AMG can compare with the speech. AMG times it
   against one whose words matched. An import does this while its time limit allows.
 
-`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears the whole audio, about
-15 CPU minutes an hour of video. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
+`SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears the whole audio, and
+takes a median of about 5 minutes per hour of video. One file in four takes 15 minutes or more per hour. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
 `--sub-time` single files, see [subtitles.md](subtitles.md).
 
 ### Mid-file jump timing
@@ -235,14 +235,15 @@ Other subtitle formats cannot be trimmed, so an alert names them. It runs at imp
 
 AMG can turn a file in another container, such as AVI, MP4, M4V, TS or WebM, into Matroska. The streams stay the same,
 and the sidecars go into the new file. A subtitle whose words do not match the audio stays out. AMG checks every stream
-of the new file, packet by packet, before it removes the source file. `CONVERT=true` turns it on for imports, and
-`--convert` for a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB`
+of the new file, packet by packet, before it removes the source file. `CONVERT=true` turns it on for imports and for
+the jobs a backfill queues, and `--convert` for a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB`
 lists `damage`. Else the alert title ends "re-grab is off". See [commands.md](commands.md#convert-files-into-matroska).
 
 ## Backfill and scans
 
-Commands run the checks over the files you already have, see [commands.md](commands.md). `--backfill` fixes the default
-tracks and language tags of a library, and is dry unless you add `--apply`. `--check` runs every check of an import on
+Commands run the checks over the files you already have, see [commands.md](commands.md). `--backfill --apply` queues
+each file of every instance, and the worker checks it as an import, after the imports. With no `--apply` it only names
+the files. A plan option runs the flag backfill, which fixes the default tracks and language tags. `--check` runs every check of an import on
 the files you name, also dry unless you add `--apply`. `--check-audio` and `--check-video` look for
 broken audio or corrupt video, and only read. The nightly audit reviews the day's edits, and removes kept files older
 than `KEEP_ORIGINALS_DAYS`. No command re-grabs.
@@ -300,13 +301,14 @@ a setting turned off, and a doubt all post, once for the same file. A problem AM
 syslog only. Examples are a re-grab, a removed or repaired subtitle, and new subtitle times. With `DISCORD_POSTS=all`,
 AMG also posts each change it makes to a file, unless an alert already says it. Imports, the burned-in subtitle check,
 the deep analysis and the recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the
-worker starts or a `--convert` run finds it. `--check --apply` posts the alerts of a file with an item. The backfill,
-`--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when it finds a problem.
+worker starts or a `--convert` run finds it. `--check --apply` and the jobs a backfill queues post the alerts of a file with an item. The flag
+backfill, `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when it finds a problem.
 `arr-media-guard --test-discord` posts a test message and prints Discord's answer.
 
 Each alert shows two short fields side by side, under its text and above the item and file. **Check** names the check
-that found the problem. The checks are Import check, Burned-in subtitle check, Deep analysis, Recheck, Command line
-check, Worker start and Command line run. Command line check is `--check`. Worker start and Command line run find a
+that found the problem. The checks are Import check, Burned-in subtitle check, Deep analysis, Recheck, Backfill check,
+Command line check, Worker start and Command line run. Backfill check is a job that `--backfill --apply` queued, and
+Command line check is `--check`. Worker start and Command line run find a
 conversion that a stop left unfinished, when the worker starts or in a `--convert` run. **Stopped at** names the step
 where AMG's fix stopped. The steps are the same for every kind of alert.
 A subtitle shows one step, the furthest its fix reached.

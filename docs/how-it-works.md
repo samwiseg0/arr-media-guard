@@ -226,11 +226,15 @@ the audit and the rotation off. An old `last_hook_run` in `status.json` shows th
 ## Commands over your library
 
 The worker checks only new imports. Commands run the same checks over the files you already have. A backfill is dry
-unless you add `--apply`, and no command re-grabs. `--check --apply` posts the alerts of a file with an item. A scan
+unless you add `--apply`, and no command re-grabs. `--check --apply` and the jobs a backfill queues post the alerts of
+a file with an item. A scan
 and the audit with `--post` post a summary, and `--test-discord` posts a test message.
 
-- `--backfill <instance>` fixes the default tracks and language tags of the Matroska files the app lists. It skips a
-  file with one audio track and no subtitle, which plays that track anyway. It runs at the lowest CPU and disk priority.
+- `--backfill --apply` puts one job per file of every instance in the background queue. The worker runs each one as
+  `--check --apply`, after the imports. `--backfill <instance>` takes one instance.
+- `--backfill <instance> --plan-out FILE` runs the flag backfill. It fixes the default tracks and language tags of the
+  Matroska files the app lists. It skips a file with one audio track and no subtitle, which plays that track anyway. It
+  runs at the lowest CPU and disk priority.
 - `--backfill <instance> --convert` converts the files that are not `.mkv`. `--sub-check` adds the subtitle check, and
   `--sub-time PATH` runs the full subtitle check of the deep analysis on single files. `--sub-check` skips a file whose
   saved result still holds, and `--recheck` checks it anyway.
@@ -239,7 +243,7 @@ and the audit with `--post` post a summary, and `--test-discord` posts a test me
 - `--check-audio` and `--check-video` scan every file much as an import checks it, and only read. A scan resumes over
   days, lists what it finds in `STATE_DIR`, and posts one summary when it finds a problem.
 
-Run a large backfill as a dry run first, check the plans, then try a small sample with `--canary N`, then the rest. See
+Run a large flag backfill as a dry run first, check the plans, then try a small sample with `--canary N`, then the rest. See
 [commands.md](commands.md#dry-runs-and-the-backfill).
 
 ## Several instances

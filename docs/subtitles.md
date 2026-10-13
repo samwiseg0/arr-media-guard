@@ -40,7 +40,8 @@ it within a minute. The worker is the AMG process that runs the queued jobs.
 
 ## Check a library
 
-A backfill checks no subtitles unless you add `--sub-check`.
+The jobs of `--backfill --apply` check the subtitles as an import does, at your `SUBTITLES` level. A flag backfill
+checks no subtitles unless you add `--sub-check`.
 
 ```
 arr-media-guard --backfill sonarr --ids 101 --sub-check       # check the subtitles of one series against the audio, dry
@@ -197,8 +198,8 @@ fixed, posts nothing. Under 20 anchored lines AMG judges nothing, and under 10 i
 - When the listening stops part way, as when the speech model fails, AMG moves nothing and judges nothing. An alert
   the import held then posts. The result stays pending, but nothing queues a new run. A later `--sub-time` or deep
   analysis of the file goes on where the listening stopped.
-- The listening runs on the CPU. It costs about 15 CPU minutes an hour of video, about 5.5 for a 22-minute episode and
-  about 30 for a 2-hour film. The deep analysis gives way to an import between two pairs of windows.
+- The listening runs on the CPU. A deep analysis takes a median of about 5 minutes per hour of video, and one file in
+  four takes 15 minutes or more per hour. The deep analysis gives way to an import between two pairs of windows.
 - Known limit: a line with no heard words moves no farther than the heard lines next to it. When one of them stays,
   the line stays too, even when the stretch around it is off.
 - Known limit: a stretch of lines with no heard words right before a jump can move with the part after the jump.
@@ -429,6 +430,6 @@ Move-Item -Force ".arr-media-guard-originals\<UTC time>\Episode.mkv" "Episode.mk
 
 The exit codes are those of `--sub-time` above.
 
-Listening to the whole audio takes about 5.5 CPU minutes for a 22-minute episode, see
-[Whole-file timing](#whole-file-timing). The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon,
+Listening to the whole audio takes a median of about 5 minutes per hour of video. One file in four takes 15 minutes
+or more per hour. See [Whole-file timing](#whole-file-timing). The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon,
 which runs the amd64 image under emulation, were not tested.

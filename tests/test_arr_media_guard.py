@@ -279,6 +279,9 @@ def env(tmp_path, monkeypatch, settings):
     return calls
 
 
+FLAG_PASS = ["--plan-out", os.devnull]   # a plan option runs the flag backfill, see cli.backfill_queue()
+
+
 def log_lines(env):
     with open(hook.CFG.log) as f:
         return [json.loads(line) for line in f]
@@ -380,7 +383,7 @@ def test_a_backfill_reads_the_episode_list_once_per_series(env, monkeypatch):
                                            {"id": 22, "path": second, "sceneName": "Show.D.S04E21.Ship.Voyage.1080p.WEB.H264-GRP"}]}[p]
     monkeypatch.setattr(hook, "arr", fake_arr)
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "sonarr"])
+    hook.main(["--backfill", "sonarr", *FLAG_PASS])
     verdicts = {r["path"]: [x["verdict"] for x in r["evidence"]["signals"] if x["kind"] == "episode_title"] for r in log_lines(env) if r.get("evidence")}
     assert verdicts == {env["path"]: ["other"], second: ["imported"]} and calls.count("episode?seriesId=5") == 1, (verdicts, calls)
 
@@ -413,7 +416,7 @@ def test_a_file_with_no_scene_name_says_the_title_comes_from_its_name(env, monke
                                                       "episode?seriesId=5": eps,
                                                       "episodefile?seriesId=5": [{"id": 21, "path": renamed, "sceneName": None}]}[p])
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "sonarr"])
+    hook.main(["--backfill", "sonarr", *FLAG_PASS])
     (sig,) = [x for r in log_lines(env) if r.get("evidence") for x in r["evidence"]["signals"] if x["kind"] == "episode_title"]
     assert sig["why"] == 'imported as S04E15 "A Rainy Day". The file name calls it "Ship Voyage", which is S04E21', sig
 
@@ -536,7 +539,7 @@ def test_a_backfill_reads_the_release_nfo_in_the_library(env, monkeypatch):
                                                       "episodefile?seriesId=5": [{"id": 21, "path": env["path"], "sceneName": "Show.D.S04E15.WEB-GRP"}]}[p])
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     open(env["path"][:-4] + ".nfo-orig", "w").write("Episode Title: Ship Voyage\n")
-    hook.main(["--backfill", "sonarr"])
+    hook.main(["--backfill", "sonarr", *FLAG_PASS])
     (sig,) = [x for r in log_lines(env) if r.get("evidence") for x in episode_signal(r)]
     assert sig["verdict"] == "other" and sig["why"].endswith('The release\'s NFO calls it "Ship Voyage", which is S04E21'), sig
 
@@ -1452,7 +1455,7 @@ def test_backfill_skips_a_section_it_gave_up_on_at_once(env, monkeypatch, tmp_pa
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     real_run = hook.subprocess.run
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: None if argv[0] == "ionice" else real_run(argv, **k))
-    hook.main(["--backfill", "radarr", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     assert analyzes(env) == ["/library/metadata/7103/analyze"]   # the third file, once the section is idle
     assert env["sleeps"] == [hook.PLEX_BUSY_WAIT] * 60 + [hook.PLEX_PACE] * 2 + [hook.PLEX_QUIET, hook.PLEX_PACE]
     done = [r for r in log_lines(env) if r.get("outcome") == "edited"]
@@ -1499,7 +1502,7 @@ def test_a_ctrl_c_during_an_edit_of_a_backfill_ends_that_file_and_stops(env, mon
                                                                    and os.kill(os.getpid(), signal.SIGINT)) or real(argv, **k))
     handler = signal.signal(signal.SIGINT, signal.SIG_IGN) if ignored else signal.getsignal(signal.SIGINT)
     try:
-        hook.main(["--backfill", "radarr", "--apply"])
+        hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     except KeyboardInterrupt:
         pytest.fail("Ctrl+C raised KeyboardInterrupt")
     finally:
@@ -1526,7 +1529,7 @@ def test_a_backfill_burst_confirms_the_section_once(env, monkeypatch, tmp_path, 
             logged.append((len(analyzes(env)), len([r for r in log_lines(env) if r.get("plex_section")])))
         real_sleep(sec)
     monkeypatch.setattr(hook.time, "sleep", sleep)
-    hook.main(["--backfill", "radarr", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     assert logged == [(1, 1), (2, 2), (3, 3)]
     assert analyzes(env) == ["/library/metadata/7101/analyze", "/library/metadata/7102/analyze", "/library/metadata/7103/analyze"]
     assert env["checks"] == checks
@@ -1595,7 +1598,7 @@ def test_backfill_arguments(env, monkeypatch):
     monkeypatch.setattr(hook, "process", lambda ctx: seen.append(ctx.label) or {"outcome": "no_change", "result": "no change"})
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     monkeypatch.setattr(hook.subprocess, "run", lambda *a, **k: None)
-    hook.main(["--backfill", "radarr", "--ids", "101", "--limit", "5", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--ids", "101", "--limit", "5", "--apply"])
     assert seen == ["Movie 101 (2000)"]
     with pytest.raises(SystemExit) as ex:
         hook.main(["--backfill", "radarr", "--limit"])
@@ -1611,7 +1614,7 @@ def test_backfill_apply_writes_the_undo_record_before_a_failed_reprobe(env, monk
     monkeypatch.setattr(hook, "mkvmerge", lambda p: next(probes))
     real_run = hook.subprocess.run
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: None if argv[0] == "ionice" else real_run(argv, **k))
-    hook.main(["--backfill", "radarr", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     lines = log_lines(env)
     assert [r["result"] for r in lines][0] == "editing" and lines[0]["undo"]   # the undo record, then the decision line with the error
     assert [(r["outcome"], r["source"]) for r in lines[1:]] == [("error", "backfill")]
@@ -1628,10 +1631,272 @@ def test_backfill_analyzes_one_item_at_a_time(env, monkeypatch, tmp_path):
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     real_run = hook.subprocess.run
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: None if argv[0] == "ionice" else real_run(argv, **k))
-    hook.main(["--backfill", "radarr", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     assert analyzes(env) == ["/library/metadata/7101/analyze", "/library/metadata/7102/analyze"]
     assert env["sleeps"] == [hook.PLEX_QUIET, hook.PLEX_PACE] * 2   # one lookup, two idle checks, then a pause
     assert env["checks"] == [0, 15, 17, 32]
+
+
+# --- a backfill of every instance, and the queue of a bare backfill (2.12.0) -----------------------------------------
+
+def libraries(env, monkeypatch, settings, files, fail=None):
+    """Fake libraries for a backfill of every instance: files is {instance: [name, ...]}, and each instance has an API
+    key. Each file is real, in a folder of its instance, and lasts 100 minutes. An instance in fail raises its error
+    there instead of listing. The flag backfill of each file is faked too: it plans a header repair. Returns ({instance:
+    [path, ...]}, the runs of the flag backfill as (instance, path) in order)."""
+    settings(**{app: {"api_key": f"key-{app}"} for app in files})
+    root, runs, fail, real = os.path.dirname(os.path.dirname(env["path"])), [], fail or {}, hook.app_list
+    lists = {app: [os.path.join(root, app, n) for n in names] for app, names in files.items()}
+    for p in (p for ps in lists.values() for p in ps):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").close()
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+
+    def library(app):
+        return lambda items, ids=(), paths=None: ([({"id": 11 + i, "movieId": 7 + i, "path": p}, (os.path.basename(p), "English", 100, None, False, {}))
+                                                    for i, p in enumerate(lists[app]) if not ids or 7 + i in ids], len(lists[app]))
+    for app in files:
+        monkeypatch.setattr(hook.ARR[app], "library", library(app))
+
+    def app_list(app):
+        if app in fail:
+            raise fail[app]
+        return [] if app in lists else real(app)
+    monkeypatch.setattr(hook, "app_list", app_list)
+
+    def one(app, f, info, a, keep_plan, pool=None, job=None):
+        runs.append((app, f["path"]))
+        rec = dict(app=app, source="backfill", apply=a.apply, ids={"app_id": f["movieId"], "file_id": f["id"]}, label=info[0], path=f["path"],
+                   outcome="no_change" if a.apply else "dry_run")
+        if keep_plan:
+            rec["plan"] = {"app": app, "label": info[0], "path": f["path"], "class": "c", "edits": [], "undecided": None, "dropped": [], "cls": None,
+                           "orig": [], "tracks": [], "header_repair": "would_repair_header"}
+        return 0.0, rec
+    monkeypatch.setattr(hook, "backfill_file", one)
+    return lists, runs
+
+
+SHOWS = {"radarr": ["A.avi", "B.mkv"], "sonarr": ["C.mp4", "D.mkv"]}
+
+
+def queued_paths():
+    """{path: instance} of the jobs a backfill queued that wait."""
+    return {j["path"]: j["app"] for j in map(hook.job_of, hook.deep_analysis_queued()) if j.get("backfill")}
+
+
+def test_a_bare_backfill_queues_every_file_of_every_instance(env, monkeypatch, settings, capsys):
+    """Owner 2026-10-13: a backfill with no pass flag puts each file the apps list in the background queue, as if the app
+    had imported it. The dry run names the files and their hours of video, probes none and queues nothing. A file with
+    a job of its path that waits keeps that job, so a second apply queues no double."""
+    lists, runs = libraries(env, monkeypatch, settings, SHOWS)
+    monkeypatch.setattr(hook, "mkvmerge", lambda p: pytest.fail("a queue probes no file"))
+    settings(subtitles="deep")
+    deep = queue_analysis(env, lists["sonarr"][1])   # the deep analysis an import queued
+    hook.main(["--backfill"])
+    out = capsys.readouterr().out
+    assert hook.deep_analysis_queued() == [deep] and runs == [] and out.index("== radarr") < out.index("== sonarr"), out
+    assert "".join(f"would queue: {p}\n" for p in lists["radarr"]) + "radarr: 2 files to queue, dry run, 3.3 hours of video, 2 of 2" in out, out
+    assert f"would queue: {lists['sonarr'][0]}\nsonarr: 1 file to queue, dry run, 1.7 hours of video, 2 of 2" in out, out
+    assert not os.path.exists(os.path.join(hook.CFG.state_dir, "status.json")) and hook.store.items("scan") == {}   # RV2 2026-10-13
+    hook.main(["--backfill", "--apply"])
+    out = capsys.readouterr().out   # the import's deep analysis takes its file
+    assert "radarr: 2 files queued, 3.3 hours" in out and "sonarr: 1 file queued, 1.7 hours of video, 0 of 2 files left" in out and runs == []
+    assert os.path.exists(os.path.join(hook.CFG.state_dir, "status.json"))
+    assert queued_paths() == {**dict.fromkeys(lists["radarr"], "radarr"), lists["sonarr"][0]: "sonarr"} and hook.deep_analysis_queued()[0] == deep
+    job = hook.job_of(hook.deep_name(lists["radarr"][0]))
+    assert (job["inputs"]["label"], job["ids"]["app_id"], job["ids"]["file_id"]) == ("A.avi", 7, 11), job
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert "radarr: the pass is done, so nothing was queued" in capsys.readouterr().out and len(hook.deep_analysis_queued()) == 4
+    hook.main(["--backfill", "radarr", "--apply", "--restart"])
+    assert "radarr: 0 files queued" in capsys.readouterr().out and len(hook.deep_analysis_queued()) == 4   # a job of the path stays
+
+
+def test_ids_paths_and_limit_narrow_the_queue(env, monkeypatch, settings, capsys):
+    lists, _ = libraries(env, monkeypatch, settings, {"radarr": ["A.mkv", "B.mkv", "E.mkv"]})
+    a, b, e = lists["radarr"]
+    hook.main(["--backfill", "radarr", "--apply", "--limit", "1"])
+    assert set(queued_paths()) == {a}
+    hook.main(["--backfill", "radarr", "--apply", "--ids", "8"])
+    assert set(queued_paths()) == {a, b}
+    hook.main(["--backfill", "radarr", "--apply", "--paths", e, "/nowhere.mkv"])
+    assert set(queued_paths()) == {a, b, e} and "not in this run's work list, skipped: /nowhere.mkv" in capsys.readouterr().out
+
+
+def test_a_plan_option_runs_the_flag_backfill_of_every_instance(env, monkeypatch, settings, tmp_path):
+    """--plan-out runs the flag backfill over the .mkv files of each instance, as a bare backfill did before 2.12.0. One
+    file holds the plans of every instance. An apply from it with --canary 1 takes one file of each instance. An apply
+    may write its plans over the plan file it reads."""
+    lists, runs = libraries(env, monkeypatch, settings, {"radarr": ["A.avi", "B.mkv", "E.mkv"], "sonarr": ["C.mp4", "D.mkv"]})
+    mkv = [(app, p) for app, ps in lists.items() for p in ps if p.endswith(".mkv")]
+    plans = tmp_path / "plans" / "all.jsonl"   # --plan-out makes the folder
+    hook.main(["--backfill", f"--plan-out={plans}"])
+    assert os.path.exists(os.path.join(hook.CFG.state_dir, "status.json"))   # a dry flag backfill records the policy
+    assert runs == mkv and sorted((r["app"], r["path"]) for r in map(json.loads, plans.read_text().splitlines())) == sorted(mkv)
+    runs.clear()
+    hook.main(["--backfill", "--apply", "--plan-from", str(plans), "--canary", "1"])
+    assert [app for app, _ in runs] == ["radarr", "sonarr"], runs
+    runs.clear()
+    hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans), "--plan-out", str(plans)])
+    assert runs == mkv[:2] and hook.deep_analysis_queued() == [], runs
+
+
+def test_a_backfill_with_no_instance_needs_one_for_ids_paths_and_force_convert(env, monkeypatch, settings, capsys):
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    settings(keep_days=7)   # so --force-convert meets every other rule
+    for extra in (["--ids", "7"], ["--paths", "/m/A.mkv"], ["--convert", "--apply", "--force-convert", "/m/A.avi"]):
+        with pytest.raises(SystemExit) as ex:
+            hook.main(["--backfill", *extra])
+        assert ex.value.code == 2 and "need an instance" in capsys.readouterr().err, extra
+
+
+def test_a_stop_ends_the_whole_backfill(env, monkeypatch, settings, capsys):
+    """SIGTERM during the flag backfill of the first instance lets its file end, and no other instance starts."""
+    lists, runs = libraries(env, monkeypatch, settings, SHOWS)
+    one = hook.backfill_file
+
+    def stopped(*args, **kw):
+        got = one(*args, **kw)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return got
+    monkeypatch.setattr(hook, "backfill_file", stopped)
+    hook.main(["--backfill", "--apply", *FLAG_PASS])
+    assert runs == [("radarr", lists["radarr"][1])] and "== sonarr" not in capsys.readouterr().out, runs
+
+
+def test_a_stop_during_a_scan_ends_the_whole_run(env, monkeypatch, settings, capsys):
+    """SIGTERM during the audio scan of the first instance starts no scan of the next one."""
+    libraries(env, monkeypatch, settings, SHOWS)
+    seen = []
+    monkeypatch.setattr(hook, "scan_file", lambda kind, app, w, stop: seen.append(app) or os.kill(os.getpid(), signal.SIGTERM))
+    hook.main(["--backfill", "--check-audio", "--workers", "1"])
+    assert seen == ["radarr"] and "== sonarr" not in capsys.readouterr().out, seen
+
+
+@pytest.mark.parametrize("error, why", [(ConnectionRefusedError(111, "Connection refused"), "ConnectionRefusedError: [Errno 111] Connection refused"),
+                                        (SystemExit("RADARR_URL is set, but the Radarr API key does not read"),   # app_list() of an instance set up in part
+                                         "RADARR_URL is set, but the Radarr API key does not read")])
+def test_one_failing_instance_lets_the_others_run_and_exits_non_zero(env, monkeypatch, settings, capsys, error, why):
+    lists, _ = libraries(env, monkeypatch, settings, SHOWS, fail={"radarr": error})
+    with pytest.raises(SystemExit) as ex:
+        hook.main(["--backfill", "--apply"])
+    assert ex.value.code == "the backfill failed for radarr" and set(queued_paths().values()) == {"sonarr"}
+    assert f"radarr: the backfill stopped: {why}" in capsys.readouterr().out
+    assert [r["note"] for r in log_lines(env) if r.get("result") == "error"] == [why]
+
+
+def test_a_backfill_with_no_instance_skips_one_not_set_up_and_names_a_broken_one(env, monkeypatch, settings, capsys, tmp_path):
+    """An instance with no key, no config.xml and a shipped URL is not set up. A config.xml with no API key is a
+    broken setup, so the run takes the instance and names its error."""
+    libraries(env, monkeypatch, settings, {"radarr": SHOWS["radarr"]})
+    settings(sonarr={"api_key": "", "dir": "/nonexistent/sonarr"})
+    hook.main(["--backfill", "--apply"])
+    assert set(queued_paths().values()) == {"radarr"} and "== sonarr: not set up, skipped" in capsys.readouterr().out
+    (tmp_path / "sonarr").mkdir()
+    (tmp_path / "sonarr" / "config.xml").write_text("<Config></Config>")
+    settings(sonarr={"api_key": "", "dir": str(tmp_path / "sonarr")})
+    with pytest.raises(SystemExit):
+        hook.main(["--backfill"])
+    assert "== sonarr\nsonarr: the backfill stopped: " in capsys.readouterr().out
+
+
+def test_drop_queued_drops_only_the_jobs_a_backfill_queued(env, monkeypatch, settings, capsys):
+    """--drop-queued drops the waiting and the running jobs a backfill queued, of one instance or of every one. The deep
+    analysis of an import stays. --selftest counts the jobs."""
+    lists, _ = libraries(env, monkeypatch, settings, SHOWS)
+    settings(subtitles="deep")
+    deep = queue_analysis(env, env["path"])
+    hook.main(["--backfill", "--apply"])
+    assert hook.claim(hook.deep_name(lists["sonarr"][1]))   # a job a worker runs
+    hook.main(["--selftest"])
+    assert "background queue: 5 jobs, 4 of them queued by a backfill\n" in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--drop-queued"])
+    assert set(queued_paths().values()) == {"sonarr"} and "dropped 2 jobs that a backfill queued" in capsys.readouterr().out
+    hook.main(["--backfill", "--drop-queued"])
+    assert hook.deep_analysis_queued() == [deep] and claimed() == [] and "dropped 2 jobs" in capsys.readouterr().out
+
+
+def test_imports_and_rechecks_go_before_the_jobs_a_backfill_queued(env, monkeypatch, settings):
+    """Owner 2026-10-13: the burn-in jobs, the deep analyses of imports, the rechecks, the jobs a backfill queued, then the
+    deep analyses those jobs queued, each kind oldest first. A new import of the path replaces such a deep analysis
+    with its own, which goes ahead again."""
+    lists, _ = libraries(env, monkeypatch, settings, {"radarr": ["A.mkv", "B.mkv", "C.mkv"]})
+    a, b, c = lists["radarr"]
+    settings(subtitles="deep")
+    later = hook.queue_deep_analysis({"app": "radarr"}, {"path": b, "tracks": [{"i": "s1"}], "job": hook.deep_name(b)}, dict(INPUTS))
+    hook.main(["--backfill", "radarr", "--apply", "--paths", a])
+    hook.queue_listed("radarr", {"path": env["path"]}, ("Film A (1979)", "English", 120, None, False, {}), recheck="sub_check")
+    deep = queue_analysis(env, c)
+    burn = hook.burn_name(c)
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", burn, time.time(), json.dumps({"app": "radarr", "path": c}))
+    assert hook.deep_analysis_queued() == [burn, deep, hook.deep_name(env["path"]), hook.deep_name(a), later]
+    enqueue(env, 0, env["path"])
+    order = []
+    monkeypatch.setattr(hook, "run_job", lambda n, pending, **k: order.append("import") or hook.drop_job(n))
+    kind = lambda j: "backfill" if j.get("backfill") else "recheck" if j.get("recheck") else "later" if j.get("from") else "deep"
+    monkeypatch.setattr(hook, "deep_analysis", lambda n, pending, claimed=False: order.append(kind(hook.job_of(n))) or hook.drop_job(n))
+    monkeypatch.setattr(hook, "burn_in", lambda n, pending, claimed=False: order.append("burn") or hook.drop_job(n))
+    run_worker()
+    assert order == ["import", "burn", "deep", "recheck", "backfill", "later"], order
+    later = hook.queue_deep_analysis({"app": "radarr"}, {"path": b, "tracks": [{"i": "s1"}], "job": hook.deep_name(b)}, dict(INPUTS))
+    assert hook.queue_deep_analysis({"app": "radarr"}, {"path": b, "tracks": [{"i": "s1"}]}, dict(INPUTS)) == later
+    hook.main(["--backfill", "radarr", "--apply", "--paths", a, "--restart"])
+    assert hook.deep_analysis_queued() == [later, hook.deep_name(a)]   # the import's own
+
+
+def test_a_queue_resumes_where_its_last_run_stopped(env, monkeypatch, settings, capsys):
+    """Owner 2026-10-13: a bare backfill keeps its place per instance, as a scan does. Each --limit N --apply queues the
+    next N files, a run after the pass queues nothing, and --restart starts a new pass. An --ids run keeps its own
+    place. A dry run writes no state and names the next files."""
+    lists, _ = libraries(env, monkeypatch, settings, {"radarr": ["A.mkv", "B.mkv", "E.mkv"]})
+    a, b, e = lists["radarr"]
+    place = lambda: hook.store.get("scan", "queue-radarr", {}).get("last")
+    hook.main(["--backfill", "radarr", "--apply", "--limit", "1"])
+    assert set(queued_paths()) == {a} and place() == 11 and "would queue" not in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--limit", "1"])
+    assert f"would queue: {b}\nradarr: 1 file to queue, dry run" in capsys.readouterr().out and place() == 11
+    hook.main(["--backfill", "radarr", "--apply", "--limit", "1"])
+    assert set(queued_paths()) == {a, b} and place() == 12
+    hook.store.write("DELETE FROM jobs")   # the worker ran them
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert set(queued_paths()) == {e} and "1 file queued, 1.7 hours of video, 0 of 3 files left in this pass" in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert "radarr: the pass is done, so nothing was queued. --restart starts a new pass." in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--apply", "--ids", "8"])
+    assert set(queued_paths()) == {b, e} and place() == 13
+    hook.main(["--backfill", "radarr", "--apply", "--ids", "7"])   # other ids start their own pass again
+    assert set(queued_paths()) == {a, b, e}
+    hook.store.write("DELETE FROM jobs")
+    hook.main(["--backfill", "radarr", "--apply", "--restart", "--limit", "2"])
+    assert set(queued_paths()) == {a, b} and place() == 12
+
+
+def test_a_file_missing_on_disk_stays_in_the_pass(env, monkeypatch, settings, capsys):
+    """Re-reviewer 2026-10-13: the app lists the files while their mount is away. The run queues none and keeps each
+    in the pass, so the next run queues the first. Before, the run counted every file as taken and ended the pass."""
+    lists, _ = libraries(env, monkeypatch, settings, {"radarr": ["A.mkv", "B.mkv", "C.mkv"]})
+    for p in lists["radarr"]:
+        os.rename(p, p + ".away")
+    hook.main(["--backfill", "radarr", "--apply", "--limit", "1"])
+    assert "radarr: 0 files queued, 0.0 hours of video, 3 of 3 files left" in capsys.readouterr().out and queued_paths() == {}
+    for p in lists["radarr"]:
+        os.rename(p + ".away", p)
+    hook.main(["--backfill", "radarr", "--apply", "--limit", "1"])
+    assert set(queued_paths()) == {lists["radarr"][0]}
+
+
+def test_a_waiting_recheck_leaves_its_file_in_the_pass(env, monkeypatch, settings, capsys):
+    """Re-reviewer 2026-10-13: a recheck repeats only the subtitle check, so a file whose path holds one stays in the
+    pass. The next run after the recheck queues it, and C, taken already, is not queued again."""
+    lists, _ = libraries(env, monkeypatch, settings, {"radarr": ["A.mkv", "B.mkv", "C.mkv"]})
+    a, b, c = lists["radarr"]
+    hook.queue_listed("radarr", {"path": b}, ("B.mkv", "English", 100, None, False, {}), recheck="import")
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert set(queued_paths()) == {a, c} and "2 files queued, 3.3 hours of video, 1 of 3 files left" in capsys.readouterr().out
+    hook.store.write("DELETE FROM jobs")   # the worker ran them
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert set(queued_paths()) == {b} and "1 file queued, 1.7 hours of video, 0 of 3 files left" in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--apply"])
+    assert "radarr: the pass is done" in capsys.readouterr().out
 
 
 # --- broken audio --------------------------------------------------------------------------------
@@ -2251,6 +2516,22 @@ def test_an_ids_audio_scan_keeps_its_own_state(env, monkeypatch, tmp_path):
     assert (scan_state(base), scan_rows(base)) == full
     assert scan_state(base + "-ids")["last"] == 103
     assert not [n for n in os.listdir(hook.CFG.state_dir) if n.endswith(".tmp")]
+
+
+def test_a_scan_after_its_pass_starts_a_new_pass_and_list(env, monkeypatch, tmp_path):
+    """A scan run after the pass is done starts a new pass, which drops the list of the last one. An --ids run starts
+    a new pass each time. See cli.pass_left()."""
+    scan_library(monkeypatch, tmp_path, 2)
+    base, doubt = os.path.join(hook.CFG.state_dir, "video-scan-radarr"), [True]
+    monkeypatch.setattr(hook, "check_video", lambda path, dur, again=False, hp=None: (None, ["doubt"] if doubt[0] else [], {"fault": None}))
+    hook.main(["--backfill", "radarr", "--check-video"])
+    assert len(scan_rows(base)) == 2
+    doubt[0] = False
+    hook.main(["--backfill", "radarr", "--check-video", "--limit", "1"])
+    assert scan_state(base)["checked"] == 1 and scan_rows(base) == []
+    for _ in range(2):
+        hook.main(["--backfill", "radarr", "--check-video", "--ids", "1", "2", "--limit", "1"])
+        assert (scan_state(base + "-ids")["last"], scan_state(base + "-ids")["checked"]) == (101, 1)
 
 
 def test_a_timeout_while_sampling_a_pack_uses_no_cap_count(env, monkeypatch, tmp_path):
@@ -2942,7 +3223,7 @@ def test_an_import_edit_waits_for_the_files_in_flight_never_for_queued_hearings(
     env["probe"] = copy.deepcopy(UND_AUDIO)   # one und track a file, so every file is heard
     backfill_movies(env, tmp_path, 6)
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    run = threading.Thread(target=hook.main, args=(["--backfill", "radarr", "--workers", "6"],))
+    run = threading.Thread(target=hook.main, args=(["--backfill", "radarr", *FLAG_PASS, "--workers", "6"],))
     run.start()
     threading.Event().wait(1.0)   # the first hearing is done, the other workers wait for the model
     t0 = time.perf_counter()
@@ -2964,7 +3245,7 @@ def test_a_file_that_changed_during_its_hearing_is_planned_again(env, monkeypatc
         return "eng"
     lid(env, monkeypatch, tmp_path, answer)
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS])
     recs = [r for r in log_lines(env) if r.get("outcome")]
     assert len(env["lid"]) == 2 and [r["outcome"] for r in recs] == ["dry_run"], recs   # heard again, with the lock exclusive
     assert ["track:=2", "en", "und", "language"] in recs[0]["edits"]
@@ -3029,12 +3310,12 @@ def test_a_dry_run_reads_files_side_by_side_under_the_shared_lock(env, monkeypat
     monkeypatch.setattr(hook.fcntl, "flock", flock)
     monkeypatch.setattr(hook, "process", process)
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr", "--workers", "3"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--workers", "3"])
     assert "6 mkv files, each read for its own tracks, dry run, 3 at a time" in capsys.readouterr().out
     assert [r["label"] for r in log_lines(env) if r.get("outcome")] == [f"Film A {i} (1979)" for i in range(6)]   # in file order
     assert set(ops) == {hook.fcntl.LOCK_SH} and peak[0] > 1 and env["mkvpropedit"] == []
     with pytest.raises(SystemExit):
-        hook.main(["--backfill", "radarr", "--apply", "--workers", "2"])   # an apply edits one file at a time
+        hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply", "--workers", "2"])   # an apply edits one file at a time
 
 
 def test_an_apply_takes_the_lock_exclusive_only_for_the_edit_and_replans_a_changed_file(env, monkeypatch, tmp_path):
@@ -3051,7 +3332,7 @@ def test_an_apply_takes_the_lock_exclusive_only_for_the_edit_and_replans_a_chang
     monkeypatch.setattr(hook.fcntl, "flock", flock)
     monkeypatch.setattr(hook.arr_meta, "expected_languages", tmdb)
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr", "--apply"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
     recs = [r for r in log_lines(env) if r.get("outcome")]
     assert [r["outcome"] for r in recs] == ["edited"] and len(env["mkvpropedit"]) == 1
     # checks shared, the lock traded for the edit, the file changed, so the file runs again with the lock exclusive
@@ -3071,7 +3352,7 @@ def test_backfill_selects_files_by_their_own_tracks(env, monkeypatch, tmp_path, 
         movies.append(dict(env["movies"]["movie/7"], id=i, title=name, movieFile={"id": i, "path": str(path), "mediaInfo": mi}))
     env["movies"]["movie"] = movies
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS])
     assert '"not_selected": 1' in capsys.readouterr().out
     recs = [r for r in log_lines(env) if r.get("outcome")]
     assert [r["label"] for r in recs] == ["Film E (1979)", "Untagged (1979)"]
@@ -4244,7 +4525,7 @@ def test_a_scan_takes_its_workers_from_the_env_file_unless_given(env, monkeypatc
 @pytest.mark.parametrize("args", [["--check-video", "--workers", "0"], ["--apply", "--workers", "2"]])
 def test_workers_needs_one_or_more_and_a_dry_run_or_a_scan(args):
     with pytest.raises(SystemExit):
-        hook.backfill(["radarr"] + args)
+        hook.backfill_args(["radarr"] + args)
 
 
 # --- a file the app moved before the worker reached it --------------------------------------------
@@ -11052,12 +11333,12 @@ def test_a_backfill_checks_subtitles_only_with_sub_check(env, monkeypatch, capsy
 
 def test_a_backfill_with_sub_check_skips_a_file_it_checked(env, monkeypatch, capsys):
     """A cached verdict that asks for nothing more skips the file, so a stopped run goes on where it stopped. A file that
-    changed since is checked again."""
+    changed since is checked again. The apply makes the flag edit the file needs, so its verdict asks for nothing more."""
     japanese_film(env, ("eng", False, {}))
     hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
     env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr", "--sub-check"])
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
     assert len(env["words"]) == 1 and hook.sub_cached(env["path"])
     hook.main(["--backfill", "radarr", "--sub-check"])
     assert len(env["words"]) == 1 and '"subtitles_cached": 1' in capsys.readouterr().out
@@ -11073,6 +11354,35 @@ def test_sub_check_runs_with_the_flag_backfill_only(env, monkeypatch):
         assert ex.value.code == 2
 
 
+def test_a_dry_run_that_plans_a_flag_edit_leaves_the_file_for_the_apply(env, monkeypatch, capsys):
+    """The subtitles match and need nothing, but the flags need an edit. The dry run's result asks for that edit, so a
+    dry run started again and the apply after it take the file. Before 2.12.0 they skipped the file as checked."""
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    last = lambda: [r for r in log_lines(env) if "schema" in r][-1]["outcome"]
+    for _ in range(2):
+        hook.main(["--backfill", "radarr", "--sub-check"])
+        assert last() == "dry_run" and not hook.sub_cached(env["path"]) and "subtitles_cached" not in capsys.readouterr().out
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert env["mkvpropedit"] and last() == "edited" and hook.sub_cached(env["path"])
+
+
+def test_a_flag_edit_that_fails_leaves_the_file_for_the_next_apply(env, monkeypatch):
+    """Reviewer 2026-10-13: mkvpropedit fails, so the flags stay as they were. The result asks for the edit, so the
+    next --sub-check takes the file again."""
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    real = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(returncode=2, stdout="", stderr="bad")
+                        if argv[0] == "mkvpropedit" else real(argv, **kw))
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert [r for r in log_lines(env) if "schema" in r][-1]["outcome"] in ("edit_failed", "verify_failed") and not hook.sub_cached(env["path"])
+
+
 def test_a_backfill_takes_only_the_listed_paths(env, monkeypatch, tmp_path, capsys):
     other = tmp_path / "media" / "Other.mkv"
     other.write_bytes(b"x")
@@ -11081,7 +11391,7 @@ def test_a_backfill_takes_only_the_listed_paths(env, monkeypatch, tmp_path, caps
     seen = []
     monkeypatch.setattr(hook, "process", lambda ctx: seen.append(ctx.path) or {"outcome": "no_change", "result": "no change"})
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
-    hook.main(["--backfill", "radarr", "--paths", str(other), "/nowhere.mkv"])
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--paths", str(other), "/nowhere.mkv"])
     assert seen == [str(other)] and "not in this run's work list, skipped: /nowhere.mkv" in capsys.readouterr().out
 
 
@@ -11311,11 +11621,12 @@ def test_a_sidecar_with_no_place_to_keep_its_original_stays(env, monkeypatch, se
     assert hook.stopped_at(rec["findings"][0], "done") is None
 
 
-def test_a_new_sidecar_undoes_the_backfill_skip(env, monkeypatch, tmp_path, capsys):
+def test_a_new_sidecar_undoes_the_backfill_skip(env, monkeypatch, settings, tmp_path, capsys):
     """A file with only a sidecar is taken by --sub-check. A sidecar Bazarr writes later makes the file new again."""
     sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.RIGHT))
     env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    settings(subtitles="off")
     hook.main(["--backfill", "radarr"])
     assert "words" not in env   # one audio track and no subtitle track: the flag backfill leaves it out
     hook.main(["--backfill", "radarr", "--sub-check"])
@@ -15639,6 +15950,23 @@ def test_a_deep_analysis_yields_before_its_remux_when_an_import_waits(env, monke
     assert len(fits) == 2 and got == [] and len(yielded) == 1 and hook.deep_analysis_queued() == [name], (fits, got, yielded)
 
 
+def test_a_deep_analysis_that_converted_its_file_yields_before_its_remux(env, monkeypatch, settings):
+    """Re-reviewer 2026-10-13: the deep analysis converts a .mkv that holds MP4, and an import arrives during the fit of
+    the French track. The job still yields before its remux. Only a job a backfill queued yields no more after its
+    conversion."""
+    settings(subtitles="deep")
+    got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    env["mkv_probe"] = dict(env["probe"], container=dict(env["probe"]["container"], type="Matroska"))   # the same tracks after the conversion
+    mp4_named_mkv(env)
+    monkeypatch.setattr(hook, "full_read", lambda p, j: {"cues": {}, "tracks": [], "took": 0, "cpu": 0, "why": None})
+    real, fits = hook.arr_subsync.reference, []
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: fits.append(enqueue(env, 1, "/other.mkv")) or real(*a, **k))
+    name = queue_analysis(env, env["path"])
+    hook.deep_analysis(name, [])
+    yielded = [r for r in log_lines(env) if r.get("result") == "yielded"]
+    assert (len(env["repacks"]), len(fits), got, len(yielded), hook.deep_analysis_queued()) == (1, 1, [], 1, [name]), [(r.get("outcome"), r.get("result")) for r in log_lines(env)]
+
+
 def test_an_import_names_its_job_in_its_decision_line(env):
     """A tester could not tie the queued line of an import to its result line. process() gives the import a new record,
     and the job file name goes back on it, so the summary line carries job= too."""
@@ -18153,7 +18481,7 @@ def test_the_mark_follows_a_remux_and_a_flag_edit_of_amg_itself(env):
         f.write(b"x")
     assert not hook.muted(env["path"]) and not hook.store.items("burned_in_muted")
     hook.mute_mark(env["path"])
-    ctx = types.SimpleNamespace(path=env["path"], st=os.stat(env["path"]), rec={})
+    ctx = types.SimpleNamespace(path=env["path"], st=os.stat(env["path"]), rec={}, yields=False)
     os.replace(env["path"], env["path"] + ".tmp")   # a remux of AMG's own, see process.refresh()
     shutil.copy(env["path"] + ".tmp", env["path"])
     hook.refresh(ctx)
@@ -18557,9 +18885,9 @@ def check_listed(env, monkeypatch, scene=""):
     return asked
 
 
-def checked(env):
-    """The decision lines of --check."""
-    return [r for r in log_lines(env) if "schema" in r and r["source"] == "check"]
+def checked(env, source="check"):
+    """The decision lines of --check, or of the jobs a backfill queued with source backfill_job."""
+    return [r for r in log_lines(env) if "schema" in r and r["source"] == source]
 
 
 def test_check_dry_run_changes_nothing_and_says_what_an_import_would_do(env, monkeypatch, capsys):
@@ -18651,7 +18979,7 @@ def test_check_never_regrabs_a_certain_fault_and_alerts_instead(env, monkeypatch
     assert not hook.store.items("regrabs") and not hook.store.items("unit")
     posts = [b for m, u, b in env["http"] if m == "POST"]
     assert len(posts) == apply and (not apply or posts[0]["embeds"][0]["title"].endswith(", would re-grab")), posts
-    assert "An import would re-grab the file. --check never re-grabs, so it was kept." in capsys.readouterr().out
+    assert "An import would re-grab the file. This check never re-grabs, so it was kept." in capsys.readouterr().out
     if kind == "content":
         assert rec["outcome"] == "would_regrab" and rec["result"].startswith("would re-grab: ")
 
@@ -19061,6 +19389,255 @@ def test_check_never_regrabs_for_burned_in_subtitles(env, burn, monkeypatch, set
     first, b = checked(env)
     assert b["findings"][0]["action"] == {"code": "check", "kind": "burned_in"} and env["writes"] == [] and locks == [True], (b, locks)
     assert [t for t, _ in posted(env)][-1] == "Burned-in subtitles, would re-grab"
+
+
+# --- a job a bare backfill queued (docs/commands.md, "Dry runs and the backfill") ----------------------------------
+
+def backfill_job(env, monkeypatch):
+    """A bare backfill --apply of radarr, which lists the env's film. Returns the name of the job it queued."""
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--apply"])
+    name = hook.deep_name(env["path"])
+    assert hook.deep_analysis_queued() == [name] and hook.job_of(name)["backfill"]
+    return name
+
+
+@pytest.mark.parametrize("kind", ["audio", "content"])
+def test_a_job_a_backfill_queued_runs_as_check_apply_and_never_regrabs(env, monkeypatch, settings, kind):
+    """Owner 2026-10-13: the worker runs a job a backfill queued as --check --apply runs its file. A certain fault that
+    an import re-grabs gets its second check and only alerts. Nothing is deleted or searched. Reviewer 2026-10-13: the
+    alert names the backfill as its check, and no command."""
+    check_fault(env, monkeypatch, kind)
+    settings(regrab=set(hook.REGRAB_KINDS), restore=True)
+    name = backfill_job(env, monkeypatch)
+    hook.background(name, [])
+    (rec,) = checked(env, "backfill_job")
+    (f,) = [f for f in rec["findings"] if f.get("action")]
+    assert (f["kind"], f["action"], rec["job"], rec["apply"]) == (kind, {"code": "check", "kind": kind}, name, True), rec
+    assert env["writes"] == [] and os.path.exists(env["path"]) and not hook.store.items("regrabs") and hook.store.read("SELECT name FROM jobs") == []
+    assert [t for t, _ in posted(env)][0].endswith(", would re-grab"), posted(env)
+    emb = [e for m, u, b in env["http"] if m == "POST" and "discord" in u for e in b["embeds"]][0]
+    assert emb["fields"][0] == {"name": "Check", "value": "Backfill check", "inline": True} and "--" not in emb["description"], emb
+
+
+def test_a_job_a_backfill_queued_queues_its_burn_in_check_and_deep_analysis(env, burn, monkeypatch, settings):
+    """The quick check flags the file, and at SUBTITLES deep the file has a subtitle. So the job queues the full
+    burned-in check and the deep analysis, as an import does, and each takes its own place in the queue. The burn-in job
+    never re-grabs: Chinese text burned in over Japanese audio only alerts."""
+    japanese_film(env, ("eng", True, {}))
+    settings(regrab={"burned_in"}, subtitles="deep")
+    check_listed(env, monkeypatch)
+    name = backfill_job(env, monkeypatch)
+    hook.background(name, [])
+    assert hook.deep_analysis_queued() == [hook.burn_name(env["path"]), name] and "backfill" not in hook.job_of(name)
+    assert burn_job(env)["grab"]["check"] == "listed"
+    hook.background(hook.burn_name(env["path"]), [])
+    b = [r for r in log_lines(env) if "schema" in r][-1]
+    assert b["source"] == "burn_in" and b["findings"][0]["action"] == {"code": "check", "kind": "burned_in"} and env["writes"] == [], b
+    assert {c[6] for c in burn["calls"] if c[0] == "full"} == {hook.store.path()}   # a job of the queue yields to an import
+
+
+def test_a_file_with_a_current_deep_analysis_gets_no_new_one(env, monkeypatch, settings):
+    """The job's import check makes no change, and keeps the saved deep analysis of the file, which still holds. So the
+    job queues no deep analysis, and the next backfill finds the result too."""
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    check_listed(env, monkeypatch)
+    settings(subtitles="deep")
+    hook.sub_cache(env["path"], {}, "deep", "radarr", False)
+    name = backfill_job(env, monkeypatch)
+    hook.background(name, [])
+    (rec,) = checked(env, "backfill_job")
+    assert rec["outcome"] == "no_change" and rec.get("subcheck") and hook.deep_analysis_queued() == [] and hook.DEADLINE.end is None, rec
+    assert hook.arr_lid.verdict_get(os.path.join(hook.CFG.state_dir, "lid.sqlite"), env["path"])[0]["mode"] == "deep"
+
+
+def test_a_job_a_backfill_queued_reaches_a_file_whose_subtitle_check_is_saved(env, monkeypatch):
+    """Reviewer 2026-10-13: --sub-check saved the file as checked. The app then gives the film another original
+    language. The job a bare backfill queues still decides the flags again."""
+    japanese_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert hook.sub_cached(env["path"])
+    before = len(env["mkvpropedit"])
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "English"}
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    hook.background(backfill_job(env, monkeypatch), [])
+    assert env["mkvpropedit"][before:]
+
+
+@pytest.mark.parametrize("step", ["convert", "remux", "header"])
+def test_a_backfill_job_yields_to_an_import_before_a_conversion_or_a_remux(env, monkeypatch, tmp_path, step):
+    """Reviewer 2026-10-13: a job a backfill queued stops for an import that waits before a conversion and before a
+    remux, as the deep analysis does. Its job stays queued, and its next run makes the change."""
+    if step == "convert":
+        path, done = mp4_import(env, monkeypatch)[0], lambda: env["repacks"]
+    elif step == "remux":
+        path, got = env["path"], removal_film(env, monkeypatch, tmp_path)
+        done = lambda: got
+    else:
+        path, calls = env["path"], header_issue(env, monkeypatch)
+        done = lambda: calls["repairs"]
+    check_listed(env, monkeypatch)
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--apply"])
+    name, waits = hook.deep_name(path), enqueue(env, 0, env["path"])
+    hook.background(name, [])
+    assert [r["result"] for r in log_lines(env) if r.get("job") == name] == ["yielded"] and not done() and hook.deep_analysis_queued() == [name]
+    hook.drop_job(waits)
+    hook.background(name, [])
+    assert done() and checked(env, "backfill_job")[-1]["outcome"] == ("subtitles_remuxed" if step == "remux" else "edited")
+
+
+def test_a_backfill_job_converts_as_an_import_and_keeps_its_new_file_in_the_queue(env, monkeypatch, settings, tmp_path):
+    """Owner 2026-10-13: a job a backfill queued converts as an import does, and keeps no original. Reviewer
+    2026-10-13: the job in the queue takes the new path, file id and key right after the swap, so a run after a kill
+    starts from the new file. The Plex analyze and the end of the time limit follow, as for an import."""
+    mp4, mkv = mp4_import(env, monkeypatch)
+    check_listed(env, monkeypatch)
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--apply"])
+    name, seen, carry, pending = hook.deep_name(mp4), [], hook.lid_carry, []
+    monkeypatch.setattr(hook, "lid_carry", lambda *a: seen.append(hook.job_of(name)) or carry(*a))
+    hook.background(name, pending)
+    (rec,) = checked(env, "backfill_job")
+    assert (rec["outcome"], rec["reasons"][0], rec["path"], rec["ids"]["app_id"], rec["ids"]["file_id"]) == ("edited", "repacked", mkv, 7, 12), rec
+    assert "kept" not in rec["repack"] and not os.path.exists(tmp_path / ".kept") and hook.DEADLINE.end is None
+    assert seen and {(j["path"], j["ids"]["file_id"], j["key"][0]) for j in seen} == {(mkv, "12", os.stat(mkv).st_ino)}
+    assert [p["source"] for p in pending] == ["backfill_job"]
+
+
+@pytest.mark.parametrize("waits", [False, True])
+def test_a_backfill_job_that_converted_its_file_yields_no_more(env, monkeypatch, settings, tmp_path, waits):
+    """Re-reviewer 2026-10-13: an import queues during the conversion of a job a backfill queued. The job goes on with
+    the header repair, because a yield would lose the post and the decision line of the conversion. The time limit of
+    an import bounds the wait."""
+    mp4, mkv = mp4_import(env, monkeypatch)
+    calls = header_issue(env, monkeypatch)
+    check_listed(env, monkeypatch)
+    settings(keep_days=7, discord_posts="all")
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--apply"])
+    carry = hook.lid_carry
+    if waits:   # an import queues right after the swap
+        monkeypatch.setattr(hook, "lid_carry", lambda *a: [hook.queued() or enqueue(env, 0, "/other.mkv"), carry(*a)])
+    hook.background(hook.deep_name(mp4), [])
+    (rec,) = checked(env, "backfill_job")
+    assert rec["path"] == mkv and rec["repack"]["new_size"] and calls["repairs"] and not hook.still_queued(hook.deep_name(mp4)), rec
+    assert [t for t, _ in posted(env)] == ["Converted to MKV", "File repaired", "Default tracks changed"], posted(env)
+
+
+def test_a_backfill_job_posts_no_alert_that_its_saved_deep_analysis_cleared(env, monkeypatch, settings):
+    """Reviewer 2026-10-13: an import holds a timing alert, and its deep analysis clears it with no change, so nothing
+    posts. A bare backfill then queues the file. The saved deep analysis still holds, so the job queues none, and the
+    alert it held counts as checked again. Before, it posted at once."""
+    settings(subtitles="deep")
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT, where=patched_windows(-0.85))})
+    monkeypatch.setattr(hook, "resub", lambda *a, **k: pytest.fail("a patch is no reason to retime a track"))
+    hook.main([])
+    first, (deep,) = two_lines(env)
+    assert first["alert_result"] == [hook.HOLD_RESULT] and deep["held_result"] == ["checked again"] and posted(env) == []
+    check_listed(env, monkeypatch)
+    hook.background(backfill_job(env, monkeypatch), [])
+    (rec,) = checked(env, "backfill_job")
+    (held,) = [r for r in log_lines(env) if "held_result" in r and "schema" not in r]
+    assert (held["source"], held["result"], held["held_result"]) == ("backfill_job", "checked again", ["checked again"]), held
+    assert rec["alert_result"] == [hook.HOLD_RESULT]
+    assert posted(env) == [] and hook.deep_analysis_queued() == []
+
+
+@pytest.mark.parametrize("link", [False, True])
+def test_sub_check_hears_a_hardlinked_file_once(env, monkeypatch, tmp_path, link):
+    """Reviewer 2026-10-13: the flags need an edit, which a hard link refuses. A refused edit asks for no action, so the
+    next --sub-check skips the file. Before 2.12.0 it heard the file again on every run."""
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 11, "path": env["path"]})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    if link:
+        os.link(env["path"], tmp_path / "seed.mkv")
+    for _ in range(3):
+        hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    assert len(env["words"]) == 1 and [r["outcome"] for r in log_lines(env) if "schema" in r][0] == ("hardlinked" if link else "edited")
+
+
+@pytest.mark.parametrize("link", [False, True])
+def test_a_hardlinked_file_gets_one_deep_analysis_however_often_a_backfill_queues_it(env, monkeypatch, settings, tmp_path, link):
+    """Reviewer 2026-10-13: a refused flag edit kept the saved result pending, so each new pass queued a deep analysis
+    of a hardlinked file again."""
+    settings(subtitles="deep")
+    english_film(env, ("eng", True, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    check_listed(env, monkeypatch)
+    if link:
+        os.link(env["path"], tmp_path / "seed.mkv")
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    deeps = []
+    for _ in range(3):
+        hook.main(["--backfill", "radarr", "--apply", "--restart"])
+        hook.background(hook.deep_name(env["path"]), [])
+        deeps.append(len(later := hook.deep_analysis_queued()))
+        for n in later:
+            hook.background(n, [])
+    assert deeps == [1, 0, 0] and checked(env, "backfill_job")[0]["outcome"] == ("hardlinked" if link else "edited")
+
+
+@pytest.mark.parametrize("kind", ["deep", "burn"])
+def test_a_backfill_job_keeps_the_jobs_an_import_queued_meanwhile(env, monkeypatch, settings, kind):
+    """Reviewer 2026-10-13: with HOOK_WORKERS above 1 an import of the path ends while its backfill job runs. The import's
+    deep analysis, with the alert it holds, or its burn-in job, which may re-grab, waits beside the claimed job. The job
+    then queues nothing over it."""
+    settings(subtitles="deep")
+    english_film(env, ("eng", False, {}))
+    hearing(env, monkeypatch, {"s1": talk.cues(talk.RIGHT)})
+    check_listed(env, monkeypatch)
+    name = backfill_job(env, monkeypatch)
+    assert hook.claim(name)
+    held = [{"kind": "subtiming", "size": 1000, "embed": {"title": "Subtitles out of sync", "description": "d"}, "keys": ["s1"]}]
+    rec = {"path": env["path"], "ids": {"app_id": "7", "file_id": 11}, "tracks": [{"i": "s1"}], "job": "1700000000-1.json"}
+    if kind == "deep":
+        assert hook.queue_deep_analysis({"app": "radarr"}, rec, dict(INPUTS), held) == name
+    else:
+        hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", hook.burn_name(env["path"]), time.time(),
+                         json.dumps({"app": "radarr", "path": env["path"], "grab": {"download_id": "D"}}))
+    hook.background(name, [], claimed=True)
+    if kind == "deep":
+        job = hook.job_of(name)
+        assert (job.get("held"), job.get("from"), claimed()) == (held, "1700000000-1.json", []), job
+    else:
+        assert hook.job_of(hook.burn_name(env["path"]))["grab"] == {"download_id": "D"} and hook.deep_analysis_queued() == [hook.burn_name(env["path"])]
+
+
+@pytest.mark.parametrize("fault", ["gone", "unread", "probe"])
+def test_a_backfill_job_whose_file_went_or_that_fails_drops(env, monkeypatch, fault):
+    """The job of a file that went drops, as a deep analysis does. A job that does not read, or whose check fails,
+    logs an error line and drops, the time limit ends, and the worker goes on."""
+    check_listed(env, monkeypatch)
+    name = backfill_job(env, monkeypatch)
+    if fault == "gone":
+        os.remove(env["path"])
+    elif fault == "unread":
+        hook.put_job(name, {k: v for k, v in hook.job_of(name).items() if k != "ids"})
+    else:
+        monkeypatch.setattr(hook, "mkvmerge", lambda p: (_ for _ in ()).throw(OSError(5, "Input/output error")))
+    hook.background(name, [])
+    (rec,) = checked(env, "backfill_job")
+    assert rec["outcome"] == ("file_gone" if fault == "gone" else "error") and posted(env) == [] and hook.store.read("SELECT name FROM jobs") == [], rec
+    assert hook.DEADLINE.end is None
+
+
+@pytest.mark.parametrize("first, pending, kept", [("deep", False, "deep"), ("deep", True, "import"), ("import", False, "import")])
+def test_an_import_result_keeps_only_a_deeper_result_and_only_when_it_asks_for_nothing(env, first, pending, kept):
+    hook.sub_cache(env["path"], {}, first, "radarr", False)
+    hook.sub_cache(env["path"], {}, "import", "sonarr", pending)
+    got = hook.arr_lid.verdict_get(os.path.join(hook.CFG.state_dir, "lid.sqlite"), env["path"])[0]
+    assert (got["mode"], got["app"]) == (kept, "radarr" if kept == "deep" else "sonarr"), got
 
 
 def check_locks(monkeypatch):

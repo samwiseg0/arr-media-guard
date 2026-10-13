@@ -9,8 +9,8 @@ Some releases of English films carry a foreign default audio track, and Plex pla
 This file says what each rule does and why it exists. The README covers the install, the env file
 and the app connection. policy.md covers the policy file.
 
-- A *job* is one file that waits in the background queue, for an import, a burn-in job, a deep analysis or a
-  recheck. AMG queues it, and a *worker* runs it.
+- A *job* is one file that waits in the background queue, for an import, a burn-in job, a deep analysis, a
+  recheck or a backfill. AMG queues it, and a *worker* runs it.
 - To *hear* a track is to let language detection name its spoken language.
 - A *certain fault* proves that a file is broken and leads to a re-grab. A *doubt* only alerts.
 - A *re-grab* deletes a broken file through the app, monitors its items again and marks the grab
@@ -726,10 +726,59 @@ arr=radarr source=hook outcome=edited class="English original: audio switched" e
 
 ## Backfill
 
-A backfill runs the hook's decision over the library. It is dry unless `--apply` is given, and it
-never posts to Discord. It runs at nice 19 and idle I/O, with the hook's file lock for each file. It
-runs language detection, the metadata checks and the header check like the hook, but it never
-re-grabs. It reads each `.mkv` file's own tracks, because the app's stored media info goes stale. It
+A backfill runs the hook's checks over the library. It is dry unless `--apply` is given. With no
+instance it runs every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`, with one
+`== <instance>` line before each. It skips an instance the user did not set up. An instance that
+fails, as one that does not answer, ends with one line, and the run goes on to the next one and
+exits 1 at the end. `--ids`, `--paths` and `--force-convert` need an instance. SIGTERM or Ctrl+C
+stops the whole run.
+
+**The queue.** With no pass flag (`--convert`, `--sub-check`, `--check-audio`, `--check-video`) and
+no plan option (`--plan-out`, `--plan-from`), an apply puts one job per file the app lists in the
+background queue, see `cli.backfill_queue()`. `runner.queue_listed()` writes it as it writes a
+recheck: the app's decision inputs, the ids and the `file_key()` of the file, under `deep_name()`,
+with `"backfill": true`. A job of the path that waits or runs stays. The pass takes the files in file
+id order. It keeps its place in the state a scan keeps, as `queue-<instance>`, see `cli.pass_left()`
+and `cli.advance()`. A file that keeps a job of its path counts as taken, unless that job is a
+recheck. A file missing on disk, or whose path holds a recheck, stays in the pass for a later run.
+`--limit N` queues the next N files, a run after the pass queues nothing, and `--restart` starts a
+new pass. An `--ids` or `--paths` run keeps a state of its own, which starts again when they change.
+A dry run writes no state and no `status.json`, queues nothing and probes no file. The worker takes
+these jobs after the burn-in jobs, the deep analyses of imports and the rechecks, see
+`deep_analysis_queued()`.
+
+`runner.deep_analysis()` runs a job with `backfill` as `--check --apply` runs a file. It calls
+`cli.backfill_file()` in import mode with the job of `cli.check_job()`, under an import's time limit
+and with no download. Its source is `backfill_job`, and its alerts name the Backfill check. It never
+re-grabs, see `regrab.regrab()`, and it posts its alerts. Its conversion keeps no original, as an
+import's does, and the proof still gates the swap. Right after the swap the job in the queue takes
+the new path, file id and key. So a run after a kill starts from the new file. It follows a rename or
+a move and drops a file that is gone or replaced, as a deep analysis does, see `follow()`.
+
+A job yields to an import that waits before a conversion and before a remux, see `process.Ctx`.
+After a conversion or a repair of its file the job yields no more, see `process.refresh()`. A yield
+then would lose the post and the decision line of the change. So with `HOOK_WORKERS=1` an import
+waits until the running job ends or reaches its first conversion or remux. The checks of the job run
+under an import's time limit. A conversion or a remux that started runs to its end. With more
+workers the import runs beside the job. It waits only while the job holds the file lock exclusive.
+The job holds it for a flag edit and for the swap of a conversion. Before a remux the job takes it
+and runs its checks again.
+
+Then the job queues the burn-in job and the deep analysis as `run_job()` does, see `queue_after()`.
+It queues none when an import of the path queued its own while the job ran. The burn-in job carries
+`check` in its grab fields, so it never re-grabs either. The deep analysis names the job in `from`,
+so it waits behind every job a backfill queued. A file whose saved deep analysis still holds gets
+none, see `subtitles.sub_cached()`. The alerts the job held for it count as checked again. With
+`DISCORD_POSTS=all` the changes they name still post. The import check keeps that saved result,
+because a result that asks for nothing never replaces a deeper one that still holds, see
+`subtitles.sub_cache()`. A flag edit that a hard link or a read-only file refuses asks for nothing.
+So such a file gets one deep analysis. `--drop-queued` drops the jobs a backfill queued, and the
+jobs they queued stay.
+
+**The flag backfill.** A plan option runs the flag backfill, which fixes the default tracks and
+language tags. It never posts to Discord. It runs at nice 19 and idle I/O, with the hook's file lock
+for each file. It runs language detection, the metadata checks and the header check like the hook,
+but it never re-grabs. It reads each `.mkv` file's own tracks, because the app's stored media info goes stale. It
 takes a file with two or more audio tracks, any subtitle, a tag to fix or another container inside.
 
 A dry run reads `SCAN_WORKERS` (1) files at a time, and `--workers N` wins. The file server sets the
@@ -738,16 +787,18 @@ long pass with `setsid nohup` and a log file. Run a large backfill as a dry run,
 plans, a canary, and then the rest.
 
 ```
-arr-media-guard --backfill radarr --plan-out /root/radarr-plans.jsonl                      # dry run
-arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl --post                 # one summary of the problems
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20 # a sample
-arr-media-guard --audit radarr --since 2026-01-01T10:00 --post                             # the canary's edits
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl             # the rest
+arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                      # dry run
+arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl --post                 # one summary of the problems
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20 # a sample
+arr-media-guard --audit radarr --since 2026-01-01T10:00 --post                               # the canary's edits
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl             # the rest
 ```
 
-`--plan-from` limits an apply to the files the dry run planned a change for. Each file is planned
-again before its edit, so a changed file gets the current plan. `--canary N` takes one file of each
-class in turn. `--only-undecided` takes the undecided files, so hearing can decide them without a
+`--plan-out` makes its folder. With no instance it writes the plans of every instance into one file.
+`--plan-from` limits an apply to the files the dry run planned a change for, and each instance takes
+its own rows. It reads them all before `--plan-out` writes, so both may name one file. Each file is
+planned again before its edit, so a changed file gets the current plan. `--canary N` takes N files of
+each instance, one file of each class in turn. `--only-undecided` takes the undecided files, so hearing can decide them without a
 probe of the whole library.
 
 ## Audit
@@ -1416,8 +1467,8 @@ language of a main audio track. The check hears the track that plays when it spe
 track that does. A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
 5 minutes are never checked. Nor is Japanese, Chinese or Thai text, which has no spaces between its words, so the
 check could never give a verdict. The check of a conversion takes the duration ffprobe reads, because mkvmerge gives an
-MP4 none. So a file with no such track or sidecar costs nothing. The check runs on imports, and a
-backfill runs it only with `--sub-check`. `SUBTITLES` sets what an import does with it: `off` runs no check, `check`
+MP4 none. So a file with no such track or sidecar costs nothing. The check runs on imports and in
+the jobs a bare backfill queues. A flag backfill runs it only with `--sub-check`. `SUBTITLES` sets what an import does with it: `off` runs no check, `check`
 reads, reports and alerts and changes nothing, `fix` acts, and `deep` (the default) adds the deep analysis. An unknown
 level acts as `check`. `--sub-check` and `--sub-time` ignore `SUBTITLES`, because a person asked for them. Without
 `--apply` they report, and with it they fix. It needs language detection, see "Audio language detection".
@@ -1653,7 +1704,9 @@ time limit, 90 seconds at most.
 
 **Cache and backfill.** `lid.sqlite` also holds each file's saved result. It holds the version and the findings of each
 check the run made, the app, the run, and the size and mtime of its sidecars. It has a mark when it asks for an action
-that no apply made yet. A backfill with `--sub-check` skips a file whose result is saved for its size and mtime and its
+that no apply made yet. A planned or failed flag edit is such an action. A flag edit that a hard link or a read-only file
+refuses asks for none. A result that asks for nothing never replaces a result of a run with
+more checks that still holds, so the import check of a backfill job keeps a deep analysis. A backfill with `--sub-check` skips a file whose result is saved for its size and mtime and its
 sidecars, comes from a run that makes every check of `--sub-check`, has no stale check, and asks for nothing more. So a
 stopped run goes on where it stopped, an apply after a dry run still acts, and a new sidecar from a program such as
 Bazarr is checked. `--sub-check` also takes a file with a sidecar that the flag backfill leaves out, and `--recheck`
@@ -1662,8 +1715,8 @@ skips no file. The decision log holds each result in `subcheck`, the remux in `s
 
 A check is stale when its registry entry says a newer version can fix its findings, see
 [development.md](development.md#when-a-change-can-fix-old-files). After an update, `runner.queue_rechecks()` queues a
-recheck job of each stale file in the background queue, behind the imports, the burn-in jobs and the deep analyses. A
-recheck makes the checks of the run that saved the result, and none deeper.
+recheck job of each stale file in the background queue, behind the imports, the burn-in jobs and the deep analyses,
+and ahead of the jobs a backfill queued. A recheck makes the checks of the run that saved the result, and none deeper.
 
 **Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.
 The check reads the CueDuration of each subtitle entry from the Cues, which mkvmerge and ffmpeg write, so it reads no
@@ -1774,9 +1827,9 @@ that hearing of a library would take weeks.
   windows. The spans of speech come from one read of the whole track, and the onsets from reads of 10 minutes each.
   The deep analysis yields to an import between two pairs, during the read of the speech and between two onset reads.
 
-  The hearing runs on the CPU of the container, at about 1.9 CPU seconds a window. That is about 15 CPU minutes an
-  hour of video, about 5.5 for a 22-minute episode and about 30 for a 2-hour film. The deep analysis of 2.7.0 spent
-  about 75 CPU seconds on an episode in time.
+  The hearing runs on the CPU of the container, at about 1.9 CPU seconds a window. A deep analysis takes a median of
+  about 5 minutes per hour of video. One file in four takes 15 minutes or more per hour. The deep analysis of 2.7.0
+  spent about 75 CPU seconds on an episode in time.
 - **Whole-file timing.** `subtitles.sub_whole()` times every line of each subtitle the word check matched. It hears
   each audio track once, in the language the word check heard it in. `align.run()` then times each subtitle on those
   words in the subtitle's own language, whose stopwords never align. It takes the lines in start order, in five steps.
@@ -1881,7 +1934,8 @@ env files into a new `/config`, so a one-off container has both shipped URLs. Wh
 so for every path. A lookup that fails, by an error, a timeout or an app restart, is not the same: `--apply` then stops
 before any change, and a dry run says why it knows no original language. An app with a URL of the user's own and no
 API key that reads is set up in part, and it fails the same way. A backfill or a scan of an app that is not set up
-stops with one line that names the settings. So do the audit's pruning and the subtitle hunter.
+stops with one line that names the settings. So do the audit's pruning and the subtitle hunter. A backfill with no
+instance skips an app the user did not set up.
 
 A dry run says each subtitle alert as `--apply` would act on it, in its decision line and its CLI line. The check
 records what `--apply` would do with the remux. `subtitles.remux_block()` then asks `remux.repack_block()` again for the
@@ -2211,7 +2265,8 @@ fresh, and a failed write never stops a job. Give the state directory mode 0751 
 agent can open the file by name. No file there holds a secret.
 
 The policy status goes in at the start of each job and of each `--backfill`, `--sub-time`, `--check --apply`,
-`--audit` and `arr-media-guard-subhunt` run. A dry run of `--check` writes no status. `--selftest`
+`--audit` and `arr-media-guard-subhunt` run. A dry run of `--check`, and a dry backfill that queues, write no status.
+`--selftest`
 records it only with `ARR_MEDIA_GUARD_RECORD=1` in its environment, and it never moves `last_hook_run`. So an install step can clear a policy problem, and a selftest
 never hides a stopped audit. The TMDB status goes in only after a live TMDB answer. Useful alerts
 are these:

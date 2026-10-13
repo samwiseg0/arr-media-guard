@@ -183,7 +183,9 @@ class Ctx:
     lists. It gets no rescan, and its conversion writes the new file beside the original, because no app knows the file.
     With no app it has no item either, so the content checks and the language alert are left out, and act() keeps the
     flags. A deep analysis of --check runs in the foreground, see cli.check(), so it never yields to an import, and
-    yields is False."""
+    yields is False. A job a backfill queued has check and "backfill" in job, see runner.deep_analysis(). Its source
+    is backfill_job, so its conversion keeps no original, as an import's does. waits is True for it, so it stops for an
+    import that waits before a conversion and before a remux, until a step replaced the file, see refresh()."""
     app: str; path: str; label: str; original: str; runtime: object   # the file, and its item's original language and runtime
     mode: str = "import"; job: dict = None   # job is the queued hook job of an import
     save: object = None   # stores job in the queue, see runner.run_job()
@@ -202,9 +204,12 @@ class Ctx:
         if self.mode not in MODES:
             raise ValueError(f"no mode {self.mode}")
         self.check = (self.job or {}).get("check")
-        self.source = "recheck" if self.recheck else "check" if self.check else {"import": "hook", "deep": "deep_analysis"}.get(self.mode, "backfill")   # of the decision log
+        queued = bool((self.job or {}).get("backfill"))   # a job a backfill queued, see runner.deep_analysis()
+        self.source = "recheck" if self.recheck else "backfill_job" if queued else "check" if self.check else \
+            {"import": "hook", "deep": "deep_analysis"}.get(self.mode, "backfill")   # of the decision log
         self.background = self.mode == "deep" or bool(self.recheck)
         self.yields = self.background and not self.check   # it stops for an import that waits, see runner.deep_waits()
+        self.waits = self.yields or queued   # it stops for an import before a conversion and before a remux
         self.depth = self.recheck or self.mode
 
     def rearm(self):
@@ -229,6 +234,8 @@ def refresh(ctx, duration=True):
     was, ctx.st = getattr(ctx, "st", None), os.stat(ctx.path)
     if was:   # a remux of AMG's own keeps the mark of a burn-in job, see runner.muted()
         runner.mute_mark(ctx.path, was)
+        ctx.waits = ctx.yields   # a job a backfill queued yields no more. A yield would lose the post and the decision line of the change,
+        # and the job's import time limit bounds the rest. A deep analysis and a recheck have no time limit, so they still yield.
     ctx.size = ctx.st.st_size; ctx.j = checks.mkvmerge(ctx.path)
     ctx.rec.update(size=ctx.size, mtime=int(ctx.st.st_mtime), **({"file_duration": round(decide.duration(ctx.j))} if duration else {}))
 
@@ -271,6 +278,8 @@ def conversion(ctx):
         return
     if ctx.shared and ctx.apply and not ctx.pool and ctx.mode != "import":
         raise runner.Replan("the file needs a repack")
+    if ctx.waits:   # a conversion of a film takes minutes, so an import that waits goes first
+        runner.deep_waits()
     was = ctx.path
     got, result, rec["repack"], ctx.path = convert.convert(ctx.app, ctx.path, j, st, ctx.apply, rec["ids"], ctx.lock, ctx.pool, ctx.force,
                                                            ctx.subs_on and subtitles.sub_fixes(ctx.source), decide.codes(ctx.original),
@@ -365,6 +374,8 @@ def header(ctx):
     if cut and h.get("repairable"):   # the subtitles of a cut file run to the full length and are good: keep the file
         code, result, info = "subtitle_file_may_be_cut", f"not repaired, the file may be cut: {cut}", {"listed": hp["listed"], "streams": h["streams"]}
     elif h.get("repairable"):
+        if ctx.waits:   # as before a subtitle remux
+            runner.deep_waits()
         code, result, info = remux.repack(path, j, ctx.st, ctx.apply, h)
         if "warnings" in info:
             ctx.rearm()   # repack() ran mkvmerge with the time limit off, whatever came of it
@@ -556,7 +567,7 @@ def subtitle_checks(ctx):
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
     if fixes or remove or ends or moves or recode or strip:
-        if ctx.yields:   # a remux of a film takes minutes, so an import that waits goes first
+        if ctx.waits:   # a remux of a film takes minutes, so an import that waits goes first
             runner.deep_waits()
         if ctx.shared and ctx.apply:
             raise runner.Replan("a subtitle needs a remux", rec.get("whole_facts"))   # the facts of the hearing this pass made
@@ -790,7 +801,6 @@ def after_edit(ctx):
         rec.update(outcome=named[0], result=named[1])
     ctx.rest += subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
     if ctx.mkv and ctx.subs_on and checks.lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
-        muted = {t["sel"] for t in d["tracks"] if t["pos"] in ctx.unmatched}
         planned = ctx.fixes or ctx.remove or ctx.ends or ctx.moves or ctx.recode or ctx.strip
         done = ctx.apply and rec["outcome"] in ("edited", "no_change", "subtitles_remuxed", "sidecars_changed") and (rec.get("subremux") or {}).get("done", not planned) \
             and all(e["result"] in ("moved", "retimed") for e in rec.get("sidecars") or [])
@@ -805,8 +815,10 @@ def after_edit(ctx):
         unmade = not subtitles.sub_fixes(ctx.source) and (any(r.get("verdict") == "mismatch" for r in ctx.sync_all.values())
                                                           or any({"fix", "unfixable"} & set(f) for f in found.values()))
         unmade = unmade or any("unread" in f for f in found.values())
-        subtitles.sub_cache(ctx.path, rec, ctx.depth, ctx.app,
-                            (bool(planned or ctx.acts) or any(e[0] in muted for e in d["edits"])) and not done or bool(ctx.later) or stopped or unmade)
+        # A flag edit that a dry run plans or that failed asks for an action too, so the next apply still takes the file,
+        # see sub_cached(). A hard link or a read-only file refuses every edit, so it asks for none.
+        flags = bool(rec.get("edits")) and (not ctx.apply or rec["outcome"] in ("edit_failed", "verify_failed"))
+        subtitles.sub_cache(ctx.path, rec, ctx.depth, ctx.app, bool(planned or ctx.acts) and not done or flags or bool(ctx.later) or stopped or unmade)
     if rec["outcome"] in ("verify_failed", "edit_failed"):
         ctx.rest.append({"kind": "edit", "error": short_error(rec["result"], rec["path"]), "unread": rec.get("after_error"),
                          "on": None if "after" not in rec else [f'{t["pos"]} {t["lang"]}' for t in rec["after"] if t["default"]]})

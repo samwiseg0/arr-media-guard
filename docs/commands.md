@@ -17,33 +17,70 @@ of an instance of `APP_INSTANCES`, as `--backfill sonarr-4k`, and uses that inst
 - No command reads an app's database. The API key alone serves every command.
 - An app counts as set up when its API key reads, or when its URL differs from the URLs the env files ship. An app at a
   shipped URL with no API key counts as not set up, also when you keep that URL on purpose.
-- A backfill or a scan of an app that is not set up stops with one line. The audit warns and goes on. `--sub-time` says
-  one line when no app at all is set up, and then works on the file alone.
+- A backfill or a scan of an app that is not set up stops with one line. A backfill with no instance skips it. The audit
+  warns and goes on. `--sub-time` says one line when no app at all is set up, and then works on the file alone.
 
 ## Dry runs and the backfill
 
-A *backfill* runs the checks of an import over the files already in your library, and fixes their default tracks and
-language tags. It runs at the lowest CPU and disk priority, and never posts to Discord. It shares a lock with the
-imports, so the two never change one file at the same time. It takes the Matroska files the app lists. It skips a file
-with one audio track, no subtitle and a right language tag, which plays that track anyway.
-
-Run a large backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one file.
-A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them. A
-*canary* is a small sample, spread across the plan groups, that you apply first.
+A *backfill* runs the checks of an import over the files already in your library. Run it first with no option. It
+names each file the apps list and the hours of video they hold, and changes nothing. Then add `--apply`.
 
 ```
-arr-media-guard --backfill radarr --plan-out /root/radarr-plans.jsonl                        # dry run, one plan per line
-arr-media-guard --audit radarr --plan-from /root/radarr-plans.jsonl                          # the plans, by plan group
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl --canary 20   # 20 files across plan groups
-arr-media-guard --audit radarr --since 2026-01-01T10:00                                      # check the canary's edits
-arr-media-guard --backfill radarr --apply --plan-from /root/radarr-plans.jsonl               # the rest
+docker exec -it arr-media-guard arr-media-guard --backfill           # dry run of every instance
+docker exec -it arr-media-guard arr-media-guard --backfill --apply   # queue every file
 ```
+
+On a host, leave out `docker exec -it arr-media-guard`.
+
+- `--apply` puts one job per file in the background queue, where the deep analyses and the rechecks wait. The worker
+  runs each job as `--check PATH --apply` runs the file, see [Check one file](#check-one-file). So the job does what an
+  import does under your settings, and posts its alerts. It never re-grabs. Its conversion keeps no original, as an
+  import's does.
+- The jobs wait behind the imports and run one at a time, after the deep analyses of imports and the rechecks. A job
+  gives way to an import that waits before a conversion and before a remux, until it changed the file. The jobs stay
+  in the queue across a restart. `--backfill --drop-queued` drops them, and `--backfill <instance> --drop-queued`
+  drops those of one instance. A job that runs then ends first.
+- A job queues the burned-in subtitle check and the deep analysis as an import does. The deep analysis waits behind
+  every job a backfill queued. At `SUBTITLES=deep` it takes a median of about 5 minutes per hour of video, and one file
+  in four takes 15 minutes or more per hour. A file whose saved deep analysis still holds gets no new one.
+- A backfill keeps its place in each instance, as a scan does. `--limit N --apply` queues the next N files, and the next
+  run goes on from there. A run after the last file queues nothing and says so. `--restart` starts a new pass, as after
+  a change of your settings. `--ids` and `--paths` keep a place of their own. A dry run keeps no place and names the
+  next files it would queue.
+- A file that has a job waiting or running keeps that job, so a second `--apply` queues it once. A file with a waiting
+  recheck, or one missing on disk, stays for the next run.
+- A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to three
+  times: from its job, its burned-in subtitle check and its deep analysis. With `DISCORD_POSTS=all`, each file whose
+  default tracks change also posts "Default tracks changed".
+- With no instance it takes every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`. A line
+  `== <instance>` starts each one. It skips an instance you did not set up. An instance that fails, as one that does
+  not answer, ends with one line, and the run goes on to the next one. The exit code is then 1.
+- On a host the worker starts with the next event of an app, as an import or a Test.
+
+A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. It fixes the default tracks and
+language tags of the Matroska files the app lists, at the lowest CPU and disk priority, and never posts to Discord. It
+shares a lock with the imports, so the two never change one file at the same time. It skips a file with one audio
+track, no subtitle and a right language tag, which plays that track anyway.
+
+Run a large flag backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one
+file. A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them.
+A *canary* is a small sample, spread across the plan groups, that you apply first.
+
+```
+arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                        # dry run, one plan per line
+arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl                          # the plans, by plan group
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20   # 20 files across plan groups
+arr-media-guard --audit radarr --since 2026-01-01T10:00                                        # check the canary's edits
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl               # the rest
+```
+
+With no instance, one plan file holds the plans of every instance, and `--canary N` takes N files of each.
 
 Other useful commands:
 
 ```
-arr-media-guard --backfill sonarr --ids 101 102               # only these series (movie ids for radarr)
-arr-media-guard --backfill radarr --apply --limit 5           # edit five files, then stop
+arr-media-guard --backfill sonarr --ids 101 102               # only these series (movie ids for radarr), dry
+arr-media-guard --backfill radarr --apply --limit 5           # queue the next five files
 arr-media-guard --backfill radarr --paths "/data/movies/Film A (2000)/Film A (2000).mkv"   # one file, dry
 arr-media-guard --backfill sonarr --check-audio --limit 2000  # scan for broken audio, resumes where it stopped
 arr-media-guard --backfill sonarr --check-video --restart     # scan for corrupt video, a new pass
@@ -59,9 +96,11 @@ arr-media-guard --audit radarr --since 24h --post             # AMG's edits of t
 ```
 
 - `--ids` takes the app's own ids: Radarr's movie id or Sonarr's series id, the `id` field of `/api/v3/movie` or
-  `/api/v3/series`. A TMDB, TVDB or IMDb id does not work.
-- `--paths` limits the backfill, `--convert` and `--sub-check` to the listed files. A scan refuses it.
-- `--limit N` stops after N files that need a change. A scan checks N files.
+  `/api/v3/series`. A TMDB, TVDB or IMDb id does not work. It needs an instance.
+- `--paths` limits the backfill, `--convert` and `--sub-check` to the listed files. It needs an instance. A scan
+  refuses it.
+- `--limit N` stops after N files that need a change. A scan checks N files, and a queue takes the next N files of
+  each instance.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
 - `--sub-check` and `--sub-time` are the subtitle check, see [subtitles.md](subtitles.md). `--sub-check` runs only with
   the backfill, never with `--convert` or a scan.
@@ -70,7 +109,7 @@ arr-media-guard --audit radarr --since 24h --post             # AMG's edits of t
   itself, see [Recheck after an update](features.md#recheck-after-an-update).
 - `SCAN_WORKERS` sets the files a dry-run backfill or a scan reads at a time, and `--workers N` wins. A backfill with
   `--apply` changes one file at a time, and `--convert --apply` converts `CONVERT_WORKERS` at a time.
-- `--canary` needs `--apply` and `--plan-from`.
+- `--canary` needs `--apply` and `--plan-from`. It takes N files of each instance.
 - The subtitle hunter's `--force` tries again a film that an earlier run gave up on, or whose import failed.
 
 ## Check one file
@@ -378,10 +417,12 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --serve` | the service itself | none | API, Media, LID, Plex, Discord |
 | `arr-media-guard --selftest` | `$RUN --selftest` | `$EXEC --selftest` | |
 | `arr-media-guard --test-discord` | `$RUN --test-discord` | `$EXEC --test-discord` | Discord |
-| `arr-media-guard --backfill sonarr [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--plan-out FILE] [--workers N]` | `$RUN --backfill sonarr ...` | `$EXEC --backfill sonarr ...` | API, Media, LID, Plex |
+| `arr-media-guard --backfill [sonarr] [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--restart]` | `$RUN --backfill ...` | `$EXEC --backfill ...` | API. The jobs need what the service needs. |
+| `arr-media-guard --backfill [sonarr] --drop-queued` | `$RUN --backfill --drop-queued` | `$EXEC --backfill --drop-queued` | |
+| `arr-media-guard --backfill sonarr --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]` | `$RUN --backfill sonarr --plan-out /config/plans/FILE ...` | `$EXEC --backfill sonarr --plan-out /config/plans/FILE ...` | API, Media, LID, Plex |
 | `arr-media-guard --backfill sonarr --sub-check [--apply] [--recheck] [--ids ID ...] [--paths PATH ...]` | `$RUN --backfill sonarr --sub-check ...` | `$EXEC --backfill sonarr --sub-check ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/FILE ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/FILE --only-undecided ...` | API, Media, LID, Plex |
+| `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/plans/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/plans/FILE ...` | API, Media, LID, Plex |
+| `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | API, Media, LID, Plex |
 | `arr-media-guard --backfill sonarr --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]` | `$RUN --backfill sonarr --convert ...` | `$EXEC --backfill sonarr --convert ...` | API, Media, Plex |
 | `arr-media-guard --backfill sonarr --convert --apply --force-convert PATH ...` | `$RUN --backfill sonarr --convert --apply --force-convert PATH ...` | `$EXEC --backfill sonarr --convert --apply --force-convert PATH ...` | API, Media, Plex |
 | `arr-media-guard --plex-flush sonarr` | `$RUN --plex-flush sonarr` | `$EXEC --plex-flush sonarr` | Plex |
@@ -393,10 +434,10 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill\|check] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | With `--since`: API, Media, Discord. With `--plan-from`: none. |
 | `arr-media-guard-subhunt radarr --ids ID ... [--apply] [--force]` | `$RUN arr-media-guard-subhunt radarr --ids ID ...` | `docker exec -it arr-media-guard arr-media-guard-subhunt radarr --ids ID ...` | API, Media, LID, Discord, `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, and SABnzbd and NZBHydra2 at the addresses Radarr has saved, or at `SABNZBD_URL` and `NEWZNAB_URL`. The download folder at SABnzbd's path, or in a pair of Radarr's path map. |
 
-- Every `sonarr` above takes `radarr` or the name of another instance too. The subtitle hunter takes a Radarr instance
-  only.
+- Every `sonarr` above takes `radarr` or the name of another instance too. A backfill or a scan with no instance runs
+  every instance. The subtitle hunter takes a Radarr instance only.
 - A file a command names, such as `--plan-out` or `--plan-from`, is a path in the container. Put it under `/config` to
-  keep it.
+  keep it. `--plan-out` makes its folder.
 - The audit with `--since` needs the API and the media. It uses them to remove kept files, to check a changed file
   again, and to turn on On Grab. Its review reads AMG's records.
 
@@ -406,8 +447,9 @@ Each command needs `/config`. The last column of the table names what else it ne
 
 - A scan stops the files it was reading, and the next run reads them again. It keeps its place, so the next run goes on
   from there.
-- A backfill with `--apply` lets the files in flight finish, then stops. A dry run stops at once. A backfill keeps no
-  place, so the next run goes through the whole list again. It finds nothing to change in the files already done.
+- A backfill with `--apply` lets the files in flight finish, then stops. A dry run stops at once. A stop ends the whole
+  run, so the next instance does not start. A flag backfill keeps no place, so the next run goes through the whole
+  list again. It finds nothing to change in the files already done. A backfill that queues keeps its place.
 - A conversion in progress with one worker stops, and the original stays as it was.
 - A command with no stop of its own, such as `--plex-flush`, ends at once. Its exit code is 143 after `docker stop` and
   130 after Ctrl+C.

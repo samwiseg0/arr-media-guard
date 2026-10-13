@@ -382,7 +382,7 @@ ACTIONS = {
                                                      f'failed, and {a["name"]} won\'t search for another copy.'),
     "deleted": ("", lambda a, t: f"Deleted {removed(a, False)}. Its item isn't monitored, so no search was started."),
     "would_regrab": (", re-grab is off", lambda a, t: f'Re-grabs for {REGRAB_WORDS[a["kind"]]} are off, so the file was kept.'),
-    "check": (", would re-grab", lambda a, t: "An import would re-grab the file. --check never re-grabs, so it was kept."),
+    "check": (", would re-grab", lambda a, t: "An import would re-grab the file. This check never re-grabs, so it was kept."),
     "unconfirmed": (", not confirmed", lambda a, t: "A second check didn't find the same problem, so the file was kept."),
     # A second pass of the burned-in subtitle check that read another verdict, or too little speech, see runner.burn_plan()
     "disagreed": (", not confirmed", lambda a, t: "A second check on other frames disagreed, so nothing was changed."),
@@ -781,7 +781,7 @@ def item_embed(rec, head, text, color, note=None, more=()):
 # The check that found the problem of an issue alert, by the source of its record. A scan and the audit post a summary
 # of their own. worker is the worker's start, which reports a conversion a stopped run left, see convert.pending_recover().
 CHECKS = {"hook": "Import check", "deep_analysis": "Deep analysis", "recheck": "Recheck", "backfill": "Command line run",
-          "check": "Command line check", "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
+          "check": "Command line check", "backfill_job": "Backfill check", "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
 # The steps where a fix can stop, in the order a job runs them, see stopped_at()
 CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "Hearing the speech", "Finding the shift", "Testing the fix",
                                                           "Writing the file", "Replacing the file")

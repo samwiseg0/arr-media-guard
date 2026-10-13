@@ -29,7 +29,8 @@ A decision line holds:
   With `DISCORD_POSTS=all`, an alert that also named a change of the import adds `, change` and what each post of that
   change gave. `said by the deep analysis` there means a posted alert of the deep analysis named that flag change
   already. When the import could not queue the deep analysis, its alerts post at once, and a `warning` line holds their
-  `held_result`.
+  `held_result`. A job a backfill queued whose saved deep analysis still holds queues none. Its line with result
+  `checked again` holds their `held_result`.
 - `change_result`, with `DISCORD_POSTS=all` only, what the post of each change to the file gave. That is `sent`, why the
   post failed, or `skipped` while Discord asked AMG to wait. A change whose text could not be built posted nothing, and
   its entry starts `no text:`. A run that changed nothing has an empty list.

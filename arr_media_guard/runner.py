@@ -197,14 +197,35 @@ def queued():
                                    time.time_ns())]
 
 
+BACKFILL = """instr(job, '"backfill": ')"""   # SQL that is above 0 for a job a backfill queued, see deep_analysis_queued()
+LATER = """instr(job, '"from": "deep-analysis-')"""   # SQL that is above 0 for a job that a backfill job queued, see queue_after()
+RECHECK = """instr(job, '"recheck": ')"""   # SQL that is above 0 for a recheck, see queue_rechecks()
+
+
 def deep_analysis_queued():
-    """The names of the jobs of the background queue: the burn-in jobs, see burn_name(), then the deep analyses, then
-    the rechecks, see deep_name(). A burn-in job is short and may change what plays, and a deep analysis goes before
-    the rechecks, so a new import's jobs wait behind no batch of rechecks. Then each kind runs the one queued longest
-    ago first. json.dumps() writes the key of a recheck as "recheck": with a space, and a value that holds the word
-    escapes its quotes, so the test matches the key alone, on any SQLite."""
+    """The names of the jobs of the background queue: the burn-in jobs, see burn_name(), then the deep analyses of
+    imports, then the rechecks, see deep_name(), then the jobs a backfill queued, then the deep analyses those jobs
+    queued. A burn-in job is short and may change what plays, and a deep analysis goes before the rechecks, so a new
+    import's jobs wait behind no batch of rechecks or of a backfill. Then each kind runs the one queued longest ago
+    first. json.dumps() writes a key as "recheck": with a space, and a value that holds the word escapes its quotes, so
+    the test matches the key alone, on any SQLite. A deep analysis that a backfill job queued names that job, a job of
+    this queue, in "from". A new import of the path replaces it with its own, which has none."""
     return [n for n, in store.read("SELECT name FROM jobs WHERE claimed = 0 AND name LIKE 'deep-analysis-%' "
-                                   f"ORDER BY name NOT LIKE '{BURN_PREFIX}%', " """instr(job, '"recheck": ') > 0, at, name""")]
+                                   f"ORDER BY name NOT LIKE '{BURN_PREFIX}%', {LATER} > 0, {BACKFILL} > 0, {RECHECK} > 0, at, name")]
+
+
+def backfill_jobs():
+    """(the jobs of the background queue, how many of them a backfill queued), the jobs that wait or run."""
+    return store.read(f"SELECT count(*), coalesce(sum({BACKFILL} > 0), 0) FROM jobs WHERE name LIKE 'deep-analysis-%'")[0]
+
+
+def drop_backfill(app=None):
+    """Drop the jobs that a backfill queued, of the instance app or of every instance. A job names its instance first,
+    see queue_listed(). A job that runs goes on until it ends, and it does not come back, because its end and its
+    requeue() find no row. A job of the path that an import queued since stays, and so do the jobs that a backfill job
+    queued, see queue_after(). Returns the count."""
+    head = '{"app": %s, ' % json.dumps(app)
+    return store.write(f"DELETE FROM jobs WHERE {BACKFILL} > 0 AND (? OR instr(job, ?) = 1)", app is None, head).rowcount
 
 
 def job_of(name, claimed=False):
@@ -334,7 +355,7 @@ def held_after(job, rec):
 
 
 BURN_PREFIX = "deep-analysis-burnin-"   # the name of a burn-in job starts with the background queue's, see burn_name()
-GRAB_KEYS = ("owner", "file_id", "episode_ids", "download_id", "deleted", "recycled", "release")   # the import job's fields a re-grab reads
+GRAB_KEYS = ("owner", "file_id", "episode_ids", "download_id", "deleted", "recycled", "release", "check")   # the import job's fields a re-grab reads
 
 
 def burn_name(path):
@@ -366,6 +387,21 @@ def deep_name(path):
     return f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
 
 
+def queue_listed(app, f, info, **extra):
+    """Queue a job of the background queue for the file record f of App.library(), with its info: (label, original
+    language, runtime, Plex lookup, kids, metadata context). The job carries them as its inputs, so it asks no app
+    when it runs, as the deep analysis of an import. extra goes into the job, as recheck, see queue_rechecks(), or
+    backfill, see cli.backfill_queue(). A job of the path that waits or runs stays, so a second pass queues no double.
+    Returns 1 when it queued the job, else 0. A file that is gone raises OSError."""
+    label, original, runtime, want, kids, item = info
+    item = {k: v for k, v in (item or {}).items() if k != "episodes"}   # a series' episodes serve only the title check
+    job = dict(app=app, path=f["path"], ids=cli.file_ids(f, want, item), time=time.time(), key=file_key(os.stat(f["path"])), **extra,
+               inputs=dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=item, release=f.get("sceneName") or ""))
+    name = deep_name(f["path"])
+    return store.write("INSERT INTO jobs (name, at, job) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE name = ?)",
+                       name, time.time(), json.dumps(job), name).rowcount
+
+
 def queue_rechecks():
     """Queue a recheck job for each file whose saved subtitle result a newer check can fix, see subtitles.sub_stale(),
     once per version of the code. RECHECK_ON_UPDATE false or SUBTITLES off queues nothing. A recheck is a job of the
@@ -387,17 +423,11 @@ def queue_rechecks():
             except Exception:
                 failed.append(apps.ARR[app].name)
                 continue
-            for f, (label, original, runtime, want, kids, item) in found:
+            for f, info in found:
                 if f.get("path") not in paths:   # a Radarr movie whose movieFile names the path, while movieFileId names another file
                     continue
                 with contextlib.suppress(OSError):
-                    item = {k: v for k, v in (item or {}).items() if k != "episodes"}   # a series' episodes serve only the title check
-                    job = dict(app=app, path=f["path"], ids=cli.file_ids(f, want, item), time=time.time(), key=file_key(os.stat(f["path"])),
-                               recheck=paths[f["path"]], inputs=dict(label=label, original=original, runtime=runtime, want=want, kids=kids,
-                                                                    ctx=item, release=f.get("sceneName") or ""))
-                    name = deep_name(f["path"])   # a job of the path that waits or runs stays, so a second pass queues no double
-                    n += store.write("INSERT INTO jobs (name, at, job) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE name = ?)",
-                                     name, time.time(), json.dumps(job), name).rowcount
+                    n += queue_listed(app, f, info, recheck=paths[f["path"]])
         text = (f"this version can improve the subtitle check of {n} file{'s' if n != 1 else ''} checked before. "
                 f"{'They wait' if n != 1 else 'It waits'} in the background queue for a recheck.") if n else ""
         if failed:
@@ -452,9 +482,34 @@ def follow(name, job, claimed, rec):
 
 
 def background(name, pending, claimed=False):
-    """Run the job name of the background queue: a burn-in job, see burn_in(), else a deep analysis or a recheck, see
-    deep_analysis()."""
+    """Run the job name of the background queue: a burn-in job, see burn_in(), else a deep analysis, a recheck or a job
+    a backfill queued, see deep_analysis()."""
     return (burn_in if name.startswith(BURN_PREFIX) else deep_analysis)(name, pending, claimed)
+
+
+def queue_after(name, job, rec, run, inputs, deep=True):
+    """Queue the jobs that an import queues after process() ran on its file with run, the process.Ctx: the deep
+    analysis, unless deep is False, and the burn-in job. inputs are the decision inputs of the import. When no deep
+    analysis queued, the alerts that run held for it post now, so none is lost. deep False says that a saved deep
+    analysis of the file still holds, see subtitles.sub_cached(). It judged those subtitles, so the held alerts count
+    as checked again. Only the change posts of DISCORD_POSTS=all go out, see logs.held_changes(). See run_job()."""
+    held, queued = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
+    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", and its burn-in job
+        with contextlib.suppress(OSError, sqlite3.Error):
+            queued = deep and queue_deep_analysis(job, rec, inputs, held)
+        try:
+            queue_burn_in(job, rec, dict(inputs, plan=process.plan_inputs(run)))
+        except (OSError, sqlite3.Error) as ex:   # a busy store, or the file went
+            with contextlib.suppress(OSError):
+                logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning",
+                              note=config.mask(f"the burned-in subtitle check of the file did not queue: {type(ex).__name__}: {ex}")[:300]))
+    if held and not queued:   # a held alert is never lost
+        with contextlib.suppress(OSError):
+            said = logs.post_held(rec["app"], rec["path"], held) if deep else logs.held_changes(rec["app"], held, "checked again")
+            logs.log(dict(source=rec.get("source", "hook"), app=rec.get("app"), job=name, path=rec.get("path"), held_result=said,
+                          result="warning" if deep else "checked again",
+                          note="the deep analysis of the file did not queue, so the alerts held for it " +
+                          ("posted now" if deep else "count as checked again, because its saved result still holds")))
 
 
 def burn_in(name, pending, claimed=False):
@@ -646,7 +701,8 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
     restored old file. Returns the decision record.
 
     --check runs it in the foreground with check in grab and no name, see cli.check(). It never yields and keeps no
-    first pass in the queue. Its re-grab only says what an import would do, see regrab.regrab(), so it takes no lock.
+    first pass in the queue. A job a backfill queued gives check in grab too, see deep_analysis(). A re-grab with check
+    only says what an import would do, see regrab.regrab(), so it takes no lock.
     Its dry run, apply False in rec, plans the mute and changes nothing. post False keeps the alert off Discord."""
     app, path, got, grab = job["app"], job["path"], job.get("inputs") or {}, dict(job.get("grab") or {}, app=job["app"], path=job["path"])
     check, apply = grab.get("check"), rec.get("apply", True)
@@ -655,8 +711,8 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
     if not audio:
         return dict(rec, outcome="burned_in_skipped", result="skipped, the file has no audio track")
     item = burn_item(app, grab.get("owner"), regrab.job_episodes(grab))
-    facts, plan = burn_passes(path, audio, duration, got.get("original"), item, job.get("first"), None if check else store.path(),
-                              None if check else lambda first: put_job(name, dict(job, first=first), claimed))
+    facts, plan = burn_passes(path, audio, duration, got.get("original"), item, job.get("first"), name and store.path(),
+                              name and (lambda first: put_job(name, dict(job, first=first), claimed)))
     facts = dict(facts, quick=job.get("quick"), audio=audio)
     first, words = facts["first"], burn_words(facts["first"])
     rec = dict(rec, outcome=f'burned_in_{first["label"]}', result=f"{words}, logged only", burned_in=dict(facts, plan=plan),
@@ -762,12 +818,20 @@ def deep_analysis(name, pending, claimed=False):
     The job goes back to the deep analysis queue, and its next run finds the words heard so far in the cache, and the
     whole-file read in the store. A track of that read that was cut short is a Cut again, see subtitles.Cut. A read
     kept by a version that did not mark such tracks is read again. A conversion of its own before the stop changed the
-    file, so the job then takes the key of the new file."""
-    started, rec, want, job, ctx = time.time(), dict(source="deep_analysis", job=name), None, {}, None
+    file, so the job then takes the key of the new file.
+
+    A job a backfill queued, see cli.backfill_queue(), runs here too, with "backfill" in its job. It runs the checks and
+    the decision of an import on its file, as --check --apply runs them, see cli.backfill_file(): under an import's time
+    limit, with no download, and it never re-grabs. Its conversion keeps no original, as an import's does. It posts its
+    alerts, and its source is backfill_job. It yields to an import only before a conversion and before a remux, see
+    process.Ctx. A conversion stores the new path and file id in the job, so a run after a kill or a yield starts from
+    the new file. Then it queues the burn-in job and the deep analysis an import queues, see queue_after(), unless an
+    import of the path queued its own meanwhile. A file whose saved deep analysis still holds gets none."""
+    started, rec, want, job, ctx, check = time.time(), dict(source="deep_analysis", job=name), None, {}, None, None
     try:
         job = job_of(name, claimed)
         app, got = job["app"], job.get("inputs") or {}
-        rec.update(app=app, path=job["path"], **({"source": "recheck"} if job.get("recheck") else {}))
+        rec.update(app=app, path=job["path"], source="recheck" if job.get("recheck") else "backfill_job" if job.get("backfill") else rec["source"])
         job, drop = follow(name, job, claimed, rec)
         path = job["path"]
         if drop:
@@ -776,6 +840,21 @@ def deep_analysis(name, pending, claimed=False):
             rec.update(outcome="subtitles_off", result="dropped, SUBTITLES is off")
         elif not got:
             rec.update(outcome="job_stale", result="dropped, the job holds no decision inputs of its import")
+        elif job.get("backfill"):
+            want, ids = got.get("want"), job["ids"]
+            f = {"path": path, "id": ids.get("file_id"), "movieId": ids.get("app_id"), "sceneName": got.get("release")}
+            info = tuple(got.get(k) for k in ("label", "original", "runtime", "want", "kids", "ctx"))
+            check = dict(cli.check_job(f, info), backfill=True)
+
+            def save():   # after a conversion, see process.conversion()
+                job.update(path=check["path"], key=file_key(os.stat(check["path"])), ids=dict(ids, file_id=check["file_id"]))
+                put_job(name, job, claimed)
+            try:   # source: the error line of backfill_file() names check
+                rec = dict(cli.backfill_file(app, f, info, types.SimpleNamespace(apply=True, **cli.CHECK_ARGS), False, job=check, save=save)[1],
+                           job=name, source=rec["source"])
+            finally:
+                config.DEADLINE.stop()
+                ctx = check.pop("run", None)
         else:
             st, read = os.stat(path), store.get("deep-read", name) or {}   # the whole-file read of a run that yielded
             if read.get("key") == [st.st_size, st.st_mtime_ns] and "cut" in read:   # JSON keeps no Cut, so "cut" names those tracks
@@ -832,7 +911,9 @@ def deep_analysis(name, pending, claimed=False):
     if want and path and os.path.exists(path) and process.changed(rec):
         pending.append(plex.plex_after(rec["app"], rec.get("source", "deep_analysis"), rec, want))
     store.drop("deep-read", name)
-    drop_job(name, claimed)
+    drop_job(name, claimed)   # first, because the deep analysis a backfill job queues takes its name
+    if ctx and check and not any(still_queued(n(path)) for n in (deep_name, burn_name)):   # an import of the path queued its own
+        queue_after(name, dict(check, app=app), rec, ctx, got, deep=not subtitles.sub_cached(path, "deep"))
 
 
 def try_lock(name):
@@ -1864,19 +1945,6 @@ def run_job(name, pending, shared=False, claimed=False):
     edited = process.changed(rec) and os.path.exists(path or "")   # a re-grab may have deleted it
     if edited and want:   # outside the file lock, so a slow Plex never holds up the next file
         pending.append(plex.plex_after(app, "hook", rec, want))
-    held, deep = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
-    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", and its burn-in job
-        inputs = dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx, release=job.get("release") or "")
-        with contextlib.suppress(OSError, sqlite3.Error):
-            deep = queue_deep_analysis(job, rec, inputs, held)
-        try:
-            queue_burn_in(job, rec, dict(inputs, plan=process.plan_inputs(run)))
-        except (OSError, sqlite3.Error) as ex:   # a busy store, or the file went
-            with contextlib.suppress(OSError):
-                logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning",
-                              note=config.mask(f"the burned-in subtitle check of the file did not queue: {type(ex).__name__}: {ex}")[:300]))
-    if held and not deep:   # a held alert is never lost
-        with contextlib.suppress(OSError):
-            logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning", held_result=logs.post_held(rec["app"], rec["path"], held),
-                          note="the deep analysis of the file did not queue, so the alerts held for it posted now"))
+    inputs = dict(label=label, original=original, runtime=runtime, want=want, kids=kids, ctx=ctx, release=job.get("release") or "") if "tracks" in rec else None
+    queue_after(name, job, rec, run, inputs)
     drop_job(name, claimed)
