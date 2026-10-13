@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
-import collections, contextlib, datetime, fcntl, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
+import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
 
 from . import apps, checks, config, content, decide, logs, proof, regrab, remux, runner, store, subtitles, vault
 
@@ -11,6 +11,7 @@ from . import apps, checks, config, content, decide, logs, proof, regrab, remux,
 HELD = b".convert-held"   # the end of the hidden name the original holds while the app takes the new file, see convert()
 COMMAND_WAIT = 600        # seconds convert() waits for the app's ManualImport of the new file
 RELINK_WAIT = 60          # seconds relink() reads the app's record again after the import, until it names the file
+START_MAX = 10            # seconds an AVI stream may start late and get --sync. One later start gives no stream --sync, see avi_sync()
 
 
 def convert_captions(path, streams, folder, size):
@@ -38,12 +39,45 @@ def convert_captions(path, streams, folder, size):
     return out, None
 
 
-def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=()):
+def avi_sync(path, j, streams):
+    """[{stream, track, ms}] of each video and audio track of the AVI path whose first packet, as ffmpeg reads it,
+    starts from 1 ms to START_MAX seconds after 0. An AVI stream header can hold dwStart, the time the stream starts
+    after the file's start, in the stream's own units. ffmpeg honours it, and mkvmerge starts every track at 0, so
+    convert_cmd() gives mkvmerge the start back with --sync. ffprobe's stream start_time can say 0 then, so the first
+    packet decides. stream names the ffprobe stream as prove() does, track is the mkvmerge track id, ms the start in
+    milliseconds. The k-th video or audio track of j is the k-th stream of its kind in streams. A subtitle gets none,
+    because its first packet is its first cue. Another container gets none, because mkvmerge reads an MP4 edit list
+    and TS times itself. A count that differs, or a read that fails, gives none for that kind, and prove() decides. One
+    video or audio start after START_MAX gives none to any stream, so the remux starts every track at 0 as before
+    2.11.2, and prove() decides."""
+    if (j.get("container") or {}).get("type") != "AVI":
+        return []
+    out = []
+    for kind in ("video", "audio"):
+        ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == kind]
+        ff = [s for s in proof.media_streams(streams) if s.get("codec_type") == kind]
+        for n, s in enumerate(ff):
+            try:
+                r = checks.run_bounded(["ffprobe", "-v", "error", "-select_streams", str(s["index"]), "-show_entries", "packet=pts_time,dts_time",
+                                        "-read_intervals", "%+#1", "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
+                p = (json.loads(r.stdout or "{}").get("packets") or [{}])[0] if r.returncode == 0 else {}
+                t = float(p.get("pts_time") or p.get("dts_time") or 0)   # AVI video with B-frames has a decode time only
+            except (subprocess.TimeoutExpired, ValueError):
+                continue
+            if t > START_MAX:
+                return []
+            if t >= 0.001 and len(ids) == len(ff):
+                out.append({"stream": f"{kind} {s['index']}", "track": ids[n], "ms": round(t * 1000)})
+    return out
+
+
+def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=()):
     """The remux of src, its captions and its sidecars subs into tmp. mkvmerge keeps the track order and every track it
     reads but the subtitle track ids in drop, then adds each caption SubRip of convert_captions() as "English (CC)",
-    then the sidecars. A sidecar with new times goes in from its "mux" file. A container
-    mkvmerge cannot read (ASF) goes through ffmpeg -c copy -copyinkf instead, with streams, its ffprobe streams, and never
-    a new encode. -copyinkf keeps the frames before the first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption."""
+    then the sidecars. A sidecar with new times goes in from its "mux" file. sync holds the AVI stream starts of
+    avi_sync(), which mkvmerge gets as --sync. A container mkvmerge cannot read (ASF) goes through ffmpeg -c copy
+    -copyinkf instead, with streams, its ffprobe streams, and never a new encode. -copyinkf keeps the frames before the
+    first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in proof.media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
@@ -52,7 +86,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=()):
     extra = len(captions) + len(subs)
     order = ["--track-order", ",".join([f"0:{i}" for i in ids] + [f"{n}:0" for n in range(1, extra + 1)])] if ids and None not in ids else []
     argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order, *(["-s", "!" + ",".join(map(str, drop))] if drop else []),
-                   src]   # each frame its own block, see times_fault()
+                   *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], src]   # each frame its own block, see times_fault()
     for c in captions:
         argv += ["--language", "0:en", "--track-name", f"0:{proof.CC_NAME}", "--sub-charset", "0:UTF-8", "--default-track-flag", "0:0",
                  "--forced-display-flag", "0:0", c["path"]]
@@ -732,7 +766,9 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     sw = remux.Swap(path, st, tmp, info)
     try:
         remux.new_tmp(tmp)
-        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), [t for t, _ in drop]),
+        if sync := [] if unreadable else avi_sync(path, j, streams):   # the decision log shows why a stream starts late
+            info["start_sync"] = sync
+        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), [t for t, _ in drop], sync),
                            capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so

@@ -11,6 +11,7 @@ SYNC = 0.05               # seconds a stream's start may move against the first 
 TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start: Matroska keeps milliseconds
 END_LOSS = 3              # video packets the new file may lack at its end, a loss of up to 3 frames that is accepted
 JUNK_MAX = 16             # audio packets the ends of a stream may lose as junk and cut frames, see ends_lost()
+LEAD_LOSS = 0.1           # seconds of the original an audio stream may lose at its start, whatever the packets hold
 JUNK_HEADERS = (b"RIFF",)  # a stray container header that an audio stream may hold as a packet of its own
 JUNK_HEADER_MAX = 128     # bytes such a header packet holds at most
 SIDECAR_FLAGS = {"forced": "--forced-display-flag", "hi": "--hearing-impaired-flag", "sdh": "--hearing-impaired-flag",
@@ -364,9 +365,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     that second check decides. The entry names it in times.reread.
 
     A few more packets may go at the ends when every other packet matches in order, see ends_lost(): up to END_LOSS
-    video packets at the end, and junk and cut frames at the ends of an audio stream. The entry names them in
-    dropped_start and dropped_end. An HEVC packet 0 may also hold units of the codec header more, see header_units(),
-    named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length. An
+    video packets at the end, junk and cut frames at the ends of an audio stream, and an audio lead of at most
+    LEAD_LOSS seconds, whatever it holds. The entry names them in dropped_start and dropped_end. The first kept packet
+    after a lead must keep its time within TIME_SLACK. An HEVC packet 0 may also hold units of the codec header more, see header_units(), named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length. An
     audio packet that shares its time with a neighbour may move one frame, see times_fault(). captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
     ones, and its text must match.
@@ -448,6 +449,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         if proof[-1]["match"] and (n := sum(x["raw_md5s"][k:k + 16] != y["raw_md5s"][k:k + 16] for k in range(0, len(x.get("raw_md5s") or b""), 16))):
             proof[-1]["crlf"] = n   # packets whose line breaks changed between LF and CRLF, and nothing else
         xt, yt, xs, why, ycut, bad = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None), None   # bad: refused for its packets
+        lead = 0   # the packets of a short lead the new file lost, see ends_lost()
         if s["index"] in moved:   # the times the fix gives, as mkvmerge --sync wrote them
             fx = moved[s["index"]]
             to = lambda t: max(0, subsync.moved(t * 1000, fx)) / 1000
@@ -476,6 +478,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         elif x["count"] > y["count"] and (lost := ends_lost(src, x, y, s, f[0], timeout)):   # a few packets at the ends
             a, b, gone = lost
             proof[-1].update(**({"dropped_start": gone[:a]} if a else {}), **({"dropped_end": gone[a:]} if b else {}))
+            lead = a if a and gone[0]["kind"] == "lead" else 0
             xt = xt[a:len(xt) - b]
             if a:   # the stream now starts at its first kept packet
                 xs = xt[0] if xt and xt[0] is not None else xs
@@ -505,6 +508,8 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             why, bad = f"the packet data of stream {name} ({s['codec_name']}) differ", s["index"]
         if not why and abs((xs - va) - (y["start"] - vb)) > SYNC:   # every stream, the exceptions included
             why = f"stream {name} starts {y['start'] - vb:+.3f} s from the video in the new file, {xs - va:+.3f} s in the original"
+        if not why and lead and abs((xs - va) - (y["start"] - vb)) > TIME_SLACK:   # mkvmerge can time the rest of an AVI's VBR MP3 early
+            why = f"stream {name} lost a lead of {lead} packets, and its first kept packet moved {((y['start'] - vb) - (xs - va)) * 1000:+.0f} ms"
         if not why and absolute and abs(xs - y["start"]) > SYNC:
             why = f"stream {name} starts at {y['start']:.3f} s in the new file, {xs:.3f} s in the original"
         if not why and (s["index"] in lengthened or s["index"] in planned) and \
@@ -615,14 +620,16 @@ def audio_damage(text, j, streams, dur, fault):
 
 def source_read(damage, path, j):
     """The read of a conversion's original that showed damage, run again from scratch on path, as damage_of() it. It
-    writes nothing: mkvmerge remuxes into /dev/null, and ffmpeg reads the streams the way prove() reads them. j is the
-    mkvmerge -J probe of path. mkvmerge must skip invalid data in the same audio stream away from the ends again. The
-    proof's refusal stands from the conversion. Any other failure of the read is no damage."""
+    writes nothing: mkvmerge remuxes into /dev/null with the conversion's --sync, and ffmpeg reads the streams the way
+    prove() reads them. j is the mkvmerge -J probe of path. mkvmerge must skip invalid data in the same audio stream
+    away from the ends again. The proof's refusal stands from the conversion. Any other failure of the read is no
+    damage."""
     read = damage["read"]
     try:
         fam, streams, _ = ff_streams(path)
         if read == "mkvmerge":
-            r = subprocess.run(convert.convert_cmd(path, os.devnull, j, []), capture_output=True, text=True, errors="replace")
+            r = subprocess.run(convert.convert_cmd(path, os.devnull, j, [], sync=convert.avi_sync(path, j, streams)), capture_output=True, text=True,
+                               errors="replace")
             dur = decide.duration(j) or checks.ffprobe_duration(path) or 0
             line = invalid_audio(r.stdout + r.stderr, j, streams, dur).get(damage["stream"])
             return dict(damage, line=line) if line else None
@@ -764,8 +771,13 @@ def ends_lost(src, x, y, s, bsf, timeout):
     A video stream may lose up to END_LOSS packets at its end, kind "lost". An audio stream may lose up to JUNK_MAX
     packets: junk at its start, zero packets at its end, and one cut frame next to the kept packets at each end. Junk
     is a packet of zero bytes, kind "zero", or a stray container header of JUNK_HEADERS, kind "header", which a read of
-    those first packets shows. A cut frame is kind "cut". prove() then checks the start and the times of the kept
-    packets, so audio that moved still fails."""
+    those first packets shows. A cut frame is kind "cut". An audio stream may also lose a short lead, kind "lead",
+    whatever its packets hold: the lost packets before the first kept one span at most LEAD_LOSS seconds, from the
+    time of packet 0 to the time of the first kept packet. An AVI can start its MP3 stream so, with a silent frame,
+    a few stray bytes and cut frames that mkvmerge drops. prove() holds the first kept packet of a lead to its time
+    within TIME_SLACK. mkvmerge can drop the lead of an AVI MP3 stream whose header times each chunk as one frame
+    (VBR) and play the rest early, and an AVI keeps no audio times for the time check. After the other kinds, prove()
+    holds the stream's start within SYNC."""
     xm, ym, sizes, times = x.get("md5s"), y.get("md5s"), x.get("sizes"), x.get("times") or []
     video = s["codec_type"] == "video"
     if xm is None or ym is None or s["codec_type"] not in ("video", "audio"):
@@ -786,14 +798,15 @@ def ends_lost(src, x, y, s, bsf, timeout):
         if not all(zero(i) for i in tail[1:]):   # after the cut last frame, only zero packets
             continue
         heads = [i for i in lead[:-1] if not zero(i)]   # before the cut first frame, only junk
-        if any(sizes[i] > JUNK_HEADER_MAX for i in heads):
-            continue
-        if heads and data is None:   # one read of the most packets any split can lose at the start
+        junk = all(sizes[i] <= JUNK_HEADER_MAX for i in heads)
+        if heads and junk and data is None:   # one read of the most packets any split can lose at the start
             data = packet_data(src, s["index"], bsf, n - m, timeout)
         start = lambda i: sum(sizes[:i])
-        if not all(data[start(i):start(i) + sizes[i]].startswith(JUNK_HEADERS) for i in heads):
+        junk = junk and all(data[start(i):start(i) + sizes[i]].startswith(JUNK_HEADERS) for i in heads)
+        short = a < len(times) and None not in (times[0], times[a]) and times[a] - times[0] <= LEAD_LOSS
+        if not junk and not short:
             continue
-        kind = lambda i, cut: "zero" if zero(i) else "header" if i in heads else cut
+        kind = lambda i, cut: "lead" if not junk and i < a else "zero" if zero(i) else "header" if i in heads else cut
         return a, b, [entry(i, kind(i, "cut")) for i in lead] + [entry(i, kind(i, "cut")) for i in tail]
     return None
 

@@ -820,6 +820,16 @@ because a warning can be harmless, such as zero bytes it skips at an audio end. 
 `-copyinkf` keeps the frames before the first keyframe. A c608 caption track becomes an English
 SubRip track, because mkvmerge drops it.
 
+An AVI stream header can hold `dwStart`, the time the stream starts after the start of the file.
+ffmpeg honours it, and mkvmerge starts every track at 0. A video that starts 2 frames late would then
+play 83 ms early against the audio. So for an AVI, ffprobe reads the first packet of each video and
+audio stream, and mkvmerge gets each start of 1 ms to 10 seconds back with `--sync`. When one stream
+starts later than that, no stream gets `--sync`. mkvmerge then starts every track at 0 as before
+2.11.2, and the proof decides. The first packet decides, because ffprobe's stream start time can say
+0 for such a stream. The decision line names each start in `repack.start_sync`. Other containers get
+no `--sync`, because mkvmerge reads an MP4 edit list and the times of a TS itself. The proof still
+checks every start.
+
 **The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyinkf
 -copyts -f framemd5` and pairs the streams of each kind. `-copyinkf` keeps the frames before the
 first keyframe, which a copy drops by default. Without it, a new file that lost them would pass. A stream must keep its codec, its count of packets
@@ -855,8 +865,15 @@ up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accept
 junk at its start, zero packets at its end, and one cut frame at each end, up to 16 packets
 (`JUNK_MAX`). Junk is a packet of zero bytes, or a stray RIFF header of at most 128 bytes. A read of
 the first packets shows a header, and it runs only when a lost packet before the first frame is not
-zeros. The kept audio must keep its start and its times, so audio that moved still fails. The proof
-entry names each lost packet in `dropped_start` or `dropped_end`, with its time, size and kind.
+zeros. The audio may also lose a short lead at its start, whatever its packets hold, when the lost
+packets span at most 0.1 seconds of the original (`LEAD_LOSS`). An AVI can start its MP3 stream with a
+silent frame, a few stray bytes and cut frames, and mkvmerge drops them all. After a short lead, the
+first kept packet must keep its time within 2 ms (`TIME_SLACK`). A VBR header in an AVI times each
+audio chunk as one frame. With one, mkvmerge can drop the lead and play the rest of the stream a frame
+or two early. The start check allows 0.05 seconds, and an AVI keeps no audio times to check, so only
+this rule refuses it. After other lost packets, the kept audio keeps the start check, and its times
+where the container keeps them. The proof entry names each lost packet in
+`dropped_start` or `dropped_end`, with its time, size and kind, `lead` for a short lead.
 
 Three more differences pass, each with its own check:
 

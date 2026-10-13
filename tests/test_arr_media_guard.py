@@ -9036,6 +9036,170 @@ def test_a_real_remux_proves_every_stream_at_packet_level(convertible, tmp_path,
         assert tracks == [("eng", True), ("eng", False), ("spa", False)]
 
 
+L1_FRAME = b"\xff\xff\x88\xc0" + bytes(i % 127 + 1 for i in range(380))   # a Layer I header of a 384-byte frame, and no sync byte after it
+
+
+@pytest.fixture(scope="module")
+def avi48(tmp_path_factory):
+    """An AVI with MPEG-4 part 2 and MP3 at 48 kHz and 128 kbit/s, made with ffmpeg: every frame holds 384 bytes in one
+    chunk. Its audio header counts bytes, as older AVI writers made it, so ffmpeg and mkvmerge time each frame by its
+    bytes. Vbr.avi beside it keeps the header ffmpeg wrote, a VBR header that times each audio chunk as one frame."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    path = tmp_path_factory.mktemp("avi48") / "Clip.avi"
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
+              "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame", "-b:a", "128k", str(path)], check=True)
+    shutil.copy(path, path.with_name("Vbr.avi"))
+    data = bytearray(path.read_bytes())
+    strh = data.find(b"strh", data.find(b"strh") + 4)   # the audio's stream header, after the video's
+    struct.pack_into("<II", data, strh + 8 + 20, 1, 16000)   # dwScale and dwRate: 16,000 bytes a second
+    struct.pack_into("<I", data, strh + 8 + 44, 1)           # dwSampleSize
+    strf = data.find(b"strf", strh) + 8
+    struct.pack_into("<IH", data, strf + 8, 16000, 1)        # nAvgBytesPerSec and nBlockAlign
+    path.write_bytes(data)
+    return path
+
+
+def avi_patched(src, dst, starts=None, lead=()):
+    """A copy of the AVI src at dst. starts maps the number of a stream header, from 0, to its dwStart in the stream's
+    units: frames for video and for an MP3 stream with a VBR header, bytes for one that counts bytes. Each audio chunk
+    of stream 1 whose number is in lead becomes L1_FRAME, a frame an MP3 stream does not hold: mkvmerge drops it with
+    the frames before it, and ffmpeg reads it as a packet of its own."""
+    data = bytearray(open(src, "rb").read())
+    heads = [m.start() for m in re.finditer(b"strh", data)]
+    for k, start in (starts or {}).items():
+        struct.pack_into("<I", data, heads[k] + 8 + 28, start)
+    pos, k = data.find(b"movi") + 4, 0
+    while lead and k <= max(lead):
+        tag, size = bytes(data[pos:pos + 4]), struct.unpack_from("<I", data, pos + 4)[0]
+        if tag == b"01wb":
+            if k in lead:
+                data[pos + 8:pos + 8 + size] = L1_FRAME
+            k += 1
+        pos += 8 + size + (size & 1)
+    open(dst, "wb").write(data)
+
+
+def converted(path, tmp_path, settings):
+    """convert() of the AVI path for real, as --check --apply converts a file no app lists. Returns (result, info)."""
+    settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
+    _, result, info, now = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, source="check", outside=True)
+    assert now == (os.path.splitext(path)[0] + ".mkv" if result == "repacked" else str(path)), (result, now)
+    return result, info
+
+
+def test_an_avi_whose_video_starts_late_keeps_its_start(avi48, tmp_path, settings):
+    """An AVI stream header can hold dwStart, the time the stream starts after the file's start. ffmpeg honours it, and
+    mkvmerge starts every track at 0, so a plain remux plays the video 83 ms early. convert() gives mkvmerge the start
+    with --sync, the decision log names it in start_sync, and the proof passes. The plain remux, and one that moves
+    the audio instead, still fail."""
+    path = tmp_path / "Clip.avi"
+    avi_patched(avi48, path, starts={0: 2})   # 2 frames at 24 fps
+    result, info = converted(path, tmp_path, settings)
+    assert result == "repacked" and info["start_sync"] == [{"stream": "video 0", "track": 0, "ms": 83}], (result, info)
+    assert [p["start"] for p in info["proof"]] == [[0.0, 0.0], [-0.083, -0.083]] and all(p["match"] for p in info["proof"])
+    j = hook.mkvmerge(str(path))
+    for sync, fault in (([], "stream audio 1 starts +0.000 s from the video in the new file, -0.083 s in the original"),
+                        ([{"track": 1, "ms": 83}], "stream audio 1 starts +0.083 s from the video in the new file, -0.083 s in the original")):
+        out = tmp_path / f"new{len(sync)}.mkv"
+        REAL_RUN(hook.convert_cmd(str(path), str(out), j, [], sync=sync)[5:], check=True)
+        assert proved(str(path), str(out), [], str(tmp_path))[0] == fault
+
+
+def test_only_an_avi_gives_mkvmerge_a_stream_start(convertible, avi48):
+    """mkvmerge reads the times of a TS and the edit list of an MP4 itself, so no other container gets --sync. ffmpeg
+    starts a TS at 1.4 s, and that start stays out too. An AVI with no dwStart gets none either."""
+    first = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=pts_time", "-read_intervals", "%+#1", "-of",
+                      "csv=p=0", str(convertible / "Clip.ts")], capture_output=True, text=True, check=True).stdout
+    assert float(first.split(",")[0]) > 1
+    for path in (convertible / "Clip.ts", convertible / "Movie (2020).mp4", convertible / "Clip.avi", avi48):
+        j = hook.mkvmerge(str(path))
+        sync = hook.avi_sync(str(path), j, hook.ff_streams(str(path))[1])
+        assert sync == [] and "--sync" not in hook.convert_cmd(str(path), "new.mkv", j, [], sync=sync), (path, sync)
+
+
+@pytest.mark.parametrize("lead, fault", [
+    ({1, 2}, None),      # a whole frame and two frames mkvmerge drops: 72 ms
+    ({1, 2, 3}, None),   # 96 ms
+    ({1, 2, 3, 4}, "stream audio 1 (mp3) holds 330 packets in the new file, 335 in the original"),   # 120 ms
+])
+def test_an_avi_whose_audio_starts_with_a_short_broken_lead_converts(avi48, tmp_path, settings, lead, fault):
+    """An AVI's MP3 stream can start with packets mkvmerge drops, such as a whole frame before junk and cut frames.
+    Every other packet matches and keeps its time. The new file may lose them when they span at most 0.1 s of the
+    original, whatever they hold, and the proof names each one in dropped_start. A longer lead fails."""
+    path = tmp_path / "Clip.avi"
+    avi_patched(avi48, path, lead=lead)
+    result, info = converted(path, tmp_path, settings)
+    assert result == (f"repack failed: {fault}" if fault else "repacked"), result
+    if not fault:
+        audio = info["proof"][1]
+        assert audio["dropped_start"] == [{"pts": round(i * 0.024, 3), "size": 384, "kind": "lead"} for i in range(len(lead) + 1)], audio
+        assert audio["start"] == [round(0.024 * (len(lead) + 1), 3)] * 2 and audio["match"] and "start_sync" not in info
+
+
+@pytest.mark.parametrize("name, lead, sync, fault", [
+    ("Clip.avi", {1, 2}, [{"track": 1, "ms": 100}], "stream audio 1 starts +0.172 s from the video in the new file, +0.072 s in the original"),
+    ("Vbr.avi", {1}, [], "stream audio 1 lost a lead of 2 packets, and its first kept packet moved -24 ms"),
+    ("Vbr.avi", {1, 2}, [], "stream audio 1 lost a lead of 3 packets, and its first kept packet moved -48 ms"),
+])
+def test_audio_that_moved_after_a_short_lead_still_fails(avi48, tmp_path, name, lead, sync, fault):
+    """After a short lead, the first kept packet must keep its time within 2 ms. Audio moved 100 ms fails the start
+    check. With a VBR header, mkvmerge drops the lead and plays the rest of the stream 24 or 48 ms early. That passes
+    the 50 ms start check, and an AVI keeps no audio times, so the lead rule refuses it."""
+    path, out = tmp_path / name, tmp_path / "new.mkv"
+    avi_patched(avi48.with_name(name), path, lead=lead)
+    REAL_RUN(hook.convert_cmd(str(path), str(out), hook.mkvmerge(str(path)), [], sync=sync)[5:], check=True)
+    assert proved(str(path), str(out), [], str(tmp_path))[0] == fault
+
+
+@pytest.mark.parametrize("span, kept", [(0.1, True), (0.104, False)])
+def test_a_short_lead_spans_at_most_a_tenth_of_a_second(span, kept):
+    """ends_lost() lets an audio stream lose real frames before its first kept packet when they span at most LEAD_LOSS
+    of the original, from packet 0 to the first kept packet. A lead of 0.1 s passes, and one of 0.104 s fails."""
+    md5s = b"".join(hashlib.md5(bytes([i]) * 400).digest() for i in range(1, 40))
+    x = {"md5s": md5s, "sizes": [400] * 39, "times": [0.0, span / 2] + [span + 0.026 * i for i in range(37)]}
+    lost = hook.ends_lost("a.avi", x, {"md5s": md5s[32:]}, {"index": 1, "codec_type": "audio"}, None, 10)
+    assert lost == ((2, 0, [{"pts": 0.0, "size": 400, "kind": "lead"}, {"pts": round(span / 2, 3), "size": 400, "kind": "lead"}]) if kept else None)
+
+
+def test_avi_sync_reads_the_start_of_each_stream(avi48, tmp_path):
+    """mkvmerge puts the video track first, so in an AVI that starts with audio the track id differs from the ffprobe
+    index. The k-th stream of a kind is the k-th track of that kind. A video with B-frames has a decode time only. A
+    start of one frame, 42 ms, gets --sync, though the proof allows 50 ms. A start under 1 ms gets none. One start after
+    START_MAX, 10 s, gives no stream --sync."""
+    path = tmp_path / "Multi.avi"
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=4", "-f", "lavfi", "-i",
+              "sine=duration=4:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=880:duration=4:sample_rate=48000", "-map", "1:a",
+              "-map", "0:v", "-map", "2:a", "-c:v", "mpeg4", "-vtag", "DX50", "-bf", "2", "-c:a", "libmp3lame", "-b:a", "128k", str(path)],
+             check=True)
+    sync = lambda p: hook.avi_sync(str(p), hook.mkvmerge(str(p)), hook.ff_streams(str(p))[1])
+    avi_patched(path, path, starts={0: 3, 1: 1})   # 3 MP3 frames of 24 ms on the first audio, 1 frame on the video
+    assert sync(path) == [{"stream": "video 1", "track": 0, "ms": 42}, {"stream": "audio 0", "track": 1, "ms": 72}]
+    for starts, want in (({1: 8}, []),   # 8 bytes of the audio that counts bytes: 0.5 ms
+                         ({0: 240}, [{"stream": "video 0", "track": 0, "ms": 10000}]), ({0: 241}, []), ({0: 240, 1: 160480}, [])):
+        avi_patched(avi48, path, starts=starts)
+        assert sync(path) == want, starts
+
+
+def test_an_avi_with_a_start_after_the_cap_converts_with_no_shift(avi48, tmp_path, settings):
+    """The video starts at 10.042 s, after START_MAX, and the audio at 10.000 s. No stream gets --sync, so mkvmerge
+    starts both at 0. The audio stays 42 ms from the video, inside the 50 ms start check, and the file converts."""
+    path = tmp_path / "Clip.avi"
+    avi_patched(avi48, path, starts={0: 241, 1: 160000})   # 241 frames at 24 fps, 160,000 bytes at 16,000 a second
+    result, info = converted(path, tmp_path, settings)
+    assert result == "repacked" and "start_sync" not in info, (result, info)
+
+
+def test_the_damage_read_of_an_avi_gives_mkvmerge_its_stream_starts(avi48, tmp_path, monkeypatch):
+    """source_read() runs the conversion's mkvmerge remux again, with the same --sync."""
+    path = tmp_path / "Clip.avi"
+    avi_patched(avi48, path, starts={0: 2})
+    seen, real = [], hook.convert_cmd
+    monkeypatch.setattr(hook, "convert_cmd", lambda *a, **k: seen.append(k.get("sync")) or real(*a, **k))
+    assert hook.source_read({"read": "mkvmerge", "stream": 1}, str(path), hook.mkvmerge(str(path))) is None
+    assert seen == [[{"stream": "video 0", "track": 0, "ms": 83}]]
+
+
 def test_a_wmv_that_starts_before_its_first_keyframe_converts_whole(tmp_path):
     """ASF and WMV go through ffmpeg -c copy. With -copyinkf the new file keeps the frames before the first keyframe and
     proves clean. The same remux without it loses them, and the proof refuses it."""
@@ -9446,10 +9610,11 @@ AUDIO_JUNK = {   # (the original's junk at the start, at the end, whether the ne
     "16 zero packets at the end": ([], [bytes(768)] * 16, True, None),
     "17 zero packets at the end": ([], [bytes(768)] * 17, True, None),
     "header and zeros at the start, cut last frame": ([b"RIFF" + bytes(66), bytes(400)], [], False, None),
-    "header of 128 bytes": ([b"RIFF" + bytes(124), bytes(400)], [], True, None),
-    "header of 129 bytes": ([b"RIFF" + bytes(125), bytes(400)], [], True, None),
+    "header of 128 bytes": ([b"RIFF" + bytes(124)] + [bytes(400)] * 3, [], True, None),   # 128 ms, longer than a short lead
+    "header of 129 bytes": ([b"RIFF" + bytes(125)] + [bytes(400)] * 3, [], True, None),
     "zero bytes at the start, audio late": ([bytes(1599)], [], True, 0.1),
     "two frames lost at the start": ([b"\x0b\x77" + bytes([1]) * 98, b"\x0b\x77" + bytes([2]) * 98], [], True, None),
+    "four frames lost at the start": ([b"\x0b\x77" + bytes([k]) * 98 for k in range(1, 5)], [], True, None),
     "two frames lost at the end": ([], [b"\x0b\x77" + bytes([1]) * 700, b"\x0b\x77" + bytes([2]) * 700], True, None),
 }
 
@@ -9460,18 +9625,20 @@ AUDIO_JUNK = {   # (the original's junk at the start, at the end, whether the ne
     ("17 zero packets at the end", "stream audio 1 (ac3) holds 300 packets in the new file, 317 in the original"),
     ("header and zeros at the start, cut last frame", None),
     ("header of 128 bytes", None),
-    ("header of 129 bytes", "stream audio 1 (ac3) holds 300 packets in the new file, 302 in the original"),
+    ("header of 129 bytes", "stream audio 1 (ac3) holds 300 packets in the new file, 304 in the original"),
     ("zero bytes at the start, audio late", "stream audio 1 starts +0.132 s from the video in the new file, +0.032 s in the original"),
-    ("two frames lost at the start", "stream audio 1 (ac3) holds 300 packets in the new file, 302 in the original"),
+    ("two frames lost at the start", None),   # 64 ms, a short lead
+    ("four frames lost at the start", "stream audio 1 (ac3) holds 300 packets in the new file, 304 in the original"),   # 128 ms
     ("two frames lost at the end", "stream audio 1 (ac3) holds 300 packets in the new file, 302 in the original"),
 ])
 def test_audio_may_lose_junk_and_cut_frames_at_its_ends(monkeypatch, tmp_path, case, fault):
     """Audio may lose packets of zero bytes and a stray RIFF header at its start, zero packets at its end, and a cut
     frame at each end, when every other packet matches in order. The kept packets keep their start and their times:
-    audio that runs 100 ms late for its first 0.5 s after a lost run of 1,599 zero bytes fails. Two real frames lost
-    at the start fail, and a read of the first packets shows they are no header. So do two real frames lost at the end,
-    a header over 128 bytes and more than 16 lost packets. Each junk packet has its own time before the first frame, so
-    the kept audio starts at its first kept packet."""
+    audio that runs 100 ms late for its first 0.5 s after a lost run of 1,599 zero bytes fails. Real frames lost at the
+    start, which a read of the first packets shows are no header, pass as a short lead when they span at most 0.1 s:
+    two frames of 32 ms pass, and four fail. Two real frames lost at the end fail, and so do a header over 128 bytes
+    and more than 16 lost packets. Each junk packet has its own time before the first frame, so the kept audio starts
+    at its first kept packet."""
     monkeypatch.chdir(tmp_path)
     head, tail, cut_kept, late = AUDIO_JUNK[case]
     frames = [b"\x0b\x77" + bytes([i % 251]) * (766 - i % 7) for i in range(300)]
@@ -9487,12 +9654,15 @@ def test_audio_may_lose_junk_and_cut_frames_at_its_ends(monkeypatch, tmp_path, c
     got, proof = proved(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
     assert got == fault, got
     # one read of the first packets, as many as the stream lost, and only for a non-zero packet before the first frame
-    assert reads == {"header and zeros at the start, cut last frame": [(1, 3)], "header of 128 bytes": [(1, 2)],
-                     "two frames lost at the start": [(1, 2)]}.get(case, []), reads
+    assert reads == {"header and zeros at the start, cut last frame": [(1, 3)], "header of 128 bytes": [(1, 4)],
+                     "two frames lost at the start": [(1, 2)], "four frames lost at the start": [(1, 4)]}.get(case, []), reads
     if case.endswith("zero packets at the end") and not fault:
         assert [d["kind"] for d in proof[1]["dropped_end"]] == ["zero"] * len(tail) and "dropped_start" not in proof[1] and proof[1]["match"]
     elif case == "header of 128 bytes":
-        assert [(d["kind"], d["size"]) for d in proof[1]["dropped_start"]] == [("header", 128), ("zero", 400)] and proof[1]["start"] == [0.064, 0.064]
+        assert [(d["kind"], d["size"]) for d in proof[1]["dropped_start"]] == [("header", 128)] + [("zero", 400)] * 3 and \
+            proof[1]["start"] == [0.128, 0.128]
+    elif case == "two frames lost at the start":
+        assert [(d["kind"], d["size"]) for d in proof[1]["dropped_start"]] == [("lead", 100)] * 2 and proof[1]["start"] == [0.064, 0.064]
     elif not fault:
         assert [(d["kind"], d["size"]) for d in proof[1]["dropped_start"]] == [("header", 70), ("zero", 400)]
         assert [(d["kind"], d["size"]) for d in proof[1]["dropped_end"]] == [("cut", 82)] and proof[1]["start"] == [0.064, 0.064]
