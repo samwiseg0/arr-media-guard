@@ -238,8 +238,13 @@ waits. The listener starts the worker when a job waits, and looks again every mi
 - It answers the Test of each app. Test checks the policy, the API key and each root folder of the app, and a failed
   Test names what to fix. When `KEEP_REPLACED` keeps no copies, Test also warns in the container log about the app's
   recycle bin. It warns when the bin is off, out of reach or not mounted.
-- At its start it prints a banner. It then runs the same checks for each app with an API key, one line per app. It turns
-  on On Grab where `KEEP_REPLACED` needs it. A failed check warns, and the listener keeps running.
+- At its start it prints a banner and a line with the release number and the code hash, such as `arr-media-guard
+  2.11.3 (85138d660b0f): listening on port 8484`. The code hash is the `version` in the decision log. It changes only
+  when the code does. An image you build yourself prints the code hash alone, see
+  [Build the image yourself](#build-the-image-yourself). `docker image inspect --format '{{index .Config.Labels
+  "org.opencontainers.image.version"}}' ghcr.io/samwiseg0/arr-media-guard:latest` prints the release number of a
+  pulled image. The listener then runs the same checks for each app with an API key, one line per app. It turns on On
+  Grab where `KEEP_REPLACED` needs it. A failed check warns, and the listener keeps running.
 - Then it checks each other service the setup uses, with one line each, such as `arr-media-guard: plex start check: ok`.
   A warning names the service and what failed, such as `arr-media-guard: plex warning: Plex at http://plex:32400 refused
   PLEX_TOKEN`. A service that is not set up gets no line. It asks an app or a service that does not answer again, for 2
@@ -268,3 +273,5 @@ In a clone, run:
 ```
 docker build -f docker/Dockerfile -t arr-media-guard .
 ```
+
+Add `--build-arg RELEASE=2.11.3` to print a release number at the start.

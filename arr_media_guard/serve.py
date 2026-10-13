@@ -460,7 +460,8 @@ def main(argv):
     maps = ", ".join(f"{who} {'|'.join(':'.join(p) for p in config.CFG.map_of(who)) or 'none'}"
                      for who in dict.fromkeys([*config.MAP_KEYS, *config.CFG.apps]))   # sonarr, radarr and plex first, as before
     print(BANNER, flush=True)
-    print(f"arr-media-guard {config.VERSION}: listening on port {PORT}. Path maps: {maps}. Nightly audit: {at or 'off'}. "
+    name = f"{config.RELEASE} ({config.VERSION})" if config.RELEASE else config.VERSION
+    print(f"arr-media-guard {name}: listening on port {PORT}. Path maps: {maps}. Nightly audit: {at or 'off'}. "
           f"Apps with an API key: {', '.join(apps_on()) or 'none'}.", flush=True)
     for why in config.CFG.errors:
         print(f"arr-media-guard: {why}", flush=True)

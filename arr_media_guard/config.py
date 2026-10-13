@@ -358,6 +358,7 @@ def own_version():
 
 
 VERSION = own_version()
+RELEASE = os.environ.get("ARR_MEDIA_GUARD_RELEASE", "")   # the image's release number, such as 2.11.3. A host install has none.
 POLICY_ERROR = None
 try:   # the policy data. A missing or malformed file never stops the script here, see run_job().
     decide.set_policy(json.load(open(CFG.policy_file)))

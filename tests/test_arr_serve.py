@@ -1884,12 +1884,13 @@ def test_a_fresh_env_file_gets_a_password_and_the_listener_takes_it(tmp_path):
                    f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\n")
     with open(out, "w") as f:
         p = subprocess.Popen([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], stdout=f, stderr=subprocess.STDOUT,
-                             env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env)))
+                             env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env), ARR_MEDIA_GUARD_RELEASE="9.9.9"))
     try:
         for _ in range(100):
             if "listening on port" in out.read_text():
                 break
             time.sleep(0.1)
+        assert re.search(r"^arr-media-guard 9\.9\.9 \([0-9a-f]{12}\): listening on port", out.read_text(), re.M), out.read_text()
         user, pw = h.env_file(str(env))["WEBHOOK_USER"], h.env_file(str(env))["WEBHOOK_PASSWORD"]
         assert user == "arr-admin" and len(pw) == 32, out.read_text()
         for secret, code in ((pw, 200), (pw[:-1], 401)):
