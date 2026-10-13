@@ -196,11 +196,12 @@ class Swap:
 
     def own(self):
         """Give tmp the owner and mode of the original and return its size. A NAS share may refuse chown, and
-        info["owner"] then says so."""
+        info["owner"] then says so. The refusal is EPERM, or EINVAL when the owner has no id in the process's user
+        namespace or the NFSv4 id map."""
         st = self.st
         try:
             os.chown(self.tmp, st.st_uid, st.st_gid)
-        except PermissionError as ex:
+        except OSError as ex:
             new = os.stat(self.tmp)
             self.info["owner"] = {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{new.st_uid}:{new.st_gid}", "why": f"chown refused: {ex}"}
         os.chmod(self.tmp, st.st_mode & 0o7777)
@@ -716,7 +717,7 @@ def keep_text(src, path, lang, st):
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    with contextlib.suppress(PermissionError):   # a NAS share may refuse chown. The mode stays.
+    with contextlib.suppress(OSError):   # a NAS share may refuse chown, see Swap.own(). The mode stays.
         os.chown(name, st.st_uid, st.st_gid)
     with open(name, "rb") as f:
         if f.read() != data:

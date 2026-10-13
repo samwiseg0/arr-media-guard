@@ -1220,7 +1220,7 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                 remux.new_tmp(tmp)
                 with open(tmp, "wb") as f:
                     f.write(bom + text.encode(code, "surrogatepass"))
-                with contextlib.suppress(PermissionError):   # a NAS share may refuse chown. The mode stays.
+                with contextlib.suppress(OSError):   # a NAS share may refuse chown, see Swap.own(). The mode stays.
                     os.chown(tmp, st.st_uid, st.st_gid)
                 os.chmod(tmp, st.st_mode & 0o7777)
             e["kept"] = vault.keep_original(s["path"], e)

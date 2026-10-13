@@ -6066,12 +6066,14 @@ def test_a_removed_default_subtitle_leads_to_a_new_decision_on_the_new_file(env,
     assert [r["result"] for r in log_lines(env)][0] == "subtitles removed"
 
 
+@pytest.mark.parametrize("err", [PermissionError(1, "Operation not permitted"), OSError(22, "Invalid argument")])
 @pytest.mark.parametrize("kind", ["header", "mp4"])
-def test_a_refused_chown_keeps_the_repair_going(mkvs, media, tmp_path, monkeypatch, settings, kind):
-    """A NAS share may refuse chown with [Errno 1]. The new file stays root's, the chmod copies the mode, and info
-    says the owner changed. Radarr and Sonarr may run as root there."""
+def test_a_refused_chown_keeps_the_repair_going(mkvs, media, tmp_path, monkeypatch, settings, kind, err):
+    """A NAS share may refuse chown with [Errno 1]. A user namespace or an NFSv4 id map refuses an owner it has no id
+    for with [Errno 22]. The new file stays root's, the chmod copies the mode, and info says the owner changed. Radarr
+    and Sonarr may run as root there."""
     settings(log=str(tmp_path / "log.jsonl"))
-    monkeypatch.setattr(hook.os, "chown", lambda p, uid, gid: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted")))
+    monkeypatch.setattr(hook.os, "chown", lambda p, uid, gid: (_ for _ in ()).throw(err))
     path = tmp_path / "Movie (2000).mkv"
     shutil.copy(mkvs / "long.mkv" if kind == "header" else media / "good.mp4", path); os.chmod(path, 0o640)
     st, j = os.stat(path), hook.mkvmerge(str(path))
@@ -6082,7 +6084,7 @@ def test_a_refused_chown_keeps_the_repair_going(mkvs, media, tmp_path, monkeypat
     now = os.stat(path)
     assert result == ("header repaired" if kind == "header" else "repacked") and now.st_mode & 0o777 == 0o640, (result, info)
     assert info["owner"] == {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{now.st_uid}:{now.st_gid}",
-                             "why": "chown refused: [Errno 1] Operation not permitted"}
+                             "why": f"chown refused: {err}"}
 
 
 def test_a_header_repair_refuses_an_original_the_app_changed(mkvs, tmp_path, monkeypatch, settings):
