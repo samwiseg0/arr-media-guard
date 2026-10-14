@@ -214,7 +214,7 @@ that is there and cannot be read, or a policy file that does not load. It only w
 
 | Job | What it does | On a host | In Docker |
 | --- | --- | --- | --- |
-| Audit | `--audit <instance> --since 24h --post` reviews the day's edits, from the plan AMG saved after each edit. It posts a list when one of the day's files has a problem. It writes one syslog line every night. | A systemd timer or cron, one line per instance. | The listener at `AUDIT_TIME`, for each instance whose API key reads. |
+| Audit | `--audit <instance> --since 24h --post` reviews the day's edits, from the plan AMG saved after each edit. It posts the list of the day's files that still have a problem, and nothing when none has. It writes one syslog line every night. | A systemd timer or cron, one line per instance. | The listener at `AUDIT_TIME`, for each instance whose API key reads. |
 | Clean up | Removes kept originals and the `KEEP_REPLACED` copies older than `KEEP_ORIGINALS_DAYS`. Turns on On Grab where `KEEP_REPLACED` needs it. | The audit, and the worker once a day. | The same. |
 | Log rotation | Rotates the decision log weekly, with compression. | logrotate. | The listener, after the audits. |
 | Recheck after an update | Queues a recheck of each file whose saved subtitle check the new version can improve, once per version. | The first audit of the version. The rechecks run after the next import starts the worker. | The listener, after the start check. |

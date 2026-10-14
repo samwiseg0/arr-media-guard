@@ -2805,7 +2805,7 @@ def test_an_und_track_heard_as_the_content_language_gets_its_tag_and_flag_in_one
     hook.main([])   # the next import of the same file edits nothing
     assert len(env["mkvpropedit"]) == 1 and log_lines(env)[-1]["outcome"] == "no_change"
     hook.main(["--audit", "radarr", "--since", "24h"])
-    assert "0 of them still have tracks to change." in capsys.readouterr().out
+    assert "0 files with an open problem since" in capsys.readouterr().out and " further=0 " in env["syslog"][-1]
 
 
 def test_an_edit_of_the_original_flag_alone_queues_no_plex_analyze(env, monkeypatch):
@@ -2909,9 +2909,7 @@ def test_audit_since_reads_the_check_after_each_edit(env, capsys):
     probes = len(env["events"])
     hook.main(["--audit", "radarr", "--since", "24h", "--source", "hook"])
     out = capsys.readouterr().out
-    assert "1 file changed since" in out and "0 of them still have tracks to change." in out
-    assert "0 with a track problem after the change." in out and "invariant" not in out
-    assert "1 English original: audio switched, foreign subtitle off (Film A (1979))" in out
+    assert "0 files with an open problem since" in out and "invariant" not in out
     assert "lock" not in env["events"][probes:]   # read from the log, the file was not probed again
     assert env["syslog"][-1].startswith("arr=radarr source=audit outcome=summary edited=1 further=0") and env["syslog"][-1].endswith("tmdb=ok")
 
@@ -2923,7 +2921,7 @@ def test_audit_since_probes_an_edit_logged_without_its_check(env, capsys):
                      rowid)   # a line from before the check existed
     env["files"][env["path"]]["tracks"][1]["properties"]["default_track"] = True   # someone put the Portuguese audio back first
     hook.main(["--audit", "radarr", "--since", "24h"])
-    assert "1 of them still have tracks to change" in capsys.readouterr().out
+    assert "\nFilm A (1979): a check after the change still finds tracks to change, " in capsys.readouterr().out
     assert log_lines(env)[-1]["source"] == "audit" and log_lines(env)[-1]["recheck"]["edits"] == 1   # a1 loses its flag again
 
 
@@ -2942,9 +2940,8 @@ def test_a_quiet_night_posts_nothing(env, capsys):
     Every plan keeps the invariants."""
     hook.main(["--audit", "sonarr", "--since", "24h", "--source", "hook", "--post"])
     out = capsys.readouterr().out.splitlines()
-    text = out[out.index(f"Audit check: 0 problems · Sonarr {hook.CFG.instance}") + 1]
-    assert text.startswith("0 files changed since ") and text.endswith(". 0 of them still have tracks to change. 0 undecided, 0 with a "
-                                                                       "planned track change not made, 0 with a track problem after the change."), text
+    text = out[out.index(f"Open problems: 0 files · Sonarr {hook.CFG.instance}") + 1]
+    assert text.startswith("0 files with an open problem since "), text
     assert [b for m, u, b in env["http"] if m == "POST"] == []
 
 
@@ -3889,8 +3886,7 @@ def test_a_repack_dry_run_the_apply_and_both_audits(env, monkeypatch, tmp_path, 
     hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans)])   # a would-repack plan is kept for the apply
     assert len(env["repacks"]) == 1 and env["writes"] == [("POST", "command", {"name": "RescanMovie", "movieId": 7})]
     hook.main(["--audit", "radarr", "--since", "24h"])
-    out = capsys.readouterr().out
-    assert "1 repacked into Matroska." in out and "1 repacked from MP4/QuickTime (Film A (1979))" in out
+    assert "0 files with an open problem since" in capsys.readouterr().out   # a conversion is no problem
 
 
 def test_a_plan_audit_groups_a_skipped_conversion_by_its_code(env, monkeypatch, tmp_path, capsys):
@@ -5952,8 +5948,7 @@ def test_a_backfill_reports_repairs_and_both_audits_count_them(env, monkeypatch,
     assert calls["repairs"] == [False, True] and env["writes"] == [("POST", "command", {"name": "RescanMovie", "movieId": 7})]
     assert analyzes(env) == ["/library/metadata/7101/analyze"]
     hook.main(["--audit", "radarr", "--since", "24h"])
-    out = capsys.readouterr().out
-    assert "1 got a new header from a remux." in out and "1 header repaired (Film A (1979))" in out
+    assert "0 files with an open problem since" in capsys.readouterr().out   # a repair is no problem
 
 
 def test_a_video_scan_lists_a_header_issue_and_never_repairs_it(env, monkeypatch, tmp_path):
@@ -8216,8 +8211,6 @@ def test_a_listed_file_skips_the_sonarr_name_check(env, monkeypatch, settings, t
     assert [f["episodeIds"] for b in imports for f in b["files"]] == [[31, 32]] and {e["episodeFileId"] for e in eps} == {10}
     assert rec["repack"]["kept"].startswith(str(root) + "/") and os.path.exists(rec["repack"]["kept"]) and not os.path.exists(mp4)
     assert ("forced" in rec["repack"]) == (case == "proof refused, then logged")
-    note = ", forced, name forced" if case == "proof refused, then logged" else ", name forced"
-    assert hook.forced_note(rec["repack"]) == note
     assert rec["repack"]["forced_name"].startswith("Sonarr reads a name as other episodes")
     assert os.path.basename(mkv) in rec["repack"]["forced_name"] and os.path.basename(extra) not in rec["repack"]["forced_name"]
     assert os.path.exists(extra) == (case == "listed, clean extra")   # the extra goes back beside the new file
@@ -8849,7 +8842,6 @@ def test_a_person_can_force_a_conversion_the_proof_refuses(env, monkeypatch, set
     assert sorted(os.listdir(os.path.dirname(first))) == sorted([os.path.basename(mkv), os.path.basename(second)])
     assert kept.startswith(str(root) + "/") and kept.endswith(os.path.basename(first)) and open(kept, "rb").read() == before
     assert os.stat(kept).st_nlink == 1   # the held name is gone
-    assert hook.forced_note(rec["repack"]) == ", forced"
 
 
 def test_backfill_conversions_run_side_by_side_and_swap_under_the_exclusive_lock(env, monkeypatch, tmp_path, capsys):
@@ -9138,12 +9130,14 @@ def test_a_stopped_flush_keeps_the_unscanned_folders_listed(env, monkeypatch, tm
 # --- the nightly audit post -------------------------------------------------------------------
 
 def audit_line(label, n, rules, tmdb="ok", **kw):
-    """A hook decision line as the audit reads it: an edit of episode n of label with rules, as (selector, new, rule)."""
+    """A hook decision line as the audit reads it: an edit of episode n of label with rules, as (selector, new, rule). Its
+    file is under the test's folder, and keep_lines() makes it."""
     before = [{"pos": "a1", "sel": "track:=1", "lang": "spa", "default": 1, "role": "main"},
               {"pos": "a2", "sel": "track:=2", "lang": "eng", "default": 0, "role": "main"},
               {"pos": "s1", "sel": "track:=3", "lang": "eng", "default": 0, "role": "full"}]
     return dict(time=datetime_now(), app="sonarr", source="hook", apply=True, outcome="edited", result="edited", label=f"{label} S01E{n:02d}",
-                path=f"/tv/{label}/{n}.mkv", before=before, edits=[[sel, new, 1 - new] for sel, new, _ in rules], edit_rules=[r for _, _, r in rules],
+                path=os.path.join(os.path.dirname(hook.CFG.log), "tv", label, f"{n}.mkv"), before=before,
+                edits=[[sel, new, 1 - new] for sel, new, _ in rules], edit_rules=[r for _, _, r in rules],
                 recheck={"edits": 0, "invariants": []}, tmdb=tmdb, **{"class": "x", **kw})
 
 
@@ -9152,63 +9146,139 @@ def datetime_now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def post_audit(env, lines):
-    """The audit of the decision lines lines, kept in the store as logs.decision() keeps them."""
+def keep_lines(lines):
+    """Keep the decision lines in the store as logs.decision() keeps them, in order, and make the file of each."""
     for r in lines:
+        os.makedirs(os.path.dirname(r["path"]), exist_ok=True)
+        open(r["path"], "a").close()
         hook.store.decided(datetime.datetime.fromisoformat(r["time"]).timestamp(), r["app"], r["path"],
                            json.dumps({k: r[k] for k in hook.KEPT_KEYS if k in r}))
+
+
+def post_audit(env, lines, gone=()):
+    """The posts of the nightly audit of the decision lines lines. The files of gone are removed first."""
+    keep_lines(lines)
+    for path in gone:
+        os.remove(path)
     hook.main(["--audit", "sonarr", "--since", "24h", "--post"])
-    (post,) = [b for m, u, b in env["http"] if m == "POST"]
-    return post
+    return [b for m, u, b in env["http"] if m == "POST"]
 
 
 ENGLISH_FIRST = [("track:=2", 1, "audio switched"), ("track:=1", 0, "audio switched"), ("track:=3", 0, "foreign subtitle off")]
+OFF = {"recheck": {"edits": 0, "invariants": ["inv_only_english_subtitle_off"]}}   # a track problem after the change
+UNDECIDED = {"outcome": "undecided", "result": "undecided", "abstain": "original_missing_bare_tag"}
+NO_ORIGINAL = "couldn't decide which audio should play first, because no track is in the original language"
 
 
 def test_a_clean_day_posts_no_audit(env):
     """A day of clean changes posts nothing. The summary line still goes to syslog."""
     lines = [audit_line("Show H", n, ENGLISH_FIRST) for n in (1, 2, 3)] + [audit_line("Show I", 1, [("track:=3", 0, "forced flag cleared")])]
-    for r in lines:
-        hook.store.decided(datetime.datetime.fromisoformat(r["time"]).timestamp(), r["app"], r["path"],
-                           json.dumps({k: r[k] for k in hook.KEPT_KEYS if k in r}))
-    hook.main(["--audit", "sonarr", "--since", "24h", "--post"])
-    assert [b for m, u, b in env["http"] if m == "POST"] == []
+    assert post_audit(env, lines) == []
     assert env["syslog"][-1].startswith("arr=sonarr source=audit outcome=summary edited=4 further=0 undecided=0"), env["syslog"]
 
 
-def test_the_audit_lists_every_file_with_the_problems_first(env):
-    """A day with problems posts one line per file: its problems in plain words, then the files that are OK. The lines
-    past the limit end in "and N more OK". TMDB shows in the footer only when it had trouble."""
-    lines = [audit_line(f"Show {k:03d}", 1, ENGLISH_FIRST) for k in range(120)]
-    lines += [dict(audit_line("Show J", 1, []), outcome="undecided", result="undecided: the app says Japanese", abstain="original_missing_bare_tag"),
-              dict(audit_line("Show 000", 1, ENGLISH_FIRST), tmdb="tmdb_unavailable", recheck={"edits": 1, "invariants": []}),
-              dict(audit_line("Show K", 1, ENGLISH_FIRST), recheck={"edits": 0, "invariants": ["inv_only_english_subtitle_off"]})]
-    post = post_audit(env, lines)
+def test_the_audit_lists_only_the_files_with_an_open_problem(env):
+    """A day with problems posts one line per file with an open problem, in plain words, and no line for a file that is
+    fine. The lines past the limit end in "and N more". TMDB shows in the footer only when it had trouble."""
+    lines = [dict(audit_line(f"Show {k:03d}", 1, ENGLISH_FIRST), **OFF) for k in range(120)]
+    lines += [dict(audit_line("Show J", 1, []), **UNDECIDED), audit_line("Show Fine", 1, ENGLISH_FIRST),
+              dict(audit_line("Show 000", 1, ENGLISH_FIRST), tmdb="tmdb_unavailable", recheck={"edits": 1, "invariants": []})]
+    (post,) = post_audit(env, lines)
     e, host = post["embeds"][0], hook.CFG.instance
     body = e["description"].split("\n")
-    assert (e["title"], e["color"], e["fields"]) == (f"Audit check: 3 problems · Sonarr {host}", hook.COLORS["amber"], [])
-    assert body[:4] == ["**Show 000 S01E01**: a check after the change still finds tracks to change",
-                        "**Show J S01E01**: couldn't decide which audio should play first, because no track is in the original language",
-                        "**Show K S01E01**: after the change, the only English subtitles are off", "**Show 001 S01E01**: OK"]
-    assert body[-1] == f"and {122 - (len(body) - 1)} more OK" and len(e["description"]) <= 2000, body[-3:]
+    assert (e["title"], e["color"], e["fields"]) == (f"Open problems: 121 files · Sonarr {host}", hook.COLORS["amber"], [])
+    assert body[:3] == ["**Show 000 S01E01**: a check after the change still finds tracks to change",
+                        "**Show 001 S01E01**: after the change, the only English subtitles are off",
+                        "**Show 002 S01E01**: after the change, the only English subtitles are off"]
+    assert body[-1] == f"and {121 - (len(body) - 1)} more" and len(e["description"]) <= 2000, body[-3:]
+    assert "OK" not in e["description"] and "Show Fine" not in e["description"] and "Show J" not in e["description"]   # past the limit
     assert e["footer"]["text"] == f"TMDB didn't answer 1 time · arr-media-guard on {host}"
     assert "invariant" not in e["description"] and "undecided" not in e["description"]
 
 
-OFF = {"recheck": {"edits": 0, "invariants": ["inv_only_english_subtitle_off"]}}   # a track problem after the change
+def test_the_title_counts_the_files_with_an_open_problem(env, capsys):
+    """One file has two problems, and the title counts it once. The terminal prints the same files as the post."""
+    lines = [dict(audit_line("Show J", 1, []), **UNDECIDED, header_repair={"code": "header_repair_skipped"})]
+    (post,) = post_audit(env, lines)
+    assert post["embeds"][0]["title"] == f"Open problems: 1 file · Sonarr {hook.CFG.instance}"
+    assert post["embeds"][0]["description"] == f"**Show J S01E01**: the file repair was skipped and {NO_ORIGINAL}"
+    keep_lines([dict(audit_line("Show K", 1, ENGLISH_FIRST), **OFF)])
+    capsys.readouterr()
+    hook.main(["--audit", "sonarr", "--since", "24h"])
+    out = capsys.readouterr().out.split("\n")
+    out = out[out.index(f"Open problems: 2 files · Sonarr {hook.CFG.instance}") + 1:]
+    assert out[0].startswith("2 files with an open problem since ") and out[1:3] == [f"Show J S01E01: the file repair was skipped and {NO_ORIGINAL}",
+                        "Show K S01E01: after the change, the only English subtitles are off"]
+
+
+def test_the_audit_leaves_out_a_file_that_is_gone(env):
+    """A backfill failed to convert an AVI, and a later --check --apply converted it to a new name. The AVI is gone, so
+    the audit posts nothing for it, and the new file has no problem."""
+    avi = dict(audit_line("Show M", 1, []), source="backfill", outcome="repack_failed", container="AVI", **{"class": "not Matroska"})
+    avi["path"] = avi["path"].replace(".mkv", ".avi")
+    mkv = dict(audit_line("Show M", 1, ENGLISH_FIRST), source="check")
+    assert post_audit(env, [avi, mkv], gone=[avi["path"]]) == []
+
+
+@pytest.mark.parametrize("later, posts", [
+    ({"source": "check"}, False), ({"source": "backfill"}, False),
+    ({"source": "hook"}, False),   # an upgrade replaced the file at its path
+    ({"source": "deep_analysis"}, True), ({"source": "recheck"}, True),   # they keep the flags
+    ({"source": "check", "apply": False}, True),   # a dry run changes nothing
+    ({"source": "hook", "class": None}, True)])   # the audio check of another file of a season pack
+def test_only_a_later_result_of_the_file_hides_its_problem(env, later, posts):
+    """Each file counts once, by its latest result, see open_problem(). An undecided import and an edit whose check found a
+    problem stay open until a later import, check or backfill of the same file finds no problem."""
+    lines = [dict(audit_line("Show J", 1, []), **UNDECIDED), dict(audit_line("Show K", 1, ENGLISH_FIRST), **OFF)]
+    lines += [{k: v for k, v in dict(audit_line(label, 1, []), outcome="no_change", result="no change", **later).items() if v is not None}
+              for label in ("Show J", "Show K")]
+    got = post_audit(env, lines)
+    assert [p["embeds"][0]["description"] for p in got] == [
+        f"**Show J S01E01**: {NO_ORIGINAL}\n**Show K S01E01**: after the change, the only English subtitles are off"] * posts
+
+
+@pytest.mark.parametrize("said, alerted", [("sent", True), ("already sent", True), ("failed: HTTPError: HTTP Error 500", False),
+                                           ("no webhook configured", False), ("skipped, Discord asked for no posts for 30 s more", False),
+                                           (None, False)])   # a backfill posts no alert, and a line of an older version keeps no result
+def test_a_failure_whose_own_alert_went_out_stays_out_of_the_audit(env, said, alerted):
+    """A failed conversion or file repair posts its own alert, see process.conversion() and process.faults(). The audit
+    leaves the problem out only when the alert_result of its kind says the alert went out. A skipped repair posts no
+    alert anywhere."""
+    said_of = lambda kinds, results: {} if said is None else {"alert_kinds": kinds, "alert_result": results}
+    lines = [dict(audit_line("Show M", 1, []), outcome="repack_failed", container="AVI", **{"class": "not Matroska"}, **said_of(["repack"], [said])),
+             dict(audit_line("Show N", 1, []), outcome="no_change", header_repair={"code": "header_repair_failed"},
+                  **said_of(["language", "header"], ["sent", said])),
+             dict(audit_line("Show P", 1, []), outcome="no_change", header_repair={"code": "header_repair_skipped"})]
+    (post,) = post_audit(env, lines)
+    want = ["**Show M S01E01**: the conversion to MKV failed", "**Show N S01E01**: the file repair failed"] * (not alerted)
+    assert post["embeds"][0]["description"].split("\n") == want + ["**Show P S01E01**: the file repair was skipped"]
+
+
+@pytest.mark.parametrize("first", [OFF, UNDECIDED])
+def test_the_lines_of_check_after_its_own_checks_hide_no_problem(env, first):
+    """--check runs the burned-in subtitle check and the deep analysis after its own checks, see check(). Their lines
+    name check as the source and keep the flags, so the problem of the check's own line stays open."""
+    keep = lambda r, *drop: {k: v for k, v in r.items() if k not in drop}
+    lines = [dict(audit_line("Show K", 1, ENGLISH_FIRST), source="check", **first),
+             dict(keep(audit_line("Show K", 1, []), "before", "edits", "edit_rules", "recheck", "tmdb"), source="check",
+                  outcome="burned_in_none", result="no burned-in subtitles, logged only", **{"class": "burned-in subtitles, logged"}),
+             dict(keep(audit_line("Show K", 1, []), "before", "edits", "recheck", "tmdb"), source="check", outcome="no_change",
+                  result="no change", deep=True, **{"class": "no change"})]
+    (post,) = post_audit(env, lines)
+    problem = NO_ORIGINAL if first is UNDECIDED else "after the change, the only English subtitles are off"
+    assert post["embeds"][0]["description"] == f"**Show K S01E01**: {problem}"
 
 
 def test_the_audit_links_each_problem_to_its_item(env, settings):
     """A problem line links its item to its page in the app, from the slug its decision line keeps. A line with no slug
-    and an OK line stay bold."""
+    stays bold."""
     settings(sonarr={"link": "https://tv.media-host.test"})
     lines = [dict(audit_line("Show K", 1, ENGLISH_FIRST), ids={"slug": "show-k"}, **OFF),
-             dict(audit_line("Show J", 1, []), outcome="undecided", result="undecided", abstain="original_missing_bare_tag"),
+             dict(audit_line("Show J", 1, []), **UNDECIDED),
              dict(audit_line("Show H", 1, ENGLISH_FIRST), ids={"slug": "show-h"})]
-    body = post_audit(env, lines)["embeds"][0]["description"].split("\n")
-    assert body == ["**Show J S01E01**: couldn't decide which audio should play first, because no track is in the original language",
-                    "[Show K S01E01](https://tv.media-host.test/series/show-k): after the change, the only English subtitles are off",
-                    "**Show H S01E01**: OK"]
+    (post,) = post_audit(env, lines)
+    assert post["embeds"][0]["description"].split("\n") == [
+        f"**Show J S01E01**: {NO_ORIGINAL}", "[Show K S01E01](https://tv.media-host.test/series/show-k): after the change, the only English subtitles are off"]
 
 
 def test_the_audit_links_a_problem_whose_first_line_of_the_day_has_no_slug(env, settings):
@@ -9217,15 +9287,17 @@ def test_the_audit_links_a_problem_whose_first_line_of_the_day_has_no_slug(env, 
     settings(sonarr={"link": "https://tv.media-host.test"})
     old = audit_line("Show K", 1, ENGLISH_FIRST)
     new = dict(audit_line("Show K", 1, ENGLISH_FIRST), ids={"slug": "show-k"}, **OFF)
-    body = post_audit(env, [old, new])["embeds"][0]["description"].split("\n")
-    assert body == ["[Show K S01E01](https://tv.media-host.test/series/show-k): after the change, the only English subtitles are off"]
+    (post,) = post_audit(env, [old, new])
+    assert post["embeds"][0]["description"].split("\n") == [
+        "[Show K S01E01](https://tv.media-host.test/series/show-k): after the change, the only English subtitles are off"]
 
 
 def test_the_audit_with_long_links_still_ends_in_and_n_more(env, settings):
     """The links count toward the cap of the file list, so the post stays under Discord's limit and no link is cut."""
     settings(sonarr={"link": "https://tv.media-host.test"})
     lines = [dict(audit_line(f"Show {k:03d}", 1, ENGLISH_FIRST), ids={"slug": f"show-{k:03d}-" + "x" * 80}, **OFF) for k in range(60)]
-    e = post_audit(env, lines)["embeds"][0]
+    (post,) = post_audit(env, lines)
+    e = post["embeds"][0]
     body = e["description"].split("\n")
     assert len(e["description"]) <= 2000 and body[-1] == f"and {60 - (len(body) - 1)} more", body[-2:]
     assert body[:-1] == [f"[Show {k:03d} S01E01](https://tv.media-host.test/series/show-{k:03d}-{'x' * 80}): after the change, the only English "
@@ -9233,21 +9305,18 @@ def test_the_audit_with_long_links_still_ends_in_and_n_more(env, settings):
 
 
 def test_the_terminal_audit_names_each_problem_in_plain_words(env, capsys):
-    """The fields of --audit in a terminal use the words of the Discord audit. The decision log keeps the codes."""
-    lines = [dict(audit_line("Show J", 1, []), outcome="undecided", result="undecided", abstain="original_missing_bare_tag"),
-             dict(audit_line("Show K", 1, ENGLISH_FIRST), recheck={"edits": 0, "invariants": ["inv_only_english_subtitle_off"]}),
+    """The terminal audit uses the words of the Discord audit. The decision log keeps the codes."""
+    lines = [dict(audit_line("Show J", 1, []), **UNDECIDED),
+             dict(audit_line("Show K", 1, ENGLISH_FIRST), **OFF),
              dict(audit_line("Show L", 1, []), outcome="dropped", result="dropped", invariants=["inv_audio_default_count"]),
-             dict(audit_line("Show M", 1, []), outcome="repack_failed", container="AVI"),
-             dict(audit_line("Show N", 1, []), outcome="no_change", header_repair={"code": "header_repair_failed"})]
-    for r in lines:
-        hook.store.decided(datetime.datetime.fromisoformat(r["time"]).timestamp(), r["app"], r["path"],
-                           json.dumps({k: r[k] for k in hook.KEPT_KEYS if k in r}))
+             dict(audit_line("Show M", 1, []), source="backfill", outcome="repack_failed", container="AVI"),
+             dict(audit_line("Show N", 1, []), source="backfill", outcome="no_change", header_repair={"code": "header_repair_failed"})]
+    keep_lines(lines)
     hook.main(["--audit", "sonarr", "--since", "24h"])
     out = capsys.readouterr().out
-    assert "Undecided:\n1 couldn't decide which audio should play first, because no track is in the original language (Show J S01E01)" in out
-    assert "Track problem after the change:\n1 the only English subtitles are off (Show K S01E01)" in out
-    assert "Dropped:\n1 the wrong number of audio tracks would play by default (Show L S01E01)" in out
-    assert "1 the conversion to MKV failed (not Matroska: AVI) (Show M S01E01)" in out and "1 the file repair failed (Show N S01E01)" in out
+    assert f"\nShow J S01E01: {NO_ORIGINAL}\nShow K S01E01: after the change, the only English subtitles are off\n" in out
+    assert "\nShow L S01E01: a planned track change wasn't made, because then the wrong number of audio tracks would play by default\n" in out
+    assert "\nShow M S01E01: the conversion to MKV failed\nShow N S01E01: the file repair failed\n" in out
     assert not [c for c in ("inv_", "original_missing", "repack_failed", "header_repair") if c in out], out
 
 
@@ -16920,17 +16989,17 @@ def test_the_kept_records_stat_the_links_before_the_transaction(env, monkeypatch
     assert stats == [False, False]
 
 
-def test_the_audit_reads_the_decisions_of_its_window_from_the_store(env, capsys):
+def test_the_audit_reads_the_decisions_of_its_window_from_the_store(env):
     """--since reads the decision lines of its app from that time on. The store drops a line after KEEP_DECISIONS."""
     hook.main([])   # an edit of Film A, logged now
     old = dict(audit_line("Show H", 1, ENGLISH_FIRST), app="radarr", time="2026-01-01T00:00:00+00:00")
     hook.store.decided(datetime.datetime.fromisoformat(old["time"]).timestamp(), "radarr", old["path"], json.dumps(old))
     hook.main(["--audit", "radarr", "--since", "2026-01-02"])
-    assert "1 file changed since" in capsys.readouterr().out
+    assert " edited=1 " in env["syslog"][-1]
     hook.main(["--audit", "radarr", "--since", "2025-12-31"])
-    assert "2 files changed since" in capsys.readouterr().out
+    assert " edited=2 " in env["syslog"][-1]
     hook.main(["--audit", "sonarr", "--since", "2025-12-31"])
-    assert "0 files changed since" in capsys.readouterr().out
+    assert " edited=0 " in env["syslog"][-1]
     hook.decision(dict(app="radarr", source="hook", path="/m/y.mkv", result="no change", outcome="no_change"), time.time())
     assert [json.loads(r)["path"] for r, in hook.store.read("SELECT rec FROM decisions")] == [env["path"], "/m/y.mkv"]   # the old line went
 
@@ -18261,7 +18330,7 @@ def test_english_burned_in_over_japanese_audio_turns_off_the_english_subtitles_a
     assert rec["burned_in"]["plan"] == "mute" and [c[4] for c in burn["calls"]] == [False, True] and "lock" in env["events"]
     assert rec["class"] == "burned-in English subtitles over other audio"
     hook.main(["--audit", "radarr", "--since", "24h", "--post"])
-    assert "0 of them still have tracks to change." in capsys.readouterr().out and len(posted(env)) == 1
+    assert "0 files with an open problem since" in capsys.readouterr().out and " further=0 " in env["syslog"][-1] and len(posted(env)) == 1
     hook.background(queue_burn(env, inputs=JAPANESE), [])   # the job again, as after a crash: nothing left to turn off, no second post
     assert len(env["mkvpropedit"]) == 1 and len(posted(env)) == 1
 
@@ -18460,8 +18529,7 @@ def test_the_nightly_audit_probes_a_muted_file_with_its_mark(env, burn, capsys):
     hook.background(japanese_burn(env, ("eng", True, {})), [])
     hook.store.write("UPDATE decisions SET rec = json_remove(rec, '$.recheck')")
     hook.main(["--audit", "radarr", "--since", "24h"])
-    out = capsys.readouterr().out
-    assert "1 file changed since" in out and "0 of them still have tracks to change." in out, out
+    assert "0 files with an open problem since" in capsys.readouterr().out and " edited=1 further=0 " in env["syslog"][-1], env["syslog"]
 
 
 def test_the_mark_follows_a_remux_and_a_flag_edit_of_amg_itself(env):
@@ -18906,7 +18974,7 @@ def test_check_dry_run_changes_nothing_and_says_what_an_import_would_do(env, mon
     assert not os.path.exists(status)   # RR2 2026-10-12: a dry run writes no status.json
     assert env["nice"] == [19, ["ionice", "-c3", "-p", str(os.getpid())]]   # the lowest CPU and disk priority, as a backfill
     hook.main(["--audit", "radarr", "--since", "24h"])
-    assert "0 files changed" in capsys.readouterr().out and os.path.exists(status)   # the next command records again
+    assert "0 files with an open problem since" in capsys.readouterr().out and os.path.exists(status)   # the next command records again
 
 
 def test_check_apply_edits_as_an_import_and_asks_plex_to_analyze(env, monkeypatch):
@@ -19300,6 +19368,7 @@ def test_check_runs_the_deep_analysis_an_import_queues_right_after_its_checks(en
     assert (first["alert_kinds"], first.get("alert_result")) == (["subtiming"], [hook.HOLD_RESULT] if apply else None), first
     assert deep["subremux"]["codes"] == (["subtitle_blocks_retimed"] if apply else ["would_remux_subtitles"]), deep
     assert deep.get("held_result") == (["checked again"] if apply else None) and posted(env) == [] and hook.store.read("SELECT name FROM jobs") == []
+    assert deep["deep"] and "deep" not in first   # the nightly audit takes no result from the deep analysis, see a_result()
     assert f'\ndeep analysis, Film A (1979): {deep["result"]}' in capsys.readouterr().out
 
 
@@ -19695,9 +19764,8 @@ def test_check_of_a_file_no_app_lists_counts_in_no_audit(env, monkeypatch, tmp_p
     hook.main(["--check", loose, "--tmdb", "movie/90001", "--apply"])
     hook.main(["--check", scratch_copy(env, tmp_path, "Film A copy.mkv"), "--apply"])
     assert [(r["app"], r["outcome"], r["outside"]) for r in checked(env)] == [("radarr", "edited", True), (None, "no_change", True)]
-    capsys.readouterr()
     hook.main(["--audit", "radarr", "--since", "24h"])
-    assert "0 files changed" in capsys.readouterr().out
+    assert " edited=0 " in env["syslog"][-1], env["syslog"]
 
 
 def test_check_tmdb_runs_as_the_app_instance_of_its_kind(env, monkeypatch, tmp_path):

@@ -34,6 +34,8 @@ A decision line holds:
 - `change_result`, with `DISCORD_POSTS=all` only, what the post of each change to the file gave. That is `sent`, why the
   post failed, or `skipped` while Discord asked AMG to wait. A change whose text could not be built posted nothing, and
   its entry starts `no text:`. A run that changed nothing has an empty list.
+- `deep`, true on the deep analysis line that `--check` writes after its own checks. The nightly audit never takes
+  that line as the file's latest result.
 
 Search the codes, never the sentences, because the words of a sentence may change. [design.md](design.md#alerts) lists
 the kinds and the codes. A dry run words its alerts as what `--apply` would do. [design.md](design.md#logs) has more on

@@ -70,7 +70,7 @@ A *canary* is a small sample, spread across the plan groups, that you apply firs
 arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                        # dry run, one plan per line
 arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl                          # the plans, by plan group
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20   # 20 files across plan groups
-arr-media-guard --audit radarr --since 2026-01-01T10:00                                        # check the canary's edits
+arr-media-guard --audit radarr --since 2026-01-01T10:00                                        # the open problems since the canary
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl               # the rest
 ```
 
@@ -92,7 +92,7 @@ arr-media-guard --sub-time "/data/movies/Film A (2000)/Film A (2000).mkv"   # ti
 arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv"      # every check of an import on one file, dry
 arr-media-guard --burn-in "/data/movies/Film A (2000)/Film A (2000).mkv"   # look for burned-in subtitles, report only
 arr-media-guard-subhunt radarr --ids 123                      # find a release with English subtitles, dry. Needs SABnzbd and NZBHydra2.
-arr-media-guard --audit radarr --since 24h --post             # AMG's edits of the last day, to Discord
+arr-media-guard --audit radarr --since 24h --post             # the open problems of the last day, to Discord
 ```
 
 - `--ids` takes the app's own ids: Radarr's movie id or Sonarr's series id, the `id` field of `/api/v3/movie` or
@@ -273,7 +273,7 @@ arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movie
   lines of 14 days for this. Another reason, or no logged refusal, is not forced, and the run says why.
 - Every other step runs as normal.
 - The original stays in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, so one move puts it back.
-- The decision line names the refusal in `repack.forced`. On a host, the audit's printed list marks the file as forced.
+- The decision line names the refusal in `repack.forced`.
 - The option needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0.
 - A path that is not in the run's list of files is reported and skipped.
 
@@ -284,16 +284,19 @@ link stays right. This needs no logged refusal.
 - The extras, such as subtitles and `.nfo` files, keep that check. AMG takes them from the whole series folder. An extra
   whose name reads as other episodes still refuses the file and is named, so you can fix or remove it.
 - The stream check still runs, and its refusal is forced only as above.
-- The decision line names what Sonarr read in `repack.forced_name`, and the original stays in `.<NAME>-originals`. On a
-  host, the audit's printed list says "name forced".
+- The decision line names what Sonarr read in `repack.forced_name`, and the original stays in `.<NAME>-originals`.
 
 ## The audit
 
 `--audit` reviews changes. With `--plan-from` it groups the plans of a dry run by the rule that made them. With
-`--since` it reviews the changes that imports, backfills and `--check` with `--apply` made in that time. A file that no
-app lists counts in no audit. AMG keeps the decision lines for 14 days. `--source hook` takes only the imports,
-`--source backfill` only the backfills, and `--source check` only `--check`. `--post` sends the summary to Discord when
-the audit found a problem.
+`--since` it lists the files that imports, backfills and `--check` with `--apply` left with a problem in that time. A
+file that no app lists counts in no audit. AMG keeps the decision lines for 14 days. `--source hook` takes only the
+imports, `--source backfill` only the backfills, and `--source check` only `--check`. `--post` sends the list to
+Discord, titled "Open problems: 2 files", when a file has an open problem.
+
+The list has one line per file, with its problems in plain words. Each file counts once, by its latest import, check or
+backfill. The list leaves out a file that is gone, and a failed conversion or file repair that already had its own
+alert. See "Audit" in [design.md](design.md#audit).
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 

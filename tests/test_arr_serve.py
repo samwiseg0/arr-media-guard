@@ -1418,7 +1418,7 @@ def test_under_the_listener_the_audit_writes_only_its_summary_line(app, monkeypa
     assert capsys.readouterr().out == line + "\n"
     monkeypatch.setattr(h, "SERVE", False)
     h.main(["--audit", "radarr", "--since", "24h"])   # in a terminal, only the text
-    assert capsys.readouterr().out.startswith(f"Audit check: 0 problems · Radarr {h.CFG.instance}\n0 files changed since ")
+    assert capsys.readouterr().out.startswith(f"Open problems: 0 files · Radarr {h.CFG.instance}\n0 files with an open problem since ")
 
 
 def test_spawn_starts_a_new_program_in_its_own_session(monkeypatch):

@@ -790,7 +790,7 @@ plans, a canary, and then the rest.
 arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                      # dry run
 arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl --post                 # one summary of the problems
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20 # a sample
-arr-media-guard --audit radarr --since 2026-01-01T10:00 --post                               # the canary's edits
+arr-media-guard --audit radarr --since 2026-01-01T10:00 --post                               # the open problems since the canary
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl             # the rest
 ```
 
@@ -811,12 +811,29 @@ decision log. It expects no further edit in each edit's `recheck`, and it probes
 without one.
 
 Schedule `arr-media-guard --audit <app> --since 24h --post` each night for each app, with a systemd
-timer or cron. It posts only when a file of the day has a problem: a re-check that still plans an edit,
-an undecided or dropped plan, a broken invariant, a failed or skipped repair or conversion, or a probe that
-failed. The post lists each file, its problems in plain words first, then the files that are OK. The name of a file
-with a problem links to its page in the app, as in an alert. Its footer
-names TMDB only when TMDB had trouble that day. The syslog summary line goes out every night. The audit also
-removes kept originals past their age and writes the policy status, see "Status file".
+timer or cron. Its post, "Open problems: 2 files · Radarr <INSTANCE>", lists only the files that still have a problem. A problem is
+a re-check that still plans an edit, an undecided or dropped plan, a broken invariant, a failed or skipped repair or
+conversion, or a probe that failed. The audit posts nothing when no file has an open problem.
+
+Each file counts once, by its latest result. A result is a decision line of an import, `--check`, a backfill or a job
+a backfill queued. These runs decide the flags and the container. The deep analysis and a recheck keep the flags. The
+burned-in subtitle check changes only the English subtitle flags. Their lines never hide an earlier problem. `--check` runs the burned-in subtitle check
+and the deep analysis after its own checks, and their lines name `check` as the source. The audit tells them apart by
+the class of the burn-in line and by `"deep": true` on the deep analysis line. A problem of the check after an edit
+counts until a later result. The post leaves out these files and problems:
+
+- A file that is gone, as after a conversion to a new name. A file that an upgrade replaced at the same path has the
+  import's new line as its latest result. The store drops the size and time of a decision line, so the audit cannot
+  tell a replaced file in another way.
+- A failed conversion or file repair whose own alert went out. Its line says so in `alert_kinds` and `alert_result`,
+  with `sent` or `already sent`. A failure whose alert failed or never posted stays in the post. A backfill posts no
+  alert, so its failure stays too.
+
+The post has one line per file, with its problems in plain words. The name of each file links to its page in the app,
+as in an alert. Its footer names TMDB only when TMDB had trouble that day. The terminal prints the same files. The
+syslog summary line goes out every night. It counts each problem of each decision line of the day, also the problems
+the post leaves out. The audit also removes kept originals past their age and writes the policy status, see "Status
+file".
 
 `--check-audio` and `--check-video` scan every file of the app the way the worker checks an import.
 A scan never deletes, edits or re-grabs. It checks `SCAN_WORKERS` files at a time, and each worker
@@ -959,8 +976,7 @@ last refusal the decision log holds for its path. Another refusal, or none in th
 forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
 import, the extras and the checks after them. The original is kept in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, as a
 header repair keeps it, so one move undoes the conversion. See "Kept originals" for the hard link and its copy fallback. The option needs `KEEP_ORIGINALS_DAYS`
-above 0. The decision line names the refusal in `repack.forced`, and the nightly audit says
-"forced". A listed path that is not in the run's work list is reported and skipped. The hook
+above 0. The decision line names the refusal in `repack.forced`. A listed path that is not in the run's work list is reported and skipped. The hook
 never forces a conversion.
 
 A listed Sonarr file also skips `parse_refuses()` for its own new name. Scene numbering can put specials at the start of
@@ -968,8 +984,7 @@ a season, and an alias can match another show, so the parse can read a right nam
 episodes. The ManualImport names the item's own episodes by id, so the link stays right. The parse
 result is fixed, so this needs no logged refusal. Every other check still runs, and the proof must
 still pass unless its refusal is logged. The decision line names the parse result in
-`repack.forced_name`, the original is kept as for a forced proof, and the audit says "name
-forced". The extras keep the check. They go back by a rescan, which links them by their parsed
+`repack.forced_name`, and the original is kept as for a forced proof. The extras keep the check. They go back by a rescan, which links them by their parsed
 names, and a later rescan or rename could link a subtitle to the wrong episode and rename it. So an
 extra whose name maps to other episodes still refuses the file, and the refusal names the extra.
 

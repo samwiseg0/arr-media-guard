@@ -644,6 +644,7 @@ def deep_later(app, f, info, a, job, rec, run):
         return None
     deep = dict(job, deep=True, path=rec["path"])
     took, r = backfill_file(app, dict(f, path=rec["path"], id=(rec.get("ids") or {}).get("file_id")), info, a, False, job=deep)
+    r["deep"] = True   # its line keeps source check, so the audit tells it apart by this, see a_result()
     if r["outcome"] == "error" and getattr(deep.get("run"), "rec", None):   # what the run changed before the error, as runner.deep_analysis() keeps it
         r.update({k: deep["run"].rec[k] for k in ("subremux", "sidecars") if k in deep["run"].rec})
     if run.held:
@@ -854,25 +855,53 @@ def lines_field(name, groups):
     return fields + ([(name if not fields else f"{name}, more", cur)] if cur else [])
 
 
+RESULTS = ("hook", "check", "backfill", "backfill_job")   # the runs that decide the flags. A deep analysis and a recheck keep them.
+
+
+def a_result(r):
+    """Whether the decision line r decides the flags of its file, so it can be the file's latest result, see
+    open_problem(). process.decision_fields() and process.conversion() set the class. --check runs the burned-in
+    subtitle check and the deep analysis after its own checks, with source check. The deep analysis keeps the flags, and
+    the burned-in check changes only the English subtitle flags. The class of a burn-in line and "deep" tell their lines
+    apart, see runner.burn_act() and deep_later()."""
+    return r.get("source") in RESULTS and "class" in r and not r.get("deep") and r["class"] not in runner.BURN_CLASSES.values()
+
+
+def open_problem(what, r, result, edited_at):
+    """Whether the nightly audit posts the problem what of the decision line r, see audit(). A file that is gone counts
+    no more. A problem of the line counts only when the line is the file's latest result in result. A problem of the
+    check after an edit counts unless a later result came after that edit. A failed conversion or a failed repair counts
+    only when its alert did not go out, see process.conversion() and process.faults(). alert_result says "sent" or
+    "already sent" for an alert that went out. A line without it, as of a backfill, keeps the problem."""
+    path = r.get("path")
+    if not os.path.exists(path or ""):
+        return False
+    if what in ("further", "reprobe") or what.startswith("broken:"):
+        return edited_at[path] >= result.get(path, (-1,))[0]
+    code = {"convert": r["outcome"], "repair": (r.get("header_repair") or {}).get("code")}.get(what)
+    posted = dict(zip(r.get("alert_kinds") or (), r.get("alert_result") or ())).get({"repack_failed": "repack", "header_repair_failed": "header"}.get(code))
+    return result.get(path, (None, None))[1] is r and posted not in ("sent", "already sent")
+
+
 def audit(argv):
-    """One summary of a dry run's plans (--plan-from) or of the edits since a time (--since). It edits no file. --since
+    """One summary of a dry run's plans (--plan-from) or of the open problems since a time (--since). It edits no file. --since
     also removes the kept files older than KEEP_ORIGINALS_DAYS, turns on On Grab where KEEP_REPLACED needs it, see
     regrab.grab_fix(), and queues the rechecks of a new version, see runner.queue_rechecks()."""
-    ap = argparse.ArgumentParser(prog="arr-media-guard --audit", description="One summary of a dry run's plans or of the edits "
-                                 "since a time. It edits nothing. --since also removes the kept files older than KEEP_ORIGINALS_DAYS, "
+    ap = argparse.ArgumentParser(prog="arr-media-guard --audit", description="One summary of a dry run's plans or of the open "
+                                 "problems since a time. It edits nothing. --since also removes the kept files older than KEEP_ORIGINALS_DAYS, "
                                  "turns on On Grab where KEEP_REPLACED needs it, and queues the rechecks of a new version.")
     ap.add_argument("app", choices=sorted(config.CFG.apps)); g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--plan-from", metavar="FILE", help="group the plans of a dry run by policy path and rule, and check the "
                    "invariants again")
     g.add_argument("--since", metavar="24h|DATE", help="read the decision log from this time on, 24h or an ISO date")
-    ap.add_argument("--source", choices=["hook", "backfill", "check"], help="only the edits of the hook, of a backfill or of --check")
+    ap.add_argument("--source", choices=["hook", "backfill", "check"], help="only the results of the hook, of a backfill or of --check")
     ap.add_argument("--post", action="store_true", help="post the summary to DISCORD_WEBHOOK, when there is anything to report")
     a = ap.parse_args(argv); app = a.app
     os.nice(19)
     subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], check=False)
-    classes, undecided, dropped, further, broken, skipped, repacked, headers = {}, {}, {}, {}, {}, {}, {}, {}
-    add = lambda d, k, label: d.setdefault(k, []).append(label)
     if a.plan_from:
+        classes, undecided, dropped, broken, skipped, repacked, headers = {}, {}, {}, {}, {}, {}, {}
+        add = lambda d, k, label: d.setdefault(k, []).append(label)
         rows = plan_rows(a.plan_from, app)
         for r in rows:
             if r.get("header_repair") == "would_repair_header":   # beside its flag plan, so not in the chain below
@@ -888,32 +917,34 @@ def audit(argv):
         text = (f"{sum(map(len, classes.values()))} of {len(rows)} files would change, in {len(classes)} classes. "
                 f"{sum(map(len, undecided.values()))} undecided, {sum(map(len, dropped.values()))} with a planned track change not made")
         worth = bool(undecided or dropped or skipped or broken)   # a plan that only changes files posts nothing
+        n_broken, n_skipped, n_repacked, n_headers = (sum(map(len, x.values())) for x in (broken, skipped, repacked, headers))
+        text += f", {n_broken} with a track problem after the planned change."
+        text += f" {n_repacked} would be repacked into Matroska." if n_repacked else ""
+        text += f" {n_headers} would get a new header from a remux." if n_headers else ""
+        text += f" {n_skipped} skipped: the container is not Matroska, or a header repair failed or was skipped." if n_skipped else ""
+        fields = (lines_field("Classes", classes) + lines_field("Undecided", undecided) + lines_field("Dropped", dropped)
+                  + lines_field("Track problem after the change", broken) + lines_field("Repacked", repacked)
+                  + lines_field("Header repaired", headers) + lines_field("Skipped", skipped))
     else:
-        start, last, day, seen = since_time(a.since), {}, [], []   # seen: ("changed" or a problem code, its decision line), see logs.audit_embed()
-        for raw, in store.read("SELECT rec FROM decisions WHERE app = ? AND at >= ? ORDER BY rowid", app, start.timestamp()):
+        # seen: (a problem code, its decision line), see logs.audit_problem(). result: per path the place and line of its
+        # latest result, and edited_at the place of its last edit, see open_problem().
+        start, last, day, seen, result, edited_at = since_time(a.since), {}, [], [], {}, {}
+        for n, (raw,) in enumerate(store.read("SELECT rec FROM decisions WHERE app = ? AND at >= ? ORDER BY rowid", app, start.timestamp())):
             r = json.loads(raw)   # a decision line of this app and window, as logs.decision() keeps it
             day.append(r)   # every source, for the TMDB status
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
-            if (r.get("repack") or {}).get("new_size"):
-                add(repacked, f'repacked from {r.get("container")}' + logs.forced_note(r["repack"]), r.get("label"))
-                seen.append(("changed", r))
-            code = (r.get("header_repair") or {}).get("code")
-            if code in config.REPAIRED:
-                add(headers, {"header_repaired": "header repaired", "subtitle_trimmed": "subtitles trimmed", "subtitle_removed": "subtitles removed",
-                              "tail_removed": "tail removed"}[code], r.get("label")); seen.append(("changed", r))
-            elif code in ("header_repair_failed", "header_repair_skipped"):
-                add(skipped, logs.audit_problem("repair", r), r.get("label")); seen.append(("repair", r))
-            if r["outcome"] == "undecided":
-                add(undecided, logs.UNDECIDED.get(r.get("abstain")) or r.get("undecided") or r.get("abstain"), r.get("label")); seen.append(("undecided", r))
-            elif r["outcome"] == "dropped":
-                add(dropped, report.and_list(logs.DROPPED.get(c, c) for c in r.get("invariants") or []) or r.get("result"), r.get("label")); seen.append(("dropped", r))
+            if a_result(r):
+                result[r.get("path")] = n, r
+            if (r.get("header_repair") or {}).get("code") in ("header_repair_failed", "header_repair_skipped"):
+                seen.append(("repair", r))
+            if r["outcome"] in ("undecided", "dropped"):
+                seen.append((r["outcome"], r))
             elif r["outcome"] == "not_matroska" or r["outcome"].startswith("repack_"):   # a repack that failed or was skipped
-                add(skipped, f'{logs.audit_problem("convert", r)} (not Matroska: {r.get("container")})', r.get("label")); seen.append(("convert", r))
+                seen.append(("convert", r))
             elif "edited" in (r["outcome"], r.get("edit_result")):   # an edit before a wrong-content verdict too
-                last[r["path"]] = r; seen.append(("changed", r))
+                last[r["path"]], edited_at[r["path"]] = r, n
         for path, r in sorted(last.items()):   # the state each edited file was left in, from the check right after the edit
-            add(classes, r.get("class", "logged before classes existed"), r.get("label"))
             check = r.get("recheck")
             if not check or "error" in check:   # a line without the check: probe the file now, and log that as an audit decision
                 if not os.path.exists(path): continue
@@ -924,17 +955,16 @@ def audit(argv):
                         d = decide.decide(checks.mkvmerge(path), r.get("original"), r.get("kids", False), r.get("release") or "", heard)
                         if runner.muted(path):   # a burn-in job turned off the English subtitles, and they stay off
                             d = process.muted_plan(d)
-                except Exception as ex:
-                    add(further, config.mask(f"the re-probe failed: {type(ex).__name__}")[:100], r.get("label")); seen.append(("reprobe", r)); continue
+                except Exception:
+                    seen.append(("reprobe", r)); continue
                 check = {"edits": len(d["edits"]), "invariants": [c for c, _ in decide.invariants(d["tracks"], [], d["cls"], set(d["orig"]))]}
                 logs.decision(dict(id=uuid.uuid4().hex[:12], app=app, source="audit", apply=False, ids=r.get("ids", {}), label=r.get("label"),
                               path=path, result="no change" if not d["edits"] else "dry run", outcome="dry_run" if d["edits"] else "no_change",
                               edits=d["edits"], reasons=d["reasons"],
                               tracks=logs.track_log(d["tracks"]), recheck=check, **{"class": decide.plan_class(d)}), started)
             if check["edits"]:
-                add(further, f'{check["edits"]} further edits', r.get("label")); seen.append(("further", r))
-            for code in check.get("invariants", []):
-                add(broken, logs.BROKEN.get(code, code), r.get("label")); seen.append((f"broken:{code}", r))
+                seen.append(("further", r))
+            seen += [(f"broken:{code}", r) for code in check.get("invariants", [])]
         tmdb = content.tmdb_day_status(day)
         # The nightly run drops the originals a repack kept, and the grab links, older than keep_days. At 0 it drops every
         # grab link and leaves the originals.
@@ -954,31 +984,23 @@ def audit(argv):
         with contextlib.suppress(sqlite3.Error):   # a busy store shrinks the next night
             store.shrink()
         runner.queue_rechecks()   # on a host the first nightly audit of a new version queues its rechecks
-        # one summary line a night, so Loki sees each host even on a day without imports
+        # one summary line a night, so Loki sees each host even on a day without imports. It counts a file once per decision line.
+        k = collections.Counter(what.partition(":")[0] for what, _ in seen)
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
-                          ("further", sum(map(len, further.values()))), ("undecided", sum(map(len, undecided.values()))),
-                          ("dropped", sum(map(len, dropped.values()))), ("broken", sum(map(len, broken.values()))), ("tmdb", tmdb)]))
-        n = len({r.get("path") for what, r in seen if what != "changed"})   # the files with a problem, as logs.audit_embed() counts them
-        title = f"Audit check: {n} problem{'' if n == 1 else 's'} · {logs.app_name(app)}"
-        text = (f"{len(last)} file{'' if len(last) == 1 else 's'} changed since {start.isoformat(timespec='minutes')}. "
-                f"{sum(map(len, further.values()))} of them still have tracks to change. {sum(map(len, undecided.values()))} undecided, "
-                f"{sum(map(len, dropped.values()))} with a planned track change not made")
-        worth = any(what != "changed" for what, _ in seen)   # the post goes out only for a problem, the syslog line every night
-    n_broken, n_skipped, n_repacked, n_headers = (sum(map(len, x.values())) for x in (broken, skipped, repacked, headers))
-    text += f", {n_broken} with a track problem after the {'planned ' if a.plan_from else ''}change."
-    text += f" {n_repacked} {'would be ' if a.plan_from else ''}repacked into Matroska." if n_repacked else ""
-    text += f" {n_headers} {'would get' if a.plan_from else 'got'} a new header from a remux." if n_headers else ""
-    text += f" {n_skipped} skipped: the container is not Matroska, or a header repair failed or was skipped." if n_skipped else ""
-    fields = (lines_field("Classes", classes) + lines_field("Undecided", undecided) + lines_field("Dropped", dropped)
-              + lines_field("Further edits", further) + lines_field("Track problem after the change", broken) + lines_field("Repacked", repacked)
-              + lines_field("Header repaired", headers) + lines_field("Skipped", skipped))
-    if not a.plan_from:
-        fields.append(("TMDB", tmdb))   # the day's metadata checks: ok, unavailable n times, key broken, or no checks
+                          ("further", k["further"] + k["reprobe"]), ("undecided", k["undecided"]), ("dropped", k["dropped"]),
+                          ("broken", k["broken"]), ("tmdb", tmdb)]))
+        files = logs.audit_files([(what, r) for what, r in seen if open_problem(what, r, result, edited_at)])
+        title = f"Open problems: {len(files)} file{'' if len(files) == 1 else 's'} · {logs.app_name(app)}"
+        text = f"{len(files)} file{'' if len(files) == 1 else 's'} with an open problem since {start.isoformat(timespec='minutes')}." + \
+            "".join(f"\n{label}: {problems}" for label, problems, _ in files)
+        fields = [("TMDB", tmdb)]   # the day's metadata checks: ok, unavailable n times, key broken, or no checks
+        worth = bool(files)   # the post goes out only for an open problem, the syslog line every night
     if not config.SERVE:   # the container log takes the summary line above, one line per event
         print(title); print(text)
         for name, value in fields: print(f"\n{name}:\n{value}")
     if a.post and worth:
-        print(f"arr-media-guard: {app} audit post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))]) if a.plan_from else logs.audit_embed(app, seen, tmdb)))
+        print(f"arr-media-guard: {app} audit post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))])
+                                                              if a.plan_from else logs.audit_embed(app, title, files, tmdb)))
 
 
 def library(app, ids):

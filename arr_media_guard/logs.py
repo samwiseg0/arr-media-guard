@@ -75,7 +75,7 @@ def to_syslog(line):
 # The fields of a decision line that the store keeps for the audit and for --force-convert, see store.decided()
 KEPT_KEYS = ("app", "source", "apply", "outcome", "result", "edit_result", "label", "path", "class", "container", "abstain", "undecided",
              "invariants", "recheck", "heard", "original", "kids", "release", "ids", "tmdb", "edits", "edit_rules", "before", "repack",
-             "header_repair")
+             "header_repair", "alert_kinds", "alert_result", "deep")
 
 
 def decision(rec, started):
@@ -268,11 +268,6 @@ def held_changes(app, held, why, flags=frozenset()):
     return [f'{why}, change {", ".join(post_one(c) for c in h["changes"])}' if h.get("changes") else why for h in held]
 
 
-def forced_note(repack):
-    """What a person forced in a conversion: ", forced" for a proof refusal, ", name forced" for Sonarr's name check."""
-    return (", forced" if repack.get("forced") else "") + (", name forced" if repack.get("forced_name") else "")
-
-
 # The nightly audit's problems in plain words, per code of cli.audit()
 UNDECIDED = {"untagged_may_be_original": "couldn't decide which audio should play first, because an untagged track may be the original language",
              "original_missing_bare_tag": "couldn't decide which audio should play first, because no track is in the original language",
@@ -312,29 +307,31 @@ def audit_problem(what, r):
     return {"reprobe": "the file couldn't be read again for the check", "further": "a check after the change still finds tracks to change"}[what]
 
 
-def audit_embed(app, seen, tmdb):
-    """The nightly audit post, which cli.audit() sends only when a file has a problem. seen holds (the problem code or
-    "changed", its decision line). One line per file, "<label>: OK" or its problems, the problems first. The label of a
-    problem links to the item's page in the app when its decision line holds the slug, see page(). The lines past
-    AUDIT_CHARS become "and N more". The footer names the host, and TMDB only when it had trouble that day, see
-    content.tmdb_day_status()."""
+def audit_files(seen):
+    """The files of the nightly audit's open problems, see cli.audit(). seen holds (the problem code, its decision line).
+    Returns one (label, its problems in plain words, the URL of its item or None) per file, by label. The URL comes from
+    the slug a decision line of the file holds, see page()."""
     files = {}
     for what, r in seen:
         f = files.setdefault(r.get("path"), {"label": r.get("label") or "?", "url": None, "problems": []})
-        f["url"] = f["url"] or page(r)   # a line of 2.1.1 holds no slug, and a later line of the file may
-        if what != "changed":
-            f["problems"].append(audit_problem(what, r))
-    lines = sorted(((not f["problems"], f["label"], report.and_list(dict.fromkeys(f["problems"])) or "OK", f["url"]) for f in files.values()),
-                   key=lambda x: x[:3])
-    body, n = [], sum(not x[0] for x in lines)
-    for k, (ok, label, text, url) in enumerate(lines):
-        shown = report.link(label, None if ok else url)
+        f["url"] = f["url"] or page(r)
+        f["problems"].append(audit_problem(what, r))
+    return sorted(((f["label"], report.and_list(dict.fromkeys(f["problems"])), f["url"]) for f in files.values()), key=lambda x: x[:2])
+
+
+def audit_embed(app, title, files, tmdb):
+    """The nightly audit post, which cli.audit() sends only when a file has an open problem. One line per file of
+    audit_files(), "<label>: <problems>". The label links to the item's page in the app when the URL is known. The lines
+    past AUDIT_CHARS become "and N more". The footer names the host, and TMDB only when it had trouble that day, see
+    content.tmdb_day_status()."""
+    body = []
+    for k, (label, text, url) in enumerate(files):
+        shown = report.link(label, url)
         line = f"{report.bold(label) if shown == label else shown}: {text}"
         if sum(len(report.markdown(x)) + 1 for x in body + [line]) > AUDIT_CHARS:
-            body.append(f"and {len(lines) - k} more" + (" OK" if all(x[0] for x in lines[k:]) else ""))
+            body.append(f"and {len(files) - k} more")
             break
         body.append(line)
     trouble = "TMDB rejected the key" if tmdb == "key broken" else f"TMDB didn't answer {tmdb.removeprefix('unavailable ')}" \
         if tmdb.startswith("unavailable") else None
-    return embed(app, f"Audit check: {n} problem{'' if n == 1 else 's'} · {app_name(app)}", "\n".join(body), "amber", [],
-                 " · ".join(x for x in (trouble, f"{config.CFG.name} on {config.CFG.instance}") if x))
+    return embed(app, title, "\n".join(body), "amber", [], " · ".join(x for x in (trouble, f"{config.CFG.name} on {config.CFG.instance}") if x))
