@@ -314,7 +314,8 @@ def keep_original(path, note=None, stamp_of=None):
             digests.append(h.digest())
         if os.path.getsize(part) != size or digests[0] != digests[1]:
             raise OSError(f"the copy of the original does not match it, so the original stays: {part}")
-        shutil.copystat(path, part)
+        with contextlib.suppress(PermissionError):   # a share may refuse the chmod, see remux.own_like(). copystat sets the times first.
+            shutil.copystat(path, part)
         os.replace(part, keep)
     except BaseException:
         with contextlib.suppress(OSError):

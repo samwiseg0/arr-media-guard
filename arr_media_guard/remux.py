@@ -144,17 +144,41 @@ def repack_tmp(path):
     return os.path.join(os.path.dirname(path), config.CFG.hide_dir, os.fsdecode(b"." + name + config.REPACK_TMP))
 
 
-def new_tmp(tmp, excl=False):
+def new_tmp(tmp, st, excl=False):
     """Create the empty temp file tmp in its hidden folder, before the remux writes it. Another conversion in the same
     folder removes that folder once it is empty, so the file holds it, and a create that finds no folder tries again.
-    With excl a tmp that is there raises FileExistsError, else the create empties it."""
+    With excl a tmp that is there raises FileExistsError, else the create empties it. tmp gets the mode of st, the
+    file it replaces, less the umask, so a share that refuses chmod still gets that mode, see own_like(). The owner
+    may always write it, so a read-only original still remuxes."""
     for n in range(3):
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
         try:
-            return os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | (os.O_EXCL if excl else os.O_TRUNC), 0o600))
+            return os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | (os.O_EXCL if excl else os.O_TRUNC), st.st_mode & 0o666 | 0o600))
         except FileNotFoundError:
             if n == 2:
                 raise
+
+
+def own_like(path, st):
+    """Give path the owner and mode of st, the file it replaces, and return what the share refused. A NAS share may
+    refuse chown with EPERM, or with EINVAL when the owner has no id in the process's user namespace or the NFSv4 id
+    map. A share that gives each new file its own owner refuses chmod with EPERM too. path then keeps its create
+    mode, and a mode that loses a read bit of st raises PermissionError, so the swap stops and the original stays."""
+    why = []
+    try:
+        os.chown(path, st.st_uid, st.st_gid)
+    except OSError as ex:
+        why.append(f"chown refused: {ex}")
+    try:
+        os.chmod(path, st.st_mode & 0o7777)
+    except PermissionError as ex:
+        mode = os.stat(path).st_mode & 0o7777
+        # ponytail: compares mode bits only. An ACL share decides access by its ACL, which the bits may not show.
+        if st.st_mode & 0o444 & ~mode:
+            raise PermissionError(f"chmod refused, and the new file's mode {mode:o} cannot be read where the "
+                                  f"original's mode {st.st_mode & 0o7777:o} can: {ex}") from None
+        why.append(f"chmod refused, mode {mode:o}: {ex}")
+    return why
 
 
 def drop_tmp(tmp):
@@ -195,16 +219,12 @@ class Swap:
             os.close(fd)
 
     def own(self):
-        """Give tmp the owner and mode of the original and return its size. A NAS share may refuse chown, and
-        info["owner"] then says so. The refusal is EPERM, or EINVAL when the owner has no id in the process's user
-        namespace or the NFSv4 id map."""
+        """Give tmp the owner and mode of the original and return its size. When a NAS share refuses either,
+        info["owner"] says so, see own_like()."""
         st = self.st
-        try:
-            os.chown(self.tmp, st.st_uid, st.st_gid)
-        except OSError as ex:
+        if why := own_like(self.tmp, st):
             new = os.stat(self.tmp)
-            self.info["owner"] = {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{new.st_uid}:{new.st_gid}", "why": f"chown refused: {ex}"}
-        os.chmod(self.tmp, st.st_mode & 0o7777)
+            self.info["owner"] = {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{new.st_uid}:{new.st_gid}", "why": ", ".join(why)}
         return os.path.getsize(self.tmp)
 
     def check(self, text, keep):
@@ -313,7 +333,7 @@ def repack(path, j, st, apply, hp):
     keep = ["--segment-uid", uid] if uid else []   # an ordered chapter of another file may point at it
     sw = Swap(path, st, tmp, info)
     try:
-        new_tmp(tmp)
+        new_tmp(tmp, st)
         extra = []
         if trim or remove:
             extra, info["trimmed"], info["removed"] = trim_inputs(path, j, hp, folder)
@@ -713,7 +733,8 @@ def keep_text(src, path, lang, st):
         except FileExistsError:   # a file came since text_name() looked
             continue
     with os.fdopen(fd, "wb") as f:
-        os.fchmod(fd, st.st_mode & 0o666)   # os.open() applies the umask
+        with contextlib.suppress(PermissionError):   # os.open() applies the umask. A share may refuse the fchmod, see own_like().
+            os.fchmod(fd, st.st_mode & 0o666)
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
@@ -873,7 +894,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         for i, (srt, md5) in texts.items():
             x = text[subs.index(i)]
             argv += ["-map", f"0:{x}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{x}", "-c", "copy", "-f", "srt", srt]
-        new_tmp(tmp)
+        new_tmp(tmp, st)
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None   # the lines copy_fault() passes too
         bad = copy_fault(r.stdout + r.stderr, streams)

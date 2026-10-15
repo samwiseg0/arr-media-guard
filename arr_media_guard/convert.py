@@ -757,7 +757,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     key, entry, hidden = f"{app}:{os.getpid()}:{uuid.uuid4().hex[:8]}", None, []   # the pending entry, and the hidden extras
     if shared:
         try:
-            remux.new_tmp(tmp, excl=True)
+            remux.new_tmp(tmp, st, excl=True)
         except FileExistsError:   # before the Swap, so this job never removes the other job's temp file
             shutil.rmtree(folder, ignore_errors=True)
             busy_tmp(lock, tmp)
@@ -765,7 +765,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             pass   # the create below fails the same way, and the conversion fails with it
     sw = remux.Swap(path, st, tmp, info)
     try:
-        remux.new_tmp(tmp)
+        remux.new_tmp(tmp, st)
         if sync := [] if unreadable else avi_sync(path, j, streams):   # the decision log shows why a stream starts late
             info["start_sync"] = sync
         r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), [t for t, _ in drop], sync),

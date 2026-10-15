@@ -1222,12 +1222,10 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                     e["error"] = config.mask(str(ex))[:300]
                     raise OSError(f"its new {'times' if times else 'ends'} do not fit its text") from None
                 text = remux.srt_moved(text, fix) if fix and not times else text
-                remux.new_tmp(tmp)
+                remux.new_tmp(tmp, st)
                 with open(tmp, "wb") as f:
                     f.write(bom + text.encode(code, "surrogatepass"))
-                with contextlib.suppress(OSError):   # a NAS share may refuse chown, see Swap.own(). The mode stays.
-                    os.chown(tmp, st.st_uid, st.st_gid)
-                os.chmod(tmp, st.st_mode & 0o7777)
+                remux.own_like(tmp, st)
             e["kept"] = vault.keep_original(s["path"], e)
             os.remove(s["path"]) if move else os.replace(tmp, s["path"])
             e["result"] = "moved" if move else "retimed"

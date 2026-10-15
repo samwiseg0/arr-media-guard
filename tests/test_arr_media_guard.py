@@ -5454,9 +5454,9 @@ def twins(pool, monkeypatch):
     monkeypatch.setattr(hook, "run_job", run_job)
     sync, new_tmp, convert, busy, write = hook.Swap.sync, hook.new_tmp, hook.convert, hook.busy_tmp, hook.arr_write
     monkeypatch.setattr(hook.Swap, "sync", lambda self: sync(self) or trace("synced", who=me[0]))
-    def b_after_a(tmp, excl=False):
+    def b_after_a(tmp, st, excl=False):
         assert me[0] == "A" or wait_until(lambda: traced("synced"))
-        return new_tmp(tmp, excl)
+        return new_tmp(tmp, st, excl)
     monkeypatch.setattr(hook, "new_tmp", b_after_a)
     monkeypatch.setattr(hook, "busy_tmp", lambda lock, tmp: trace("busy", who=me[0]) or busy(lock, tmp))
     monkeypatch.setattr(hook, "convert", lambda *a, **k: (lambda out: trace("converted", who=me[0], code=out[0]) or out)(convert(*a, **k)))
@@ -5518,7 +5518,7 @@ def test_a_swap_refuses_a_temp_file_written_after_its_checks(env):
     """The identity check behind the exclusive create: a temp file that another write changed after sync() never
     takes the original's place."""
     tmp = hook.repack_tmp(env["path"])
-    hook.new_tmp(tmp)
+    hook.new_tmp(tmp, os.stat(env["path"]))
     open(tmp, "wb").write(b"MKV!" + b"x" * 1000)
     sw = hook.Swap(env["path"], os.stat(env["path"]), tmp, {})
     try:
@@ -6342,25 +6342,70 @@ def test_a_removed_default_subtitle_leads_to_a_new_decision_on_the_new_file(env,
     assert [r["result"] for r in log_lines(env)][0] == "subtitles removed"
 
 
-@pytest.mark.parametrize("err", [PermissionError(1, "Operation not permitted"), OSError(22, "Invalid argument")])
+NO_CHMOD = PermissionError(1, "Operation not permitted")
+
+
+def refuse_chmod(monkeypatch):
+    """A share that gives each new file its own owner refuses chmod on the temp file with [Errno 1]."""
+    real = os.chmod
+    monkeypatch.setattr(hook.os, "chmod", lambda p, m, **kw: (_ for _ in ()).throw(NO_CHMOD) if str(p).endswith(".repack-tmp") else real(p, m, **kw))
+
+
+@pytest.mark.parametrize("chmod", [False, True])
+@pytest.mark.parametrize("err", [NO_CHMOD, OSError(22, "Invalid argument"), None])
 @pytest.mark.parametrize("kind", ["header", "mp4"])
-def test_a_refused_chown_keeps_the_repair_going(mkvs, media, tmp_path, monkeypatch, settings, kind, err):
+def test_a_refused_chown_keeps_the_repair_going(mkvs, media, tmp_path, monkeypatch, settings, kind, err, chmod):
     """A NAS share may refuse chown with [Errno 1]. A user namespace or an NFSv4 id map refuses an owner it has no id
     for with [Errno 22]. The new file stays root's, the chmod copies the mode, and info says the owner changed. Radarr
-    and Sonarr may run as root there."""
+    and Sonarr may run as root there. A share that gives each new file its own owner refuses the chmod too (a tester's
+    share, 2026-10-14). The temp file was created with the original's mode, so the mode stays."""
     settings(log=str(tmp_path / "log.jsonl"))
-    monkeypatch.setattr(hook.os, "chown", lambda p, uid, gid: (_ for _ in ()).throw(err))
+    if err:
+        monkeypatch.setattr(hook.os, "chown", lambda p, uid, gid: (_ for _ in ()).throw(err))
     path = tmp_path / "Movie (2000).mkv"
     shutil.copy(mkvs / "long.mkv" if kind == "header" else media / "good.mp4", path); os.chmod(path, 0o640)
-    st, j = os.stat(path), hook.mkvmerge(str(path))
-    if kind == "header":
-        _, result, info = hook.repack(str(path), j, st, True, hook.header_of(str(path), j))
-    else:   # an MP4 under a .mkv name keeps its name, so the conversion needs no re-link
-        _, result, info, _ = hook.convert("radarr", str(path), j, st, True, {})
+    if chmod:
+        refuse_chmod(monkeypatch)
+    st, j, old = os.stat(path), hook.mkvmerge(str(path)), os.umask(0o022)   # the create mode is 640 under any umask that keeps it
+    try:
+        if kind == "header":
+            _, result, info = hook.repack(str(path), j, st, True, hook.header_of(str(path), j))
+        else:   # an MP4 under a .mkv name keeps its name, so the conversion needs no re-link
+            _, result, info, _ = hook.convert("radarr", str(path), j, st, True, {})
+    finally:
+        os.umask(old)
     now = os.stat(path)
     assert result == ("header repaired" if kind == "header" else "repacked") and now.st_mode & 0o777 == 0o640, (result, info)
-    assert info["owner"] == {"from": f"{st.st_uid}:{st.st_gid}", "to": f"{now.st_uid}:{now.st_gid}",
-                             "why": f"chown refused: {err}"}
+    why = [f"chown refused: {err}"] * bool(err) + [f"chmod refused, mode 640: {NO_CHMOD}"] * chmod
+    assert info.get("owner") == ({"from": f"{st.st_uid}:{st.st_gid}", "to": f"{now.st_uid}:{now.st_gid}", "why": ", ".join(why)} if why else None)
+
+
+def test_a_read_only_original_still_converts(media, tmp_path, settings):
+    """The temp file takes the original's mode at its create, and its owner may still write it, so mkvmerge can."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = tmp_path / "Movie (2000).mkv"
+    shutil.copy(media / "good.mp4", path); os.chmod(path, 0o444)
+    st, j = os.stat(path), hook.mkvmerge(str(path))
+    _, result, info, _ = hook.convert("radarr", str(path), j, st, True, {})
+    assert result == "repacked" and os.stat(path).st_mode & 0o777 == 0o444, (result, info)
+
+
+def test_a_refused_chmod_never_swaps_in_a_file_others_cannot_read(media, tmp_path, monkeypatch, settings):
+    """The umask took the read bits for group and others off the temp file, and the share refuses the chmod that puts
+    them back. A reader of the original could not read the new file, so the original stays."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = tmp_path / "Movie (2000).mkv"
+    shutil.copy(media / "good.mp4", path); os.chmod(path, 0o644)
+    refuse_chmod(monkeypatch)
+    st, j, old = os.stat(path), hook.mkvmerge(str(path)), os.umask(0o077)
+    try:
+        _, result, _, _ = hook.convert("radarr", str(path), j, st, True, {})
+    finally:
+        os.umask(old)
+    assert result == ("repack failed: chmod refused, and the new file's mode 600 cannot be read where the original's "
+                      f"mode 644 can: {NO_CHMOD}"), result
+    assert os.stat(path).st_ino == st.st_ino and os.stat(path).st_mode & 0o777 == 0o644
+    assert os.listdir(tmp_path) == [path.name]   # no temp file or hidden folder is left
 
 
 def test_a_header_repair_refuses_an_original_the_app_changed(mkvs, tmp_path, monkeypatch, settings):
