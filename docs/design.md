@@ -9,8 +9,8 @@ Some releases of English films carry a foreign default audio track, and Plex pla
 This file says what each rule does and why it exists. The README covers the install, the env file
 and the app connection. policy.md covers the policy file.
 
-- A *job* is one file that waits in the background queue, for an import, a burn-in job, a deep analysis, a
-  recheck or a backfill. AMG queues it, and a *worker* runs it.
+- A *job* is one file that waits in the background queue, for an import, a burn-in job, a whole-file check, a deep
+  analysis, a recheck or a backfill. AMG queues it, and a *worker* runs it.
 - To *hear* a track is to let language detection name its spoken language.
 - A *certain fault* proves that a file is broken and leads to a re-grab. A *doubt* only alerts.
 - A *re-grab* deletes a broken file through the app, monitors its items again and marks the grab
@@ -232,7 +232,7 @@ and its file, and the sentence `report.UNTOLD` in place of the error. Its line i
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
-`hook`, `burn_in`, `deep_analysis`, `recheck` and `check`. A conversion that a stopped run left has `worker` when the worker
+`hook`, `burn_in`, `whole_file`, `deep_analysis`, `recheck` and `check`. A conversion that a stopped run left has `worker` when the worker
 finds it as it starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names
 the step where the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its
 step from `ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see
@@ -329,7 +329,7 @@ hunter links the movie in the Title field of its posts.
 | `duration` | The header duration disagrees with the size or the other duration sources. The size check trusts BPS tags only from mkvmerge, because ffmpeg copies stale tags. Else it allows 50 Mbit/s up to 1080p and 150 above. |
 | `episode` | The release names another episode than the one Sonarr imported it as. The alert leads with the imported episode and its title. |
 | `content` | The evidence adds up to a re-grab. The title ends "re-grab is off" when `REGRAB` does not list `content`. |
-| `audio`, `video` | See "Broken audio" and "Corrupt video". |
+| `audio`, `video` | See "Broken audio", "Corrupt video" and "Whole-file check". |
 | `edit` | mkvpropedit failed, or the second probe shows the old flags. |
 | `damage` | The conversion of an import shows a damaged source, see "Damaged source". |
 | `repack`, `header` | A conversion or a header repair failed, and the original stays. A conversion a stopped run left alerts as `repack` too. |
@@ -441,6 +441,14 @@ count, because clean files log them too.
 
 Clean encoders pad easy frames with short zero runs, so only a run of 256 KiB counts. The zero probe
 skips the Attachments and anything past the Segment end, where fonts and old copies can hold zeros.
+
+In a Matroska, MP4 or MOV file with a PCM audio track the zero probe's hits only log, with no alert and no re-grab.
+Digital silence in PCM audio is zero bytes, so the probe defers to the whole-file check, whose read pass confirms each
+run. The windows run whatever the probe found, so two bad windows are still certain. The hits still block a header
+repair. The rule sits in `checks.check_video()`, so the import, the second check before a re-grab, `--check`, a
+backfill and a scan all follow it. In Matroska, PCM comes from the mkvmerge probe the caller has, by codec_id
+`A_PCM/...`. In MP4 and MOV mkvmerge names some PCM by its fourcc (`ipcm`, `fpcm`, `fl32`, `in32`), so ffprobe decides
+there, as it does when the caller has no probe. Another container keeps the probe's verdict, see "Whole-file check".
 Three windows rarely meet a small hole, so they are for damage spread through the file. An encrypted
 track has no decoder, and neither does a codec ffmpeg does not know. So such windows are certain
 only with evidence of encryption, such as an `encv` FourCC, a ContentEncryption element or an MP4
@@ -459,6 +467,62 @@ its windows to 30, 70 and 95 percent, and it must find the same fault class. So 
 stay an amber "Broken video, not confirmed". It counts against the same `REGRAB_CAP` as broken audio.
 Decode each certain file and each doubt of a `--check-video` scan in
 full before you act on it.
+
+## Whole-file check
+
+The zero probe and the windows read about 16 MiB of a file. A torrent piece that never downloaded leaves a gap of zero
+bytes, and a few gaps of a megabyte or two in a large file pass both. So each import queues a *whole-file check* job in
+the background queue. It reads the whole file once, and it never runs on the import path. An import whose own video
+check was certain queues none, and neither does one whose re-grab deleted the file. In a file with PCM audio the
+import's zero probe defers to this check, see "Corrupt video".
+
+| Pass | What it reads | Certain | Doubt |
+| --- | --- | --- | --- |
+| zero scan | every byte of the span the zero probe reads. A zero run counts from 256 KiB. | runs at 2 or more places | a run at 1 place |
+| read pass | `ffmpeg -v error -i FILE -ignore_unknown -map 0 -c copy -f null -`: every packet of every stream, with no decode | never | a line it prints |
+
+`checks.whole_check()` starts the read pass in an ffmpeg process of its own. Then `checks.zero_scan()` reads the same
+file in the job's process. The slower reader takes the file from the page cache, so the NAS sends it about once. The
+scan tests each 64 KiB block of a grid from the span start. A run of 256 KiB holds a whole block, and `zero_run()`
+measures the run around it. A read that comes back short is read on, so the grid never moves.
+
+**Silent PCM.** Digital silence in PCM audio is zero bytes too. mkvmerge puts 5.1 and 7.1 audio of 24 bits in blocks
+of over 256 KiB, so each second of silence leaves about three zero runs of valid payload. In Matroska, a real gap that
+covers a block edge breaks the container, and the read pass names a byte inside it. So in a Matroska, MP4 or MOV file
+with a PCM audio track, by ffprobe's format and codec names, a run counts only when the read pass names a byte within
+one grid block of it. Each such byte confirms only its nearest run, because a silent run can sit beside a real gap.
+The other runs are logged only. They never alert and never re-grab. In a file with PCM audio the read pass runs to its
+end, because it confirms the runs. In a file with no PCM audio every run counts, and a certain scan stops the read
+pass.
+
+The rule has known misses. In a PCM Matroska file, a gap smaller than the block it falls in leaves the container
+whole, so it is logged only. In MP4 and MOV the read pass names no byte inside a gap, so with PCM audio every run
+there is logged only. In AVI, MPEG-TS and VOB the read pass named no byte inside a gap either, and silent PCM left no
+zero run. So in those containers every run counts, whatever the audio.
+
+A healthy file prints nothing in the read pass. Every line counts, except the lines the windows skip too: ffmpeg's repeat
+counter and the null muxer's complaint of a repeated timestamp. That complaint names no byte of the file, and a healthy
+episode printed it. A remux printed it once a packet, so the stderr goes through a pipe and only the other lines stay.
+A line that names a byte within 1 percent of the file of a run that counts belongs to that run, so it adds no doubt.
+`-ignore_unknown` leaves out a stream of a type ffmpeg does not know, as in some MPEG-TS files. A file that ffmpeg
+cannot open, or whose streams it cannot set up, gives no doubt. Neither does a read pass that runs over `WHOLE_MIN`
+seconds or the time the file needs at `WHOLE_RATE`, whichever is longer.
+
+A certain verdict re-grabs the job's file alone, with `REGRAB`, `REGRAB_CAP` and the restore of an import's re-grab.
+Each other file of the download has a job of its own. Under the exclusive file lock, the second check measures the runs
+that count again with `zero_run()`. It reads at most 512 KiB a run, and never the whole file again. A doubt only alerts.
+When the import's own probe found the one gap and its alert named it, the job logs it only. The alert has a marker of
+its own, so an earlier video alert of the file never holds it back. A file that changed or went during the scan gets no
+verdict, so a doubt of the old file never posts against a new one.
+
+A conversion, a header repair or a subtitle remux of the import writes the file again, and a remux reads past the
+damage and leaves the zeros out. So the job reads the original that the first remux kept, while it is kept. In the
+decision line, `whole.file` names the file the job read and `whole.remux` names the remux. With no kept original the
+job reads the remux, and `whole.original_gone` names a kept original that went.
+
+The job reads with no file lock. It yields to an import that waits, and starts both passes again on its next run. Its
+source is `whole_file`, and its outcome is `corrupt_video`, `video_doubt`, `video_checked` or `file_changed`. `--check`
+runs it right after its own checks and never re-grabs. A job that a backfill queued queues one too, which alerts only.
 
 ## Restore after a bad upgrade
 
@@ -624,6 +688,10 @@ import. Its name starts like a deep analysis job's name, so it waits behind the 
 deep analyses and rechecks. Burn-in jobs run before deep analyses, so the burn-in job of an import ends before its deep
 analysis starts.
 
+**Whole-file check job.** Every import queues one, see "Whole-file check". It works like a burn-in job, and
+`runner.follow_up()` runs both. In each group of the queue it runs before the deep analyses, because a subtitle remux of
+a deep analysis replaces the file and drops the job.
+
 **Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
 job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
 inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending Plex analyzes go into
@@ -744,7 +812,7 @@ recheck. A file missing on disk, or whose path holds a recheck, stays in the pas
 `--limit N` queues the next N files, a run after the pass queues nothing, and `--restart` starts a
 new pass. An `--ids` or `--paths` run keeps a state of its own, which starts again when they change.
 A dry run writes no state and no `status.json`, queues nothing and probes no file. The worker takes
-these jobs after the burn-in jobs, the deep analyses of imports and the rechecks, see
+these jobs after the burn-in jobs, the whole-file checks and deep analyses of imports, and the rechecks, see
 `deep_analysis_queued()`.
 
 `runner.deep_analysis()` runs a job with `backfill` as `--check --apply` runs a file. It calls
@@ -764,9 +832,10 @@ workers the import runs beside the job. It waits only while the job holds the fi
 The job holds it for a flag edit and for the swap of a conversion. Before a remux the job takes it
 and runs its checks again.
 
-Then the job queues the burn-in job and the deep analysis as `run_job()` does, see `queue_after()`.
-It queues none when an import of the path queued its own while the job ran. The burn-in job carries
-`check` in its grab fields, so it never re-grabs either. The deep analysis names the job in `from`,
+Then the job queues the burn-in job, the whole-file check and the deep analysis as `run_job()` does, see
+`queue_after()`. It queues none when an import of the path queued its own while the job ran. The burn-in job and the
+whole-file check carry `check` in their grab fields, so they never re-grab either. A full backfill reads every file
+once more for the whole-file check. The deep analysis names the job in `from`,
 so it waits behind every job a backfill queued. A file whose saved deep analysis still holds gets
 none, see `subtitles.sub_cached()`. The alerts the job held for it count as checked again. With
 `DISCORD_POSTS=all` the changes they name still post. The import check keeps that saved result,
@@ -817,8 +886,9 @@ conversion, or a probe that failed. The audit posts nothing when no file has an 
 
 Each file counts once, by its latest result. A result is a decision line of an import, `--check`, a backfill or a job
 a backfill queued. These runs decide the flags and the container. The deep analysis and a recheck keep the flags. The
-burned-in subtitle check changes only the English subtitle flags. Their lines never hide an earlier problem. `--check` runs the burned-in subtitle check
-and the deep analysis after its own checks, and their lines name `check` as the source. The audit tells them apart by
+burned-in subtitle check changes only the English subtitle flags. The whole-file check line has no class, so it is
+never a result. Their lines never hide an earlier problem. `--check` runs the burned-in subtitle check, the whole-file
+check and the deep analysis after its own checks, and their lines name `check` as the source. The audit tells them apart by
 the class of the burn-in line and by `"deep": true` on the deep analysis line. A problem of the check after an edit
 counts until a later result. The post leaves out these files and problems:
 
@@ -1007,7 +1077,15 @@ formats on the scene name, else the download path's name, else the file name. So
 the download path, so the hook reads it from the import history: the row with the record's file id, or
 for a row an older Sonarr wrote with no file id, the row of one of its episodes within 60 seconds of
 the record's date. So a new name that would lose a format scoring above 0, or gain one below 0,
-refuses the conversion. On Radarr the hook
+refuses the conversion. The app scores the stored file on its record's quality, languages and group, which
+the import carries. Only a Release Title condition reads a name, the title or the file name. So the hook reads
+the app's custom formats and matches each one's Release Title regexes on the old and the new names, as the app
+would. A format counts as lost only when the file's record lists it now, and as gained only when it does not.
+For a regex that Python cannot compile or reads another way than .NET, the parse API decides. The parse API
+alone is no guide, because it cuts the extension before it matches and reads the quality from the name. A name
+with no quality takes one from its extension. `.mp4` parses as SDTV on both apps, and `.mkv` as WEBDL-720p on
+Radarr and HDTV-720p on Sonarr. The skip names the lost and gained formats with their scores first, and
+`convert-<app>.txt` keeps the whole text. On Radarr the hook
 reads the record that `movieFileId` names, because `movie/<id>` shows the old record while it stays.
 
 **The extras.** The rescan that removes the old record would send its extras to the recycle bin. So
@@ -1730,7 +1808,8 @@ skips no file. The decision log holds each result in `subcheck`, the remux in `s
 
 A check is stale when its registry entry says a newer version can fix its findings, see
 [development.md](development.md#when-a-change-can-fix-old-files). After an update, `runner.queue_rechecks()` queues a
-recheck job of each stale file in the background queue, behind the imports, the burn-in jobs and the deep analyses,
+recheck job of each stale file in the background queue, behind the imports, the burn-in jobs, the whole-file checks
+and the deep analyses,
 and ahead of the jobs a backfill queued. A recheck makes the checks of the run that saved the result, and none deeper.
 
 **Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.

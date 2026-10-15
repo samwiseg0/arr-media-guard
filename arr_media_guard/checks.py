@@ -494,6 +494,138 @@ def zero_span(f, size):
     return ds, end
 
 
+WHOLE_CHUNK = 8 << 20   # bytes of one read of the zero scan, a whole number of 64 KiB blocks
+WHOLE_RATE = 20e6       # bytes a second the read pass may take at the least: a third of the slowest NAS a tester measured, 60 MB/s
+WHOLE_MIN = 600         # seconds the read pass may always take
+WHOLE_ASK = 1           # seconds between two asks of stop() in the zero scan
+
+
+def zero_scan(path, stop=lambda: None):
+    """(the zero runs of ZERO_RUN or more as [first byte, end], bytes read) of every byte of zero_span(), the zeros
+    stage of whole_check(). It tests each 64 KiB block of a grid from the span's start. A run of ZERO_RUN holds a
+    whole block of the grid, and zero_run() measures the run around its first zero block. The later zero blocks of the
+    run move its end, a block at a time. stop() runs every WHOLE_ASK seconds and may raise to end the scan, as
+    runner.deep_waits() does. A running time limit ends it too."""
+    runs, read, zero, size = [], 0, bytes(65536), os.path.getsize(path)
+    with open(path, "rb", buffering=0) as f:
+        lo, hi = zero_span(f, size)
+        pos, asked, last = lo, time.monotonic(), None   # last: the end of the latest zero block, so a run counts once
+        while pos < hi:
+            if time.monotonic() - asked >= WHOLE_ASK:
+                stop(); config.DEADLINE.check(); asked = time.monotonic()
+            f.seek(pos); want = min(WHOLE_CHUNK, hi - pos); b = f.read(want)
+            while 0 < len(b) < want and (more := f.read(want - len(b))):   # a short read would move the grid and split a run in two
+                b += more
+            read += len(b)
+            if not b:
+                break
+            for i in range(0, len(b) - 65535, 65536):
+                if not b.startswith(zero, i):
+                    continue
+                at = pos + i
+                if at == last and runs and runs[-1][1] == at:   # the counted run goes on
+                    runs[-1][1] = at + 65536
+                elif at != last:
+                    n, more = zero_run(f, at, lo, hi); read += more
+                    if n >= decide.ZERO_RUN:
+                        runs.append([at, at + 65536])
+                last = at + 65536
+            pos += len(b)
+    return runs, read
+
+
+def zero_again(path, runs):
+    """(the runs of zero_scan() that zero_run() still measures at ZERO_RUN or more, bytes read): the second check
+    before a re-grab of the whole-file check. It reads at most 2 x ZERO_RUN per run, so never the whole file again. A
+    file that is gone or does not read keeps no run."""
+    try:
+        with open(path, "rb", buffering=0) as f:
+            lo, hi = zero_span(f, os.path.getsize(path))
+            got = [(r, zero_run(f, r[0], lo, hi)) for r in runs]
+    except OSError:
+        return [], 0
+    return [r for r, (n, _) in got if n >= decide.ZERO_RUN], sum(more for _, (_, more) in got)
+
+
+COPY_KEEP = 1000   # lines of the read pass kept for their places. A healthy remux can log a NOISE line per packet.
+
+
+def copy_lines(stream, got):
+    """Read the read pass's stderr into got, line by line in a thread of its own, so a long stderr never blocks
+    ffmpeg and never fills a disk. got takes the count of NOISE lines, the count of the other lines, and the first
+    COPY_KEEP of those in "kept"."""
+    for line in stream:
+        if not line.strip():
+            continue
+        if any(n in line for n in decide.NOISE):
+            got["noise"] += 1
+            continue
+        got["lines"] += 1
+        if len(got["kept"]) < COPY_KEEP:
+            got["kept"].append(line.rstrip("\n"))
+
+
+PCM_FORMATS = ("matroska", "mov", "mp4")   # ffprobe's format names where the PCM rule holds, see pcm_audio()
+
+
+def pcm_audio(path):
+    """Whether path is Matroska, MP4 or MOV with a PCM audio track, by ffprobe's format and codec names (pcm_s24le,
+    pcm_f32le, pcm_s16be), or None when ffprobe cannot read the file. Silent PCM is zero bytes, so only the zero runs
+    the read pass confirms count in such a file, see decide.whole_verdict(). In other containers the read pass named no
+    byte inside a real gap, and silent PCM left no zero run, so there every run counts and this is False."""
+    try:
+        r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name:format=format_name", "-of", "json", path],
+                        120, capture_output=True, text=True, errors="replace")
+        got = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if not got:
+        return None
+    if not set(((got.get("format") or {}).get("format_name") or "").split(",")) & set(PCM_FORMATS):
+        return False
+    return any(x.get("codec_type") == "audio" and (x.get("codec_name") or "").startswith("pcm_") for x in got.get("streams") or [])
+
+
+def whole_check(path, stop=lambda: None):
+    """(certain reason or None, [doubts of the zero runs], [doubts of the read pass], log fields) of the whole-file
+    check (docs/design.md, "Whole-file check"). Two read-only passes over the same file at once, so the NAS sends it
+    about once. The read pass, ffmpeg -c copy of every stream to the null muxer, starts first in its own process.
+    zero_scan() reads beside it in the job's process, and the slower reader takes the file from the page cache. In a
+    file with no PCM audio, see pcm_audio(), a certain zero scan kills the read pass, which then gives nothing. In a
+    file with PCM audio the read pass runs to its end, because it confirms the zero runs. It stops at WHOLE_MIN seconds
+    or the time WHOLE_RATE needs, whichever is longer, and a stopped pass gives nothing. Its stderr goes through a pipe
+    to copy_lines(). stop() runs as often as zero_scan() and watch() ask, and may raise, see zero_scan(). No ffmpeg
+    outlives the check. The zeros field holds the runs in bytes, in "at" as shares of the size, and in "count" the runs
+    that count. fault is zero-filled for a certain verdict."""
+    size, t0, pcm = os.path.getsize(path), time.monotonic(), pcm_audio(path)
+    bound = max(WHOLE_MIN, size / WHOLE_RATE)
+    took = lambda t: round(time.monotonic() - t, 1)
+    p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error", "-i", path,
+                          "-ignore_unknown", "-map", "0", "-c", "copy", "-f", "null", "-"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.PIPE, text=True, errors="replace")
+    got = {"kept": [], "lines": 0, "noise": 0}
+    reader = threading.Thread(target=copy_lines, args=(p.stderr, got), daemon=True)
+    reader.start()
+    try:
+        runs, read = zero_scan(path, stop)
+        zeros = {"runs": runs, "at": [[round(a / size, 4), round(e / size, 4)] for a, e in runs], "read": read, "took": took(t0)}
+        if len(runs) >= 2 and not pcm:
+            p.kill(); p.wait()
+            ff, out = {"skipped": "the zero scan was certain"}, None
+        else:
+            stopped = watch(p, lambda: stop() or config.DEADLINE.check() or (f"ran over {bound:.0f} s" if time.monotonic() - t0 > bound else None))
+            p.wait(); reader.join()
+            out = None if stopped else dict(decide.parse_copy("\n".join(got["kept"]), p.returncode, size), lines=got["lines"], noise=got["noise"])
+            ff = dict(out or {"skipped": stopped}, took=took(t0), code=p.returncode)
+    finally:
+        if p.poll() is None:   # a stop or an error: no ffmpeg outlives the check
+            p.kill(); p.wait()
+        reader.join(10)
+        p.stderr.close()
+    certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm)
+    return certain, zero, more, {"zeros": zeros, "ffmpeg": ff, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
+
+
 def stream_gap(path, video):
     """The doubt of a file that is not Matroska whose format duration runs past its video end by more than AV_APART, or
     None. check_audio() needs mkvmerge's duration, which an MP4, AVI or MPEG-TS file lacks. One stray audio packet can set
@@ -547,13 +679,26 @@ def hook_edit_failed(path):
 REAP = threading.Lock()   # window() reaps its ffmpeg under it, see there
 
 
+def watch(p, why):
+    """Wait for the process p to exit, and return None. why() runs every WINDOW_POLL seconds and returns a reason to
+    stop p, or None. A reason kills p, and watch() returns it. A pidfd says when p exits, before it is reaped."""
+    exited = os.pidfd_open(p.pid)
+    try:
+        while not select.select([exited], [], [], config.WINDOW_POLL)[0]:
+            if stopped := why():
+                p.kill()
+                return stopped
+    finally:
+        os.close(exited)
+    return None
+
+
 def window(path, start, secs):
     """Decode secs seconds of the main video stream from start, parsed by decide.parse_window(). Read-only, so it
     may be killed. A seek with no usable index reads the file from the start, and a seek into zeros reads to the next
     intact cluster. So the window stops at VIDEO_MAX_READ bytes or VIDEO_TIMEOUT seconds. 0:V:0 skips cover art.
-    Skipping the loop filter saves time and parses the same bitstream. A pidfd says when ffmpeg exits, before it is
-    reaped. Its bytes read are the change of our own count across the reap, under REAP, so the other scan workers do
-    not add to it."""
+    Skipping the loop filter saves time and parses the same bitstream. watch() waits for ffmpeg. Its bytes read are the
+    change of our own count across the reap, under REAP, so the other scan workers do not add to it."""
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-threads", "2", "-skip_loop_filter", "all",
            "-ss", f"{start:.2f}", "-t", f"{secs:.2f}", "-i", path, "-map", "0:V:0", "-an", "-sn", "-dn", "-vf", "showinfo=checksum=0",
            "-f", "null", "-"]
@@ -561,16 +706,8 @@ def window(path, start, secs):
     with tempfile.TemporaryFile("w+", errors="replace", dir=config.CFG.state_dir) as err:   # a file, so a long stderr never blocks ffmpeg
         p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
         try:
-            exited = os.pidfd_open(p.pid)
-            try:
-                while not select.select([exited], [], [], config.WINDOW_POLL)[0]:
-                    stopped = (f"ran over {decide.VIDEO_TIMEOUT} s" if time.monotonic() - t0 > decide.VIDEO_TIMEOUT else
-                               f"read over {decide.VIDEO_MAX_READ >> 20} MiB" if rchar(p.pid) > decide.VIDEO_MAX_READ else None)
-                    if stopped:
-                        p.kill()
-                        break
-            finally:
-                os.close(exited)
+            stopped = watch(p, lambda: f"ran over {decide.VIDEO_TIMEOUT} s" if time.monotonic() - t0 > decide.VIDEO_TIMEOUT else
+                            f"read over {decide.VIDEO_MAX_READ >> 20} MiB" if rchar(p.pid) > decide.VIDEO_MAX_READ else None)
             # ponytail: the samples and probes of other workers reap without REAP. One reaped in these microseconds adds its reads.
             with REAP:
                 b0 = rchar(); p.wait(); read = rchar() - b0
@@ -582,7 +719,7 @@ def window(path, start, secs):
                     took=round(time.monotonic() - t0, 2), read=read)
 
 
-def check_video(path, dur, again=False, hp=None):
+def check_video(path, dur, again=False, hp=None, pcm=None):
     """(certain reason or None, [doubts], log fields) for one file of dur seconds, the shape of check_audio().
 
     Three read-only stages, each only when the earlier ones found nothing certain. header: a Matroska file shorter
@@ -602,8 +739,14 @@ def check_video(path, dur, again=False, hp=None):
     it counts. Only a window the read cap stopped with no error on the way is no sign of damage in such a file.
     Such a window is never a doubt, but in a file with usable Cues it still blocks the repair. windows_clean says
     all three windows decoded clean, which a repair of a track with no default duration needs.
+
+    pcm says the file is Matroska, MP4 or MOV with a PCM audio track, see pcm_tracks(). None asks pcm_audio(), once per
+    check. Digital silence in PCM audio is zero bytes, so in such a file the zero probe's hits are logged only, and the
+    windows run all the same. The whole-file check judges the zeros, because its read pass confirms each run. The hits
+    still block a header repair, as they do in any other file. Another container keeps the probe's verdict.
     """
-    certain, doubts, fields = video_stages(path, dur, again, hp)
+    pcm = pcm_audio(path) if pcm is None else pcm
+    certain, doubts, fields = video_stages(path, dur, again, hp, pcm)
     h = fields["header"]
     if hp and hp["issue"]:
         z, w = fields.get("zeros") or {}, fields.get("windows") or {}
@@ -612,6 +755,8 @@ def check_video(path, dur, again=False, hp=None):
         against += [decide.stopped_doubt(x) for x in wins if hp["cues"] is True and decide.read_capped(x)]   # no doubt, still no repair
         if not z or "skipped" in z:
             against.append("the zero probe did not run to its end")
+        if pcm and z.get("hits"):   # logged only, see video_stages(), and still no repair
+            against.append(f"the zero probe found blank gaps at {len(z['hits'])} places in a file with PCM audio")
         if w.get("skipped") or len(wins) < 3:   # a skip is never clean
             against.append(f"the video windows did not all run: {w.get('skipped') or 'none ran'}")
         clean = len(wins) == 3 and all(x["ran"] and not decide.bad_window(x) and not x["empty"] and not x.get("stopped") for x in wins)
@@ -619,8 +764,8 @@ def check_video(path, dur, again=False, hp=None):
     return certain, doubts, fields
 
 
-def video_stages(path, dur, again, hp):
-    """The three stages of check_video()."""
+def video_stages(path, dur, again, hp, pcm=False):
+    """The three stages of check_video(). With pcm the zero probe's hits give no verdict, and the windows run."""
     left = lambda: config.DEADLINE.left() or float("inf")   # None means no time limit, as in a scan
     took = lambda t: round(time.monotonic() - t, 2)
     fields, doubts, t = {"fault": None}, [], time.monotonic()
@@ -643,12 +788,12 @@ def video_stages(path, dur, again, hp):
         fields["zeros"] = {"skipped": f"{left():.0f} s left of the job's time limit"}
         return None, doubts, fields
     t = time.monotonic(); hits, read, stopped = zero_probe(path, again, lambda: left() < config.VIDEO_RESERVE)
-    fields["zeros"] = {"hits": hits, "took": took(t), "read": read}
+    fields["zeros"] = {"hits": hits, "took": took(t), "read": read, **({"pcm": True} if pcm else {})}
     if stopped:   # a partial probe gives no verdict
         fields["zeros"]["skipped"] = f"stopped with {left():.0f} s left of the job's time limit"
         return None, doubts, fields
     windows, skipped, t = [], None, time.monotonic()
-    if len(hits) < 2:
+    if len(hits) < 2 or pcm:
         for share in decide.VIDEO_AGAIN if again else decide.VIDEO_AT:
             skipped = "the duration is under 60 s" if dur < 60 else \
                 f"{left():.0f} s left of the job's time limit" if left() < decide.VIDEO_TIMEOUT + config.VIDEO_RESERVE else None
@@ -659,8 +804,8 @@ def video_stages(path, dur, again, hp):
     if sum(bool(w.get("nodecoder")) for w in windows) >= 2 and not any(w.get("encrypted") for w in windows) and encrypted_video(path):
         for w in windows:   # ffmpeg named no encryption, but the bytes show it
             w["encrypted"] = bool(w.get("nodecoder"))
-    certain, more = decide.video_verdict(hits, windows)
-    return certain, more + doubts, dict(fields, fault=certain and ("zero-filled" if len(hits) >= 2 else "bad windows"))
+    certain, more = decide.video_verdict([] if pcm else hits, windows)
+    return certain, more + doubts, dict(fields, fault=certain and ("zero-filled" if len(hits) >= 2 and not pcm else "bad windows"))
 
 
 def video_seconds(j, hp=None):
@@ -681,10 +826,22 @@ def video_summary(certain, doubts, fields):
     return dict(certain=certain, doubts=doubts, **fields)
 
 
+def pcm_tracks(j):
+    """Whether the mkvmerge probe j of a Matroska file lists a PCM audio track, by codec_id A_PCM/.... False for a
+    container outside the PCM rule, as in pcm_audio(). None for MP4 and MOV, where mkvmerge names some PCM by its
+    fourcc (ipcm, fpcm, fl32, in32), and for a probe with no track. pcm_audio() then asks ffprobe."""
+    tracks, kind = (j or {}).get("tracks"), (((j or {}).get("container") or {}).get("type") or "Matroska")   # no type reads as Matroska
+    if not tracks or kind == "MP4/QuickTime":
+        return None
+    return kind == "Matroska" and any(t.get("type") == "audio" and ((t.get("properties") or {}).get("codec_id") or "").startswith("A_PCM")
+                                      for t in tracks)
+
+
 def video_inputs(path, j=None, hp=None):
-    """(the duration for the windows, header_probe() or None) of one file for check_video(). A .mkv file is probed with
-    mkvmerge when j is not given. A probe that fails reads as none, so the zero probe and the windows still run. The
-    duration is video_seconds(), else the video stream's own for a file that is not Matroska, else the format duration."""
+    """(the duration for the windows, header_probe() or None, pcm_tracks()) of one file for check_video(). A .mkv file
+    is probed with mkvmerge when j is not given. A probe that fails reads as none, so the zero probe and the windows
+    still run. The duration is video_seconds(), else the video stream's own for a file that is not Matroska, else the
+    format duration."""
     if path.lower().endswith(".mkv") and j is None:
         try:
             j = mkvmerge(path)
@@ -694,7 +851,7 @@ def video_inputs(path, j=None, hp=None):
             j = {}
     hp = hp or (header_of(path, j) if j else None)
     matroska = ((j or {}).get("container") or {}).get("type") == "Matroska"   # ffprobe reads no stream duration from Matroska
-    return video_seconds(j, hp) or (None if matroska else video_stream_seconds(path)) or ffprobe_duration(path) or 0, hp
+    return video_seconds(j, hp) or (None if matroska else video_stream_seconds(path)) or ffprobe_duration(path) or 0, hp, pcm_tracks(j)
 
 
 def video_stream_seconds(path):
@@ -714,8 +871,8 @@ def video_check(path, again=False, j=None, hp=None):
     verdict. Its log fields then carry error and code video_check_error. So the check never costs the flag edit, and a
     second check that fails keeps the file. The time limit outside the check still stops the job."""
     try:
-        dur, hp = video_inputs(path, j, hp)
-        return check_video(path, dur, again, hp)
+        dur, hp, pcm = video_inputs(path, j, hp)
+        return check_video(path, dur, again, hp, pcm)
     except Exception as ex:
         return None, [], {"fault": None, "error": config.mask(f"{type(ex).__name__}: {ex}")[:200], "code": "video_check_error"}
 

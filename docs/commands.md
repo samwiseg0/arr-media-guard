@@ -40,18 +40,20 @@ On a host, leave out `docker exec -it arr-media-guard`.
   gives way to an import that waits before a conversion and before a remux, until it changed the file. The jobs stay
   in the queue across a restart. `--backfill --drop-queued` drops them, and `--backfill <instance> --drop-queued`
   drops those of one instance. A job that runs then ends first.
-- A job queues the burned-in subtitle check and the deep analysis as an import does. The deep analysis waits behind
-  every job a backfill queued. At `SUBTITLES=deep` it takes a median of about 5 minutes per hour of video, and one file
-  in four takes 15 minutes or more per hour. A file whose saved deep analysis still holds gets no new one.
+- A job queues the burned-in subtitle check, the whole-file check and the deep analysis as an import does. The
+  whole-file check reads each file whole, so a full backfill reads the library once more, and it only alerts. The deep
+  analysis waits behind every job a backfill queued. At `SUBTITLES=deep` it takes a median of about 5 minutes per hour
+  of video, and one file in four takes 15 minutes or more per hour. A file whose saved deep analysis still holds gets
+  no new one.
 - A backfill keeps its place in each instance, as a scan does. `--limit N --apply` queues the next N files, and the next
   run goes on from there. A run after the last file queues nothing and says so. `--restart` starts a new pass, as after
   a change of your settings. `--ids` and `--paths` keep a place of their own. A dry run keeps no place and names the
   next files it would queue.
 - A file that has a job waiting or running keeps that job, so a second `--apply` queues it once. A file with a waiting
   recheck, or one missing on disk, stays for the next run.
-- A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to three
-  times: from its job, its burned-in subtitle check and its deep analysis. With `DISCORD_POSTS=all`, each file whose
-  default tracks change also posts "Default tracks changed".
+- A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to four
+  times: from its job, its burned-in subtitle check, its whole-file check and its deep analysis. With
+  `DISCORD_POSTS=all`, each file whose default tracks change also posts "Default tracks changed".
 - With no instance it takes every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`. A line
   `== <instance>` starts each one. It skips an instance you did not set up. An instance that fails, as one that does
   not answer, ends with one line, and the run goes on to the next one. The exit code is then 1.
@@ -126,9 +128,10 @@ arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --apply  
   the runtime checks, and the burned-in subtitle check. It also runs the subtitle checks at `SUBTITLES` with the deep
   analysis, and it sets the language tags and flags. It repairs a broken header, and converts at `CONVERT` with the
   damage check.
-- An import queues the full burned-in subtitle check and the deep analysis to run later. `--check` runs them right after
-  the other checks, in the same way, and prints a line for each. They follow the same rules for a dry run and for
-  `--apply`. They never wait for an import. The deep analysis has no time limit, so a film can take many minutes.
+- An import queues the full burned-in subtitle check, the whole-file check and the deep analysis to run later.
+  `--check` runs them right after the other checks, in the same way, and prints a line for each. They follow the same
+  rules for a dry run and for `--apply`. They never wait for an import. The whole-file check and the deep analysis have
+  no time limit, so a film can take many minutes.
 - Each file runs as an import of its own, with an import's 300-second time limit and the file lock. It takes every file
   you name, also one that a backfill leaves out. It runs at the lowest CPU and disk priority, as a backfill does.
 - A dry run changes no file, posts nothing, asks Plex nothing and writes nothing to the app or to `status.json`.

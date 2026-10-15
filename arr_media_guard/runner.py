@@ -206,12 +206,15 @@ def deep_analysis_queued():
     """The names of the jobs of the background queue: the burn-in jobs, see burn_name(), then the deep analyses of
     imports, then the rechecks, see deep_name(), then the jobs a backfill queued, then the deep analyses those jobs
     queued. A burn-in job is short and may change what plays, and a deep analysis goes before the rechecks, so a new
-    import's jobs wait behind no batch of rechecks or of a backfill. Then each kind runs the one queued longest ago
+    import's jobs wait behind no batch of rechecks or of a backfill. In each group the whole-file check jobs, see
+    whole_name(), go before the deep analyses. A subtitle remux of a deep analysis replaces the file, which drops the
+    whole-file check, and mkvmerge leaves the zeros out. Then each kind runs the one queued longest ago
     first. json.dumps() writes a key as "recheck": with a space, and a value that holds the word escapes its quotes, so
     the test matches the key alone, on any SQLite. A deep analysis that a backfill job queued names that job, a job of
     this queue, in "from". A new import of the path replaces it with its own, which has none."""
     return [n for n, in store.read("SELECT name FROM jobs WHERE claimed = 0 AND name LIKE 'deep-analysis-%' "
-                                   f"ORDER BY name NOT LIKE '{BURN_PREFIX}%', {LATER} > 0, {BACKFILL} > 0, {RECHECK} > 0, at, name")]
+                                   f"ORDER BY name NOT LIKE '{BURN_PREFIX}%', {LATER} > 0, {BACKFILL} > 0, {RECHECK} > 0, "
+                                   f"name NOT LIKE '{WHOLE_PREFIX}%', at, name")]
 
 
 def backfill_jobs():
@@ -381,6 +384,50 @@ def queue_burn_in(job, rec, inputs):
     return name
 
 
+WHOLE_PREFIX = "deep-analysis-whole-"   # the name of a whole-file check job, see whole_name()
+
+
+def whole_name(path):
+    """The name of the whole-file check job of path, see whole_job(). It starts as the name of a deep analysis job
+    does, so every rule of the background queue holds for it, as for a burn-in job, see burn_name()."""
+    return f"{WHOLE_PREFIX}{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
+
+
+def whole_plan(rec):
+    """The fields of the whole-file check of the file of the decision record rec of an import, see whole_act(), or None
+    when the import's own video check was certain, or its re-grab deleted the file. A file at the path then is gone, or
+    is an old file a restore put back. A conversion, a header repair or a subtitle remux of the import wrote the file
+    again with mkvmerge or ffmpeg, which read past damage and leave its zeros out. remux names the first of them, and
+    original is the file it kept, the file of the download. Only the first one's kept file holds what the download
+    gave. gap is the place of the one blank gap that the import's video check found and its alert named."""
+    v = rec.get("video") or {}
+    deleted = any((f.get("action") or {}).get("code") in report.DELETED for f in rec.get("findings") or [])
+    if v.get("certain") or deleted or not os.path.exists(rec["path"]):
+        return None
+    steps = (("conversion", "repacked" in (rec.get("reasons") or []), rec.get("repack")),
+             ("header repair", (rec.get("header_repair") or {}).get("code") in config.REPAIRED, rec.get("header_repair")),
+             ("subtitle remux", (rec.get("subremux") or {}).get("done"), rec.get("subremux")))
+    what, info = next(((w, i or {}) for w, ran, i in steps if ran), (None, {}))
+    hits = [] if (v.get("zeros") or {}).get("pcm") else (v.get("zeros") or {}).get("hits") or []   # with PCM audio no hit alerted
+    return dict(path=rec["path"], **({"remux": what} if what else {}), **({"original": info["kept"]} if info.get("kept") else {}),
+                **({"gap": hits[0]} if len(hits) == 1 else {}))
+
+
+def queue_whole(job, rec, inputs):
+    """Queue the whole-file check job of the file an import job checked, see whole_plan(). As a burn-in job, it carries
+    inputs, the decision inputs of the import, the file_key() of the file the import left, the import's job in "from",
+    and in "grab" the fields of the import job that a re-grab reads. A newer import of the path replaces a queued one.
+    Returns its name, or None. A file that is gone raises OSError."""
+    plan = whole_plan(rec)
+    if not plan:
+        return None
+    name = whole_name(rec["path"])
+    store.write("INSERT OR REPLACE INTO jobs (name, at, job) VALUES (?, ?, ?)", name, time.time(), json.dumps(dict(
+        plan, app=job.get("app"), ids=rec.get("ids") or {}, inputs=inputs, time=time.time(), key=file_key(os.stat(rec["path"])),
+        grab={k: job.get(k) for k in GRAB_KEYS}, **({"from": rec["job"]} if rec.get("job") else {}))))
+    return name
+
+
 def deep_name(path):
     """The name of the job of the background queue for path, a deep analysis or a recheck. The worker runs a job of
     this name only while no import waits, one at a time."""
@@ -482,27 +529,31 @@ def follow(name, job, claimed, rec):
 
 
 def background(name, pending, claimed=False):
-    """Run the job name of the background queue: a burn-in job, see burn_in(), else a deep analysis, a recheck or a job
-    a backfill queued, see deep_analysis()."""
-    return (burn_in if name.startswith(BURN_PREFIX) else deep_analysis)(name, pending, claimed)
+    """Run the job name of the background queue: a burn-in job, see burn_in(), a whole-file check, see whole_job(),
+    else a deep analysis, a recheck or a job a backfill queued, see deep_analysis()."""
+    run = burn_in if name.startswith(BURN_PREFIX) else whole_job if name.startswith(WHOLE_PREFIX) else deep_analysis
+    return run(name, pending, claimed)
 
 
 def queue_after(name, job, rec, run, inputs, deep=True):
     """Queue the jobs that an import queues after process() ran on its file with run, the process.Ctx: the deep
-    analysis, unless deep is False, and the burn-in job. inputs are the decision inputs of the import. When no deep
-    analysis queued, the alerts that run held for it post now, so none is lost. deep False says that a saved deep
-    analysis of the file still holds, see subtitles.sub_cached(). It judged those subtitles, so the held alerts count
-    as checked again. Only the change posts of DISCORD_POSTS=all go out, see logs.held_changes(). See run_job()."""
+    analysis, unless deep is False, the burn-in job and the whole-file check. inputs are the decision inputs of the
+    import. When no deep analysis queued, the alerts that run held for it post now, so none is lost. deep False says
+    that a saved deep analysis of the file still holds, see subtitles.sub_cached(). It judged those subtitles, so the
+    held alerts count as checked again. Only the change posts of DISCORD_POSTS=all go out, see logs.held_changes().
+    See run_job()."""
     held, queued = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
-    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", and its burn-in job
+    if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", its burn-in job and its whole-file check
         with contextlib.suppress(OSError, sqlite3.Error):
             queued = deep and queue_deep_analysis(job, rec, inputs, held)
-        try:
-            queue_burn_in(job, rec, dict(inputs, plan=process.plan_inputs(run)))
-        except (OSError, sqlite3.Error) as ex:   # a busy store, or the file went
-            with contextlib.suppress(OSError):
-                logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning",
-                              note=config.mask(f"the burned-in subtitle check of the file did not queue: {type(ex).__name__}: {ex}")[:300]))
+        for what, put in (("the burned-in subtitle check", lambda: queue_burn_in(job, rec, dict(inputs, plan=process.plan_inputs(run)))),
+                          ("the whole-file check", lambda: queue_whole(job, rec, inputs))):
+            try:
+                put()
+            except (OSError, sqlite3.Error) as ex:   # a busy store, or the file went
+                with contextlib.suppress(OSError):
+                    logs.log(dict(source="hook", app=rec.get("app"), job=name, path=rec.get("path"), result="warning",
+                                  note=config.mask(f"{what} of the file did not queue: {type(ex).__name__}: {ex}")[:300]))
     if held and not queued:   # a held alert is never lost
         with contextlib.suppress(OSError):
             said = logs.post_held(rec["app"], rec["path"], held) if deep else logs.held_changes(rec["app"], held, "checked again")
@@ -520,21 +571,29 @@ def burn_in(name, pending, claimed=False):
     does, see follow(). It drops itself at BURNED_IN off, and when the check is not installed. Its reads take no file
     lock, so no import waits for them. It yields when an import waits in the queue, and goes back to its queue then, as
     a deep analysis does. Its decision line has source burn_in."""
-    started, rec, job = time.time(), dict(id=uuid.uuid4().hex[:12], source="burn_in", job=name), {}
+    def act(job, rec):
+        why = process.burn_ready()
+        if config.CFG.burned_in == "off":   # turned off after the job was queued
+            return dict(rec, outcome="burned_in_off", result="dropped, BURNED_IN is off")
+        if why:
+            return dict(rec, outcome="burned_in_skipped", result=f"dropped, {why}")
+        return burn_act(name, job, rec, pending, claimed)
+    follow_up(name, pending, claimed, "burn_in", act)
+
+
+def follow_up(name, pending, claimed, source, act):
+    """Run the job name of the background queue that an import queues beside its deep analysis, a burn-in job or a
+    whole-file check, with source for its decision line. act(job, rec) runs its check and returns the line. The job
+    follows a rename or a move of its file, and drops itself when the file is gone or replaced, see follow(). A
+    yield puts it back in its queue. An error is its line, unless the app replaced or removed the file meanwhile. A
+    file the job changed gets a Plex analyze."""
+    started, rec, job = time.time(), dict(id=uuid.uuid4().hex[:12], source=source, job=name), {}
     try:
         job = job_of(name, claimed)
         got = job.get("inputs") or {}
         rec.update(app=job["app"], path=job["path"], apply=True, ids=job.get("ids") or {}, label=got.get("label") or os.path.basename(job["path"]))
         job, drop = follow(name, job, claimed, rec)
-        why = process.burn_ready()
-        if drop:
-            rec.update(drop)
-        elif config.CFG.burned_in == "off":   # turned off after the job was queued
-            rec.update(outcome="burned_in_off", result="dropped, BURNED_IN is off")
-        elif why:
-            rec.update(outcome="burned_in_skipped", result=f"dropped, {why}")
-        else:
-            rec = burn_act(name, job, rec, pending, claimed)
+        rec = dict(rec, **drop) if drop else act(job, rec)
     except subtitles.Yielded as ex:
         logs.log(dict(rec, result="yielded", note=str(ex)))
         if claimed:   # back to the background queue, unless a newer import queued the path again meanwhile
@@ -552,8 +611,73 @@ def burn_in(name, pending, claimed=False):
     rec = logs.decision(rec, started)
     want = (job.get("inputs") or {}).get("want")
     if want and os.path.exists(rec.get("path") or "") and process.changed(rec):
-        pending.append(plex.plex_after(rec["app"], "burn_in", rec, want))
+        pending.append(plex.plex_after(rec["app"], source, rec, want))
     drop_job(name, claimed)
+
+
+def whole_job(name, pending, claimed=False):
+    """One whole-file check job (docs/design.md, "Whole-file check"), see whole_act(), queued by queue_whole(). It
+    runs in the background queue, after the burn-in jobs and before the deep analyses of its group, see
+    deep_analysis_queued(). Its reads take no file lock, so no import waits for them. It yields when an import waits
+    and starts both passes again on its next run. Its decision line has source whole_file."""
+    follow_up(name, pending, claimed, "whole_file", lambda job, rec: whole_act(name, job, rec, pending))
+
+
+def whole_act(name, job, rec, pending, post=True):
+    """The whole-file check of the job name, see checks.whole_check(), and what REGRAB does with its verdict. It reads
+    the kept original of the import's remux while it exists, see whole_plan(), else the file. rec["whole"] names the
+    file it read in "file", and "remux" says the import remuxed it. A certain verdict re-grabs the job's file alone, as
+    an import's re-grab would, with the cap, the kept copies and the restore of regrab.regrab(). Every other file of the
+    download has a job of its own. The lock is exclusive for the re-grab, and the second check measures the runs that
+    count again then, see regrab.whole_probe(). A doubt only alerts. The one blank gap that the import's alert named
+    logs only. A file that changed during the scan gets no verdict, see same_file(). The zero runs of a file with PCM
+    audio that the read pass did not confirm are logged in the note only, see decide.whole_verdict().
+
+    --check runs it with no name and check in grab, see cli.whole_later(). It then never yields, and its re-grab
+    only says what an import would do, so it takes no lock. A job a backfill queued gives check in grab too. post False
+    keeps the alert off Discord."""
+    app, grab, original = job["app"], dict(job.get("grab") or {}, app=job["app"], path=job["path"]), job.get("original")
+    path = original if original and os.path.exists(original) else job["path"]
+    st = os.stat(path)
+    certain, zero, more, fields = checks.whole_check(path, deep_waits if name else lambda: None)
+    fields = dict(fields, file=path, **({"remux": job["remux"]} if job.get("remux") else {}),
+                  **({"original_gone": original} if original and path != original else {}))
+    rec = dict(rec, whole=fields)
+    try:   # a file that shrank or was replaced during the scan gives no verdict, so no stale doubt posts
+        same_file(path, st, "the whole-file check", "during")
+    except Replan as ex:
+        return dict(rec, outcome="file_changed", result=f"dropped, {ex}")
+    count, size = fields["zeros"]["count"], fields["size"]
+    said = job.get("gap") is not None and len(count) == 1 and count[0][0] / size - decide.NEAR <= job["gap"] <= count[0][1] / size + decide.NEAR
+    posts = more if said else zero + more
+    rec["whole"].update(certain=certain, doubts=zero + more)
+    notes, left = [], len(fields["zeros"]["runs"]) - len(count)   # the runs of a file with PCM audio that the read pass did not confirm
+    if left:
+        notes.append(f"{left} zero run{'s' if left != 1 else ''} in a file with PCM audio, where the read pass found no error, logged only")
+    if (fields["ffmpeg"].get("ran") is False or "skipped" in fields["ffmpeg"]) and not certain:
+        notes.append("the read pass " + ("could not open the file" if "skipped" not in fields["ffmpeg"] else fields["ffmpeg"]["skipped"]) +
+                     ", so only the zero scan judged it")
+    if notes:
+        rec["note"] = "; ".join(notes)
+    f = None
+    if certain:
+        f = {"kind": "video", "certain": certain, "mark": "whole"}
+        with contextlib.nullcontext() if grab.get("check") else locked():   # a re-grab deletes the file
+            if drop := deep_replaced(job):
+                return dict(rec, **drop)
+            f["action"] = dict(regrab.regrab(app, grab, "zero-filled", regrab.whole_probe(path, count, rec["whole"]), "video", alone=True), kind="video")
+        code = f["action"]["code"]
+        rec = regrab.restore_log(dict(rec, outcome="corrupt_video", regrab=code, result=f"corrupt video: {certain}, re-grab {code}"), grab, pending, app)
+    elif zero + more:
+        rec.update(outcome="video_doubt", result=f"video may be broken: {'; '.join(zero + more)}" + ("" if posts else ", logged only, the import's alert named it"))
+        f = posts and {"kind": "video", "doubts": posts, "mark": "whole"}
+    else:
+        rec.update(outcome="video_checked", result=report.FAULTS["video"][1])
+    if f:
+        rec.update(findings=[f], alert_kinds=["video"])
+        if post:
+            rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(job["path"]) if os.path.exists(job["path"]) else 0)
+    return rec
 
 
 def burn_full(path, audio, duration, second=False, queue=None):
@@ -912,7 +1036,7 @@ def deep_analysis(name, pending, claimed=False):
         pending.append(plex.plex_after(rec["app"], rec.get("source", "deep_analysis"), rec, want))
     store.drop("deep-read", name)
     drop_job(name, claimed)   # first, because the deep analysis a backfill job queues takes its name
-    if ctx and check and not any(still_queued(n(path)) for n in (deep_name, burn_name)):   # an import of the path queued its own
+    if ctx and check and not any(still_queued(n(path)) for n in (deep_name, burn_name, whole_name)):   # an import of the path queued its own
         queue_after(name, dict(check, app=app), rec, ctx, got, deep=not subtitles.sub_cached(path, "deep"))
 
 

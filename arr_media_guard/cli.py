@@ -498,9 +498,10 @@ def check(argv):
     """--check runs the checks and the decision of an import on each file named by path (docs/commands.md, "Check one
     file"). Each file runs as an import of its own with no download, see backfill_file(). It runs under an import's time
     limit, with the file lock shared for the checks and exclusive for an edit. Every check the settings turn on runs.
-    Then the full burned-in subtitle check and the deep analysis that an import queues run at once, see burn_later() and
-    deep_later(). The run is dry unless --apply is given, and a dry run changes nothing. A re-grab only says what an
-    import would do, see regrab.regrab(), so nothing deletes a file for a fault or searches. An apply edits the file as
+    Then the full burned-in subtitle check, the whole-file check and the deep analysis that an import queues run at
+    once, see burn_later(), whole_later() and deep_later(). The run is dry unless --apply is given, and a dry run
+    changes nothing. A re-grab only says what an import would do, see regrab.regrab(), so nothing deletes a file for a
+    fault or searches. An apply edits the file as
     an import does, keeps the original of a conversion, posts the alerts, and asks Plex to analyze the file as a
     backfill does. The apps list the files, as for --sub-time. --app takes the item from that instance only, and the other
     instances are asked for the paths it does not list. A path another instance lists fails, because it would run as a
@@ -600,7 +601,7 @@ def check(argv):
         rec["not_checked"] = (out or []) + check_left(rec)
         done(app, info, out, took, rec)
         if run and "tracks" in rec:   # the decision ran, so an import would queue these, see runner.run_job()
-            for what, later in (("burned-in subtitle check, ", burn_later), ("deep analysis, ", deep_later)):
+            for what, later in (("burned-in subtitle check, ", burn_later), ("whole-file check, ", whole_later), ("deep analysis, ", deep_later)):
                 if got := later(app, f, info, a, job, rec, run):
                     done(app, info, out, *got, what=what)
     if failed:
@@ -632,6 +633,22 @@ def burn_later(app, f, info, a, job, rec, run):
     except Exception as ex:
         if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
             raise
+        r.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
+    return time.time() - started, r
+
+
+def whole_later(app, f, info, a, job, rec, run):
+    """(seconds, decision record) of the whole-file check that an import queues for its file, see runner.queue_whole(),
+    run now as the job runs it, see runner.whole_act(), or None when the import queues none. It has no time limit, and
+    it never re-grabs, as the check does."""
+    plan = runner.whole_plan(rec)
+    if not plan:
+        return None
+    started = time.time()
+    r = dict(id=uuid.uuid4().hex[:12], app=app, source="check", path=rec["path"], apply=a.apply, ids=rec.get("ids") or {}, label=rec.get("label"))
+    try:
+        r = runner.whole_act(None, dict(plan, app=app, grab=job), r, [], post=run.post)
+    except Exception as ex:
         r.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, r
 
@@ -1023,8 +1040,8 @@ def scan_file(kind, app, w, stop):
     try:
         with runner.locked(shared=True):
             if kind == "video":
-                dur, hp = checks.video_inputs(path)
-                certain, doubts, detail = checks.check_video(path, dur, hp=hp)
+                dur, hp, pcm = checks.video_inputs(path)
+                certain, doubts, detail = checks.check_video(path, dur, hp=hp, pcm=pcm)
             else:
                 j = checks.mkvmerge(path)
                 d = decide.decide(j, original, kids, "") if path.lower().endswith(".mkv") else None

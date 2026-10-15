@@ -173,7 +173,9 @@ HOLD_RESULT = "held for the deep analysis"   # what alert_findings() gives for a
 
 def alert_findings(rec, size, held=None):
     """Post the findings of rec that report.posts() passes, one embed each, see report.alert_embed() and alert(). This is
-    the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log.
+    the one gate of the alerts. Returns what each finding gave, "log only" for one that stays in the decision log. A
+    finding's "mark" keys its marker in place of its kind, so an alert of the whole-file check is not one the import
+    sent for the same file, see alert().
 
     held is a list when the deep analysis of the file follows this import, see process.alerts(). A finding of
     DEEP_KINDS that would post then goes into held as its kind, size and embed, the subtitles it names as "keys", see
@@ -198,7 +200,7 @@ def alert_findings(rec, size, held=None):
                          **({"spans": spans} if spans else {})})
             out.append(HOLD_RESULT)
         else:
-            out.append(alert(rec["app"], f["kind"], rec["path"], size, e))
+            out.append(alert(rec["app"], f.get("mark", f["kind"]), rec["path"], size, e))
     if config.CFG.discord_posts == "all":
         try:
             rec["change_result"] = [post(rec["app"], e) if isinstance(e, dict) else e for e in report.render(rec, "changes")]
@@ -287,6 +289,14 @@ SKIPPED = {"header_repair_failed": "the file repair failed", "header_repair_skip
            "repack_failed": "the conversion to MKV failed", "repack_source_changed": "the app changed the file during the conversion to MKV",
            "repack_hardlinked": "the conversion to MKV was skipped, because the file has another hard link",
            "repack_no_keep": "the conversion to MKV was skipped, because the original couldn't be kept",
+           "repack_score_refused": "the conversion to MKV was skipped, because the new name could lower its custom format score",
+           "repack_too_big": "the conversion to MKV was skipped, because the file is over the size limit for a conversion",
+           "repack_low_space": "the conversion to MKV was skipped, because the disk didn't have enough free space",
+           "repack_name_taken": "the conversion to MKV was skipped, because another file already has the .mkv name",
+           "repack_unreadable": "the conversion to MKV was skipped, because the file couldn't be read",
+           "repack_app_refused": "the conversion to MKV was skipped, because the app doesn't list this file, or the file is outside the movie or series folder",
+           "repack_parse_refused": "the conversion to MKV was skipped, because Sonarr couldn't match the new name, or a file beside it, to this episode",
+           "repack_no_captions": "the conversion to MKV was skipped, because a closed caption track gave no text",
            "not_matroska": "the file isn't MKV, so its tracks weren't changed"}
 AUDIT_CHARS = 1950   # the characters of the file list, under the 2000 that embed() keeps of a description
 

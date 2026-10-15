@@ -164,6 +164,12 @@ When AMG is unsure, an alert such as "Audio may be broken" says why. `REGRAB` pi
 `REGRAB_CAP` allows 30 a day by default for each Sonarr or Radarr instance. When either stops a re-grab, an alert says
 so. See [regrabs.md](regrabs.md#re-grabs).
 
+After the import, a *whole-file check* reads each file whole in the background queue. It looks for gaps of zero bytes,
+as a torrent piece that never downloaded leaves, and ffmpeg reads every packet beside it. Gaps at two or more places
+re-grab the file when `REGRAB` lists `video`. One gap, or an error of the full read, only alerts. Silent PCM audio is
+zero bytes too, so in an MKV, MP4 or MOV file with PCM audio a gap counts only where the full read breaks. The check takes about the
+time the NAS needs to send the file once. See [design.md](design.md#whole-file-check).
+
 ## Restore after a bad upgrade
 
 When the broken file was an upgrade, the re-grab puts the old file back from the app's recycle bin, if it checks clean.
@@ -264,8 +270,9 @@ arr-media-guard: recheck: this version can improve the subtitle check of 12 file
 On a host install, the first nightly audit of the new version queues them, and they run after the next import.
 
 The rechecks wait in the background queue with every other job. Imports always go first. After them come the burned-in
-subtitle checks, the deep analyses and the rechecks, one at a time. A recheck repeats the check that saved the result,
-and never checks deeper. A file that only an import checked gets the import's subtitle checks again, and no more.
+subtitle checks, the whole-file checks, the deep analyses and the rechecks, one at a time. A recheck repeats the check
+that saved the result, and never checks deeper. A file that only an import checked gets the import's subtitle checks
+again, and no more.
 `SUBTITLES` decides what a recheck may do, as for an import. At `check` it only alerts, and a later
 `--sub-check --apply` makes the fix. AMG posts an alert of one kind once for a file. So at `check`, a recheck posts
 nothing when an alert of the same kind posted for the file before. At `fix` or `deep` it fixes. At `off` it does

@@ -333,9 +333,17 @@ def score_refuses(app, owner, old, new):
     its scene name, else its original download path's name, else its file name (CustomFormatCalculationService). A
     ManualImport keeps no download path, and the bulk PUT keeps a scene name only when it reads as a release with a
     group (SceneChecker.IsSceneTitle), the old scene name too. Many scene names do not. So the title may change to
-    the new file name. The app's parse API gives the custom formats of both titles, and the item's quality profile
-    their scores. A lost format that scores above 0, or a new one below 0, refuses the conversion before the remux. A
-    lost format that scores 0 does not."""
+    the new file name, and the file name always changes. A lost format that scores above 0, or a new one below 0,
+    refuses the conversion before the remux, and the item's quality profile gives the scores.
+
+    The app scores a stored file on the quality, languages and group of its record, which relink() carries. Of the
+    specifications only Release Title reads a name, the title or the file name (ReleaseTitleSpecification). So the
+    check matches each format's Release Title regexes on the old and the new names, as the app would, see
+    title_match(). A format can be lost only when the record lists it now, and gained only when it does not. A listed
+    format matched the real old title, which the old names here can miss. A regex
+    Python cannot read leaves the call to the parse API, which matches the title alone with its extension cut. The
+    parse is no guide for the rest, because it reads the quality from the title. A title with no quality takes one
+    from its extension. .mp4 and .m4v give SDTV, and .mkv gives WEBDL-720p on Radarr and HDTV-720p on Sonarr."""
     orig = apps.ARR[app].original(owner, old) if old.get("id") else None
     before = old.get("sceneName") or os.path.basename(orig or "") or os.path.basename(old.get("path") or "")
     parse = lambda t: apps.arr(app, "parse?" + urllib.parse.urlencode({"title": t})) or {}
@@ -345,17 +353,52 @@ def score_refuses(app, owner, old, new):
                     and ((info.get("quality") or {}).get("quality") or {}).get("name") not in (None, "Unknown"))
     cand = os.path.splitext(os.path.basename(orig or ""))[0] if apps.ARR[app].film else ""   # relink() sends it on Radarr only
     after = next((t for t in (old.get("sceneName"), cand) if kept(t)), None) or os.path.basename(new)
-    if after == before:
-        return None
     item = apps.arr(app, f"{apps.ARR[app].kind}/{owner}") or {}
     score = {f.get("format"): f.get("score") or 0 for f in (apps.arr(app, f"qualityprofile/{item.get('qualityProfileId')}") or {}).get("formatItems") or []}
-    a, b = ({c["id"]: c["name"] for c in parse(t).get("customFormats") or []} for t in (before, after))
-    lost = sorted(f"{a[i]} ({score.get(i, 0):+d})" for i in a.keys() - b.keys() if score.get(i, 0) > 0)
-    gained = sorted(f"{b[i]} ({score.get(i, 0):+d})" for i in b.keys() - a.keys() if score.get(i, 0) < 0)
-    if lost or gained:
-        return config.mask(f"the new name loses custom formats: {before!r} gives {sorted(a.values())}, {after!r} gives {sorted(b.values())}"
-                    + (f", lost {', '.join(lost)}" if lost else "") + (f", gained {', '.join(gained)}" if gained else ""))[:300]
+    if not any(score.values()):
+        return None
+    has = None if old.get("customFormats") is None else {c.get("id") for c in old["customFormats"]}   # the record's formats now
+    a = {c["id"]: c["name"] for c in parse(before).get("customFormats") or []}
+    b = a if after == before else {c["id"]: c["name"] for c in parse(after).get("customFormats") or []}
+    simple = (lambda t: re.sub(r"\s*[<>?*|]", "", t)) if apps.ARR[app].film else str   # SimplifyReleaseTitle(), Radarr only
+    names = [(simple(before), os.path.basename(old.get("path") or "")), (simple(after), os.path.basename(new))]
+    formats = {c.get("id"): c for c in apps.arr(app, "customformat") or []}
+    lost, gained = [], []
+    for i in (formats.keys() | a.keys() | b.keys()) - {None}:
+        c = formats.get(i)
+        was, now = (title_match(c, n) for n in names) if c else ("?", "?")
+        if "?" in (was, now):
+            was, now = i in a, i in b
+        elif has is not None and i in has and any(s.get("implementation") == "ReleaseTitleSpecification" for s in c.get("specifications") or []):
+            was = True   # the app matched it on the real old title, which Sonarr's API can hide, see original()
+        name = f"{(c or {}).get('name') or a.get(i) or b.get(i)} ({score.get(i, 0):+d})"
+        if was and not now and score.get(i, 0) > 0 and (has is None or i in has):
+            lost.append(name)
+        elif now and not was and score.get(i, 0) < 0 and (has is None or i not in has):
+            gained.append(name)
+    if lost or gained:   # the formats first and whole, the names last and cut
+        return config.mask("the new name changes custom formats that score: " + ", ".join(
+            [f"lost {', '.join(sorted(lost))}"] * bool(lost) + [f"gained {', '.join(sorted(gained))}"] * bool(gained))) \
+            + config.mask(f", the name {before!r} becomes {after!r}")[:200]
     return None
+
+
+def title_match(c, names):
+    """Whether the Release Title specifications of the custom format c match, as the app groups them
+    (SpecificationMatchesGroup.DidMatch). names holds the title and the file name, and a regex matches either, case
+    insensitive (ReleaseTitleSpecification, RegexSpecificationBase). A format with no such specification gives False.
+    A regex Python cannot use, or reads another way than .NET, gives "?". Python cannot compile a lookbehind of
+    varying width. It reads x{,2} as up to two x, and .NET as text. .NET reads [a-z-[aeiou]] as the consonants, and
+    Python as a set and a "]"."""
+    specs = [(next((f.get("value") or "" for f in s.get("fields") or [] if f.get("name") == "value"), ""), bool(s.get("negate")), s.get("required"))
+             for s in c.get("specifications") or [] if s.get("implementation") == "ReleaseTitleSpecification"]
+    try:
+        if any(re.search(r"\{,|-\[[^\]]*\]\]", v) for v, _, _ in specs):
+            return "?"
+        got = [(neg != any(v.strip() and re.search(v, n, re.I) for n in names), req) for v, neg, req in specs]
+    except Exception:   # re.error, and OverflowError or RecursionError on a huge pattern
+        return "?"
+    return bool(got) and not any(r and not m for m, r in got) and any(m for m, _ in got)
 
 
 def hide_extras(paths):
@@ -914,4 +957,4 @@ def convert_list(app, rec):
     """Add a conversion that was refused or failed to <STATE_DIR>/convert-<app>.txt, the list to review by hand."""
     with contextlib.suppress(OSError), open(os.path.join(config.CFG.state_dir, f"convert-{app}.txt"), "a") as f:
         f.write(f'{rec.get("time") or datetime.datetime.now().astimezone().isoformat(timespec="seconds")}\t{rec["outcome"]}\t'
-                f'{rec.get("label")}\t{rec["result"][:300]}\t{rec["path"]}\n')
+                f'{rec.get("label")}\t{rec["result"]}\t{rec["path"]}\n')

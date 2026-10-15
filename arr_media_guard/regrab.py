@@ -15,6 +15,17 @@ def video_probe(path, f, fresh=False):
     return fields["fault"], {"video": checks.video_summary(certain, doubts, fields)}
 
 
+def whole_probe(path, runs, out):
+    """probe() for regrab() of a whole-file check, see runner.whole_act(): the zero runs it found in path, measured
+    again, see checks.zero_again(). zero-filled when 2 or more are still there, else None. Every call measures them
+    again, so fresh changes nothing. out["again"] takes the runs still there and the bytes read."""
+    def probe(p, f, fresh=False):
+        still, read = checks.zero_again(path, runs)
+        out["again"] = {"runs": still, "read": read}
+        return "zero-filled" if len(still) >= 2 else None, {"again": out["again"]}
+    return probe
+
+
 def planned(path, j, original, kids, release, heard=None, spoken=None):
     """The flag edits the rules plan for a file. Empty for a non-mkv file, which is never edited."""
     return decide.decide(j, original, kids, release, heard, spoken)["edits"] if path.lower().endswith(".mkv") else []
@@ -120,7 +131,7 @@ RESULT_CODES = {"audio": ("broken_audio", "audio_checked"), "content": ("wrong_c
                 "burned_in": ("burned_in_full", "burned_in_checked")}
 
 
-def regrab(app, job, fault, probe, kind="audio"):
+def regrab(app, job, fault, probe, kind="audio", alone=False):
     """A download is one unit. Check every file it imported, delete each faulty one, re-monitor their items, then
     mark the grab failed once. That order matters: the app searches at once, and a faulty file still on disk would
     make it reject the replacement as not an upgrade. Clean files stay. Returns the action, {"code", **facts}, which
@@ -132,7 +143,8 @@ def regrab(app, job, fault, probe, kind="audio"):
     second check passes fresh=True. kind is audio, content, video, damage or burned_in. Every kind counts against the
     one REGRAB_CAP of the app. A kind REGRAB does not list stops after the second check of the job's file and deletes
     nothing. burned_in judges the job's file alone. Each other file of the download that its quick check flagged, or could
-    not sort, gets a burn-in job of its own.
+    not sort, gets a burn-in job of its own. alone judges the job's file alone for another kind, as for the whole-file
+    check, whose job each file of the download gets, see runner.whole_act().
 
     The job of --check has no download, and its run changes nothing in the app, see cli.check(). It returns after the
     second check, with check when an import would re-grab, else would_regrab as on an import. So no delete, failed mark,
@@ -166,7 +178,7 @@ def regrab(app, job, fault, probe, kind="audio"):
             return {"code": "would_regrab", "kind": kind}
         files = unit_files(app, records, job)
         broken = {int(job["file_id"])}
-        if kind == "burned_in":   # a flagged or unsorted file of the download has a burn-in job of its own, see runner.burn_in()
+        if kind == "burned_in" or alone:   # each other file has a job of its own, see runner.burn_in() and runner.whole_job()
             files = {fid: f for fid, f in files.items() if fid in broken}
         unit = unit or {"time": time.time(), "failed": False, "deleted": [], "clean": [], "kind": kind}
         for fid, f in files.items():

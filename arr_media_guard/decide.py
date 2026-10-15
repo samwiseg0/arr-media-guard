@@ -1337,7 +1337,7 @@ def read_capped(w):
     return (w.get("stopped") or "").startswith("read over") and not w["errors"] and not w["noisy"]
 
 
-def video_verdict(zero_hits, windows):
+def video_verdict(zero_hits, windows, checked=ZERO_READS):
     """(certain reason or None, [doubts]) from the zero probe's offsets and the windows.
 
     Certain: zero runs of ZERO_RUN or more at 2 or more offsets, 2 or more windows with no decoder for an encrypted
@@ -1345,13 +1345,15 @@ def video_verdict(zero_hits, windows):
     ffmpeg does not know may be a healthy file. A doubt: such a run at one offset, one bad window, a window stopped by the time limit, a window
     that did not run, or an empty window. An empty window with no error is a cut file, which the audio check judges in
     Matroska, or    a window past the end of the video. A window that the read cap stopped with no error is only logged.
+    checked is the count of places the probe read. The whole-file check reads every byte and gives None.
     """
     if len(zero_hits) >= 2:
-        return f"the file has blank gaps at {len(zero_hits)} of {ZERO_READS} places checked, so the download is incomplete", []
+        where = f"{len(zero_hits)} of {checked} places checked" if checked else f"{len(zero_hits)} places"
+        return f"the file has blank gaps at {where}, so the download is incomplete", []
     nodecoder = sum(bool(w.get("nodecoder") and w.get("encrypted")) for w in windows)
     if nodecoder >= 2:
         return f"the video is encrypted and cannot play at {nodecoder} of {len(windows)} places checked", []
-    doubts = [f"the file has a blank gap at {zero_hits[0]:.0%} of its length"] if zero_hits else []
+    doubts = [f"the file has a blank gap {places(zero_hits[:1])}"] if zero_hits else []
     bads = []
     for w in windows:
         why = bad_window(w) if w["ran"] else None
@@ -1368,6 +1370,72 @@ def video_verdict(zero_hits, windows):
     if len(bads) >= 2:
         return f"the video is broken at {len(bads)} of {len(windows)} places checked: " + ", ".join(bads[:-1]) + " and " + bads[-1], doubts
     return None, doubts + bads
+
+
+# The read pass of the whole-file check (docs/design.md, "Whole-file check"): ffmpeg -v error -i FILE -ignore_unknown
+# -map 0 -c copy -f null -. It demuxes every packet of the file and decodes none.
+UNREADABLE = ("Error opening input", "Error opening output")   # ffmpeg 7 cannot open the file or set up its streams, and exits non-zero
+# The byte a demuxer error names: "0x00 at pos 2055615 (0x1f5dbf) invalid as first byte of an EBML number", and
+# "Element at 0x1f5dbf ending at 0x29312a exceeds containing master element". The end may lie past the file.
+POS = re.compile(r"\bpos (\d+)|\bElement at 0x([0-9a-f]+)")
+NEAR = 0.01                          # a share of the file around a zero run where the read pass's errors belong to that run
+WHOLE_BLOCK = 64 << 10               # the zero scan's grid. A run's ends sit within one block of the real ends of its zeros.
+
+
+def places(shares):
+    """Where shares of a file sit, as an alert says it: "at the start of the file", "at 13% and 61% of its length". It
+    names up to 5 places and counts the rest."""
+    rest = sorted({round(a, 2) for a in shares} - {0})
+    shown = [f"{a:.0%}" for a in rest[:5]] + ([f"{len(rest) - 5} more places"] if len(rest) > 5 else [])
+    said = ["at the start of the file"] if any(round(a, 2) == 0 for a in shares) else []
+    if shown:
+        said.append(f"at {shown[0] if len(shown) == 1 else ', '.join(shown[:-1]) + ' and ' + shown[-1]} of its length")
+    return " and ".join(said)
+
+
+def parse_copy(stderr, rc, size):
+    """The read pass's stderr and exit code -> a dict. lines: every line except NOISE, as the windows read it. A
+    healthy file prints none. The null muxer's complaint of a repeated timestamp names no byte of the file, and
+    healthy files print it. ran is False when ffmpeg could not open the file, which is no doubt. pos: the bytes the
+    lines name, and at: those as shares of size. loose: the lines that name no place. noise: the NOISE lines. first:
+    the first lines, for the log."""
+    lines = [x.strip() for x in stderr.splitlines() if x.strip() and not any(n in x for n in NOISE)]
+    pos = sorted({b for x in lines for d, h in POS.findall(x) if (b := int(d or int(h, 16))) <= size})
+    return {"ran": not (rc and any(u in x for x in lines for u in UNREADABLE)), "lines": len(lines), "pos": pos,
+            "at": [round(b / size, 4) for b in pos] if size else [], "loose": sum(not POS.search(x) for x in lines),
+            "noise": sum(any(n in x for n in NOISE) for x in stderr.splitlines()), "first": lines[:3]}
+
+
+def whole_verdict(runs, size, read, pcm=False):
+    """(certain reason or None, [doubts of the zero runs], [doubts of the read pass], the runs that count) of the
+    whole-file check. runs are the zero runs as [first byte, end]. read is parse_copy(), or None when the pass did
+    not run to its end. pcm says the file has a PCM audio track, see checks.pcm_audio().
+
+    A run is confirmed when a byte the read pass names lies in it, give or take WHOLE_BLOCK, and no other run lies
+    nearer. In Matroska a real gap that covers a block edge breaks the container, and the read pass names a byte inside
+    it. Silent PCM audio is zero bytes too, and in blocks of ZERO_RUN or more it is valid payload. A silent run can sit
+    within a block of a real gap, so each byte confirms its nearest run only. In a file with PCM audio only the
+    confirmed runs count, and the others are only logged. In any other file every run counts. 2 or more runs that
+    count are certain, and 1 is a doubt, worded as video_verdict() words the zero probe. The read pass is only ever a
+    doubt. Its errors within NEAR of a run that counts belong to that run, so they add no doubt. A line that names no
+    place does."""
+    count = runs
+    if pcm:
+        apart = lambda r, b: max(r[0] - b, b - r[1], 0)   # bytes from b to the run r, 0 inside it
+        hit = []
+        for b in (read or {}).get("pos") or []:
+            r = min(runs, key=lambda r: apart(r, b), default=None)
+            if r is not None and apart(r, b) <= WHOLE_BLOCK:
+                hit.append(r)
+        count = [r for r in runs if r in hit]
+    certain, zero = video_verdict([round(a / size, 3) for a, _ in count], [], None)
+    if certain or not read or not read["ran"] or not read["lines"]:
+        return certain, zero, [], count
+    away = [a for a in read["at"] if not any(s / size - NEAR <= a <= e / size + NEAR for s, e in count)]
+    if away:
+        return None, zero, [f"a full read of the file found damaged data {places(away)}"], count
+    n = read["loose"]
+    return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count
 
 
 # The header check (docs/design.md, "Header repair"). A lossless mkvmerge remux rewrites the Matroska Segment duration, the

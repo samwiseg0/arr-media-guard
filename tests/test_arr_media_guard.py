@@ -22,6 +22,7 @@ fork real processes and trace them through a shared file.
 
 Run: pytest tests/test_arr_media_guard.py
 """
+import ast
 import collections
 import concurrent.futures
 import contextlib
@@ -60,7 +61,7 @@ os.environ["ARR_MEDIA_GUARD_ENV"] = "/nonexistent/arr-media-guard.env"
 hook = amg.load("arr_media_guard_hook")
 hook.CFG = dataclasses.replace(hook.CFG, plex_url="https://plex.invalid:32400")   # the fake Plex answers only this host
 REAL_FLOCK = fcntl.flock
-REAL_MKVMERGE, REAL_WINDOW = hook.mkvmerge, hook.window   # the env fixture fakes them, a test with real files needs them
+REAL_MKVMERGE, REAL_WINDOW, REAL_WHOLE_PLAN = hook.mkvmerge, hook.window, hook.whole_plan   # the env fixture fakes them, a test with real files needs them
 REAL_FORK, REAL_EXIT, REAL_RUN = os.fork, os._exit, subprocess.run   # the fixture fakes them, the job process tests need them
 # The policy is the example policy file.
 with open(os.path.join(FILES, "examples", "policy.json")) as _f:
@@ -145,6 +146,10 @@ def env(tmp_path, monkeypatch, settings):
         if argv[0] == "ffprobe" and "format=duration" in argv:   # the repack compares durations, from calls["durations"]
             with open(argv[-1], "rb") as f:
                 return type("R", (), {"returncode": 0, "stdout": f'{calls["durations"][f.read(4) == b"MKV!"]}\n', "stderr": ""})()
+        if argv[0] == "ffprobe" and any("codec_name:format" in a for a in argv):   # pcm_audio(): the audio codecs of calls["codecs"]
+            out = {"streams": [{"codec_type": "audio", "codec_name": c} for c in calls.get("codecs", "").split()],
+                   "format": {"format_name": calls.get("format", "matroska,webm")}}
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(out), "stderr": ""})()
         if argv[0] == "ffprobe":   # as many audio streams as the fake mkvmerge lists, unless a test says otherwise
             probe = calls["files"].get(argv[-1], calls["probe"])
             count = sum(t.get("type") == "audio" for t in probe.get("tracks", []))
@@ -216,6 +221,8 @@ def env(tmp_path, monkeypatch, settings):
             return calls.get("parse_cf", lambda title: {})(parse_qs(p.split("?", 1)[1])["title"][0])
         if p.startswith("qualityprofile/"):
             return calls.get("profile", {})
+        if p == "customformat":
+            return calls.get("formats", [])
         if p.startswith("moviefile/") and p not in calls["movies"]:   # the record a movie/<id> names, when a test set no other.
             fid = int(p.split("/")[1])   # A record no movie names belongs to the env's movie 7, as the job's file does.
             return next(({"movieId": int(k[6:]), **m["movieFile"]} for k, m in calls["movies"].items() if k.startswith("movie/")
@@ -255,6 +262,7 @@ def env(tmp_path, monkeypatch, settings):
 
     monkeypatch.setattr(hook, "mkvmerge", fake_mkvmerge)
     monkeypatch.setattr(hook, "window", fake_window)
+    monkeypatch.setattr(hook, "whole_plan", lambda rec: None)   # the whole-file check reads the file with ffmpeg. Its tests put it back.
     monkeypatch.setattr(hook.subprocess, "run", fake_run)
     monkeypatch.setattr(hook, "http", fake_http)
     monkeypatch.setattr(hook.os, "fork", fake_fork)
@@ -2523,7 +2531,7 @@ def test_a_scan_after_its_pass_starts_a_new_pass_and_list(env, monkeypatch, tmp_
     a new pass each time. See cli.pass_left()."""
     scan_library(monkeypatch, tmp_path, 2)
     base, doubt = os.path.join(hook.CFG.state_dir, "video-scan-radarr"), [True]
-    monkeypatch.setattr(hook, "check_video", lambda path, dur, again=False, hp=None: (None, ["doubt"] if doubt[0] else [], {"fault": None}))
+    monkeypatch.setattr(hook, "check_video", lambda path, dur, again=False, hp=None, pcm=None: (None, ["doubt"] if doubt[0] else [], {"fault": None}))
     hook.main(["--backfill", "radarr", "--check-video"])
     assert len(scan_rows(base)) == 2
     doubt[0] = False
@@ -4167,10 +4175,11 @@ def test_the_zero_probe_reads_only_the_matroska_clusters(tmp_path):
         assert hook.zero_span(g, size) == (ds + len(head), ds + len(segment))
     for again in (False, True):
         assert hook.zero_probe(str(f), again)[0] == []
-    assert hook.check_video(str(f), 0)[:2] == (None, [])
+    assert hook.check_video(str(f), 0)[:2] == (None, []) and hook.zero_scan(str(f))[0] == []   # the whole-file scan reads the same span
     with open(f, "r+b") as g:   # an unfinished download: 2 MiB of zeros at two places inside the Clusters
         for at in (ds + len(head) + (6 << 20), ds + len(head) + (15 << 20)):
             g.seek(at); g.write(bytes(2 << 20))
+    assert len(hook.zero_scan(str(f))[0]) == 2
     hits = hook.zero_probe(str(f))[0]
     assert len(hits) >= 2 and all((ds + len(head)) / size < h < (ds + len(segment)) / size for h in hits), hits   # shares of the file
     assert hook.check_video(str(f), 0)[2]["fault"] == "zero-filled"
@@ -4253,8 +4262,8 @@ def test_windows_follow_the_video_stream_of_a_file_that_is_not_matroska(tmp_path
     f = tmp_path / "Show L - s01e05 - DVD.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=70", "-f", "lavfi", "-i",
                     "sine=frequency=440:duration=150", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(f)], check=True)
-    dur, hp = hook.video_inputs(str(f))
-    assert hp is None and abs(dur - 70) < 0.1 and hook.ffprobe_duration(str(f)) > 149, dur
+    dur, hp, pcm = hook.video_inputs(str(f))
+    assert hp is None and pcm is None and abs(dur - 70) < 0.1 and hook.ffprobe_duration(str(f)) > 149, dur
     certain, doubts, fields = hook.check_video(str(f), dur)
     assert certain is None and [w["at"] for w in fields["windows"]["list"]] == [7, 35, 60]
     assert doubts == ["the file's tracks run to 2:30, but the video stops at 1:10, so another track may be broken"], doubts
@@ -4457,7 +4466,7 @@ def test_a_parallel_scan_stops_cleanly_and_a_restart_never_skips(env, monkeypatc
     killed, stopping, seen = threading.Event(), [True], []
     monkeypatch.setattr(hook, "kill_children", killed.set)
 
-    def check(path, dur, again=False, hp=None):
+    def check(path, dur, again=False, hp=None, pcm=None):
         name = os.path.basename(path); seen.append(name)
         if name == "m1.mkv" and stopping[0]:   # slow: the other three finish first, then a SIGTERM arrives
             for _ in range(200):
@@ -5953,7 +5962,7 @@ def test_a_backfill_reports_repairs_and_both_audits_count_them(env, monkeypatch,
 
 def test_a_video_scan_lists_a_header_issue_and_never_repairs_it(env, monkeypatch, tmp_path):
     scan_library(monkeypatch, tmp_path, 2)
-    def check(path, dur, again=False, hp=None):
+    def check(path, dur, again=False, hp=None, pcm=None):
         h = dict(HEADER_HP, repairable=True) if path.endswith("m1.mkv") else {"skipped": "not Matroska, or no Segment size"}
         return None, [], {"fault": None, "header": h}
     monkeypatch.setattr(hook, "check_video", check)
@@ -8331,8 +8340,23 @@ def test_a_name_that_loses_a_scoring_custom_format_refuses_the_conversion(env, m
         assert env["repacks"] == [] and env["writes"] == [] and os.path.exists(mp4)
         (line,) = open(os.path.join(hook.CFG.state_dir, "convert-radarr.txt")).read().splitlines()
         assert line.split("\t")[1] == "repack_score_refused"
+        assert hook.audit_problem("convert", rec) == "the conversion to MKV was skipped, because the new name could lower its custom format score"
     else:
         assert rec["outcome"] == "edited" and os.path.exists(mkv), rec["result"]
+
+
+def test_a_format_the_record_decides_never_refuses_the_conversion(env, monkeypatch):
+    """The parse API gives the old name "SDTV" (+10) and the new name "720p WEB-DL" (-20), each from the extension
+    alone. Neither format has a Release Title specification, so the stored file keeps its result, and the conversion goes on."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    env["movies"]["movie/7"]["qualityProfileId"] = 4
+    env["profile"] = {"formatItems": [{"format": 1, "name": "SDTV", "score": 10}, {"format": 2, "name": "720p WEB-DL", "score": -20}]}
+    env["formats"] = EXTENSION_FORMATS
+    env["parse_cf"] = lambda title: {"customFormats": [{"id": 2, "name": "720p WEB-DL"}] if title.endswith(".mkv") else [{"id": 1, "name": "SDTV"}]}
+    env["movies"]["moviefile/12"] = {"id": 12, "movieId": 7, "path": mkv, "customFormatScore": 25}
+    hook.main([])
+    rec = decided(env)
+    assert rec["outcome"] == "edited" and os.path.exists(mkv) and not os.path.exists(mp4), rec["result"]
 
 
 def test_a_listed_file_still_refuses_at_the_score_check(env, monkeypatch, settings, tmp_path, capsys):
@@ -10388,6 +10412,7 @@ def test_sonarr_takes_the_original_path_from_its_import_history(monkeypatch, his
         if p == "history/series?seriesId=5&eventType=3": return rows
         if p == "series/5": return {"id": 5, "qualityProfileId": 4}
         if p == "qualityprofile/4": return {"formatItems": [{"format": 1, "name": "Format A", "score": 5}]}
+        if p == "customformat": return []
         title = parse_qs(p.split("?", 1)[1])["title"][0]
         titles.append(title)
         return {"customFormats": [{"id": 1, "name": "Format A"}] if title in ("Show.S02E01.1080p.WEB.AAC2.0-GRP.mp4", "Show.S02E01.720p.HDTV.x264-OLD") else []}
@@ -10397,7 +10422,177 @@ def test_sonarr_takes_the_original_path_from_its_import_history(monkeypatch, his
     why = hook.score_refuses("sonarr", 5, old, "/tv/Show/Season 02/Show - S02E01.mkv")
     assert titles[0] == before and (why is None) == (history == "none"), (titles, why)
     if why:
-        assert f"{before!r} gives ['Format A']" in why and "lost Format A (+5)" in why
+        assert why.startswith("the new name changes custom formats that score: lost Format A (+5), the name ") and before in why, why
+
+
+def custom_format(fid, name, *specs):
+    """A custom format as the customformat API lists it. Each spec is (implementation, value, negate), and a fourth item
+    False makes it not required."""
+    return {"id": fid, "name": name, "specifications": [{"implementation": impl, "negate": neg, "required": req[0] if req else True,
+                                                         "fields": [{"name": "value", "value": v}]} for impl, v, neg, *req in specs]}
+
+
+EXTENSION_FORMATS = [custom_format(1, "SDTV", ("SourceSpecification", 1, False)),
+                     custom_format(2, "720p WEB-DL", ("SourceSpecification", 7, False), ("ResolutionSpecification", 720, False)),
+                     custom_format(3, "Release Group (Missing)", ("ReleaseGroupSpecification", ".", True)),
+                     custom_format(4, "x265", ("ReleaseTitleSpecification", r"[xh][ ._-]?265", False))]
+
+
+@pytest.mark.parametrize("app", ["radarr", "sonarr"])
+@pytest.mark.parametrize("extra, refused", [
+    (None, None),
+    (custom_format(5, "M4V Source", ("ReleaseTitleSpecification", r"\.m4v$", False)), "M4V Source"),
+    (custom_format(6, "Lookbehind", ("ReleaseTitleSpecification", r"(?<!DTS[ .-]?HD[ .-]?)\bMA\b", False), ("SourceSpecification", 1, False)), "Lookbehind"),
+    (custom_format(7, "Huge", ("ReleaseTitleSpecification", "a{4294967296}", False)), "Huge"),
+    (custom_format(8, "Not MKV", ("ReleaseTitleSpecification", r"\.mkv$", True, False), ("ReleaseTitleSpecification", "", False, False)), "Not MKV")])
+def test_a_quality_the_parse_takes_from_the_extension_never_refuses(monkeypatch, app, extra, refused):
+    """A name with no quality marker parses as SDTV with .m4v and as WEBDL-720p with .mkv. The release group and the
+    languages come from the title too. The app scores the stored file on its record's quality, group and languages,
+    which the import carries, and only a Release Title regex reads the name. So the formats that read none of it keep
+    their result, and the conversion goes on. A Release Title regex that matches only the old name refuses, and the
+    message names the format first. A negated regex counts, and an empty one never matches, as in the app. For a regex
+    Python cannot compile, or one too large for it, the parse API decides, and here it names the format lost."""
+    name = "Film A (1979) {tmdb-90001} [Unknown][AAC 5.1][x265]" if app == "radarr" else "Show - S01E01 [Unknown][AAC 5.1][x265]"
+    formats = EXTENSION_FORMATS + ([extra] if extra else [])
+    scores = {1: 10, 2: -20, 3: -5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}
+    asked = []
+
+    def arr(a, p):
+        asked.append(p)
+        if p in ("movie/7", "series/7"): return {"qualityProfileId": 4}
+        if p == "qualityprofile/4": return {"formatItems": [{"format": i, "score": s} for i, s in scores.items()]}
+        if p == "customformat": return formats
+        title = parse_qs(p.split("?", 1)[1])["title"][0]   # the parse API: the extension gives the quality, the title no group
+        ids = [2, 3, 4] if title.endswith(".mkv") else [1, 4] + ([extra["id"]] if extra else [])
+        return {"customFormats": [{"id": c["id"], "name": c["name"]} for c in formats if c["id"] in ids]}
+    monkeypatch.setattr(hook, "arr", arr)
+    why = hook.score_refuses(app, 7, {"path": f"/lib/{name}.m4v"}, f"/lib/{name}.mkv")
+    if refused is None:
+        assert why is None and "customformat" in asked
+    else:
+        assert why == f"the new name changes custom formats that score: lost {refused} (+3), the name '{name}.m4v' becomes '{name}.mkv'", why
+
+
+@pytest.mark.parametrize("app", ["radarr", "sonarr"])
+def test_a_format_the_old_file_name_matched_never_refuses(monkeypatch, app):
+    """The record's scene name has no codec, and the app drops it, so the title becomes the new file name. The parse API
+    gives "x265" (-5) to the new title only. But the app matches a Release Title regex on the file name too, and the old
+    file name has the codec. So the stored file had "x265" already, and the conversion goes on."""
+    name = "Film A (1979) [x265]" if app == "radarr" else "Show - S01E01 [x265]"
+    asked = []
+
+    def arr(a, p):
+        asked.append(p)
+        if p in ("movie/7", "series/7"): return {"qualityProfileId": 4}
+        if p == "qualityprofile/4": return {"formatItems": [{"format": 4, "score": -5}]}
+        if p == "customformat": return EXTENSION_FORMATS
+        title = parse_qs(p.split("?", 1)[1])["title"][0]
+        return {"customFormats": [{"id": 4, "name": "x265"}] if "x265" in title else []}
+    monkeypatch.setattr(hook, "arr", arr)
+    assert hook.score_refuses(app, 7, {"path": f"/lib/{name}.m4v", "sceneName": "Film.A.1979.WEB"}, f"/lib/{name}.mkv") is None
+    assert "customformat" in asked
+
+
+MEDIA_EXT = re.compile(r"\.(m4v|mp4|mkv|avi)$", re.I)   # the parse cuts a media extension before it matches (Parser.cs)
+
+
+def scoring_app(formats, scores, title_formats):
+    """A fake app for score_refuses(): the profile scores, the customformat list, and a parse API that gives the
+    formats title_formats(title) names. Returns (the fake, the paths it was asked)."""
+    asked = []
+
+    def arr(a, p):
+        asked.append(p)
+        if p in ("movie/7", "series/7"): return {"qualityProfileId": 4}
+        if p == "qualityprofile/4": return {"formatItems": [{"format": i, "score": s} for i, s in scores.items()]}
+        if p == "customformat": return formats
+        title = parse_qs(p.split("?", 1)[1])["title"][0]
+        return {"customFormats": [{"id": c["id"], "name": c["name"]} for c in formats if c["id"] in title_formats(title)]}
+    return arr, asked
+
+
+@pytest.mark.parametrize("app", ["radarr", "sonarr"])
+@pytest.mark.parametrize("scene", [None, "Film.A.1979.1080p.WEB-DL.x265-GRP"])
+def test_an_extension_format_the_parse_cannot_see_still_refuses(monkeypatch, app, scene):
+    """The parse API cuts the extension before it matches, so a Release Title regex on the extension never differs
+    there. The stored file's file name keeps the extension, and so does its title when it has no scene name. The
+    conversion changes it to .mkv, so "M4V Source" is lost. Found by the 2.14.0 review."""
+    name = "Film A (1979) {tmdb-90001} [Unknown][AAC 5.1][x265]"
+    formats = EXTENSION_FORMATS + [custom_format(5, "M4V Source", ("ReleaseTitleSpecification", r"\.m4v$", False))]
+
+    def title_formats(title):   # the extension gives the quality, the regexes see the title without it
+        bare = MEDIA_EXT.sub("", title)
+        return ([2, 3] if title.endswith(".mkv") else [1]) + [4] * bool(re.search(r"[xh][ ._-]?265", bare)) + [5] * bool(re.search(r"\.m4v$", bare))
+    arr, asked = scoring_app(formats, {1: 10, 2: -20, 3: -5, 4: 5, 5: 3}, title_formats)
+    monkeypatch.setattr(hook, "arr", arr)
+    old = {"path": f"/lib/{name}.m4v", **({"sceneName": scene} if scene else {})}
+    why = hook.score_refuses(app, 7, old, f"/lib/{name}.mkv")
+    assert why and why.startswith("the new name changes custom formats that score: lost M4V Source (+3), the name "), (why, asked)
+
+
+@pytest.mark.parametrize("app, refused", [("radarr", False), ("sonarr", True)])
+def test_only_radarr_simplifies_the_title(monkeypatch, app, refused):
+    """Radarr matches a Release Title regex on SimplifyReleaseTitle() of the title, which drops " |". Sonarr matches the
+    raw title. The parse names the format lost on both, so only the app's own simplification decides."""
+    name = "Film A (1979) [x265]" if app == "radarr" else "Show - S01E01 [x265]"
+    arr, _ = scoring_app([custom_format(9, "Pipe", ("ReleaseTitleSpecification", r"x265 \|GRP", False))], {9: 4}, lambda title: [9] if "|" in title else [])
+    monkeypatch.setattr(hook, "arr", arr)
+    why = hook.score_refuses(app, 7, {"path": f"/lib/{name}.m4v", "sceneName": "Film A 1979 WEB x265 |GRP"}, f"/lib/{name}.mkv")
+    assert (why is not None) == refused, why
+
+
+@pytest.mark.parametrize("app", ["radarr", "sonarr"])
+@pytest.mark.parametrize("listed, odd_new, refused", [([], False, None), ([5], False, "lost M4V Source (+3)"), ([6], True, None),
+                                                    ([], True, "gained Odd Group (-4)"), (None, False, "lost M4V Source (+3)")])
+def test_the_record_decides_which_formats_the_file_has(monkeypatch, app, listed, odd_new, refused):
+    """The record lists the formats the app gives the file now. "M4V Source" also needs the WEB-DL source, which the
+    record lacks, so the app never gave it, and it cannot be lost. Only a record that lists it refuses. "Odd Group"
+    (-4) has a lookbehind Python cannot compile, and the parse gives it to the new name only. A record that lists it
+    has it already, so it is not gained. A record with no list leaves each format possible."""
+    name = "Film A (1979) [x265]" if app == "radarr" else "Show - S01E01 [x265]"
+    m4v = custom_format(5, "M4V Source", ("ReleaseTitleSpecification", r"\.m4v$", False), ("SourceSpecification", 7, False))
+    odd = custom_format(6, "Odd Group", ("ReleaseTitleSpecification", r"(?<=^|[\s.-])x265\b", False))
+    arr, _ = scoring_app([m4v, odd], {5: 3, 6: -4}, lambda title: [6] if odd_new and title.endswith(".mkv") else [])
+    monkeypatch.setattr(hook, "arr", arr)
+    old = {"path": f"/lib/{name}.m4v", **({} if listed is None else {"customFormats": [{"id": i} for i in listed]})}
+    why = hook.score_refuses(app, 7, old, f"/lib/{name}.mkv")
+    assert why == (refused and f"the new name changes custom formats that score: {refused}, the name '{name}.m4v' becomes '{name}.mkv'"), why
+
+
+def test_a_listed_format_the_old_title_model_misses_still_refuses(monkeypatch):
+    """Sonarr's import history has no row for the file, so the hook takes the file name as the old title. The app scores
+    the record on its OriginalFilePath, which the API leaves out. The record lists "GRP tier", so its Release Title
+    regex matches the real old title. The relink drops OriginalFilePath, so the new title is the new file name. Found
+    by the 2.14.0 review."""
+    fmt = custom_format(9, "GRP tier", ("ReleaseTitleSpecification", r"-GRP\b", False))
+
+    def arr(a, p):
+        if p.startswith("history/series"): return []
+        if p == "series/7": return {"qualityProfileId": 4}
+        if p == "qualityprofile/4": return {"formatItems": [{"format": 9, "score": 50}]}
+        if p == "customformat": return [fmt]
+        if p.startswith("parse?"): return {"customFormats": [{"id": 9, "name": "GRP tier"}] if "-GRP" in parse_qs(p.split("?", 1)[1])["title"][0] else []}
+        raise AssertionError(p)
+    monkeypatch.setattr(hook, "arr", arr)
+    old = {"id": 12, "path": "/tv/Show/Season 01/Show - S01E01 [x265].m4v", "customFormats": [{"id": 9, "name": "GRP tier"}]}
+    why = hook.score_refuses("sonarr", 7, old, "/tv/Show/Season 01/Show - S01E01 [x265].mkv")
+    assert why and "lost GRP tier (+50)" in why, why
+
+
+@pytest.mark.parametrize("value, name, got", [(r"x{,2}5", "xx5", "?"), (r"[a-z-[aeiou]]", "b", "?"), (r"-[a-z0-9]+$", "Film-grp", True),
+                                              (r"(?<=^|[\s.-])GRP\b", "Film GRP", "?"), (r"\bGRP\b", "Film", False)])
+def test_title_match_doubts_a_regex_dotnet_reads_another_way(value, name, got):
+    """.NET reads x{,2} as text and [a-z-[aeiou]] as a set less the vowels, where Python reads x{0,2} and a set and a
+    "]". Python cannot compile a lookbehind of varying width. Each gives "?". A plain set after a dash is no doubt."""
+    assert hook.title_match(custom_format(1, "A", ("ReleaseTitleSpecification", value, False)), (name, "")) == got
+
+
+def test_the_convert_list_keeps_the_whole_reason(env):
+    """A reason over 300 characters, such as a long list of lost formats, goes whole into convert-<app>.txt."""
+    why = "the new name changes custom formats that score: lost " + ", ".join(f"Format {n} (+1)" for n in range(40))
+    hook.convert_list("radarr", {"outcome": "repack_score_refused", "result": why, "label": "Film A (1979)", "path": "/m/a.mp4"})
+    (line,) = open(os.path.join(hook.CFG.state_dir, "convert-radarr.txt")).read().splitlines()
+    assert line.split("\t")[1:] == ["repack_score_refused", "Film A (1979)", why, "/m/a.mp4"] and len(why) > 300
 
 
 @pytest.mark.parametrize("full, ok", [(("a56934", 56934), True), (("a56933", 56933), False)])
@@ -19377,6 +19572,17 @@ def test_check_conversion_that_cannot_keep_the_original_stops_before_the_remux(e
     assert checked(env)[-1]["path"] == loose[:-4] + ".mkv" and len(env["repacks"]) == 1
 
 
+def test_every_conversion_skip_has_plain_words():
+    """The nightly audit names a failed or skipped conversion by its outcome code. Every repack_ code in the code has
+    its own words, so a new code without them fails here."""
+    codes = {n.value for f in glob.glob(os.path.join(FILES, "arr_media_guard", "*.py")) for n in ast.walk(ast.parse(open(f).read()))
+             if isinstance(n, ast.Constant) and isinstance(n.value, str) and re.fullmatch(r"repack_[a-z_]+", n.value)}
+    assert {"repack_failed", "repack_too_big", "repack_score_refused"} <= codes, codes
+    plain = {c: hook.audit_problem("convert", {"outcome": c}) for c in sorted(codes)}
+    assert [c for c, t in plain.items() if t == "the conversion to MKV was skipped"] == [], plain
+    assert len(set(plain.values())) == len(plain), plain
+
+
 def test_check_apply_stops_when_a_lookup_fails_and_a_path_is_left(env, monkeypatch, tmp_path, capsys):
     loose = scratch_copy(env, tmp_path)
     def fake_arr(app, p):
@@ -19926,3 +20132,531 @@ def test_check_prints_the_whole_result_and_the_checks_of_a_file_that_is_not_mkv(
     hook.main(["--check", mp4])
     out = capsys.readouterr().out
     assert out.startswith("Film A (1979): skipped, not mkv\n  checked: audio clean, video clean, wrong content: "), out
+
+
+# --- the whole-file check --------------------------------------------------------------------------
+
+def unknown_stream_ts(src, dst, kind=0x99):
+    """A copy of the MPEG-TS src whose stream of type 0x06 becomes type kind, which ffmpeg does not know. Its PMT CRC
+    is computed again."""
+    def crc(b):
+        c = 0xFFFFFFFF
+        for x in b:
+            c ^= x << 24
+            for _ in range(8):
+                c = ((c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if c & 0x80000000 else (c << 1) & 0xFFFFFFFF
+        return c
+    data = bytearray(open(src, "rb").read())
+    for i in range(0, len(data), 188):
+        if ((data[i + 1] & 0x1F) << 8 | data[i + 2]) == 0x1000 and data[i + 1] & 0x40:   # the PMT of ffmpeg's muxer
+            p = i + 5 + data[i + 4]
+            end = p + 3 + ((data[p + 1] & 0x0F) << 8 | data[p + 2]) - 4
+            q = p + 12 + ((data[p + 10] & 0x0F) << 8 | data[p + 11])
+            while q < end:
+                data[q] = kind if data[q] == 0x06 else data[q]
+                q += 5 + ((data[q + 3] & 0x0F) << 8 | data[q + 4])
+            data[end:end + 4] = crc(data[p:end]).to_bytes(4, "big")
+    open(dst, "wb").write(data)
+
+
+@pytest.fixture(scope="module")
+def whole_media(tmp_path_factory):
+    """Made-up media for the whole-file check: a 20-second MKV, its streams in MP4 and in AVI, and copies of the MKV.
+    One has 300 KiB of zeros at 20, 50 and 80 percent, as torrent pieces that never came leave. One has the zeros at
+    50 percent alone. One has random bytes at the three places. The PCM files hold 12 seconds of digital silence in
+    5.1 and 7.1 at 24 bits, which mkvmerge puts in blocks of over 256 KiB, and a MOV of 7.1 with one block a second.
+    One copy of the 5.1 file has two real gaps of 1 MiB. Two TS files hold a stream of a type ffmpeg does not know. An
+    AVI with PCM audio has two gaps. An MP4 and a MOV hold silence in PCM that mkvmerge names ipcm and fl32."""
+    d = tmp_path_factory.mktemp("whole")
+    clean = d / "clean.mkv"
+    REAL_RUN(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=20", "-f", "lavfi", "-i",
+              "sine=frequency=440:duration=20", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "4M", "-c:a", "aac", "-shortest", str(clean)],
+             check=True)
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c", "copy", str(d / "clean.mp4")], check=True)
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "ac3", str(d / "clean.avi")], check=True)
+    size = os.path.getsize(clean)
+    for name, shares, fill in (("zeros3", (0.2, 0.5, 0.8), bytes), ("zeros1", (0.5,), bytes), ("garbage3", (0.2, 0.5, 0.8), noise)):
+        shutil.copy(clean, d / f"{name}.mkv")
+        with open(d / f"{name}.mkv", "r+b") as f:
+            for share in shares:
+                f.seek(int(size * share)); f.write(fill(300 << 10))
+    video = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=12"]
+    REAL_RUN(video + ["-c:v", "libx264", "-preset", "ultrafast", str(d / "v.mp4")], check=True)
+    for layout in ("5.1", "7.1"):
+        REAL_RUN(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"anullsrc=r=48000:cl={layout}:d=12", "-c:a", "pcm_s24le", str(d / f"{layout}.wav")],
+                 check=True)
+        REAL_RUN(["mkvmerge", "-q", "-o", str(d / f"silence{layout}.mkv"), str(d / "v.mp4"), str(d / f"{layout}.wav")], check=True)
+    REAL_RUN(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset", "ultrafast",
+                      "-c:a", "pcm_s24le", "-shortest", str(d / "silence7.1.mov")], check=True)
+    shutil.copy(d / "silence5.1.mkv", d / "gaps5.1.mkv")
+    with open(d / "gaps5.1.mkv", "r+b") as f:
+        for share in (0.3, 0.7):
+            f.seek(int(os.path.getsize(d / "gaps5.1.mkv") * share)); f.write(bytes(1 << 20))
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-f", "data", "-i", str(d / "v.mp4"), "-map", "0", "-map", "1", "-c", "copy", "-t", "4",
+              "-f", "mpegts", str(d / "data.ts")], check=True)
+    unknown_stream_ts(d / "data.ts", d / "unknown.ts")
+    unknown_stream_ts(d / "data.ts", d / "unknownc5.ts", 0xC5)   # the type the reviewer's TS had
+    for out, codec in (("ipcm7.1.mp4", "pcm_s24le"), ("fl32_7.1.mov", "pcm_f32le")):   # mkvmerge names these by fourcc
+        REAL_RUN(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset",
+                          "ultrafast", "-c:a", codec, "-shortest", str(d / out)], check=True)
+    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "pcm_s16le", str(d / "gaps_pcm.avi")], check=True)
+    with open(d / "gaps_pcm.avi", "r+b") as f:   # outside Matroska and MP4 every run counts, PCM or not
+        for share in (0.3, 0.7):
+            f.seek(int(os.path.getsize(d / "gaps_pcm.avi") * share)); f.write(bytes(300 << 10))
+    return d
+
+
+@pytest.mark.parametrize("name, certain, zero", [
+    ("clean.mkv", None, []), ("clean.mp4", None, []), ("clean.avi", None, []), ("garbage3.mkv", None, []), ("unknown.ts", None, []),
+    ("unknownc5.ts", None, []), ("gaps_pcm.avi", "the file has blank gaps at 2 places, so the download is incomplete", []),
+    ("zeros3.mkv", "the file has blank gaps at 3 places, so the download is incomplete", []),
+    ("zeros1.mkv", None, ["the file has a blank gap at 50% of its length"]),
+    ("silence5.1.mkv", None, []), ("silence7.1.mkv", None, []), ("silence7.1.mov", None, []),
+    ("gaps5.1.mkv", "the file has blank gaps at 2 places, so the download is incomplete", [])])
+def test_the_whole_file_check_on_made_up_media(whole_media, tmp_path, settings, name, certain, zero):
+    """A healthy file prints nothing in the read pass, also with a stream of a type ffmpeg does not know. Zeros at 2 or
+    more places are certain, and the read pass stops then. One zero run is a doubt, and the read pass's error at that
+    run adds no doubt of its own. Random bytes leave no zeros, and only the read pass finds them. Reviewer 2026-10-15:
+    digital silence in PCM audio is zero runs of valid payload. In a file with PCM audio a run counts only where the
+    read pass breaks, as at the two real gaps, and the read pass runs to its end."""
+    settings(state_dir=str(tmp_path))
+    path = whole_media / name
+    got, zeros, more, f = hook.whole_check(str(path))
+    assert (got, zeros) == (certain, zero) and f["fault"] == (certain and "zero-filled"), (got, f)
+    assert f["zeros"]["read"] >= os.path.getsize(path) - (64 << 10) and f["size"] == os.path.getsize(path)   # every byte of the span
+    assert f["pcm"] == name.startswith(("silence", "gaps5"))   # an AVI with PCM audio is outside the rule
+    if name.startswith(("silence", "gaps5")):
+        runs, count = f["zeros"]["runs"], f["zeros"]["count"]
+        assert len(runs) >= 2 and len(count) == (2 if certain else 0) and f["ffmpeg"]["ran"] and more == [], f
+    elif certain:
+        at = [0.3066, 0.7052] if name.endswith(".avi") else [0.2059, 0.5018, 0.8041]
+        assert f["ffmpeg"] == {"skipped": "the zero scan was certain"} and [a for a, _ in f["zeros"]["at"]] == at and more == []
+    elif name.startswith(("clean", "unknown")):   # an unknown stream type stops ffmpeg with no -ignore_unknown
+        assert (f["ffmpeg"]["ran"], f["ffmpeg"]["lines"], f["ffmpeg"]["code"], more) == (True, 0, 0, [])
+    elif name == "zeros1.mkv":   # its demuxer error names a byte inside the run
+        assert f["ffmpeg"]["lines"] >= 1 and f["ffmpeg"]["loose"] == 0 and more == []
+    else:
+        assert f["ffmpeg"]["lines"] >= 1 and len(more) == 1 and more[0].startswith("a full read of the file found damaged data at 20%"), more
+
+
+def test_the_read_pass_reads_only_ffmpegs_error_lines():
+    D, size = hook.arr_decide, 1000
+    line = "[matroska,webm @ 0x61c9] 0x00 at pos 500 (0x1f4) invalid as first byte of an EBML number"
+    dts = "[null @ 0x5fdf] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 563000 >= 563000"
+    assert D.parse_copy("", 0, size) == {"ran": True, "lines": 0, "pos": [], "at": [], "loose": 0, "noise": 0, "first": []}
+    assert D.parse_copy(f"{line}\n    Last message repeated 3 times\n{dts}\n", 0, size) == {
+        "ran": True, "lines": 1, "pos": [500], "at": [0.5], "loose": 0, "noise": 2, "first": [line]}
+    got = {"kept": [], "lines": 0, "noise": 0}   # a remux may log a NOISE line per packet before the one real error
+    hook.copy_lines(io.StringIO(f"{dts}\n" * 20000 + f"\n{line}\n"), got)
+    assert got == {"kept": [line], "lines": 1, "noise": 20000}
+    opened = "[in#0 @ 0x5d41] Error opening input: Invalid data found when processing input\nError opening input file x.mkv.\n"
+    output = "[out#0/null @ 0x60ce] Cannot map stream #0:2 - unsupported type.\nError opening output file -.\n"
+    nested = "[matroska,webm @ 0x5c2] Element at 0x1f4 ending at 0xe6cb0ee exceeds containing master element ending at 0x266057"
+    assert D.parse_copy(nested, 0, size)["at"] == [0.5]
+    assert D.parse_copy(opened, 183, size)["ran"] is False and D.parse_copy(output, 234, size)["ran"] is False
+    assert D.parse_copy("[mov,mp4 @ 0x1] stream 1, offset 0x20: partial file\n", 0, size)["loose"] == 1
+    read = lambda at, loose=0: {"ran": True, "lines": len(at) + loose, "pos": [round(a * size) for a in at], "at": at, "loose": loose}
+    assert D.whole_verdict([], size, read([0.13, 0.61, 0.83]))[2] == ["a full read of the file found damaged data at 13%, 61% and 83% of its length"]
+    assert D.whole_verdict([], size, read([0.002, 0.61]))[2] == ["a full read of the file found damaged data at the start of the file and at 61% of its length"]
+    assert D.whole_verdict([], size, read([i / 10 for i in range(1, 9)]))[2] == [
+        "a full read of the file found damaged data at 10%, 20%, 30%, 40%, 50% and 3 more places of its length"]
+    assert D.whole_verdict([[600, 620]], size, read([0.605], loose=2))[:3] == (None, ["the file has a blank gap at 60% of its length"],
+                                                                               ["a full read of the file found 2 errors"])
+    assert D.whole_verdict([[600, 620]], size, read([0.61]))[2] == [] and D.whole_verdict([], size, dict(read([0.5]), ran=False))[2] == []
+    assert D.whole_verdict([[100, 120], [600, 620]], size, None)[0] == "the file has blank gaps at 2 places, so the download is incomplete"
+    assert D.whole_verdict([[1, 120]], size, None)[1] == ["the file has a blank gap at the start of the file"]
+    # With PCM audio a run counts only where the read pass names a byte within a grid block of it
+    big, runs = 10 << 20, [[1 << 20, 2 << 20], [5 << 20, 6 << 20], [8 << 20, 9 << 20]]
+    on = lambda *b: {"ran": True, "lines": len(b), "pos": list(b), "at": [x / big for x in b], "loose": 0}
+    assert D.whole_verdict(runs, big, on(), pcm=True) == (None, [], [], [])
+    assert D.whole_verdict(runs, big, None, pcm=True)[:2] == (None, [])   # a read pass that did not finish confirms nothing
+    assert D.whole_verdict(runs, big, on((5 << 20) - 1000), pcm=True)[1:] == ([f"the file has a blank gap at 50% of its length"], [], runs[1:2])
+    assert D.whole_verdict(runs, big, on((1 << 20) + 5, (9 << 20) + (64 << 10)), pcm=True)[3] == [runs[0], runs[2]]
+    assert D.whole_verdict(runs, big, on((9 << 20) + (64 << 10) + 1), pcm=True)[3] == []
+    assert D.whole_verdict(runs, big, on(), pcm=False)[3] == runs
+    # Reviewer 2026-10-15: a byte of one real gap confirms only its nearest run, never a silent run a block away
+    pair = [[1 << 20, 2 << 20], [(2 << 20) + (10 << 10), 3 << 20]]
+    assert D.whole_verdict(pair, big, on((2 << 20) + (4 << 10)), pcm=True)[3] == pair[:1]
+    assert D.whole_verdict(pair, big, on((2 << 20) + (4 << 10), (2 << 20) + (500 << 10)), pcm=True)[3] == pair
+
+
+def test_the_zero_scan_counts_each_long_run_once_across_its_reads(tmp_path, monkeypatch):
+    """A run of 300 KiB across the edge of two reads and one of 1 MiB count, each once. Encoder padding of 40 KiB and a
+    run 1 KiB short of ZERO_RUN do not. The second check measures the runs again with a few reads. One the file no
+    longer holds drops out."""
+    monkeypatch.setattr(hook, "WHOLE_CHUNK", 1 << 20)
+    K, data = 1 << 10, bytearray(noise(6 << 20))
+    for at, n in ((1024 - 100) * K, 300 * K), ((3 << 20) + 4 * K, 1 << 20), (5 << 20, 40 * K), ((5 << 20) + 200 * K, 255 * K):
+        data[at:at + n] = bytes(n)
+    f = tmp_path / "v.bin"
+    f.write_bytes(data)
+    runs, read = hook.zero_scan(str(f))
+    assert runs == [[960 * K, 1216 * K], [(3 << 20) + 64 * K, 4 << 20]] and read - (6 << 20) in range(1, 3 * 2 * hook.arr_decide.ZERO_RUN), (runs, read)
+    again, read = hook.zero_again(str(f), runs)
+    assert again == runs and read <= 2 * 2 * hook.arr_decide.ZERO_RUN
+    with open(f, "r+b") as g:
+        g.seek(runs[1][0]); g.write(noise(64 * K))
+    assert hook.zero_again(str(f), runs)[0] == runs[:1] and hook.zero_again(str(tmp_path / "gone"), runs) == ([], 0)
+
+
+def test_a_short_read_never_splits_a_run(tmp_path, monkeypatch):
+    """Reviewer 2026-10-15: one short read inside a gap moved the scan's grid, so the gap counted as two runs, which
+    read as certain. The scan reads on until the chunk is full."""
+    monkeypatch.setattr(hook, "WHOLE_CHUNK", 1 << 20)
+    data = bytearray(noise(6 << 20))
+    data[(1 << 20) + 4096:(4 << 20) + 4096] = bytes(3 << 20)
+    f = tmp_path / "v.bin"
+    f.write_bytes(data)
+    real, short = open, [True]
+
+    class Short:   # the first read at 2 MiB returns 12 KiB short, as a read of a network file system may
+        def __init__(self, g):
+            self.g = g
+
+        def read(self, n=-1):
+            if short and self.g.tell() == 2 << 20:
+                short.clear()
+                return self.g.read(n - 12288)
+            return self.g.read(n)
+
+        def __getattr__(self, k):
+            return getattr(self.g, k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.g.close()
+    monkeypatch.setattr(sys.modules[hook.zero_scan.__module__], "open", lambda *a, **k: Short(real(*a, **k)), raising=False)
+    runs, read = hook.zero_scan(str(f))
+    assert not short and runs == [[(1 << 20) + (64 << 10), 4 << 20]], runs
+
+
+@pytest.mark.parametrize("when", ["scan", "read pass", "over time"])
+def test_the_whole_file_check_stops_with_no_ffmpeg_left(whole_media, tmp_path, monkeypatch, settings, when):
+    """An import that waits stops the zero scan or the read pass, which raise as the deep analysis does. A read pass
+    over its time gives no verdict of its own, and the zero run still counts. No ffmpeg outlives the check."""
+    settings(state_dir=str(tmp_path))
+    procs, real = [], hook.subprocess.Popen
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda *a, **k: procs.append(real(*a, **k)) or procs[-1])
+    monkeypatch.setattr(hook, "WHOLE_ASK", 0)   # the scan asks before each read, two reads here
+    monkeypatch.setattr(hook, "WINDOW_POLL", 0.01)
+    asked = []
+
+    def stop():
+        asked.append(1)
+        if (when, len(asked)) in (("scan", 1), ("read pass", 3)):
+            raise hook.Yielded("an import waits")
+    if when == "over time":
+        monkeypatch.setattr(hook, "WHOLE_MIN", 0)
+        monkeypatch.setattr(hook, "WHOLE_RATE", 1e15)
+        certain, zero, more, f = hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
+        assert (certain, zero, more, f["ffmpeg"]["skipped"]) == (None, ["the file has a blank gap at 50% of its length"], [], "ran over 0 s"), f
+    else:
+        with pytest.raises(hook.Yielded):
+            hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
+        assert len(asked) == (1 if when == "scan" else 3)
+    (ff,) = [p for p in procs if "ffmpeg" in p.args]   # beside the ffprobe of pcm_audio()
+    assert all(p.poll() is not None for p in procs) and ff.args[:5] == ["ionice", "-c3", "nice", "-n", "19"] and "-ignore_unknown" in ff.args
+
+
+def test_the_whole_file_check_reads_the_original_an_import_remux_kept(env, tmp_path, settings):
+    """A remux reads past damage and leaves the zeros out. So the check reads the original that the first remux of the
+    import kept. A conversion that kept none leaves only the remux, and the line says so. An import whose own video
+    check was certain queues none."""
+    plan, video = REAL_WHOLE_PLAN, {"zeros": {"hits": [0.4]}}
+    kept = str(tmp_path / "kept.mkv")
+    assert plan({"path": env["path"], "video": video}) == {"path": env["path"], "gap": 0.4}
+    assert plan({"path": env["path"], "video": {"certain": "the file has blank gaps"}}) is None
+    assert plan({"path": env["path"], "header_repair": {"code": "header_repaired", "kept": kept}, "subremux": {"done": True, "kept": "x"}}) == \
+        {"path": env["path"], "remux": "header repair", "original": kept}
+    assert plan({"path": env["path"], "reasons": ["repacked"], "repack": {}, "header_repair": {"code": "header_repaired", "kept": kept}}) == \
+        {"path": env["path"], "remux": "conversion"}
+    assert plan({"path": env["path"], "subremux": {"done": True, "kept": kept}})["original"] == kept
+    for code in ("regrabbed", "restored", "searched", "deleted"):   # the file the import re-grabbed is gone, or an old one is back
+        assert plan({"path": env["path"], "findings": [{"kind": "audio", "action": {"code": code}}]}) is None
+    assert plan({"path": env["path"], "findings": [{"kind": "audio", "action": {"code": "capped"}}]}) == {"path": env["path"]}
+    assert plan({"path": env["path"] + ".gone"}) is None
+    data = bytearray(noise(4 << 20))
+    for at in (1 << 20, 3 << 20):
+        data[at:at + (300 << 10)] = bytes(300 << 10)
+    open(kept, "wb").write(data)
+    job = dict(plan({"path": env["path"], "header_repair": {"code": "header_repaired", "kept": kept}}), app="radarr", grab={"check": "listed"})
+    rec = hook.whole_act(None, job, {"app": "radarr", "path": env["path"], "label": "Film A"}, [], post=False)
+    assert (rec["outcome"], rec["regrab"], rec["whole"]["file"], rec["whole"]["remux"]) == ("corrupt_video", "check", kept, "header repair"), rec
+    assert rec["whole"]["again"]["read"] <= 2 * 2 * hook.arr_decide.ZERO_RUN and env["writes"] == []   # --check: no lock, no re-grab
+    os.remove(kept)
+    rec = hook.whole_act(None, job, {"app": "radarr", "path": env["path"], "label": "Film A"}, [], post=False)
+    assert (rec["outcome"], rec["whole"]["file"], rec["whole"]["original_gone"]) == ("video_checked", env["path"], kept), rec
+    assert rec["note"] == "the read pass could not open the file, so only the zero scan judged it"
+
+
+def whole_import(env, monkeypatch, gaps, probe=(), src=None):
+    """An import of 8 MiB of random bytes with 300 KiB of zeros at each share of gaps, or of a copy of src. The import's
+    zero probe finds only probe, the way 256 reads miss most of a large file. probe None runs the real one. Its
+    whole-file check job runs after it."""
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    if probe is not None:
+        monkeypatch.setattr(hook, "zero_probe", lambda path, again=False, stop=None: (list(probe), 256 << 16, False))
+    data = bytearray(open(src, "rb").read() if src else noise(8 << 20))
+    for share in gaps:
+        data[int(len(data) * share):int(len(data) * share) + (300 << 10)] = bytes(300 << 10)
+    open(env["path"], "wb").write(data)
+    grabbed(env, monkeypatch)
+    hook.main([])
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [r["source"] for r in lines] == ["hook", "whole_file"] and lines[1]["from"] == lines[0]["job"], lines
+    return lines[1]
+
+
+def test_the_whole_file_check_regrabs_what_the_imports_check_missed(env, monkeypatch):
+    """Owner 2026-10-15: "if regrab is on then it should regrab". The second check measures the two runs again and
+    never reads the whole file twice. The re-grab is fixed, so it posts nothing."""
+    rec = whole_import(env, monkeypatch, (0.3, 0.7))
+    assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+                             ("POST", "history/failed/2101", None)]
+    assert (rec["outcome"], rec["regrab"], rec["whole"]["fault"], rec["alert_result"]) == ("corrupt_video", "regrabbed", "zero-filled", ["log only"])
+    assert rec["findings"][0]["certain"] == "the file has blank gaps at 2 places, so the download is incomplete" and posted(env) == []
+    assert rec["whole"]["again"]["read"] <= 2 * 2 * hook.arr_decide.ZERO_RUN and rec["whole"]["ffmpeg"] == {"skipped": "the zero scan was certain"}
+    assert hook.deep_analysis_queued() == []
+
+
+def test_the_whole_file_check_alerts_when_regrab_leaves_video_out(env, monkeypatch, settings):
+    """The import's own alert of a blank gap at 10% does not stop the alert of the whole-file check."""
+    settings(regrab=frozenset({"audio"}))
+    rec = whole_import(env, monkeypatch, (0.3, 0.7), probe=(0.1,))
+    assert env["writes"] == [] and rec["regrab"] == "would_regrab" and rec["alert_result"] == ["sent"]
+    assert [t for t, _ in posted(env)] == ["Video may be broken", "Broken video, re-grab is off"], posted(env)
+
+
+@pytest.mark.parametrize("probe", [(), (0.5,)])
+def test_one_blank_gap_only_alerts_once(env, monkeypatch, probe):
+    """One gap is a doubt, which never re-grabs. When the import's probe found it, the import's alert named it, so the
+    whole-file check logs it only."""
+    rec = whole_import(env, monkeypatch, (0.5,), probe)
+    assert env["writes"] == [] and rec["outcome"] == "video_doubt" and rec["whole"]["doubts"] == ["the file has a blank gap at 50% of its length"]
+    assert posted(env) == [("Video may be broken", "The file has a blank gap at 50% of its length.")], posted(env)
+    assert ("findings" in rec) == (not probe) and rec["result"].endswith(", logged only, the import's alert named it") == bool(probe)
+
+
+def test_the_whole_file_check_goes_before_the_deep_analyses_of_its_group(env, monkeypatch, settings):
+    settings(subtitles="deep")
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    deep = queue_analysis(env, env["path"], age=300)
+    rec = {"path": env["path"], "ids": {"app_id": "7", "file_id": "11"}, "job": "1-1.json"}
+    whole = hook.queue_whole({"app": "radarr", "owner": "7", "file_id": "11", "download_id": "a1b2c3d4"}, rec, INPUTS)
+    burn = queue_burn(env)
+    assert whole == hook.whole_name(env["path"]) and hook.deep_analysis_queued() == [burn, whole, deep]
+    job = hook.job_of(whole)
+    assert set(job["grab"]) == set(hook.GRAB_KEYS) and job["from"] == "1-1.json" and job["key"] == list(hook.file_key(os.stat(env["path"])))
+
+
+def test_check_runs_the_whole_file_check_and_never_regrabs(env, monkeypatch, capsys):
+    check_listed(env, monkeypatch)
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    monkeypatch.setattr(hook, "zero_probe", lambda path, again=False, stop=None: ([], 256 << 16, False))
+    data = bytearray(noise(8 << 20))
+    for at in (2 << 20, 6 << 20):
+        data[at:at + (300 << 10)] = bytes(300 << 10)
+    open(env["path"], "wb").write(data)
+    hook.main(["--check", env["path"]])
+    lines = checked(env)
+    assert [r.get("whole", {}).get("fault") for r in lines] == [None, "zero-filled"] and lines[1]["regrab"] == "check" and env["writes"] == []
+    assert "\nwhole-file check, Film A (1979): " in capsys.readouterr().out
+
+
+def test_an_import_that_regrabbed_its_file_queues_no_whole_file_check(env, monkeypatch):
+    """Reviewer 2026-10-15: the re-grab deleted the file, and the queue logged a warning that the check did not queue."""
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    env["ffmpeg_out"] = [SILENCE]
+    grabbed(env, monkeypatch)
+    hook.main([])
+    (rec,) = log_lines(env)
+    assert rec["outcome"] == "broken_audio" and hook.deep_analysis_queued() == []
+
+
+def pcm_track(env):
+    """The env film's English audio track becomes 24-bit PCM, as mkvmerge lists it, and ffprobe names it so."""
+    env["probe"]["tracks"][2]["properties"]["codec_id"] = "A_PCM/INT/LIT"
+    env["codecs"] = "pcm_s24le"
+
+
+@pytest.mark.parametrize("name, writes", [("silence5.1.mkv", False), ("silence7.1.mkv", False), ("silence7.1.mov", False), ("gaps5.1.mkv", True)])
+def test_silent_pcm_audio_never_regrabs_and_real_gaps_in_it_do(env, monkeypatch, whole_media, name, writes):
+    """Reviewer 2026-10-15: the zero runs of digital silence in PCM audio re-grabbed a healthy file. Owner 2026-10-15:
+    in a file with PCM audio the import's zero probe hits only log, and the windows still run. The whole-file check
+    judges the zeros. Silence only logs there too. Two real gaps in the same file still re-grab, because its read pass
+    breaks at each."""
+    pcm_track(env)
+    rec = whole_import(env, monkeypatch, (), probe=None, src=whole_media / name)
+    first = decided(env)["video"]
+    assert (first["certain"], first["zeros"]["pcm"], len(first["windows"]["list"])) == (None, True, 3) and len(first["zeros"]["hits"]) >= 2, first
+    assert bool(env["writes"]) == writes and rec["whole"]["pcm"] is True and posted(env) == [], (rec["result"], env["writes"])
+    if writes:
+        assert (rec["outcome"], rec["regrab"], len(rec["whole"]["again"]["runs"])) == ("corrupt_video", "regrabbed", 2)
+    else:
+        n = len(rec["whole"]["zeros"]["runs"])
+        assert rec["outcome"] == "video_checked" and n >= 2 and rec["note"] == f"{n} zero runs in a file with PCM audio, where the read pass found no error, logged only"
+
+
+def test_the_second_check_keeps_a_file_with_one_run_left(env, monkeypatch):
+    """A run that the file no longer holds at the second check leaves one, which is no certain fault."""
+    real = hook.zero_again
+
+    def again(path, runs):
+        with open(path, "r+b") as f:
+            f.seek(runs[1][0]); f.write(noise(64 << 10))
+        return real(path, runs)
+    monkeypatch.setattr(hook, "zero_again", again)
+    rec = whole_import(env, monkeypatch, (0.3, 0.7))
+    assert (rec["regrab"], len(rec["whole"]["again"]["runs"]), env["writes"]) == ("unconfirmed", 1, []), rec["whole"]["again"]
+
+
+def test_a_whole_file_check_a_backfill_job_queued_never_regrabs(env, monkeypatch):
+    """The backfill job queues the whole-file check as an import does, with check in its grab fields. So its certain
+    fault gets the second check and only says what an import would do."""
+    check_listed(env, monkeypatch)
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    monkeypatch.setattr(hook, "zero_probe", lambda path, again=False, stop=None: ([], 256 << 16, False))
+    data = bytearray(noise(8 << 20))
+    for at in (2 << 20, 6 << 20):
+        data[at:at + (300 << 10)] = bytes(300 << 10)
+    open(env["path"], "wb").write(data)
+    hook.background(backfill_job(env, monkeypatch), [])
+    whole = hook.whole_name(env["path"])
+    assert hook.deep_analysis_queued() == [whole] and hook.job_of(whole)["grab"]["check"] == "listed"
+    hook.background(whole, [])
+    rec = [r for r in log_lines(env) if r.get("source") == "whole_file"][-1]
+    assert rec["findings"][0]["action"] == {"code": "check", "kind": "video"} and env["writes"] == [], rec
+
+
+@pytest.mark.parametrize("when", ["scan", "lock"])
+def test_a_file_replaced_or_changed_since_its_scan_gets_no_verdict(env, monkeypatch, when):
+    """A file that changed during the scan gives no verdict, so a doubt of the old file never posts against the new
+    one. One the app replaced while the job waited for the lock is dropped before the re-grab."""
+    def replace():
+        os.replace(env["path"], env["path"] + ".old")
+        shutil.copy(env["path"] + ".old", env["path"])
+    if when == "scan":
+        real = hook.whole_check
+        monkeypatch.setattr(hook, "whole_check", lambda path, stop: (real(path, stop), replace())[0])
+    else:
+        real_lock = hook.locked
+        monkeypatch.setattr(hook, "locked", lambda *a, **k: (replace(), real_lock(*a, **k))[1])
+    rec = whole_import(env, monkeypatch, (0.3, 0.7))
+    want = {"scan": ("file_changed", "dropped, the file changed during the whole-file check"), "lock": ("file_replaced", None)}[when]
+    assert (rec["outcome"], rec["result"] if when == "scan" else None) == want and env["writes"] == [] and posted(env) == [], rec
+
+
+@pytest.mark.parametrize("pcm, container", [(False, None), (True, None), (False, "AVI")])
+def test_the_imports_zero_probe_is_certain_only_in_a_file_with_no_pcm_audio(env, monkeypatch, settings, pcm, container):
+    """Owner 2026-10-15: with no PCM audio, zero runs at 2 or more places the probe reads are certain at import, as
+    before, and they re-grab there. With PCM audio they only log, the windows run, and the whole-file check follows.
+    Reviewer 2026-10-15: the rule holds in Matroska, MP4 and MOV only. An AVI with PCM audio that the import does not
+    convert is certain as before."""
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    path = env["path"]
+    if pcm or container:
+        pcm_track(env)
+    if container:
+        path = env["path"][:-4] + ".avi"
+        env["probe"]["container"]["type"], env["format"] = container, "avi"   # the second check asks ffprobe, see video_inputs()
+        monkeypatch.setenv("radarr_moviefile_path", path)
+        settings(convert=False)
+    data = bytearray(noise(8 << 20))
+    for at in (2 << 20, 6 << 20):
+        data[at:at + (300 << 10)] = bytes(300 << 10)
+    open(path, "wb").write(data)
+    grabbed(env, monkeypatch)
+    hook.main([])
+    lines = [r for r in log_lines(env) if "schema" in r]
+    v = lines[0]["video"]
+    assert len(v["zeros"]["hits"]) >= 2 and v["zeros"].get("pcm", False) == pcm and ("windows" in v) == pcm, v
+    if pcm:   # the whole-file check finds the two runs, but the read pass cannot open random bytes, so none counts
+        assert [r["source"] for r in lines] == ["hook", "whole_file"] and v["certain"] is None and env["writes"] == []
+    else:
+        assert [r["source"] for r in lines] == ["hook"] and v["fault"] == "zero-filled" and lines[0]["outcome"] == "corrupt_video"
+        assert ("DELETE", "moviefile/11", None) in env["writes"]
+
+
+def test_bad_windows_of_a_file_with_pcm_audio_still_regrab_at_import(env, monkeypatch, whole_media):
+    """The windows run in a PCM file whatever the zero probe found, so two bad windows are certain, and the second check
+    before the re-grab finds them again."""
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    pcm_track(env)
+    shutil.copy(whole_media / "silence5.1.mkv", env["path"])
+    env["window_out"] = [BAD_WINDOW]
+    grabbed(env, monkeypatch)
+    hook.main([])
+    (rec,) = [r for r in log_lines(env) if "schema" in r]
+    assert (rec["outcome"], rec["video"]["fault"], rec["video"]["zeros"]["pcm"]) == ("corrupt_video", "bad windows", True), rec["video"]
+    assert ("DELETE", "moviefile/11", None) in env["writes"] and len(env["windows"]) == 6   # three windows, then three for the second check
+
+
+def test_pcm_audio_comes_from_the_track_list_the_caller_has():
+    """mkvmerge names PCM by codec_id in Matroska and by codec in MP4 or AVI. A probe with no track asks ffprobe."""
+    track = lambda codec, cid=None: {"type": "audio", "codec": codec, "properties": {"codec_id": cid} if cid else {}}
+    assert hook.pcm_tracks({"tracks": [track("PCM", "A_PCM/INT/LIT")]}) is True and hook.pcm_tracks({"tracks": [track("PCM", "A_PCM/FLOAT/IEEE")]})
+    assert hook.pcm_tracks({"tracks": [track("AAC", "A_AAC"), {"type": "video", "codec": "PCM", "properties": {"codec_id": "A_PCM/INT/LIT"}}]}) is False
+    assert hook.pcm_tracks({}) is None and hook.pcm_tracks(None) is None
+    # Reviewer 2026-10-15: in MP4 and MOV mkvmerge names some PCM by fourcc, so ffprobe decides there
+    mp4 = {"container": {"type": "MP4/QuickTime"}, "tracks": [track('0x6970636d "ipcm"')]}
+    assert hook.pcm_tracks(mp4) is None and hook.pcm_tracks(dict(mp4, container={"type": "AVI"}, tracks=[track("PCM")])) is False
+
+
+def test_one_real_gap_in_a_pcm_file_alerts_from_the_whole_file_check(env, monkeypatch, whole_media, tmp_path):
+    """With PCM audio the import's probe hit only logged, so the whole-file check posts the gap its read pass confirms."""
+    pcm_track(env)
+    src = tmp_path / "gap.mkv"
+    data = bytearray(open(whole_media / "silence5.1.mkv", "rb").read())
+    data[len(data) // 2:len(data) // 2 + (1 << 20)] = bytes(1 << 20)
+    src.write_bytes(data)
+    rec = whole_import(env, monkeypatch, (), probe=(0.5,), src=src)
+    assert decided(env)["video"]["doubts"] == [] and rec["outcome"] == "video_doubt" and len(rec["whole"]["zeros"]["count"]) == 1, rec["whole"]
+    (title, text), = posted(env)   # the run takes in the silent block before the gap
+    assert title == "Video may be broken" and re.fullmatch(r"The file has a blank gap at (4[89]|50)% of its length\.", text) and env["writes"] == []
+
+
+@pytest.mark.parametrize("share", [0.265, 0.8525])
+def test_one_gap_beside_silence_counts_once(whole_media, tmp_path, settings, share):
+    """Reviewer 2026-10-15: one gap of 300 KiB beside a silent PCM run read as two runs that count, so certain. Each
+    byte the read pass names confirms only its nearest run. These two places counted two runs under the old rule."""
+    settings(state_dir=str(tmp_path))
+    data = bytearray(open(whole_media / "silence5.1.mkv", "rb").read())
+    data[int(len(data) * share):int(len(data) * share) + (300 << 10)] = bytes(300 << 10)
+    (tmp_path / "gap.mkv").write_bytes(data)
+    certain, zero, more, f = hook.whole_check(str(tmp_path / "gap.mkv"))
+    assert certain is None and len(f["zeros"]["count"]) == 1 and len(f["zeros"]["runs"]) > 1, f["zeros"]
+
+
+
+@pytest.mark.parametrize("name, codec", [("ipcm7.1.mp4", "pcm_s24le"), ("fl32_7.1.mov", "pcm_f32le")])
+def test_silent_pcm_that_mkvmerge_names_by_fourcc_is_no_fault_at_import(env, monkeypatch, settings, whole_media, name, codec):
+    """Reviewer 2026-10-15: mkvmerge names some PCM in MP4 and MOV by its fourcc, as ipcm or fl32, so the import
+    counted the zero runs of silence. ffprobe decides PCM there. The silence is not certain at import and posts no
+    video alert, and the whole-file check only logs its runs."""
+    monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
+    path = os.path.join(os.path.dirname(env["path"]), "Film A (1979)" + os.path.splitext(name)[1])
+    shutil.copy(whole_media / name, path)
+    probe = json.loads(REAL_RUN(["mkvmerge", "-J", path], capture_output=True, text=True).stdout)   # the real probe, with its fourcc
+    assert probe["container"]["type"] == "MP4/QuickTime" and next(t for t in probe["tracks"] if t["type"] == "audio")["codec"] != "PCM"
+    env["files"][path], env["codecs"], env["format"] = probe, codec, "mov,mp4,m4a,3gp,3g2,mj2"
+    monkeypatch.setenv("radarr_moviefile_path", path)
+    settings(convert=False)
+    grabbed(env, monkeypatch)
+    hook.main([])
+    lines = [r for r in log_lines(env) if "schema" in r]
+    v = lines[0]["video"]
+    assert (v["certain"], v["zeros"].get("pcm")) == (None, True) and len(v["zeros"]["hits"]) >= 2 and env["writes"] == [], v
+    assert [r["source"] for r in lines] == ["hook", "whole_file"] and lines[1]["outcome"] == "video_checked"
+    assert not [t for t, _ in posted(env) if "ideo" in t], posted(env)
+
+
+def test_probe_hits_in_a_pcm_file_still_block_a_header_repair(env, whole_media):
+    """Owner 2026-10-15: in a PCM file the zero probe's hits only log, but a header repair waits for them, as in any
+    other file."""
+    hp = dict(HEADER_HP, issue=list(HEADER_HP["issue"]), blocked=[])
+    certain, doubts, f = hook.check_video(str(whole_media / "silence5.1.mkv"), 600, hp=hp, pcm=True)
+    n = len(f["zeros"]["hits"])
+    assert (certain, doubts, n >= 2) == (None, [], True) and f["header"]["repairable"] is False, f["header"]
+    assert f["header"]["blocked"] == [f"the zero probe found blank gaps at {n} places in a file with PCM audio"]

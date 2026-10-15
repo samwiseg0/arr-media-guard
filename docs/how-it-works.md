@@ -5,15 +5,16 @@ each step, what arr-media-guard (AMG) checks and what it may change. [features.m
 and [design.md](design.md) the rules behind it. These words come up often.
 
 - *The app* is the Sonarr or Radarr that sent the file. The *item* is its movie or series.
-- A *job* is one file that waits for its check. It is an import, a burned-in subtitle check, a deep analysis or a
-  recheck.
+- A *job* is one file that waits for its check. It is an import, a burned-in subtitle check, a whole-file check, a
+  deep analysis or a recheck.
 - The *listener* is AMG's small web server in Docker. The apps post to it through a **Webhook** connection. On a host,
   each app runs AMG as a **Custom Script** instead.
 - The *worker* is the AMG process that takes the jobs and checks the files.
 - The *state store* is a small database, `STATE_DIR/state.sqlite`. It holds the background queue and AMG's other
   records.
 - The *background queue* is the line of jobs in the state store. Imports always go first. After them come the burned-in
-  subtitle checks, the deep analyses and the rechecks, one at a time and only while no import waits.
+  subtitle checks, the whole-file checks, the deep analyses and the rechecks, one at a time and only while no import
+  waits.
 - The *decision log* is the file `LOG` names. It gets a line for each file AMG checks.
 - A *remux* writes a file again with the same video and audio. AMG never re-encodes.
 - A *re-grab* deletes a broken file through the app and marks the grab as failed, so the app searches again.
@@ -40,6 +41,8 @@ flowchart TD
     log --> plex["Plex reads the changed file again"]
     log -->|"BURNED_IN on, and the quick check flagged the file or could not tell"| burn["The full burned-in subtitle check, while no import waits"]
     burn --> burnalert["Discord: one alert for a change or a doubt, everything else to the decision log"]
+    log --> whole["The whole-file check, while no import waits"]
+    whole --> wholealert["Re-grab at gaps in 2 or more places. Discord: one alert for a doubt"]
     log -->|"SUBTITLES=deep"| deep["The deep analysis, while no import waits"]
     deep --> deepalert["Discord: one alert for each subtitle problem still left, nothing for a problem it fixed"]
 ```
@@ -194,6 +197,15 @@ change or a doubt posts one alert. Everything else only goes to the decision log
 audio, a partial burn-in, too little speech to judge, and a file with no burned-in subtitles. `BURNED_IN` can turn the
 check off or make it alert only. See [features.md](features.md#burned-in-subtitles).
 
+## 9. The whole-file check
+
+Each import also puts a whole-file check in the background queue, before its deep analysis. It reads every byte of the
+file once. It looks for gaps of zero bytes, as a torrent piece that never downloaded leaves, and ffmpeg reads every
+packet beside it. Gaps at two or more places re-grab the file when `REGRAB` lists `video`, as at import. One gap, or an
+error of the full read, posts one alert. Silent PCM audio is zero bytes too, so in an MKV, MP4 or MOV file with PCM
+audio a gap counts only where the full read breaks. When the import converted or repaired the file, the check reads the original that
+AMG kept, because a remux leaves the gaps out. See [design.md](design.md#whole-file-check).
+
 ## The Test button and the start check
 
 Press Test in the app's connection, or save it, and the app sends a Test. AMG then checks that the env file reads, that
@@ -238,8 +250,8 @@ and the audit with `--post` post a summary, and `--test-discord` posts a test me
 - `--backfill <instance> --convert` converts the files that are not `.mkv`. `--sub-check` adds the subtitle check, and
   `--sub-time PATH` runs the full subtitle check of the deep analysis on single files. `--sub-check` skips a file whose
   saved result still holds, and `--recheck` checks it anyway.
-- `--check PATH` runs every check of an import on single files, with the burned-in subtitle check and the deep
-  analysis that the import queues. It says "would re-grab" where an import would re-grab.
+- `--check PATH` runs every check of an import on single files, with the burned-in subtitle check, the whole-file
+  check and the deep analysis that the import queues. It says "would re-grab" where an import would re-grab.
 - `--check-audio` and `--check-video` scan every file much as an import checks it, and only read. A scan resumes over
   days, lists what it finds in `STATE_DIR`, and posts one summary when it finds a problem.
 

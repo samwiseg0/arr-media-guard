@@ -781,7 +781,8 @@ def item_embed(rec, head, text, color, note=None, more=()):
 # The check that found the problem of an issue alert, by the source of its record. A scan and the audit post a summary
 # of their own. worker is the worker's start, which reports a conversion a stopped run left, see convert.pending_recover().
 CHECKS = {"hook": "Import check", "deep_analysis": "Deep analysis", "recheck": "Recheck", "backfill": "Command line run",
-          "check": "Command line check", "backfill_job": "Backfill check", "worker": "Worker start", "burn_in": "Burned-in subtitle check"}
+          "check": "Command line check", "backfill_job": "Backfill check", "worker": "Worker start", "burn_in": "Burned-in subtitle check",
+          "whole_file": "Whole-file check"}
 # The steps where a fix can stop, in the order a job runs them, see stopped_at()
 CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "Hearing the speech", "Finding the shift", "Testing the fix",
                                                           "Writing the file", "Replacing the file")

@@ -1126,7 +1126,8 @@ def test_every_alert_code_has_its_step():
     Stopped at field. A step is a name of FIX_STEPS, None for no fix tried, or a function of the facts."""
     assert set(h.FINDING_STEPS) == set(h.FINDINGS) and set(h.ACTION_STEPS) == set(h.ACTIONS) and set(h.LINE_STEPS) == set(h.SUB_LINES)
     assert all(v is None or v in h.FIX_STEPS or callable(v) for m in (h.FINDING_STEPS, h.ACTION_STEPS, h.LINE_STEPS) for v in m.values())
-    assert 4 <= len(h.FIX_STEPS) <= 7 and set(h.CHECKS) == {"hook", "deep_analysis", "recheck", "backfill", "check", "backfill_job", "worker", "burn_in"}
+    assert 4 <= len(h.FIX_STEPS) <= 7 and set(h.CHECKS) == {"hook", "deep_analysis", "recheck", "backfill", "check", "backfill_job", "worker", "burn_in",
+                                                          "whole_file"}
 
 
 def test_each_alert_names_the_step_where_its_fix_stopped():
