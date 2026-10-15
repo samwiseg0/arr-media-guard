@@ -20206,37 +20206,51 @@ def whole_media(tmp_path_factory):
     return d
 
 
-@pytest.mark.parametrize("name, certain, zero", [
-    ("clean.mkv", None, []), ("clean.mp4", None, []), ("clean.avi", None, []), ("garbage3.mkv", None, []), ("unknown.ts", None, []),
-    ("unknownc5.ts", None, []), ("gaps_pcm.avi", "the file has blank gaps at 2 places, so the download is incomplete", []),
-    ("zeros3.mkv", "the file has blank gaps at 3 places, so the download is incomplete", []),
-    ("zeros1.mkv", None, ["the file has a blank gap at 50% of its length"]),
-    ("silence5.1.mkv", None, []), ("silence7.1.mkv", None, []), ("silence7.1.mov", None, []),
-    ("gaps5.1.mkv", "the file has blank gaps at 2 places, so the download is incomplete", [])])
-def test_the_whole_file_check_on_made_up_media(whole_media, tmp_path, settings, name, certain, zero):
+def gap_found(f, planted):
+    """Whether the zero runs of the whole-file check's fields f start where planted shares put the gaps. A run starts at
+    the first whole 64 KiB block of its gap, so within one block after the planted byte. Each made-up file is over
+    6 MiB, so a block is under 1 percent of it. ffmpeg builds differ in the bytes they write, so the shares do too."""
+    starts = [a for a, _ in f["zeros"]["at"]]
+    return len(starts) == len(planted) and all(p - 1e-4 <= a < p + 0.01 for a, p in zip(starts, planted))
+
+
+def gap_words(p):
+    """The doubt of one gap planted at share p: its run starts in the same percent, or in the next one."""
+    return rf"the file has a blank gap at ({round(p * 100)}|{round(p * 100) + 1})% of its length"
+
+
+@pytest.mark.parametrize("name, certain, planted", [
+    ("clean.mkv", None, ()), ("clean.mp4", None, ()), ("clean.avi", None, ()), ("garbage3.mkv", None, ()), ("unknown.ts", None, ()),
+    ("unknownc5.ts", None, ()), ("gaps_pcm.avi", "the file has blank gaps at 2 places, so the download is incomplete", (0.3, 0.7)),
+    ("zeros3.mkv", "the file has blank gaps at 3 places, so the download is incomplete", (0.2, 0.5, 0.8)),
+    ("zeros1.mkv", None, (0.5,)),
+    ("silence5.1.mkv", None, ()), ("silence7.1.mkv", None, ()), ("silence7.1.mov", None, ()),
+    ("gaps5.1.mkv", "the file has blank gaps at 2 places, so the download is incomplete", ())])
+def test_the_whole_file_check_on_made_up_media(whole_media, tmp_path, settings, name, certain, planted):
     """A healthy file prints nothing in the read pass, also with a stream of a type ffmpeg does not know. Zeros at 2 or
-    more places are certain, and the read pass stops then. One zero run is a doubt, and the read pass's error at that
-    run adds no doubt of its own. Random bytes leave no zeros, and only the read pass finds them. Reviewer 2026-10-15:
-    digital silence in PCM audio is zero runs of valid payload. In a file with PCM audio a run counts only where the
-    read pass breaks, as at the two real gaps, and the read pass runs to its end."""
+    more places are certain where they were planted, and the read pass stops then. One zero run is a doubt, and the
+    read pass's error at that run adds no doubt of its own. Random bytes leave no zeros, and only the read pass finds
+    them. Reviewer 2026-10-15: digital silence in PCM audio is zero runs of valid payload. In a file with PCM audio a run
+    counts only where the read pass breaks, as at the two real gaps, and the read pass runs to its end."""
     settings(state_dir=str(tmp_path))
     path = whole_media / name
     got, zeros, more, f = hook.whole_check(str(path))
-    assert (got, zeros) == (certain, zero) and f["fault"] == (certain and "zero-filled"), (got, f)
+    assert got == certain and f["fault"] == (certain and "zero-filled"), (got, f)
     assert f["zeros"]["read"] >= os.path.getsize(path) - (64 << 10) and f["size"] == os.path.getsize(path)   # every byte of the span
     assert f["pcm"] == name.startswith(("silence", "gaps5"))   # an AVI with PCM audio is outside the rule
     if name.startswith(("silence", "gaps5")):
         runs, count = f["zeros"]["runs"], f["zeros"]["count"]
-        assert len(runs) >= 2 and len(count) == (2 if certain else 0) and f["ffmpeg"]["ran"] and more == [], f
+        assert zeros == [] and len(runs) >= 2 and len(count) == (2 if certain else 0) and f["ffmpeg"]["ran"] and more == [], f
     elif certain:
-        at = [0.3066, 0.7052] if name.endswith(".avi") else [0.2059, 0.5018, 0.8041]
-        assert f["ffmpeg"] == {"skipped": "the zero scan was certain"} and [a for a, _ in f["zeros"]["at"]] == at and more == []
+        assert f["ffmpeg"] == {"skipped": "the zero scan was certain"} and gap_found(f, planted) and zeros == more == [], f["zeros"]
     elif name.startswith(("clean", "unknown")):   # an unknown stream type stops ffmpeg with no -ignore_unknown
-        assert (f["ffmpeg"]["ran"], f["ffmpeg"]["lines"], f["ffmpeg"]["code"], more) == (True, 0, 0, [])
+        assert (f["ffmpeg"]["ran"], f["ffmpeg"]["lines"], f["ffmpeg"]["code"], zeros, more) == (True, 0, 0, [], [])
     elif name == "zeros1.mkv":   # its demuxer error names a byte inside the run
+        assert gap_found(f, planted) and len(zeros) == 1 and re.fullmatch(gap_words(0.5), zeros[0]), (zeros, f["zeros"])
         assert f["ffmpeg"]["lines"] >= 1 and f["ffmpeg"]["loose"] == 0 and more == []
-    else:
-        assert f["ffmpeg"]["lines"] >= 1 and len(more) == 1 and more[0].startswith("a full read of the file found damaged data at 20%"), more
+    else:   # random bytes at 20 percent: the read pass names a byte in or just past them
+        assert zeros == [] and f["ffmpeg"]["lines"] >= 1 and len(more) == 1 and more[0].startswith("a full read of the file found damaged data at ")
+        assert any(0.2 <= a <= 0.25 for a in f["ffmpeg"]["at"]), f["ffmpeg"]
 
 
 def test_the_read_pass_reads_only_ffmpegs_error_lines():
@@ -20351,7 +20365,7 @@ def test_the_whole_file_check_stops_with_no_ffmpeg_left(whole_media, tmp_path, m
         monkeypatch.setattr(hook, "WHOLE_MIN", 0)
         monkeypatch.setattr(hook, "WHOLE_RATE", 1e15)
         certain, zero, more, f = hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
-        assert (certain, zero, more, f["ffmpeg"]["skipped"]) == (None, ["the file has a blank gap at 50% of its length"], [], "ran over 0 s"), f
+        assert (certain, len(zero), more, f["ffmpeg"]["skipped"]) == (None, 1, [], "ran over 0 s") and re.fullmatch(gap_words(0.5), zero[0]), f
     else:
         with pytest.raises(hook.Yielded):
             hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
@@ -20613,8 +20627,11 @@ def test_one_real_gap_in_a_pcm_file_alerts_from_the_whole_file_check(env, monkey
     src.write_bytes(data)
     rec = whole_import(env, monkeypatch, (), probe=(0.5,), src=src)
     assert decided(env)["video"]["doubts"] == [] and rec["outcome"] == "video_doubt" and len(rec["whole"]["zeros"]["count"]) == 1, rec["whole"]
-    (title, text), = posted(env)   # the run takes in the silent block before the gap
-    assert title == "Video may be broken" and re.fullmatch(r"The file has a blank gap at (4[89]|50)% of its length\.", text) and env["writes"] == []
+    (title, text), = posted(env)
+    (run,) = rec["whole"]["zeros"]["count"]   # it takes in the silent block before the gap, under 4 percent of the file
+    share = run[0] / rec["whole"]["size"]
+    assert 0.46 <= share <= 0.5 and title == "Video may be broken" and env["writes"] == []
+    assert text == f"The file has a blank gap {hook.arr_decide.places([round(share, 3)])}.", text
 
 
 @pytest.mark.parametrize("share", [0.265, 0.8525])
