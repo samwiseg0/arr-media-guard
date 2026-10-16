@@ -45,8 +45,10 @@ In these docs, *the app* is the Sonarr or Radarr that sent the file, and the *it
 On a host, it needs these instead of Docker:
 
 - Linux and Python 3.12 or later, with Sonarr and Radarr on the same host.
-- `mkvtoolnix` and `ffmpeg`, for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`. It is tested with mkvtoolnix 92
-  and ffmpeg 7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so AMG refuses every header repair with it.
+- `mkvtoolnix` and `ffmpeg`, for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`. AMG supports mkvtoolnix 102
+  from [MKVToolNix's Debian repository](https://mkvtoolnix.download/downloads.html#debian), as the image ships it.
+  Debian 13's own mkvtoolnix is 92, and `--selftest` warns about any mkvmerge older than 102. AMG is tested with ffmpeg
+  7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so AMG refuses every header repair with it.
 - Optional: the language detection venv, about 450 MB, and its model, 464 MB. It needs Python 3.13 on x86_64 or aarch64,
   because its pinned wheels are built for CPython 3.13. The burned-in subtitle check uses the same venv, plus three
   text models of 24.6 MB.
@@ -97,35 +99,49 @@ secrets in a file of their own, and the listener.
 
 Use this way when Sonarr and Radarr run on the host. Each app runs the script as a **Custom Script** connection.
 
-1. Install the tools, the code and the state folders:
+1. Install mkvtoolnix 102 from MKVToolNix's Debian repository, as `docker/mkvtoolnix.sh` does for the image. These
+   commands are for Debian 13. [MKVToolNix's downloads page](https://mkvtoolnix.download/downloads.html) lists the
+   repositories of other distributions.
    ```
-   sudo apt install mkvtoolnix ffmpeg python3-venv
+   sudo apt install ca-certificates curl gpg
+   sudo curl -fsSL -o /usr/share/keyrings/mkvtoolnix.gpg https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg
+   gpg --show-keys /usr/share/keyrings/mkvtoolnix.gpg
+   ```
+   The key must have the fingerprint `D9199745B0545F2E8197062B0F92290A445B9007`. Then add the repository and install:
+   ```
+   echo "deb [signed-by=/usr/share/keyrings/mkvtoolnix.gpg] https://mkvtoolnix.download/debian/ trixie main" | sudo tee /etc/apt/sources.list.d/mkvtoolnix.list
+   sudo apt update
+   sudo apt install mkvtoolnix=102.0-0~debian13bunkus01
+   ```
+2. Install the other tools, the code and the state folders:
+   ```
+   sudo apt install ffmpeg python3-venv
    sudo git clone https://github.com/samwiseg0/arr-media-guard /opt/arr-media-guard
    sudo ln -s /opt/arr-media-guard/arr-media-guard /usr/local/bin/arr-media-guard
    sudo ln -s /opt/arr-media-guard/arr-media-guard-subhunt /usr/local/bin/arr-media-guard-subhunt
    sudo mkdir -p /var/lib/arr-media-guard
    ```
-2. Install the env file and the policy file. Without the policy file the selftest fails.
+3. Install the env file and the policy file. Without the policy file the selftest fails.
    ```
    sudo install -m 0640 /opt/arr-media-guard/examples/arr-media-guard.env /etc/arr-media-guard.env
    sudo install -m 0644 /opt/arr-media-guard/examples/policy.json /etc/arr-media-guard.policy.json
    ```
-3. Give the app users access. Sonarr and Radarr run the script as their own user. That user must read the env file, and
+4. Give the app users access. Sonarr and Radarr run the script as their own user. That user must read the env file, and
    write `STATE_DIR`, `LOG` and your media files. Both apps share the state folder and its locks. So give them a shared
-   group, or run both as the same user. Step 2 leaves the env file readable by root only, so give it that group:
+   group, or run both as the same user. Step 3 leaves the env file readable by root only, so give it that group:
    `sudo chgrp media /etc/arr-media-guard.env`, with your group's name. When the app user cannot read the file, the
    selftest and the app's Test fail and name the file and the user.
    [docs/regrabs.md](docs/regrabs.md#where-the-folders-go) says where AMG keeps its copies of old files.
-4. Add `OOMPolicy=continue` to the `[Service]` section of both app units. AMG's checks run inside the app's service.
+5. Add `OOMPolicy=continue` to the `[Service]` section of both app units. AMG's checks run inside the app's service.
    This setting keeps the app running when one of those checks runs out of memory. See
    [Memory](docs/design.md#memory).
-5. Rotate the *decision log* weekly with logrotate, and leave out `copytruncate`. The decision log is the file `LOG`
+6. Rotate the *decision log* weekly with logrotate, and leave out `copytruncate`. The decision log is the file `LOG`
    names, with one line for each file AMG checks. [docs/monitoring.md](docs/monitoring.md#rotate-the-decision-log) has a
    ready file.
-6. Schedule `arr-media-guard --audit radarr --since 24h --post` nightly, and the same for `sonarr`. Use a systemd
+7. Schedule `arr-media-guard --audit radarr --since 24h --post` nightly, and the same for `sonarr`. Use a systemd
    timer or cron. The audit reviews the day's edits, and removes the files AMG kept that are older than
    `KEEP_ORIGINALS_DAYS`. It also turns on On Grab when `KEEP_REPLACED` needs it.
-7. Run `arr-media-guard --selftest`.
+8. Run `arr-media-guard --selftest`.
 
 AMG also reads its settings from the app's environment, and the environment wins over the env file. So a variable of the
 app with a common name, such as `NAME`, `LOG`, `INSTANCE` or `STATE_DIR`, changes AMG's settings. At its start the
@@ -373,7 +389,7 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio. It takes a median of about 5 minutes per hour of video, and one file in four takes 15 minutes or more per hour. The jobs of a backfill with no pass flag follow it as an import does, the deep analysis included. See [docs/subtitles.md](docs/subtitles.md#levels). |
+| `SUBTITLES` | `deep` | What the subtitle check of an import does. `off`: nothing. `check`: alerts only. `fix`: also fixes. `deep`: also runs the deep analysis, a slower check after each import that listens to the whole audio. It takes about 16 minutes per hour of video on a recent CPU, and longer with more speech or on an older CPU, see [docs/design.md](docs/design.md#subtitle-match). The jobs of a backfill with no pass flag follow it as an import does, the deep analysis included. See [docs/subtitles.md](docs/subtitles.md#levels). |
 | `BURNED_IN` | `fix` | What the burned-in subtitle check does. `off`: nothing. `check`: alerts only. `fix`: also turns off the English subtitle tracks when English subtitles are burned into the picture and the audio is in another language. When the burned-in subtitles are in another language, AMG re-grabs the file if `REGRAB` includes `burned_in`. AMG changes a file only when a second check on other frames agrees. An unknown value acts as `check`, and `--selftest` fails on it. See [docs/features.md](docs/features.md#burned-in-subtitles). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |

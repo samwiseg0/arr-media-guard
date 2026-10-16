@@ -1160,10 +1160,11 @@ def services(app, monkeypatch, settings):
     return s
 
 
-def test_the_start_check_checks_each_service_with_one_get(services, capsys):
+def test_the_start_check_checks_each_service_with_one_get(services, capsys, mkvmerge_says):
     """One line per service after the apps. Plex gets its token in a header, Discord the webhook URL without its
     query, TMDB the key, SABnzbd a read of its queue and the indexer t=caps. Each waits TEST_TIMEOUT seconds. The
     last request is the path check's list of Plex libraries."""
+    mkvmerge_says()   # no mkvmerge warning, whatever the host has
     arr_serve.start_check()
     assert capsys.readouterr().out.splitlines() == SERVICES_OK
     assert [(m, u) for m, u, _, _ in services["calls"]] == [
@@ -1194,9 +1195,10 @@ def test_a_service_that_is_not_set_up_gets_no_line_and_no_request(services, sett
     assert capsys.readouterr().out.splitlines() == ["arr-media-guard: tmdb start check: ok"] and len(services["calls"]) == 1
 
 
-def test_a_service_that_does_not_answer_warns_and_the_listener_goes_on(services, monkeypatch, capsys):
+def test_a_service_that_does_not_answer_warns_and_the_listener_goes_on(services, monkeypatch, capsys, mkvmerge_says):
     """The start check asks a service again until START_WAIT, as an app, then warns. The selftest asks once, warns and
     passes. No line shows a token, a key or the webhook."""
+    mkvmerge_says()   # no mkvmerge warning, whatever the host has
     monkeypatch.setattr(arr_serve, "START_WAIT", 0.3)
     monkeypatch.setattr(h, "ASK_AGAIN", 0.05)
     for host in SERVICE_HOSTS:
@@ -1947,7 +1949,8 @@ def test_a_missing_recycle_bin_warns_in_the_test_and_the_selftest_and_fails_neit
     assert "warning: Radarr has no recycle bin" in out and "Sonarr" not in out and out.rstrip().endswith("selftest ok")
 
 
-def test_a_config_xml_with_no_key_gives_no_warning_in_the_selftest(app, monkeypatch, settings, capsys, tmp_path):
+def test_a_config_xml_with_no_key_gives_no_warning_in_the_selftest(app, monkeypatch, settings, capsys, tmp_path, mkvmerge_says):
+    mkvmerge_says()   # no mkvmerge warning, whatever the host has
     app["api"]["config/mediamanagement"] = {"recycleBin": ""}   # a bin warning for any app the selftest asks
     (tmp_path / "config.xml").write_text("<Config><Port>8989</Port></Config>")
     settings(sonarr={"dir": str(tmp_path), "api_key": ""}, radarr={"dir": "/nonexistent", "api_key": ""})

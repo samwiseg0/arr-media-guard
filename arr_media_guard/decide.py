@@ -842,13 +842,6 @@ REPAIR_CUT = 0.02   # the share of a track's cues a read-back may find cut short
 # The share of the letters a read-back must change to show garbled text, see recode(). In its right codepage, text
 # changes only in a few borrowed words, such as an Italian "perchè" in Romanian dialogue.
 GARBLE_SHARE = 0.01
-# The letters outside ASCII of the languages a one-byte codepage writes in Latin letters, and the script of the others.
-# A read-back keeps a character as it was when it would give a letter outside them, see read_back().
-ALPHABETS = {"pol": "ąćęłńóśźż", "cze": "áčďéěíňóřšťúůýž", "slo": "áäčďéíĺľňóôŕšťúýž", "rum": "ăâîșțşţ", "hun": "áéíóöőúüű",
-             "hrv": "čćđšž", "bos": "čćđšž", "srp": "čćđšž", "slv": "čšž", "tur": "çğıöşüâîûİ", "aze": "çəğıöşüİ",
-             "lit": "ąčęėįšųūž", "lav": "āčēģīķļņšūž", "est": "äöõüšž"}
-SCRIPT_LANGS = {"CYRILLIC": "rus ukr bul bel srp mac", "GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara per urd"}
-SYMBOLS = ("So", "Sc")   # the symbols a read-back always gives, as № and € of cp1251. Marks such as ˇ and ˛ stay kept.
 
 
 def writes(cp):
@@ -873,24 +866,10 @@ def plausible(text):
     return bool(top) and scripts[top] >= TEXT_SHARE * len(letters) and (top != "LATIN" or sum(c.isascii() for c in letters) >= len(letters) / 2)
 
 
-def letter_of(c, lang):
-    """Whether c is a letter that lang writes: ASCII, one of its ALPHABETS letters or a letter of its script. A
-    language with neither entry takes every letter."""
-    key = lang_key(lang)
-    alphabet = next((v for k, v in ALPHABETS.items() if lang_key(k) == key), None)
-    script = next((s for s, ls in SCRIPT_LANGS.items() if key in {lang_key(x) for x in ls.split()}), None)
-    if alphabet is None and script is None:
-        return c.isalpha()
-    return c.isascii() or c in (alphabet or "") or c.lower() in (alphabet or "") or (script is not None and script_of(c) == script)
-
-
-def read_back(text, cp, lang=None):
+def read_back(text, cp):
     """(text as the codepage cp reads its cp1252 bytes, True when it ends cut inside a character), see recode().
     A character that cp1252 does not write stays as it is, as a right "♪" a later tool added. Raises UnicodeError
-    when the bytes of a run between such characters do not decode as cp. With lang, a one-byte codepage keeps a
-    character as it was when its read-back is neither a letter lang writes, see letter_of(), nor a symbol of SYMBOLS.
-    A right "Señor" in Romanian text then stays, where cp1250 would give "Seńor", and Russian "№" reads back. See kept()
-    for the letters that stay too."""
+    when the bytes of a run between such characters do not decode as cp."""
     out, cut, runs = [], False, list(CP1252_RUNS.finditer(text))
     pos = 0
     for k, m in enumerate(runs):
@@ -905,36 +884,12 @@ def read_back(text, cp, lang=None):
             if k < len(runs) - 1 or pos < len(text):   # only the end of a cue can be cut
                 raise
             back, cut = back + "\N{REPLACEMENT CHARACTER}", True
-        if lang and cp.startswith("cp125") and len(back) == len(m[0]):
-            back = "".join(g if g != b and kept(m[0], i, b, lang) else b for i, (g, b) in enumerate(zip(m[0], back)))
         out.append(back)
     out.append(text[pos:])
     return "".join(out), cut
 
 
-def kept(run, i, b, lang):
-    """Whether a one-byte read-back keeps run[i] as it was, where the codepage gives b, see read_back(). It keeps a
-    character whose read-back is neither a letter lang writes, see letter_of(), nor a symbol of SYMBOLS. It keeps a
-    Latin letter right after a digit, as the "º" of "40.5ºC", which cp1250 gives as "ş", unless a lowercase letter
-    follows, as in a word joined to a number: "9876ºase" reads back as "9876şase". It keeps a letter of another
-    script in a word that holds ASCII letters too, as the "é" of "Café", which cp1251 gives as "й". Garbled Cyrillic,
-    Greek, Hebrew and Arabic words hold no ASCII letters, because those codepages write their letters above 0x7F."""
-    if not (letter_of(b, lang) or unicodedata.category(b) in SYMBOLS):
-        return True
-    if not b.isalpha():
-        return False
-    if script_of(b) == "LATIN":
-        # "¹".isdigit() holds, and cp1250 reads it as "ą"
-        return i > 0 and run[i - 1] in "0123456789" and not (i + 1 < len(run) and run[i + 1].islower())
-    lo, hi = i, i + 1
-    while lo and run[lo - 1].isalpha():
-        lo -= 1
-    while hi < len(run) and run[hi].isalpha():
-        hi += 1
-    return any(c.isascii() for c in run[lo:hi])
-
-
-def recode(texts):
+def recode(texts, readable=False):
     """[(codepage, the language the texts read as, the texts read back, the count of texts cut short)] of each codepage
     of UTF-8 and CODEPAGES that reads cue texts back, in that order (docs/design.md, "Garbled subtitle repair"). An old
     muxer that took a sidecar's bytes for cp1252 wrote each byte as the character cp1252 gives it. So the cp1252 bytes
@@ -945,7 +900,12 @@ def recode(texts):
     None then. In a codepage of more than one byte, each character outside ASCII that cp1252 writes counts as changed. The muxer
     cut a cue at a byte cp1252 leaves undefined. A cue cut inside a character, as UTF-8 always cuts it, gets U+FFFD
     there and counts as cut. A cue cut between two characters only ends early, and the count misses it. In a one-byte
-    codepage that is every cut, such as at Ť and ť of cp1250."""
+    codepage that is every cut, such as at Ť and ť of cp1250. With readable, the texts as they stand read as a
+    language. Then, or when a cut cue holds a letter before its cut, UTF-8 counts only when one character decodes whole.
+    Right text whose only letters outside ASCII end its cues, as "José", reads as UTF-8 cut at each of those cues. Such
+    text can read as no language, as Indonesian, which has no word list. A track whose every cue the muxer cut in its
+    first character, as at the right-to-left mark of Hebrew cues, decodes no character whole and holds no letter before
+    a cut."""
     if not any(not t.isascii() for t in texts):
         return []
     letters, out = sum(c.isalpha() for t in texts for c in t), []
@@ -957,6 +917,9 @@ def recode(texts):
         except UnicodeError:
             continue
         back = [t for t, _ in got]
+        if cp == "utf-8" and (readable or any(cut and any(c.isalpha() for c in u) for u, cut in got)) and \
+                not any(c != "\N{REPLACEMENT CHARACTER}" and c not in t for t, u in zip(texts, back) for c in u):
+            continue   # each cue only ends cut, as right text whose only letters outside ASCII end its cues
         changed = sum(sum(a != b for a, b in zip(t, u)) if len(t) == len(u) else sum(not c.isascii() and c in CP1252_TEXT for c in t)
                       for t, u in zip(texts, back))
         if changed >= GARBLE_SHARE * letters and ((lang := reads_as(back, cp)) or cp == "utf-8"):
@@ -970,16 +933,19 @@ def garbled(texts, tag):
     them back. A UTF-8 reading wins over the others: Hebrew letters read back from UTF-8 cut at every cue give a few
     letters that read as Hebrew by their script alone. Else the reading in the tag's language wins, then one in any
     language, then the first one. The verdict is
-    {"repair", "codepage", "lang", "read", "cut", "cues", "why"}. repair is True under the repair rule: the reading
-    reads as the tag's language. read is the language the texts read as."""
+    {"repair", "codepage", "lang", "read", "cut", "cues", "why"}. repair is True under the repair rule: the reading is
+    UTF-8 and reads as the tag's language. A UTF-8 read-back checks itself, because each character must decode. The
+    read-back of another codepage can give wrong letters with no sign, as when the muxer lost a byte. read is the
+    language the texts read as."""
     texts = list(texts)
     read = text_language(texts)
-    got = recode(texts) if not read[2].startswith("short") else []
+    got = recode(texts, bool(read[0])) if not read[2].startswith("short") else []
     if not got:
         return None
     got = [g for g in got if g[0] == "utf-8"] or got   # text that decodes as UTF-8 is UTF-8, even when the muxer cut most of it
     cp, lang, _, cut = min(got, key=lambda g: (lang_key(g[1]) != lang_key(tag), g[1] is None))
-    why = None if lang and lang_key(lang) == lang_key(tag) else f"the track is tagged {tag}"
+    why = f"the track is tagged {tag}" if not (lang and lang_key(lang) == lang_key(tag)) else None if cp == "utf-8" else \
+        "only a UTF-8 read-back is repaired"
     return {"repair": not why, "codepage": cp, "lang": lang, "read": read[0], "cut": cut, "cues": len(texts),
             "why": f"read back as {cp}, the text reads as {lang or 'no language'}" + (f", but {why}" if why else "")}
 
@@ -1337,7 +1303,7 @@ def read_capped(w):
     return (w.get("stopped") or "").startswith("read over") and not w["errors"] and not w["noisy"]
 
 
-def video_verdict(zero_hits, windows, checked=ZERO_READS):
+def video_verdict(zero_hits, windows, checked=ZERO_READS, when=None):
     """(certain reason or None, [doubts]) from the zero probe's offsets and the windows.
 
     Certain: zero runs of ZERO_RUN or more at 2 or more offsets, 2 or more windows with no decoder for an encrypted
@@ -1345,7 +1311,9 @@ def video_verdict(zero_hits, windows, checked=ZERO_READS):
     ffmpeg does not know may be a healthy file. A doubt: such a run at one offset, one bad window, a window stopped by the time limit, a window
     that did not run, or an empty window. An empty window with no error is a cut file, which the audio check judges in
     Matroska, or    a window past the end of the video. A window that the read cap stopped with no error is only logged.
-    checked is the count of places the probe read. The whole-file check reads every byte and gives None.
+    checked is the count of places the probe read. The whole-file check reads every byte and gives None. when holds the
+    play time of each hit, see checks.play_times(), and the doubt names it as read_places() does. With no when, the
+    doubt names the hit's share of the file size.
     """
     if len(zero_hits) >= 2:
         where = f"{len(zero_hits)} of {checked} places checked" if checked else f"{len(zero_hits)} places"
@@ -1353,7 +1321,7 @@ def video_verdict(zero_hits, windows, checked=ZERO_READS):
     nodecoder = sum(bool(w.get("nodecoder") and w.get("encrypted")) for w in windows)
     if nodecoder >= 2:
         return f"the video is encrypted and cannot play at {nodecoder} of {len(windows)} places checked", []
-    doubts = [f"the file has a blank gap {places(zero_hits[:1])}"] if zero_hits else []
+    doubts = [f"the file has a blank gap {read_places([(zero_hits[0], (when or [None])[0])])}"] if zero_hits else []
     bads = []
     for w in windows:
         why = bad_window(w) if w["ran"] else None
@@ -1382,14 +1350,31 @@ NEAR = 0.01                          # a share of the file around a zero run whe
 WHOLE_BLOCK = 64 << 10               # the zero scan's grid. A run's ends sit within one block of the real ends of its zeros.
 
 
+def place_list(xs):
+    """Places as an alert lists them: "13%, 61% and 83%". It names up to 5 and counts the rest."""
+    shown = xs[:5] + ([f"{len(xs) - 5} more places"] if len(xs) > 5 else [])
+    return shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+
+
 def places(shares):
-    """Where shares of a file sit, as an alert says it: "at the start of the file", "at 13% and 61% of its length". It
-    names up to 5 places and counts the rest."""
+    """Where shares of a file sit, as an alert says it: "at the start of the file", "at 13% and 61% of the file size"."""
     rest = sorted({round(a, 2) for a in shares} - {0})
-    shown = [f"{a:.0%}" for a in rest[:5]] + ([f"{len(rest) - 5} more places"] if len(rest) > 5 else [])
     said = ["at the start of the file"] if any(round(a, 2) == 0 for a in shares) else []
-    if shown:
-        said.append(f"at {shown[0] if len(shown) == 1 else ', '.join(shown[:-1]) + ' and ' + shown[-1]} of its length")
+    if rest:
+        said.append(f"at {place_list([f'{a:.0%}' for a in rest])} of the file size")
+    return " and ".join(said)
+
+
+def read_places(found):
+    """Where the read pass found damage, as an alert says it: "at 12:01 and 41:07", "after the video and audio end".
+    found holds (the share of the file, the play time) of each byte, see checks.play_times(). A byte with no play time
+    names its share of the file size, so no alert shows a wrong time."""
+    secs = sorted({int(w) for _, w in found if w not in (None, "start", "end")})
+    shares = [a for a, w in found if w is None]
+    said = ["before the video starts"] if any(w == "start" for _, w in found) else []
+    said += [f"at {place_list([clock(s) for s in secs])}"] if secs else []
+    said += [places(shares)] if shares else []
+    said += ["after the video and audio end"] if any(w == "end" for _, w in found) else []
     return " and ".join(said)
 
 
@@ -1406,10 +1391,12 @@ def parse_copy(stderr, rc, size):
             "noise": sum(any(n in x for n in NOISE) for x in stderr.splitlines()), "first": lines[:3]}
 
 
-def whole_verdict(runs, size, read, pcm=False):
+def whole_verdict(runs, size, read, pcm=False, when=None):
     """(certain reason or None, [doubts of the zero runs], [doubts of the read pass], the runs that count) of the
     whole-file check. runs are the zero runs as [first byte, end]. read is parse_copy(), or None when the pass did
-    not run to its end. pcm says the file has a PCM audio track, see checks.pcm_audio().
+    not run to its end. pcm says the file has a PCM audio track, see checks.pcm_audio(). when holds the play time of
+    the first byte of each run, see checks.play_times(). Each doubt names play times, from when and read["when"], see
+    read_places().
 
     A run is confirmed when a byte the read pass names lies in it, give or take WHOLE_BLOCK, and no other run lies
     nearer. In Matroska a real gap that covers a block edge breaks the container, and the read pass names a byte inside
@@ -1428,12 +1415,14 @@ def whole_verdict(runs, size, read, pcm=False):
             if r is not None and apart(r, b) <= WHOLE_BLOCK:
                 hit.append(r)
         count = [r for r in runs if r in hit]
-    certain, zero = video_verdict([round(a / size, 3) for a, _ in count], [], None)
+    times = dict(zip((a for a, _ in runs), when or ()))
+    certain, zero = video_verdict([round(a / size, 3) for a, _ in count], [], None, [times.get(a) for a, _ in count])
     if certain or not read or not read["ran"] or not read["lines"]:
         return certain, zero, [], count
-    away = [a for a in read["at"] if not any(s / size - NEAR <= a <= e / size + NEAR for s, e in count)]
+    found = zip(read["at"], read.get("when") or [None] * len(read["at"]))
+    away = [(a, w) for a, w in found if not any(s / size - NEAR <= a <= e / size + NEAR for s, e in count)]
     if away:
-        return None, zero, [f"a full read of the file found damaged data {places(away)}"], count
+        return None, zero, [f"a full read of the file found damaged data {read_places(away)}"], count
     n = read["loose"]
     return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count
 
@@ -1442,6 +1431,7 @@ def whole_verdict(runs, size, read, pcm=False):
 # Cues and the Segment size from the real streams. These functions parse Matroska bytes the script reads.
 EBML_ID, SEGMENT, SEEKHEAD, SEEK, SEEK_ID, SEEK_POS = 0x1A45DFA3, 0x18538067, 0x114D9B74, 0x4DBB, 0x53AB, 0x53AC
 CLUSTER, CUES, CUEPOINT, CUETIME, CUETRACKPOS, CUETRACK, TIMESTAMP = 0x1F43B675, 0x1C53BB6B, 0xBB, 0xB3, 0xB7, 0xF7, 0xE7
+CUECLUSTER, INFO, TIMESTAMP_SCALE = 0xF1, 0x1549A966, 0x2AD7B1
 SIMPLEBLOCK, BLOCKGROUP, BLOCK, BLOCKDURATION, VOID, CRC = 0xA3, 0xA0, 0xA1, 0x9B, 0xEC, 0xBF
 # The level-1 elements of a Segment: Info, Tracks, Chapters, Attachments and Tags beside the named ones.
 LEVEL1 = {SEEKHEAD, 0x1549A966, 0x1654AE6B, 0x1043A770, CLUSTER, CUES, 0x1941A469, 0x1254C367, VOID, CRC}
@@ -1508,18 +1498,35 @@ def seek_entries(b, start, end, into):
     return into
 
 
-def front_seeks(b, start):
-    """The seek_entries() of every SeekHead among the level-1 elements of b from start up to the first Cluster."""
-    seek, p = {}, start
+def front(b, start):
+    """The (id, data start, size) of each level-1 element of b from start up to the first Cluster."""
+    p = start
     while (e := element(b, p)) and e[0] in LEVEL1 and e[0] != CLUSTER and e[2] is not None:
-        if e[0] == SEEKHEAD:
-            seek_entries(b, e[1], e[1] + e[2], seek)
+        yield e
         p = e[1] + e[2]
+
+
+def front_seeks(b, start):
+    """The seek_entries() of every SeekHead among the front() elements of b from start."""
+    seek = {}
+    for i, d, s in front(b, start):
+        if i == SEEKHEAD:
+            seek_entries(b, d, d + s, seek)
     return seek
 
 
-def last_cues(b):
-    """{track number: its last CueTime in ticks} of the data of a whole Cues element."""
+def timestamp_scale(b, start):
+    """The TimestampScale in nanoseconds of the Info among the front() elements of b from start. Matroska's default is
+    1000000. None when b holds no whole Info."""
+    for i, d, s in front(b, start):
+        if i == INFO and d + s <= len(b):
+            return next((int.from_bytes(b[cd:cd + cs], "big") for ci, cd, cs in children(b, d, d + s) if ci == TIMESTAMP_SCALE), 1000000)
+    return None
+
+
+def last_cues(b, by=CUETRACK, pick=max):
+    """{track number: its last CueTime in ticks} of the data of a whole Cues element. by=CUECLUSTER with pick=min gives
+    {Cluster position relative to the Segment data: the first CueTime that points into it} instead."""
     out = {}
     for i, d, s in children(b, 0, len(b)):
         if i == CUEPOINT:
@@ -1527,8 +1534,8 @@ def last_cues(b):
             t = next((int.from_bytes(b[cd:cd + cs], "big") for ci, cd, cs in got if ci == CUETIME), None)
             for ci, cd, cs in got:
                 if ci == CUETRACKPOS and t is not None:
-                    for n in (int.from_bytes(b[td:td + ts], "big") for ti, td, ts in children(b, cd, cd + cs) if ti == CUETRACK):
-                        out[n] = max(out.get(n, t), t)
+                    for n in (int.from_bytes(b[td:td + ts], "big") for ti, td, ts in children(b, cd, cd + cs) if ti == by):
+                        out[n] = pick(out.get(n, t), t)
     return out
 
 

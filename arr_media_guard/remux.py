@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import contextlib, fractions, itertools, os, re, shutil, signal, subprocess, threading, time
+import contextlib, fractions, os, re, shutil, signal, subprocess, threading, time
 
 from . import align, checks, config, decide, logs, proof, runner, subsync, vault
 
@@ -600,7 +600,7 @@ def ended_track(path, j, tid, plan, folder, text=None):
     adds the section. mkvmerge numbers the ASS events from 0 in ReadOrder order, so the events of a track whose
     ReadOrders skip a number, as HandBrake's may, take new ones. mkvmerge also drops the spaces and tabs at the end of
     each ASS event. mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as CRLF.
-    mkvmerge 92 does, and the mkvmerge of a source may store LF. prove() and header_kept() pass only those changes.
+    mkvmerge 92 and 102 do, and a source's mkvmerge may store LF. prove() and header_kept() pass only those changes.
     The language goes in here, as ffmpeg copies it. The flags and names come back later with mkvpropedit, see resub().
     text takes the place of plan for a repair, see resub(): the new SubRip text, which needs no mkvextract, or a
     function of the extracted text."""
@@ -631,9 +631,9 @@ def repair_name(r):
     return f'its text read back as {r["codepage"]}{side}'
 
 
-def repaired(texts, cp, tag, side=None):
+def repaired(texts, cp, side=None):
     """(the repaired cue texts, the places of the cues that side fills, the count of cues left cut) of the cue texts of a
-    garbled SubRip track tagged tag, read back as the codepage cp (docs/design.md, "Garbled subtitle repair"). side,
+    garbled SubRip track, read back as the codepage cp (docs/design.md, "Garbled subtitle repair"). side,
     the cue texts of a sidecar in the same order, may fill the cues the old muxer cut: there the read-back is the start
     of the sidecar's text, and the next character holds a byte cp1252 leaves undefined. Every other cue of side must
     equal the read-back, as srt_cues() compares text. Else the result is None, because the sidecar is not the source of
@@ -642,7 +642,7 @@ def repaired(texts, cp, tag, side=None):
         return None
     out, filled, left = [], [], 0
     for k, t in enumerate(texts):
-        back, cut = decide.read_back(t, cp, tag)
+        back, cut = decide.read_back(t, cp)
         if side is not None:
             mine, theirs = proof.clean_text(back.removesuffix("\N{REPLACEMENT CHARACTER}")), proof.clean_text(side[k])
             if theirs != mine or cut:
@@ -678,14 +678,14 @@ def side_blocks(side):
         return proof.srt_blocks(proof.sidecar_text(f.read(), side.get("named"))[1], "\n")
 
 
-def repair_text(r):
+def repair_text(r, cut=decide.REPAIR_CUT):
     """(the new text for ended_track(), a function of srt_blocks() of the old text that gives the new cues for prove())
     of the repair r of a garbled SubRip track (docs/design.md, "Garbled subtitle repair"). r holds "codepage", which
     reads the track back, see repaired(), and "lang", its tag. With "sidecar", the sidecar_subs() entry, the sidecar
     fills the cut cues. It must still hold "side", the cues the check read, else the remux stops: a sidecar written
     again since then is read again, and never with the charset the check gave it. The new text must pass
-    decide.repair_fault(), and at most decide.REPAIR_CUT of all its cues may stay cut. A cue that does not read back
-    stops the remux too."""
+    decide.repair_fault(), and at most the share cut of all its cues may stay cut. A sidecar gives 0: no muxer cut its
+    cues, and a cut writes U+FFFD over a right letter. A cue that does not read back stops the remux too."""
     side = None
     if r.get("sidecar"):
         now = [list(b) for b in side_blocks(r["sidecar"])]
@@ -695,12 +695,12 @@ def repair_text(r):
 
     def fix(texts):
         try:
-            got = repaired(texts, r["codepage"], r["lang"], side)
+            got = repaired(texts, r["codepage"], side)
         except UnicodeError:
             raise RuntimeError(f'some of its cues do not read back as {r["codepage"]}') from None
         if got is None:
             raise RuntimeError(f'the sidecar {r["sidecar"]["name"]} no longer fits the track')
-        why = (f"{got[2]} of {len(texts)} cues were cut short" if got[2] > decide.REPAIR_CUT * len(texts) else None) \
+        why = (f"{got[2]} of {len(texts)} cues were cut short" if got[2] > cut * len(texts) else None) \
             or decide.repair_fault(got[0], r["lang"])
         if why:
             raise RuntimeError(why)
@@ -708,42 +708,92 @@ def repair_text(r):
     return (lambda text: srt_rewrite(text, fix)), (lambda blocks: [(a, b, t) for (a, b, _), t in zip(blocks, fix([t for _, _, t in blocks]))])
 
 
-def text_name(path, lang, taken=()):
-    """The first free name beside the video path for the bytes of a garbled track tagged lang, see resub():
-    <base>.<lang>.garbled.txt, then <base>.<lang>.garbled.1.txt and on. Players skip a .txt file. A name in taken is
-    used too."""
-    base = os.path.splitext(path)[0]
-    for n in itertools.count():
-        name = f"{base}.{lang}.garbled{f'.{n}' if n else ''}.txt"
-        if name not in taken and not os.path.lexists(name):
-            return name
+TEXT_EXT = {"S_TEXT/UTF8": "srt", "S_TEXT/ASS": "ass", "S_TEXT/SSA": "ssa", "S_TEXT/WEBVTT": "vtt"}   # the extension of each text format
+BROKEN_END = ".broken-encoding.{}.txt"   # the end of the name of the file that keeps removed subtitle bytes, with its format's extension
+BROKEN_SIDECAR = BROKEN_END.format("srt")
 
 
-def keep_text(src, path, lang, st):
-    """Copy the file src beside the video path under text_name(), with the video's owner and mode less any execute
-    bits, and return the new path. It never writes over a file. It reads the copy back and raises when its bytes are
-    not those of src."""
-    with open(src, "rb") as f:
-        data = f.read()
-    while True:
-        name = text_name(path, lang)
-        try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, st.st_mode & 0o666)
-            break
-        except FileExistsError:   # a file came since text_name() looked
-            continue
-    with os.fdopen(fd, "wb") as f:
-        with contextlib.suppress(PermissionError):   # os.open() applies the umask. A share may refuse the fchmod, see own_like().
-            os.fchmod(fd, st.st_mode & 0o666)
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    with contextlib.suppress(OSError):   # a NAS share may refuse chown, see Swap.own(). The mode stays.
-        os.chown(name, st.st_uid, st.st_gid)
-    with open(name, "rb") as f:
-        if f.read() != data:
-            raise RuntimeError(f"{os.path.basename(name)} does not hold the bytes of its track")
-    return name
+def holds(name, data):
+    """Whether the file name holds the bytes data."""
+    with contextlib.suppress(OSError):
+        if os.path.isfile(name) and os.path.getsize(name) == len(data):
+            with open(name, "rb") as f:
+                return f.read() == data
+    return False
+
+
+def broken_plan(path, broken):
+    """Give each entry of broken, {key: {"lang", "data", "ext", "numbers"}}, its sidecar in "sidecar", and return why no
+    name is free, or None (docs/design.md, "Unreadable subtitles"). It writes nothing. This is the one place that names
+    the file of removed subtitle bytes: of a broken MP4 track, see convert.broken_tracks(), of a garbled track, see
+    resub(), and of a garbled sidecar, see subtitles.broken_side(). An entry's key is a track's place, as s3, or a
+    sidecar's name. lang is its language tag or the language part of its name. data is the bytes of its file, or None
+    for a plan made before they are read. ext is the extension of its format, srt by default. numbers are the numbers
+    its name may take in a clash, the track's own by default.
+
+    The name is <base>.<lang>.broken-encoding.<ext>.txt beside the video at path, as Film.per.broken-encoding.srt.txt.
+    An untagged entry has no language part. Players, the apps and Bazarr skip a .txt file. Two entries with one
+    language part and one format, and a name that a file of other bytes holds, put a number in front, as
+    Film.per.3.broken-encoding.srt.txt. A file with the same bytes stays, and "reused" says so. No two entries take one
+    name, and no file is written over. With data None a name a file holds counts as taken, and with none free the last
+    name stands, because the write plans again with the bytes."""
+    base, taken = os.path.splitext(path)[0], set()
+    part = {k: ("" if e["lang"] in decide.UNTAGGED else f".{e['lang']}", BROKEN_END.format(e.get("ext", "srt"))) for k, e in broken.items()}
+    for k, e in broken.items():
+        (lang, end), alone = part[k], list(part.values()).count(part[k]) == 1
+        names = ([f"{base}{lang}{end}"] if alone else []) + [f"{base}{lang}.{n}{end}" for n in e.get("numbers") or [k[1:]]]
+        free = next((n for n in names if n not in taken and (not os.path.lexists(n) or e["data"] is not None and holds(n, e["data"]))),
+                    None if e["data"] is not None else names[-1])
+        if not free:
+            return f"the name {os.path.basename(names[-1])} is taken"
+        taken.add(free)
+        e.update(sidecar=free, reused=os.path.lexists(free))
+    return None
+
+
+def keep_broken(e, st):
+    """Write the bytes of the entry e of broken_plan() to its sidecar, owned like st, see own_like(), and read them back.
+    Returns whether it wrote the file. A file with the same bytes stays as it is, and e["reused"] says so. e["written"]
+    says whether it wrote, for drop_broken(). It never writes over a file, so a name taken since the plan raises
+    FileExistsError. The file gets the mode of st at its create, as in new_tmp(), so a share that refuses chmod keeps it."""
+    e.update(reused=holds(e["sidecar"], e["data"]), written=False)
+    if e["reused"]:
+        return False
+    fd = os.open(e["sidecar"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, st.st_mode & 0o666 | 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(e["data"])
+            f.flush()
+            os.fsync(f.fileno())
+        own_like(e["sidecar"], st)
+        if not holds(e["sidecar"], e["data"]):
+            raise RuntimeError(f"{os.path.basename(e['sidecar'])} does not hold the bytes of its track")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(e["sidecar"])
+        raise
+    e["written"] = True
+    return True
+
+
+def drop_broken(entries):
+    """The undo of keep_broken(): remove the file it wrote for each of the entries, when the change that took their bytes
+    out does not stand. A file it reused stays. e["removed"] says it went."""
+    for e in entries:
+        if e.get("written"):
+            with contextlib.suppress(OSError):
+                os.remove(e["sidecar"])
+            e["removed"] = True
+
+
+def events_file(path, tid, codec, folder):
+    """The path of the file mkvextract writes in folder of the ASS, SSA or WebVTT track tid of path, with its header
+    from the track's codec private data. A garbled track's bytes go beside the video in it, see resub()."""
+    out = os.path.join(folder, f"{tid}.{TEXT_EXT[codec]}")
+    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvextract", path, "tracks", f"{tid}:{out}"], capture_output=True, text=True, errors="replace")
+    if r.returncode:   # 1 is a warning, and the bytes of a removed track never build on one
+        raise RuntimeError(f"mkvextract exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
+    return out
 
 
 def cover_edits(path, j, pics, folder):
@@ -824,10 +874,13 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     UID, which ffmpeg does not keep. The new file must keep every other track and its properties (props_fault()), and
     prove() must show every packet of every kept stream the same, the retimed tracks' times as the fix moves them.
 
-    A garbled SubRip track in strip, {mkvmerge track id: its language tag}, leaves the file, and its bytes go beside the
-    video, see keep_text(). The remux's ffmpeg also writes its packets as they are into a SubRip file, and
-    proof.packet_text() shows each cue's bytes equal to its packet's. After the proof and the kept original, keep_text()
-    copies that file beside the video. A failure after that removes the copy. info["garbled_text"] names each copy.
+    A garbled text track in strip, {mkvmerge track id: its language tag}, leaves the file, and its bytes go beside the
+    video under the name of broken_plan(), in the track's own format. The remux's ffmpeg also writes its packets: a
+    SubRip track's as SubRip, and proof.packet_text() shows each cue's bytes equal to its packet's. An ASS, SSA or
+    WebVTT track's go as they are, and mkvextract writes the file with its header, see events_file(). proof.event_text()
+    shows the text of each packet in it. After the proof and the kept original, keep_broken() writes the bytes beside
+    the video. A failure after that removes each new file, see drop_broken(). info["garbled_text"] names each file,
+    and info["garbled_text_removed"] each one the failure removed again.
 
     It runs like repack(): the temp file in hide_dir, no time limit during the remux, and SIGTERM removes the temp file.
     The original must still be the file st describes. The temp file takes its owner and mode, the original is kept in
@@ -836,20 +889,20 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     attachments go into a folder under STATE_DIR, never the system temp dir, which is often a small tmpfs."""
     ends, timed, recode, strip = ends or {}, timed or {}, recode or {}, strip or {}
     drop = [*drop, *strip]
-    names, written = {}, []
-    for i, lang in strip.items():   # the plan's names. keep_text() takes the first free name when it writes.
-        names[i] = text_name(path, lang, names.values())
+    place = {i: f"s{n}" for n, i in enumerate((t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
+    codec = {t.get("id"): (t.get("properties") or {}).get("codec_id") for t in j.get("tracks") or []}
+    broken = {i: {"lang": lang, "data": None, "ext": TEXT_EXT[codec[i]]} for i, lang in strip.items()}
+    broken_plan(path, {place[i]: e for i, e in broken.items()})   # the plan's names. The write names them again with the bytes.
     info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()},
             **({"timed": {str(i): len(plan) for i, plan in timed.items()}} if timed else {}),
             **({"recode": {str(i): repair_name(r) for i, r in recode.items()}} if recode else {}),
-            **({"garbled_text": {str(i): os.path.basename(n) for i, n in names.items()}} if strip else {})}
+            **({"garbled_text": {str(i): os.path.basename(e["sidecar"]) for i, e in broken.items()}} if strip else {})}
     what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
                      + [f"track {i}: new ends for {sum(e != o for _, _, o, e in plan)} of {len(plan)} cues" for i, plan in ends.items()]
                      + [f"track {i}: {blocks_moved(plan, fixes.get(i)) or f'new times for {len(plan)} cues'}" for i, plan in timed.items()]
                      + [f"track {i}: {repair_name(r)}" + (", default flag off" if r.get("default_off") else "") for i, r in recode.items()]
                      + [f"remove track {i}" for i in drop if i not in strip]
-                     + [f"take out track {i}, its bytes to {os.path.basename(n)}" for i, n in names.items()])
-    codec = {t.get("id"): (t.get("properties") or {}).get("codec_id") for t in j.get("tracks") or []}
+                     + [f"take out track {i}, its bytes to {os.path.basename(e['sidecar'])}" for i, e in broken.items()])
     grid = {i: x for i, plan in ends.items() if i not in timed and (x := grid_plan(plan, fixes.get(i), codec.get(i)))}
     if grid:   # the starts on the ASS grid, see grid_plan()
         timed = {**timed, **grid}
@@ -890,19 +943,22 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         clamp = lambda k: (f"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(1\\,PTS+DURATION*{k})\\,DURATION*{k})")
         argv += [a for n, x in enumerate(kept) if x in moved for a in (f"-bsf:{n}", clamp(repr(1 / float(fractions.Fraction(moved[x]["rate"])))))]
         argv += ["-c", "copy", "-copyinkf", "-default_mode", "passthrough", "-f", "matroska", tmp]
-        texts = {i: (os.path.join(folder, f"{i}.garbled.srt"), os.path.join(folder, f"{i}.md5")) for i in strip}   # the same read writes them
+        # The same read writes the packets of a track in strip: as SubRip, or as they are for mkvextract's file, see below
+        texts = {i: (os.path.join(folder, f"{i}.garbled.{'srt' if codec[i] == 'S_TEXT/UTF8' else 'bin'}"), os.path.join(folder, f"{i}.md5")) for i in strip}
         for i, (srt, md5) in texts.items():
             x = text[subs.index(i)]
-            argv += ["-map", f"0:{x}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{x}", "-c", "copy", "-f", "srt", srt]
+            argv += ["-map", f"0:{x}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{x}", "-c", "copy", "-f", "srt" if srt.endswith(".srt") else "data", srt]
         new_tmp(tmp, st)
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None   # the lines copy_fault() passes too
         bad = copy_fault(r.stdout + r.stderr, streams)
         if r.returncode or bad:
             raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(chr(10).join(bad))[-500:] or info['warnings']}")
-        for i, (srt, md5) in texts.items():
-            if why := proof.packet_text(srt, md5):
+        for i, (srt, md5) in texts.items():   # an ASS, SSA or WebVTT file holds its header too, which mkvextract writes
+            out = srt if srt.endswith(".srt") else events_file(path, i, codec[i], folder)
+            if why := (proof.packet_text(srt, md5) if out == srt else proof.event_text(out, md5, srt, codec[i])):
                 raise RuntimeError(f"the bytes of track {i} were not written whole: {why}")
+            texts[i] = (out, md5)
         uid = ((j.get("container") or {}).get("properties") or {}).get("segment_uid")
         edits = ["--edit", "info", "--set", f"segment-uid=0x{uid}"] if uid else []
         for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("id") not in drop), 1):   # the n-th track of the new file
@@ -911,7 +967,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
             edits += ["--edit", f"track:{n}"] + [a for x in sets for a in ("--set", x)] if sets else []
         edits += cover_edits(path, j, pics, folder)
         e = subprocess.run(["mkvpropedit", tmp, *edits], capture_output=True, text=True, errors="replace")
-        if e.returncode > 1:
+        if e.returncode not in (0, 1):   # a signal gives a negative code
             raise RuntimeError(f"mkvpropedit exited {e.returncode}: {config.mask((e.stdout + e.stderr).strip())[-300:]}")
         sw.sync()
         new = checks.mkvmerge(tmp)
@@ -928,14 +984,19 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         size = sw.own()
         sw.check("the app replaced or renamed the original during the subtitle remux", config.CFG.keep_days)
         for i, (srt, _) in texts.items():
-            written.append(keep_text(srt, path, strip[i], st))
-            info["garbled_text"][str(i)] = os.path.basename(written[-1])
+            with open(srt, "rb") as f:
+                broken[i]["data"] = f.read()
+        if taken := broken_plan(path, {place[i]: e for i, e in broken.items()}):
+            raise RuntimeError(taken)
+        for i, e in broken.items():
+            keep_broken(e, st)
+            info["garbled_text"][str(i)] = os.path.basename(e["sidecar"])
         os.replace(tmp, path)
     except BaseException as ex:
         sw.unkeep(path)
-        for n in written:
-            with contextlib.suppress(OSError):
-                os.remove(n)
+        drop_broken(broken.values())
+        if undone := sorted(os.path.basename(e["sidecar"]) for e in broken.values() if e.get("removed")):
+            info["garbled_text_removed"] = undone
         if not isinstance(ex, Exception):
             raise
         return "subtitle_remux_failed", config.mask(f"subtitle remux failed{', the original changed' if isinstance(ex, SourceChanged) else ''}: {ex}")[:500], info

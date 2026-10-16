@@ -218,8 +218,11 @@ def deep_analysis_queued():
 
 
 def backfill_jobs():
-    """(the jobs of the background queue, how many of them a backfill queued), the jobs that wait or run."""
-    return store.read(f"SELECT count(*), coalesce(sum({BACKFILL} > 0), 0) FROM jobs WHERE name LIKE 'deep-analysis-%'")[0]
+    """(the jobs of the background queue, how many of them are from a backfill, how many of them a backfill queued), the
+    jobs that wait or run. A job from a backfill is a job a backfill queued, or a job that such a job queued in turn,
+    see queue_after(). A recheck queues none. A job of an import names the import's job in "from", so it does not count."""
+    return store.read(f"SELECT count(*), coalesce(sum({BACKFILL} > 0 OR {LATER} > 0), 0), coalesce(sum({BACKFILL} > 0), 0) "
+                      "FROM jobs WHERE name LIKE 'deep-analysis-%'")[0]
 
 
 def drop_backfill(app=None):

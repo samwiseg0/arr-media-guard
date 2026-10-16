@@ -31,6 +31,8 @@ import time
 
 import pytest
 
+import amg
+
 FILES = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, FILES)
 from arr_media_guard import decide as arr_decide, lid as arr_lid, store  # noqa: E402
@@ -178,8 +180,8 @@ def test_the_speech_runs_on_the_files_clock_when_the_audio_starts_late(tmp_path,
     """An audio track that starts 1.5 s after the video decodes from its first packet. start_delay() gives the delay, and
     speech() adds it, so a burst at 5 s of the audio is speech at 6.5 s of the file. A track with no delay gets 0."""
     src = tmp_path / "av.mkv"
-    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=32x32:rate=5:duration=12", "-f", "lavfi", "-i",
-                    "aevalsrc=if(between(t\\,5\\,7)\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d=12", "-c:v", "mpeg4", "-c:a", "flac", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=32x32:rate=5:duration=12", "-f", "lavfi", "-i",
+                "aevalsrc=if(between(t\\,5\\,7)\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d=12", "-c:v", "mpeg4", "-c:a", "flac", str(src)], check=True)
     late = tmp_path / "late.mkv"
     subprocess.run(["mkvmerge", "-q", "-o", str(late), "--sync", "1:1500", str(src)], check=True)
     assert arr_lid.start_delay(str(src), 0) == 0.0 and arr_lid.start_delay(str(late), 0) == pytest.approx(1.5, abs=0.002)
@@ -267,8 +269,8 @@ def test_real_model_on_a_generated_clip(tmp_path):
     Every language the model can name must be in WHISPER, or it would map to nothing."""
     pytest.importorskip("faster_whisper")
     clip = tmp_path / "tone.mkv"
-    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=300", "-c:a", "flac",
-                    str(clip)], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=300", "-c:a", "flac",
+                str(clip)], check=True)
     r = arr_lid.identify(str(clip), 0, 300, model_dir=MODEL_DIR, cache=str(tmp_path / "lid.sqlite"))
     assert r["lang"] is None and [x["at"] for x in r["samples"]] == [75, 150, 225, 120, 180] and all(x["speech"] < arr_lid.MIN_SPEECH for x in r["samples"])
     import numpy as np

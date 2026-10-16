@@ -238,13 +238,14 @@ def outcomes(rec, sync, starts, flags_off=True):
     flags_off is False at SUBTITLES check, see subtitles.sub_fixes(). A subtitle that does not match the audio gets no
     outcome: its alert says so. Nor does one a remux removed or took out as garbled.
 
-    A plan that failed or that SUBTITLES check left out leaves its own stretches off. A track whose garbled text a
-    repair rewrites first gets "unknown", as a later run judges its times. A subtitle the whole-file timing timed goes
-    to whole_outcome(). A subtitle timed by a reference or by the speech layout takes its fit: steps from
+    A plan that failed or that SUBTITLES check left out leaves its own stretches off. A track or sidecar whose garbled
+    text a repair rewrites first gets "unknown", as a later run judges its times. A subtitle the whole-file timing
+    timed goes to whole_outcome(). A subtitle timed by a reference or by the speech layout takes its fit: steps from
     subsync.ALERT_ROWS, or when subsync.stepped() shows a jump, and an offset no fix lined up. Any other subtitle goes to
     window_outcome()."""
     rm, out = rec.get("subremux") or {}, {}
     gone = set(rm.get("remove") or ()) | set(rm.get("stripped") or ())
+    later = {k for k, g in (rec.get("garbled") or {}).items() if g.get("later")} | {e["name"] for e in rec.get("sidecars") or () if e.get("later")}
     dur = rec.get("file_duration") or 0.0
     for k, r in sorted(sync.items()):
         if r.get("verdict") == "mismatch" or k in gone:
@@ -254,7 +255,7 @@ def outcomes(rec, sync, starts, flags_off=True):
         plan = {"fix": fix, "moved": moved, "written": written}
         done = written in ("done", "planned")
         clock = "layout" if (r.get("layout") or {}).get("verdict") == "fit" else "slices" if k in (rec.get("subtime") or {}) else "window"
-        if ((rec.get("garbled") or {}).get(k) or {}).get("later"):
+        if k in later:
             out[k] = outcome("unknown", checked=False, why="a repair of its text runs first, and a later run judges its times")
         elif written in ("failed", "check") and e:
             off = whole_stretches(e, e["before"], "live" if e["live"] else "whole") or plan_stretch(fix, dur, "whole")

@@ -264,6 +264,35 @@ def failed_repack(f, t):
     return f'Couldn\'t convert the {f["container"]} file to MKV, so the original was kept. {cap(f["why"])}.'
 
 
+def unreadable_finding(tracks, kept=None, container=None, mark=None, remux=None):
+    """The one notice of subtitle bytes AMG took out and kept beside the video, see remux.broken_plan(): tracks,
+    {place or sidecar name: its entry, with "sidecar" and the facts of track_name()}, the kept original, and the
+    container of a conversion. The run of a conversion posts one notice: remux holds the notice of its subtitle remux
+    and its sidecars, see process.after_edit(). mark keys the marker, see logs.alert_findings()."""
+    return {"kind": "unreadable", "tracks": tracks, **({"kept": kept} if kept else {}), **({"container": container} if container else {}),
+            **({"mark": mark} if mark else {}), **({"remux": remux} if remux else {})}
+
+
+def unreadable(f, t, of="original"):
+    """The subtitle tracks a conversion to MKV removed because their text is not UTF-8, see convert.broken_tracks(), or a
+    subtitle remux removed because their text is garbled, see subtitles.garbled_tracks(), and the file beside the video
+    that holds the bytes of each. A track goes by its number in the original file. A garbled sidecar goes by its name
+    and the name it was renamed to, see subtitles.broken_side(). The repairs of the same run follow, see
+    subtitles.sub_findings(). Only a conversion has a container. The remux of a conversion's notice follows it. It
+    names a track by its number in the original file, from places, see process.conversion(), else in the converted
+    file, as a sidecar the conversion added."""
+    tracks, places = sorted((p for p in f["tracks"] if re.fullmatch(r"s\d+", p)), key=lambda p: int(p[1:])), f.get("places") or {}
+    num = lambda p: f"{places[p][1:]} of the original file" if p in places else f"{p[1:]} of the {of} file"
+    told = [f'{cap(track_name(p, f["tracks"][p]["lang"], num(p), f["tracks"][p]))} can\'t be read as text, so they were '
+            f'removed and saved beside the file as {bold(os.path.basename(f["tracks"][p]["sidecar"]))}.' for p in tracks]
+    told += [f'{cap(sub_name(n, {}))} can\'t be read as text, so the file was renamed to {bold(x["sidecar"])}.'
+             for n, x in sorted(f["tracks"].items()) if n not in tracks]
+    told += [sub_line(dict(x, kept=None) if x.get("kept") == f.get("kept") else x, t, f.get("langs")) for x in f.get("repaired") or []]
+    head = [f'Converted the {f["container"]} file to MKV.'] if f.get("container") else []
+    after = [unreadable(dict(f["remux"], langs=f.get("langs")), t, "converted")] if f.get("remux") else []
+    return " ".join(head + told + ([f'The {of} file is kept at {f["kept"]}.'] if f.get("kept") else []) + after)
+
+
 def damage(f, t):
     refused = f' The new MKV did not match the original, because {f["refusal"]}.' if f.get("refusal") else ""
     return f'Converting the file to MKV showed that it\'s damaged, because {bold(f["fault"])}. {f["line"].rstrip(".")}.{refused}'
@@ -328,9 +357,11 @@ FINDINGS = {
     "episode": ("Maybe the wrong episode", lambda f, t: f'{cap(content.episode_why(f["imported"], f["said"], f["title"], f["names"], quote))}.'),
     "content": ("Wrong content", lambda f, t: sentences(f["signals"])),
     "audio": ("Audio may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
-    "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
+    "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else
+              sentences(f["doubts"]) + (" AMG kept the file and did not re-grab it." if f.get("mark") == "whole" else "")),
     "damage": ("Damaged file", damage),
     "repack": ("Conversion to MKV failed", failed_repack),
+    "unreadable": ("Unreadable subtitles", unreadable),
     "header": ("File repair failed", lambda f, t: f'Couldn\'t repair the file. {cap(f["why"])}. The original file was not changed.'),
     "cut": ("File may be cut short", lambda f, t: f'{cap(f["why"])}. The file may be cut short, or the subtitles may belong to another version. '
                                                  "Nothing was changed."),
@@ -523,9 +554,11 @@ def block(b):
     return BLOCKS[b["code"]](b)
 
 
-# Why a track that does not match stays in the file, per kept_back code of process.subtitle_checks()
+# Why a track that does not match stays in the file, per kept_back code of process.subtitle_checks(). names is a
+# garbled track whose file of bytes has no free name, see subtitles.sub_findings().
 KEPT_BACK = {"check": "SUBTITLES is set to check",
-             "keep_days": "KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original"}
+             "keep_days": "KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original",
+             "names": "other files hold the names for their text beside the video"}
 
 
 REWRITE_FAILED = "rewriting the file failed"   # the words of a rewrite that failed, see remux_why()
@@ -734,8 +767,10 @@ SUB_LINES = {
     "garbled": garbled,
     "repaired": lambda x, t: f'{cap(subs_name(x["tracks"], x["langs"]))} showed garbled characters. Replaced them with the same '
                              "subtitles in readable characters" + (f' and kept the original file at {x["kept"]}.' if x.get("kept") else "."),
-    "stripped": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} showed garbled characters that couldn\'t be fixed. Took them out of '
-                             f'the file and kept their text beside the video as {x["name"]}.' + (f' The original file is kept at {x["kept"]}.' if x.get("kept") else ""),
+    "garbled_sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {GARBLED}. '
+                                    + (f'AMG didn\'t {"repair them" if x.get("repair") else "rename the file"}, because {x["left"]}.' if x.get("left")
+                                       else "--apply would replace them with the same subtitles in readable characters." if x.get("repair")
+                                       else f'--apply would rename the file to {bold(x["to"])}.'),
     "live": live_line,
 }
 
@@ -790,7 +825,7 @@ CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "
 # subtitle finding the steps of its sentences, see LINE_STEPS. None: the program tried no fix. A conversion that
 # finished, whose extras wait for the app to take the new file, stopped at the swap of the file in the app.
 FINDING_STEPS = {"language": None, "runtime": None, "duration": None, "episode": None, "content": None, "audio": None, "video": None,
-                 "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "header": WRITE, "cut": None,
+                 "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "unreadable": None, "header": WRITE, "cut": None,
                  "subtitle": None, "sublang": None, "edit": WRITE, "policy": None, "submatch": None, "subtiming": None,
                  "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None}
 # Per action code. A setting or the daily limit stops a re-grab before it starts, and so does a second check that did
@@ -803,12 +838,13 @@ sidecar_step = lambda x: WRITE if x.get("left") and not x["left"].startswith(SET
 # Per sentence code of a subtitle alert, its step, or a function of its facts that gives it. A fixed sentence, a check
 # that only reports, and SUBTITLES check give None.
 LINE_STEPS = {
-    "removed": None, "converted_track": None, "repaired": None, "stripped": None, "layout": None, "check_times": None, "check_flash": None,
+    "removed": None, "converted_track": None, "repaired": None, "layout": None, "check_times": None, "check_flash": None,
     "stays": lambda x: None if x.get("kept_back") else WRITE,
-    "sidecar": sidecar_step, "converted_sidecar": sidecar_step, "sidecar_left": sidecar_step,
+    "sidecar": sidecar_step, "converted_sidecar": sidecar_step, "sidecar_left": sidecar_step, "garbled_sidecar": sidecar_step,
     "off": lambda x: SHIFT if x.get("offsets") or "moved" in x else None if x.get("would") else HEAR if x.get("unheard") else TEST,   # see off_line()
     "not_retimed": WRITE,
-    "garbled": lambda x: None if x.get("kept_back") else WRITE if "result" in x else None if x["repair"] and not x["flags_off"] else TEST,
+    "garbled": lambda x: WRITE if x.get("kept_back") == "names" else None if x.get("kept_back") else WRITE if "result" in x
+    else None if x["repair"] and not x["flags_off"] else TEST,
     "live": lambda x: None if not x["flags_off"] else HEAR if x.get("hearing_stopped") else SHIFT,
 }
 
@@ -860,7 +896,7 @@ def said(rec):
     """What the posted alerts of rec say of its changes already, so no change post says it again: "flags", the places
     after the run of the tracks whose default and forced flags an alert says were turned off, "moved", the places of the
     tracks whose moved lines an alert counts, live captions or parts moved to their speech, and "converted", whether a
-    subtitle sentence names the conversion to MKV."""
+    subtitle sentence or the unreadable subtitles alert names the conversion to MKV."""
     langs, out = track_langs(rec, after=True), {"flags": set(), "moved": set(), "converted": False}
     for f in rec.get("findings") or []:
         told = tells(f, langs)
@@ -879,7 +915,7 @@ def tells(f, langs):
             | {f'{x["track"][0]}{number(x["track"], langs)}' for x in lines if x["code"] == "stays" and x.get("flags_off")}
             | (set(f.get("tracks") or ()) if f.get("edit") == "edited" else set()),   # see burned()
             "moved": {x["track"] for x in lines if x["code"] == "live" and x.get("moved") and x.get("flags_off") or x["code"] == "off" and "moved" in x},
-            "converted": any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)}
+            "converted": f["kind"] == "unreadable" and bool(f.get("container")) or any(x["code"] in ("converted_track", "converted_sidecar") for x in lines)}
 
 
 def held_posts(rec, f, t):
@@ -935,7 +971,7 @@ def line_keys(x):
 
 
 def conversion_change(rec, told):
-    """A conversion to MKV that no subtitle sentence names, see said()."""
+    """A conversion to MKV that no alert names, see said()."""
     rp = rec.get("repack") or {}
     if rp.get("new_size") and not told["converted"]:
         return "Converted to MKV", f'Converted the {rec.get("container") or "original"} file to MKV. Its video and audio stayed the same.' + kept(rp)

@@ -3,10 +3,14 @@
 # docker build -f docker/Dockerfile -t arr-media-guard .
 FROM debian:trixie-slim
 
+# ffmpeg comes from Debian 13. mkvtoolnix.sh installs mkvtoolnix at its pinned version from MKVToolNix's own repository,
+# and checks the repository's key by its fingerprint. The test workflow runs the same script.
+COPY docker/mkvtoolnix.sh /tmp/
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        python3 python3-venv ffmpeg mkvtoolnix logrotate tzdata tini \
-    && rm -rf /var/lib/apt/lists/*
+        python3 python3-venv ffmpeg logrotate tzdata tini \
+    && sh /tmp/mkvtoolnix.sh \
+    && rm -rf /var/lib/apt/lists/* /tmp/mkvtoolnix.sh
 
 # The venv from the lock file, each wheel checked by its sha256. lid.py --fetch downloads the pinned model and
 # checks its sha256, so a wrong model fails the build. The marker "ready" turns detection on.

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks of one file: the probes, the header check, broken audio, corrupt video and the spoken language."""
-import contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
+import bisect, contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
 
 from . import config, content, decide, store, subsync, subtitles
 
@@ -18,8 +18,9 @@ def run_bounded(argv, timeout, **kw):
 
 def mkvmerge(path):
     r = run_bounded(["mkvmerge", "-J", path], 120, capture_output=True, text=True, errors="replace")
-    if r.returncode > 1:   # 1 means warnings, and the JSON is still complete
-        raise RuntimeError("mkvmerge: " + (r.stdout + r.stderr).strip()[-300:])
+    if r.returncode not in (0, 1):   # 1 means warnings, and the JSON is still complete. A signal gives a negative code.
+        text = (r.stdout + r.stderr).strip()[-300:]
+        raise RuntimeError(f"mkvmerge exited {r.returncode}" + (f": {text}" if text else ""))
     return json.loads(r.stdout)
 
 
@@ -289,6 +290,30 @@ def segment_short(path):
     return None if not seg or seg[1] is None else seg[0] + seg[1] - size   # seg[1] None: the unknown size of a live stream
 
 
+def seeks(f, b, ds):
+    """(seek, read, lost) of the open Matroska file f. seek is decide.front_seeks() of b, the first bytes of f, with
+    the Segment data at ds. When those list no Cues, seek also gets the entries of each SeekHead they list, and of each
+    SeekHead those list. mkvpropedit writes such a second SeekHead at the end of the file when it grows an element.
+    Each SeekHead is read once, the front ones included, and SEEK_HEADS of them in all, so SeekHeads that list each
+    other or themselves end the read. read counts the bytes it reads, and lost holds the file offset of each listed
+    SeekHead that does not read as one."""
+    seek, read, lost, seen, p = decide.front_seeks(b, ds), 0, [], set(), ds
+    for i, d, n in decide.front(b, ds):
+        if i == decide.SEEKHEAD:
+            seen.add(p - ds)   # front_seeks() read it
+        p = d + n
+    for pos in [] if decide.CUES in seek else seek.get(decide.SEEKHEAD, []):   # the list grows as each SeekHead read lists more
+        if pos in seen or len(seen) >= config.SEEK_HEADS:
+            continue
+        seen.add(pos)
+        f.seek(ds + pos); c = f.read(config.HEADER_READ); read += len(c); e = decide.element(c, 0)
+        if e and e[0] == decide.SEEKHEAD and e[2] is not None:
+            decide.seek_entries(c, e[1], e[1] + e[2], seek)
+        else:
+            lost.append(ds + pos)
+    return seek, read, lost
+
+
 def header_probe(path, j):
     """The header check of a Matroska file (docs/design.md, "Header repair"), None for another container. j is its mkvmerge -J
     probe. It reads the start of the file and the Cues. It reads the last HEADER_TAIL bytes of the Segment only when
@@ -323,14 +348,10 @@ def header_probe(path, j):
             return None
         ds, seg_size = seg
         short = None if seg_size is None else ds + seg_size - size
-        seek, cues, cue_end = decide.front_seeks(b, ds), "no SeekHead lists the Cues", None
-        if decide.CUES not in seek:
-            for pos in seek.get(decide.SEEKHEAD, []):   # a second SeekHead, often at the end of the file, lists the Cues
-                f.seek(ds + pos); c = f.read(config.HEADER_READ); read += len(c); e = decide.element(c, 0)
-                if e and e[0] == decide.SEEKHEAD and e[2] is not None:
-                    decide.seek_entries(c, e[1], e[1] + e[2], seek)
-                elif ds + pos >= size:
-                    cues = "the SeekHead that lists the Cues sits past the end of the file"
+        (seek, more, lost), cues, cue_end = seeks(f, b, ds), "no SeekHead lists the Cues", None
+        read += more
+        if any(x >= size for x in lost):
+            cues = "the SeekHead that lists the Cues sits past the end of the file"
         for pos in seek.get(decide.CUES, []):
             f.seek(ds + pos); e = decide.element(f.read(12), 0)
             if not e or e[0] != decide.CUES or e[2] is None:
@@ -450,12 +471,12 @@ def zero_run(f, pos, lo=0, hi=1 << 62):
 
 
 def zero_probe(path, again=False, stop=lambda: False):
-    """(offsets as a share of the size where a 64 KiB read meets a zero run of ZERO_RUN or more, bytes read, stopped). An
+    """(the first byte of each zero page where a 64 KiB read meets a zero run of ZERO_RUN or more, bytes read, stopped). An
     incomplete download leaves regions of zero bytes. The read holds an all-zero 4 KiB page, and zero_run() measures
     the run around it. An encoder that pads easy frames with zeros leaves only short runs, far under ZERO_RUN. again
     moves every read by half a step, for the second check before a re-grab. Hits closer than one read count once,
     because the reads of a file under about 18 MB overlap. stop() is asked before each read and ends the probe early.
-    The reads spread over zero_span() of the file, and each offset is a share of the whole file."""
+    The reads spread over zero_span() of the file."""
     size, hits, zero, read, n, last = os.path.getsize(path), [], bytes(4096), 0, decide.ZERO_READS, None
     with open(path, "rb", buffering=0) as f:
         lo, hi = zero_span(f, size)
@@ -470,7 +491,7 @@ def zero_probe(path, again=False, stop=lambda: False):
             if page is not None and (last is None or page - last >= 65536):
                 run, more = zero_run(f, page, lo, hi); read += more
                 if run >= decide.ZERO_RUN:
-                    hits.append(round(page / size, 3)); last = page
+                    hits.append(page); last = page
     return hits, read, False
 
 
@@ -547,6 +568,101 @@ def zero_again(path, runs):
     return [r for r, (n, _) in got if n >= decide.ZERO_RUN], sum(more for _, (_, more) in got)
 
 
+def zero_pad(path):
+    """The first byte of the zero padding of a Matroska file, or None. Padding is one run of zero bytes after the Cues,
+    inside the Segment. Only whole level-1 elements that are not Clusters lie from the Cues to the Segment end, and at
+    least one follows the run. No player reads it. Some releases end with a few hundred zero bytes past their Segment.
+    mkvpropedit can then write a grown element at the end of the file and extend the Segment over the zeros. The read
+    pass names the first zero. None for an unknown Segment size, a Segment end past the file end, no SeekHead that
+    lists the Cues, see seeks(), Cues before a Cluster, a run of ZERO_RUN or more, or an element past the Segment end."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2); f.seek(0); b = f.read(config.HEADER_READ)
+            seg = decide.segment_start(b)
+            cues = seg and seg[1] is not None and seeks(f, b, seg[0])[0].get(decide.CUES)
+            if not cues or seg[0] + seg[1] > size:
+                return None
+            p, end, run = seg[0] + cues[0], seg[0] + seg[1], None
+            f.seek(p); e = decide.element(f.read(16), 0)
+            if not e or e[0] != decide.CUES or e[2] is None:
+                return None
+            p += e[1] + e[2]
+            for _ in range(64):   # a few elements: Tags, Chapters, Tracks, a Void
+                if p >= end:
+                    break
+                f.seek(p); h = f.read(16)
+                if h[:1] == b"\0" and run is None:
+                    f.seek(p); z = f.read(min(decide.ZERO_RUN, end - p)); k = len(z) - len(z.lstrip(b"\0"))
+                    if k == len(z):   # a run of ZERO_RUN or more, or one up to the Segment end
+                        return None
+                    run, p = p, p + k
+                    continue
+                e = decide.element(h, 0)
+                if not e or e[2] is None or e[0] not in decide.LEVEL1 or e[0] == decide.CLUSTER:
+                    return None
+                p += e[1] + e[2]
+    except OSError:
+        return None
+    return run if p == end else None
+
+
+def play_times(path, pos):
+    """The play time of each byte of pos in a Matroska file, in seconds: the Timestamp of the last Cluster at or before
+    it that the Cues name, from one 32-byte read of that Cluster's start. So the time is never more than a few frames
+    later than the byte's blocks. Reordered frames can time a block a little before its Cluster's Timestamp. A Cluster
+    the Cues do not name makes the time earlier. The Clusters after the last named one are walked, a
+    few at most, and each gives its own Timestamp. "start" for a byte before the first named Cluster, and "end" for
+    one past the last Cluster, when the walk reaches the next level-1 element or the Segment end. When it reaches
+    neither, a byte past the Clusters it read gets None, as does a byte of a Cluster whose Timestamp does not read.
+    Every byte gets None in another container, with no SeekHead that lists the Cues, see seeks(), and with Cues that
+    do not parse to their end, as when the last piece of a download is lost. The read pass names bytes, and an alert
+    names play times, or a share of the file size for None."""
+    out = [None] * len(pos)
+    stamp = lambda h, e: next((int.from_bytes(h[d:d + n], "big") for i, d, n in decide.children(h, e[1], len(h)) if i == decide.TIMESTAMP), None)
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2); f.seek(0); b = f.read(config.HEADER_READ)
+            seg = decide.segment_start(b)
+            cues = seg and seeks(f, b, seg[0])[0].get(decide.CUES)
+            scale = cues and decide.timestamp_scale(b, seg[0])
+            if not scale:
+                return out
+            f.seek(seg[0] + cues[0]); e = decide.element(f.read(12), 0)
+            if not e or e[0] != decide.CUES or e[2] is None or e[2] > config.CUES_MAX:
+                return out
+            f.seek(seg[0] + cues[0] + e[1]); c = f.read(e[2])
+            if len(c) != e[2] or max((d + n for _, d, n in decide.children(c, 0, len(c))), default=0) != len(c):
+                return out   # zeros from inside the Cues on: the Clusters they name are only a part
+            named = sorted(seg[0] + p for p in decide.last_cues(c, decide.CUECLUSTER))
+            if not named:
+                return out
+            end, p, done, walked = size if seg[1] is None else min(size, seg[0] + seg[1]), named[-1], None, []   # done: the end of the last Cluster
+            for _ in range(64):   # the Clusters from the last one the Cues name: a few
+                f.seek(p); h = f.read(32); e = decide.element(h, 0)
+                if p >= end or (e and e[0] in decide.LEVEL1 and e[0] != decide.CLUSTER and e[2] is not None):
+                    done = p
+                    break
+                if not e or e[0] != decide.CLUSTER or e[2] is None:   # a broken Cluster: its end is unknown
+                    break
+                walked.append((p, stamp(h, e)))
+                p += e[1] + e[2]
+            ticks, starts = dict(walked), [w for w, _ in walked]   # the Timestamp of each Cluster read
+            for k, x in enumerate(pos):
+                if x < named[0]:
+                    out[k] = "start"
+                elif done is not None and x >= done:
+                    out[k] = "end"
+                elif x < p:   # past p lie the Clusters the walk did not read
+                    c = starts[bisect.bisect_right(starts, x) - 1] if x >= named[-1] else named[bisect.bisect_right(named, x) - 1]
+                    if c not in ticks:
+                        f.seek(c); h = f.read(32); e = decide.element(h, 0)
+                        ticks[c] = stamp(h, e) if e and e[0] == decide.CLUSTER else None
+                    out[k] = None if ticks[c] is None else round(ticks[c] * scale / 1e9, 3)
+    except OSError:
+        pass
+    return out
+
+
 COPY_KEEP = 1000   # lines of the read pass kept for their places. A healthy remux can log a NOISE line per packet.
 
 
@@ -596,7 +712,9 @@ def whole_check(path, stop=lambda: None):
     or the time WHOLE_RATE needs, whichever is longer, and a stopped pass gives nothing. Its stderr goes through a pipe
     to copy_lines(). stop() runs as often as zero_scan() and watch() ask, and may raise, see zero_scan(). No ffmpeg
     outlives the check. The zeros field holds the runs in bytes, in "at" as shares of the size, and in "count" the runs
-    that count. fault is zero-filled for a certain verdict."""
+    that count. fault is zero-filled for a certain verdict. A byte of the read pass that starts the file's zero_pad()
+    moves from pos to padding, because no player reads it. when holds the play_times() of the other bytes, and in the
+    zeros field those of the first byte of each run."""
     size, t0, pcm = os.path.getsize(path), time.monotonic(), pcm_audio(path)
     bound = max(WHOLE_MIN, size / WHOLE_RATE)
     took = lambda t: round(time.monotonic() - t, 1)
@@ -609,6 +727,8 @@ def whole_check(path, stop=lambda: None):
     try:
         runs, read = zero_scan(path, stop)
         zeros = {"runs": runs, "at": [[round(a / size, 4), round(e / size, 4)] for a, e in runs], "read": read, "took": took(t0)}
+        if runs:
+            zeros["when"] = play_times(path, [a for a, _ in runs])
         if len(runs) >= 2 and not pcm:
             p.kill(); p.wait()
             ff, out = {"skipped": "the zero scan was certain"}, None
@@ -616,13 +736,18 @@ def whole_check(path, stop=lambda: None):
             stopped = watch(p, lambda: stop() or config.DEADLINE.check() or (f"ran over {bound:.0f} s" if time.monotonic() - t0 > bound else None))
             p.wait(); reader.join()
             out = None if stopped else dict(decide.parse_copy("\n".join(got["kept"]), p.returncode, size), lines=got["lines"], noise=got["noise"])
+            if out and out["pos"]:
+                if (pad := zero_pad(path)) in out["pos"]:
+                    keep = [b for b in out["pos"] if b != pad]
+                    out.update(pos=keep, at=[round(b / size, 4) for b in keep], padding=pad)
+                out["when"] = play_times(path, out["pos"])
             ff = dict(out or {"skipped": stopped}, took=took(t0), code=p.returncode)
     finally:
         if p.poll() is None:   # a stop or an error: no ffmpeg outlives the check
             p.kill(); p.wait()
         reader.join(10)
         p.stderr.close()
-    certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm)
+    certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
     return certain, zero, more, {"zeros": zeros, "ffmpeg": ff, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
 
 
@@ -730,7 +855,8 @@ def check_video(path, dur, again=False, hp=None, pcm=None):
     find again. again is that second check: the zero reads move by half a step and the windows go to VIDEO_AGAIN, so it
     samples other parts of the file. Under a time limit (the hook) a stage starts only when the limit holds its worst
     case plus VIDEO_RESERVE, and the zero probe stops once the reserve is reached. A skipped or stopped stage is logged
-    and is never a doubt. video_check() turns any exception into no verdict.
+    and is never a doubt. video_check() turns any exception into no verdict. The zeros stage logs its hits as shares of
+    the file size, and their play_times() in when.
 
     hp is header_probe() of the file. Its fields join the header stage. With it, a Segment size under SHORT_CERTAIN past
     the end after the hook's own failed edit is a header issue, and no doubt. The header stage then says whether a remux
@@ -787,8 +913,10 @@ def video_stages(path, dur, again, hp, pcm=False):
     if left() < config.ZERO_SECS + config.VIDEO_RESERVE:
         fields["zeros"] = {"skipped": f"{left():.0f} s left of the job's time limit"}
         return None, doubts, fields
-    t = time.monotonic(); hits, read, stopped = zero_probe(path, again, lambda: left() < config.VIDEO_RESERVE)
-    fields["zeros"] = {"hits": hits, "took": took(t), "read": read, **({"pcm": True} if pcm else {})}
+    t = time.monotonic(); pos, read, stopped = zero_probe(path, again, lambda: left() < config.VIDEO_RESERVE)
+    size = os.path.getsize(path)
+    hits, when = [round(b / size, 3) for b in pos], play_times(path, pos) if pos else None   # the Cues: a few small reads
+    fields["zeros"] = {"hits": hits, **({"when": when} if when else {}), "took": took(t), "read": read, **({"pcm": True} if pcm else {})}
     if stopped:   # a partial probe gives no verdict
         fields["zeros"]["skipped"] = f"stopped with {left():.0f} s left of the job's time limit"
         return None, doubts, fields
@@ -804,7 +932,7 @@ def video_stages(path, dur, again, hp, pcm=False):
     if sum(bool(w.get("nodecoder")) for w in windows) >= 2 and not any(w.get("encrypted") for w in windows) and encrypted_video(path):
         for w in windows:   # ffmpeg named no encryption, but the bytes show it
             w["encrypted"] = bool(w.get("nodecoder"))
-    certain, more = decide.video_verdict([] if pcm else hits, windows)
+    certain, more = decide.video_verdict([] if pcm else hits, windows, when=when)
     return certain, more + doubts, dict(fields, fault=certain and ("zero-filled" if len(hits) >= 2 and not pcm else "bad windows"))
 
 

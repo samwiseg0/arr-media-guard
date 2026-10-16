@@ -198,8 +198,9 @@ fixed, posts nothing. Under 20 anchored lines AMG judges nothing, and under 10 i
 - When the listening stops part way, as when the speech model fails, AMG moves nothing and judges nothing. An alert
   the import held then posts. The result stays pending, but nothing queues a new run. A later `--sub-time` or deep
   analysis of the file goes on where the listening stopped.
-- The listening runs on the CPU. A deep analysis takes a median of about 5 minutes per hour of video, and one file in
-  four takes 15 minutes or more per hour. The deep analysis gives way to an import between two pairs of windows.
+- The listening runs on the CPU. A deep analysis takes about 16 minutes per hour of video on a recent CPU. More
+  speech and an older CPU take longer, see [design.md](design.md#subtitle-match). The deep analysis gives way to an
+  import between two pairs of windows.
 - Known limit: a line with no heard words moves no farther than the heard lines next to it. When one of them stays,
   the line stays too, even when the stretch around it is off.
 - Known limit: a stretch of lines with no heard words right before a jump can move with the part after the jump.
@@ -330,28 +331,36 @@ no gap get none either. It runs with Foreign subtitle timing, never at an import
 ### Garbled subtitle repair
 
 An old muxer could store a subtitle track in the wrong character set. Greek "Καλημέρα, φίλε μου" then shows as
-"ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. AMG checks each SubRip track, the text format of `.srt` files, for it. It
-does that in the deep analysis and with `--sub-check` and `--sub-time`, which read the whole file. An import does not.
-This check needs no language detection.
+"ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. AMG checks each SubRip, ASS, SSA and WebVTT track for it, and each `.srt`
+sidecar saved in UTF-8. It does that in the deep analysis and with `--sub-check` and `--sub-time`, which read the whole
+file. An import does not. This check needs no language detection.
 
-- AMG reads the track's own bytes in the right character set. When that text reads as the language of the track's tag,
-  AMG writes the track back readable. It does that in one remux, which it checks line by line.
+- When the track was UTF-8 read the wrong way and its text then reads as the language of its tag, AMG writes the track
+  back readable. It does that in one remux, which it checks line by line. Only a SubRip track is repaired.
 - A line the old muxer cut short stays cut, unless a sidecar holds it whole. Such a sidecar, as the `Movie.3.srt` Radarr
   writes, must hold the same lines as the track.
-- When more than 2 percent of the lines were cut short, AMG does not repair the track. Some character sets leave no
-  trace of a cut, so the count can miss a few.
-- A letter that is already right stays, such as the "º" of "40.5ºC", or the "é" of "Café" in Cyrillic text.
+- When more than 2 percent of the lines were cut short, AMG does not repair the track.
 - The word check cannot read garbled text, so AMG repairs such a track and does not take it out. The saved result stays
   pending, so the next `--sub-check` checks the repaired words and times.
 - A track read only in part gets an alert, and no repair.
 
-AMG takes a garbled track that it cannot repair out of the file, and keeps the old file for `KEEP_ORIGINALS_DAYS`. Its
-bytes go beside the video as `<name>.<language>.garbled.txt`, for example `Film (2001).bul.garbled.txt`, and an alert
-names it. Players skip that file, and AMG never writes over a file. With `KEEP_ORIGINALS_DAYS` at 0, the track stays,
-and the alert says why.
+A track whose text reads right only in an older character set, such as Windows-1250, often lost letters when the old
+muxer cut bytes. AMG cannot tell which ones, so it takes that track out of the file. It does the same with a garbled
+track it cannot repair for another reason, and with a garbled ASS, SSA or WebVTT track. It keeps the old file for
+`KEEP_ORIGINALS_DAYS`. The track's bytes go beside the video in its own format, for example
+`Film (2001).bul.broken-encoding.srt.txt` or `Film (2001).pol.broken-encoding.ass.txt`. An ASS file keeps its styles.
+With `KEEP_ORIGINALS_DAYS` at 0, the track stays, and the alert says why.
 
-To fix such a track by hand, open the `.garbled.txt` file in a subtitle editor that reads other character sets, such as
-Subtitle Edit. Pick the set that makes it readable, save it as a UTF-8 `.srt`, then add it back.
+A garbled `.srt` sidecar gets the same rule. When it was UTF-8 read the wrong way and reads as the language of its
+name, AMG writes its lines back readable and keeps the old file for `KEEP_ORIGINALS_DAYS`. A sidecar with no language
+in its name takes the language its lines read as. No line of a sidecar may be cut short. Its times and the rest of the
+file stay as they are, and the next `--sub-check` checks its words and times. Any other garbled sidecar, or one
+whose repair AMG cannot prove, gets the name `<name>.<language>.broken-encoding.srt.txt` with its bytes as they are.
+Bazarr may then fetch a new sidecar.
+
+Players, Sonarr, Radarr and Bazarr skip a `.txt` file, and AMG never writes over a file. The alert "Unreadable
+subtitles" names each file. To fix such a file by hand, open it in a subtitle editor that reads other character sets,
+such as Subtitle Edit. Pick the set that makes it readable, save it as a UTF-8 `.srt`, then add it back.
 
 ```sh
 mkvmerge -o "Film (2001).new.mkv" "Film (2001).mkv" --language 0:bul "Film (2001).bul.srt"
@@ -430,6 +439,6 @@ Move-Item -Force ".arr-media-guard-originals\<UTC time>\Episode.mkv" "Episode.mk
 
 The exit codes are those of `--sub-time` above.
 
-Listening to the whole audio takes a median of about 5 minutes per hour of video. One file in four takes 15 minutes
-or more per hour. See [Whole-file timing](#whole-file-timing). The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon,
+Listening to the whole audio takes about 16 minutes per hour of video on a recent CPU. See
+[Whole-file timing](#whole-file-timing). The run was tested on Linux. Windows with Docker Desktop, and Apple Silicon,
 which runs the amd64 image under emulation, were not tested.

@@ -165,6 +165,20 @@ FINDINGS = [
     ({"kind": "burned_in", "lang": "eng", "english": True, "audio": "jpn", "tracks": ["s1"], "edit": "hardlinked"}, "Burned-in subtitles", "amber",
      "The video has English subtitles burned in, and the audio is Japanese. Couldn't turn off the English subtitles (track 1), because the file "
      "has another hard link, such as the download client's copy. The original file was not changed."),
+    ({"kind": "unreadable", "container": "MP4/QuickTime", "tracks": {"s3": {"stream": 4, "lang": "per", "sidecar": "/m/Film A (1979).per.broken-encoding.srt.txt",
+     "reused": False, "role": "full", "name": "", "sdh": False, "forced": False}}}, "Unreadable subtitles", "amber",
+     "Converted the MP4/QuickTime file to MKV. The Persian subtitles (track 3 of the original file) can't be read as text, so they were removed "
+     "and saved beside the file as Film A (1979).per.broken-encoding.srt.txt."),
+    ({"kind": "video", "doubts": ["a full read of the file found damaged data at 41:07"], "mark": "whole"}, "Video may be broken", "amber",
+     "A full read of the file found damaged data at 41:07. AMG kept the file and did not re-grab it."),
+    ({"kind": "unreadable", "kept": "/k/F.mkv", "tracks": {"Film A (1979).pl.srt": {"sidecar": "Film A (1979).pl.broken-encoding.srt.txt"},
+                                                         "s10": {"lang": "pol", "role": "sdh", "sidecar": "Film A (1979).pol.10.broken-encoding.ass.txt"},
+                                                         "s2": {"lang": "per", "sidecar": "Film A (1979).per.broken-encoding.srt.txt"}}},
+     "Unreadable subtitles", "amber",
+     "The Persian subtitles (track 2 of the original file) can't be read as text, so they were removed and saved beside the file as "
+     "Film A (1979).per.broken-encoding.srt.txt. The Polish SDH subtitles (track 10 of the original file) can't be read as text, so they were "
+     "removed and saved beside the file as Film A (1979).pol.10.broken-encoding.ass.txt. The subtitles in Film A (1979).pl.srt can't be read "
+     "as text, so the file was renamed to Film A (1979).pl.broken-encoding.srt.txt. The original file is kept at /k/F.mkv."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -379,14 +393,13 @@ SUB_LINES = [
     ({"code": "live", "track": "s1", "lag": 8.0, "moved": 380, "cues": 400, "left": 10, "flags_off": False},
      "The English subtitles (track 1) run behind the speech by a different amount on each line, as live captions do. On average they "
      "are about 8.0 s late. SUBTITLES is set to check, so they were left as they are.", None),
-    ({"code": "stripped", "track": "s2", "name": "F.spa.garbled.txt", "kept": "/k/F.mkv"},
-     "The Spanish subtitles (track 2) showed garbled characters that couldn't be fixed. Took them out of the file and kept their text "
-     "beside the video as F.spa.garbled.txt. The original file is kept at /k/F.mkv.", None),
+    ({"code": "garbled_sidecar", "name": "F.pl.srt", "to": "F.pl.broken-encoding.srt.txt", "left": "SUBTITLES is set to check"},
+     "The subtitles in F.pl.srt show garbled characters. AMG didn't rename the file, because SUBTITLES is set to check.", None),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "result": "subtitle remux failed: mkvmerge exited 2",
-      "names": ["F.spa.garbled.txt"], "block": {"code": "remux"}, "hardlinked": False},
+      "names": ["F.spa.broken-encoding.srt.txt"], "block": {"code": "remux"}, "hardlinked": False},
      "The Spanish subtitles (track 2) show garbled characters, but rewriting the file failed. The original file was not changed.",
      "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. "
-     "--apply would take them out of the file and keep their text beside the video as F.spa.garbled.txt."),
+     "--apply would take them out of the file and keep their text beside the video as F.spa.broken-encoding.srt.txt."),
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "kept_back": "keep_days"},
      "The Spanish subtitles (track 2) show garbled characters, and the right text couldn't be worked out for sure. They're still in the "
      "file, because KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original.", None),
@@ -471,6 +484,8 @@ SUB_LINES = [
     ({"code": "off", "track": "s2", "ref": "s1", "why": "the cues are off", "offsets": [-0.04, -0.12, -0.08, -0.04, -0.09, -0.11, -1.04, -0.96, -0.96, -0.93],
       "unfixed": None}, "The Spanish subtitles (track 2) are out of sync compared with the English subtitles (track 1) by different amounts in "
      "different parts of the file, up to 1.0 s early. One shift can't fix that, so they were left as they are.", None),
+    ({"code": "garbled_sidecar", "name": "F.pl.srt", "to": "F.pl.broken-encoding.srt.txt", "left": None},
+     "The subtitles in F.pl.srt show garbled characters. --apply would rename the file to F.pl.broken-encoding.srt.txt.", None),
 ]
 
 def test_every_template_has_a_golden():
@@ -650,7 +665,7 @@ def test_the_embed_target_is_one_embed_per_finding():
 # program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
 # track a conversion left out. Every other golden posts, a doubt and a failed restore too.
 LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9, 20, 21}, "sub_lines": {0, 7, 10, 23, 24, 26}}
-SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "stripped")   # the sentences of a submatch finding
+SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "garbled_sidecar")   # the sentences of a submatch finding
 
 
 def every_alert():
@@ -768,6 +783,22 @@ def test_discord_posts_all_posts_one_per_change_and_nothing_for_no_change(sent, 
     dry = decision(**dict(CHANGED, apply=False, outcome="dry_run", result="dry run", repack={}, header_repair={"code": "would_repair_header"},
                           subremux=dict(CHANGED["subremux"], done=False, removed=[]), findings=[]))
     assert h.alert_findings(dry, 1) == [] and dry["change_result"] == [] and sent == []
+
+
+def test_the_unreadable_subtitles_notice_names_each_track_and_its_file(sent, settings):
+    """One notice for a conversion that took out broken tracks: each track by its number in the original file, as a
+    player names it, with the file that holds its bytes, and the kept original. With DISCORD_POSTS all it is the only
+    post of the conversion."""
+    settings(discord_posts="all")
+    side = lambda n: {"lang": "per", "sidecar": f"/m/Film A (1979).per.{n}.broken-encoding.srt.txt", "role": "forced" if n == 4 else "full", "name": "",
+                      "sdh": False, "forced": n == 4}
+    f = {"kind": "unreadable", "container": "MP4/QuickTime", "kept": "/k/Film A.mp4", "tracks": {"s4": side(4), "s2": side(2)}}
+    got, rec = changed(findings=[f], header_repair={}, subremux={}, edits=[], whole={}, flash={}, subcheck={})
+    assert got == ["sent"] and described(sent) == [("Unreadable subtitles", "Converted the MP4/QuickTime file to MKV.\nThe **Persian subtitles (track 2 of "
+        "the original file)** can't be read as text, so they were removed and saved beside the file as **Film A (1979).per.2.broken-encoding.srt.txt**.\n"
+        "The **Persian forced subtitles (track 4 of the original file)** can't be read as text, so they were removed and saved beside the file as "
+        "**Film A (1979).per.4.broken-encoding.srt.txt**.\nThe original file is kept at /k/Film A.mp4.")], described(sent)
+    assert h.render(rec, "log")["alerts"] == ["unreadable: " + h.unmarked(h.texts(f, "done")[0])]
 
 
 def test_after_a_re_grab_only_the_re_grab_posts(sent, settings):
@@ -896,7 +927,7 @@ def test_an_overrun_alert_after_a_strip_names_the_track_that_runs_over():
                    subremux={"done": True, "removed": [], "stripped": {"s1": "Film A.fre.srt"}, "kept": "/k/A.mkv",
                              "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}]})
     hp = {"issue": ["a subtitle runs past the end"], "unfixable": [{"track": "s1", "codec": "S_HDMV/PGS", "end": 7300.0, "streams": 6000.0}]}
-    ctx = types.SimpleNamespace(rec=rec, d={}, hp=hp, vpre=None, damaged=None, unconverted=None, tags=None, mode="sub_time")
+    ctx = types.SimpleNamespace(rec=rec, d={}, hp=hp, vpre=None, damaged=None, unconverted=None, unreadable=None, tags=None, mode="sub_time")
     h.faults(ctx)
     assert ctx.rest[0]["tracks"][0]["track"] == "s2"
     assert h.render(dict(rec, findings=ctx.rest), "embed")[0]["description"].startswith("The **English subtitles (track 1)** keep going until")
@@ -1513,8 +1544,8 @@ def test_the_documented_undo_reverses_an_edit_from_the_editing_line(tmp_path, se
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvpropedit")):
         pytest.skip("needs ffmpeg and mkvtoolnix")
     src, path, log = tmp_path / "src.mkv", tmp_path / "Film A (2000).mkv", tmp_path / "log.jsonl"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
-                    "-map", "0", "-map", "1", "-c:a", "aac", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
+                "-map", "0", "-map", "1", "-c:a", "aac", str(src)], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(path), "--language", "0:eng", "--default-track-flag", "0:1", "--language", "1:spa",
                     "--default-track-flag", "1:0", str(src)], check=True)
     settings(log=str(log), state_dir=str(tmp_path))

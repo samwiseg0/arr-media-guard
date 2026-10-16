@@ -1199,6 +1199,24 @@ instance. With no pass flag (--convert, --sub-check, --check-audio, --check-vide
 README.md says how to install and connect it. docs/commands.md explains each mode, and docs/design.md how it works."""
 
 
+MKVMERGE_MIN = 102   # the oldest mkvmerge AMG supports, owner 2026-10-16. docker/mkvtoolnix.sh installs it in the image.
+
+
+def mkvmerge_lines():
+    """The --selftest lines of the mkvmerge on PATH: its version, and one warning when it is older than MKVMERGE_MIN or
+    its version does not read. The warning names the README's install steps and never fails the selftest."""
+    try:
+        said = subprocess.run(["mkvmerge", "--version"], capture_output=True, text=True, errors="replace", timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        said = ""
+    m = re.match(r"mkvmerge v(\d+)((?:\.\d+)*)", said)
+    see = f'AMG supports mkvmerge {MKVMERGE_MIN}, see "Install on a host" in README.md.'
+    if not m:
+        return ["mkvmerge version: unknown", f"warning: the version of mkvmerge does not read. {see}"]
+    version = m[1] + m[2]
+    return [f"mkvmerge version: {version}"] + ([f"warning: mkvmerge {version} is older than {MKVMERGE_MIN}. {see}"] if int(m[1]) < MKVMERGE_MIN else [])
+
+
 def main(argv):
     mode = argv[:1]
     # A deploy tool may run --selftest on every dry run, which must change nothing on the host. So the selftest records
@@ -1213,11 +1231,13 @@ def main(argv):
         print(f"keys from the environment: {', '.join(config.CFG.from_env) or 'none'}")   # the names only, as a value may be a secret
         if os.path.exists(store.path()):   # a selftest creates no store
             with contextlib.suppress(sqlite3.Error):
-                print("background queue: {} jobs, {} of them queued by a backfill".format(*runner.backfill_jobs()))
+                jobs, ours, left = runner.backfill_jobs()
+                print(f"background queue: {jobs} jobs, {ours} of them from a backfill ({left} file{'s' if left != 1 else ''} still to check)")
         if config.CFG.errors:
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:
             sys.exit(f"selftest failed: {config.policy_help()}")
+        print(*mkvmerge_lines(), sep="\n")
         for app in config.CFG.apps:   # a warning only: an app this host does not run has no key here
             try:
                 apps.api_key(app)

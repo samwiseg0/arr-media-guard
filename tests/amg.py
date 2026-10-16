@@ -14,11 +14,21 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """The package as a test sees it: one object for the names the script held when it was one file. load() gives a test
-file its own copy of the package, as loading the script by path did."""
+file its own copy of the package, as loading the script by path did. ffmpeg() makes a test clip once and copies it
+after that."""
+import contextlib
+import functools
+import hashlib
 import importlib
 import importlib.util
+import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,3 +99,99 @@ def load(name="arr_media_guard"):
 def deadlines():
     """The job's time limit, content.DEADLINE, of each copy of the package loaded so far."""
     return [m.DEADLINE for k, m in list(sys.modules.items()) if k.endswith(".content") and hasattr(m, "DEADLINE")]
+
+
+MEDIA = os.environ.get("AMG_TEST_MEDIA") or os.path.join(os.path.expanduser("~"), ".cache", "arr-media-guard", "test-media")
+MEDIA = MEDIA if MEDIA == "off" else os.path.abspath(MEDIA)   # a test that changes folder keeps the same cache
+STOPS = r"\s:,'|=\[\];"   # the characters that end a path inside an argument
+INNER_PATH = re.compile(rf"/[^{STOPS}]+")   # an absolute path inside an argument, as subtitles=/a/b.srt or concat:/a|/b
+WORD = re.compile(rf"[^{STOPS}]+")
+KEPT = re.compile(r"[0-9a-f]{64}(\.\w+)?|\.new-\w+")   # the names of the clips and temp files ffmpeg() writes
+RUN = subprocess.run   # bound at import, so a test that fakes subprocess.run never reaches the cache
+
+
+@functools.cache
+def ffmpeg_version():
+    """The part of the key that the host decides. It holds the output of ffmpeg -version, the size and mtime of the
+    ffmpeg program and of each library ldd lists for it, and each line of fc-list with the size and mtime of its font
+    file. An update of a codec library, libass or a font changes it. None when ldd or fc-list is missing, and then
+    ffmpeg() keeps no clip."""
+    stat = lambda path: f"{path} {os.stat(path).st_size} {os.stat(path).st_mtime_ns}"
+    try:
+        version = RUN(["ffmpeg", "-version"], capture_output=True, text=True, check=True).stdout
+        libs = re.findall(r"(/\S+) \(0x", RUN(["ldd", shutil.which("ffmpeg")], capture_output=True, text=True).stdout)
+        fonts = sorted(RUN(["fc-list"], capture_output=True, text=True, check=True).stdout.splitlines())
+        return "\n".join([version, *map(stat, [shutil.which("ffmpeg"), *libs]), *(f"{f} {stat(f.split(': ')[0])}" for f in fonts)])
+    except FileNotFoundError:
+        return None
+
+
+@functools.cache
+def prune(folder, days=3):
+    """Deletes each clip and temp file of ffmpeg() in folder that no call has used for days, once in each process. A
+    clip made from a file that differs on each run, such as one mkvmerge wrote with new UIDs, is never used again."""
+    old = time.time() - days * 86400
+    for f in os.scandir(folder):
+        with contextlib.suppress(FileNotFoundError):   # another worker renamed or deleted it after the scan
+            if KEPT.fullmatch(f.name) and f.stat().st_mtime < old:
+                os.remove(f.path)
+
+
+def content(path):
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest() + os.path.splitext(path)[1]
+
+
+def key(argv):
+    """The key of the ffmpeg call argv, or None when the call reads a file the key cannot see. The key holds
+    ffmpeg_version(), the arguments before the output and the output's extension. An argument that names a file counts
+    by the file's content. So does each absolute path inside an argument, as in subtitles=/a/b.srt, and each character
+    in STOPS ends such a path. A concat list, -attach and an input that is neither a file nor a lavfi graph, such as an
+    image pattern, give None. So do a relative path inside an argument, and a path inside an argument that names no
+    file in a folder that exists, such as a path with a space."""
+    version, fmt, parts = ffmpeg_version(), None, []
+    if version is None or "-attach" in argv:
+        return None
+    for flag, a in zip([None, *argv], map(str, argv[:-1])):
+        inner = INNER_PATH.findall(a)
+        unseen = [p for p in inner if not os.path.isfile(p)]
+        if flag == "-i":
+            if fmt == "concat" or (fmt != "lavfi" and not os.path.isfile(a) and (unseen or not inner)):
+                return None
+            fmt = None
+        fmt = a if flag == "-f" else fmt
+        if os.path.isfile(a):
+            parts.append(content(a))
+            continue
+        if any(os.path.dirname(p) != "/" and os.path.isdir(os.path.dirname(p)) for p in unseen) or any(
+                not w.startswith("/") and os.path.isfile(w) for w in WORD.findall(a)):
+            return None
+        parts.append(INNER_PATH.sub(lambda m: content(m[0]) if os.path.isfile(m[0]) else m[0], a))
+    return json.dumps([version, parts, os.path.splitext(str(argv[-1]))[1]])
+
+
+def ffmpeg(argv, **kw):
+    """subprocess.run() for an ffmpeg call that makes a test clip, the file its last argument names. The first call with
+    a key, see key(), makes the clip and keeps a copy in the folder AMG_TEST_MEDIA names. A later call with that key
+    copies the clip. Each call writes its own copy, so a test may change it. When a call keeps a new clip, it deletes
+    each clip that no call used for 3 days, see prune(). AMG_TEST_MEDIA=off makes every clip again. A call runs as it
+    is when key() gives None, when it runs another program, or when it passes an argument other than check. Only a
+    test's own clips come here. Product code, and a test that runs a command line of the product, run the real tools."""
+    out = str(argv[-1])
+    k = None if MEDIA == "off" or argv[0] != "ffmpeg" or set(kw) - {"check"} or out == "-" else key(argv)
+    if k is None:
+        return RUN(argv, **kw)
+    kept = os.path.join(MEDIA, hashlib.sha256(k.encode()).hexdigest() + os.path.splitext(out)[1])
+    with contextlib.suppress(FileNotFoundError):   # none kept, or another run pruned it just now
+        os.utime(kept)
+        shutil.copyfile(kept, out)
+        return subprocess.CompletedProcess(argv, 0)
+    made = RUN(argv, **kw)
+    if made.returncode == 0:   # a temp name, then a rename, so two workers that make the same clip at once both keep a whole file
+        os.makedirs(MEDIA, exist_ok=True)
+        prune(MEDIA)
+        fd, tmp = tempfile.mkstemp(dir=MEDIA, prefix=".new-")
+        os.close(fd)
+        shutil.copyfile(out, tmp)
+        os.replace(tmp, kept)
+    return made

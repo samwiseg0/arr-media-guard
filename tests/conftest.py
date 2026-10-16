@@ -17,6 +17,7 @@
 import dataclasses
 import io
 import os
+import shlex
 import signal
 import socket
 import urllib.request
@@ -83,3 +84,17 @@ def settings(request, monkeypatch):
         apps = {app: dataclasses.replace(a, **changes.pop(app, {})) for app, a in script.CFG.apps.items()}
         monkeypatch.setattr(script, "CFG", dataclasses.replace(script.CFG, apps=apps, **changes))
     return change
+
+
+@pytest.fixture
+def mkvmerge_says(tmp_path, monkeypatch):
+    """mkvmerge_says(text) puts an mkvmerge first on PATH that prints text, so the selftest reads its version from
+    text, see cli.mkvmerge_lines(). With no text it says 102.0. A test of a selftest with no warning takes it, so it
+    passes with any mkvmerge on the host, or none."""
+    def says(text="mkvmerge v102.0 ('Made Up') 64-bit"):
+        folder = tmp_path / "mkvmerge-says"
+        folder.mkdir(exist_ok=True)
+        (folder / "mkvmerge").write_text(f"#!/bin/sh\necho {shlex.quote(text)}\n")
+        (folder / "mkvmerge").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+    return says

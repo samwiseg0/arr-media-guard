@@ -632,3 +632,26 @@ def test_an_api_key_left_as_change_me_sets_up_no_app(tmp_path):
     with pytest.raises(FileNotFoundError) as ex:
         m.api_key("sonarr-4k")
     assert m.no_key("sonarr-4k", ex.value).startswith("SONARR_4K_URL is set, but the Sonarr-4k API key does not read")
+
+
+def test_the_host_install_takes_the_mkvtoolnix_of_the_image():
+    """Owner 2026-10-16: AMG supports mkvmerge 102 only. README.md "Install on a host" installs the version and checks
+    the key of docker/mkvtoolnix.sh, which the image and the test workflow run."""
+    script = open(os.path.join(FILES, "docker", "mkvtoolnix.sh")).read()
+    readme = open(os.path.join(FILES, "README.md")).read()
+    version, key = (re.search(rf"^{k}=(\S+)", script, re.M)[1] for k in ("VERSION", "KEY_FPR"))
+    assert f"   sudo apt install mkvtoolnix={version}\n" in readme and f"fingerprint `{key}`" in readme, (version, key)
+
+
+@pytest.mark.parametrize("text, version, warns", [("mkvmerge v101.0 ('Made Up') 64-bit", "101.0", True), ("mkvmerge v102.0 ('Made Up') 64-bit", "102.0", False),
+                                                  ("mkvmerge: no version here", "unknown", True)])
+def test_the_selftest_names_the_mkvmerge_version_and_warns_below_102(tmp_path, capsys, mkvmerge_says, text, version, warns):
+    """Owner 2026-10-16: "Warn in selftest". The selftest names the version of the mkvmerge on PATH. One older than 102,
+    or one whose version does not read, gives one warning that names the README's install steps. It still passes."""
+    mkvmerge_says(text)
+    m = load(tmp_path)
+    m.main(["--selftest"])
+    out = capsys.readouterr().out.splitlines()
+    warned = [x for x in out if x.startswith("warning: ") and "mkvmerge" in x]
+    assert f"mkvmerge version: {version}" in out and out[-1] == "selftest ok", out
+    assert len(warned) == warns and all(x.endswith('AMG supports mkvmerge 102, see "Install on a host" in README.md.') for x in warned), warned

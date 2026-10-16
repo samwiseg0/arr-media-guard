@@ -34,6 +34,8 @@ import sys
 
 import pytest
 
+import amg
+
 FILES = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, FILES)
 from arr_media_guard import burnin, lid  # noqa: E402
@@ -491,10 +493,10 @@ def make(folder, name, secs=120, vf=None, speech=None, size="640x360", rate=5, e
     out = os.path.join(folder, f"{name}.{ext}")
     if not os.path.exists(out):
         speech = speech or f"between(mod(t\\,{CYCLE})\\,{ON}\\,{OFF})"
-        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=0x304050:size={size}:rate={rate}:duration={secs}",
-                        "-f", "lavfi", "-i", f"aevalsrc=if({speech}\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d={secs}",
-                        *(["-vf", vf] if vf else []), "-c:v", "mpeg4", "-q:v", "2", "-g", str(rate), "-c:a", "flac" if ext == "mkv" else "aac",
-                        *extra, "-shortest", out], check=True)
+        amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=0x304050:size={size}:rate={rate}:duration={secs}",
+                    "-f", "lavfi", "-i", f"aevalsrc=if({speech}\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d={secs}",
+                    *(["-vf", vf] if vf else []), "-c:v", "mpeg4", "-q:v", "2", "-g", str(rate), "-c:a", "flac" if ext == "mkv" else "aac",
+                    *extra, "-shortest", out], check=True)
     return out
 
 
@@ -603,8 +605,8 @@ def test_the_recognizers_read_every_letter_and_the_spaces(clips, tmp_path):
         pytest.skip("no DejaVu font")
     import av
     text, png = "In the middle of the year just until", str(tmp_path / "line.png")
-    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x304050:size=960x544:d=1", "-vf",
-                    f"drawtext=fontfile={font}:text='{text}':fontsize=28:fontcolor=white:borderw=2:x=(w-tw)/2:y=h-60", "-frames:v", "1", png], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x304050:size=960x544:d=1", "-vf",
+                f"drawtext=fontfile={font}:text='{text}':fontsize=28:fontcolor=white:borderw=2:x=(w-tw)/2:y=h-60", "-frames:v", "1", png], check=True)
     with av.open(png) as c:
         rgb = next(c.decode(video=0)).to_ndarray(format="rgb24")
     ocr = burnin.Ocr(MODEL_DIR)
@@ -688,7 +690,7 @@ def test_the_video_is_the_first_stream_that_is_no_cover(clips, tmp_path, monkeyp
         burnin.Sampler("cover.mp4")
     monkeypatch.undo()
     audio = str(tmp_path / "audio.mka")
-    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=5", audio], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=5", audio], check=True)
     with pytest.raises(ValueError, match="no video"):
         burnin.Sampler(audio)
 

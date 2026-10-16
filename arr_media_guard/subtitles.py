@@ -3,7 +3,7 @@
 """The subtitle match check and the reads of the subtitle tracks."""
 import contextlib, fractions, json, math, os, re, resource, select, statistics, subprocess, tempfile, time, zlib
 
-from . import align, checks, config, content, decide, judge, logs, proof, remux, runner, store, subsync, vault
+from . import align, checks, config, content, decide, judge, logs, proof, remux, report, runner, store, subsync, vault
 
 
 def subtitle_ends(path, j, timeout, limit=None, lines=None):
@@ -92,15 +92,11 @@ def sub_codecs(j):
 
 def cue_entries(f, numbers, cap):
     """(the file offset of the Segment data or None, decide.cue_blocks() of the track numbers) of the open
-    Matroska file f, from its Cues. A second SeekHead may list the Cues."""
+    Matroska file f, from its Cues. A second SeekHead may list the Cues, see checks.seeks()."""
     b = f.read(config.HEADER_READ); seg = decide.segment_start(b)
     if not seg:
         return None, {}
-    ds, seek = seg[0], decide.front_seeks(b, seg[0])
-    for pos in [] if decide.CUES in seek else seek.get(decide.SEEKHEAD, []):
-        f.seek(ds + pos); c = f.read(config.HEADER_READ); e = decide.element(c, 0)
-        if e and e[0] == decide.SEEKHEAD and e[2] is not None:
-            decide.seek_entries(c, e[1], e[1] + e[2], seek)
+    ds, seek = seg[0], checks.seeks(f, b, seg[0])[0]
     for pos in seek.get(decide.CUES, [])[:1]:
         f.seek(ds + pos); e = decide.element(f.read(12), 0)
         if e and e[0] == decide.CUES and e[2] is not None and e[2] <= config.CUES_MAX:
@@ -1063,7 +1059,10 @@ SUB_CHECKS = {
     "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
-    "garbled_repair": {"version": 1, "fixes": {}},
+    "garbled_repair": {"version": 2, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
+                                                       # SSA or WebVTT track, and repairs or renames a garbled .srt sidecar.
+                                                       # Version 1 checked no sidecar and no ASS, SSA or WebVTT track. A
+                                                       # result names no codec, so each older result gets one recheck.
     "flash": {"version": 2, "fixes": {2: ["fix"]}},    # lines that flash by too fast to read. Version 2 writes the new
                                                        # ends of a HandBrake ASS track, whose events end in a NUL byte.
                                                        # Version 1 failed there, and its result says fix.
@@ -1100,7 +1099,8 @@ def sub_found(rec):
            "reference_timing": [words(k, r.get("verdict"), r.get("timing") or {}) for k, r in timed if "layout" not in r],
            "foreign_timing": [words(k, r["layout"].get("verdict"), r.get("timing") or {}) for k, r in timed if "layout" in r]
            + ([{"unread"}] if "why" in (rec.get("speech") or {}) else []),
-           "garbled_repair": [{"cut" if g.get("capped") else "fix" if g.get("repair") else "unfixable"} for g in (rec.get("garbled") or {}).values()],
+           "garbled_repair": [{"cut" if g.get("capped") else "fix" if g.get("repair") else "unfixable"} for g in (rec.get("garbled") or {}).values()]
+           + [{"fix" if e["action"] == "repair" else "unfixable"} for e in rec.get("sidecars") or [] if e["action"] in ("repair", "rename")],
            "flash": [{"off" if f.get("report_only") else "fix"} for f in (rec.get("flash") or {}).values()],
            "block_timing": [{w for w, on in (("fix", judge.lines_moved(e)), ("live", e["live"])) if on} for e in (rec.get("whole") or {}).values()]
            + [{"off"} for o in outs.values() if judge.still_off(o) and any(x["clock"] in ("whole", "live") for x in o["off"])]}
@@ -1191,19 +1191,27 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     lines move, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
     holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
     KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. A rewrite changes only the time lines and keeps every other byte,
-    see raw_srt(). Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime" or "lengthen", why, result:
-    "moved", "retimed", "left" or "dry run", kept or left}. A rewrite whose new times do not fit the text adds error,
-    the error of remux.set_ends(), and left says so in plain words for the alert."""
+    see raw_srt(). Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action:
+    "move", "retime", "lengthen" or "repair", why, result: "moved", "retimed", "repaired", "left" or "dry run", kept or
+    left}. A rewrite whose new times do not fit the text adds error, the error of remux.set_ends(), and left says so in
+    plain words for the alert. A garbled sidecar, one that holds "garbled", gets the action repair when its verdict
+    holds a repair, see side_repair(), else rename, see broken_side(). A repair takes the place of every other change
+    but a move, as for a track, see process.subtitle_checks(). Its original is kept as for a rewrite. A repair that
+    fails its proof renames the sidecar instead."""
     out, ends, timed = [], ends or {}, timed or {}
     for n, s in sorted(sides.items()):
         r, plan, times = sync.get(n) or {}, ends.get(n), timed.get(n)
-        fix = (r.get("timing") or {}).get("fix")
-        if r.get("verdict") != "mismatch" and not fix and not plan and not times:
+        fix, move = (r.get("timing") or {}).get("fix"), r.get("verdict") == "mismatch"   # the word check holds its own mismatch of garbled text
+        g = None if move else s.get("garbled")
+        if g and not g["repair"]:
+            out.append(broken_side(s, apply, app, source))
             continue
-        move = r.get("verdict") == "mismatch"
-        e = {"name": n, "action": "move" if move else "retime" if fix or times else "lengthen",
-             "why": r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan),
-                                                                times and remux.blocks_moved(times, fix)) if x)}
+        if not g and not move and not fix and not plan and not times:
+            continue
+        e = {"name": n, "action": "repair" if g else "move" if move else "retime" if fix or times else "lengthen",
+             "why": g["why"] if g else r["why"] if move else "; ".join(x for x in (fix and r["timing"]["why"], plan and flash_why(plan),
+                                                                                times and remux.blocks_moved(times, fix)) if x),
+             **({"garbled": {k: g[k] for k in ("codepage", "lang", "read", "cut", "cues")}} if g else {}), **({"later": True} if g and g.get("later") else {})}
         out.append(e)
         if not apply or not sub_fixes(source):
             e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is set to check")
@@ -1213,7 +1221,16 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
             st = os.stat(s["path"])
             why = vault.keepable(s["path"], st) if config.CFG.keep_days else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"
             if why: raise OSError(why)
-            if not move:   # a new file over the name, so the kept hard link holds the old text
+            if g:
+                try:
+                    data = side_repair(s)
+                except RuntimeError as ex:   # the repair fails its proof, so the sidecar's bytes go beside the video as they are
+                    b = dict(s["broken"])
+                    if taken := remux.broken_plan(b["video"], {n: b}):
+                        b["taken"] = taken
+                    out[-1] = broken_side(dict(s, garbled=dict(g, repair=False, why=f'{g["why"]}, but {ex}'), broken=b), apply, app, source)
+                    continue
+            elif not move:   # a new file over the name, so the kept hard link holds the old text
                 with open(s["path"], "rb") as f:
                     bom, code, text = raw_srt(f.read())
                 try:
@@ -1222,21 +1239,103 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                     e["error"] = config.mask(str(ex))[:300]
                     raise OSError(f"its new {'times' if times else 'ends'} do not fit its text") from None
                 text = remux.srt_moved(text, fix) if fix and not times else text
+                data = bom + text.encode(code, "surrogatepass")
+            if not move:
                 remux.new_tmp(tmp, st)
                 with open(tmp, "wb") as f:
-                    f.write(bom + text.encode(code, "surrogatepass"))
+                    f.write(data)
                 remux.own_like(tmp, st)
             e["kept"] = vault.keep_original(s["path"], e)
             os.remove(s["path"]) if move else os.replace(tmp, s["path"])
-            e["result"] = "moved" if move else "retimed"
+            e["result"] = "moved" if move else "repaired" if g else "retimed"
             logs.log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", kept=e["kept"], why=e["why"]))
         except OSError as ex:
-            e.update(result="left", left=config.mask(str(ex))[:200])
+            e.update(result="left", **left_of(ex))
         finally:
             remux.drop_tmp(tmp)
-    if any(e.get("kept") for e in out):
-        vault.prune_originals(vault.originals_root(out[0]["kept"]))
+    if kept := next((e["kept"] for e in out if e.get("kept")), None):   # the first entry may be a rename or one left
+        vault.prune_originals(vault.originals_root(kept))
     return out
+
+
+def side_repair(s):
+    """The bytes of the garbled sidecar s of garbled_sidecars() with the text of each cue read back, see
+    remux.repair_text(). No cue may stay cut. A BOM and the line ending of each line stay. The new text must hold each
+    cue of the old one at its times with the text of its repair, as prove() holds a repaired track. Raises OSError
+    when the sidecar changed since the check, and RuntimeError when the repair fails its proof."""
+    with open(s["path"], "rb") as f:
+        raw = f.read()
+    if raw != s["broken"]["data"]:
+        raise OSError("it changed since the check")
+    bom = raw[:3] if raw.startswith(b"\xef\xbb\xbf") else b""
+    text = raw[len(bom):].decode("utf-8")
+    new_text, new_cues = remux.repair_text({"codepage": s["garbled"]["codepage"], "lang": s["garbled"]["tag"]}, 0)
+    lines, ends = new_text(text).split("\n"), re.findall(r"\r?\n", text)   # srt_rewrite() reads a CRLF line break as LF
+    if len(lines) != len(ends) + 1:
+        raise RuntimeError("the new file does not keep the lines of the old one")
+    new = "".join(x + end for x, end in zip(lines, [*ends, ""]))
+    if proof.srt_blocks(new, "\n") != [list(c) for c in new_cues(proof.srt_blocks(text, "\n"))]:
+        raise RuntimeError("the new file does not hold each cue at its times with its repaired text")
+    return bom + new.encode()
+
+
+def broken_side(s, apply, app, source):
+    """Move the bytes of the garbled sidecar s of garbled_sidecars() to the name its plan gives, see
+    remux.broken_plan(), so no player reads them. A hard link gives the new name the sidecar's own file, and the link
+    must hold the bytes the check read. On a share that refuses a hard link, remux.keep_broken() writes a copy, owned
+    like the sidecar, and reads it back. The sidecar's name goes only while it names that file, unchanged since that
+    check, so a sidecar Bazarr writes meanwhile stays. So the bytes never change, and no file is written over. A
+    sidecar that changed since the check stays, and the new name goes. It needs no kept original. A dry run and
+    SUBTITLES check only name the new file. Returns the entry of sidecar_fix(), with action rename, the new name in to,
+    and reused when a file held the bytes already. A failure gives its reason in left, see left_of()."""
+    g, b = s["garbled"], s["broken"]
+    e = {"name": s["name"], "action": "rename", "why": g["why"], "garbled": {k: g[k] for k in ("codepage", "lang", "read", "cut", "cues")},
+         **({"to": os.path.basename(b["sidecar"])} if b.get("sidecar") else {})}
+    if not b.get("sidecar"):
+        return dict(e, result="left", left=b["taken"])
+    if not apply or not sub_fixes(source):
+        return dict(e, result="dry run") if not apply else dict(e, result="left", left="SUBTITLES is set to check")
+    try:
+        with open(s["path"], "rb") as f:
+            st = os.fstat(f.fileno())
+            if f.read() != b["data"]:
+                raise OSError("it changed since the check")
+        if os.path.lexists(b["sidecar"]) and not remux.holds(b["sidecar"], b["data"]) and (why := remux.broken_plan(b["video"], {s["name"]: b})):
+            raise OSError(why)   # a track of this run took the name, so the plan takes the next one
+        e["to"], key = os.path.basename(b["sidecar"]), runner.file_key(st)
+        b.update(reused=remux.holds(b["sidecar"], b["data"]), written=False)
+        try:
+            if not b["reused"]:
+                try:
+                    os.link(s["path"], b["sidecar"])   # never writes over a file
+                except FileExistsError:
+                    raise
+                except OSError:   # a share with no hard links
+                    remux.keep_broken(b, st)
+                else:
+                    b["written"], key = True, runner.file_key(os.stat(b["sidecar"]))
+                    if not remux.holds(b["sidecar"], b["data"]):
+                        raise OSError("it changed since the check")
+            # ponytail: a write between this stat and the unlink still goes. POSIX has no unlink of one inode only.
+            if runner.file_key(os.stat(s["path"])) != key:
+                raise OSError("it changed since the check")
+            os.remove(s["path"])
+        except BaseException:
+            remux.drop_broken([b])
+            raise
+        logs.log(dict(app=app, source=source, path=s["path"], result="sidecar renamed", to=e["to"], why=e["why"]))
+        return dict(e, result="renamed", reused=b["reused"])
+    except (OSError, RuntimeError) as ex:
+        return dict(e, result="left", **left_of(ex))
+
+
+def left_of(ex):
+    """{"left": why a sidecar change failed, in plain words for the alert}. An OSError that names its reason in this
+    code's words has no errno, and its words stay. Every other error leaves "the new file couldn't be written", and
+    "error" keeps the error for the decision log."""
+    if type(ex) is OSError and ex.errno is None:
+        return {"left": config.mask(str(ex))[:200]}
+    return {"left": "the new file couldn't be written", "error": config.mask(f"{type(ex).__name__}: {ex}")[:300]}
 
 
 def flash_why(plan):
@@ -1245,9 +1344,21 @@ def flash_why(plan):
             f"{len(plan)} cues get new ends")
 
 
+def dialogue(text, codec):
+    """The text of a cue of the text format codec as garbled_tracks() judges it: with no ASS override blocks, no drawing
+    commands after a {\\p1} block, no WebVTT or HTML tags, and a space for each ASS line break. The other characters
+    stay, as the no-break space of garbled "à", "Ã\\xa0". SubRip text stays as it is."""
+    return text if codec == "S_TEXT/UTF8" else DIALOGUE_NOISE.sub(" ", ASS_DRAWING.sub("", text))
+
+
+ASS_DRAWING = re.compile(r"\{[^}]*\\p[1-9][^}]*\}[^{]*")   # an ASS block that starts drawing mode, and the drawing commands after it
+DIALOGUE_NOISE = re.compile(r"\{[^}]*\}|<[^>]*>|\\[hNn]")   # override blocks, tags and line breaks
+
+
 def garbled_tracks(path, j, sides, full=False):
-    """{subtitle position: decide.garbled() verdict} of the SubRip tracks of the Matroska file path whose text is
-    garbled (docs/design.md, "Garbled subtitle repair"). A repair reads the track back, see remux.repaired(). A
+    """{subtitle position: decide.garbled() verdict} of the SubRip, ASS, SSA and WebVTT tracks of the Matroska file path
+    whose text is garbled (docs/design.md, "Garbled subtitle repair"). The verdict judges the text of each cue, see
+    dialogue(). Only a SubRip track is repaired. A repair reads the track back, see remux.repaired(). A
     sidecar of sides, the sidecar_subs() entries, may fill the cues the old muxer cut. It must be in the track's
     language, name and text alike. It must hold the track's cues at their times. Every other cue must equal the
     read-back. The verdict then names it in "sidecar", counts the cues it fills in "filled" and holds its cues in
@@ -1257,24 +1368,27 @@ def garbled_tracks(path, j, sides, full=False):
     verdict holds "capped", because the cues past the cut were never judged."""
     tags = {f"s{n}": ((t.get("properties") or {}).get("language") or "und")
             for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
-    want = {p for p, c in sub_codecs(j).items() if c == "S_TEXT/UTF8"}
+    codecs = sub_codecs(j)
+    want = {p for p, c in codecs.items() if c in config.SUB_CODECS}
     out = {}
     for p, cues in sorted(subtitle_cues(path, j, want, full).items(), key=lambda x: int(x[0][1:])) if want else ():
-        texts = [t for _, _, t in cues]
+        texts = [dialogue(t, codecs[p]) for _, _, t in cues]
         g = decide.garbled(texts, tags[p])
         if not g:
             continue
+        if g["repair"] and codecs[p] != "S_TEXT/UTF8":   # the proof checks the new text of a SubRip track only
+            g = dict(g, repair=False, why=f'{g["why"]}, but only a SubRip track is repaired')
         if isinstance(cues, Cut):
             g = dict(g, capped=True, **({"repair": False, "why": f'{g["why"]}, but only its first {len(cues)} cues were read'} if g["repair"] else {}))
         if g["repair"]:
-            got, side = remux.repaired(texts, g["codepage"], tags[p]), None
+            got, side = remux.repaired(texts, g["codepage"]), None
             for s in sides:
                 if not decide.lang_key(side_code(s)) == decide.lang_key(tags[p]) == decide.lang_key(s["read"][0]):
                     continue
                 blocks = remux.side_blocks(s)
                 if len(blocks) != len(cues) or any(abs(a / 1000 - c[0]) > 0.002 or abs(b / 1000 - c[1]) > 0.002 for (a, b, _), c in zip(blocks, cues)):
                     continue
-                fit = remux.repaired(texts, g["codepage"], tags[p], [t for _, _, t in blocks])
+                fit = remux.repaired(texts, g["codepage"], [t for _, _, t in blocks])
                 if fit and fit[1]:   # it fills a cut cue
                     got, side = fit, (s, blocks)
                     break
@@ -1285,6 +1399,41 @@ def garbled_tracks(path, j, sides, full=False):
             elif side:
                 g = dict(g, sidecar=side[0]["name"], filled=len(filled), side=[list(b) for b in side[1]])
         out[p] = dict(g, tag=tags[p])
+    return out
+
+
+def garbled_sidecars(path):
+    """{name: the sidecar_subs() entry} of the UTF-8 sidecars beside the video path whose text is garbled (docs/design.md,
+    "Garbled subtitle repair"). Each entry holds its decide.garbled() verdict in "garbled", with its tag in "tag", and
+    its bytes and the language part of its name in "broken". The verdict judges the text of each cue as the file holds
+    it, as for a SubRip track. Its tag is its name's language. An untagged sidecar takes the language its UTF-8
+    read-back reads as, else und. A verdict with a repair must pass the proof of a track's repair, see
+    remux.repair_text(), with no cue cut. Else it says why and holds no repair. sidecar_fix() repairs the
+    sidecar, see side_repair(), or renames it, see broken_side(). One to rename gets the name of remux.broken_plan() in
+    "broken". A sidecar in another charset is not checked."""
+    out = {}
+    for s in proof.sidecar_subs(path):
+        tag = side_code(s) if s["named"] else "und"
+        if s["charset"] != "UTF-8":
+            continue
+        with open(s["path"], "rb") as f:
+            data = f.read()
+        blocks = proof.srt_blocks(data.decode("utf-8-sig"), "\n")   # as written: srt_cues() folds the no-break space of a garbled "à", "Ã\xa0"
+        g = decide.garbled([t for _, _, t in blocks], tag)
+        if g and tag in decide.UNTAGGED and g["codepage"] == "utf-8" and g["lang"]:   # an untagged sidecar takes the language of its read-back
+            tag = g["lang"]
+            g = decide.garbled([t for _, _, t in blocks], tag)
+        if g:
+            if g["repair"]:
+                try:
+                    remux.repair_text({"codepage": g["codepage"], "lang": tag}, 0)[1](blocks)
+                except RuntimeError as ex:
+                    g = dict(g, repair=False, why=f'{g["why"]}, but {ex}')
+            out[s["name"]] = dict(s, garbled=dict(g, tag=tag), broken={"lang": s["named"] or "und", "data": data, "numbers": range(1, 100), "video": path})
+    renames = {n: s["broken"] for n, s in out.items() if not s["garbled"]["repair"]}
+    if renames and (taken := remux.broken_plan(path, renames)):
+        for b in renames.values():
+            b.setdefault("taken", taken)
     return out
 
 
@@ -1313,22 +1462,31 @@ def sub_findings(rec, sync, unmatched, starts=None):
         wrong.append({"code": "stays", "track": p, "why": sync[p]["why"], "gone": gone, "result": rm["result"] if gone else None,
                       "kept_back": rm.get("kept_back"), "flags_off": flags_off, **plan, **laid(p)})
     for e in rec.get("sidecars") or []:
-        if e["action"] == "move":
+        if e["action"] in ("rename", "repair"):   # a renamed one goes to the unreadable finding below, and a repaired one to repaired
+            wrong += [{"code": "repaired", "tracks": [e["name"]], "kept": e["kept"]}] if e["result"] == "repaired" else [] if e["result"] == "renamed" \
+                else [{"code": "garbled_sidecar", "name": e["name"], "to": e.get("to"), "left": e.get("left"), **({"repair": True} if e["action"] == "repair" else {})}]
+        elif e["action"] == "move":
             wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left"), **laid(e["name"])})
         elif e["result"] == "left":
             late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]})
     wrong += [{"code": "layout", "track": k} for k, r in sorted(sync.items()) if laid(k) and r["verdict"] != "mismatch"]   # see subsync.LAYOUT_ACTION
     # The tracks whose text is garbled, by their place before any remux. A track that cannot be repaired is taken out
     # with its bytes kept beside the video, or stays when a setting keeps it or its read was cut, see subtitle_checks().
+    # The tracks taken out and the garbled sidecars renamed go to one unreadable finding, as a conversion's do. The
+    # repairs of the run go into it too, below.
     garbled, mine, out = rec.get("garbled") or {}, rm.get("recoded") or [], rm.get("stripped") or {}
     wrong += [{"code": "repaired", "tracks": mine, "kept": rm.get("kept")}] if mine and rm.get("done") else []
-    wrong += [{"code": "stripped", "track": p, "name": n, "kept": rm.get("kept")} for p, n in sorted(out.items()) if rm.get("done")]
+    facts = {x["i"]: x for x in rm.get("tracks_before") or []}
+    gone = {p: dict(facts.get(p) or {"lang": garbled[p]["tag"]}, sidecar=n) for p, n in out.items()} if rm.get("done") else {}
+    gone.update({e["name"]: {"sidecar": e["to"]} for e in rec.get("sidecars") or [] if e["action"] == "rename" and e["result"] == "renamed"})
+    unreadable = [report.unreadable_finding(gone, rm.get("kept") if out and rm.get("done") else None, mark="unreadable_subtitles")] if gone else []
     rest = sorted(p for p, g in garbled.items() if not g["repair"] and p not in out)
     kept_back = "check" if not flags_off else "keep_days" if not config.CFG.keep_days else None
     for ps, repair, more in ((mine, True, {"result": rm.get("result"), **plan}),
                              (sorted(p for p, g in garbled.items() if g["repair"] and p not in mine and p not in (rm.get("remove") or [])), True, {}),
                              (sorted(out), False, {"result": rm.get("result"), "names": [out[p] for p in sorted(out)], **plan}),
-                             ([p for p in rest if not garbled[p].get("capped")], False, {"kept_back": kept_back} if kept_back else {}),
+                             ([p for p in rest if not garbled[p].get("capped") and not garbled[p].get("held")], False, {"kept_back": kept_back} if kept_back else {}),
+                             ([p for p in rest if garbled[p].get("held")], False, {"kept_back": "names"}),
                              ([p for p in rest if garbled[p].get("capped")], False, {})):
         if ps and not ("result" in more and rm.get("done")):   # one sentence for the tracks that share their outcome
             wrong.append({"code": "garbled", "tracks": sorted(ps, key=lambda p: int(p[1:])), "repair": repair, "flags_off": flags_off, **more})
@@ -1337,9 +1495,11 @@ def sub_findings(rec, sync, unmatched, starts=None):
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
         wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept")})
     late += judge.alert_lines(rec, sync, flags_off, plan)
+    if unreadable and (mended := [x for x in wrong if x["code"] == "repaired"]):   # one notice per run, with DISCORD_POSTS issues and all
+        unreadable[0]["repaired"], wrong = mended, [x for x in wrong if x["code"] != "repaired"]
     out = ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])
     judge.check_outcome(rec, out)
-    return out
+    return unreadable + out
 
 
 def remux_block(rec):

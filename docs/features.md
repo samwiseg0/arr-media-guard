@@ -78,7 +78,7 @@ check*. It needs language detection.
   against one whose words matched. An import does this while its time limit allows.
 
 `SUBTITLES=check` only alerts. `SUBTITLES=deep` adds the deep analysis after each import. It hears the whole audio, and
-takes a median of about 5 minutes per hour of video. One file in four takes 15 minutes or more per hour. It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
+takes about 16 minutes per hour of video on a recent CPU, see [design.md](design.md#subtitle-match). It waits in the background queue, and runs only while no import waits. `--sub-check` checks a library and
 `--sub-time` single files, see [subtitles.md](subtitles.md).
 
 ### Mid-file jump timing
@@ -149,11 +149,15 @@ way, and a conversion puts it into the new file with the right characters. The s
 
 ## Garbled subtitle repair
 
-An old muxer could store a subtitle track in the wrong character set, so Greek "Καλημέρα" shows as "ÊáëçìÝñá". When such
-*garbled* text reads as the track's language in the right character set, AMG writes it back readable in a remux. A
-sidecar with the same lines fills in lines the old muxer cut short. AMG takes a track it cannot repair out of the file.
-An alert names `<name>.<language>.garbled.txt`, the file beside the video that holds its bytes. It runs in the deep
-analysis and with `--sub-check` and `--sub-time`, see [subtitles.md](subtitles.md#garbled-subtitle-repair).
+An old muxer could store a subtitle track in the wrong character set, so Greek "Καλημέρα" shows as "ÊáëçìÝñá". AMG
+repairs such *garbled* text only when it was UTF-8 read the wrong way and reads as the track's language, because only
+that repair checks itself. A sidecar with the same lines fills in lines the old muxer cut short. Text from an older
+character set, such as Windows-1250 or Windows-1256, often lost letters on the way, so AMG takes that track out of the
+file. It does the same with a garbled ASS, SSA or WebVTT track. A garbled `.srt` sidecar gets the same repair, or else
+a new name. The bytes stay as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`, or `.ass.txt`, `.ssa.txt` or
+`.vtt.txt` for a track in those formats. Players, Sonarr, Radarr and Bazarr skip a `.txt` file. The alert "Unreadable
+subtitles" names each file. It runs in the deep analysis and with `--sub-check` and `--sub-time`, see
+[subtitles.md](subtitles.md#garbled-subtitle-repair).
 
 ## Broken audio and corrupt video
 
@@ -166,9 +170,10 @@ so. See [regrabs.md](regrabs.md#re-grabs).
 
 After the import, a *whole-file check* reads each file whole in the background queue. It looks for gaps of zero bytes,
 as a torrent piece that never downloaded leaves, and ffmpeg reads every packet beside it. Gaps at two or more places
-re-grab the file when `REGRAB` lists `video`. One gap, or an error of the full read, only alerts. Silent PCM audio is
-zero bytes too, so in an MKV, MP4 or MOV file with PCM audio a gap counts only where the full read breaks. The check takes about the
-time the NAS needs to send the file once. See [design.md](design.md#whole-file-check).
+re-grab the file when `REGRAB` lists `video`. One gap, or an error of the full read, only alerts. That alert names the
+play time of the gap or of each error, as the import's alert of one gap does. Silent PCM audio is zero bytes too, so in
+an MKV, MP4 or MOV file with PCM audio a gap counts only where the full read breaks. The check takes about the time the
+NAS needs to send the file once. See [design.md](design.md#whole-file-check).
 
 ## Restore after a bad upgrade
 
@@ -241,9 +246,15 @@ Other subtitle formats cannot be trimmed, so an alert names them. It runs at imp
 
 AMG can turn a file in another container, such as AVI, MP4, M4V, TS or WebM, into Matroska. The streams stay the same,
 and the sidecars go into the new file. A subtitle whose words do not match the audio stays out. AMG checks every stream
-of the new file, packet by packet, before it removes the source file. `CONVERT=true` turns it on for imports and for
+of the new file, packet by packet, before it removes the source file. In an MP4 with HEVC, MPEG-1 or MPEG-2 video,
+mkvmerge would drop the last frames when a subtitle or audio track ends first. AMG reads such a video on its own, so it keeps
+every frame. An MP4 subtitle track must hold its text in UTF-8.
+A track with any line in an older character set, such as Windows-1256, shows as garbage in every player. AMG removes
+it from the MKV and saves its bytes as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`.
+Players, Sonarr, Radarr and Bazarr skip a `.txt` file. An alert names each such track and its file. `CONVERT=true` turns it on for imports and for
 the jobs a backfill queues, and `--convert` for a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB`
-lists `damage`. Else the alert title ends "re-grab is off". See [commands.md](commands.md#convert-files-into-matroska).
+lists `damage`. Else the alert title ends "re-grab is off". Subtitle text that does not read is never damage. See
+[commands.md](commands.md#convert-files-into-matroska).
 
 ## Backfill and scans
 

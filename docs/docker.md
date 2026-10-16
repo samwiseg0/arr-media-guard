@@ -1,7 +1,9 @@
 # Docker
 
 The arr-media-guard (AMG) image includes everything AMG needs. It has the two commands, `ffmpeg`, `mkvtoolnix`,
-language detection with its speech model, and the text models for the burned-in subtitle check. The build checks each
+language detection with its speech model, and the text models for the burned-in subtitle check. ffmpeg 7.1 comes from
+Debian 13. mkvtoolnix 102 comes from MKVToolNix's own Debian repository, pinned in `docker/mkvtoolnix.sh`, and the
+build checks the repository's key by its fingerprint. The tests run with these same versions. The build checks each
 model against a fixed checksum, so nothing downloads while AMG runs. Sonarr and Radarr post to AMG through a
 **Webhook** connection, so nothing goes into their containers. The published image is for amd64. An arm64 image is not
 published yet.

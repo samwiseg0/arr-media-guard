@@ -41,6 +41,7 @@ WINDOW_POLL = 0.5     # seconds between two checks of a video window's time and 
 REPACK_SIZE = 0.03    # a header repair's new file may differ from the original's size by this share
 REPACK_TMP = b".repack-tmp"   # the end of a repack's temp file name, see repack_tmp(). A header repair uses it too.
 HEADER_READ = 64 << 10                # bytes header_probe() reads at the start of a file, and at a second SeekHead
+SEEK_HEADS = 8                        # SeekHeads checks.seeks() reads in all, the front one included. mkvpropedit adds one.
 HEADER_TAIL = (16 << 20, 128 << 20)   # bytes it reads at the end for the stream ends. The second when one Cluster is longer.
 TAIL_MIN = 1 << 20                    # bytes past the Segment end that make a header issue. A few stray bytes there are
                                       # common and harmless. Over 1 MiB is a header issue.

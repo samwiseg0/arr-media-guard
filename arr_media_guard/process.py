@@ -269,10 +269,12 @@ def start(ctx):
 def conversion(ctx):
     """The conversion into Matroska, see convert(). mkvpropedit edits Matroska only. A file that did not convert ends
     the run there. An import of a file that is not .mkv goes on with the original instead, so its audio and video checks
-    still run. A convert run ends after the conversion too."""
+    still run. A convert run ends after the conversion too. A conversion that removed a broken timed-text track, see
+    convert.broken_tracks(), gives an unreadable finding, in a convert run too."""
     rec, j, st, job = ctx.rec, ctx.j, ctx.st, ctx.job
     container = (j.get("container") or {}).get("type") or "Matroska"   # a probe without a type reads as Matroska
-    ctx.unconverted = ctx.damaged = None
+    ctx.unconverted = ctx.damaged = ctx.unreadable = None
+    ctx.places = {}
     review = not ctx.check or (ctx.apply and ctx.check == "listed")   # the list to review by hand takes no dry --check run and no file no app lists
     if not ((ctx.mkv and container != "Matroska") or (not ctx.mkv and ctx.conv)):
         return
@@ -316,11 +318,24 @@ def conversion(ctx):
             rec["path"], ctx.mkv = path, True
         logs.log(dict(rec, outcome="repacked", result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
+        if broken := rec["repack"].get("broken"):
+            ctx.unreadable = report.unreadable_finding(broken, rec["repack"].get("kept"), container)
+        # The place in the original of each subtitle track of the new file that came from one of the original's, for
+        # the notice of a remux that takes it out, see after_edit(). The conversion keeps their order, and its own
+        # tracks come after them, see convert.convert_cmd().
+        gone = {*(broken or ()), *([] if rec["repack"].get("tracks_kept_back") else rec["repack"].get("tracks_unmatched") or ())}
+        sub_langs = lambda j: [(t.get("properties") or {}).get("language") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
+        before = [(f"s{n}", lang) for n, lang in enumerate(sub_langs(j), 1) if f"s{n}" not in gone]
         if ctx.mode == "convert":   # the language backfill decides the flags later, from its own cache
             rec["repack"]["rescan"] = "after the run"
             ctx.rec = dict(rec, outcome="repacked", result="repacked", reasons=["repacked"], **{"class": "repacked"})
+            if ctx.unreadable:
+                ctx.rec.update(findings=[ctx.unreadable], alert_kinds=[ctx.unreadable["kind"]])
+                if ctx.post:
+                    ctx.rec["alert_result"] = logs.alert_findings(ctx.rec, rec["repack"]["new_size"])
             return True
         refresh(ctx)
+        ctx.places = {f"s{k}": p for k, ((p, lang), now) in enumerate(zip(before, sub_langs(ctx.j)), 1) if lang == now}
         return
     would = got == "would_repack"
     kind = container if ctx.mkv else os.path.splitext(path)[1].lower().lstrip(".")
@@ -457,8 +472,13 @@ def subtitle_checks(ctx):
     if unindexed:
         rec["unindexed"] = {"tracks": sorted(unindexed), "why": "the Cues index none of their blocks, and an import never reads the whole file, "
                                                                "so the subtitle checks skip them"}
+    # A garbled .srt sidecar is repaired or renamed, see subtitles.sidecar_fix(). Only a run that reads whole files
+    # checks it, as for a garbled track below. One to rename leaves every other check. One to repair stays in them, as a
+    # garbled track does, and what they find waits for its readable text, see later below.
+    bad_sides = subtitles.garbled_sidecars(path) if mkv and full else {}
+    gone_sides = {n for n, s in bad_sides.items() if not s["garbled"]["repair"]}
     if mkv and subs_on and checks.lid_ready():
-        sides = subtitles.mkv_sidecars(path, d)
+        sides = {n: s for n, s in subtitles.mkv_sidecars(path, d).items() if n not in gone_sides}
         if subtitles.sub_targets(j, d) or sides:
             items = subtitles.sub_items(path, j, d, sides, full) if decide.duration(j) >= config.SUB_MIN_SECONDS else {}   # read under the file lock
             if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock, as above
@@ -482,7 +502,7 @@ def subtitle_checks(ctx):
     deadline = time.monotonic() + left - config.SUB_RESERVE if left else None
     stop = runner.deep_waits if ctx.yields else (lambda: time.monotonic() > deadline) if deadline is not None else None
     if mkv and subs_on:   # the reference timing
-        others = subtitles.ref_sidecars(path, d)
+        others = {n: s for n, s in subtitles.ref_sidecars(path, d).items() if n not in gone_sides}
         timed_by, refs = subtitles.sub_reference(path, j, d, sync, items or {}, others, full=full, stop=stop, report=timing, whole=rec.get("whole"))
         if full and checks.lid_ready():   # the speech layout of the subtitles no word check reads and no reference fits
             if ctx.shared:   # the read of the whole audio track takes minutes for a film, so it runs without the file lock
@@ -502,7 +522,7 @@ def subtitle_checks(ctx):
     garbled = subtitles.garbled_tracks(path, j, all_sides, full) if mkv and full else {}
     if garbled:
         rec["garbled"] = {p: {k: v for k, v in g.items() if k != "side"} for p, g in garbled.items()}
-    waits = {p for p, g in garbled.items() if (sync.get(p) or {}).get("verdict") == "mismatch"}
+    waits = {p for p in [*garbled, *bad_sides] if (sync.get(p) or {}).get("verdict") == "mismatch"}
     for p in waits:
         sync[p] = dict(sync[p], verdict="unknown", why=f'{sync[p]["why"]}, but its text is garbled, so a later run judges it', held=True)
     if sync or timed_by:
@@ -524,6 +544,14 @@ def subtitle_checks(ctx):
     # remux.resub(). A cut read never does, because the bytes past the cut were never read.
     strip = {p: g["tag"] for p, g in garbled.items() if not g["repair"] and not g.get("capped")} \
         if subtitles.sub_fixes(ctx.source) and config.CFG.keep_days else {}
+    # A track whose every name for its bytes holds a file stays this run, so the remux still makes the other fixes.
+    # Before the remux no bytes say whether one of those files holds them already, see remux.broken_plan().
+    names = {p: {"lang": tag, "data": None, "ext": remux.TEXT_EXT[subtitles.sub_codecs(j)[p]]} for p, tag in strip.items()}
+    remux.broken_plan(path, names)
+    for p in [p for p, e in names.items() if e["reused"]]:   # with no bytes, a name that holds a file is taken
+        del strip[p]
+        for g in (garbled[p], rec["garbled"][p]):
+            g.update(held=True, why=f'{g["why"]}, but the names for its bytes beside the video are taken')
     remove = sorted(unmatched - set(strip)) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
     # A repair takes the track's place in the remux and keeps its times, so the track gets no other change in this run.
     # Its default flag goes when the decision turns it off, in a run whose flag edit acts on the decision, see act().
@@ -534,7 +562,7 @@ def subtitle_checks(ctx):
               for p, g in garbled.items() if g["repair"] and p not in remove} if subtitles.sub_fixes(ctx.source) else {}
     later = {p for p in recode if p in fixes or p in blocks or p in starts or p in waits}   # judged again after the repair, see after_edit()
     fixes = {p: f for p, f in fixes.items() if p not in recode and p not in strip}
-    flashy = subtitles.flash_check(path, j, proof.sidecar_subs(path), full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
+    flashy = subtitles.flash_check(path, j, [s for s in proof.sidecar_subs(path) if s["name"] not in gone_sides], full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
     codecs = subtitles.sub_codecs(j)
     vtt = {p for p, c in codecs.items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
     if flashy:
@@ -561,8 +589,13 @@ def subtitle_checks(ctx):
              and (x := plan(p, cues_of(p), fixes.get(p), codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")))}
     timing_of = lambda n: ({**sync, **timed_by}.get(n) or {}).get("timing") or {}
     side_cue = lambda n: subtitles.side_cues({**others, **sides}[n])
-    side_moves = {n: x for n in {*blocks, *starts} if (n in sides or n in others) and (n not in starts or subtitles.same_cues(side_cue(n), items[n][2]))
-                  and (x := plan(n, side_cue(n), timing_of(n).get("fix"), False))}
+    side_moves = {n: x for n in {*blocks, *starts} if (n in sides or n in others) and n not in bad_sides
+                  and (n not in starts or subtitles.same_cues(side_cue(n), items[n][2])) and (x := plan(n, side_cue(n), timing_of(n).get("fix"), False))}
+    # A repair of a sidecar's text takes the place of its other changes in this run, as for a track. Its verdicts and
+    # times wait for a run that reads its readable text.
+    side_later = {n for n in bad_sides if n in waits or timing_of(n).get("fix") or n in blocks or n in starts or n in flashy}
+    for n in side_later:
+        bad_sides[n]["garbled"]["later"] = True
     st = ctx.st
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
@@ -610,7 +643,7 @@ def subtitle_checks(ctx):
             d = decide.with_tags(d, ctx.tags)
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
     ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves, ctx.recode = fixes, remove, ends, flashy, moves, side_moves, recode
-    ctx.strip, ctx.later = strip, later
+    ctx.strip, ctx.later, ctx.bad_sides = strip, later | side_later, bad_sides
     ctx.starts = {k: sorted(c[0] for c in x[2]) for k, x in items.items()}   # the cue starts the timing judge counts, see judge.outcomes()
 
 
@@ -687,6 +720,8 @@ def faults(ctx):
         first.append(ctx.damaged)
     if ctx.unconverted and ctx.unconverted[1]:
         rest.append(ctx.unconverted[1])
+    if ctx.unreadable:
+        rest.append(ctx.unreadable)
     if ctx.tags and ctx.tags["mismatch"]:
         rest.append({"kind": "sublang", "mismatch": ctx.tags["mismatch"], "muted": [n for n in d["notes"] if " loses its default and forced flags, " in n]})
     code = rec.get("header_repair", {}).get("code") if hp and hp["issue"] else None   # a subtitle remux can end the issue
@@ -727,10 +762,11 @@ def act(ctx):
     if ctx.shared and not (certain or vcertain or "content" in config.CFG.regrab):   # the checks found nothing to re-grab
         ctx.shared.settle()
     sides = {s["name"]: s for s in proof.sidecar_subs(ctx.path)} if ctx.flashy else {**ctx.sides, **ctx.others}   # the sidecars act alike
+    sides.update(ctx.bad_sides)   # a garbled sidecar holds its verdict, see subtitles.broken_side()
     ctx.sync_all = {**ctx.sync, **ctx.timed_by}
     ctx.sides, ctx.side_ends = sides, {n: v for n, v in ctx.flashy.items() if n in sides}   # at SUBTITLES check, sidecar_fix() only reports
     ctx.acts = [n for n in sides if (ctx.sync_all.get(n) or {}).get("verdict") == "mismatch" or ((ctx.sync_all.get(n) or {}).get("timing") or {}).get("fix")
-                or n in ctx.side_ends or n in ctx.side_moves]
+                or n in ctx.side_ends or n in ctx.side_moves or n in ctx.bad_sides]
     if ctx.shared and ctx.apply and (certain or vcertain or (ctx.mkv and (d["edits"] or ctx.acts))):
         ctx.shared.exclusive(ctx.st)
     if certain:
@@ -776,7 +812,8 @@ def sub_outcome(rec):
     kept = lambda p: ((rec.get("subtime") or {}).get(p) or {}).get("timing", {}) or {}   # a partial shift names the lines it kept
     left = lambda p: f', {n} lines kept their times' if (n := kept(p).get("kept")) else ""
     what = [f"{p} {x}" + (left(p) if k == "fixed" else "") for k, x in did for p in rm.get(k) or []] + \
-        [f'{e["name"]} {e["result"]}' + (left(e["name"]) if e["result"] == "retimed" else "") for e in rec.get("sidecars") or [] if e.get("result") in ("retimed", "moved")]
+        [f'{e["name"]} {e["result"]}' + (left(e["name"]) if e["result"] == "retimed" else "") for e in rec.get("sidecars") or []
+         if e.get("result") in ("retimed", "moved", "renamed", "repaired")]
     code, head = ("subtitles_remuxed", "subtitles remuxed") if rm.get("done") else ("sidecars_changed", "sidecars changed")
     return (code, f"{head}: " + ", ".join(what)) if what else None
 
@@ -799,11 +836,21 @@ def after_edit(ctx):
                                                 **({"timed": ctx.side_moves} if ctx.side_moves else {}))
     if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
         rec.update(outcome=named[0], result=named[1])
-    ctx.rest += subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
+    found = subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
+    remux = next((f for f in found if f["kind"] == "unreadable"), None)
+    if remux and (rec.get("repack") or {}).get("new_size"):   # the run converted the file first, so one notice names both
+        found.remove(remux)
+        if ctx.places:   # the number in the original of each track it took out, see report.unreadable()
+            remux["places"] = ctx.places
+        if ctx.unreadable:   # in rest already, see faults()
+            ctx.unreadable["remux"] = remux
+        else:
+            ctx.rest.append(report.unreadable_finding({}, rec["repack"].get("kept"), rec["container"], remux=remux))
+    ctx.rest += found
     if ctx.mkv and ctx.subs_on and checks.lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
         planned = ctx.fixes or ctx.remove or ctx.ends or ctx.moves or ctx.recode or ctx.strip
         done = ctx.apply and rec["outcome"] in ("edited", "no_change", "subtitles_remuxed", "sidecars_changed") and (rec.get("subremux") or {}).get("done", not planned) \
-            and all(e["result"] in ("moved", "retimed") for e in rec.get("sidecars") or [])
+            and all(e["result"] in ("moved", "retimed", "renamed", "repaired") for e in rec.get("sidecars") or [])
         # A repaired track whose times or words this run left out stays pending, so the next run judges its readable text.
         # So does a track whose whole-file hearing stopped part way, see subtitles.sub_whole(). Nothing queues a new
         # run, so a later --sub-time or deep analysis times it.
@@ -932,7 +979,8 @@ def quick_check(ctx):
 
 def alerts(ctx):
     """The findings of the run in the record, and their alerts, posted unless post is False. The deep analysis and a
-    recheck alert on the subtitles only, because the import alerted on the rest. An import whose file gets the deep
+    recheck alert on the subtitles only, because the import alerted on the rest. The subtitles they took out are among
+    them, see report.unreadable_finding(). An import whose file gets the deep
     analysis holds the subtitle alerts in held, because that analysis checks them again and posts what it still finds,
     see logs.alert_findings() and runner.queue_deep_analysis()."""
     rec = ctx.rec
@@ -944,7 +992,7 @@ def alerts(ctx):
     except Exception as ex:   # a finding must never cost the decision line or the Plex analyze of an edited file
         rec["alert_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         problems = ctx.first + ctx.rest
-    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in logs.DEEP_KINDS]
+    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in (*logs.DEEP_KINDS, "unreadable")]
     rec["alert_kinds"] = [p["kind"] for p in rec["findings"]]
     if ctx.post:   # after the edit, so a failed post never blocks one
         ctx.held = [] if ctx.mode == "import" and runner.deep_wanted(rec) else None
@@ -1069,8 +1117,8 @@ def edit(rec, j, edits, apply, replan=None, ts=None):
         e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
     checks.lid_carry(path, before)
     runner.mute_mark(path, before)
-    if e.returncode > 1:   # it may still have written. A run can fail on "Tracks" and still set the flags.
-        rec.update(outcome="edit_failed", result="mkvpropedit failed: " + (e.stdout + e.stderr).strip()[-300:])
+    if e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
+        rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
             rec["after"] = runner.flags(checks.mkvmerge(path))
         except Exception as ex:

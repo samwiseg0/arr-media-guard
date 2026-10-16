@@ -185,11 +185,26 @@ def media_streams(streams):
     return [s for s in streams if s.get("codec_type") in ("video", "audio", "subtitle") and not (s.get("disposition") or {}).get("attached_pic")]
 
 
+# A line of a subtitle stream's decoder, as ffmpeg 7 names it: "[sist#0:2/mov_text @ 0x..] [dec:mov_text @ 0x..] Error
+# decoding subtitles: Invalid data found when processing input". Timed text that is not UTF-8 prints it, and its read
+# exits 0, or 69 when most cues fail. The video and the audio still read, so packet_hashes() never counts it as damage.
+SUB_DECODER = re.compile(r"\[sist#")
+
+
 class ReadFailed(RuntimeError):
     """ffmpeg did not read the file at path cleanly, see packet_hashes()."""
     def __init__(self, path, text):
         super().__init__(text)
         self.path = path
+
+
+def bad_lines(stderr):
+    """The lines of the stderr of an ffmpeg read with -v error that show a failed read. ffmpeg decodes a few frames of
+    each stream while it opens a file, and a decoder may complain there: "[mp3float @ ..] Header missing", "[h264 @ ..]
+    decode_slice_header error". ffprobe says the same, and the packets still read. Any other line is a failed read."""
+    return [line for line in stderr.splitlines() if line.strip() and not re.match(r"\[(\w+) @ 0x[0-9a-f]+\]|\s+Last message repeated", line)
+            or re.match(r"\[(matroska|mov|avi|mpegts|asf|mpeg|flv|webm|ipod|mp4|srt|framemd5|in#|out#|filter_units|aac_adtstoasc|"
+                        r"h264_mp4toannexb|pcm_rechunk)\b", line)]
 
 
 def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), nul=(), crlf=()):
@@ -211,7 +226,8 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
     duration), md5s (their md5s, 16 bytes each) and sizes, for a stream of nul nul_cut, read_order and space_cut, the
     counts of packets that lost a NUL, took another ReadOrder and lost spaces at their end, and for a stream of crlf
     raw_md5s, the md5s of its packets as they are}, {stream index in texts: its SubRip text}). A timeout raises, and an
-    ffmpeg error raises ReadFailed."""
+    ffmpeg error raises ReadFailed. A read whose only errors come from a subtitle decoder raises RuntimeError, see
+    SUB_DECODER."""
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
     if maps:
@@ -223,14 +239,13 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
     for i, f in srt.items():
         argv += ["-map", f"0:{i}", "-c:s", "copy" if raw is True or i in (raw or ()) else "srt", "-f", "srt", f]
     r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
-    # ffmpeg decodes a few frames of each stream while it opens a file, and a decoder may complain there: "[mp3float @ ..]
-    # Header missing", "[h264 @ ..] decode_slice_header error". ffprobe says the
-    # same, and the packets still read. Any other line is a failed read.
-    bad = [line for line in r.stderr.splitlines() if line.strip() and not re.match(r"\[(\w+) @ 0x[0-9a-f]+\]|\s+Last message repeated", line)
-           or re.match(r"\[(matroska|mov|avi|mpegts|asf|mpeg|flv|webm|ipod|mp4|srt|framemd5|in#|out#|filter_units|aac_adtstoasc|"
-                       r"h264_mp4toannexb|pcm_rechunk)\b", line)]
+    bad = bad_lines(r.stderr)
+    real = [line for line in bad if not SUB_DECODER.match(line)]
+    if bad and not real:   # only the text of a subtitle failed to decode, which shows no damage, see DAMAGE
+        streams = sorted({int(n) for line in bad for n in re.findall(r"sist#\d+:(\d+)", line)})
+        raise RuntimeError(f"ffmpeg could not read the text of subtitle stream {', '.join(map(str, streams))} of {os.path.basename(path)}")
     if r.returncode or bad:
-        raise ReadFailed(path, f"ffmpeg did not read {os.path.basename(path)} cleanly: {config.mask(chr(10).join(bad) or r.stderr.strip())[-200:]}")
+        raise ReadFailed(path, f"ffmpeg did not read {os.path.basename(path)} cleanly: {config.mask(chr(10).join(real) or r.stderr.strip())[-200:]}")
     tb, stats, data, at = {}, {}, {}, {}
     for i, f in raw_of.items():
         with open(f, "rb") as fh:
@@ -338,6 +353,89 @@ def packet_text(srt, md5):
     return f"{len(data) - pos} bytes follow the last packet" if pos != len(data) else None
 
 
+def event_text(path, md5, raw, codec):
+    """Why the file path, which mkvextract wrote of an ASS, SSA or WebVTT track, does not hold the bytes of each packet
+    that one ffmpeg read wrote into the framemd5 file md5 and, as they are, into the file raw, or None, see
+    remux.resub(). Each packet's bytes must hash to its md5, and no byte may be left. mkvextract writes each event
+    again with its times, so the file must hold the text of every packet, byte for byte: the fields of an ASS or SSA
+    event after its Layer, and the payload of a WebVTT cue. A line break counts as LF."""
+    with open(md5) as f:
+        sizes = [(int(p[4]), p[5].strip()) for p in (line.split(",") for line in f if line[:1].isdigit())]
+    with open(raw, "rb") as f:
+        data = f.read()
+    packets, pos = [], 0
+    for k, (size, digest) in enumerate(sizes, 1):
+        packets.append(data[pos:pos + size])
+        pos += size
+        if hashlib.md5(packets[-1]).hexdigest() != digest:
+            return f"packet {k} differs from its md5"
+    if pos != len(data):
+        return f"{len(data) - pos} bytes follow the last packet"
+    with open(path, "rb") as f:
+        text = f.read().replace(b"\r\n", b"\n")
+    if codec == "S_TEXT/WEBVTT":
+        want, have = [b.replace(b"\r\n", b"\n") for b in packets], []
+        for block in re.split(rb"\n\n+", text):
+            lines = block.strip(b"\n").split(b"\n")
+            k = next((n for n, line in enumerate(lines[:2]) if b" --> " in line), None)
+            have += [] if k is None else [b"\n".join(lines[k + 1:])]
+    else:   # a packet is "ReadOrder,Layer,Style,...,Text", and a line "Dialogue: Layer,Start,End,Style,...,Text"
+        want = [b.split(b",", 2)[-1].rstrip(b"\0") for b in packets]
+        have = [line.split(b",", 3)[-1] for line in text.split(b"\n") if line.startswith(b"Dialogue:")]
+    return None if sorted(want) == sorted(have) else "the extracted text does not hold the bytes of each packet"
+
+
+def timed_packets(path, indexes, folder, timeout):
+    """{stream index: [(start, end in seconds, the bytes of its text)]} of the MP4 timed-text streams indexes of path,
+    read with -c copy and -copyts, so no text is decoded. Each packet holds a 2-byte length, the text in that many
+    bytes, then style boxes, which go, as mkvmerge drops them. A packet with no text gives no entry. A timeout raises,
+    and so does a failed read, see bad_lines(), or a packet shorter than its length."""
+    files = {i: (os.path.join(folder, f"{uuid.uuid4().hex}.md5"), os.path.join(folder, f"{uuid.uuid4().hex}.bin")) for i in indexes}
+    argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", "-i", path]
+    for i, (md5, data) in files.items():
+        argv += ["-map", f"0:{i}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{i}", "-c", "copy", "-f", "data", data]
+    r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+    if r.returncode or bad_lines(r.stderr):
+        raise RuntimeError(f"ffmpeg did not read the timed text of {os.path.basename(path)}: {config.mask(r.stderr.strip())[-200:]}")
+    out = {}
+    for i, (md5, data) in files.items():
+        with open(data, "rb") as f:
+            raw = f.read()
+        out[i], pos, tb = [], 0, 1
+        with open(md5) as f:
+            for line in f:
+                if line.startswith("#tb "):
+                    num, den = line.split(":")[1].split("/")
+                    tb = int(num) / int(den)
+                elif line[:1].isdigit():
+                    p = [x.strip() for x in line.split(",")]
+                    pts, dur, size = int(p[2]), int(p[3]), int(p[4])
+                    b, pos = raw[pos:pos + size], pos + size
+                    n = int.from_bytes(b[:2], "big")
+                    if size < 2 + n:
+                        raise RuntimeError(f"a timed-text packet of stream {i} at {pts * tb:.3f} s holds {size} bytes, less than its text")
+                    if n:
+                        out[i].append((pts * tb, (pts + dur) * tb, b[2:2 + n]))
+    return out
+
+
+def timed_srt(cues, shift=0.0):
+    """The SubRip bytes of the cues of timed_packets(), each time moved by shift seconds and kept to the millisecond.
+    The number lines, the time lines and the blank lines are ASCII. Each cue holds the bytes of its packet's text as
+    they are, see remux.keep_broken()."""
+    stamp = lambda t: (lambda v: b"%02d:%02d:%02d,%03d" % (v // 3600000, v // 60000 % 60, v // 1000 % 60, v % 1000))(max(0, round((t + shift) * 1000)))
+    return b"".join(b"%d\n%s --> %s\n%s\n\n" % (k, stamp(a), stamp(e), t) for k, (a, e, t) in enumerate(cues, 1))
+
+
+def utf8(b):
+    """Whether the bytes b are valid UTF-8."""
+    try:
+        b.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None, recoded=None):
     """(the refusal, or None; the proof per stream). The refusal is (stream, why): why the new file tmp is not a lossless
     copy of src with the sidecars subs, and the ffprobe index of the stream of src it refuses for its packet count or
@@ -355,8 +453,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     Some differences pass. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
     cut first frame, alone or with its cut last frame. The entry names it in
-    dropped_first, and the stream's start is then its second packet. mkvmerge may instead trim that fragment. A
-    smaller first MP3 or MP2 packet passes when every other packet matches and the second packet keeps its time.
+    dropped_first, and the stream's start is then its second packet, which must keep its time within TIME_SLACK.
+    mkvmerge may instead trim that fragment. A smaller first MP3 or MP2 packet passes when every other packet matches
+    and the second packet keeps its time.
     The entry names both sizes in trimmed_first. The stream may also lose its cut last frame then, when the new packet
     0 is the tail of the old one after zeros or a stray header, see junk_head(). The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
@@ -449,7 +548,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         if proof[-1]["match"] and (n := sum(x["raw_md5s"][k:k + 16] != y["raw_md5s"][k:k + 16] for k in range(0, len(x.get("raw_md5s") or b""), 16))):
             proof[-1]["crlf"] = n   # packets whose line breaks changed between LF and CRLF, and nothing else
         xt, yt, xs, why, ycut, bad = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None), None   # bad: refused for its packets
-        lead = 0   # the packets of a short lead the new file lost, see ends_lost()
+        lead = None   # what the new file lost at the start, a cut first frame or a short lead, see ends_lost()
         if s["index"] in moved:   # the times the fix gives, as mkvmerge --sync wrote them
             fx = moved[s["index"]]
             to = lambda t: max(0, subsync.moved(t * 1000, fx)) / 1000
@@ -465,6 +564,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         elif s["codec_type"] == "audio" and x["count"] - y["count"] in (1, 2) and \
                 x.get("but_first" if x["count"] == y["count"] + 1 else "but_ends") == y["digest"]:   # a cut first audio frame too
             proof[-1].update(dropped_first={"pts": x.get("first_pts"), "size": x["first"]})
+            lead = "its cut first frame"   # mkvmerge drops it after an empty edit, and a --sync from its time is a frame off
             if x["count"] == y["count"] + 2:
                 proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[1:len(xt) - (x["count"] - y["count"] - 1)]
@@ -478,7 +578,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         elif x["count"] > y["count"] and (lost := ends_lost(src, x, y, s, f[0], timeout)):   # a few packets at the ends
             a, b, gone = lost
             proof[-1].update(**({"dropped_start": gone[:a]} if a else {}), **({"dropped_end": gone[a:]} if b else {}))
-            lead = a if a and gone[0]["kind"] == "lead" else 0
+            lead = f"a lead of {a} packets" if a and gone[0]["kind"] == "lead" else None
             xt = xt[a:len(xt) - b]
             if a:   # the stream now starts at its first kept packet
                 xs = xt[0] if xt and xt[0] is not None else xs
@@ -509,7 +609,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         if not why and abs((xs - va) - (y["start"] - vb)) > SYNC:   # every stream, the exceptions included
             why = f"stream {name} starts {y['start'] - vb:+.3f} s from the video in the new file, {xs - va:+.3f} s in the original"
         if not why and lead and abs((xs - va) - (y["start"] - vb)) > TIME_SLACK:   # mkvmerge can time the rest of an AVI's VBR MP3 early
-            why = f"stream {name} lost a lead of {lead} packets, and its first kept packet moved {((y['start'] - vb) - (xs - va)) * 1000:+.0f} ms"
+            why = f"stream {name} lost {lead}, and its first kept packet moved {((y['start'] - vb) - (xs - va)) * 1000:+.0f} ms"
         if not why and absolute and abs(xs - y["start"]) > SYNC:
             why = f"stream {name} starts at {y['start']:.3f} s in the new file, {xs:.3f} s in the original"
         if not why and (s["index"] in lengthened or s["index"] in planned) and \
@@ -582,7 +682,7 @@ def proof_bsf(fam, codec):
 # check can compare it. A proof refusal alone (an edit list, the times, the cues, a packet count) stays a refusal, and
 # the original stays. So does a warning alone, see invalid_audio(). ffprobe reads no stream in a file it cannot open
 # either, so its message must name a data error.
-DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes of invalid data which were skipped", "part of the audio cannot be read"),
+DAMAGE = {"mkvmerge": (r"This audio track contains \d+ bytes? of invalid data which (?:were|was) skipped", "part of the audio cannot be read"),
           "ffmpeg": (r"NAL unit size|Invalid data found|partial file", "parts of the file cannot be read"),
           "ffprobe": (r"ffprobe read no stream: .*?(?:Invalid data found|moov atom not found|partial file)", "no track of the file can be read")}
 SKIP_EDGE = 5   # seconds from either end of the file where an mkvmerge skip is end junk, such as zero bytes after the last frame
@@ -621,7 +721,8 @@ def audio_damage(text, j, streams, dur, fault):
 def source_read(damage, path, j):
     """The read of a conversion's original that showed damage, run again from scratch on path, as damage_of() it. It
     writes nothing: mkvmerge remuxes into /dev/null with the conversion's --sync, and ffmpeg reads the streams the way
-    prove() reads them. j is the mkvmerge -J probe of path. mkvmerge must skip invalid data in the same audio stream
+    prove() reads them. A subtitle decoder's error is no damage there either, see SUB_DECODER. j is the mkvmerge -J
+    probe of path. mkvmerge must skip invalid data in the same audio stream
     away from the ends again. The proof's refusal stands from the conversion. Any other failure of the read is no
     damage."""
     read = damage["read"]

@@ -47,10 +47,23 @@ Run the tests from the top of a clone:
 python -m pytest -q
 ```
 
-The tests need pytest. The tests on real media files need `ffmpeg` and `mkvtoolnix`, and skip without them.
+The tests need pytest. The tests on real media files need `ffmpeg` and mkvtoolnix 102, and skip when a tool is
+missing. The README's [Install on a host](../README.md#install-on-a-host) installs mkvtoolnix 102.
 The burned-in subtitle tests on media in `tests/test_burnin.py` also need numpy, onnxruntime, PyAV and the text
 models, and skip without them.
 With pytest-xdist installed, `python -m pytest -q -n auto` runs them on every core, as CI does.
+
+The tests make their own clips with ffmpeg. `amg.ffmpeg()` in [tests/amg.py](../tests/amg.py) keeps each clip in
+`~/.cache/arr-media-guard/test-media`, so a later run copies it in place of a new encode. Each clip has a key, which
+holds everything that decides its bytes. The key holds the arguments, the content of each input file and the ffmpeg
+version. It also holds the size and mtime of each library and font that ffmpeg uses. A call with a new key makes a new
+clip. A call that reads a file the key cannot see runs each time and keeps no clip. Such files are a concat list, an
+image pattern, an `-attach` file, a relative path inside a filter, and a path with a space inside a filter.
+`AMG_TEST_MEDIA` names another folder, and `AMG_TEST_MEDIA=off` makes every clip again. Without `ldd` or `fc-list`,
+every call makes its clip. When a run keeps a new clip, it deletes each clip that no run used for 3 days. A new test
+makes its clips with `amg.ffmpeg()`. A call whose input mkvmerge wrote in the same run calls ffmpeg directly. mkvmerge
+writes new UIDs on each run, so that key never comes again. A test that runs a command line of the product uses
+`subprocess.run()`, so it runs the real tools.
 
 The tests assert codes and fields. [tests/test_report.py](../tests/test_report.py) holds the golden text of each
 template in `report.py`, so a reworded template changes that file only.

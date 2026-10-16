@@ -241,11 +241,12 @@ def test_a_job_of_the_listener_or_of_a_single_instance_skips_the_name_check(g, m
     assert g.job_refused({"app": "sonarr", "instance_name": "Sonarr"}).startswith("the run named 'Sonarr' may come from another instance")
 
 
-def test_a_misnamed_instance_warns_in_the_selftest_and_never_in_the_listener(g, post, monkeypatch, capsys):
+def test_a_misnamed_instance_warns_in_the_selftest_and_never_in_the_listener(g, post, monkeypatch, capsys, mkvmerge_says):
     """The URL path of the Webhook picks the instance, so the listener's Test and start check skip the Instance Name. The
     owner saw this line at the first start of 2.1.0 in Docker:
     arr-media-guard: radarr warning: Radarr names its instance 'RadarrHD', so its Custom Script runs go to no instance. ...
     The selftest on a host names the clash and passes."""
+    mkvmerge_says()   # no mkvmerge warning, whatever the host has
     g.api[HOSTS["sonarr-4k"]]["system/status"]["instanceName"] = "Sonarr"
     clash = CLASH.format("Sonarr", "the instance sonarr")
     monkeypatch.setattr(g, "SERVE", True)   # serve.main() sets it in the listener

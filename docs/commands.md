@@ -42,9 +42,10 @@ On a host, leave out `docker exec -it arr-media-guard`.
   drops those of one instance. A job that runs then ends first.
 - A job queues the burned-in subtitle check, the whole-file check and the deep analysis as an import does. The
   whole-file check reads each file whole, so a full backfill reads the library once more, and it only alerts. The deep
-  analysis waits behind every job a backfill queued. At `SUBTITLES=deep` it takes a median of about 5 minutes per hour
-  of video, and one file in four takes 15 minutes or more per hour. A file whose saved deep analysis still holds gets
-  no new one.
+  analysis waits behind every job a backfill queued. At `SUBTITLES=deep` it takes about 16 minutes per hour of video
+  on a recent CPU, see [design.md](design.md#subtitle-match). A file whose saved deep analysis still holds gets no
+  new one. `--selftest` counts these checks as jobs from a backfill, as in
+  `background queue: 12 jobs, 9 of them from a backfill (1 file still to check)`.
 - A backfill keeps its place in each instance, as a scan does. `--limit N --apply` queues the next N files, and the next
   run goes on from there. A run after the last file queues nothing and says so. `--restart` starts a new pass, as after
   a change of your settings. `--ids` and `--paths` keep a place of their own. A dry run keeps no place and names the
@@ -326,6 +327,10 @@ In Docker, the listener runs the nightly audit at `AUDIT_TIME`, see [docker.md](
 setup uses. A bad setting, an env file that does not read, or a policy file that does not load fails it. An app or a
 service that fails its check only warns, because a deploy may run the selftest while one is down. The last line is
 `selftest ok`.
+
+After the policy file, the selftest names the version of the mkvmerge on PATH, as `mkvmerge version: 102.0`. AMG
+supports mkvmerge 102, and the image ships it. An older mkvmerge, or one whose version does not read, gives one
+warning that points to [Install on a host](../README.md#install-on-a-host). The warning never fails the selftest.
 
 ```
 arr-media-guard --selftest

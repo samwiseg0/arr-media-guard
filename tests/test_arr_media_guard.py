@@ -1816,7 +1816,7 @@ def test_drop_queued_drops_only_the_jobs_a_backfill_queued(env, monkeypatch, set
     hook.main(["--backfill", "--apply"])
     assert hook.claim(hook.deep_name(lists["sonarr"][1]))   # a job a worker runs
     hook.main(["--selftest"])
-    assert "background queue: 5 jobs, 4 of them queued by a backfill\n" in capsys.readouterr().out
+    assert "background queue: 5 jobs, 4 of them from a backfill (4 files still to check)\n" in capsys.readouterr().out
     hook.main(["--backfill", "radarr", "--drop-queued"])
     assert set(queued_paths().values()) == {"sonarr"} and "dropped 2 jobs that a backfill queued" in capsys.readouterr().out
     hook.main(["--backfill", "--drop-queued"])
@@ -2006,10 +2006,10 @@ def media(tmp_path_factory):
     d = tmp_path_factory.mktemp("media")
     lav = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10:duration=120", "-f", "lavfi"]
     enc = ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"]
-    subprocess.run(lav + ["-i", "sine=frequency=440:duration=120"] + enc + [str(d / "good.mkv")], check=True)
-    subprocess.run(lav + ["-i", "anullsrc=r=48000:cl=stereo", "-t", "120"] + enc + [str(d / "silent.mkv")], check=True)
-    subprocess.run(lav + ["-i", "sine=frequency=440:duration=60"] + enc + [str(d / "short.mkv")], check=True)
-    subprocess.run(lav + ["-i", "sine=frequency=440:duration=120"] + enc + ["-movflags", "+faststart", str(d / "good.mp4")], check=True)
+    amg.ffmpeg(lav + ["-i", "sine=frequency=440:duration=120"] + enc + [str(d / "good.mkv")], check=True)
+    amg.ffmpeg(lav + ["-i", "anullsrc=r=48000:cl=stereo", "-t", "120"] + enc + [str(d / "silent.mkv")], check=True)
+    amg.ffmpeg(lav + ["-i", "sine=frequency=440:duration=60"] + enc + [str(d / "short.mkv")], check=True)
+    amg.ffmpeg(lav + ["-i", "sine=frequency=440:duration=120"] + enc + ["-movflags", "+faststart", str(d / "good.mp4")], check=True)
     shutil.copy(d / "good.mkv", d / "corrupt.mkv")
     with open(d / "corrupt.mkv", "r+b") as f:
         size = os.path.getsize(d / "corrupt.mkv")
@@ -2017,8 +2017,8 @@ def media(tmp_path_factory):
             f.seek(int(size * share)); f.write(bytes((i * 7919) % 256 for i in range(20000)))
     shutil.copy(d / "good.mkv", d / "cut.mkv")
     os.truncate(d / "cut.mkv", int(os.path.getsize(d / "good.mkv") * 0.6))
-    subprocess.run(lav[:7] + ["testsrc=size=160x90:rate=10:duration=90", "-f", "lavfi", "-i", "sine=frequency=440:duration=90"] + enc
-                   + [str(d / "tail.mkv")], check=True)
+    amg.ffmpeg(lav[:7] + ["testsrc=size=160x90:rate=10:duration=90", "-f", "lavfi", "-i", "sine=frequency=440:duration=90"] + enc
+               + [str(d / "tail.mkv")], check=True)
     os.truncate(d / "tail.mkv", os.path.getsize(d / "tail.mkv") - 3000)   # only the last 3 KB are missing
     return d
 
@@ -2259,7 +2259,7 @@ def shapes(tmp_path_factory):
     d = tmp_path_factory.mktemp("shapes")
     vid = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10:duration=120", "-f", "lavfi"]
     enc = ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3", "-b:a", "192k"]
-    run = lambda *argv: subprocess.run(list(argv), check=True)
+    run = lambda *argv: amg.ffmpeg(list(argv), check=True)
     run(*vid, "-i", "sine=frequency=440:duration=4", *enc, str(d / "stops.mkv"))   # the audio stops at 0:04
     run(*vid, "-i", "sine=frequency=440:duration=120", "-af", "aselect='not(between(t,20,80))'", *enc, str(d / "hole.mkv"))   # no packets 0:20-1:20
     run(*vid, "-i", "sine=frequency=440:duration=120", *enc, str(d / "damaged.mkv"))
@@ -2555,13 +2555,15 @@ def test_a_timeout_while_sampling_a_pack_uses_no_cap_count(env, monkeypatch, tmp
     assert not hook.store.items("regrabs")
 
 
-def test_a_failed_mkvpropedit_still_records_the_flags_it_left(env, monkeypatch):
-    """mkvpropedit can exit 2 on the Tracks element, yet the file reads fine with the intended flags."""
+@pytest.mark.parametrize("code", [2, -9])
+def test_a_failed_mkvpropedit_still_records_the_flags_it_left(env, monkeypatch, code):
+    """mkvpropedit can exit 2 on the Tracks element, yet the file reads fine with the intended flags. A signal gives a
+    negative code, and fails the edit too."""
     real = hook.subprocess.run
     def exits_2(argv, **kw):
         r = real(argv, **kw)   # the fixture's mkvpropedit changes the flags
         if argv[0] == "mkvpropedit":
-            return type("R", (), {"returncode": 2, "stdout": "Updating the 'Tracks' element failed. The file has been modified.", "stderr": ""})()
+            return type("R", (), {"returncode": code, "stdout": "Updating the 'Tracks' element failed. The file has been modified.", "stderr": ""})()
         return r
     monkeypatch.setattr(hook.subprocess, "run", exits_2)
     hook.main([])
@@ -3148,8 +3150,8 @@ def test_mkvpropedit_writes_both_tags_and_the_undo_brings_the_old_ones_back(tmp_
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvpropedit")):
         pytest.skip("needs ffmpeg and mkvtoolnix")
     src, path = tmp_path / "src.mkv", tmp_path / "file.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
-              "-map", "0", "-map", "1", "-c:a", "aac", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
+                "-map", "0", "-map", "1", "-c:a", "aac", str(src)], check=True)
     REAL_RUN(["mkvmerge", "-q", "--disable-language-ietf", "-o", str(path), "--language", "0:und", "--language", "1:eng", "--track-name", "1:Spanish",
               str(src)], check=True)
     REAL_RUN(["mkvpropedit", "-q", str(path), "--edit", "track:a2", "--set", "language-ietf=en-US"], check=True)
@@ -4122,11 +4124,11 @@ def clips(tmp_path_factory):
         pytest.skip("needs ffmpeg")
     d = tmp_path_factory.mktemp("clips")
     good = d / "good.mkv"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=120", "-c:v", "libx264",
-                    "-preset", "ultrafast", "-g", "48", "-b:v", "2M", str(good)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=120", "-c:v", "libx264",
+                "-preset", "ultrafast", "-g", "48", "-b:v", "2M", str(good)], check=True)
     for name, container in (("good.ts", "mpegts"), ("cut.mp4", "mp4")):
-        subprocess.run(["ffmpeg", "-v", "error", "-i", str(good), "-c", "copy", "-movflags", "+faststart", "-f", container, str(d / name)],
-                       check=True)
+        amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(good), "-c", "copy", "-movflags", "+faststart", "-f", container, str(d / name)],
+                   check=True)
     os.truncate(d / "cut.mp4", os.path.getsize(d / "cut.mp4") * 8 // 10)
     size = os.path.getsize(good)
     shutil.copy(good, d / "truncated.mkv")
@@ -4181,7 +4183,7 @@ def test_the_zero_probe_reads_only_the_matroska_clusters(tmp_path):
             g.seek(at); g.write(bytes(2 << 20))
     assert len(hook.zero_scan(str(f))[0]) == 2
     hits = hook.zero_probe(str(f))[0]
-    assert len(hits) >= 2 and all((ds + len(head)) / size < h < (ds + len(segment)) / size for h in hits), hits   # shares of the file
+    assert len(hits) >= 2 and all(ds + len(head) < h < ds + len(segment) for h in hits), hits   # bytes of the file
     assert hook.check_video(str(f), 0)[2]["fault"] == "zero-filled"
     with open(f, "r+b") as g:   # a zero run is measured only inside the span, never into the zeros past the Segment end
         g.seek(ds + len(segment) - 65536); g.write(bytes(65536))
@@ -4220,8 +4222,8 @@ def test_a_codec_ffmpeg_does_not_know_is_only_a_doubt(tmp_path):
     if not shutil.which("ffmpeg"):
         pytest.skip("needs ffmpeg")
     f = tmp_path / "unknown.mkv"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=90", "-c:v", "libx264",
-                    "-preset", "ultrafast", str(f)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=90", "-c:v", "libx264",
+                "-preset", "ultrafast", str(f)], check=True)
     b = bytearray(f.read_bytes()); i = b.find(b"V_MPEG4/ISO/AVC"); b[i:i + 15] = b"V_MPEG4/ISO/AVX"; f.write_bytes(b)
     certain, doubts, fields = hook.check_video(str(f), 90.0)
     wins = fields["windows"]["list"]
@@ -4248,8 +4250,8 @@ def test_the_bytes_show_an_encrypted_track_when_ffmpeg_names_none(tmp_path, monk
         return
     for name, args in (("cenc.mp4", ["-encryption_scheme", "cenc-aes-ctr", "-encryption_key", "76a6c65c5ea762046bd749a2e632ccbb",
                                      "-encryption_kid", "a7e61c373e219033c21091fa607bf3b8"]), ("clear.mp4", [])):
-        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=3", "-c:v", "libx264",
-                        "-preset", "ultrafast", *args, str(tmp_path / name)], check=True)
+        amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=3", "-c:v", "libx264",
+                    "-preset", "ultrafast", *args, str(tmp_path / name)], check=True)
     assert hook.encrypted_video(str(tmp_path / "cenc.mp4")) and not hook.encrypted_video(str(tmp_path / "clear.mp4"))
 
 
@@ -4260,8 +4262,8 @@ def test_windows_follow_the_video_stream_of_a_file_that_is_not_matroska(tmp_path
     if not shutil.which("ffmpeg"):
         pytest.skip("needs ffmpeg")
     f = tmp_path / "Show L - s01e05 - DVD.mp4"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=70", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=150", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(f)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=70", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=150", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(f)], check=True)
     dur, hp, pcm = hook.video_inputs(str(f))
     assert hp is None and pcm is None and abs(dur - 70) < 0.1 and hook.ffprobe_duration(str(f)) > 149, dur
     certain, doubts, fields = hook.check_video(str(f), dur)
@@ -5635,9 +5637,9 @@ def mkvs(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     d = tmp_path_factory.mktemp("mkvs")
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=120", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=120", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "src.mkv")],
-                   check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=120", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=120", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "src.mkv")],
+               check=True)
     mux = lambda out, *args: subprocess.run(["mkvmerge", "-q", "-o", str(d / out), *args], check=True)
     mux("good.mkv", str(d / "src.mkv"))
     shutil.copy(d / "good.mkv", d / "long.mkv"); set_duration(d / "long.mkv", 48213)
@@ -5664,9 +5666,9 @@ def mkvs(tmp_path_factory):
     (d / "forced.srt").write_text(srt([(20 * k, 20 * k + 2, f"Sign {k}") for k in range(5)] + [(125, 300, "One stray sign")]))
     mux("forced.mkv", str(d / "good.mkv"), "--forced-display-flag", "0:1", str(d / "forced.srt"))   # 1 of 6 late: a trim
     # A film cut at 60 percent: 3 of its 5 minutes, and a good SubRip track that runs to the full length
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=180", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=180", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "cutsrc.mkv")],
-                   check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=180", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=180", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "cutsrc.mkv")],
+               check=True)
     (d / "full.srt").write_text(srt([(6 * k, 6 * k + 3, f"Line {k}") for k in range(50)]))
     mux("cut.mkv", str(d / "cutsrc.mkv"), "--language", "0:eng", str(d / "full.srt"))
     # A shorter copy written over an older, larger one without a truncate. Zeros start at the
@@ -5677,9 +5679,9 @@ def mkvs(tmp_path_factory):
     (d / "tail_long.mkv").write_bytes((d / "long.mkv").read_bytes() + junk)   # and a header duration no stream reaches
     # The write of the shorter copy stopped at 60 percent. The last 40 percent of its Segment holds the old
     # copy, a larger encode, so the Clusters before the Segment end come from early in the old timeline.
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=180", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=180", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-crf", "2", "-c:a", "aac",
-                    str(d / "oldsrc.mkv")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=180", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=180", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-crf", "2", "-c:a", "aac",
+                str(d / "oldsrc.mkv")], check=True)
     mux("old.mkv", str(d / "oldsrc.mkv"))
     good, old = (d / "good.mkv").read_bytes(), (d / "old.mkv").read_bytes()
     (d / "interrupted.mkv").write_bytes(good[:len(good) * 6 // 10] + old[len(good) * 6 // 10:])
@@ -5911,12 +5913,12 @@ def test_a_failed_header_repair_alerts_and_still_edits(env, monkeypatch):
 
 
 def test_a_header_issue_with_real_damage_is_never_repaired(env, monkeypatch):
-    calls = header_issue(env, monkeypatch, repairable=False, doubts=["the file has a blank gap at 30% of its length"])
+    calls = header_issue(env, monkeypatch, repairable=False, doubts=["the file has a blank gap at 30% of the file size"])
     hook.main([])
     rec = decided(env)
     assert calls["repairs"] == [] and len(calls["checks"]) == 1 and rec["reasons"][0] == "header_not_repaired"
     assert rec["header_repair"]["result"] == "not repaired: zero-filled regions at 18 of 256 offsets"
-    assert rec["findings"] == [{"kind": "video", "doubts": ["the file has a blank gap at 30% of its length"]}]
+    assert rec["findings"] == [{"kind": "video", "doubts": ["the file has a blank gap at 30% of the file size"]}]
 
 
 def test_header_repair_switched_off_never_repairs(env, monkeypatch, settings):
@@ -6087,9 +6089,9 @@ def damaged(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     d = tmp_path_factory.mktemp("damaged")
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=80,noise=alls=40:allf=t:all_seed=1", "-f", "lavfi",
-                    "-i", "sine=frequency=440:duration=80", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M", "-g", "48", "-threads", "1", "-c:a", "aac",
-                    str(d / "src.mkv")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=80,noise=alls=40:allf=t:all_seed=1", "-f", "lavfi",
+                "-i", "sine=frequency=440:duration=80", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M", "-g", "48", "-threads", "1", "-c:a", "aac",
+                str(d / "src.mkv")], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), "--cues", "0:none", "--cues", "1:none", str(d / "src.mkv")], check=True)
     size = os.path.getsize(d / "nocues.mkv")
     for name, at, data in (("garbage.mkv", 0.4, noise(2 << 20)), ("hole.mkv", 0.4, bytes(160 << 10))):
@@ -6466,9 +6468,9 @@ def cuts(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     d = tmp_path_factory.mktemp("cuts")
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=600", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=600", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "src.mkv")],
-                   check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=600", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=600", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "aac", str(d / "src.mkv")],
+               check=True)
     srt = lambda events: "\n\n".join(f"{k + 1}\n{stamp(a)} --> {stamp(b)}\n{text}" for k, (a, b, text) in enumerate(events)) + "\n"
     (d / "remove.srt").write_text(srt([(k * 706 / 604, k * 706 / 604 + 1, f"Line {k}") for k in range(604)]))
     (d / "trim.srt").write_text(srt([(k * 1.4, k * 1.4 + 1, f"Line {k}") for k in range(427)]
@@ -7884,6 +7886,28 @@ def test_invalid_audio_counts_only_for_the_refused_stream_away_from_the_ends(env
     rec = decided(env)
     assert rec.get("regrab") == regrab and env["writes"] == [] and os.path.exists(mp4), rec
     assert rec["outcome"] == ("damaged_source" if regrab else "repack_failed")
+
+
+@pytest.mark.parametrize("n, words", [(1, "byte of invalid data which was"), (173, "bytes of invalid data which were")])
+def test_a_skip_of_one_byte_counts_as_damage_too(n, words):
+    """mkvmerge words a skip of one byte in the singular. damage_of() and invalid_audio() read both forms."""
+    text = (f"Warning: '/m/Show/Season 1/Show - s01e02 - Title - DVD.avi' track 1: This audio track contains {n} {words} skipped before "
+            "timestamp 00:04:21.517000000. The audio/video synchronization may have been lost.")
+    j = {"tracks": [{"id": 0, "type": "video"}, {"id": 1, "type": "audio"}]}
+    streams = [{"index": 0, "codec_type": "video"}, {"index": 1, "codec_type": "audio"}]
+    line = text.split("track 1: ")[1]
+    assert hook.damage_of("mkvmerge", text)["line"] == line and hook.invalid_audio(text, j, streams, 600) == {1: line}
+
+
+@pytest.mark.parametrize("code, out, why", [(-9, "", "mkvmerge exited -9"), (2, "Error: not a file", "mkvmerge exited 2: Error: not a file"),
+                                            (-6, "malloc(): corrupted top size", "mkvmerge exited -6: malloc(): corrupted top size")])
+def test_an_mkvmerge_probe_that_a_signal_ends_fails_with_its_text(monkeypatch, code, out, why):
+    """A probe that a signal ends has a negative exit code. It fails as an exit code 2 does, with the code and mkvmerge's
+    words."""
+    monkeypatch.setattr(hook, "run_bounded", lambda argv, *a, **k: subprocess.CompletedProcess(argv, code, "", out))
+    with pytest.raises(RuntimeError) as ex:
+        REAL_MKVMERGE("/m/Film A (1979)/Film A (1979).mkv")
+    assert str(ex.value) == why
 
 
 def test_a_skip_in_a_file_of_unknown_length_is_no_damage(env, monkeypatch):
@@ -9398,20 +9422,20 @@ def convertible(tmp_path_factory):
     d = tmp_path_factory.mktemp("convert")
     src = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=20", "-f", "lavfi", "-i", "sine=duration=20"]
     (d / "s.srt").write_text("1\n00:00:01,000 --> 00:00:03,500\nHello <i>there</i>\n\n2\n00:00:05,000 --> 00:00:07,000\nTwo\nlines\n")
-    subprocess.run(src + ["-i", str(d / "s.srt"), "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "2",
-                          "-c:a", "aac", "-c:s", "mov_text", str(d / "Movie (2020).mp4")], check=True)
+    amg.ffmpeg(src + ["-i", str(d / "s.srt"), "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "2",
+                      "-c:a", "aac", "-c:s", "mov_text", str(d / "Movie (2020).mp4")], check=True)
     (d / "Movie (2020).en.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\n<i>World</i>\n")
     (d / "Movie (2020).en.forced.srt").write_text("1\n00:00:04,000 --> 00:00:05,000\n[SIGN]\n")
     (d / "Movie (2020).es.srt").write_bytes(b"1\n00:00:01,000 --> 00:00:02,000\nCaf\xe9\n")
-    subprocess.run(src + ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts", str(d / "Clip.ts")], check=True)
-    subprocess.run(src + ["-c:v", "mpeg4", "-bf", "2", "-vtag", "DX50", "-c:a", "libmp3lame", str(d / "Clip.avi")], check=True)
-    subprocess.run(src + ["-c:v", "wmv2", "-c:a", "wmav2", str(d / "Clip.wmv")], check=True)
+    amg.ffmpeg(src + ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts", str(d / "Clip.ts")], check=True)
+    amg.ffmpeg(src + ["-c:v", "mpeg4", "-bf", "2", "-vtag", "DX50", "-c:a", "libmp3lame", str(d / "Clip.avi")], check=True)
+    amg.ffmpeg(src + ["-c:v", "wmv2", "-c:a", "wmav2", str(d / "Clip.wmv")], check=True)
     style = ("[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontsize\nStyle: Default,20\n\n[Events]\n"
              "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     (d / "lead.ass").write_text(style + "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,It's a first line.\n"
                                 "Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,\\NA second line after a break,\n")
-    subprocess.run(src[:8] + ["-i", str(d / "lead.ass"), "-map", "0", "-map", "1", "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "mov_text",
-                              str(d / "Lead.mp4")], check=True)
+    amg.ffmpeg(src[:8] + ["-i", str(d / "lead.ass"), "-map", "0", "-map", "1", "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "mov_text",
+                          str(d / "Lead.mp4")], check=True)
     return d
 
 
@@ -9455,6 +9479,406 @@ def test_a_real_remux_proves_every_stream_at_packet_level(convertible, tmp_path,
         assert tracks == [("eng", True), ("eng", False), ("spa", False)]
 
 
+def mkvmerge_major():
+    """The major version of the mkvmerge on PATH."""
+    return int(re.match(r"mkvmerge v(\d+)", REAL_RUN(["mkvmerge", "--version"], capture_output=True, text=True).stdout).group(1))
+
+
+def test_a_conversion_keeps_the_name_of_each_track(tmp_path):
+    """Since 100.0 mkvmerge reads the name of an MP4 track, and gives it to each later track with none. Each track of an
+    MP4 keeps the name of its source track, also after a dropped subtitle track, and a track with none gets none. A
+    WebM gets no --track-name, which would trim the spaces at the ends of its names."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    (tmp_path / "cues.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    lavfi = lambda x: ("-f", "lavfi", "-i", x)
+    tones = [a for f in (440, 550, 660) for a in lavfi(f"sine=frequency={f}:duration=4")]
+    video = [*lavfi("testsrc=size=160x90:rate=24:duration=4")]
+    names = lambda p: [t["properties"].get("track_name") for t in hook.mkvmerge(str(p))["tracks"]]
+    src, out = tmp_path / "Clip.mp4", tmp_path / "new.mkv"   # tracks v0, a1, a2, s3, s4, a5. mkvmerge reads no timed text of a MOV.
+    maps = [a for i in (0, 1, 2, 4, 4, 3) for a in ("-map", str(i))]
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", *video, *tones, "-i", str(tmp_path / "cues.srt"), *maps,
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "mov_text", "-metadata:s:a:0", "title=Director Commentary",
+                "-metadata:s:s:0", "title=Signs", "-metadata:s:a:2", "title=Stereo", str(src)], check=True)
+    r = REAL_RUN(hook.convert_cmd(str(src), str(out), hook.mkvmerge(str(src)), [], drop=[3])[5:], capture_output=True, text=True)
+    assert r.returncode == 0 and not r.stdout + r.stderr, r   # -s 4 keeps the other text track, and mkvmerge warns nothing
+    assert names(out) == [n for i, n in enumerate(names(src)) if i != 3] == ([None, "Director Commentary", None, None, "Stereo"]
+                                                                           if mkvmerge_major() >= 100 else [None] * 5)
+    src = tmp_path / "Clip.webm"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", *video, *tones[:8], "-map", "0", "-map", "1", "-map", "2", "-c:v", "libvpx", "-deadline", "realtime",
+                "-c:a", "libopus", "-metadata:s:a:0", "title=  Spaced  ", str(src)], check=True)
+    remux(src, out)
+    assert names(out) == names(src) == [None, "  Spaced  ", None]
+
+
+def test_pcm_audio_that_starts_late_keeps_its_start_in_a_conversion(tmp_path):
+    """A MOV whose PCM audio starts 0.5 s after the video. Since 95.0 mkvmerge keeps that start, and the proof passes.
+    mkvmerge 92 started the audio at 0, and the proof refused the new file for it."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    src, out = tmp_path / "Clip.mov", tmp_path / "new.mkv"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-itsoffset", "0.5", "-f", "lavfi",
+                "-i", "sine=duration=5", "-map", "0", "-map", "1", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le", str(src)], check=True)
+    fault, proof = proved(str(src), str(out), remux(src, out), str(tmp_path))
+    if mkvmerge_major() >= 95:
+        assert fault is None and all(p["match"] for p in proof), (fault, proof)
+    else:
+        assert "starts +0.000 s from the video in the new file, +0.500 s in the original" in fault, fault
+
+
+# A GOP every 97 frames with B-frames, for each video codec gop_mp4() writes. The last GOP is its last 46 frames.
+GOP = {"hevc": ["libx265", "-x265-params", "keyint=97:min-keyint=97:bframes=3:open-gop=0:scenecut=0:pools=1:frame-threads=1:log-level=error"],
+       "mpeg2video": ["mpeg2video", "-g", "97", "-bf", "2"], "mpeg1video": ["mpeg1video", "-g", "97", "-bf", "2"],
+       "h264": ["libx264", "-preset", "ultrafast", "-g", "97", "-bf", "3", "-threads", "1"], "mpeg4": ["mpeg4", "-g", "97", "-bf", "2"],
+       "av1": ["libsvtav1", "-g", "97", "-preset", "12"], "vp9": ["libvpx-vp9", "-g", "97", "-deadline", "realtime", "-cpu-used", "8"]}
+EARLY = [("eng", [(1.0, 2.5, "Hello there.")])]   # a subtitle track that ends long before the video
+LATE_TEXT = [("eng", [(1.0, 2.5, "Hello there."), (12.0, 13.0, "After the end.")])]   # one that ends after it
+
+
+def gop_mp4(path, codec="hevc", video_offset=0.0, audio=(10.0, 0.0), subs=EARLY, second=False, cp=None, rate=None, fmt="mp4"):
+    """An MP4 made with ffmpeg: 240 frames of video at 23.976 fps in GOP[codec], the last 45 black as at the end of a
+    film, an AAC sine of audio = (length, offset) or None, and a timed-text track (lang, [(start, end, text)]) for each
+    of subs. video_offset and offset delay a track by an edit list. second adds a second video track of 150 frames.
+    cp writes the text of the first track in that codepage: ffmpeg writes an ASCII stand-in, and its bytes are swapped.
+    rate is the audio's sample rate, and fmt the ffmpeg muxer, mov for QuickTime."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")) or f" {GOP[codec][0]} " not in REAL_RUN(
+            ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout:
+        pytest.skip(f"needs mkvmerge and ffmpeg with {GOP[codec][0]}")
+    stamp = lambda x: f"00:00:{int(x):02d},{round(x * 1000) % 1000:03d}"
+    swaps, inputs, n = [], [], 1 + bool(audio) + bool(second)
+    for k, (lang, cues) in enumerate(subs):
+        lines = []
+        for i, (a, e, text) in enumerate(cues, 1):
+            if cp and k == 0:
+                swaps.append((f"Zq{i}x".ljust(len(text.encode(cp)), "j").encode(), text.encode(cp)))
+                text = swaps[-1][0].decode()
+            lines.append(f"{i}\n{stamp(a)} --> {stamp(e)}\n{text}\n")
+        (path.parent / f"s{k}.srt").write_text("\n".join(lines), encoding="utf-8")
+        inputs += ["-i", str(path.parent / f"s{k}.srt")]
+    frames = "testsrc2=size=160x96:rate=24000/1001,trim=end_frame=195,setpts=PTS-STARTPTS[a];color=black:size=160x96:rate=24000/1001," \
+             "trim=end_frame=45,setpts=PTS-STARTPTS[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p"
+    argv = ["ffmpeg", "-v", "error", "-y", *(["-itsoffset", str(video_offset)] if video_offset else []), "-f", "lavfi", "-i", frames]
+    argv += ["-f", "lavfi", "-i", "testsrc=size=160x96:rate=24000/1001,trim=end_frame=150,format=yuv420p"] if second else []
+    argv += [*(["-itsoffset", str(audio[1])] if audio[1] else []), "-f", "lavfi", "-i",
+             f"sine=duration={audio[0]}" + (f":sample_rate={rate}" if rate else "")] if audio else []
+    argv += inputs + [a for i in range(n + len(subs)) for a in ("-map", str(i))] + ["-c:v", *GOP[codec], "-c:a", "aac", "-c:s", "mov_text"]
+    argv += ["-tag:s", "tx3g"] if fmt == "mov" else []   # else the mov muxer writes a QuickTime text track, which mkvmerge skips
+    argv += [a for k, (lang, _) in enumerate(subs) for a in (f"-metadata:s:s:{k}", f"language={lang}")]
+    amg.ffmpeg(argv + ["-f", fmt, str(path)], check=True)
+    data = path.read_bytes()
+    for stand_in, raw in swaps:
+        assert data.count(stand_in) == 1, stand_in
+        data = data.replace(stand_in, raw)
+    path.write_bytes(data)
+    return path
+
+
+def video_frames(path):
+    """The packet count of each video stream of path."""
+    r = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "v", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "json",
+                  str(path)], capture_output=True, text=True, check=True)
+    return [int(s["nb_read_packets"]) for s in json.loads(r.stdout)["streams"]]
+
+
+def last_keyframe(path):
+    """The index of the last keyframe packet of the first video stream of path."""
+    r = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0", str(path)],
+                 capture_output=True, text=True, check=True)
+    return max(i for i, f in enumerate(r.stdout.split()) if "K" in f)
+
+
+def film_path(tmp_path):
+    """A .mkv path in its own folder, so convert() converts the file under its own name and asks no app."""
+    (tmp_path / "Film (2020)").mkdir()
+    return tmp_path / "Film (2020)" / "Film (2020).mkv"
+
+
+def one_input(src, out, *a, **k):
+    """The one-input remux of convert_cmd(), as before split_sync(), run for real."""
+    REAL_RUN(hook.convert_cmd(str(src), str(out), hook.mkvmerge(str(src)), [], *a, **k)[5:], check=False, capture_output=True)
+    return out
+
+
+def test_mkvmerge_still_loses_the_last_gop_of_an_hevc_mp4(tmp_path):
+    """The removal signal of split_sync() (docs/design.md, "Conversion") for mkvmerge issue 6320,
+    https://codeberg.org/mbunkus/mkvtoolnix/issues/6320. In one input, the subtitle track that ends first makes mkvmerge
+    flush the HEVC track early. It ends before the GOP that leads up to the last keyframe, so every frame from that
+    keyframe on is lost. A mkvmerge with the issue fixed keeps them and fails this test on purpose. Then the split can
+    go."""
+    src = gop_mp4(tmp_path / "Clip.mp4")
+    kept, total = video_frames(one_input(src, tmp_path / "one.mkv")), video_frames(src)
+    assert kept != total, "mkvmerge no longer loses the last GOP of an HEVC MP4. The two-input form of split_sync() can go."
+    assert kept == [last_keyframe(src)] and total[0] - kept[0] > hook.END_LOSS, (kept, total)
+
+
+@pytest.mark.parametrize("codec", ["mpeg2video", "mpeg1video", "h264", "mpeg4", "av1", "vp9"])
+def test_last_gop_lists_the_codecs_mkvmerge_cuts_in_one_input(tmp_path, codec):
+    """A one-input remux loses video frames at the end exactly for the codecs of LAST_GOP. HEVC has the test above.
+    MPEG-1 and MPEG-2 lose more than the last GOP: their packetizer ends the stream at the early flush."""
+    src = gop_mp4(tmp_path / "Clip.mp4", codec)
+    kept, total = video_frames(one_input(src, tmp_path / "one.mkv")), video_frames(src)
+    listed = [t["codec"] for t in hook.mkvmerge(str(src))["tracks"] if t["type"] == "video"][0] in hook.LAST_GOP
+    assert (kept != total) == listed, (f"{codec} {'no longer loses' if listed else 'loses'} its last GOP in one input: "
+                                       f"{'take it off' if listed else 'put it on'} LAST_GOP", kept, total)
+
+
+@pytest.mark.parametrize("codec, fmt", [("hevc", "mp4"), ("mpeg2video", "mp4"), ("hevc", "mov")])
+def test_an_mp4_whose_video_loses_its_last_gop_converts_with_every_frame(tmp_path, settings, codec, fmt):
+    """The video 0.105 s late by an empty edit, and a subtitle track that ends first. One input loses the last GOP, and
+    the proof refuses it. Each video track from its own input keeps every frame, and the proof passes. A QuickTime
+    file (brand qt) gets the same."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = gop_mp4(film_path(tmp_path), codec, video_offset=0.105, fmt=fmt)
+    total = video_frames(path)
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and video_frames(new) == total, (result, info.get("proof"))
+    assert set(info["split_sync"]["video"]) == {0} and not [p for p in info["proof"] if "dropped_end" in p], info
+
+
+def test_an_h264_mp4_keeps_the_one_input_remux(tmp_path, settings, monkeypatch):
+    """H.264 keeps every frame in one input, so its remux keeps the one-input command."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path, seen, real = gop_mp4(film_path(tmp_path), "h264"), [], hook.convert_cmd
+    monkeypatch.setattr(hook, "convert_cmd", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and video_frames(new) == [240] and "split_sync" not in info, (result, info.get("proof"))
+    assert seen[0].count(str(path)) == 1 and "-D" not in seen[0], seen
+
+
+def track_times(path, folder):
+    """{mkvmerge track id: [ms]} of every track of the Matroska file path, as mkvextract writes them."""
+    os.makedirs(folder)
+    ids = [t["id"] for t in hook.mkvmerge(str(path))["tracks"]]
+    REAL_RUN(["mkvextract", str(path), "timestamps_v2", *(f"{i}:{os.path.join(folder, str(i))}" for i in ids)], check=True, capture_output=True)
+    return {i: [float(x) for x in open(os.path.join(folder, str(i))).read().split("\n")[1:] if x] for i in ids}
+
+
+@pytest.mark.parametrize("video_offset, audio, subs", [(0.105, (10.0, 0.0), LATE_TEXT), (0.0, (10.0, 0.0), LATE_TEXT), (0.5, (10.0, 0.0), LATE_TEXT),
+                                                       (0.0, (9.5, 0.5), [])], ids=["empty edit", "media time", "video late", "audio late"])
+def test_the_split_remux_keeps_the_times_of_a_one_input_remux(tmp_path, settings, video_offset, audio, subs):
+    """The B-frames give the video a media time of 2 frames, and the AAC priming starts the audio before 0. A subtitle
+    track that ends after the video, or none, makes one input lose nothing. The text track starts at 0, so the audio
+    that starts late moves the other input only in a file with no text. Each track of the split remux keeps the time
+    of every packet of the one-input remux within 1 ms, as --sync takes whole ms, see split_sync()."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = gop_mp4(film_path(tmp_path), video_offset=video_offset, audio=audio, subs=subs)
+    plain = track_times(one_input(path, tmp_path / "one.mkv"), str(tmp_path / "a"))
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and "split_sync" in info, (result, info.get("proof"))
+    got = track_times(new, str(tmp_path / "b"))
+    assert [len(t) for t in got.values()] == [len(t) for t in plain.values()] and all(
+        abs(x - y) <= 1 for i in plain for x, y in zip(got[i], plain[i])), (info["split_sync"], {i: (got[i][:2], plain[i][:2]) for i in plain})
+
+
+def test_each_video_track_gets_its_own_input(tmp_path, settings):
+    """A second video track that ends first flushes the first one in a shared input. Each from its own input keeps
+    every frame of both."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = gop_mp4(film_path(tmp_path), second=True)
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and video_frames(new) == [240, 150] and set(info["split_sync"]["video"]) == {0, 1}, (result, info.get("proof"))
+
+
+def test_audio_that_ends_inside_the_last_gop_keeps_every_frame(tmp_path, settings):
+    """The audio ends after the last keyframe, and the subtitle track ends first. The split remux keeps every frame."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = gop_mp4(film_path(tmp_path), audio=(9.0, 0.0))
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and video_frames(new) == [240], (result, info.get("proof"))
+
+
+def test_a_broken_timed_text_track_goes_beside_the_split_remux(tmp_path, settings):
+    """A cp1252 track is broken. The split remux removes it, and the video keeps every frame. Its sidecar holds the
+    bytes of its packets, and its first cue starts with the English cue of the MKV, as in the MP4."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    cues = [(1.0, 2.0, "Un café noir."), (2.5, 3.5, "Déjà vu, à côté.")]
+    path = gop_mp4(film_path(tmp_path), video_offset=0.105, subs=[("fre", cues), *EARLY], cp="cp1252")
+    packets = hook.timed_packets(str(path), [2], str(tmp_path), 60)[2]
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    side = path.parent / f"Film (2020).fre{hook.BROKEN_SIDECAR}"
+    assert result == "repacked" and set(info["split_sync"]["video"]) == {0} and info["broken"]["s1"]["sidecar"] == str(side), (result, info.get("proof"))
+    assert video_frames(new) == [240] and [(t["type"], t["properties"]["language"]) for t in hook.mkvmerge(str(new))["tracks"]] == [
+        ("video", "und"), ("audio", "und"), ("subtitles", "eng")]
+    got = sidecar_cues(side)
+    assert [t for _, _, t in got] == [t for _, _, t in packets] == [c[2].encode("cp1252") for c in cues]
+    assert abs(got[0][0] - hook.srt_cues(track_text(new, 2, str(tmp_path)))[0][0]) <= 1, (got, info["split_sync"])
+
+
+@pytest.mark.parametrize("fmt, codec", [("mpegts", "hevc"), ("avi", "mpeg2video"), ("mpegts", "mpeg2video")])
+def test_hevc_and_mpeg2_in_another_container_keep_one_input(tmp_path, settings, monkeypatch, fmt, codec):
+    """mkvmerge loses no frame of a TS or an AVI, so an HEVC or MPEG-2 file in one converts with one input."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    src, path, seen, real = gop_mp4(tmp_path / "src.mp4", codec, video_offset=0.105, subs=[]), film_path(tmp_path), [], hook.convert_cmd
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0", "-c", "copy", "-f", fmt, str(path)], check=True, capture_output=True)
+    monkeypatch.setattr(hook, "convert_cmd", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and "split_sync" not in info and seen[0].count(str(path)) == 1, (result, info.get("split_sync"))
+
+
+def test_split_sync_rounds_to_the_nearest_ms(tmp_path):
+    """24 kHz AAC primes 1024 samples, so the audio starts 42.667 ms before the video. The video input gets --sync 43."""
+    src = gop_mp4(tmp_path / "Clip.mp4", rate=24000)
+    assert hook.split_sync(str(src), hook.mkvmerge(str(src)), hook.ff_streams(str(src))[1], set()) == ({0: 43}, 0)
+
+
+def test_a_track_that_starts_after_the_first_500_packets_keeps_one_input(tmp_path, settings):
+    """The only audio starts 25 s in, after the first 500 packets that start_shift() reads. Its start is not known, so
+    the file converts with one input, and every track keeps its time."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = film_path(tmp_path)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=24:duration=30", "-itsoffset", "25", "-f", "lavfi",
+                "-i", "sine=duration=5", "-map", "0", "-map", "1", "-c:v", *GOP["hevc"], "-c:a", "aac", "-f", "mp4", str(path)], check=True)
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and "split_sync" not in info, (result, info.get("split_sync"))
+
+
+def edit_list(path, kind, empty_ms=0, cut=0.0):
+    """Give the first track of handler kind (b"soun", b"vide") of the MP4 path an empty edit of empty_ms before its
+    media edit, and move that edit's media time cut seconds later. ffprobe flags D each packet that then ends before
+    the edit's start. The moov must follow the mdat, as ffmpeg writes it, so no chunk offset moves."""
+    data = bytearray(path.read_bytes())
+
+    def boxes(start, end):   # (position, size, type) of each box from start to end
+        while start < end:
+            n = struct.unpack_from(">I", data, start)[0]
+            yield start, n, bytes(data[start + 4:start + 8])
+            start += n
+    inside = lambda box, name: next((p, n) for p, n, k in boxes(box[0] + 8, sum(box)) if k == name)
+    scale = lambda box: struct.unpack_from(">I", data, box[0] + (28 if data[box[0] + 8] else 20))[0]   # of an mvhd or an mdhd
+    moov = next((p, n) for p, n, k in boxes(0, len(data)) if k == b"moov")
+    assert next(p for p, _, k in boxes(0, len(data)) if k == b"mdat") < moov[0]
+    handler = lambda trak: (h := inside(inside(trak, b"mdia"), b"hdlr")[0]) and bytes(data[h + 16:h + 20])
+    trak = next((p, n) for p, n, k in boxes(moov[0] + 8, sum(moov)) if k == b"trak" and handler((p, n)) == kind)
+    edts = inside(trak, b"edts")
+    elst = inside(edts, b"elst")[0]
+    assert data[elst + 8] == 0, "elst version 1"
+    media = struct.unpack_from(">i", data, elst + 20)[0] + round(cut * scale(inside(inside(trak, b"mdia"), b"mdhd")))
+    struct.pack_into(">i", data, elst + 20, media)
+    if empty_ms:
+        data[elst + 16:elst + 16] = struct.pack(">IiI", empty_ms * scale(inside(moov, b"mvhd")) // 1000, -1, 0x10000)
+        struct.pack_into(">I", data, elst + 12, struct.unpack_from(">I", data, elst + 12)[0] + 1)
+        for p in (elst, edts[0], trak[0], moov[0]):
+            struct.pack_into(">I", data, p, struct.unpack_from(">I", data, p)[0] + 12)
+    path.write_bytes(data)
+    return path
+
+
+def test_a_packet_an_edit_list_cuts_keeps_one_input(tmp_path):
+    """ffprobe flags D the packets before an edit list's start, and mkvmerge times them by its own rules. So a cut
+    with ffmpeg -ss and -c copy keeps one input, as does audio cut more than the 1 s ffmpeg keeps. The AAC priming
+    packet of the uncut file is D too, and it keeps the split. Reviewer 2026-10-16: a priming packet that an empty
+    edit of 500 ms moves to end after 0, and a D video packet, keep one input. The split would play that audio 21 ms
+    early."""
+    src = gop_mp4(tmp_path / "Clip.mp4", subs=LATE_TEXT)
+    split = lambda f: hook.split_sync(str(f), hook.mkvmerge(str(f)), hook.ff_streams(str(f))[1], set())
+    assert split(src) == ({0: 23}, 0)
+    cuts = {"cut": ["-ss", "1.3", "-i", str(src)], "late cut": ["-ss", "1.3", "-itsoffset", "0.2", "-i", str(src)],
+            "short cut": ["-ss", "0.06", "-i", str(src)], "audio cut": ["-i", str(src), "-ss", "1.3", "-i", str(src), "-map", "0:v", "-map", "1:a", "-map", "0:s"]}
+    for name, argv in cuts.items():
+        out = tmp_path / f"{name}.mp4"
+        REAL_RUN(["ffmpeg", "-v", "error", "-y", *argv, *([] if "-map" in argv else ["-map", "0"]), "-c", "copy", "-f", "mp4", str(out)], check=True,
+                 capture_output=True)
+        assert split(out) is None, name
+    for name, kind, ms, cut in (("audio after 500 ms", b"soun", 500, 0.0), ("video frame", b"vide", 0, 1001 / 24000)):
+        out = tmp_path / f"{name}.mp4"
+        shutil.copy(src, out)
+        assert split(edit_list(out, kind, ms, cut)) is None, name
+
+
+@pytest.mark.parametrize("empty_ms, fault", [(0, None), (10, "stream audio 1 lost its cut first frame, and its first kept packet moved -22 ms"),
+                                             (20, "stream audio 1 lost its cut first frame, and its first kept packet moved -22 ms")])
+def test_a_split_that_times_a_dropped_priming_frame_is_refused(tmp_path, empty_ms, fault):
+    """Reviewer 2026-10-16: an audio edit list of an empty edit, then a media edit that cuts one whole AAC frame and
+    1023 samples of the next. ffprobe flags the cut frame D, and it ends before 0, so split_sync() counts it as
+    priming. mkvmerge drops it after an empty edit and keeps it with none, so after one the --sync plays the audio a
+    frame early. The file has no text track, which would show the move too. The proof holds the second packet to its
+    time and refuses the split remux. With no empty edit the split passes."""
+    src = edit_list(gop_mp4(tmp_path / "Clip.mp4", rate=48000, subs=[]), b"soun", empty_ms, 1023 / 48000)
+    split = hook.split_sync(str(src), hook.mkvmerge(str(src)), hook.ff_streams(str(src))[1], set())
+    got, proof = proved(str(src), str(one_input(src, tmp_path / "new.mkv", split=split)), [], str(tmp_path))
+    assert split and got == fault, (split, got, proof)
+
+
+def test_a_broken_track_that_starts_first_moves_no_input(tmp_path, settings):
+    """The video and the audio start 0.5 s late, and the cp1252 track at 0. It is broken and removed, so it does not
+    count for a start. The audio, the other input's earliest track, gets no --sync, and the video input none of the
+    0.5 s. With the track's start, the video would play 0.5 s late, and the proof would refuse it."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    cues = [(1.0, 2.0, "Un café noir."), (2.5, 3.5, "Déjà vu, à côté.")]
+    path = gop_mp4(film_path(tmp_path), video_offset=0.5, audio=(9.5, 0.5), subs=[("fre", cues)], cp="cp1252")
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7})
+    assert result == "repacked" and list(info["broken"]) == ["s1"] and video_frames(new) == [240], (result, info.get("split_sync"))
+    assert info["split_sync"]["other"] == 0 and info["split_sync"]["video"][0] < 250, info["split_sync"]
+
+
+def test_a_broken_and_a_dropped_track_stay_out_of_every_input_of_the_split(tmp_path, settings, monkeypatch):
+    """The video and the audio start 0.5 s late. A broken cp1252 track and an English track that the match check drops
+    start at 0. Both are out of the start of every input, and no input reads them. The video and the audio keep their
+    names, which hold a colon, as each input reads the track id before the first colon. No text track stays, so the
+    input of the other tracks gets -S, and mkvmerge warns nothing. The video keeps every frame, and the sidecar holds
+    the broken track's bytes."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    cues = [(1.0, 2.0, "Un café noir."), (2.5, 3.5, "Déjà vu, à côté.")]
+    path = gop_mp4(film_path(tmp_path), video_offset=0.5, audio=(9.5, 0.5), subs=[("fre", cues), *EARLY], cp="cp1252")
+    packets, j, seen, real = hook.timed_packets(str(path), [2], str(tmp_path), 60)[2], hook.mkvmerge(str(path)), [], hook.convert_cmd
+    for t, name in zip(j["tracks"], ("Main: Feature", "Stereo: Mix", "French: Old", "English: Dropped")):   # as mkvmerge 100 and later read them
+        t["properties"]["track_name"] = name
+    monkeypatch.setattr(hook, "convert_cmd", lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+    monkeypatch.setattr(hook, "convert_subs", lambda path, j, streams, subs, *a, **k: (subs, [(3, 3)]))
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))   # a track left out keeps the original
+    _, result, info, new = hook.convert("radarr", str(path), j, os.stat(path), True, {"app_id": 7}, sub=True)
+    assert result == "repacked" and list(info["broken"]) == ["s1"], (result, info.get("proof"))
+    assert info["warnings"] is None, info["warnings"]
+    assert info["split_sync"]["other"] == 0 and info["split_sync"]["video"][0] < 250, info["split_sync"]
+    argv = seen[0][seen[0].index("--track-order"):]
+    inputs = "\0".join(argv[2:]).split(f"\0{path}")[:-1]   # the options of each input of the file
+    assert argv[1] == "0:0,1:1" and len(inputs) == 2 and "-S" in inputs[0].split("\0") and "\0-S\0-D" in inputs[1], argv
+    assert not [a for a in argv[2:] if a.startswith(("2:", "3:"))], argv
+    assert [(t["type"], t["properties"].get("track_name")) for t in hook.mkvmerge(str(new))["tracks"]] == [("video", "Main: Feature"),
+                                                                                                         ("audio", "Stereo: Mix")]
+    assert video_frames(new) == [240] and [t for _, _, t in sidecar_cues(path.parent / f"Film (2020).fre{hook.BROKEN_SIDECAR}")] == [
+        t for _, _, t in packets]
+
+
+def test_the_split_remux_equals_a_one_input_remux_but_for_its_frames(tmp_path):
+    """Two audio tracks and three text tracks with languages, names and flags, chapters, global tags, a title and a
+    cover. Two text tracks are left out, as for a dropped and a broken track. Every text track ends after the video,
+    so one input loses nothing. mkvmerge -J reads the same of both remuxes, but for the statistics tags that count the
+    1 ms that --sync rounds, and the proof passes."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")) or " libx265 " not in REAL_RUN(["ffmpeg", "-hide_banner", "-encoders"],
+                                                                                              capture_output=True, text=True).stdout:
+        pytest.skip("needs mkvmerge and ffmpeg with libx265")
+    (tmp_path / "meta.txt").write_text(";FFMETADATA1\ntitle=Made Up Film\ncomment=Made up\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=4000\n"
+                                       "title=Opening\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=4000\nEND=10000\ntitle=Closing\n")
+    for k, text in enumerate(("Signs", "Bonjour.", "Hola.")):
+        (tmp_path / f"s{k}.srt").write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{text}\n\n2\n00:00:12,000 --> 00:00:13,000\n{text}\n")
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=64x64", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
+    src, lavfi = tmp_path / "Clip.mp4", lambda x: ("-f", "lavfi", "-i", x)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-itsoffset", "0.105", *lavfi("testsrc2=size=160x96:rate=24000/1001:duration=10"),
+                *lavfi("sine=duration=10"), *lavfi("sine=frequency=550:duration=10"), *(a for k in range(3) for a in ("-i", str(tmp_path / f"s{k}.srt"))),
+                "-i", str(tmp_path / "meta.txt"), "-i", str(tmp_path / "cover.png"), *(a for i in (0, 1, 2, 3, 4, 5, 7) for a in ("-map", str(i))),
+                "-map_metadata", "6", "-map_chapters", "6", "-c:v:0", *GOP["hevc"], "-c:v:1", "png", "-disposition:v:1", "attached_pic",
+                "-c:a", "aac", "-c:s", "mov_text", "-metadata:s:v:0", "title=Main", "-metadata:s:a:0", "language=fre", "-metadata:s:a:0",
+                "title=Director Commentary", "-metadata:s:a:1", "language=eng", "-disposition:a:1", "0", "-metadata:s:s:0", "language=eng",
+                "-metadata:s:s:0", "title=Signs", "-disposition:s:0", "forced", "-metadata:s:s:1", "language=fre", "-metadata:s:s:2", "language=spa",
+                str(src)], check=True)
+    j, streams = hook.mkvmerge(str(src)), hook.ff_streams(str(src))[1]
+    assert [t["type"] for t in j["tracks"]] == ["video", "audio", "audio", "subtitles", "subtitles", "subtitles"] and j["attachments"], j
+    split = hook.split_sync(str(src), j, streams, {4, 5})
+    outs = [one_input(src, tmp_path / f"{n}.mkv", drop=[4, 5], split=s) for n, s in (("one", None), ("split", split))]
+    stats = ("tag_bps", "tag_duration", "tag__statistics_writing_date_utc")   # mkvmerge's statistics: the 1 ms --sync rounds, the clock
+    read = lambda f: {k: v for k, v in json.loads(REAL_RUN(["mkvmerge", "-J", str(f)], capture_output=True, text=True).stdout).items() if k != "file_name"}
+    same = lambda d: dict(d, tracks=[dict(t, properties={k: v for k, v in t["properties"].items() if k not in stats + ("uid",)}) for t in d["tracks"]],
+                          attachments=[{k: v for k, v in a.items() if k != "properties"} for a in d["attachments"]],
+                          container=dict(d["container"], properties={k: v for k, v in d["container"]["properties"].items()
+                                                                     if k not in ("date_local", "date_utc", "segment_uid")}))
+    a, b = (same(read(f)) for f in outs)
+    assert split[0][0] >= 105 and split[1] == 0 and a == b, (split, a, b)
+    assert len(a["tracks"]) == 4 and a["attachments"] and a["chapters"] == [{"num_entries": 2}] and a["global_tags"], a
+    fault, proof = proved(str(src), str(outs[1]), [], str(tmp_path), dropped={4, 5})
+    assert fault is None, (fault, proof)
+
+
 L1_FRAME = b"\xff\xff\x88\xc0" + bytes(i % 127 + 1 for i in range(380))   # a Layer I header of a 384-byte frame, and no sync byte after it
 
 
@@ -9466,8 +9890,8 @@ def avi48(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     path = tmp_path_factory.mktemp("avi48") / "Clip.avi"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
-              "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame", "-b:a", "128k", str(path)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
+                "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame", "-b:a", "128k", str(path)], check=True)
     shutil.copy(path, path.with_name("Vbr.avi"))
     data = bytearray(path.read_bytes())
     strh = data.find(b"strh", data.find(b"strh") + 4)   # the audio's stream header, after the video's
@@ -9587,10 +10011,10 @@ def test_avi_sync_reads_the_start_of_each_stream(avi48, tmp_path):
     start of one frame, 42 ms, gets --sync, though the proof allows 50 ms. A start under 1 ms gets none. One start after
     START_MAX, 10 s, gives no stream --sync."""
     path = tmp_path / "Multi.avi"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=4", "-f", "lavfi", "-i",
-              "sine=duration=4:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=880:duration=4:sample_rate=48000", "-map", "1:a",
-              "-map", "0:v", "-map", "2:a", "-c:v", "mpeg4", "-vtag", "DX50", "-bf", "2", "-c:a", "libmp3lame", "-b:a", "128k", str(path)],
-             check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=4", "-f", "lavfi", "-i",
+                "sine=duration=4:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=880:duration=4:sample_rate=48000", "-map", "1:a",
+                "-map", "0:v", "-map", "2:a", "-c:v", "mpeg4", "-vtag", "DX50", "-bf", "2", "-c:a", "libmp3lame", "-b:a", "128k", str(path)],
+               check=True)
     sync = lambda p: hook.avi_sync(str(p), hook.mkvmerge(str(p)), hook.ff_streams(str(p))[1])
     avi_patched(path, path, starts={0: 3, 1: 1})   # 3 MP3 frames of 24 ms on the first audio, 1 frame on the video
     assert sync(path) == [{"stream": "video 1", "track": 0, "ms": 42}, {"stream": "audio 0", "track": 1, "ms": 72}]
@@ -9625,9 +10049,9 @@ def test_a_wmv_that_starts_before_its_first_keyframe_converts_whole(tmp_path):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     full, src, new, lost = (tmp_path / n for n in ("full.wmv", "Clip.wmv", "new.mkv", "lost.mkv"))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
-              "-c:v", "wmv2", "-g", "48", "-c:a", "wmav2", str(full)], check=True)
-    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-map", "0", "-c", "copy", "-copyinkf", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+                "-c:v", "wmv2", "-g", "48", "-c:a", "wmav2", str(full)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-map", "0", "-c", "copy", "-copyinkf", str(src)], check=True)
     remux(src, new)   # convert_cmd(), as convert() runs it for a container mkvmerge cannot read
     fault, proof = proved(str(src), str(new), [], str(tmp_path))
     flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags", "-of", "csv=p=0", str(src)],
@@ -9646,11 +10070,11 @@ def test_frames_before_the_first_keyframe_are_proven(tmp_path):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     full, src, kept, lost = (tmp_path / n for n in ("full.mp4", "Clip.mp4", "kept.mkv", "lost.mkv"))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
-              "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", str(full)], check=True)
-    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-c", "copy", "-copyinkf", str(src)], check=True)   # a cut mid-GOP
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+                "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", str(full)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "quiet", "-y", "-i", str(full), "-ss", "1.1", "-c", "copy", "-copyinkf", str(src)], check=True)   # a cut mid-GOP
     remux(src, kept)
-    REAL_RUN(["ffmpeg", "-v", "quiet", "-y", "-i", str(src), "-c", "copy", str(lost)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "quiet", "-y", "-i", str(src), "-c", "copy", str(lost)], check=True)
     fault, proof = proved(str(src), str(kept), [], str(tmp_path))
     flags = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "0", "-show_entries", "packet=flags,size", "-of", "csv=p=0", str(src)],
                      capture_output=True, text=True).stdout.split()
@@ -9669,7 +10093,7 @@ def test_frames_before_the_first_keyframe_are_proven(tmp_path):
 def test_the_proof_refuses_a_copy_that_is_not_lossless(convertible, tmp_path, tamper, why):
     """No stream is decoded: a re-encoded stream, a short copy or a lost stream shows in the packets or the stream count."""
     out = tmp_path / "new.mkv"
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(convertible / "Movie (2020).mp4"), *tamper, "-f", "matroska", str(out)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-i", str(convertible / "Movie (2020).mp4"), *tamper, "-f", "matroska", str(out)], check=True)
     fault, _ = proved(str(convertible / "Movie (2020).mp4"), str(out), [], str(tmp_path))
     assert fault == why, fault
 
@@ -10230,8 +10654,8 @@ def test_a_real_hevc_remux_passes_with_the_header_sei_in_packet_0(tmp_path):
                                                                                                 capture_output=True, text=True).stdout:
         pytest.skip("needs ffmpeg with libx265 and mkvmerge")
     src, out = tmp_path / "Clip.mp4", tmp_path / "new.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=2", "-c:v", "libx265", "-x265-params",
-              "log-level=none", "-tag:v", "hvc1", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=2", "-c:v", "libx265", "-x265-params",
+                "log-level=none", "-tag:v", "hvc1", str(src)], check=True)
     REAL_RUN(["mkvmerge", "-q", "--disable-lacing", "-o", str(out), str(src)], check=True)
     fault, proof = proved(str(src), str(out), [], str(tmp_path))
     assert fault is None and proof[0]["header_units"][0].startswith("4e01"), (fault, proof)
@@ -10675,6 +11099,354 @@ def test_the_proof_refuses_a_sidecar_whose_text_changed(convertible, tmp_path):
     (tmp_path / "other.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nWorld!\n")
     fault, proof = proved(str(convertible / "Movie (2020).mp4"), str(out), subs, str(tmp_path))
     assert fault == "the sidecar other.srt differs at 0:03: 'World!' against 'World'" and not proof[-2]["match"], fault
+
+
+@pytest.fixture(scope="module")
+def codepages(tmp_path_factory):
+    """MP4 files of 6 s with one timed-text track of two cues, made with ffmpeg. ffmpeg writes UTF-8 text, so a
+    stand-in of the same length takes the place of the second cue's text, and its bytes are swapped in afterwards:
+    French in cp1252 and Russian in cp1251."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    d = tmp_path_factory.mktemp("codepages")
+    files = {"cp1252": ("fre", "Un caf\u00e9 pour moi".encode("cp1252")), "cp1251": ("rus", "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440!".encode("cp1251"))}
+    for name, (lang, raw) in files.items():
+        stand_in = "Zk7Wq2Pz3Vb8Xy4R"[:len(raw)]
+        (d / "s.srt").write_text(f"1\n00:00:01,000 --> 00:00:02,000\n- 1 -\n\n2\n00:00:03,000 --> 00:00:04,000\n{stand_in}\n", encoding="utf-8")
+        amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+                    "-i", str(d / "s.srt"), "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                    "-c:s", "mov_text", "-metadata:s:s:0", f"language={lang}", "-f", "mp4", str(d / f"{name}.mkv")], check=True)
+        data = (d / f"{name}.mkv").read_bytes()
+        assert data.count(stand_in.encode()) == 1, name
+        (d / f"{name}.mkv").write_bytes(data.replace(stand_in.encode(), raw))
+    return d
+
+
+def track_text(path, tid, folder):
+    """The text mkvextract writes of track tid of the Matroska file path, as UTF-8."""
+    out = os.path.join(folder, f"track{tid}.srt")
+    REAL_RUN(["mkvextract", str(path), "tracks", f"{tid}:{out}"], check=True, capture_output=True)
+    with open(out, encoding="utf-8-sig") as f:
+        return f.read()
+
+
+@pytest.mark.parametrize("name", ["cp1252", "cp1251"])
+def test_timed_text_that_does_not_decode_is_no_damage(codepages, tmp_path, name):
+    """ffmpeg's decoder prints "Invalid data found" for timed text that is not UTF-8, and exits 0, or 69 when most cues
+    fail. packet_hashes() raises no ReadFailed for it, so neither the proof nor the second check before a re-grab
+    counts it as damage."""
+    path = str(codepages / f"{name}.mkv")
+    with pytest.raises(RuntimeError) as got:
+        hook.packet_hashes(path, [0, 1], {}, [2], str(tmp_path), 60)
+    assert not isinstance(got.value, hook.ReadFailed) and hook.damage_of("ffmpeg", str(got.value)) is None, got.value
+    assert str(got.value) == f"ffmpeg could not read the text of subtitle stream 2 of {name}.mkv"
+    assert hook.source_read({"read": "ffmpeg", "fault": hook.DAMAGE["ffmpeg"][1], "line": "x"}, path, hook.mkvmerge(path)) is None
+
+
+# ffmpeg 7's lines for a timed-text cue that is not UTF-8. The addresses are made up.
+SUB_ERROR = ("[mov_text @ 0x55d0c1a2b3c0] invalid UTF-8 byte in subtitle\n[mov_text @ 0x55d0c1a2b3c0] Invalid UTF-8 in decoded subtitles text; "
+             "maybe missing -sub_charenc option\n[sist#0:2/mov_text @ 0x55d0c1a2b4c0] [dec:mov_text @ 0x55d0c1a2b5c0] Error decoding "
+             "subtitles: Invalid data found when processing input")
+
+
+@pytest.mark.parametrize("message, line", [(BAD_READ, "NAL unit size (0 > 4817)."), (PARTIAL, "partial file")])
+def test_a_damage_line_beside_a_subtitle_decode_error_is_still_damage(tmp_path, monkeypatch, message, line):
+    """The subtitle decoder's lines drop out of the read's fault, and a real damage line beside them still shows damage."""
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout="", stderr=f"{SUB_ERROR}\n{message}"))
+    with pytest.raises(hook.ReadFailed) as got:
+        hook.packet_hashes("/m/Film A (1979).mp4", [0], {}, [2], str(tmp_path), 60)
+    assert hook.damage_of("ffmpeg", str(got.value)) == {"read": "ffmpeg", "fault": "parts of the file cannot be read", "line": line}
+    assert "sist#" not in str(got.value)
+
+
+def text_mp4(path, tracks, video_offset=0.0, audio=True, dur=8):
+    """An MP4 of dur s, made with ffmpeg, with one timed-text track for each of tracks: {lang, enc, cues, title,
+    default, offset}. Each cue is (start, end, text, payload). payload, when not None, follows text in the codepage enc:
+    ffmpeg writes an ASCII stand-in of its byte length, and its bytes are swapped in afterwards. video_offset delays the
+    video by an edit list, and offset a track."""
+    rnd, swaps, n = random.Random(repr(tracks)), [], 2 if audio else 1   # seeded by the tracks, so a later run copies the clip
+    argv = ["ffmpeg", "-v", "error", "-y", *(["-itsoffset", str(video_offset)] if video_offset else []), "-f", "lavfi", "-i",
+            f"testsrc=size=160x90:rate=24:duration={dur}", *(["-f", "lavfi", "-i", f"sine=duration={dur}"] if audio else [])]
+    stamp = lambda x: f"{int(x // 3600):02d}:{int(x // 60 % 60):02d}:{int(x % 60):02d},{round(x * 1000) % 1000:03d}"
+    for k, t in enumerate(tracks):
+        blocks = []
+        for i, (a, e, text, payload) in enumerate(t["cues"], 1):
+            if payload is not None:
+                raw = payload.encode(t["enc"])
+                swaps.append(("".join(rnd.choice("ZQXJKVWzqxjkvw") for _ in raw).encode(), raw))
+                text += swaps[-1][0].decode()
+            blocks.append(f"{i}\n{stamp(a)} --> {stamp(e)}\n{text}\n")
+        (path.parent / f"t{k}.srt").write_text("\n".join(blocks), encoding="utf-8")
+        argv += [*(["-itsoffset", str(t["offset"])] if t.get("offset") else []), "-i", str(path.parent / f"t{k}.srt")]
+    argv += ["-map", "0", *(["-map", "1"] if audio else []), *(a for k in range(len(tracks)) for a in ("-map", str(n + k)))]
+    argv += ["-c:v", "libx264", "-preset", "ultrafast", *(["-c:a", "aac"] if audio else []), "-c:s", "mov_text"]
+    for k, t in enumerate(tracks):
+        argv += [f"-metadata:s:s:{k}", f"language={t['lang']}", *([f"-metadata:s:s:{k}", f"handler_name={t['title']}"] if t.get("title") else []),
+                 f"-disposition:s:{k}", "default" if t.get("default") else "0"]
+    amg.ffmpeg(argv + ["-movflags", "+faststart", "-f", "mp4", str(path)], check=True)
+    data = path.read_bytes()
+    for stand_in, raw in swaps:
+        assert data.count(stand_in) == 1, stand_in
+        data = data.replace(stand_in, raw)
+    path.write_bytes(data)
+
+
+def mkv_texts(path, folder):
+    """{mkvmerge track id: the text mkvextract writes} of each text track of the Matroska file path."""
+    return {t["id"]: track_text(path, t["id"], folder) for t in hook.mkvmerge(str(path))["tracks"] if t["type"] == "subtitles"}
+
+
+def twin_setup(tmp_path, tracks, **kw):
+    """(the MP4 of text_mp4() under a .mkv name, a plain mkvmerge remux of its twin with every payload in UTF-8)."""
+    path, twin = tmp_path / "Film (2020)" / "Film (2020).mkv", tmp_path / "twin" / "twin.mp4"
+    path.parent.mkdir(), twin.parent.mkdir()
+    text_mp4(path, tracks, **kw)
+    text_mp4(twin, [dict(t, cues=[(a, e, x + (p or ""), None) for a, e, x, p in t["cues"]]) for t in tracks], **kw)
+    REAL_RUN(["mkvmerge", "-q", "--disable-lacing", "-o", str(tmp_path / "plain.mkv"), str(twin)])   # as convert_cmd() runs it
+    return path, tmp_path / "plain.mkv"
+
+
+FRE_CUES = [(1.0, 2.0, "Un ", "café noir."), (2.5, 3.5, "", "Déjà vu, à côté."), (4.0, 5.0, "Ou est-il ? ", "Là-bas, près de l'église."),
+            (5.5, 6.5, "", "Ça m'étonne.")]
+
+
+# Made-up Persian dialogue in cp1256 with credits in ASCII, as in a real file. cp1256 writes "اگ" as the bytes C7 90,
+# which are valid UTF-8 by chance, so the packets of one track can be valid UTF-8 and not.
+PERSIAN_CUES = [(1.0, 2.0, "www.example.com", None), (2.5, 3.5, "Subtitles by Example Team", None), (4.0, 5.0, "", "اگ اگ اگ"),
+                (5.5, 6.5, "", "سلام دوست من، حالت چطوره؟ خوبم ممنون")]
+PERSIAN = {"lang": "per", "enc": "cp1256", "cues": PERSIAN_CUES}
+
+
+def broken_film(tmp_path, tracks, name="Film (2020).mkv", **kw):
+    """The MP4 of text_mp4() in its own folder. Under a .mkv name convert() converts it under its own name and asks no
+    app. A copy stays in tmp_path as orig.mp4."""
+    path = tmp_path / "Film (2020)" / name
+    path.parent.mkdir(exist_ok=True)
+    text_mp4(tmp_path / "orig.mp4", tracks, **kw)
+    shutil.copy(tmp_path / "orig.mp4", path)
+    return path
+
+
+def sidecar_cues(path, shift=0):
+    """[(start ms, end ms, the bytes of its text)] of each cue of the sidecar of a broken track at path."""
+    return [(a, b, t.encode("latin-1")) for a, b, t in hook.srt_cues(path.read_bytes().decode("latin-1"), shift)]
+
+
+def convert_own(path, apply=True):
+    """convert() of the file at path under its own name."""
+    return hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), apply, {"app_id": 7})
+
+
+def test_a_persian_track_in_a_codepage_goes_beside_the_mkv_with_its_bytes(tmp_path, settings):
+    """The tester's file in small: a Persian cp1256 track with credits in ASCII, after an English track with cues at the
+    same times. MP4 timed text must be UTF-8, so the Persian track is broken. The MKV holds the video, the audio and the
+    English track. The sidecar holds each packet's bytes as they are, at the times the MKV gives the English cues. None
+    of it is damage."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    eng = [(a, e, f"Line {k}", None) for k, (a, e, _, _) in enumerate(PERSIAN_CUES, 1)]
+    path = broken_film(tmp_path, [{"lang": "eng", "enc": "utf-8", "cues": eng}, PERSIAN])
+    packets = hook.timed_packets(str(tmp_path / "orig.mp4"), [3], str(tmp_path), 60)[3]
+    _, result, info, new = convert_own(path)
+    side = path.parent / f"Film (2020).per{hook.BROKEN_SIDECAR}"
+    assert result == "repacked" and "damage" not in info, (result, info.get("proof"))
+    assert info["broken"] == {"s2": {"stream": 3, "lang": "per", "sidecar": str(side), "reused": False, "role": "full", "name": "", "sdh": False,
+                                     "forced": False}}, info["broken"]
+    assert [t["type"] for t in hook.mkvmerge(new)["tracks"]] == ["video", "audio", "subtitles"] and sorted(os.listdir(path.parent)) == sorted([path.name, side.name])
+    got = sidecar_cues(side)
+    assert [t for _, _, t in got] == [t for _, _, t in packets] and hook.utf8(got[2][2]) and not hook.utf8(got[3][2])
+    assert [(a, b) for a, b, _ in got] == [(a, b) for a, b, _ in hook.srt_cues(track_text(new, 2, tmp_path))]
+
+
+@pytest.mark.parametrize("enc", ["cp1252", "utf-8"])
+def test_one_stray_byte_breaks_a_utf8_track(tmp_path, settings, enc):
+    """An English UTF-8 track whose last cue holds "café" in cp1252: one stray byte. The whole track is broken and goes
+    beside the MKV. The same track all in UTF-8 stays in the MKV, and no sidecar is written."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [{"lang": "eng", "enc": enc, "cues": [(1.0, 2.0, "I don’t know where she went.", None),
+                                                                       (2.5, 3.5, "♪ Over the hills ♪", None), (4.0, 5.0, "Un ", "café")]}])
+    _, result, info, new = convert_own(path)
+    side = path.parent / f"Film (2020).eng{hook.BROKEN_SIDECAR}"
+    kinds = [t["type"] for t in hook.mkvmerge(new)["tracks"]]
+    assert result == "repacked", (result, info.get("proof"))
+    if enc == "utf-8":
+        assert kinds == ["video", "audio", "subtitles"] and "broken" not in info and os.listdir(path.parent) == [path.name]
+        return
+    assert kinds == ["video", "audio"] and sorted(os.listdir(path.parent)) == sorted([path.name, side.name])
+    assert [t for _, _, t in sidecar_cues(side)] == ["I don’t know where she went.".encode(), "♪ Over the hills ♪".encode(), "Un café".encode("cp1252")]
+
+
+def test_two_broken_tracks_of_one_language_take_their_numbers(tmp_path, settings):
+    """Two broken Persian tracks and one with no language tag. The Persian sidecars take their track numbers, and the
+    untagged one has no language part. Each holds its own bytes."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    other = [(1.0, 2.0, "", "خوبم ممنون")]
+    path = broken_film(tmp_path, [PERSIAN, dict(PERSIAN, cues=other), dict(PERSIAN, lang="und", cues=other)])
+    _, result, info, _ = convert_own(path)
+    names = [f"Film (2020).per.1{hook.BROKEN_SIDECAR}", f"Film (2020).per.2{hook.BROKEN_SIDECAR}", f"Film (2020){hook.BROKEN_SIDECAR}"]
+    assert result == "repacked" and [os.path.basename(e["sidecar"]) for _, e in sorted(info["broken"].items())] == names, (result, info.get("broken"))
+    assert sorted(os.listdir(path.parent)) == sorted([path.name, *names])
+    assert [t for _, _, t in sidecar_cues(path.parent / names[1])] == [t for _, _, t in sidecar_cues(path.parent / names[2])] == ["خوبم ممنون".encode("cp1256")]
+
+
+@pytest.mark.parametrize("taken", [1, 2])
+def test_a_sidecar_never_writes_over_a_file(tmp_path, settings, taken):
+    """A file of other bytes holds the sidecar's name. It stays as it is, and the sidecar takes the track's number. When
+    a file holds that name too, the conversion is skipped, and the original stays."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [PERSIAN])
+    names = [path.parent / f"Film (2020).per{hook.BROKEN_SIDECAR}", path.parent / f"Film (2020).per.1{hook.BROKEN_SIDECAR}"]
+    for n in names[:taken]:
+        n.write_bytes(b"other bytes")
+    code, result, info, _ = convert_own(path)
+    assert all(n.read_bytes() == b"other bytes" for n in names[:taken])
+    if taken == 2:
+        assert (code, result) == ("repack_name_taken", "skipped, not matroska, the name Film (2020).per.1.broken-encoding.srt.txt is taken: the "
+                                  "container is MP4/QuickTime"), result
+        assert path.read_bytes() == (tmp_path / "orig.mp4").read_bytes()
+        return
+    assert result == "repacked" and info["broken"]["s1"]["sidecar"] == str(names[1]), (result, info.get("broken"))
+    assert [t for _, _, t in sidecar_cues(names[1])] == [t for _, _, t in hook.timed_packets(str(tmp_path / "orig.mp4"), [2], str(tmp_path), 60)[2]]
+
+
+def test_a_rerun_uses_the_sidecar_with_the_same_bytes(tmp_path, settings):
+    """The same release converts again, as after a new grab of it. The sidecar there holds the same bytes, so it stays as
+    it is, and no numbered copy is written."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [PERSIAN])
+    side = path.parent / f"Film (2020).per{hook.BROKEN_SIDECAR}"
+    assert convert_own(path)[1] == "repacked" and side.exists()
+    was = side.stat()
+    shutil.copy(tmp_path / "orig.mp4", path)
+    _, result, info, _ = convert_own(path)
+    assert result == "repacked" and info["broken"]["s1"]["reused"] is True, (result, info.get("broken"))
+    assert sorted(os.listdir(path.parent)) == sorted([path.name, side.name]) and side.stat().st_mtime_ns == was.st_mtime_ns
+
+
+def test_a_dry_run_names_the_sidecar_and_writes_nothing(tmp_path, settings):
+    """A dry run reads the track and says where its bytes would go. It writes nothing."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [PERSIAN])
+    code, result, info, _ = convert_own(path, apply=False)
+    assert (code, result) == ("would_repack", "would repack: the container is MP4/QuickTime, take out subtitle track 1, its bytes to "
+                              "Film (2020).per.broken-encoding.srt.txt"), result
+    assert info["broken"]["s1"]["sidecar"] == str(path.parent / f"Film (2020).per{hook.BROKEN_SIDECAR}")
+    assert os.listdir(path.parent) == [path.name] and path.read_bytes() == (tmp_path / "orig.mp4").read_bytes()
+
+
+def test_the_sidecar_waits_for_the_swap_checks(tmp_path, settings, monkeypatch):
+    """The sidecar is written only after the proof and the swap's checks pass. Here the app replaced the original during
+    the remux, so the swap stops. The original stays, and no sidecar is written."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [PERSIAN])
+    side, seen = path.parent / f"Film (2020).per{hook.BROKEN_SIDECAR}", []
+
+    def check(self, text, keep):
+        seen.append(side.exists())
+        raise hook.SourceChanged(text)
+    monkeypatch.setattr(hook.Swap, "check", check)
+    code, result, _, _ = convert_own(path)
+    assert code == "repack_source_changed" and seen == [False] and not side.exists(), result
+    assert path.read_bytes() == (tmp_path / "orig.mp4").read_bytes()
+
+
+def test_the_undo_removes_the_sidecar(tmp_path, monkeypatch, settings):
+    """The app does not take the new file, so the undo puts the original back. The original holds the broken track
+    again, so the sidecar goes, and the folder is as it was. The decision log says so."""
+    settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
+    mp4 = broken_film(tmp_path, [PERSIAN], name="Film (2020).mp4")
+    folder, seen = mp4.parent, []
+    monkeypatch.setattr(hook, "app_lists", lambda app, owner, items: ({}, {}))
+    monkeypatch.setattr(hook.Radarr, "extras", lambda self, owner, fid, path, home, items: [])
+    monkeypatch.setattr(hook, "score_refuses", lambda app, owner, old, new: None)
+    monkeypatch.setattr(hook.Radarr, "record", lambda self, ids: ({"id": 11, "path": str(mp4)}, {7: True}, str(folder)))
+    monkeypatch.setattr(hook, "relink", lambda app, owner, old, items, target, imports=None: seen.append(sorted(os.listdir(folder))) or (
+        False, {"import": "completed", "file_id": 12, "listed": [target], "remonitored": []}))
+    monkeypatch.setattr(hook, "app_now", lambda app, owner, items: [str(mp4)])   # the app still lists the original
+    before = sorted(os.listdir(folder))
+    _, result, info, now = hook.convert("radarr", str(mp4), hook.mkvmerge(str(mp4)), os.stat(mp4), True, {"app_id": 7, "file_id": 11})
+    assert result.startswith("repack failed: the app did not take the new file") and now == str(mp4), result
+    assert f"Film (2020).per{hook.BROKEN_SIDECAR}" in seen[0] and sorted(os.listdir(folder)) == before
+    assert info["broken"]["s1"]["removed"] is True and info["restored"]["result"] == "restored"
+
+
+def test_the_subtitle_scans_skip_a_broken_track_sidecar(tmp_path):
+    """The sidecars a conversion muxes, the subtitle checks and their saved results read .srt files only. A sidecar of
+    a broken track ends in .srt.txt, so none of them reads it."""
+    video = tmp_path / "Film (2020).mkv"
+    video.touch()
+    (tmp_path / "Film (2020).en.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+    (tmp_path / f"Film (2020).per{hook.BROKEN_SIDECAR}").write_bytes("1\n00:00:01,000 --> 00:00:02,000\nسلام\n\n".encode("cp1256"))
+    assert [s["name"] for s in hook.sidecar_subs(str(video))] == ["Film (2020).en.srt"]
+    assert list(hook.side_stats(str(video))) == ["Film (2020).en.srt"]
+
+
+def test_the_match_check_leaves_a_broken_track_out(tmp_path, monkeypatch):
+    """convert_subs() never reads a broken track, which the remux removes. ffmpeg's decoder cannot read it either."""
+    video = tmp_path / "Film A (1979).mp4"
+    video.touch()
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+               {"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"}]
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "run_bounded", lambda *a, **k: pytest.fail("ffmpeg read the track"))
+    assert hook.convert_subs(str(video), sub_probe(("fre", False, {}), audio=(("fre", True),)), streams, [], talk.DURATION, False, str(tmp_path), {},
+                             broken={2}) == ([], [])
+
+
+@pytest.mark.parametrize("other", [None, "kept", "dropped"])
+def test_a_broken_track_in_a_file_with_no_audio_keeps_its_times(tmp_path, settings, monkeypatch, other):
+    """No audio, and the video 0.105 s late. mkvmerge starts the file at the earliest packet of the tracks it keeps.
+    That is the video's when the broken track held the earliest one, so the video starts at 0, and the sidecar's times
+    move with it, see start_shift(). A UTF-8 text track before it starts at 0 with an empty packet. When the remux
+    keeps that track, nothing moves. When the match check drops it, the video starts at 0 again. Against the video,
+    each cue of the sidecar keeps the time and the text it has in a plain remux of the UTF-8 twin."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    eng = [{"lang": "eng", "enc": "utf-8", "cues": [(1.2, 2.2, "First track", None)]}] if other else []
+    path, plain = twin_setup(tmp_path, eng + [{"lang": "fre", "enc": "cp1252", "cues": FRE_CUES}], audio=False, video_offset=0.105)
+    if other == "dropped":
+        monkeypatch.setattr(hook, "convert_subs", lambda path, j, streams, subs, *a, **k: (subs, [(1, 1)]))
+        monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))   # a track left out keeps the original
+    _, result, info, new = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), True, {"app_id": 7}, sub=other == "dropped")
+    assert result == "repacked", (result, info.get("proof"))
+    video = []
+    for f, out in ((new, tmp_path / "x"), (plain, tmp_path / "y")):
+        out.mkdir()
+        REAL_RUN(["mkvextract", str(f), "timestamps_v2", f"0:{out / 'v'}"], check=True, capture_output=True)
+        video.append(round(float(next(line for line in (out / "v").read_text().splitlines() if not line.startswith("#")))))
+    got = [(a, b, t.decode("cp1252")) for a, b, t in sidecar_cues(path.parent / f"Film (2020).fre{hook.BROKEN_SIDECAR}", -video[0])]
+    assert got == hook.srt_cues([*mkv_texts(plain, tmp_path / "y").values()][-1], -video[1])
+
+
+@pytest.mark.parametrize("level", ["issues", "all"])
+def test_a_conversion_that_removed_a_broken_track_posts_one_notice(env, monkeypatch, settings, level):
+    """An import whose conversion took out a broken track posts one notice, with the default DISCORD_POSTS issues and
+    with all. With all, no second post says that the file was converted."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    settings(discord_posts=level)
+    took_out(monkeypatch, mkv)
+    hook.main([])
+    rec = decided(env)
+    titles = [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
+    assert rec["outcome"] == "edited" and "unreadable" in rec["alert_kinds"] and titles.count("Unreadable subtitles") == 1, (rec["result"], titles)
+    assert "Converted to MKV" not in titles
+
+
+def took_out(monkeypatch, mkv):
+    """Make convert() report that it took out the broken track s1 of the file that became mkv."""
+    broken = {"s1": {"stream": 2, "lang": "per", "sidecar": mkv[:-4] + f".per{hook.BROKEN_SIDECAR}", "reused": False, "role": "full", "name": "",
+                     "sdh": False, "forced": False}}
+    convert = hook.convert
+    monkeypatch.setattr(hook, "convert", lambda *a, **k: (lambda out: (out[0], out[1], dict(out[2], broken=broken), out[3]))(convert(*a, **k)))
+
+
+def test_a_convert_run_keeps_the_unreadable_notice_in_its_decision_line(env, monkeypatch):
+    """A --convert run that took out a broken track names it in its decision line. A backfill posts no alert."""
+    (mp4,) = mp4_films(env, monkeypatch, 1)
+    took_out(monkeypatch, mp4[:-4] + ".mkv")
+    hook.main(["--backfill", "radarr", "--convert", "--apply"])
+    (rec,) = [r for r in log_lines(env) if r.get("findings")]
+    assert (rec["outcome"], rec["alert_kinds"], [f["kind"] for f in rec["findings"]]) == ("repacked", ["unreadable"], ["unreadable"]), rec
+    assert rec["alerts"][0].startswith("unreadable: Converted the MP4/QuickTime file to MKV. The Persian subtitles (track 1 of the original file)")
+    assert [u for m, u, b in env["http"] if m == "POST"] == []
 
 
 def test_a_real_file_is_converted_renamed_and_its_sidecars_go(convertible, tmp_path, monkeypatch, settings):
@@ -11194,13 +11966,13 @@ def text_mkv(tmp_path_factory):
         pytest.skip("needs ffmpeg and mkvmerge")
     d = tmp_path_factory.mktemp("text")
     sub = lambda n: os.path.join(SUBS, f"{n}.srt")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=600:size=320x180:rate=25", "-c:v", "libx264",
-                    "-preset", "ultrafast", "-threads", "1", str(d / "v.mp4")], check=True)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", sub("jpn"), str(d / "jpn.ass")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=600:size=320x180:rate=25", "-c:v", "libx264",
+                "-preset", "ultrafast", "-threads", "1", str(d / "v.mp4")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-i", sub("jpn"), str(d / "jpn.ass")], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(d / "mkvmerge.mkv"), str(d / "v.mp4"), "--language", "0:eng", "--forced-display-flag", "0:1", sub("rum"),
                     "--language", "0:eng", "--track-name", "0:French", sub("fre"), "--language", "0:eng", sub("eng"),
                     "--language", "0:spa", "--compression", "0:zlib", sub("spa"), "--language", "0:jpn", str(d / "jpn.ass")], check=True)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(d / "mkvmerge.mkv"), "-map", "0", "-c", "copy", str(d / "ffmpeg.mkv")], check=True)
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(d / "mkvmerge.mkv"), "-map", "0", "-c", "copy", str(d / "ffmpeg.mkv")], check=True)
     subprocess.run(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), str(d / "v.mp4"), "--cues", "0:none", sub("eng")], check=True)
     return d
 
@@ -11271,6 +12043,32 @@ def test_cue_blocks_takes_only_entries_with_a_relative_position():
     point = lambda rest: cue_el(d.CUEPOINT, cue_el(d.CUETIME, b"\x00") + cue_el(d.CUETRACKPOS, cue_el(d.CUETRACK, b"\x02") + cue_el(0xF1, b"\x05") + rest))
     b = point(cue_el(0xF0, b"\x03")) + point(cue_el(0xB2, b"\x07")) + point(cue_el(0xF0, b"\x09") + cue_el(0xB2, b"\x8a"))
     assert d.cue_blocks(b, {2}, 10) == {2: [(5, 3, None), (5, 9, 138)]} and d.cue_blocks(b, {2}, 1) == {2: [(5, 3, None)]} and d.cue_blocks(b, {3}, 10) == {}
+
+
+class CappedFile(io.FileIO):
+    """A file that counts its reads, so a read loop on SeekHeads fails a test and never hangs the suite."""
+    reads = 0
+
+    def read(self, n=-1):
+        self.reads += 1
+        assert self.reads < 20, "the SeekHead read loops"
+        return super().read(n)
+
+
+def test_cue_entries_reads_a_second_seekhead_once(tmp_path):
+    """mkvpropedit can move the index to a second SeekHead at the end of the file, and the subtitle checks read the
+    Cues from there. A second SeekHead that lists the front one ends the read, see checks.seeks()."""
+    d = hook.arr_decide
+    point = cue_el(d.CUEPOINT, cue_el(d.CUETIME, b"\x00") + cue_el(d.CUETRACKPOS, cue_el(d.CUETRACK, b"\x01") + cue_el(0xF1, b"\x05")
+                                                                     + cue_el(0xF0, b"\x03") + cue_el(0xB2, b"\x07")))
+    cues, tracks, path = el(d.CUES, point), el(0x1654AE6B, bytes(40)), tmp_path / "second.mkv"
+    cluster = el(d.CLUSTER, el(d.TIMESTAMP, b"\x00") + el(d.SIMPLEBLOCK, bytes(300)))   # the front SeekHead's read ends there
+    at = made_mkv(path, [cluster, cues, tracks])
+    seg = d.segment_start(path.read_bytes())[0]
+    for lists in (seek_entry(d.CUES, at[1] - seg), seek_entry(d.SEEKHEAD, 0) + seek_entry(d.CUES, at[1] - seg)):   # the second also lists the front one
+        made_mkv(path, [cluster, cues, tracks, el(d.SEEKHEAD, lists)], 3, lists=d.SEEKHEAD)
+        with CappedFile(path) as f:
+            assert hook.cue_entries(f, {1}, 10) == (seg, {1: [(5, 3, 7)]})
 
 
 def test_block_frame_checks_the_track_and_the_lacing():
@@ -12074,8 +12872,9 @@ def test_convert_subs_leaves_out_what_does_not_match(monkeypatch, settings, tmp_
     assert not (video.parent / "Film A (1979).en.srt").exists() and info["sidecars_unmatched"][0]["moved"].startswith(str(tmp_path / ".kept"))
     assert info["sidecars_kept"][0].endswith("Film A (1979).en.sdh.srt") and (video.parent / "Film A (1979).en.sdh.srt").exists()
     assert open(keep[0]["mux"]).read().startswith("1\n00:01:00,000 --> 00:01:02,000\n")   # the first cue, at 62 s, moved 2 s earlier
-    argv = hook.convert_cmd(str(video), "/t.mkv", {"tracks": [{"id": 0}, {"id": 1}, {"id": 2}]}, keep, drop=[2])
-    assert argv[argv.index("--track-order") + 1] == "0:0,0:1,1:0" and argv[argv.index("-s") + 1] == "!2" and argv[-1] == keep[0]["mux"]
+    argv = hook.convert_cmd(str(video), "/t.mkv", {"tracks": [{"id": 0, "type": "video"}, {"id": 1, "type": "audio"}, {"id": 2, "type": "subtitles"}]},
+                            keep, drop=[2])
+    assert argv[argv.index("--track-order") + 1] == "0:0,0:1,1:0" and "-S" in argv and "-s" not in argv and argv[-1] == keep[0]["mux"]
     (video.parent / "Film A (1979).en.forced.srt").unlink()
     # with no place to keep it, the unmatched sidecar stays beside the file and says why
     (video.parent / "Film A (1979).en.srt").write_text(srt([(round(a), round(b), t) for a, b, t in talk.cues(talk.OTHER)]))
@@ -12094,8 +12893,8 @@ def sync_mkv(tmp_path_factory):
     d = tmp_path_factory.mktemp("sync")
     with open(d / "s.srt", "w") as f:
         f.write("".join(f"{i}\n00:00:{2 * i:02d},000 --> 00:00:{2 * i + 1:02d},500\n{talk.RIGHT[i]}\n\n" for i in range(1, 19)))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
-              "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
     REAL_RUN(["mkvmerge", "-q", "-o", str(d / "f.mkv"), str(d / "av.mp4"), "--language", "0:eng", str(d / "s.srt")], check=True)
     return d
 
@@ -12346,7 +13145,7 @@ def test_a_conversion_that_leaves_a_track_out_keeps_the_original(env, monkeypatc
     hook.main([])
     rec = decided(env)
     remux = env["repacks"][0]
-    assert remux[remux.index("-s") + 1] == "!2" and rec["repack"]["kept"].startswith(root + "/") and os.path.exists(rec["repack"]["kept"])
+    assert "-S" in remux and "-s" not in remux and rec["repack"]["kept"].startswith(root + "/") and os.path.exists(rec["repack"]["kept"])
     assert ("converted_track", "s1", rec["repack"]["kept"]) in [(x["code"], x.get("track"), x["kept"]) for f in rec["findings"] for x in f["lines"]], rec["findings"]
 
 
@@ -12491,6 +13290,19 @@ def test_resub_refuses_a_remux_whose_track_properties_did_not_come_back(sync_mkv
     assert result.startswith("subtitle remux failed: track 0 changed its ") and "proof" not in info, result
     assert open(path, "rb").read() == before and os.listdir(tmp_path) == ["f.mkv"]
 
+
+@pytest.mark.parametrize("code", [2, -9])
+def test_resub_fails_when_mkvpropedit_fails(sync_mkv, tmp_path, monkeypatch, code):
+    """mkvpropedit exits 2 on an error, and a signal gives a negative code. The remux fails, and the original stays."""
+    path = str(tmp_path / "f.mkv")
+    shutil.copy(sync_mkv / "f.mkv", path)
+    before, real = open(path, "rb").read(), hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: type("R", (), {"returncode": code, "stdout": "", "stderr": ""})()
+                        if argv[0] == "mkvpropedit" else real(argv, **k))
+    _, result, info = hook.resub(path, REAL_MKVMERGE(path), os.stat(path), True, {2: {"rate": "1/1", "offset": 1.0}})
+    assert result.startswith(f"subtitle remux failed: mkvpropedit exited {code}") and "proof" not in info, result
+    assert open(path, "rb").read() == before and os.listdir(tmp_path) == ["f.mkv"]
+
 def test_a_subtitle_remux_stopped_at_the_rename_removes_its_kept_link(sync_mkv, tmp_path, monkeypatch, settings):
     """SIGTERM at the rename leaves the original at its name, so its kept link goes and the temp file too."""
     path = str(tmp_path / "f.mkv")
@@ -12588,7 +13400,7 @@ def test_a_retime_before_0_fails_the_proof_when_the_audio_has_a_codec_delay(sync
     the later cues then move by that delay. The proof refuses the remux, and the file stays as it was. A fix that moves
     no cue before 0 passes."""
     av, path = tmp_path / "av.mkv", str(tmp_path / "f.mkv")
-    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(sync_mkv / "av.mp4"), "-c:v", "copy", "-c:a", "aac", str(av)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(sync_mkv / "av.mp4"), "-c:v", "copy", "-c:a", "aac", str(av)], check=True)
     REAL_RUN(["mkvmerge", "-q", "-o", path, str(av), "--language", "0:eng", str(sync_mkv / "s.srt")], check=True)
     j, st = REAL_MKVMERGE(path), os.stat(path)
     assert j["tracks"][1]["properties"].get("codec_delay"), j["tracks"][1]
@@ -13219,8 +14031,8 @@ def pic_mkv(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvextract")):
         pytest.skip("needs ffmpeg and mkvtoolnix")
     d = tmp_path_factory.mktemp("pic")
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
-              "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=40:size=160x90:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=40", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")], check=True)
     (d / "t.sup").write_bytes(pgs_sup(PIC_CUES, fade={2}))
     (d / "s.srt").write_text("".join(f"{i}\n00:00:{2 * i:02d},000 --> 00:00:{2 * i + 1:02d},500\n{talk.RIGHT[i]}\n\n" for i in range(1, 19)))
     REAL_RUN(["mkvmerge", "-q", "-o", str(d / "pgs.mkv"), str(d / "av.mp4"), "--language", "0:eng", str(d / "s.srt"), "--language", "0:spa", str(d / "t.sup")],
@@ -13589,8 +14401,8 @@ def hb_base(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvextract")):
         pytest.skip("needs ffmpeg and mkvtoolnix")
     path = tmp_path_factory.mktemp("hb") / "av.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=42:size=160x90:rate=25", "-f", "lavfi", "-i",
-              "sine=frequency=440:duration=42", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "ac3", str(path)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=42:size=160x90:rate=25", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=42", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "ac3", str(path)], check=True)
     return path
 
 
@@ -13609,8 +14421,8 @@ def hb_mkv(path, base, packets, private=HB_HEAD, ms=lambda i: 0, length=1500, cu
     raw = f"{path}.track.mkv"
     with open(raw, "wb") as f:
         f.write(head + el(0x18538067, el(0x1549A966, u(0x2AD7B1, 1000000)) + el(0x1654AE6B, track) + clusters))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(base), "-i", raw, "-map", "0", "-map", "1", "-c", "copy", "-write_crc32", "0", str(path)],
-             check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-i", str(base), "-i", raw, "-map", "0", "-map", "1", "-c", "copy", "-write_crc32", "0", str(path)],
+               check=True)
     os.remove(raw)
     if not cues:   # CueTrack 3, the subtitle track, becomes 9 in each entry after the Cues element's ID
         data = open(path, "rb").read()
@@ -13687,9 +14499,9 @@ def test_resub_takes_the_hevc_header_ffmpeg_writes(tmp_path, settings):
     if not re.search(r"\slibx265\s", encoders):
         pytest.skip("ffmpeg -encoders lists no libx265")
     video, audio, srt, path = tmp_path / "v.hevc", tmp_path / "a.ac3", tmp_path / "s.srt", str(tmp_path / "x265.mkv")
-    REAL_RUN(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2.4:size=160x90:rate=25", "-pix_fmt", "yuv420p",
-              "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error", "-threads", "1", "-f", "hevc", str(video)], check=True)
-    REAL_RUN(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2.4", "-c:a", "ac3", str(audio)], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=2.4:size=160x90:rate=25", "-pix_fmt", "yuv420p",
+                "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error", "-threads", "1", "-f", "hevc", str(video)], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2.4", "-c:a", "ac3", str(audio)], check=True)
     srt.write_text("1\n00:00:00,500 --> 00:00:01,500\nOne\n\n")
     REAL_RUN(["mkvmerge", "-q", "-o", path, str(video), str(audio), "--language", "0:en", str(srt), "--language", "0:zh", str(srt)], check=True)
     settings(keep_days=0)
@@ -13902,9 +14714,9 @@ def test_resub_passes_the_decoder_lines_of_a_damaged_audio_frame(tmp_path, setti
     remux copies the stream, so the write passes, every packet matches, and the log keeps the lines in warnings."""
     base, srt = tmp_path / "base.mkv", tmp_path / "s.srt"
     srt.write_text("".join(f"{i}\n00:00:{i:02d},000 --> 00:00:{i:02d},800\nLine {i}\n\n" for i in range(1, 9)))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10", "-f", "lavfi", "-i",
-              "testsrc=duration=10:size=160x90:rate=25", "-i", str(srt), "-map", "0", "-map", "1", "-map", "2", "-c:a", "eac3",
-              "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:s", "srt", str(base)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=10", "-f", "lavfi", "-i",
+                "testsrc=duration=10:size=160x90:rate=25", "-i", str(srt), "-map", "0", "-map", "1", "-map", "2", "-c:a", "eac3",
+                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:s", "srt", str(base)], check=True)
     path = damaged_eac3(tmp_path, base)
     settings(keep_days=0)
     j = REAL_MKVMERGE(path)
@@ -15348,7 +16160,7 @@ def onset_audio(tmp_path, layout):
     steady = "0.3*sin(2*PI*300*t)"
     expr = f"{burst}|{burst}" if layout == "stereo" else "|".join([steady, steady, burst, "0", steady, steady])
     path = tmp_path / f"{layout}.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"aevalsrc={expr}:s=48000:d=30:c={layout}", "-c:a", "flac", str(path)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"aevalsrc={expr}:s=48000:d=30:c={layout}", "-c:a", "flac", str(path)], check=True)
     return str(path), REAL_MKVMERGE(str(path))
 
 
@@ -15383,8 +16195,8 @@ def test_onsets_hear_the_mono_mix_of_a_track_with_no_centre_channel(tmp_path):
     so the mix holds a silence of 4 s there, while each channel alone holds none."""
     path = tmp_path / "inverted.mkv"
     tone = "0.5*sin(2*PI*440*t)"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"aevalsrc={tone}|if(between(t\\,2\\,6)\\,-{tone}\\,{tone}):s=48000:d=10:c=stereo",
-              "-c:a", "flac", str(path)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"aevalsrc={tone}|if(between(t\\,2\\,6)\\,-{tone}\\,{tone}):s=48000:d=10:c=stereo",
+                "-c:a", "flac", str(path)], check=True)
     got = hook.onsets(str(path), {"tracks": [{"type": "audio", "properties": {"audio_channels": 2}}]}, 0, [(0.0, 10.0)])
     assert [(round(t), round(d)) for t, d in got] == [(6, 4)], got
 
@@ -15431,9 +16243,9 @@ def block_mkv(tmp_path_factory):
         pytest.skip("needs ffmpeg and mkvmerge")
     d, secs = tmp_path_factory.mktemp("block"), f"{talk.DURATION:.0f}"
     (d / "s.srt").write_text(srt_text(late_block(E2E_LATE)[0]))
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=duration={secs}:size=64x36:rate=1", "-f", "lavfi", "-i",
-              f"sine=frequency=440:sample_rate=8000:duration={secs}", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac",
-              str(d / "av.mp4")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=duration={secs}:size=64x36:rate=1", "-f", "lavfi", "-i",
+                f"sine=frequency=440:sample_rate=8000:duration={secs}", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac",
+                str(d / "av.mp4")], check=True)
     REAL_RUN(["mkvmerge", "-q", "-o", str(d / "f.mkv"), "--language", "1:eng", str(d / "av.mp4"), "--language", "0:eng", "--default-track-flag", "0:0",
               str(d / "s.srt")], check=True)
     return d
@@ -15477,7 +16289,7 @@ def test_end_to_end_a_late_block_moves_back_to_its_speech(env, monkeypatch, sett
 def test_resub_keeps_a_cover_attachment_out_of_the_streams(sync_mkv, tmp_path, monkeypatch, settings):
     """ffmpeg reads an image attachment as a cover picture stream and would write it back as a video track. The remux
     leaves it out of the map and mkvpropedit adds it back with its name, type and UID, so the tracks stay the same."""
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
     path = str(tmp_path / "f.mkv")
     REAL_RUN(["mkvmerge", "-q", "-o", path, str(sync_mkv / "f.mkv"), "--attachment-mime-type", "image/png", "--attach-file", str(tmp_path / "cover.png")],
              check=True)
@@ -15492,7 +16304,7 @@ def test_resub_keeps_a_cover_attachment_out_of_the_streams(sync_mkv, tmp_path, m
 def test_resub_writes_nothing_to_the_system_temp_dir(pic_mkv, tmp_path, monkeypatch, settings):
     """A remux with a cover, a track that gets a ratio fix and new ends, and a track that gets new ends. The system temp
     dir does not exist, so any file there would fail the remux. The work folder under STATE_DIR goes after it."""
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=red:size=32x32", "-frames:v", "1", str(tmp_path / "cover.png")], check=True)
     path = str(tmp_path / "flash.mkv")
     REAL_RUN(["mkvmerge", "-q", "-o", path, str(pic_mkv / "flash.mkv"), "--attachment-mime-type", "image/png", "--attach-file", str(tmp_path / "cover.png")],
              check=True)
@@ -17073,7 +17885,6 @@ def test_a_whole_file_hearing_that_yields_to_a_waiting_hearing_hears_the_rest_wi
     assert len(calls) == 2 and calls[1][0] == starts[2:] and calls[0][1][1] is None and [w["at"] for w in got] == starts, calls
 
 
-
 def test_a_target_is_judged_against_the_audio_and_not_the_reference_offset(env, monkeypatch):
     """The English reference sits 0.6 s late, its measured offset, and the whole-file timing moves its lines. The French
     track sits 0.2 s early against the audio. Against the moved reference it is in time, so it keeps its times. Against
@@ -17350,14 +18161,15 @@ def scene_srt(texts):
     ("rus", "utf-8"), ("jpn", "cp932"), ("heb", "cp1255")])
 def test_a_garbled_track_reads_back_in_its_codepage(name, cp):
     """An old muxer read a sidecar of each codepage as cp1252. The cp1252 bytes of the garbled text read back as that
-    codepage, in the text's language, so the owner's rule repairs it. That holds for Latin text whose words stay
-    readable too, as French or Polish. Each cue reads back whole, or is cut where the muxer cut it. UTF-8 marks a cut
-    with U+FFFD."""
+    codepage, in the text's language. That holds for Latin text whose words stay readable too, as French or Polish.
+    Only a UTF-8 reading is repaired, because only its decode checks each character. Each cue reads back whole, or is
+    cut where the muxer cut it. UTF-8 marks a cut with U+FFFD."""
     d, texts = hook.arr_decide, scene(name)
     lang = "chi" if name == "trad" else name
     bad = old_mux(texts, cp)
     g = d.garbled(bad, lang)
-    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, True), g
+    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, cp == "utf-8"), g
+    assert g["why"].endswith(", but only a UTF-8 read-back is repaired") == (cp != "utf-8"), g
     back = [d.read_back(t, cp) for t in bad]
     assert all(b.endswith("\ufffd") == cut and t.startswith(b.removesuffix("\ufffd")) for (b, cut), t in zip(back, texts))
     assert g["cut"] == sum(cut for _, cut in back) and (g["cut"] > 0) == ((name, cp) in (("rus", "utf-8"), ("jpn", "cp932"))), g
@@ -17390,22 +18202,15 @@ def test_the_undefined_bytes_of_cp1252_read_back():
         d.read_back("Å ♪ ok", "utf-8")   # only the end of a cue can be cut
 
 
-def test_a_character_cp1252_does_not_write_stays_and_a_right_letter_stays():
-    """A later tool can add "♪" or "κ" to garbled text. Such a character stays as it is, and the rest reads back. With
-    the tag, a one-byte read-back keeps a character as it was when it would give a letter the language does not write,
-    as the right "Señor" and "Voilà" in Romanian text that cp1250 would turn into "Seńor" and "Voilŕ". A symbol reads
-    back, and a mark does not."""
+def test_a_character_cp1252_does_not_write_stays():
+    """A later tool can add "♪" or "κ" to garbled text. Such a character stays as it is, and the rest reads back."""
     d = hook.arr_decide
-    rum = [t.replace("ș", "ş").replace("ț", "ţ").replace("Ș", "Ş").replace("Ț", "Ţ") for t in cue_texts("rum")]
-    bad = [b + (" ♪" if k % 5 == 0 else "") for k, b in enumerate(old_mux(rum, "cp1250"))] + ["La revedere, Señor κ.", "Voilà, gata."]
-    g = d.garbled(bad, "rum")
-    assert (g["repair"], g["codepage"]) == (True, "cp1250"), g
-    new, filled, left = hook.repaired(bad, "cp1250", "rum")
-    assert new[:-2] == [t + (" ♪" if k % 5 == 0 else "") for k, t in enumerate(rum)] and new[-2:] == ["La revedere, Señor κ.", "Voilà, gata."]
-    assert [d.read_back(t, "cp1250")[0] for t in bad[-2:]] == ["La revedere, Seńor κ.", "Voilŕ, gata."] and (filled, left) == ([], 0)
-    # a symbol reads back, as № and € of cp1251, while a mark such as ˇ or ˛ of cp1250 stays as it was
-    assert d.read_back(old_mux(["Комната № 10 стоит 5 €."], "cp1251")[0], "cp1251", "rus")[0] == "Комната № 10 стоит 5 €."
-    assert d.read_back("¡Hola! Pas ². Şi ºi.", "cp1250", "rum")[0] == "¡Hola! Pas ². Şi şi."
+    pol = [t for t in cue_texts("pol") if not set(t.encode()) & set(hook.arr_decide.CP1252_HOLES)]   # no cue cut
+    bad = [b + (" ♪" if k % 5 == 0 else "") for k, b in enumerate(old_mux(pol, "utf-8"))] + ["Do widzenia, κ."]
+    g = d.garbled(bad, "pol")
+    assert (g["repair"], g["codepage"]) == (True, "utf-8"), g
+    new, filled, left = hook.repaired(bad, "utf-8")
+    assert new == [t + (" ♪" if k % 5 == 0 else "") for k, t in enumerate(pol)] + ["Do widzenia, κ."] and (filled, left) == ([], 0)
 
 
 def test_text_garbled_twice_or_in_another_language_is_not_repaired():
@@ -17414,9 +18219,9 @@ def test_text_garbled_twice_or_in_another_language_is_not_repaired():
     d, texts = hook.arr_decide, scene("spa")
     bad = old_mux(old_mux(texts, "utf-8"), "utf-8")
     g = d.garbled(bad, "spa")
-    once = hook.repaired(bad, g["codepage"], "spa")[0]
+    once = hook.repaired(bad, g["codepage"])[0]
     assert g["repair"] and d.repair_fault(once, "spa").startswith("the repaired text is still garbled") and once != texts
-    assert d.repair_fault(hook.repaired(once, "utf-8", "spa")[0], "spa") is None
+    assert d.repair_fault(hook.repaired(once, "utf-8")[0], "spa") is None
     assert d.repair_fault(scene("ita"), "spa") == "the repaired text reads as ita, not as spa"
 
 
@@ -17424,16 +18229,14 @@ def test_text_garbled_twice_or_in_another_language_is_not_repaired():
 def test_a_sidecar_fills_only_the_cut_cues_of_its_own_track(side, fits):
     """A sidecar may fill the cues the old muxer cut only when it is the track's source: every other cue equals the
     read-back. A garbled sidecar, the garbled track extracted beside the file and an SDH version all differ. One cue
-    in UTF-8 is cut inside "Ł", and one in cp1250 between letters, at "ť", where only the sidecar shows the cut."""
-    pol = scene("pol", 1) + ["Łódź jest daleko stąd, wiesz?"]
-    slo = scene("slo", 1) + ["Daj mi ťa, prosím."]
-    for texts, cp, tag in ((pol, "utf-8", "pol"), (slo, "cp1250", "slo")):
-        bad = old_mux(texts, cp)
-        theirs = {"source": texts, "garbled": bad, "extracted": hook.repaired(bad, cp, tag)[0], "sdh": ["[DOOR] " + t for t in texts],
-                  "short": texts[:-1]}[side]
-        got = hook.repaired(bad, cp, tag, theirs)
-        cut = [k for k, t in enumerate(texts) if set(t.encode(cp)) & set(hook.arr_decide.CP1252_HOLES)]   # the cues the muxer cut
-        assert (got[0] == texts and got[1] == cut and got[2] == 0) if fits else not (got and got[1]), (cp, got and got[1:])
+    is cut inside "Ł"."""
+    texts = scene("pol", 1) + ["Łódź jest daleko stąd, wiesz?"]
+    bad = old_mux(texts, "utf-8")
+    theirs = {"source": texts, "garbled": bad, "extracted": hook.repaired(bad, "utf-8")[0], "sdh": ["[DOOR] " + t for t in texts],
+              "short": texts[:-1]}[side]
+    got = hook.repaired(bad, "utf-8", theirs)
+    cut = [k for k, t in enumerate(texts) if set(t.encode()) & set(hook.arr_decide.CP1252_HOLES)]   # the cues the muxer cut
+    assert (got[0] == texts and got[1] == cut and got[2] == 0) if fits else not (got and got[1]), got and got[1:]
 
 
 def test_a_sidecar_that_changed_since_the_check_stops_the_repair(tmp_path):
@@ -17456,8 +18259,10 @@ def test_a_sidecar_that_changed_since_the_check_stops_the_repair(tmp_path):
 # --- saved results and the recheck (docs/development.md, "When a change can fix old files") ---------------------------
 
 def saved(mode="sub_check", app="radarr", **found):
-    """A saved result of mode, each check at version 1 with the findings found {check: [words]}, [] by default."""
-    return {"checks": {c: {"version": 1, "found": found.get(c, [])} for c in hook.SUB_RUNS[mode]}, "app": app, "mode": mode, "sidecars": {}}
+    """A saved result of mode with the findings found {check: [words]}, [] by default. Each check is at version 1, and
+    Garbled subtitle repair at version 2, because version 2 rechecks every result of version 1."""
+    return {"checks": {c: {"version": 2 if c == "garbled_repair" else 1, "found": found.get(c, [])} for c in hook.SUB_RUNS[mode]}, "app": app,
+            "mode": mode, "sidecars": {}}
 
 
 def test_a_result_of_2_4_0_or_of_an_import_does_not_count_for_sub_check(env, monkeypatch):
@@ -17499,6 +18304,17 @@ def test_block_timing_5_rechecks_every_result_of_sub_time_and_the_deep_analysis_
     now = lambda mode, found: {**saved(mode, subtitle_match=found), "checks": {**saved(mode)["checks"], "subtitle_match": {"version": 2, "found": found}}}
     for mode in ("import", "sub_check"):
         assert hook.sub_fixed(saved(mode)) == hook.sub_fixed(now(mode, ["steps"])) == hook.sub_fixed(now(mode, ["off"])) == []
+
+
+def test_garbled_repair_2_rechecks_every_result_that_made_the_check_once():
+    """Version 2 checks .srt sidecars and ASS, SSA and WebVTT tracks, and takes out what version 1 read back from a
+    one-byte codepage. A result names no codec, so each result of version 1 of a run that makes the check is stale,
+    with or without a finding. An import makes no garbled check, so its result stays, and so does one of version 2."""
+    for mode in ("sub_check", "sub_time", "deep"):
+        old = saved(mode)
+        old["checks"]["garbled_repair"]["version"] = 1
+        assert "garbled_repair" in hook.sub_fixed(old) and "garbled_repair" not in hook.sub_fixed(saved(mode)), mode
+    assert "garbled_repair" not in hook.sub_fixed(saved("import"))
 
 
 def test_a_new_check_reaches_old_results_only_when_its_entry_says_so(env, monkeypatch):
@@ -17885,8 +18701,8 @@ def test_a_conversion_muxes_a_legacy_sidecar_with_its_language_and_codepage(tmp_
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     src, out = tmp_path / "Clip.mp4", tmp_path / "new.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=70", "-f", "lavfi", "-i",
-              "sine=sample_rate=8000:duration=70", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(src)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=70", "-f", "lavfi", "-i",
+                "sine=sample_rate=8000:duration=70", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(src)], check=True)
     (tmp_path / "Clip.srt").write_bytes(scene_srt(scene("pol", 1)).encode("cp1250"))
     subs = remux(src, out)
     fault, proof = proved(str(src), str(out), subs, str(tmp_path))
@@ -17905,26 +18721,53 @@ def test_the_word_check_of_a_conversion_hears_an_mp4(monkeypatch):
     assert seen == [600.0]
 
 
+# Made-up WebVTT and ASS text, as a Turkish and a Polish fansub write it
+VTT_TUR = ["<i>Nereye gittiğini bilmiyorum.</i>", "Şimdi değil, lütfen. Çok yorgunum.", "Öğleden sonra görüşürüz, tamam mı?",
+           "<c.yellow>Hayır</c>, bu işi bitirmeden çıkmıyoruz.", "Ağabeyin geldi mi? Çay içelim."]
+ASS_HEAD = ("[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, Alignment\n"
+            "Style: Default,Arial,20,&H00FFFFFF,2\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+
+
+def ass_text(texts, step=1.6):
+    """An ASS file of texts, an event every step seconds from 1 second. Every fourth event starts with an override block."""
+    clock, top = (lambda t: f"{int(t // 3600)}:{int(t // 60 % 60):02d}:{t % 60:05.2f}"), "{\\an8}"
+    return ASS_HEAD + "".join(f"Dialogue: 0,{clock(1 + step * k)},{clock(2.2 + step * k)},Default,,0,0,0,,{top if k % 4 == 0 else ''}{t}\n"
+                              for k, t in enumerate(texts))
+
+
+def vtt_text(texts):
+    """A WebVTT file of texts, a cue every 1.6 seconds from 1 second, with a cue setting on each."""
+    clock = lambda t: f"00:{int(t // 60):02d}:{t % 60:06.3f}"
+    return "WEBVTT\n\n" + "".join(f"{clock(1 + 1.6 * k)} --> {clock(2.2 + 1.6 * k)} line:85%\n{t}\n\n" for k, t in enumerate(texts))
+
+
 @pytest.fixture(scope="module")
 def garbled_mkv(tmp_path_factory):
-    """f.mkv: English audio and five SubRip tracks, as an old muxer wrote them by reading each sidecar as cp1252.
-    s1 Chinese from GBK, flagged default and not in the Cues. s2 Greek from cp1253. s3 Polish from UTF-8, one cue cut
-    at a byte cp1252 leaves undefined. s4 English, right. s5 Russian from cp1251, tagged Bulgarian. pol.srt is the
-    Polish sidecar."""
+    """f.mkv: English audio and eight text tracks, as an old muxer wrote them by reading each sidecar as cp1252. s1
+    French from UTF-8, flagged default and not in the Cues. s2 Greek from cp1253. s3 Polish from UTF-8, one cue cut at a
+    byte cp1252 leaves undefined. s4 English, right. s5 Russian from cp1251, tagged Bulgarian. s6 an ASS track of
+    Polish from cp1250. s7 a WebVTT track of Turkish from cp1254, stored as UTF-8. s8 a right French ASS track with
+    karaoke tags and a drawing. pol.srt is the Polish sidecar."""
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvextract")):
         pytest.skip("needs ffmpeg and mkvtoolnix")
     d = tmp_path_factory.mktemp("garbled")
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=130", "-f", "lavfi", "-i",
-              "sine=sample_rate=8000:duration=130", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")],
-             check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=130", "-f", "lavfi", "-i",
+                "sine=sample_rate=8000:duration=130", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(d / "av.mp4")],
+               check=True)
     pol = scene("pol", 2) + ["Łódź jest daleko stąd, wiesz?"]
-    tracks = [("chi", scene("chi", 2), "gbk"), ("gre", scene("gre", 2), "cp1253"), ("pol", pol, "utf-8"), ("eng", scene("eng", 2), "utf-8"),
+    tracks = [("fre", scene("fre", 2), "utf-8"), ("gre", scene("gre", 2), "cp1253"), ("pol", pol, "utf-8"), ("eng", scene("eng", 2), "utf-8"),
               ("bul", scene("rus", 2), "cp1251")]
     argv = ["mkvmerge", "-q", "-o", str(d / "f.mkv"), "--language", "1:eng", str(d / "av.mp4")]
     for k, (lang, texts, cp) in enumerate(tracks):
         (d / f"{k}.srt").write_bytes(scene_srt(texts).encode(cp))
         argv += ["--language", f"0:{lang}", "--default-track-flag", f"0:{int(k == 0)}", "--sub-charset", f"0:{'UTF-8' if lang == 'eng' else 'cp1252'}",
                  *(["--cues", "0:none"] if k == 0 else []), str(d / f"{k}.srt")]
+    (d / "6.ass").write_bytes(ass_text(scene("pol", 2)).encode("cp1250"))
+    (d / "7.vtt").write_text(vtt_text(old_mux(VTT_TUR * 12, "cp1254")))
+    karaoke = [("{\\k20}" if k % 3 else "{\\p1}m 0 0 l 100 0 100 100 0 100{\\p0}") + t for k, t in enumerate(scene("fre", 2))]
+    (d / "8.ass").write_text(ass_text(karaoke))
+    for lang, name, more in (("pol", "6.ass", ["--sub-charset", "0:cp1252"]), ("tur", "7.vtt", []), ("fre", "8.ass", [])):
+        argv += ["--language", f"0:{lang}", "--default-track-flag", "0:0", *more, str(d / name)]
     REAL_RUN(argv, check=True)
     (d / "pol.srt").write_text(scene_srt(pol))
     return d
@@ -17934,11 +18777,14 @@ def test_a_cut_read_gets_no_repair_and_no_flash_ends(garbled_mkv, pic_mkv, monke
     """A remux rewrites every cue, and a read that stopped at CUE_MAX checked only the cues before it, see
     subtitles.Cut. So a garbled track read that way gets no repair, and a flash track no new ends."""
     path = str(garbled_mkv / "f.mkv")
-    whole = hook.garbled_tracks(path, REAL_MKVMERGE(path), [])
-    monkeypatch.setattr(hook, "CUE_MAX", len(REAL_SUBTITLE_CUES(path, REAL_MKVMERGE(path), {"s2"})["s2"]) - 1)
-    cut = hook.garbled_tracks(path, REAL_MKVMERGE(path), [])
-    assert whole["s2"]["repair"] and not whole["s2"].get("capped") and (cut["s2"]["repair"], cut["s2"]["capped"]) == (False, True), cut["s2"]
-    assert cut["s2"]["why"].endswith(f"but only its first {hook.CUE_MAX} cues were read"), cut["s2"]
+    monkeypatch.setattr(hook, "FULL", {})
+    whole = hook.garbled_tracks(path, REAL_MKVMERGE(path), [], True)
+    monkeypatch.setattr(hook, "FULL", {})
+    monkeypatch.setattr(hook, "CUE_MAX", len(REAL_SUBTITLE_CUES(path, REAL_MKVMERGE(path), {"s1"}, True)["s1"]) - 1)
+    monkeypatch.setattr(hook, "FULL", {})
+    cut = hook.garbled_tracks(path, REAL_MKVMERGE(path), [], True)
+    assert whole["s1"]["repair"] and not whole["s1"].get("capped") and (cut["s1"]["repair"], cut["s1"]["capped"]) == (False, True), cut["s1"]
+    assert cut["s1"]["why"].endswith(f"but only its first {hook.CUE_MAX} cues were read"), cut["s1"]
     path = str(pic_mkv / "flash.mkv")
     monkeypatch.setattr(hook, "CUE_MAX", 10)
     assert hook.flash_check(path, REAL_MKVMERGE(path), []) == {}
@@ -17946,12 +18792,14 @@ def test_a_cut_read_gets_no_repair_and_no_flash_ends(garbled_mkv, pic_mkv, monke
 
 @pytest.mark.parametrize("run", ["dry", "apply", "no app", "check"])
 def test_end_to_end_garbled_tracks_are_repaired_in_one_proven_remux(env, monkeypatch, settings, tmp_path, capsys, garbled_mkv, run):
-    """--sub-time reads every SubRip track, the unindexed one from the whole file. s1, s2 and s3 read back from their
-    codepages. The Polish sidecar, numbered as Radarr names it, equals the read-back of s3 and fills its cut cue. s1
-    loses its default flag in the same remux, where an app lists the file, and keeps it where no app does, because
-    that run keeps every flag. The proof holds each new text and every other packet. s5 reads back as Russian under a
-    Bulgarian tag, so it cannot be repaired. It leaves the file in the same remux, and its packets go beside the video
-    byte for byte. After the remux every subtitle block is in the Cues. At SUBTITLES check nothing changes."""
+    """--sub-time reads every text track, the unindexed one from the whole file. s1 and s3 read back from UTF-8. The
+    Polish sidecar, numbered as Radarr names it, equals the read-back of s3 and fills its cut cue. s1 loses its default
+    flag in the same remux, where an app lists the file, and keeps it where no app does, because that run keeps every
+    flag. The proof holds each new text and every other packet. s2, s5, s6 and s7 read right only in a one-byte
+    codepage, and s5 reads as Russian under a Bulgarian tag, so none is repaired. They leave the file in the same remux,
+    and their bytes go beside the video: a SubRip track's packets byte for byte, an ASS or WebVTT track as mkvextract
+    writes it, with its header. One notice names them and the repairs. The right French ASS track stays. After the remux every
+    subtitle block is in the Cues. At SUBTITLES check nothing changes."""
     apply = run != "dry"
     if run == "check":   # as a run of the hook at SUBTITLES check
         monkeypatch.setattr(hook, "sub_fixes", lambda source: False)
@@ -17971,53 +18819,55 @@ def test_end_to_end_garbled_tracks_are_repaired_in_one_proven_remux(env, monkeyp
     monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
     j = REAL_MKVMERGE(env["path"])
     assert hook.cue_less(env["path"], j) == {"s1"}
-    texts = lambda path: {p: [t for _, _, t in c] for p, c in REAL_SUBTITLE_CUES(path, REAL_MKVMERGE(path), {"s1", "s2", "s3", "s4", "s5"}, True).items()}
+    every = {f"s{k}" for k in range(1, 9)}
+    texts = lambda path: {p: [t for _, _, t in c] for p, c in REAL_SUBTITLE_CUES(path, REAL_MKVMERGE(path), every, True).items()}
     before = texts(env["path"])
     hook.main(["--sub-time", env["path"]] + (["--apply"] if apply else []))
     rec, out = last_decided(env), capsys.readouterr().out
     assert {p: (g["repair"], g["codepage"], g["lang"], g.get("sidecar")) for p, g in rec["garbled"].items()} == {
-        "s1": (True, "gbk", "chi", None), "s2": (True, "cp1253", "gre", None), "s3": (True, "utf-8", "pol", "Film A (1979) WEBDL-1080p.3.srt"),
-        "s5": (False, "cp1251", "rus", None)}, rec["garbled"]
+        "s1": (True, "utf-8", "fre", None), "s2": (False, "cp1253", "gre", None), "s3": (True, "utf-8", "pol", "Film A (1979) WEBDL-1080p.3.srt"),
+        "s5": (False, "cp1251", "rus", None), "s6": (False, "cp1250", "pol", None), "s7": (False, "cp1254", "tur", None)}, rec["garbled"]
     lines = [(x["code"], x.get("tracks")) for f in rec["findings"] if f["kind"] == "submatch" for x in f["lines"]]
     after = texts(env["path"])
-    side = env["path"][:-4] + ".bul.garbled.txt"
+    base = env["path"][:-4]
+    sides = {"s2": base + ".gre.broken-encoding.srt.txt", "s5": base + ".bul.broken-encoding.srt.txt", "s6": base + ".pol.broken-encoding.ass.txt",
+             "s7": base + ".tur.broken-encoding.vtt.txt"}
     if run == "check":
-        assert after == before and "subremux" not in rec and not os.path.exists(side) and lines == [("garbled", ["s1", "s2", "s3"]), ("garbled", ["s5"])]
-        assert "track 5) show garbled characters, and the right text couldn't be worked out for sure. They're still in the file, because SUBTITLES is " \
-            "set to check." in out, out
+        assert after == before and "subremux" not in rec and not any(map(os.path.exists, sides.values()))
+        assert lines == [("garbled", ["s1", "s3"]), ("garbled", ["s2", "s5", "s6", "s7"])], lines
+        assert "track 7) show garbled characters, and the right text couldn't be worked out for sure. They're still in the file, because SUBTITLES " \
+            "is set to check." in out, out
         return
     if not apply:
-        assert after == before and rec["subremux"]["codes"] == ["would_remux_subtitles"] and "track 2: its text read back as gbk, default flag off" in \
+        assert after == before and rec["subremux"]["codes"] == ["would_remux_subtitles"] and "track 2: its text read back as utf-8, default flag off" in \
             rec["subremux"]["result"], rec["subremux"]
-        assert lines == [("garbled", ["s1", "s2", "s3"]), ("garbled", ["s5"])] and "--apply would remux the file." in out and not os.path.exists(side)
-        assert f"--apply would take them out of the file and keep their text beside the video as {os.path.basename(side)}." in out, out
+        assert lines == [("garbled", ["s1", "s3"]), ("garbled", ["s2", "s5", "s6", "s7"])] and "--apply would remux the file." in out
+        assert not any(map(os.path.exists, sides.values()))
+        names = [os.path.basename(sides[p]) for p in ("s2", "s5", "s6", "s7")]
+        assert f"--apply would take them out of the file and keep their text beside the video as {', '.join(names[:3])} and {names[3]}." in out, out
         return
     assert (rec["outcome"], rec["subremux"]["codes"], rec["subremux"]["recoded"]) == ("subtitles_remuxed", ["subtitle_repaired", "subtitle_garbled_removed"],
-                                                                                    ["s1", "s2", "s3"])
-    assert after["s1"] == scene("chi", 2) and after["s2"] == scene("gre", 2) and after["s3"] == scene("pol", 2) + ["Łódź jest daleko stąd, wiesz?"], after["s3"][-3:]
-    assert after["s4"] == before["s4"] and "s5" not in after and rec["garbled"]["s3"]["filled"] == 1
+                                                                                    ["s1", "s3"])
+    assert after == {"s1": scene("fre", 2), "s2": scene("pol", 2) + ["Łódź jest daleko stąd, wiesz?"], "s3": before["s4"], "s4": before["s8"]}, after
+    assert rec["garbled"]["s3"]["filled"] == 1
+    assert rec["subremux"]["stripped"] == {p: os.path.basename(n) for p, n in sides.items()}, rec["subremux"]["stripped"]
     raw = REAL_RUN(["ffmpeg", "-v", "error", "-i", str(garbled_mkv / "f.mkv"), "-map", "0:6", "-c", "copy", "-f", "srt", "-"], capture_output=True).stdout
-    assert rec["subremux"]["stripped"] == {"s5": os.path.basename(side)} and open(side, "rb").read() == raw   # the packets of the original's s5
-    assert [t for _, _, t in hook.srt_blocks(raw.decode(), "\n")] == before["s5"]
+    assert open(sides["s5"], "rb").read() == raw and [t for _, _, t in hook.srt_blocks(raw.decode(), "\n")] == before["s5"]   # the packets of the original's s5
+    for p, tid, head in (("s6", 7, b"\xef\xbb\xbf[Script Info]"), ("s7", 8, b"\xef\xbb\xbfWEBVTT")):   # as mkvextract writes the original's track, header and all
+        REAL_RUN(["mkvextract", str(garbled_mkv / "f.mkv"), "tracks", "-q", f"{tid}:{tmp_path / p}"], check=True)
+        assert open(sides[p], "rb").read() == (tmp_path / p).read_bytes() and (tmp_path / p).read_bytes().startswith(head), p
+    assert open(sides["s7"], "rb").read().count(b" line:85%\n") == len(before["s7"])
     new = REAL_MKVMERGE(env["path"])
     assert [t["properties"]["default_track"] for t in new["tracks"][2:]] == [run == "no app"] + [False] * 3 and hook.cue_less(env["path"], new) == set()
-    assert [p["stream"] for p in rec["subremux"]["proof"] if p["method"] == "recoded text"] == ["s2", "s3", "s4"]   # by ffprobe index: s1 to s3
-    assert all(p["match"] for p in rec["subremux"]["proof"]) and lines == [("repaired", ["s1", "s2", "s3"]), ("stripped", None)], (rec["subremux"], lines)
-
-
-def test_a_latin_word_in_garbled_script_text_and_a_sign_after_a_digit_stay():
-    """A right Latin name in garbled Cyrillic, Greek or Hebrew keeps its letters, because a garbled word of those
-    scripts holds no ASCII letter. A Latin letter right after a digit stays, as the "º" of "40.5ºC" under a Romanian
-    tag, which cp1250 reads as "ş", unless a lowercase letter follows. A garbled word right after a digit still reads back
-    in a script language."""
-    d = hook.arr_decide
-    for cp, tag, word in (("cp1251", "rus", "Привет"), ("cp1253", "gre", "Καλημέρα"), ("cp1255", "heb", "שלום")):
-        bad = old_mux([word], cp)[0] + " Café, Noël, Señor."
-        assert d.read_back(bad, cp, tag)[0] == word + " Café, Noël, Señor.", (cp, d.read_back(bad, cp, tag))
-    bad = old_mux(["Afară sunt "], "cp1250")[0] + "40.5ºC, 360º " + old_mux(["şi vântul. Codul: 9876şase."], "cp1250")[0]
-    assert d.read_back(bad, "cp1250", "rum")[0] == "Afară sunt 40.5ºC, 360º şi vântul. Codul: 9876şase."   # a word joined to a number
-    assert d.read_back(old_mux(["Это 5кг."], "cp1251")[0], "cp1251", "rus")[0] == "Это 5кг."
-    assert d.read_back(old_mux(["Muszę usiąść na głębokim."], "cp1250")[0], "cp1250", "pol")[0] == "Muszę usiąść na głębokim."   # ą is ¹, ł is ³
+    assert [p["stream"] for p in rec["subremux"]["proof"] if p["method"] == "recoded text"] == ["s2", "s4"]   # by ffprobe index: s1 and s3
+    assert all(p["match"] for p in rec["subremux"]["proof"]) and lines == [], (rec["subremux"], lines)
+    told = [f for f in rec["findings"] if f["kind"] == "unreadable"]
+    assert len(told) == 1 and sorted(told[0]["tracks"]) == ["s2", "s5", "s6", "s7"], told
+    assert [(x["code"], x["tracks"]) for x in told[0]["repaired"]] == [("repaired", ["s1", "s3"])], told   # the one notice says the repairs too
+    assert "The Turkish subtitles (track 7 of the original file) can't be read as text, so they were removed and saved beside the file as " \
+        f"{os.path.basename(sides['s7'])}." in out, out
+    assert "The French subtitles (track 1) and the Polish subtitles (track 3) showed garbled characters. Replaced them with the same subtitles in " \
+        "readable characters. The original file is kept at" in out, out
 
 
 def test_a_cut_read_is_never_repaired_and_the_remux_refuses_what_the_check_never_read(monkeypatch):
@@ -18039,18 +18889,13 @@ def test_a_cut_read_is_never_repaired_and_the_remux_refuses_what_the_check_never
         fix(blocks(bad + old_mux(["Łódź."] * 10, "utf-8")))
 
 
-def test_the_bytes_of_a_garbled_track_never_overwrite_a_file_and_must_match_its_packets(tmp_path):
-    """keep_text() writes beside the video under the first free name and reads the copy back. packet_text() walks a
-    SubRip copy against the md5 of each packet, so a changed line break or a byte past the last cue fails."""
-    video, src = tmp_path / "Film.mkv", tmp_path / "t.srt"
-    video.write_bytes(b"")
-    (tmp_path / "Film.bul.garbled.txt").write_bytes(b"mine")
+def test_the_bytes_of_a_garbled_track_must_match_its_packets(tmp_path):
+    """packet_text() walks a SubRip copy against the md5 of each packet, so a changed line break or a byte past the last
+    cue fails. event_text() holds an ASS or WebVTT file of mkvextract to the packets: each event's fields after its
+    Layer, or each cue's payload, must be there byte for byte."""
+    src = tmp_path / "t.srt"
     body = "Ïðèâåò\r\nline two".encode()
     src.write_bytes(b"1\n00:00:01,000 --> 00:00:02,500\n" + body + b"\n\n")
-    got = [hook.keep_text(str(src), str(video), "bul", os.stat(video)) for _ in range(2)]
-    assert [os.path.basename(p) for p in got] == ["Film.bul.garbled.1.txt", "Film.bul.garbled.2.txt"] and hook.text_name(str(video), "bul") == \
-        str(tmp_path / "Film.bul.garbled.3.txt")
-    assert (tmp_path / "Film.bul.garbled.txt").read_bytes() == b"mine" and all(open(p, "rb").read() == src.read_bytes() for p in got)
     md5 = tmp_path / "t.md5"
     md5.write_text(f"#tb 0: 1/1000\n0,       1000,       1000,     1500,       {len(body)}, {hashlib.md5(body).hexdigest()}\n")
     assert hook.packet_text(str(src), str(md5)) is None
@@ -18061,6 +18906,23 @@ def test_the_bytes_of_a_garbled_track_never_overwrite_a_file_and_must_match_its_
     src.write_bytes(b"1\n00:00:01,000 --> 00:00:02,500\n" + body + b"\n\nx")
     assert hook.packet_text(str(src), str(md5)) == "1 bytes follow the last packet"
 
+    def packets(*bodies):
+        (tmp_path / "p.bin").write_bytes(b"".join(bodies))
+        (tmp_path / "p.md5").write_text("".join(f"0, {k}, {k}, 1, {len(x)}, {hashlib.md5(x).hexdigest()}\n" for k, x in enumerate(bodies)))
+        return str(tmp_path / "p.md5"), str(tmp_path / "p.bin")
+    ass = tmp_path / "t.ass"
+    ass.write_bytes(ASS_HEAD.encode() + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8}PÃ³Åºniej\nDialogue: 1,0:00:03.00,0:00:04.00,Default,,0,0,0,,Dwa  \n".encode())
+    assert hook.event_text(str(ass), *packets("0,0,Default,,0,0,0,,{\\an8}PÃ³Åºniej".encode(), b"1,1,Default,,0,0,0,,Dwa  \0"), "S_TEXT/ASS") is None
+    assert hook.event_text(str(ass), *packets("0,0,Default,,0,0,0,,{\\an8}PÃ³Åºniej".encode(), b"1,1,Default,,0,0,0,,Dwa"), "S_TEXT/ASS") \
+        == "the extracted text does not hold the bytes of each packet"
+    vtt = tmp_path / "t.vtt"
+    vtt.write_bytes("\ufeffWEBVTT\n\nNOTE made up\n\nc1\n00:00:01.000 --> 00:00:02.000 line:85%\nA\nB\n\n00:00:03.000 --> 00:00:04.000\nÃ³\n".encode())
+    assert hook.event_text(str(vtt), *packets(b"A\r\nB", "Ã³".encode()), "S_TEXT/WEBVTT") is None
+    assert hook.event_text(str(vtt), *packets(b"A\nB", "ó".encode()), "S_TEXT/WEBVTT") == "the extracted text does not hold the bytes of each packet"
+    md5_, raw = packets(b"A\nB")
+    open(raw, "ab").write(b"x")
+    assert hook.event_text(str(vtt), md5_, raw, "S_TEXT/WEBVTT") == "1 bytes follow the last packet"
+
 
 @pytest.fixture(scope="module")
 def garbled_av(tmp_path_factory):
@@ -18068,8 +18930,8 @@ def garbled_av(tmp_path_factory):
     if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
         pytest.skip("needs ffmpeg and mkvmerge")
     path = tmp_path_factory.mktemp("garbled") / "av.mp4"
-    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=400", "-f", "lavfi", "-i",
-              "sine=sample_rate=8000:duration=400", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(path)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=1:duration=400", "-f", "lavfi", "-i",
+                "sine=sample_rate=8000:duration=400", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(path)], check=True)
     return path
 
 
@@ -18099,16 +18961,17 @@ def garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, cp, lang
 
 
 def test_a_garbled_track_whose_words_do_not_match_is_repaired_and_judged_again(env, monkeypatch, settings, tmp_path, garbled_av):
-    """A Russian film whose Russian subtitles an old muxer garbled from cp1251. The word check hears the right words and
+    """An Arabic film whose Arabic subtitles an old muxer garbled from UTF-8. The word check hears the right words and
     finds none of them in the garbled cues. The track's verdict waits, so the repair runs and the track stays. The run
     stays pending in the cache, so the next run judges the readable text."""
-    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Russian"}
-    cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("rus", 2))]
-    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "rus", "rus")
-    env["movies"]["movie"][0]["originalLanguage"] = {"name": "Russian"}
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Arabic"}
+    pool = [t for t in scene("ara", 6) if not set(t.encode()) & set(hook.arr_decide.CP1252_HOLES)]   # no cue cut
+    cues = [(10 + 1.5 * i, 11.4 + 1.5 * i, t) for i, t in enumerate(pool)]
+    cache = garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "utf-8", "ara", "ara")
+    env["movies"]["movie"][0]["originalLanguage"] = {"name": "Arabic"}
     sub = hook.arr_subsync
-    heard = [{"at": at, "words": [[round(t - at, 2), w] for t, _, w, _ in sub.flat(cues) if at <= t < at + sub.WINDOW]} for at in (40.0, 180.0)]
-    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, *a, **k: {key: dict(sub.check(heard, c, lang, 400.0), audio=idx, starts=[40.0, 180.0])
+    heard = [{"at": at, "words": [[round(t - at, 2), w] for t, _, w, _ in sub.flat(cues) if at <= t < at + sub.WINDOW]} for at in (40.0, 100.0)]
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, *a, **k: {key: dict(sub.check(heard, c, lang, 400.0), audio=idx, starts=[40.0, 100.0])
                                                                                for key, (lang, idx, c) in items.items()})
     hook.main(["--sub-time", env["path"], "--apply"])
     rec = last_decided(env)
@@ -18183,7 +19046,7 @@ def test_a_garbled_track_read_only_in_part_only_alerts(env, monkeypatch, setting
     rec = last_decided(env)
     lines = [(x["code"], x.get("tracks")) for f in rec["findings"] if f["kind"] == "submatch" for x in f["lines"]]
     assert rec["garbled"]["s1"]["capped"] and not rec["garbled"]["s1"]["repair"] and "subremux" not in rec and lines == [("garbled", ["s1"])], rec
-    assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"} and not os.path.exists(env["path"][:-4] + ".bul.garbled.txt")
+    assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"} and not os.path.exists(env["path"][:-4] + f".bul{hook.BROKEN_SIDECAR}")
 
 
 @pytest.mark.parametrize("kind", ["garbled", "flash"])
@@ -18218,17 +19081,719 @@ def test_a_cut_whole_file_read_stays_cut_when_a_deep_analysis_resumes(env, monke
 
 def test_a_garbled_track_that_flashes_and_cannot_be_repaired_is_taken_out(env, monkeypatch, settings, tmp_path, garbled_av):
     """Its cues show 0.4 s each, so the flash check plans new ends. The track leaves the file instead, and its bytes go
-    beside the video. A second track the same way and tag takes the next free name."""
+    beside the video. A file of other bytes holds the first name, so the name takes the track's number."""
     cues = [(10 + 2.0 * i, 10.4 + 2.0 * i, t) for i, t in enumerate(scene("rus", 2))]
     garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1251", "bul")
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
-    open(env["path"][:-4] + ".bul.garbled.txt", "w").close()
+    open(env["path"][:-4] + f".bul{hook.BROKEN_SIDECAR}", "w").close()
     hook.main(["--sub-time", env["path"], "--apply"])
     rec = last_decided(env)
-    name = os.path.basename(env["path"][:-4]) + ".bul.garbled.1.txt"
+    name = os.path.basename(env["path"][:-4]) + f".bul.1{hook.BROKEN_SIDECAR}"
     assert (rec["subremux"]["codes"], rec["subremux"]["stripped"], rec["subremux"]["ended"]) == (["subtitle_garbled_removed"], {"s1": name}, []), rec["subremux"]
-    assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {} and os.path.getsize(env["path"][:-4] + ".bul.garbled.txt") == 0
+    assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {} and os.path.getsize(env["path"][:-4] + f".bul{hook.BROKEN_SIDECAR}") == 0
     assert [t for _, _, t in hook.srt_blocks(open(os.path.join(os.path.dirname(env["path"]), name), encoding="utf-8").read(), "\n")] == old_mux(scene("rus", 2), "cp1251")
+
+
+# The shapes of garbled text the owner's rule tells apart (2026-10-16), each as (texts, the codepage the old muxer read as
+# cp1252, the tag). pol_lost is Polish from cp1250 with a lost byte: Ź is 0x8F, which cp1252 leaves undefined, so the
+# muxer cut the cue there. per is Persian from cp1256, which loses پ, چ and گ the same way. utf8 is Polish from UTF-8.
+# fre is French in its right encoding.
+SHAPES = {"pol_lost": (lambda: scene("pol", 2) + ["Źle się czuję, wiesz?"], "cp1250", "pol"),
+          "per": (lambda: [t.replace("ی", "ي").replace("ک", "ك") for t in scene("per", 6)], "cp1256", "per"),   # as cp1256 writes Persian
+          "utf8": (lambda: [t for t in scene("pol", 2) if not set(t.encode()) & set(hook.arr_decide.CP1252_HOLES)], "utf-8", "pol"),
+          "fre": (lambda: scene("fre", 2), "cp1252", "fre")}
+
+
+@pytest.mark.parametrize("kind, want", [("pol_lost", "removed"), ("per", "removed"), ("utf8", "repaired"), ("fre", None)])
+def test_each_shape_of_a_garbled_track(env, monkeypatch, settings, tmp_path, garbled_av, kind, want):
+    """A track that reads right only in a one-byte codepage leaves the file, and its packets go beside the video byte
+    for byte. A track of UTF-8 read as cp1252 is repaired. A right track stays as it is."""
+    texts, cp, tag = SHAPES[kind][0](), SHAPES[kind][1], SHAPES[kind][2]
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(texts)], cp, tag)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    raw = REAL_RUN(["ffmpeg", "-v", "error", "-i", env["path"], "-map", "0:2", "-c", "copy", "-f", "srt", "-"], capture_output=True).stdout
+    shutil.copy(env["path"], tmp_path / "orig.mkv")
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec, side = last_decided(env), env["path"][:-4] + f".{tag}{hook.BROKEN_SIDECAR}"
+    codes = (rec.get("subremux") or {}).get("codes")
+    if want is None:
+        assert "garbled" not in rec and codes is None and not os.path.exists(side), rec.get("garbled")
+    elif want == "repaired":
+        got = [t for _, _, t in REAL_SUBTITLE_CUES(env["path"], REAL_MKVMERGE(env["path"]), {"s1"}, True)["s1"]]
+        assert (rec["garbled"]["s1"]["codepage"], codes, got) == ("utf-8", ["subtitle_repaired"], texts) and not os.path.exists(side), codes
+    else:
+        assert (rec["garbled"]["s1"]["codepage"], rec["garbled"]["s1"]["repair"], codes) == (cp, False, ["subtitle_garbled_removed"]), rec["garbled"]
+        assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {} and open(side, "rb").read() == raw
+        f = next(f for f in rec["findings"] if f["kind"] == "unreadable")
+        assert hook.unmarked(hook.texts(f, "done", hook.track_langs(rec, after=True))[0]).startswith(
+            f"The {hook.arr_decide.lang_name(tag)} subtitles (track 1 of the original file) can't be read as text, so they were removed"), f
+        os.replace(tmp_path / "orig.mkv", env["path"])   # the original comes back, as from the kept originals, and is checked again
+        hook.main(["--sub-time", env["path"], "--apply"])
+        again = last_decided(env)["subremux"]
+        assert (again["codes"], again["stripped"]) == (["subtitle_garbled_removed"], {"s1": os.path.basename(side)}) and open(side, "rb").read() == raw
+
+
+def garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, name, film="eng"):
+    """garbled_run() with a right English track and audio tagged film, and the sidecar name beside the file holding the
+    bytes raw."""
+    cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(scene("eng", 2))]
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1252", "eng", film)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    path = os.path.join(os.path.dirname(env["path"]), name)
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path
+
+
+@pytest.mark.parametrize("kind, want", [("pol_lost", "renamed"), ("per", "renamed"), ("utf8", "repaired"), ("fre", None), ("cp1250", None)])
+def test_each_shape_of_a_garbled_sidecar(env, monkeypatch, settings, tmp_path, garbled_av, kind, want):
+    """A UTF-8 .srt sidecar whose text reads right only in another codepage is renamed with its bytes as they are. One
+    of UTF-8 read as cp1252 is repaired as a track is: only the text of its cues changes, and its original is kept. A
+    right sidecar stays, and so does one in a codepage of its own, which a conversion reads in that codepage. One
+    notice names the new file of a rename, and one sentence the repair."""
+    texts, cp, tag = SHAPES["pol_lost" if kind == "cp1250" else kind][0](), SHAPES.get(kind, (0, "cp1250"))[1], SHAPES.get(kind, (0, 0, "pol"))[2]
+    raw = scene_srt(texts).encode("cp1250") if kind == "cp1250" else scene_srt(texts if kind == "fre" else old_mux(texts, cp)).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + f".{tag}.srt")
+    to = path[:-4] + hook.BROKEN_SIDECAR
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    acts = [(e["name"], e["action"], e["result"], e.get("to")) for e in rec.get("sidecars") or []]
+    if not want:
+        assert open(path, "rb").read() == raw and not os.path.exists(to) and acts == [], acts
+        return
+    if want == "repaired":
+        (e,) = rec["sidecars"]
+        assert open(path, "rb").read() == scene_srt(texts).encode() and open(e["kept"], "rb").read() == raw and not os.path.exists(to), acts
+        assert acts == [(os.path.basename(path), "repair", "repaired", None)] and hook.sub_found(rec)["garbled_repair"] == ["fix"]
+        lines = [x for f in rec["findings"] if f["kind"] == "submatch" for x in f["lines"]]
+        assert "unreadable" not in rec["alert_kinds"] and hook.unmarked(hook.sub_line(lines[0], "done", hook.track_langs(rec, after=True))) == (
+            f"The subtitles in {os.path.basename(path)} showed garbled characters. Replaced them with the same subtitles in readable characters "
+            f"and kept the original file at {e['kept']}."), lines
+        return
+    assert not os.path.exists(path) and open(to, "rb").read() == raw and acts == [(os.path.basename(path), "rename", "renamed", os.path.basename(to))], acts
+    f = next(f for f in rec["findings"] if f["kind"] == "unreadable")
+    assert hook.unmarked(hook.texts(f, "done", hook.track_langs(rec, after=True))[0]) == \
+        f"The subtitles in {os.path.basename(path)} can't be read as text, so the file was renamed to {os.path.basename(to)}.", f
+    assert hook.sub_found(rec)["garbled_repair"] == ["unfixable"]
+
+
+def test_a_garbled_sidecar_never_writes_over_a_file_and_a_rerun_finds_it(env, monkeypatch, settings, tmp_path, garbled_av, capsys):
+    """A dry run names the new file and writes nothing. A file of other bytes holds the first name, so the rename takes
+    a number. A .garbled.txt file of an older run and the new file stay out of every sidecar scan. Bazarr fetches the
+    same bytes again: the file that holds them stays, and the new sidecar goes. A rerun then finds nothing to do. At
+    SUBTITLES check the sidecar stays, and the alert says why."""
+    texts, cp, tag = SHAPES["pol_lost"][0](), "cp1250", "pol"
+    raw = scene_srt(old_mux(texts, cp)).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt")
+    mine, old, to = path[:-4] + hook.BROKEN_SIDECAR, env["path"][:-4] + ".pol.garbled.txt", path[:-4] + ".1" + hook.BROKEN_SIDECAR
+    for n, data in ((mine, b"mine"), (old, raw)):
+        with open(n, "wb") as f:
+            f.write(data)
+    folder = os.path.dirname(path)
+    listing = lambda: {n: open(os.path.join(folder, n), "rb").read() for n in os.listdir(folder) if not n.endswith(".mkv")}
+    before = listing()
+    hook.main(["--sub-time", env["path"]])
+    assert listing() == before and f"--apply would rename the file to {os.path.basename(to)}." in capsys.readouterr().out
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    assert [(e["result"], e["to"], e["reused"]) for e in rec["sidecars"]] == [("renamed", os.path.basename(to), False)]
+    assert listing() == {os.path.basename(mine): b"mine", os.path.basename(old): raw, os.path.basename(to): raw}, sorted(listing())
+    with open(path, "wb") as f:   # Bazarr fetches the same bytes again
+        f.write(raw)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    assert [(e["result"], e["reused"]) for e in last_decided(env)["sidecars"]] == [("renamed", True)] and not os.path.exists(path)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    assert "sidecars" not in last_decided(env) and listing() == {os.path.basename(mine): b"mine", os.path.basename(old): raw, os.path.basename(to): raw}
+    with open(path, "wb") as f:
+        f.write(raw)
+    monkeypatch.setattr(hook, "sub_fixes", lambda source: False)
+    capsys.readouterr()
+    with pytest.raises(SystemExit):   # --sub-time --apply says it did not make every change
+        hook.main(["--sub-time", env["path"], "--apply"])
+    assert open(path, "rb").read() == raw and [e["result"] for e in last_decided(env)["sidecars"]] == ["left"]
+    assert f"The subtitles in {os.path.basename(path)} show garbled characters. AMG didn't rename the file, because SUBTITLES is set to " \
+        "check." in capsys.readouterr().out
+
+
+def double_encoded(texts):
+    """texts as a tool wrote UTF-8 text it read as cp1252, the bytes cp1252 leaves undefined as the control characters
+    of their values, as Windows reads them."""
+    return ["".join(chr(b) if b in hook.arr_decide.CP1252_HOLES else bytes([b]).decode("cp1252") for b in t.encode()) for t in texts]
+
+
+FRE_SIDE = [t for t in scene("fre", 2)]   # French dialogue, garbled as double_encoded() gives it
+
+
+@pytest.mark.parametrize("verdict", ["mismatch", "late"])
+def test_a_repaired_sidecar_holds_its_word_check_and_its_times_for_a_later_run(env, monkeypatch, settings, tmp_path, garbled_av, verdict):
+    """A French film whose French sidecar a tool wrote in UTF-8 read as cp1252. The word check of the garbled text finds
+    a mismatch, or a match 2 s late. As for a track, the verdict waits, the times stay, and the repair runs. The run stays
+    pending, so the next run judges the readable text: it moves the sidecar to the kept originals, or retimes it."""
+    raw = scene_srt(double_encoded(FRE_SIDE)).encode()
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "French"}
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".fr.srt", "fre")
+    env["movies"]["movie"][0]["originalLanguage"] = {"name": "French"}
+    name, cache = os.path.basename(path), {}
+    monkeypatch.setattr(hook.arr_lid, "verdict_put", lambda db, p, result, pending: cache.update({p: pending}))
+    said = {"mismatch": {"verdict": "mismatch", "why": "5%", "timing": None},
+            "late": {"verdict": "match", "why": "90%", "windows": [{"at": a, "words": 20, "overlap": 0.9, "offset": 2.0, "cues": 6, "late": 2.0} for a in (60.0, 180.0)],
+                     "timing": {"fix": {"rate": "1/1", "offset": 2.0}, "why": "fit"}}}[verdict]
+    monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, *a, **k: {key: dict(said, audio=0, starts=[]) for key in items})
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    rec = last_decided(env)
+    (e,) = rec["sidecars"]
+    assert (e["action"], e["result"], e.get("later"), cache[env["path"]]) == ("repair", "repaired", True, True), e
+    assert open(path, "rb").read() == scene_srt(FRE_SIDE).encode() and open(e["kept"], "rb").read() == raw
+    assert rec["subcheck"][name]["verdict"] == ("unknown" if verdict == "mismatch" else "match") and rec["subjudge"][name]["state"] == "unknown", rec
+    assert "subtiming" not in rec["alert_kinds"], rec["alert_kinds"]   # its times wait
+    shutil.rmtree(tmp_path / ".kept")   # the next keep of the sidecar falls in the same second
+    hook.main(["--backfill", "radarr", "--sub-check", "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["action"], e["result"], cache[env["path"]]) == (("move", "moved") if verdict == "mismatch" else ("retime", "retimed")) + (False,), e
+    assert verdict == "mismatch" or [c[0] for c in hook.srt_cues(open(path, encoding="utf-8").read())] == \
+        [max(0, c[0] - 2000) for c in hook.srt_cues(scene_srt(FRE_SIDE))]
+
+
+def tagged_srt(texts):
+    """scene_srt() of texts with each cue in italics and the first one raised, with a BOM and CRLF line breaks."""
+    return "﻿" + scene_srt([("{\\an8}" if k == 0 else "") + f"<i>{t}</i>" for k, t in enumerate(texts)]).replace("\n", "\r\n")
+
+
+# The hostile shapes of a garbled sidecar, each as (its text, the text a repair gives or None, the words of why it is
+# renamed, or None when it stays as it is). Czech "č" is C4 8D in UTF-8, and cp1252 leaves 8D undefined. lost_end:
+# the tool cut each such cue there, as an old muxer did. lost_mid: it dropped the byte. tags: tags, a BOM and CRLF.
+# continued: a cue goes on after a blank line, as mkvmerge reads one, and the rewrite of the cues leaves that part
+# garbled, so the proof of the new file fails.
+CZE = [t for t in scene("cze", 2)]
+SIDE_SHAPES = {
+    "lost_end": lambda: (scene_srt(old_mux(CZE, "utf-8")), None, "cues were cut short"),
+    "lost_mid": lambda: (scene_srt([bytes(b for b in t.encode() if b not in hook.arr_decide.CP1252_HOLES).decode("cp1252") for t in CZE]), None, None),
+    "tags": lambda: (tagged_srt(double_encoded(FRE_SIDE)), tagged_srt(FRE_SIDE), None),
+    "continued": lambda: (scene_srt(double_encoded(FRE_SIDE)).replace("\n\n2\n", "\n\n" + double_encoded(["Très bien."])[0] + "\n\n2\n", 1), None,
+                          "the new file does not hold each cue at its times with its repaired text")}
+
+
+@pytest.mark.parametrize("shape", sorted(SIDE_SHAPES))
+def test_a_garbled_sidecar_of_each_hostile_shape(env, monkeypatch, settings, tmp_path, garbled_av, capsys, shape):
+    """A sidecar a repair cannot prove is renamed with its bytes as they are, whether the proof fails at the check or
+    at the write. A lost byte inside a cue leaves no reading, so the sidecar stays as it is. A repair keeps the tags,
+    the BOM and the line breaks. A dry run writes nothing and says what --apply would do, as far as the check knows."""
+    text, fixed, why = SIDE_SHAPES[shape]()
+    raw = text.encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + (".fre.srt" if fixed or shape == "continued" else ".cze.srt"))
+    to = path[:-4] + hook.BROKEN_SIDECAR
+    hook.main(["--sub-time", env["path"]])
+    assert open(path, "rb").read() == raw and not os.path.exists(to)
+    out = capsys.readouterr().out
+    assert ("--apply would replace them" in out) == (bool(fixed) or shape == "continued") and ("--apply would rename" in out) == (shape == "lost_end"), out
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    acts = [(e["action"], e["result"]) for e in rec.get("sidecars") or []]
+    if fixed:
+        assert acts == [("repair", "repaired")] and open(path, "rb").read() == fixed.encode(), acts
+    elif why:
+        assert acts == [("rename", "renamed")] and open(to, "rb").read() == raw and not os.path.exists(path) and why in rec["sidecars"][0]["why"], rec["sidecars"]
+        assert [f["kind"] for f in rec["findings"]].count("unreadable") == 1
+    else:
+        assert acts == [] and open(path, "rb").read() == raw and "unreadable" not in rec["alert_kinds"], acts
+
+
+def test_a_move_takes_the_place_of_a_sidecar_repair(env, monkeypatch, settings, tmp_path, garbled_av):
+    """A Polish sidecar of UTF-8 read as cp1252, beside an English film. The speech layout finds that its lines do not
+    line up with the speech, which garbled text does not change. The sidecar moves to the kept originals as it is, as a
+    removal takes out a garbled track, and no repair runs."""
+    texts = SHAPES["utf8"][0]()
+    raw = scene_srt(double_encoded(texts)).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt")
+    name, off = os.path.basename(path), {"verdict": "mismatch", "why": "its lines do not line up with the speech", "timing": None}
+    monkeypatch.setattr(hook, "sub_layout", lambda *a, **k: ({name: dict(off, layout=dict(off))}, {}))
+    hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["action"], e["result"]) == ("move", "moved") and open(e["kept"], "rb").read() == raw and not os.path.exists(path), e
+
+
+def test_one_run_repairs_one_garbled_sidecar_and_renames_another(env, monkeypatch, settings, tmp_path, garbled_av):
+    """A Czech sidecar cut at each lost byte and a French sidecar of UTF-8 read as cp1252. The Czech one is renamed and
+    keeps no original, the French one is repaired and keeps one. One notice names the new file and the repair."""
+    stem = os.path.basename(env["path"][:-4])
+    cze = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, scene_srt(old_mux(CZE, "utf-8")).encode(), stem + ".cze.srt")
+    fre = os.path.join(os.path.dirname(cze), stem + ".fre.srt")
+    with open(fre, "wb") as f:
+        f.write(scene_srt(double_encoded(FRE_SIDE)).encode())
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    assert [(e["name"], e["action"], e["result"]) for e in rec["sidecars"]] == [(stem + ".cze.srt", "rename", "renamed"), (stem + ".fre.srt", "repair", "repaired")]
+    assert open(fre, "rb").read() == scene_srt(FRE_SIDE).encode() and os.path.exists(cze[:-4] + hook.BROKEN_SIDECAR)
+    lines = [x["code"] for f in rec["findings"] if f["kind"] == "submatch" for x in f["lines"]]
+    (f,) = [f for f in rec["findings"] if f["kind"] == "unreadable"]
+    assert lines == [] and [(x["code"], x["tracks"]) for x in f["repaired"]] == [("repaired", [stem + ".fre.srt"])], (rec["alert_kinds"], lines)
+
+
+@pytest.mark.parametrize("step", ["replaced", "check"])
+def test_a_sidecar_repair_never_writes_over_a_new_download_or_at_subtitles_check(env, monkeypatch, settings, tmp_path, garbled_av, capsys, step):
+    """Bazarr writes a new sidecar between the check and the repair: it stays as Bazarr wrote it, and nothing is kept
+    or renamed. At SUBTITLES check the sidecar stays, and the alert says why. A dry run says what --apply would do."""
+    raw = scene_srt(double_encoded(FRE_SIDE)).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".fr.srt")
+    name = os.path.basename(path)
+    hook.main(["--sub-time", env["path"]])
+    assert f"The subtitles in {name} show garbled characters. --apply would replace them with the same subtitles in readable characters." \
+        in capsys.readouterr().out
+    if step == "replaced":
+        real = hook.sidecar_fix
+        monkeypatch.setattr(hook, "sidecar_fix", lambda sides, *a, **k: open(path, "wb").write(b"Bazarr") and real(sides, *a, **k))
+    else:
+        monkeypatch.setattr(hook, "sub_fixes", lambda source: False)
+    with pytest.raises(SystemExit):   # --sub-time --apply says it did not make every change
+        hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    left = "it changed since the check" if step == "replaced" else "SUBTITLES is set to check"
+    assert (e["action"], e["result"], e["left"], e.get("kept")) == ("repair", "left", left, None), e
+    assert open(path, "rb").read() == (b"Bazarr" if step == "replaced" else raw) and not os.path.exists(path[:-4] + hook.BROKEN_SIDECAR)
+    assert f"The subtitles in {name} show garbled characters. AMG didn't repair them, because {left}." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("level", ["issues", "all"])
+def test_a_deep_analysis_posts_one_notice_for_the_subtitles_it_took_out(env, monkeypatch, settings, tmp_path, garbled_av, level):
+    """The deep analysis renames a garbled sidecar. It alerts on the subtitles only, and the notice of the new file is
+    one of them, with DISCORD_POSTS issues and all."""
+    texts = SHAPES["pol_lost"][0]()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, scene_srt(old_mux(texts, "cp1250")).encode(),
+                        os.path.basename(env["path"][:-4]) + ".pol.srt")
+    settings(subtitles="deep", discord_posts=level)
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = last_decided(env)
+    titles = [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
+    assert [e["result"] for e in rec["sidecars"]] == ["renamed"] and titles.count("Unreadable subtitles") == 1, (rec["alert_kinds"], titles)
+    assert not os.path.exists(path)
+
+
+@pytest.mark.parametrize("level", ["issues", "all"])
+def test_a_run_that_converts_and_takes_out_garbled_subtitles_posts_one_notice(env, monkeypatch, settings, tmp_path, garbled_av, level):
+    """A .mkv that holds MP4, with a Polish track an old tool garbled from cp1250. The deep analysis converts it, and its
+    conversion takes out a broken track. Then the garbled track leaves the new file. One notice names the conversion,
+    both tracks and both files, with DISCORD_POSTS issues and all. With all, no second post says it was converted."""
+    texts = SHAPES["pol_lost"][0]()
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, "x") for i in range(3)], "utf-8", "eng")
+    srt = tmp_path / "src" / "pol.srt"
+    srt.write_text(srt_text([(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(old_mux(texts, "cp1250"))]), encoding="utf-8")
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(garbled_av), "-i", str(srt), "-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+              "-metadata:s:s:0", "language=pol", "-f", "mp4", env["path"]], check=True)
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    took_out(monkeypatch, env["path"])
+    settings(discord_posts=level, subtitles="deep")
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = last_decided(env)
+    titles = [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
+    assert "repacked" in rec["reasons"] and rec["subremux"]["codes"] == ["subtitle_garbled_removed"], (rec["result"], rec.get("subremux"))
+    assert titles.count("Unreadable subtitles") == 1 and "Converted to MKV" not in titles, titles
+    (f,) = [f for f in rec["findings"] if f["kind"] == "unreadable"]
+    said = hook.unmarked(hook.texts(f, "done", hook.track_langs(rec, after=True))[0])
+    assert said.startswith("Converted the MP4/QuickTime file to MKV. The Persian subtitles (track 1 of the original file) can't be read as text") and \
+        "The Polish subtitles (track 1 of the converted file) can't be read as text, so they were removed and saved beside the file as " \
+        f"{os.path.basename(env['path'][:-4])}.pol{hook.BROKEN_SIDECAR}." in said, said
+
+
+# Right English dialogue whose only letters outside ASCII are names at the end of a cue, as a forced track or a short
+# film can hold. Read as cp1252, each such cue ends in a UTF-8 lead byte, so a UTF-8 read-back cuts it there.
+NAMES_AT_ENDS = ["Where are you going tonight, my friend?", "I am going to the market with José", "He said he would meet us at the station",
+                 "Are you sure about that, André", "We need to talk about what happened yesterday", "I know, but it was not my fault, Chloé",
+                 "Then whose fault was it, tell me now", "Nobody knows the answer to that question", "Let us go home before it starts to rain",
+                 "Good night and sleep well, René", "Tomorrow we will see what the weather brings", "The train leaves at seven, José",
+                 "Do not forget your coat and your umbrella", "I will call you when I get there, José"]
+
+
+@pytest.mark.parametrize("name", [".en.srt", ".srt"])
+def test_a_right_sidecar_with_names_at_cue_ends_stays(env, monkeypatch, settings, tmp_path, garbled_av, name):
+    """A right UTF-8 English sidecar, named or not, whose only letters outside ASCII end its cues. Its UTF-8 read-back
+    cuts each of those cues and decodes no character whole, so the text is not garbled, and the sidecar stays."""
+    raw = scene_srt(NAMES_AT_ENDS * 2).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + name)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    assert open(path, "rb").read() == raw and "sidecars" not in last_decided(env), last_decided(env).get("sidecars")
+
+
+def test_a_right_track_with_names_at_cue_ends_stays(env, monkeypatch, settings, tmp_path, garbled_av):
+    """The same right English dialogue as a SubRip track: cp1252 bytes muxed as cp1252 give right UTF-8. The track is
+    not garbled, so it stays in the file as it is."""
+    cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(NAMES_AT_ENDS * 2)]
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1252", "eng")
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    assert [t for _, _, t in REAL_SUBTITLE_CUES(env["path"], REAL_MKVMERGE(env["path"]), {"s1"}, True)["s1"]] == NAMES_AT_ENDS * 2
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    assert "garbled" not in rec and hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"}, rec.get("garbled")
+
+
+# Right text that reads as no language, with the same names at cue ends: English mixed with Spanish, and Indonesian,
+# which has no word list.
+MIXED_AT_ENDS = ["Where are you going tonight, José", "Vamos a la playa con mis amigos", "I do not know what to say to you",
+                 "Tengo que trabajar temprano", "Come with me, we have to go now", "No quiero ir contigo, André",
+                 "Then tell me what you want from me", "Quiero que me digas la verdad, Chloé", "I told you everything I know",
+                 "Eso no es verdad y lo sabes bien, René", "Please, just listen to me for once", "Te llamo cuando llegue a casa, José"]
+IND_AT_ENDS = ["Kamu mau pergi ke mana malam ini, José", "Aku akan pergi ke pasar dengan teman", "Apakah kamu yakin tentang itu, André",
+               "Kita harus bicara tentang apa yang terjadi kemarin", "Aku tahu, tapi itu bukan salahku, Chloé",
+               "Lalu salah siapa, katakan padaku sekarang", "Tidak ada yang tahu jawaban pertanyaan itu", "Ayo pulang sebelum hujan turun, René",
+               "Besok kita lihat cuacanya bagaimana", "Kereta berangkat jam tujuh pagi, José", "Jangan lupa jaket dan payungmu",
+               "Aku akan menelepon saat sampai di sana, José"]
+
+
+@pytest.mark.parametrize("lines, name", [(MIXED_AT_ENDS, ".srt"), (IND_AT_ENDS, ".srt"), (IND_AT_ENDS, ".id.srt")])
+def test_a_right_sidecar_of_no_language_with_names_at_cue_ends_stays(env, monkeypatch, settings, tmp_path, garbled_av, lines, name):
+    """A right UTF-8 sidecar whose text reads as no language, and whose only letters outside ASCII end its cues. Its
+    UTF-8 read-back cuts those cues after a letter and decodes no character whole, so the sidecar stays."""
+    raw = scene_srt(lines * 2).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + name)
+    hook.main(["--sub-time", env["path"], "--apply"])
+    assert open(path, "rb").read() == raw and "sidecars" not in last_decided(env), last_decided(env).get("sidecars")
+
+
+def test_a_right_indonesian_track_with_names_at_cue_ends_stays(env, monkeypatch, settings, tmp_path, garbled_av):
+    """The Indonesian dialogue as a SubRip track tagged ind. Its text reads as no language, and the track stays."""
+    cues = [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(IND_AT_ENDS * 2)]
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, cues, "cp1252", "ind")
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    assert "garbled" not in rec and hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"}, rec.get("garbled")
+
+
+def test_right_text_with_one_cut_cue_of_no_letter_is_not_garbled():
+    """One cut cue holds no letter before its cut. The other cut cues hold one, so the text is still right."""
+    assert hook.arr_decide.garbled(IND_AT_ENDS * 2 + ["- É"], "ind") is None
+
+
+@pytest.mark.parametrize("lead, extra", [("", []), ("- ", []), ("", ["Subtitles by Nobody"])])
+def test_a_track_whose_every_cue_was_cut_in_its_first_character_is_taken_out(lead, extra):
+    """A Hebrew track whose every cue starts with a right-to-left mark, cut by the muxer inside that mark. A dash can
+    come before the mark, and a credit cue of plain ASCII can follow. Its UTF-8 read-back decodes no character whole.
+    Its text reads as no language, and no cut cue holds a letter before its cut, so the UTF-8 reading still counts."""
+    d = hook.arr_decide
+    heb = scene("heb", 10)
+    bad = old_mux([lead + chr(0x200F) + t for t in heb], "utf-8") + extra
+    assert d.text_language(bad)[0] is None
+    g = d.garbled(bad, "heb")
+    assert (g["repair"], g["codepage"], g["cut"]) == (False, "utf-8", len(heb)), g
+
+
+NO_CHMOD, NO_LINK = PermissionError(1, "Operation not permitted"), PermissionError(1, "Operation not permitted")
+
+
+def refuse(monkeypatch, chmod=(), link=False):
+    """A share that refuses chmod on each new file whose name ends in one of chmod, and with link a hard link to a file
+    of removed subtitle bytes, as a tester's share did (2026-10-14)."""
+    real_chmod, real_link = os.chmod, os.link
+    monkeypatch.setattr(os, "chmod", lambda p, m, **kw: (_ for _ in ()).throw(NO_CHMOD) if chmod and str(p).endswith(chmod) else real_chmod(p, m, **kw))
+    monkeypatch.setattr(os, "link", lambda a, b, **kw: (_ for _ in ()).throw(NO_LINK) if link and str(b).endswith(".txt") else real_link(a, b, **kw))
+
+
+@pytest.mark.parametrize("when", ["link", "in place", "copy", "before"])
+def test_a_sidecar_bazarr_writes_during_a_rename_stays(env, monkeypatch, settings, tmp_path, garbled_av, when):
+    """Bazarr replaces a garbled Polish sidecar while AMG moves its bytes to the new name: right after the hard link,
+    in the same file just before the link, during the copy on a share that refuses hard links, or on that share before
+    the move starts. Bazarr's sidecar stays, the new name goes, and the alert says the sidecar changed since the
+    check."""
+    raw = scene_srt(old_mux(SHAPES["pol_lost"][0](), "cp1250")).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt")
+    theirs = b"1\n00:00:10,000 --> 00:00:12,500\nBazarr\n\n"
+
+    def bazarr():
+        with open(path + ".part", "wb") as f:
+            f.write(theirs)
+        os.replace(path + ".part", path)   # Bazarr writes its new download in place
+    refuse(monkeypatch, link=when in ("copy", "before"))
+    real_link, real_own, real_side = os.link, hook.own_like, hook.broken_side
+
+    def link(a, b, **kw):
+        if str(b).endswith(".txt") and when == "in place":
+            with open(path, "wb") as f:   # Bazarr writes the same file again
+                f.write(theirs)
+        out = real_link(a, b, **kw)
+        if str(b).endswith(".txt") and when == "link":
+            bazarr()
+        return out
+    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(hook, "own_like", lambda p, st: (bazarr() if when == "copy" and p.endswith(hook.BROKEN_SIDECAR) else None, real_own(p, st))[1])
+    monkeypatch.setattr(hook, "broken_side", lambda s, *a: (bazarr() if when == "before" else None, real_side(s, *a))[1])
+    with pytest.raises(SystemExit):   # --sub-time --apply says it did not make every change
+        hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["result"], e["left"]) == ("left", "it changed since the check") and open(path, "rb").read() == theirs, e
+    assert not os.path.exists(path[:-4] + hook.BROKEN_SIDECAR)
+
+
+def test_a_rename_whose_new_file_fails_keeps_the_sidecar(env, monkeypatch, settings, tmp_path, garbled_av, capsys):
+    """A share that refuses hard links, and a copy that does not read back. The sidecar stays with its bytes, the copy
+    goes, and the alert says it in plain words. The decision log keeps the error."""
+    raw = scene_srt(old_mux(SHAPES["pol_lost"][0](), "cp1250")).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt")
+    refuse(monkeypatch, link=True)
+    real = hook.own_like
+    monkeypatch.setattr(hook, "own_like", lambda p, st: (open(p, "ab").write(b"x"), real(p, st))[1])   # the share lost the write
+    with pytest.raises(SystemExit):
+        hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["result"], e["left"]) == ("left", "the new file couldn't be written") and "does not hold the bytes" in e["error"], e
+    assert open(path, "rb").read() == raw and not os.path.exists(path[:-4] + hook.BROKEN_SIDECAR)
+    assert "AMG didn't rename the file, because the new file couldn't be written." in capsys.readouterr().out
+
+
+def test_an_untagged_double_encoded_sidecar_is_repaired(env, monkeypatch, settings, tmp_path, garbled_av):
+    """Movie.srt, French text a tool wrote in UTF-8 read as cp1252. The UTF-8 read-back reads as French, so the sidecar
+    takes French as its tag, and the repair checks itself as for Movie.fr.srt. The file keeps its name."""
+    raw = scene_srt(double_encoded(FRE_SIDE)).encode()
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "French"}
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".srt", "fre")
+    hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["action"], e["result"], e["garbled"]["lang"]) == ("repair", "repaired", "fre"), e
+    assert open(path, "rb").read() == scene_srt(FRE_SIDE).encode() and open(e["kept"], "rb").read() == raw
+
+
+def test_a_sidecar_repair_may_leave_no_cue_cut(env, monkeypatch, settings, tmp_path, garbled_av, capsys):
+    """French text a tool wrote in UTF-8 read as cp1252, with two right cues that end in "é". A UTF-8 read-back cuts
+    those two cues and would write U+FFFD over the right letter. No muxer cuts a sidecar, so the check renames it, and
+    the write refuses such a repair too. Under 2 percent of the cues are cut, which a track's repair takes."""
+    texts = double_encoded(scene("fre", 3)) + ["Il est né", "Un café"]
+    raw = scene_srt(texts).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".fr.srt", "fre")
+    hook.main(["--sub-time", env["path"]])
+    assert "--apply would rename the file" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="2 of .* cues were cut short"):
+        hook.side_repair({"path": path, "broken": {"data": raw}, "garbled": {"codepage": "utf-8", "tag": "fre"}})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["action"], e["result"]) == ("rename", "renamed") and "2 of" in e["why"] and "cues were cut short" in e["why"], e
+    assert open(path[:-4] + hook.BROKEN_SIDECAR, "rb").read() == raw
+
+
+def test_a_sidecar_repair_keeps_the_line_ending_of_each_line(env, monkeypatch, settings, tmp_path, garbled_av):
+    """A garbled French sidecar with CRLF line breaks in its first cue only. The repair keeps the line ending of each
+    line."""
+    text = scene_srt(double_encoded(FRE_SIDE))
+    head, rest = text.split("\n\n", 1)
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, (head.replace("\n", "\r\n") + "\r\n\r\n" + rest).encode(),
+                        os.path.basename(env["path"][:-4]) + ".fr.srt", "fre")
+    hook.main(["--sub-time", env["path"], "--apply"])
+    fixed = scene_srt(FRE_SIDE)
+    head, rest = fixed.split("\n\n", 1)
+    assert open(path, "rb").read() == (head.replace("\n", "\r\n") + "\r\n\r\n" + rest).encode(), last_decided(env)["sidecars"]
+
+
+def test_a_sidecar_repair_needs_a_kept_original(env, monkeypatch, settings, tmp_path, garbled_av, capsys):
+    """With KEEP_ORIGINALS_DAYS 0 no original of a repair can be kept, so a garbled sidecar to repair stays as it is,
+    and the alert says why."""
+    raw = scene_srt(double_encoded(FRE_SIDE)).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".fr.srt", "fre")
+    settings(keep_days=0)
+    with pytest.raises(SystemExit):
+        hook.main(["--sub-time", env["path"], "--apply"])
+    (e,) = last_decided(env)["sidecars"]
+    assert (e["action"], e["result"], e.get("kept")) == ("repair", "left", None) and open(path, "rb").read() == raw, e
+    assert "AMG didn't repair them, because KEEP_ORIGINALS_DAYS is 0" in capsys.readouterr().out
+
+
+def test_a_sidecar_to_rename_leaves_the_word_check(env, monkeypatch, settings, tmp_path, garbled_av):
+    """A Polish film with a garbled Polish sidecar that cannot be repaired. Its words never reach the word check, which
+    cannot read them, and it is renamed."""
+    env["movies"]["movie/7"]["originalLanguage"] = {"name": "Polish"}
+    raw = scene_srt(old_mux(SHAPES["pol_lost"][0](), "cp1250")).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt", "pol")
+    env["movies"]["movie"][0]["originalLanguage"] = {"name": "Polish"}
+    heard = set()
+    monkeypatch.setattr(hook, "sub_verdicts", lambda p, j, items, *a, **k: heard.update(items) or {})
+    hook.main(["--sub-time", env["path"], "--apply"])
+    assert os.path.basename(path) not in heard and [e["result"] for e in last_decided(env)["sidecars"]] == ["renamed"], heard
+
+
+@pytest.mark.parametrize("level", ["issues", "all"])
+def test_one_run_that_renames_and_repairs_posts_once(env, monkeypatch, settings, tmp_path, garbled_av, level):
+    """One deep analysis renames a Czech sidecar and repairs a French one. One notice says both, with DISCORD_POSTS
+    issues and all, and no second post says the repair."""
+    stem = os.path.basename(env["path"][:-4])
+    cze = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, scene_srt(old_mux(CZE, "utf-8")).encode(), stem + ".cze.srt")
+    with open(os.path.join(os.path.dirname(cze), stem + ".fre.srt"), "wb") as f:
+        f.write(scene_srt(double_encoded(FRE_SIDE)).encode())
+    settings(subtitles="deep", discord_posts=level)
+    hook.deep_analysis(queue_analysis(env, env["path"]), [])
+    rec = last_decided(env)
+    posts = [b["embeds"][0] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
+    assert [e["result"] for e in rec["sidecars"]] == ["renamed", "repaired"] and [p["title"] for p in posts] == ["Unreadable subtitles"], posts
+    said = posts[0]["description"]
+    assert "can't be read as text, so the file was renamed" in said and "Replaced them with the same subtitles" in said, said
+
+
+def test_a_share_that_refuses_chmod_still_converts_a_broken_track(tmp_path, settings, monkeypatch):
+    """The share refuses chmod on every new file. The temp file of a conversion takes the original's mode at its
+    create, and so does the file of a broken track's bytes, so the conversion works there."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    eng = [(a, e, f"Line {k}", None) for k, (a, e, _, _) in enumerate(PERSIAN_CUES, 1)]
+    path = broken_film(tmp_path, [{"lang": "eng", "enc": "utf-8", "cues": eng}, PERSIAN])
+    os.chmod(path, 0o644)
+    refuse(monkeypatch, chmod=(".repack-tmp", ".txt"))
+    old = os.umask(0o022)
+    try:
+        _, result, info, new = convert_own(path)
+    finally:
+        os.umask(old)
+    assert result == "repacked" and os.stat(info["broken"]["s2"]["sidecar"]).st_mode & 0o777 == 0o644, (result, info.get("broken"))
+
+
+def test_a_share_that_refuses_chmod_and_hard_links_still_renames_a_garbled_sidecar(env, monkeypatch, settings, tmp_path, garbled_av):
+    """The share refuses chmod on every new file and every hard link, so the rename writes a copy. The copy takes the
+    sidecar's mode at its create, so the rename works there."""
+    raw = scene_srt(old_mux(SHAPES["pol_lost"][0](), "cp1250")).encode()
+    path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, os.path.basename(env["path"][:-4]) + ".pol.srt")
+    os.chmod(path, 0o644)
+    refuse(monkeypatch, chmod=(".txt",), link=True)
+    old = os.umask(0o022)
+    try:
+        hook.main(["--sub-time", env["path"], "--apply"])
+    finally:
+        os.umask(old)
+    (e,) = last_decided(env)["sidecars"]
+    assert e["result"] == "renamed" and os.stat(path[:-4] + hook.BROKEN_SIDECAR).st_mode & 0o777 == 0o644, e
+
+
+def test_keep_broken_gives_the_mode_of_the_original_reads_back_and_reuses_only_the_same_bytes(tmp_path, monkeypatch):
+    """keep_broken() gives the new file the original's mode, also under a umask that takes the group's and others'
+    read bits, and reads it back: a write the share lost raises, and the file goes. A file of other bytes of the same
+    size is never reused, and drop_broken() leaves a reused file."""
+    video, st_of = tmp_path / "Film.mkv", lambda mode: (os.chmod(video, mode), os.stat(video))[1]
+    video.write_bytes(b"")
+    name = lambda n: str(tmp_path / n)
+    old = os.umask(0o077)
+    try:
+        e = {"sidecar": name("Film.per.broken-encoding.srt.txt"), "data": b"abc"}
+        assert hook.keep_broken(e, st_of(0o640)) and os.stat(e["sidecar"]).st_mode & 0o777 == 0o640
+    finally:
+        os.umask(old)
+    real = hook.own_like
+    monkeypatch.setattr(hook, "own_like", lambda p, st: (open(p, "ab").write(b"x"), real(p, st))[1])
+    lost = {"sidecar": name("Film.pol.broken-encoding.srt.txt"), "data": b"abc"}
+    with pytest.raises(RuntimeError, match="does not hold the bytes"):
+        hook.keep_broken(lost, st_of(0o644))
+    assert not os.path.exists(lost["sidecar"])
+    (tmp_path / "Film.cze.broken-encoding.srt.txt").write_bytes(b"xyz")   # other bytes of the same size
+    plan = {"Film.cze.srt": {"lang": "cze", "data": b"abc", "numbers": range(1, 100)}}
+    assert hook.broken_plan(str(video), plan) is None and (os.path.basename(plan["Film.cze.srt"]["sidecar"]), plan["Film.cze.srt"]["reused"]) == (
+        "Film.cze.1.broken-encoding.srt.txt", False)
+    same = {"sidecar": e["sidecar"], "data": b"abc"}
+    assert not hook.keep_broken(same, st_of(0o644)) and same["reused"]
+    hook.drop_broken([same])
+    assert open(e["sidecar"], "rb").read() == b"abc"
+
+
+def test_a_failed_remux_removes_the_file_of_bytes_it_wrote(env, monkeypatch, settings, tmp_path, garbled_av):
+    """A Polish track that reads right only in cp1250 leaves the file, and its bytes go beside the video. The rename of
+    the new file then fails, so the original stays, the file of its bytes goes, and the decision log names it."""
+    texts = SHAPES["pol_lost"][0]()
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(texts)], "cp1250", "pol")
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    side = env["path"][:-4] + f".pol{hook.BROKEN_SIDECAR}"
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda a, b, **kw: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+                        if str(a).endswith(".repack-tmp") and str(b) == env["path"] else real(a, b, **kw))
+    with pytest.raises(SystemExit):
+        hook.main(["--sub-time", env["path"], "--apply"])
+    rm = last_decided(env)["subremux"]
+    assert (rm["codes"], rm["garbled_text_removed"]) == (["subtitle_remux_failed"], [os.path.basename(side)]), rm
+    assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"} and not os.path.exists(side)
+
+
+def test_a_track_whose_names_are_taken_stays_and_the_remux_makes_its_other_fixes(env, monkeypatch, settings, tmp_path, garbled_av, capsys):
+    """Two garbled tracks. Files of other bytes hold both names of the Polish one, so it stays in the file this run, and
+    the alert says why. The Czech one still leaves the file in the same remux."""
+    garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(SHAPES["pol_lost"][0]())],
+                "cp1250", "pol")
+    srt = tmp_path / "src" / "cze.srt"
+    srt.write_bytes(srt_text([(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(old_mux(scene("cze", 2), "cp1250"))]).encode())
+    two = str(tmp_path / "two.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", two, env["path"], "--language", "0:cze", str(srt)], check=True)
+    os.replace(two, env["path"])
+    monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
+    base = env["path"][:-4]
+    for n in (f"{base}.pol{hook.BROKEN_SIDECAR}", f"{base}.pol.1{hook.BROKEN_SIDECAR}"):
+        with open(n, "wb") as f:
+            f.write(b"other")
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec = last_decided(env)
+    assert (rec["subremux"]["codes"], rec["subremux"]["stripped"]) == (["subtitle_garbled_removed"], {"s2": os.path.basename(base) + f".cze{hook.BROKEN_SIDECAR}"})
+    assert rec["garbled"]["s1"]["held"] and hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {"s1": "S_TEXT/UTF8"}, rec["garbled"]
+    assert "They're still in the file, because other files hold the names for their text beside the video." in capsys.readouterr().out
+
+
+def test_a_track_a_remux_after_a_conversion_took_out_goes_by_its_number_in_the_original():
+    """The notice of a conversion that then took out a garbled track names that track by its number in the original
+    file. A track the conversion added goes by its number in the converted file."""
+    remux = {"kind": "unreadable", "tracks": {"s1": {"lang": "pol", "sidecar": "/m/Film.pol.broken-encoding.srt.txt"},
+                                              "s3": {"lang": "eng", "sidecar": "/m/Film.eng.broken-encoding.srt.txt"}}, "places": {"s1": "s2"}}
+    f = hook.unreadable_finding({"s1": {"lang": "per", "sidecar": "/m/Film.per.broken-encoding.srt.txt"}}, None, "MP4/QuickTime", remux=remux)
+    said = hook.unmarked(hook.texts(f, "done", {})[0])
+    assert "The Polish subtitles (track 2 of the original file) can't be read" in said and "The English subtitles (track 3 of the converted file)" in said, said
+
+
+def test_one_plan_names_every_file_of_removed_subtitle_bytes(tmp_path, monkeypatch):
+    """broken_plan() names the file of a broken MP4 track, a garbled track and a garbled sidecar alike. Two entries of
+    one language and format take numbers, and never one name. A format of its own gives its own name. A file of the
+    same bytes is reused, one of other bytes is never written over. Before the bytes are read a held name counts as
+    taken. drop_broken() removes only what keep_broken() wrote. A sidecar that changed since the check stays."""
+    video = tmp_path / "Film.mkv"
+    video.write_bytes(b"")
+    name = lambda n: str(tmp_path / n)
+    (tmp_path / f"Film.per{hook.BROKEN_SIDECAR}").write_bytes(b"other")
+    (tmp_path / "Film.pl.1.broken-encoding.srt.txt").write_bytes(b"pl")
+    plan = {"s3": {"lang": "per", "data": b"a"}, "s4": {"lang": "per", "data": b"b", "ext": "ass"}, "s5": {"lang": "und", "data": b"c"},
+            "Film.pl.srt": {"lang": "pl", "data": b"pl", "numbers": range(1, 100)}, "Film.pl.forced.srt": {"lang": "pl", "data": b"x", "numbers": range(1, 100)}}
+    assert hook.broken_plan(str(video), plan) is None
+    assert {k: (os.path.basename(e["sidecar"]), e["reused"]) for k, e in plan.items()} == {
+        "s3": ("Film.per.3.broken-encoding.srt.txt", False), "s4": ("Film.per.broken-encoding.ass.txt", False), "s5": ("Film.broken-encoding.srt.txt", False),
+        "Film.pl.srt": ("Film.pl.1.broken-encoding.srt.txt", True), "Film.pl.forced.srt": ("Film.pl.2.broken-encoding.srt.txt", False)}
+    dry = {"s3": {"lang": "per", "data": None}}
+    assert hook.broken_plan(str(video), dry) is None and dry["s3"]["sidecar"] == name("Film.per.3.broken-encoding.srt.txt")
+    (tmp_path / "Film.per.3.broken-encoding.srt.txt").write_bytes(b"other")
+    assert hook.broken_plan(str(video), {"s3": {"lang": "per", "data": b"a"}}) == "the name Film.per.3.broken-encoding.srt.txt is taken"
+    st = os.stat(video)
+    for k in ("s4", "Film.pl.srt"):
+        hook.keep_broken(plan[k], st)
+    assert (plan["s4"]["written"], plan["Film.pl.srt"]["written"]) == (True, False) and (tmp_path / "Film.per.broken-encoding.ass.txt").read_bytes() == b"b"
+    hook.drop_broken([plan["s4"], plan["Film.pl.srt"]])
+    assert not os.path.exists(plan["s4"]["sidecar"]) and (tmp_path / "Film.pl.1.broken-encoding.srt.txt").read_bytes() == b"pl" and plan["s4"]["removed"]
+    with pytest.raises(FileExistsError):   # a file came since the plan
+        hook.keep_broken({"sidecar": name("Film.per.3.broken-encoding.srt.txt"), "data": b"a"}, st)
+    side = tmp_path / "Film.pl.forced.srt"
+    side.write_bytes(b"y")   # Bazarr wrote it again since the check
+    monkeypatch.setattr(hook, "sub_fixes", lambda source: True)
+    s = {"name": side.name, "path": str(side), "garbled": {"why": "w", "codepage": "cp1250", "lang": "pol", "read": None, "cut": 0, "cues": 9},
+         "broken": dict(plan["Film.pl.forced.srt"], video=str(video))}
+    got = hook.broken_side(s, True, "radarr", "backfill")
+    assert (got["result"], got["left"], side.read_bytes()) == ("left", "it changed since the check", b"y") and not os.path.exists(plan["Film.pl.forced.srt"]["sidecar"])
+
+
+@pytest.mark.parametrize("codec, tag, texts", [
+    ("S_TEXT/ASS", "fre", ["{\\an8}{\\k20}Un {\\k35}café {\\k20}noir, s'il vous plaît.", "{\\p1}m 0 0 l 100 0 100 100 0 100{\\p0}Déjà vu, à côté."]),
+    ("S_TEXT/SSA", "pol", ["{\\pos(10,20)}Gdzie byłeś? Dzwoniłam trzy razy.", "{\\b1}Źle się czuję{\\b0}, wiesz?"]),
+    ("S_TEXT/ASS", "fre", ["{\\p1}m 0 0 l 100 0 100 100 0 100{\\p0}", "{\\an8\\fad(200,200)}"]),
+    ("S_TEXT/WEBVTT", "fre", ["<c.yellow>Où étais-tu ?</c> <00:00:01.500>Je t'ai appelé.", "<v Anna><i>Déjà</i> vu, à côté.</v>"])])
+def test_tags_and_drawings_never_make_right_text_garbled(codec, tag, texts):
+    """A right French or Polish ASS, SSA or WebVTT track, with override blocks, karaoke tags, a drawing or styling
+    tags, is never garbled. A track of only override blocks and drawings holds no letters to judge. The same text
+    garbled from UTF-8 reads as its tag, but such a track is never repaired, because the proof checks SubRip text only."""
+    cues = [(1 + k, 2 + k, t) for k, t in enumerate(texts * 60)]
+    j = {"tracks": [{"type": "subtitles", "id": 2, "properties": {"language": tag, "codec_id": codec}}]}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": cues})
+        assert hook.garbled_tracks("/x/Film.mkv", j, [], True) == {}
+    assert hook.dialogue(texts[0], codec) != texts[0] and hook.dialogue("<i>Hi</i>", "S_TEXT/UTF8") == "<i>Hi</i>"
+    garbled = [(a, b, old_mux([t], "utf-8")[0]) for a, b, t in cues]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": garbled})
+        got = hook.garbled_tracks("/x/Film.mkv", j, [], True)
+    if any(c.isalpha() for c in hook.dialogue(texts[0], codec)):
+        assert (got["s1"]["codepage"], got["s1"]["lang"], got["s1"]["repair"]) == ("utf-8", tag, False), got
+        assert got["s1"]["why"].endswith("but only a SubRip track is repaired"), got
+    else:
+        assert got == {}, got
 
 
 # --- the burned-in subtitle check (docs/design.md, "Burned-in subtitles") ---------------------------------------------
@@ -19757,6 +21322,27 @@ def test_a_job_a_backfill_queued_queues_its_burn_in_check_and_deep_analysis(env,
     assert {c[6] for c in burn["calls"] if c[0] == "full"} == {hook.store.path()}   # a job of the queue yields to an import
 
 
+@pytest.mark.parametrize("kind", ["backfill", "import"])
+def test_the_jobs_a_backfill_job_queues_count_as_from_a_backfill(env, burn, monkeypatch, settings, capsys, kind):
+    """Tester 2026-10-16: each backfill job that ran left its burn-in job and deep analysis out of the count, which fell
+    by one per job. Owner 2026-10-16: those jobs count, and the line names the files still to check. The same jobs of
+    an import never count."""
+    japanese_film(env, ("eng", True, {}))
+    settings(subtitles="deep")
+    check_listed(env, monkeypatch)
+    if kind == "backfill":
+        name = backfill_job(env, monkeypatch)
+        hook.main(["--selftest"])
+        assert "background queue: 1 jobs, 1 of them from a backfill (1 file still to check)\n" in capsys.readouterr().out
+        hook.background(name, [])
+    else:
+        hook.run_job(enqueue(env, 0, env["path"]), [], shared=True)
+    assert hook.deep_analysis_queued() == [hook.burn_name(env["path"]), hook.deep_name(env["path"])]
+    hook.main(["--selftest"])
+    n = 2 if kind == "backfill" else 0
+    assert f"background queue: 2 jobs, {n} of them from a backfill (0 files still to check)\n" in capsys.readouterr().out
+
+
 def test_a_file_with_a_current_deep_analysis_gets_no_new_one(env, monkeypatch, settings):
     """The job's import check makes no change, and keeps the saved deep analysis of the file, which still holds. So the
     job queues no deep analysis, and the next backfill finds the result too."""
@@ -20169,11 +21755,11 @@ def whole_media(tmp_path_factory):
     AVI with PCM audio has two gaps. An MP4 and a MOV hold silence in PCM that mkvmerge names ipcm and fl32."""
     d = tmp_path_factory.mktemp("whole")
     clean = d / "clean.mkv"
-    REAL_RUN(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=20", "-f", "lavfi", "-i",
-              "sine=frequency=440:duration=20", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "4M", "-c:a", "aac", "-shortest", str(clean)],
-             check=True)
-    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c", "copy", str(d / "clean.mp4")], check=True)
-    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "ac3", str(d / "clean.avi")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=20", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=20", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "4M", "-c:a", "aac", "-shortest", str(clean)],
+               check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(clean), "-c", "copy", str(d / "clean.mp4")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "ac3", str(d / "clean.avi")], check=True)
     size = os.path.getsize(clean)
     for name, shares, fill in (("zeros3", (0.2, 0.5, 0.8), bytes), ("zeros1", (0.5,), bytes), ("garbage3", (0.2, 0.5, 0.8), noise)):
         shutil.copy(clean, d / f"{name}.mkv")
@@ -20181,25 +21767,25 @@ def whole_media(tmp_path_factory):
             for share in shares:
                 f.seek(int(size * share)); f.write(fill(300 << 10))
     video = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=12"]
-    REAL_RUN(video + ["-c:v", "libx264", "-preset", "ultrafast", str(d / "v.mp4")], check=True)
+    amg.ffmpeg(video + ["-c:v", "libx264", "-preset", "ultrafast", str(d / "v.mp4")], check=True)
     for layout in ("5.1", "7.1"):
-        REAL_RUN(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"anullsrc=r=48000:cl={layout}:d=12", "-c:a", "pcm_s24le", str(d / f"{layout}.wav")],
-                 check=True)
+        amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"anullsrc=r=48000:cl={layout}:d=12", "-c:a", "pcm_s24le", str(d / f"{layout}.wav")],
+                   check=True)
         REAL_RUN(["mkvmerge", "-q", "-o", str(d / f"silence{layout}.mkv"), str(d / "v.mp4"), str(d / f"{layout}.wav")], check=True)
-    REAL_RUN(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset", "ultrafast",
-                      "-c:a", "pcm_s24le", "-shortest", str(d / "silence7.1.mov")], check=True)
+    amg.ffmpeg(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset", "ultrafast",
+                        "-c:a", "pcm_s24le", "-shortest", str(d / "silence7.1.mov")], check=True)
     shutil.copy(d / "silence5.1.mkv", d / "gaps5.1.mkv")
     with open(d / "gaps5.1.mkv", "r+b") as f:
         for share in (0.3, 0.7):
             f.seek(int(os.path.getsize(d / "gaps5.1.mkv") * share)); f.write(bytes(1 << 20))
-    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-f", "data", "-i", str(d / "v.mp4"), "-map", "0", "-map", "1", "-c", "copy", "-t", "4",
-              "-f", "mpegts", str(d / "data.ts")], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(clean), "-f", "data", "-i", str(d / "v.mp4"), "-map", "0", "-map", "1", "-c", "copy", "-t", "4",
+                "-f", "mpegts", str(d / "data.ts")], check=True)
     unknown_stream_ts(d / "data.ts", d / "unknown.ts")
     unknown_stream_ts(d / "data.ts", d / "unknownc5.ts", 0xC5)   # the type the reviewer's TS had
     for out, codec in (("ipcm7.1.mp4", "pcm_s24le"), ("fl32_7.1.mov", "pcm_f32le")):   # mkvmerge names these by fourcc
-        REAL_RUN(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset",
-                          "ultrafast", "-c:a", codec, "-shortest", str(d / out)], check=True)
-    REAL_RUN(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "pcm_s16le", str(d / "gaps_pcm.avi")], check=True)
+        amg.ffmpeg(video + ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=7.1:d=12", "-af", "asetnsamples=n=48000", "-c:v", "libx264", "-preset",
+                            "ultrafast", "-c:a", codec, "-shortest", str(d / out)], check=True)
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-i", str(clean), "-c:v", "mpeg4", "-q:v", "3", "-c:a", "pcm_s16le", str(d / "gaps_pcm.avi")], check=True)
     with open(d / "gaps_pcm.avi", "r+b") as f:   # outside Matroska and MP4 every run counts, PCM or not
         for share in (0.3, 0.7):
             f.seek(int(os.path.getsize(d / "gaps_pcm.avi") * share)); f.write(bytes(300 << 10))
@@ -20214,9 +21800,7 @@ def gap_found(f, planted):
     return len(starts) == len(planted) and all(p - 1e-4 <= a < p + 0.01 for a, p in zip(starts, planted))
 
 
-def gap_words(p):
-    """The doubt of one gap planted at share p: its run starts in the same percent, or in the next one."""
-    return rf"the file has a blank gap at ({round(p * 100)}|{round(p * 100) + 1})% of its length"
+GAP_WORDS = r"the file has a blank gap at 0:\d\d"   # the one gap of zeros1.mkv, at a play time ffmpeg's build moves
 
 
 @pytest.mark.parametrize("name, certain, planted", [
@@ -20246,11 +21830,78 @@ def test_the_whole_file_check_on_made_up_media(whole_media, tmp_path, settings, 
     elif name.startswith(("clean", "unknown")):   # an unknown stream type stops ffmpeg with no -ignore_unknown
         assert (f["ffmpeg"]["ran"], f["ffmpeg"]["lines"], f["ffmpeg"]["code"], zeros, more) == (True, 0, 0, [], [])
     elif name == "zeros1.mkv":   # its demuxer error names a byte inside the run
-        assert gap_found(f, planted) and len(zeros) == 1 and re.fullmatch(gap_words(0.5), zeros[0]), (zeros, f["zeros"])
+        assert gap_found(f, planted) and len(zeros) == 1 and re.fullmatch(GAP_WORDS, zeros[0]), (zeros, f["zeros"])
         assert f["ffmpeg"]["lines"] >= 1 and f["ffmpeg"]["loose"] == 0 and more == []
     else:   # random bytes at 20 percent: the read pass names a byte in or just past them
         assert zeros == [] and f["ffmpeg"]["lines"] >= 1 and len(more) == 1 and more[0].startswith("a full read of the file found damaged data at ")
         assert any(0.2 <= a <= 0.25 for a in f["ffmpeg"]["at"]), f["ffmpeg"]
+
+
+@pytest.fixture(scope="module")
+def gap_media(whole_media, tmp_path_factory):
+    """Copies of the made-up MKV with one blank gap. front.mkv has a 1 MiB attachment before the first Cluster, as
+    mkvmerge writes it, with 512 KiB of zeros from its header on. end.mkv has the attachment after the Cues, where
+    mkvpropedit adds it, with 512 KiB of zeros in its data. nocues.mkv has no Cues and 300 KiB of zeros at 50 percent.
+    made.mkv is made-up Matroska of three Clusters of 400 KiB at 0, 60 and 120 s, with 300 KiB of zeros from the
+    middle of the second one into the third."""
+    D, d, blob = hook.arr_decide, tmp_path_factory.mktemp("gaps"), noise(1 << 20)
+    info = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 6).to_bytes(4, "big")))
+    clusters = [el(D.CLUSTER, el(D.TIMESTAMP, (60000 * i).to_bytes(4, "big")) + el(D.SIMPLEBLOCK, noise(400 << 10, i))) for i in range(3)]
+    at = made_mkv(d / "made.mkv", [info, *clusters])
+    seg = D.segment_start((d / "made.mkv").read_bytes())[0]
+    made_mkv(d / "made.mkv", [info, *clusters, cue_index([(t, at[i + 1] - seg) for i, t in enumerate((0, 60000, 120000))])], 4)
+    (d / "blob.bin").write_bytes(blob)
+    att = ["--attachment-mime-type", "application/octet-stream"]
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "front.mkv"), *att, "--attach-file", str(d / "blob.bin"), str(whole_media / "clean.mkv")], check=True)
+    shutil.copy(whole_media / "clean.mkv", d / "end.mkv")
+    REAL_RUN(["mkvpropedit", "-q", str(d / "end.mkv"), *att, "--add-attachment", str(d / "blob.bin")], check=True)
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "nocues.mkv"), "--no-cues", str(whole_media / "clean.mkv")], check=True)
+    b = (d / "front.mkv").read_bytes()[:64 << 10]
+    ds = D.segment_start(b)[0]
+    for name, at, n in (("front", ds + D.front_seeks(b, ds)[0x1941A469][0], 512 << 10), ("end", (d / "end.mkv").read_bytes().index(blob), 512 << 10),
+                        ("nocues", os.path.getsize(d / "nocues.mkv") // 2, 300 << 10), ("made", at[2] + (200 << 10), 300 << 10)):
+        with open(d / f"{name}.mkv", "r+b") as f:
+            f.seek(at); f.write(bytes(n))
+    return d
+
+
+@pytest.mark.parametrize("name, when, words", [
+    ("zeros1.mkv", float, r"at 0:\d\d"), ("front.mkv", "start", "before the video starts"),
+    ("end.mkv", "end", "after the video and audio end"), ("nocues.mkv", None, r"at \d+% of the file size"), ("made.mkv", 60.0, "at 1:00")])
+def test_a_blank_gap_names_its_play_time(whole_media, gap_media, tmp_path, settings, name, when, words):
+    """Owner 2026-10-16: the whole-file check's alert of one blank gap names the play time of its first byte, from the
+    Cues, as the read pass's alert does. A gap before the first Cluster is before the video, and one after the last
+    Cluster is after it. A file with no Cues names its share of the file size. The log keeps the run in bytes. A gap
+    that runs into the next Cluster names the time of the Cluster it starts in."""
+    settings(state_dir=str(tmp_path))
+    certain, zeros, more, f = hook.whole_check(str((whole_media if name == "zeros1.mkv" else gap_media) / name))
+    (got,), (_,) = f["zeros"]["when"], f["zeros"]["runs"]
+    assert certain is None and (0 <= got <= 20 if when is float else got == when), f   # the read pass judges on its own
+    assert len(zeros) == 1 and re.fullmatch(rf"the file has a blank gap {words}", zeros[0]), (zeros, f)
+
+
+@pytest.mark.parametrize("name, when, words", [
+    ("middle", 60.0, "at 1:00"), ("front", "start", "before the video starts"), ("end", "end", "after the video and audio end"),
+    ("nocues", None, "at 50% of the file size")])
+def test_the_imports_zero_probe_names_its_gaps_play_time(tmp_path, monkeypatch, name, when, words):
+    """Owner 2026-10-16: the import's zero probe names the play time of its one hit with the words and fallbacks of the
+    whole-file check, so a gap reads the same whichever check found it. Made-up Matroska of three Clusters of 1 MiB at
+    0, 60 and 120 s. One probe read, at the middle of the span, meets 768 KiB of zeros in the second Cluster. The Cues
+    of front name only the third Cluster. end has a 4 MiB attachment after the Cues, with the zeros in it. nocues has
+    no Cues. The log keeps the hit's share of the file size and adds its play time."""
+    D = hook.arr_decide
+    monkeypatch.setattr(D, "ZERO_READS", 1)   # one read, so one hit
+    info = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 6).to_bytes(4, "big")))
+    clusters = [el(D.CLUSTER, el(D.TIMESTAMP, (60000 * i).to_bytes(4, "big")) + el(D.SIMPLEBLOCK, noise(1 << 20, i))) for i in range(3)]
+    f, tail = tmp_path / f"{name}.mkv", [el(0x1941A469, noise(4 << 20))] if name == "end" else []
+    at = made_mkv(f, [info, *clusters, *tail])
+    seg = D.segment_start(f.read_bytes()[:64])[0]
+    points = [(t, at[i + 1] - seg) for i, t in enumerate((0, 60000, 120000))][2 if name == "front" else 0:]
+    at = made_mkv(f, [info, *clusters, cue_index(points), *tail], None if name == "nocues" else 4)
+    with open(f, "r+b") as g:
+        g.seek((at[-1] if tail else at[2]) + (128 << 10)); g.write(bytes(768 << 10))
+    certain, doubts, v = hook.check_video(str(f), 0, pcm=False)
+    assert (certain, doubts, v["zeros"]["hits"], v["zeros"]["when"]) == (None, [f"the file has a blank gap {words}"], [0.5], [when]), v
 
 
 def test_the_read_pass_reads_only_ffmpegs_error_lines():
@@ -20270,12 +21921,27 @@ def test_the_read_pass_reads_only_ffmpegs_error_lines():
     assert D.parse_copy(opened, 183, size)["ran"] is False and D.parse_copy(output, 234, size)["ran"] is False
     assert D.parse_copy("[mov,mp4 @ 0x1] stream 1, offset 0x20: partial file\n", 0, size)["loose"] == 1
     read = lambda at, loose=0: {"ran": True, "lines": len(at) + loose, "pos": [round(a * size) for a in at], "at": at, "loose": loose}
-    assert D.whole_verdict([], size, read([0.13, 0.61, 0.83]))[2] == ["a full read of the file found damaged data at 13%, 61% and 83% of its length"]
-    assert D.whole_verdict([], size, read([0.002, 0.61]))[2] == ["a full read of the file found damaged data at the start of the file and at 61% of its length"]
+    assert D.whole_verdict([], size, read([0.13, 0.61, 0.83]))[2] == ["a full read of the file found damaged data at 13%, 61% and 83% of the file size"]
+    assert D.whole_verdict([], size, read([0.002, 0.61]))[2] == ["a full read of the file found damaged data at the start of the file and at 61% of the file size"]
     assert D.whole_verdict([], size, read([i / 10 for i in range(1, 9)]))[2] == [
-        "a full read of the file found damaged data at 10%, 20%, 30%, 40%, 50% and 3 more places of its length"]
-    assert D.whole_verdict([[600, 620]], size, read([0.605], loose=2))[:3] == (None, ["the file has a blank gap at 60% of its length"],
+        "a full read of the file found damaged data at 10%, 20%, 30%, 40%, 50% and 3 more places of the file size"]
+    # Owner 2026-10-16: a share of the file's bytes says nothing a viewer can use, so the doubt names play times
+    timed = lambda at, when: dict(read(at), when=when)
+    assert D.whole_verdict([], size, timed([0.13, 0.61, 0.83], [61.4, 2467.9, 5025.0]))[2] == [
+        "a full read of the file found damaged data at 1:01, 41:07 and 1:23:45"]
+    assert D.whole_verdict([], size, timed([0.001, 0.4, 0.41, 0.999], ["start", 61.2, 61.9, "end"]))[2] == [
+        "a full read of the file found damaged data before the video starts and at 1:01 and after the video and audio end"]
+    assert D.whole_verdict([[600, 620]], size, timed([0.605, 0.999], [30.0, "end"]))[2] == [
+        "a full read of the file found damaged data after the video and audio end"]   # the byte of the run adds no doubt
+    assert D.whole_verdict([[600, 620]], size, read([0.605], loose=2))[:3] == (None, ["the file has a blank gap at 60% of the file size"],
                                                                                ["a full read of the file found 2 errors"])
+    # Owner 2026-10-16: the blank gap names its play time too, the time of the run's first byte
+    gap = lambda run, when: D.whole_verdict([run], size, None, when=[when])[1]
+    assert gap([600, 620], 2467.9) == ["the file has a blank gap at 41:07"] and gap([5, 30], "start") == ["the file has a blank gap before the video starts"]
+    assert gap([990, 1000], "end") == ["the file has a blank gap after the video and audio end"]
+    assert gap([600, 620], None) == ["the file has a blank gap at 60% of the file size"]   # a file with no Cues
+    assert D.whole_verdict([[100, 120], [600, 620]], size, None, when=[61.4, 2467.9])[:2] == (
+        "the file has blank gaps at 2 places, so the download is incomplete", [])
     assert D.whole_verdict([[600, 620]], size, read([0.61]))[2] == [] and D.whole_verdict([], size, dict(read([0.5]), ran=False))[2] == []
     assert D.whole_verdict([[100, 120], [600, 620]], size, None)[0] == "the file has blank gaps at 2 places, so the download is incomplete"
     assert D.whole_verdict([[1, 120]], size, None)[1] == ["the file has a blank gap at the start of the file"]
@@ -20284,7 +21950,8 @@ def test_the_read_pass_reads_only_ffmpegs_error_lines():
     on = lambda *b: {"ran": True, "lines": len(b), "pos": list(b), "at": [x / big for x in b], "loose": 0}
     assert D.whole_verdict(runs, big, on(), pcm=True) == (None, [], [], [])
     assert D.whole_verdict(runs, big, None, pcm=True)[:2] == (None, [])   # a read pass that did not finish confirms nothing
-    assert D.whole_verdict(runs, big, on((5 << 20) - 1000), pcm=True)[1:] == ([f"the file has a blank gap at 50% of its length"], [], runs[1:2])
+    assert D.whole_verdict(runs, big, on((5 << 20) - 1000), pcm=True)[1:] == (["the file has a blank gap at 50% of the file size"], [], runs[1:2])
+    assert D.whole_verdict(runs, big, on((5 << 20) - 1000), pcm=True, when=[10.0, 25.5, 40.0])[1] == ["the file has a blank gap at 0:25"]
     assert D.whole_verdict(runs, big, on((1 << 20) + 5, (9 << 20) + (64 << 10)), pcm=True)[3] == [runs[0], runs[2]]
     assert D.whole_verdict(runs, big, on((9 << 20) + (64 << 10) + 1), pcm=True)[3] == []
     assert D.whole_verdict(runs, big, on(), pcm=False)[3] == runs
@@ -20292,6 +21959,182 @@ def test_the_read_pass_reads_only_ffmpegs_error_lines():
     pair = [[1 << 20, 2 << 20], [(2 << 20) + (10 << 10), 3 << 20]]
     assert D.whole_verdict(pair, big, on((2 << 20) + (4 << 10)), pcm=True)[3] == pair[:1]
     assert D.whole_verdict(pair, big, on((2 << 20) + (4 << 10), (2 << 20) + (500 << 10)), pcm=True)[3] == pair
+
+
+def made_mkv(path, body, cues=None, unknown=False, cut=0, lists=None):
+    """Write a made-up Matroska file: an EBML header and a Segment of a SeekHead, then the elements of body. The
+    SeekHead lists body[cues] as the Cues, or as the element id lists, such as a second SeekHead. unknown writes the
+    unknown Segment size of a live stream. cut drops bytes from the end of the file. Returns the file offset of each
+    element of body."""
+    D = hook.arr_decide
+    head = len(el(D.SEEKHEAD, seek_entry(D.CUES, 0))); starts = [head + sum(map(len, body[:i])) for i in range(len(body))]
+    data = (el(D.SEEKHEAD, seek_entry(lists or D.CUES, starts[cues])) if cues is not None else el(D.VOID, bytes(head - 9))) + b"".join(body)
+    top = el(D.EBML_ID, el(0x4286, b"\x01"))
+    size = bytes.fromhex("01ffffffffffffff") if unknown else (1 << 56 | len(data)).to_bytes(8, "big")
+    out = top + D.SEGMENT.to_bytes(4, "big") + size + data
+    path.write_bytes(out[:len(out) - cut])
+    return [len(top) + 12 + s for s in starts]
+
+
+def cue_index(points):
+    """A made-up Cues element of (CueTime, Cluster position relative to the Segment data) pairs, track 1."""
+    D = hook.arr_decide
+    return el(D.CUES, b"".join(el(D.CUEPOINT, el(D.CUETIME, t.to_bytes(4, "big")) + el(D.CUETRACKPOS, el(D.CUETRACK, b"\x01")
+                                                   + el(D.CUECLUSTER, c.to_bytes(8, "big")))) for t, c in points))
+
+
+def test_zero_padding_after_the_cues_is_no_damage(tmp_path):
+    """Owner 2026-10-16: the read pass's error at the first byte of the zero padding is no damage. Every other layout
+    keeps today's doubt: an unknown or short Segment, no Cues where the SeekHead points, Cues before the Clusters, a
+    zero run with a Cluster, a cut element, an element of unknown size, another element or nothing after it, random
+    bytes, two runs, and a run of ZERO_RUN. A second SeekHead may list the Cues, and its read ends when it lists the
+    front one."""
+    D = hook.arr_decide
+    info, tracks, tags = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 6).to_bytes(4, "big"))), el(0x1654AE6B, bytes(40)), el(0x1254C367, bytes(20))
+    cluster = el(D.CLUSTER, el(D.TIMESTAMP, b"\x00") + el(D.SIMPLEBLOCK, bytes(300)))
+    cues = cue_index([(0, 0)])
+    def pad(name, body, cues_at=2, **kw):
+        at = made_mkv(tmp_path / name, body, cues_at, **kw)
+        return hook.zero_pad(str(tmp_path / name)), at
+    got, at = pad("pad.mkv", [info, cluster, cues, bytes(858), tracks])
+    assert got == at[3]
+    seg = D.segment_start((tmp_path / "pad.mkv").read_bytes())[0]
+    second = el(D.SEEKHEAD, seek_entry(D.CUES, at[2] - seg))   # mkvpropedit's index at the end
+    assert pad("second.mkv", [info, cluster, cues, bytes(858), tracks, second], 5, lists=D.SEEKHEAD)[0] == at[3]
+    looped = el(D.SEEKHEAD, seek_entry(D.SEEKHEAD, 0) + seek_entry(D.CUES, at[2] - seg))   # it lists the front SeekHead too
+    assert pad("looped.mkv", [info, cluster, cues, bytes(858), tracks, looped], 5, lists=D.SEEKHEAD)[0] == at[3]
+    got, at = pad("tags.mkv", [info, cluster, cues, tags, bytes(500), el(D.VOID, bytes(3)), tracks])   # whole elements on either side
+    assert got == at[4]
+    assert pad("short_pad.mkv", [info, cluster, cues, bytes(1), tracks])[0] is not None
+    for name, body, cues_at, kw in (
+            ("unknown.mkv", [info, cluster, cues, bytes(858), tracks], 2, {"unknown": True}),
+            ("cut_file.mkv", [info, cluster, cues, bytes(858), tracks], 2, {"cut": 10}),   # the Segment ends past the file
+            ("no_cues.mkv", [info, cluster, cues, bytes(858), tracks], None, {}),
+            ("cue_zeros.mkv", [info, cluster, bytes(len(cues)), bytes(858), tracks], 2, {}),
+            ("not_cues.mkv", [info, cluster, tags, bytes(858), tracks], 2, {}),   # the SeekHead points at another element
+            ("cues_unknown.mkv", [info, cluster, cues[:4] + bytes.fromhex("01ffffffffffffff") + cues[12:], bytes(858), tracks], 2, {}),
+            ("cues_first.mkv", [info, cues, cluster, bytes(858), tracks], 1, {}),
+            ("then_cluster.mkv", [info, cluster, cues, bytes(858), cluster, tracks], 2, {}),
+            ("then_cut.mkv", [info, cluster, cues, bytes(858), tracks[:-5]], 2, {}),   # Tracks runs past the Segment end
+            ("then_block.mkv", [info, cluster, cues, bytes(858), el(D.SIMPLEBLOCK, bytes(40))], 2, {}),   # no level-1 element
+            ("then_unknown.mkv", [info, cluster, cues, bytes(858), tags[:4] + bytes.fromhex("01ffffffffffffff") + tags[12:]], 2, {}),
+            ("to_end.mkv", [info, cluster, cues, bytes(858)], 2, {}),
+            ("random.mkv", [info, cluster, cues, noise(858), tracks], 2, {}),
+            ("two_runs.mkv", [info, cluster, cues, bytes(400), tags, bytes(400), tracks], 2, {}),
+            ("long_run.mkv", [info, cluster, cues, bytes(D.ZERO_RUN), tracks], 2, {})):
+        assert pad(name, body, cues_at, **kw)[0] is None, name
+
+
+def test_seeks_follows_a_chain_of_seekheads_and_reads_each_once(tmp_path):
+    """Reviewer 2026-10-16: a chain of SeekHeads, front to B to C, lists the Cues in C, so the header check finds them
+    and no header repair remuxes a healthy file. Two SeekHeads that list each other, or one that lists itself, end the
+    read, and each SeekHead is read once. A chain longer than SEEK_HEADS ends there."""
+    D, SH = hook.arr_decide, hook.arr_decide.SEEKHEAD
+    info, tracks = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 6).to_bytes(4, "big"))), el(0x1654AE6B, bytes(40))
+    cluster = el(D.CLUSTER, el(D.TIMESTAMP, b"\x00") + el(D.SIMPLEBLOCK, bytes(300)))
+    path = tmp_path / "heads.mkv"
+    j = {"container": {"properties": {"timestamp_scale": 1000000, "duration": 5000000000}}, "tracks": [{"type": "video", "properties": {"number": 1}}]}
+    long = [[(SH, 5 + k)] for k in range(hook.SEEK_HEADS - 1)] + [[(D.CUES, 2)]]   # with the front one, a SeekHead too many
+    for name, tail, reads, found in (
+            ("chain", [[(SH, 5)], [(SH, "front"), (D.CUES, 2)]], 2, True),   # C lists the front one too
+            ("pair", [[(SH, 5)], [(SH, 4)]], 2, False),
+            ("self", [[(SH, 4)]], 1, False),
+            ("long", long, hook.SEEK_HEADS - 1, False)):
+        # body[2] is the Cues, body[4] on the SeekHeads after the Tracks, each entry (id, the body index it lists)
+        body = lambda where: [info, cluster, cue_index([(0, 0)]), tracks, *(el(SH, b"".join(seek_entry(i, where(t)) for i, t in h)) for h in tail)]
+        at = made_mkv(path, body(lambda t: 0))
+        seg = D.segment_start(path.read_bytes())[0]
+        made_mkv(path, body(lambda t: 0 if t == "front" else at[t] - seg), 4, lists=SH)
+        with CappedFile(path) as f:
+            seek, _, lost = hook.seeks(f, f.read(hook.HEADER_READ), seg)
+            assert (seek.get(D.CUES), lost, f.reads - 1) == ([at[2] - seg] if found else None, [], reads), name
+        assert hook.header_probe(str(path), j)["cues"] == (True if found else "no SeekHead lists the Cues"), name
+
+
+def test_the_play_time_of_a_byte_comes_from_its_cluster(tmp_path):
+    """Owner 2026-10-16: the read pass's doubt names the play time of each byte. Reviewer 2026-10-16: it is the
+    Timestamp of the last Cluster the Cues name at or before the byte, so it is never more than a few frames later than
+    the damage, also for a Cluster that starts before its first cue. A Cluster after the last named one gives its own
+    Timestamp. A byte before the first Cluster is before the video, and one past the last Cluster is after it. A second
+    SeekHead may list the Cues. A Cluster whose Timestamp does not read gives no time. A broken Cluster hides where the last one ends, so
+    no byte past it has a time. With no Cues, with Cues that end in zeros, or with Cues the file end cuts, no byte has a
+    time."""
+    D = hook.arr_decide
+    info = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 5).to_bytes(4, "big")))   # ticks of 0.1 ms
+    clusters = [el(D.CLUSTER, el(D.TIMESTAMP, t.to_bytes(4, "big")) + el(D.SIMPLEBLOCK, bytes(500))) for t in (0, 585000, 2467000, 2500000)]
+    path, tracks = tmp_path / "timed.mkv", el(0x1654AE6B, bytes(40))
+    at = made_mkv(path, [info, *clusters])
+    seg = D.segment_start(path.read_bytes())[0]
+    points = [(0, at[1] - seg), (600000, at[2] - seg), (601000, at[2] - seg), (2467000, at[3] - seg)]   # 0, 60, 60.1 and 246.7 s
+    at = made_mkv(path, [info, *clusters, cue_index(points), tracks], 5)
+    probe, times = [at[0], at[1], at[1] + 300, at[2] + 1, at[4] + 100, at[5], at[6] + 3], ["start", 0.0, 0.0, 58.5, 250.0, "end", "end"]
+    assert hook.play_times(str(path), probe) == times
+    second = el(D.SEEKHEAD, seek_entry(D.CUES, at[5] - seg))   # mkvpropedit's index at the end of the file
+    made_mkv(path, [info, *clusters, cue_index(points), tracks, second], 7, lists=D.SEEKHEAD)
+    assert hook.play_times(str(path), probe) == times
+    broken = lambda c: bytes(4) + c[4:]   # a Cluster whose id is zeros
+    for body, cues_at, want in (
+            ([info, clusters[0], broken(clusters[1]), *clusters[2:], cue_index(points), tracks], 5, ["start", 0.0, 0.0, None, 250.0, "end", "end"]),
+            ([info, *clusters[:3], broken(clusters[3]), cue_index(points), tracks], 5, ["start", 0.0, 0.0, 58.5, None, None, None]),
+            ([info, *clusters, cue_index(points), tracks], None, [None] * 7),
+            ([info, *clusters, cue_index(points)[:-80] + bytes(80), tracks], 5, [None] * 7)):   # zeros over the last CuePoints
+        made_mkv(path, body, cues_at)
+        assert hook.play_times(str(path), probe) == want, want
+    made_mkv(path, [info, *clusters, cue_index(points)], 5, cut=len(cue_index(points[:1])) - len(cue_index([])))   # the file ends after a CuePoint
+    assert hook.play_times(str(path), probe) == [None] * 7
+
+
+@pytest.fixture(scope="module")
+def padded_media(whole_media, tmp_path_factory):
+    """The made-up MKV after the hook's flag edit, (folder, size before). Some releases end with a few hundred zero bytes
+    past their Segment. mkvpropedit writes the grown Tracks at the end of the file, after the zeros, and the Segment
+    then holds them. pad.mkv has 858 zero bytes, and edited.mkv none. The other copies of pad.mkv hold damage that must
+    still alert: 200 KiB of zeros at 50 percent, 2 KiB of zeros over the end of the last Cluster, zeros over the start
+    of the Cues, and random bytes in place of the padding. chapters.mkv is pad.mkv after mkvpropedit added chapters,
+    which moves the index to a second SeekHead at the end, and chapmid.mkv holds the zeros at 50 percent too."""
+    D, d = hook.arr_decide, tmp_path_factory.mktemp("padded")
+    clean = whole_media / "clean.mkv"
+    end = os.path.getsize(clean)   # where the padding starts
+    shutil.copy(clean, d / "pad.mkv"); shutil.copy(clean, d / "edited.mkv")
+    with open(d / "pad.mkv", "ab") as f:
+        f.write(bytes(858))
+    for name in ("pad.mkv", "edited.mkv"):
+        REAL_RUN(["mkvpropedit", "-q", str(d / name), "--edit", "track:a1", "--set", "flag-original=1"], check=True)
+    (d / "chapters.xml").write_text("<?xml version=\"1.0\"?><Chapters><EditionEntry><ChapterAtom><ChapterTimeStart>00:00:00.000</ChapterTimeStart>"
+                                    "<ChapterDisplay><ChapterString>One</ChapterString></ChapterDisplay></ChapterAtom></EditionEntry></Chapters>")
+    shutil.copy(d / "pad.mkv", d / "chapters.mkv")
+    REAL_RUN(["mkvpropedit", "-q", str(d / "chapters.mkv"), "--chapters", str(d / "chapters.xml")], check=True)
+    shutil.copy(d / "chapters.mkv", d / "chapmid.mkv")
+    b = (d / "pad.mkv").read_bytes()[:64 << 10]
+    ds = D.segment_start(b)[0]; cues = ds + D.front_seeks(b, ds)[D.CUES][0]
+    for name, at, data in (("mid", end // 2, bytes(200 << 10)), ("endclu", cues - 2048, bytes(2048)), ("cuehead", cues, bytes(64)),
+                           ("rand", end, noise(858)), ("chapmid", end // 2, bytes(200 << 10))):
+        if name != "chapmid":
+            shutil.copy(d / "pad.mkv", d / f"{name}.mkv")
+        with open(d / f"{name}.mkv", "r+b") as f:
+            f.seek(at); f.write(data)
+    return d, end
+
+
+@pytest.mark.parametrize("name, padding, doubt", [
+    ("pad.mkv", True, None), ("edited.mkv", False, None), ("mid.mkv", True, r"at \d:\d\d"), ("endclu.mkv", True, r"at \d+% of the file size"),
+    ("cuehead.mkv", False, r"at \d+% of the file size"), ("rand.mkv", False, "after the video and audio end"), ("chapters.mkv", True, None),
+    ("chapmid.mkv", True, r"at \d:\d\d")])
+def test_the_whole_file_check_drops_only_the_padding_byte(padded_media, tmp_path, settings, name, padding, doubt):
+    """Owner 2026-10-16: four false alerts said "damaged data at 100% of its length" after the hook's flag edit of a
+    release that ends with zero padding. The read pass names the first zero, and no player reads it. The log keeps the
+    byte in padding. Damage in a Cluster, over the Cues or in place of the padding still alerts, beside the padding too.
+    The zeros over the end of the last Cluster cover the start of a short last Cluster, so its time is not known, and
+    the alert names a share of the file size. Reviewer 2026-10-16: a second SeekHead that lists the Cues gives the
+    padding and the play times too."""
+    settings(state_dir=str(tmp_path))
+    d, end = padded_media
+    certain, zeros, more, f = hook.whole_check(str(d / name))
+    assert certain is None and zeros == [] and f["ffmpeg"].get("padding") == (end if padding else None), f["ffmpeg"]
+    if doubt is None:
+        assert more == [] and end not in f["ffmpeg"]["pos"], f["ffmpeg"]
+    else:
+        assert len(more) == 1 and re.fullmatch(rf"a full read of the file found damaged data {doubt}", more[0]), (more, f["ffmpeg"])
 
 
 def test_the_zero_scan_counts_each_long_run_once_across_its_reads(tmp_path, monkeypatch):
@@ -20365,7 +22208,7 @@ def test_the_whole_file_check_stops_with_no_ffmpeg_left(whole_media, tmp_path, m
         monkeypatch.setattr(hook, "WHOLE_MIN", 0)
         monkeypatch.setattr(hook, "WHOLE_RATE", 1e15)
         certain, zero, more, f = hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
-        assert (certain, len(zero), more, f["ffmpeg"]["skipped"]) == (None, 1, [], "ran over 0 s") and re.fullmatch(gap_words(0.5), zero[0]), f
+        assert (certain, len(zero), more, f["ffmpeg"]["skipped"]) == (None, 1, [], "ran over 0 s") and re.fullmatch(GAP_WORDS, zero[0]), f
     else:
         with pytest.raises(hook.Yielded):
             hook.whole_check(str(whole_media / "zeros1.mkv"), stop)
@@ -20411,7 +22254,7 @@ def whole_import(env, monkeypatch, gaps, probe=(), src=None):
     whole-file check job runs after it."""
     monkeypatch.setattr(hook, "whole_plan", REAL_WHOLE_PLAN)
     if probe is not None:
-        monkeypatch.setattr(hook, "zero_probe", lambda path, again=False, stop=None: (list(probe), 256 << 16, False))
+        monkeypatch.setattr(hook, "zero_probe", lambda path, again=False, stop=None: ([int(os.path.getsize(path) * s) for s in probe], 256 << 16, False))
     data = bytearray(open(src, "rb").read() if src else noise(8 << 20))
     for share in gaps:
         data[int(len(data) * share):int(len(data) * share) + (300 << 10)] = bytes(300 << 10)
@@ -20448,8 +22291,9 @@ def test_one_blank_gap_only_alerts_once(env, monkeypatch, probe):
     """One gap is a doubt, which never re-grabs. When the import's probe found it, the import's alert named it, so the
     whole-file check logs it only."""
     rec = whole_import(env, monkeypatch, (0.5,), probe)
-    assert env["writes"] == [] and rec["outcome"] == "video_doubt" and rec["whole"]["doubts"] == ["the file has a blank gap at 50% of its length"]
-    assert posted(env) == [("Video may be broken", "The file has a blank gap at 50% of its length.")], posted(env)
+    assert env["writes"] == [] and rec["outcome"] == "video_doubt" and rec["whole"]["doubts"] == ["the file has a blank gap at 50% of the file size"]
+    alert = "at 50% of the file size." + ("" if probe else " AMG kept the file and did not re-grab it.")   # the import's alert, or the check's own
+    assert posted(env) == [("Video may be broken", f"The file has a blank gap {alert}")], posted(env)
     assert ("findings" in rec) == (not probe) and rec["result"].endswith(", logged only, the import's alert named it") == bool(probe)
 
 
@@ -20631,7 +22475,7 @@ def test_one_real_gap_in_a_pcm_file_alerts_from_the_whole_file_check(env, monkey
     (run,) = rec["whole"]["zeros"]["count"]   # it takes in the silent block before the gap, under 4 percent of the file
     share = run[0] / rec["whole"]["size"]
     assert 0.46 <= share <= 0.5 and title == "Video may be broken" and env["writes"] == []
-    assert text == f"The file has a blank gap {hook.arr_decide.places([round(share, 3)])}.", text
+    assert re.fullmatch(r"The file has a blank gap at 0:0\d\. AMG kept the file and did not re-grab it\.", text), text   # a 12-second file
 
 
 @pytest.mark.parametrize("share", [0.265, 0.8525])
@@ -20644,7 +22488,6 @@ def test_one_gap_beside_silence_counts_once(whole_media, tmp_path, settings, sha
     (tmp_path / "gap.mkv").write_bytes(data)
     certain, zero, more, f = hook.whole_check(str(tmp_path / "gap.mkv"))
     assert certain is None and len(f["zeros"]["count"]) == 1 and len(f["zeros"]["runs"]) > 1, f["zeros"]
-
 
 
 @pytest.mark.parametrize("name, codec", [("ipcm7.1.mp4", "pcm_s24le"), ("fl32_7.1.mov", "pcm_f32le")])

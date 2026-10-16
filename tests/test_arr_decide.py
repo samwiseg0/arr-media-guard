@@ -374,7 +374,10 @@ def test_the_decision_rules(monkeypatch):
         "the video is broken at 2 of 3 places checked: 1 playback error at 2:30 and no video at 42:30")
     assert decide.video_verdict([], [ok, ok, at(empty, 2550)]) == (None, ["no video at 42:30"])
     assert decide.video_verdict([0.3, 0.5], [])[0].startswith("the file has blank gaps at 2 of 256")
-    assert decide.video_verdict([0.3], [ok, ok, ok]) == (None, ["the file has a blank gap at 30% of its length"])
+    assert decide.video_verdict([0.3], [ok, ok, ok]) == (None, ["the file has a blank gap at 30% of the file size"])   # no play time
+    gap = lambda when: decide.video_verdict([0.3], [ok, ok, ok], when=[when])[1]   # owner 2026-10-16: as the whole-file check says it
+    assert gap(164.164) == ["the file has a blank gap at 2:44"] and gap(None) == ["the file has a blank gap at 30% of the file size"]
+    assert gap("start") == ["the file has a blank gap before the video starts"] and gap("end") == ["the file has a blank gap after the video and audio end"]
     assert decide.video_verdict([], [ok, ok, at(cut, 2550)]) == (None, ["no video at 42:30, where the file is cut off"])
     capped = at(decide.parse_window(frames(3), rc=1), 1502, stopped="read over 512 MiB")   # a killed window never counts as bad
     assert decide.video_verdict([], [capped, capped, ok]) == (None, [])   # the read cap alone is no doubt

@@ -441,6 +441,9 @@ count, because clean files log them too.
 
 Clean encoders pad easy frames with short zero runs, so only a run of 256 KiB counts. The zero probe
 skips the Attachments and anything past the Segment end, where fonts and old copies can hold zeros.
+The doubt of one hit names a play time with the words of the whole-file check, see "Play times" under
+"Whole-file check". The decision line keeps the hits as shares of the file size in `video.zeros.hits`
+and their times in `video.zeros.when`. Only a file with a hit reads the Cues for them.
 
 In a Matroska, MP4 or MOV file with a PCM audio track the zero probe's hits only log, with no alert and no re-grab.
 Digital silence in PCM audio is zero bytes, so the probe defers to the whole-file check, whose read pass confirms each
@@ -500,13 +503,39 @@ whole, so it is logged only. In MP4 and MOV the read pass names no byte inside a
 there is logged only. In AVI, MPEG-TS and VOB the read pass named no byte inside a gap either, and silent PCM left no
 zero run. So in those containers every run counts, whatever the audio.
 
-A healthy file prints nothing in the read pass. Every line counts, except the lines the windows skip too: ffmpeg's repeat
-counter and the null muxer's complaint of a repeated timestamp. That complaint names no byte of the file, and a healthy
-episode printed it. A remux printed it once a packet, so the stderr goes through a pipe and only the other lines stay.
+A healthy file prints nothing in the read pass, except at zero padding (below). Every line counts, except the lines the
+windows skip too: ffmpeg's repeat counter and the null muxer's complaint of a repeated timestamp. That complaint names
+no byte of the file, and a healthy episode printed it. A remux printed it once a packet, so the stderr goes through a pipe and only the other lines stay.
 A line that names a byte within 1 percent of the file of a run that counts belongs to that run, so it adds no doubt.
 `-ignore_unknown` leaves out a stream of a type ffmpeg does not know, as in some MPEG-TS files. A file that ffmpeg
 cannot open, or whose streams it cannot set up, gives no doubt. Neither does a read pass that runs over `WHOLE_MIN`
 seconds or the time the file needs at `WHOLE_RATE`, whichever is longer.
+
+**Zero padding.** Some releases end with a few hundred zero bytes past the Segment end. The hook's flag edit can grow
+the Tracks, and mkvpropedit then writes them at the end of the file, after the zeros. The Segment then holds the zeros,
+and the read pass names the first one. `checks.zero_pad()` drops that byte when it starts the one zero run after the
+Cues. Only whole elements that are not Clusters may lie from the Cues to the Segment end, and at least one must follow
+the run. No player reads those zeros. The decision line keeps the byte in `whole.ffmpeg.padding`. An unknown Segment
+size, a Segment end past the file end, no SeekHead that lists the Cues, Cues before a Cluster and a run of 256 KiB or
+more keep the doubt. When mkvpropedit adds chapters, it can move the index to a second SeekHead at the end of the
+file, which the front one lists. `checks.seeks()` reads that one too, as the header check does. It follows a chain of
+such SeekHeads and reads each one once, 8 at most, so SeekHeads that list each other end the read.
+
+**Play times.** The doubts of the whole-file check and of the import's zero probe name play times, from the Cues, see
+`checks.play_times()`. So a gap reads the same whichever check found it. The read pass names the time of each byte, one
+blank gap names the time of its first byte, and the probe names the time of the zero page it read. A byte gets the
+Timestamp of the last Cluster that the Cues name at or before it, from a 32-byte read of that Cluster's start. So the
+time is never more than a few frames later than the damage. Reordered frames can time a block a little before its
+Cluster's Timestamp. A Cluster that the Cues do not name makes the time earlier. The first cue time of a Cluster can
+be seconds late, where the Cluster starts before its first cued keyframe. The Clusters after the last named one are
+walked, up to 64. A byte before the first named Cluster is "before the video starts", and a byte past the last Cluster
+is "after the video and audio end". When the walk reaches neither the next element after
+the Clusters nor the Segment end, a byte past the Clusters it read gets no time. Neither does a byte of a Cluster
+whose Timestamp does not read. A byte with no time names its share of the file size. So does every byte of a file
+with no SeekHead that lists the Cues, and of a file whose Cues do not parse to their end, as when the last piece of
+a download is lost. The decision line keeps the bytes in `whole.ffmpeg.pos` and `whole.zeros.runs`, and the
+times in `whole.ffmpeg.when` and `whole.zeros.when`. The whole-file check's alert also says that AMG kept the file and
+did not re-grab it.
 
 A certain verdict re-grabs the job's file alone, with `REGRAB`, `REGRAB_CAP` and the restore of an import's re-grab.
 Each other file of the download has a job of its own. Under the exclusive file lock, the second check measures the runs
@@ -958,6 +987,23 @@ because a warning can be harmless, such as zero bytes it skips at an audio end. 
 `-copyinkf` keeps the frames before the first keyframe. A c608 caption track becomes an English
 SubRip track, because mkvmerge drops it.
 
+**Broken timed text.** MP4 timed text must be UTF-8. Some files hold a track in an old codepage, such as Persian in
+cp1256, and every player shows it as garbage. mkvmerge's MP4 reader, in 92 and 102, writes U+FFFD for each byte it
+cannot read. It ignores `--sub-charset`. So `broken_tracks()` reads the packets of each timed-text track with `-c copy`
+and takes the text bytes after each 2-byte length. A track with any packet whose text is not valid UTF-8 is *broken*.
+One stray byte in an English UTF-8 track is enough. AMG does not repair a broken track, because each automatic repair
+it tried had a case that wrote wrong text.
+
+The remux removes a broken track, and the proof leaves it out, as for a track the subtitle match drops. The subtitle
+match does not read it. Its bytes go beside the new file, see "Unreadable subtitles". The file is SubRip. Its number
+lines, time lines and blank lines are ASCII, and each cue holds the text bytes of its packet as they are. The times
+follow the new file. mkvmerge starts an MP4 at the earliest packet of the tracks it keeps, before 0 or after it. An AAC
+priming edit puts the first audio packets before 0. A removed track no longer counts, so a video that starts after 0
+then starts at 0. The times move by the same amount, see `start_shift()`. When no name is free, the conversion is
+skipped as `repack_name_taken`. A stranded conversion keeps the file beside the new file. A dry run writes nothing,
+and its result names each file. The decision line names each broken track in `repack.broken`, by its place in the
+original.
+
 An AVI stream header can hold `dwStart`, the time the stream starts after the start of the file.
 ffmpeg honours it, and mkvmerge starts every track at 0. A video that starts 2 frames late would then
 play 83 ms early against the audio. So for an AVI, ffprobe reads the first packet of each video and
@@ -965,8 +1011,31 @@ audio stream, and mkvmerge gets each start of 1 ms to 10 seconds back with `--sy
 starts later than that, no stream gets `--sync`. mkvmerge then starts every track at 0 as before
 2.11.2, and the proof decides. The first packet decides, because ffprobe's stream start time can say
 0 for such a stream. The decision line names each start in `repack.start_sync`. Other containers get
-no `--sync`, because mkvmerge reads an MP4 edit list and the times of a TS itself. The proof still
+no `--sync` for a late start, because mkvmerge reads an MP4 edit list and the times of a TS itself. The proof still
 checks every start.
+
+**An MP4 video in its own input.** mkvmerge hands the frames of each track to the code that writes that track, and
+this code can hold frames back. When one track of an input reads its last packet, mkvmerge tells the code of every
+track of that input to write out the frames it holds. For HEVC and MPEG-1/2 that works only the first time. So when
+another track ends first, such as a subtitle track or an audio track, the video loses frames at its end. A GOP is the
+run of frames from one keyframe up to the next. HEVC loses every frame after its last keyframe. It loses that keyframe
+too when the other track ends before the GOP that leads up to it. MPEG-1/2 loses more. mkvmerge 92 and 102 drop them
+with no warning, and the proof refuses the new file. This is mkvmerge issue 6320,
+https://codeberg.org/mbunkus/mkvtoolnix/issues/6320. So each video track of an MP4 with a video codec of `LAST_GOP`
+comes from its own input of the file. The other tracks come from one more input with `-D`, and only that input gives
+the chapters, the tags and the attachments. mkvmerge starts each input at its own earliest packet. So `split_sync()`
+gives the tracks of each input a `--sync`. It is the time from the earliest packet of all kept tracks to the earliest
+packet of the input, see `start_shift()`. A dropped track and a broken track are not kept. They count for no start,
+and no input reads them. ffprobe finds those packets in the first 500 packets of the file. A file
+keeps one input when a kept track has no packet among them. It keeps one input too when ffprobe flags one of them D
+(discard). An edit list cuts such a packet, and mkvmerge keeps and times it by its own rules. In a file cut with
+`ffmpeg -ss`, ffprobe's start of the audio was 0.3 s off. Audio packets that end at 0 s or before, and start less than
+1 s before 0, are the exception. An AAC priming edit gives them, and mkvmerge keeps them at ffprobe's times. ffmpeg
+keeps at most 1 s of audio before an edit, so an earlier start can be cut short. `--sync` takes whole milliseconds, so
+a packet can move 1 ms against a one-input remux. The decision line names each `--sync` in `repack.split_sync`. H.264,
+MPEG-4 part 2, AV1 and VP9 lose no frame, and their files keep one input. The test
+`test_mkvmerge_still_loses_the_last_gop_of_an_hevc_mp4` is the signal to remove the split. It fails when a mkvmerge
+with issue 6320 fixed keeps those frames.
 
 **The proof.** No stream is decoded. ffmpeg reads both files at once with `-c copy -copyinkf
 -copyts -f framemd5` and pairs the streams of each kind. `-copyinkf` keeps the frames before the
@@ -989,7 +1058,10 @@ again. ffprobe only demuxes. The second check decides, and the proof entry names
 `times.reread`. The second read runs only after a failed check. Stored times that moved still fail.
 
 The proof allows a cut last frame and a cut first audio frame that mkvmerge drops, because a cut
-frame cannot decode. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
+frame cannot decode. After a cut first frame, the second packet must keep its time within 2 ms
+(`TIME_SLACK`). mkvmerge drops an MP4's cut first audio frame after an empty edit and keeps it with
+none, so a `--sync` of `split_sync()` from its time plays the audio a frame early. The proof refuses
+that file. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
 passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
 The first MP3 or MP2 packet can also hold junk before a whole frame, zeros or a RIFF header of at
@@ -1117,11 +1189,13 @@ A conversion reads the whole original, so it can show that the download is damag
 re-grabs the import. Only these signs count:
 
 - mkvmerge warns "This audio track contains N bytes of invalid data which were skipped" for an audio
-  track, more than `SKIP_EDGE` (5) seconds from either end of the file. The proof then refuses that
-  same audio stream, for its packet count or its packet data. The k-th audio track of mkvmerge is the
-  k-th audio stream of ffprobe, as the proof pairs them.
+  track, or "1 byte ... which was skipped", more than `SKIP_EDGE` (5) seconds from either end of the
+  file. The proof then refuses that same audio stream, for its packet count or its packet data. The
+  k-th audio track of mkvmerge is the k-th audio stream of ffprobe, as the proof pairs them.
 - ffmpeg does not read the original cleanly in the proof, with "NAL unit size", "Invalid data found" or
-  "partial file". A failed read of the temp file says nothing of the original.
+  "partial file". A failed read of the temp file says nothing of the original. A line of a subtitle stream's
+  decoder never counts (`SUB_DECODER`). ffmpeg 7 prints "Error decoding subtitles: Invalid data found" for timed
+  text that is not UTF-8, while the video and the audio read. A read whose only errors are such lines is a refusal.
 - ffprobe reads no stream in the original and names a data error, "Invalid data found", "moov atom not
   found" or "partial file". An empty message or a read error of the file system is no damage.
 
@@ -1134,7 +1208,7 @@ The re-grab uses the steps and safeguards of "Broken audio". They are the grab r
 the download as one unit, the second check and "Restore after a bad upgrade". The second check runs
 the read that showed the damage again, from scratch. mkvmerge remuxes into `/dev/null` and must skip
 invalid data in the same audio stream, away from the ends, again. ffmpeg reads the original through the
-proof's filters, and ffprobe probes it. The proof does not run again, and its refusal stands. The
+proof's filters, and ffprobe probes it. A line of a subtitle decoder is no damage there either. The proof does not run again, and its refusal stands. The
 re-grab judges only the job's own file. Another file of the download shows its damage in its own
 conversion, and joins the unit then. A re-grab that deletes the file ends the job. Otherwise the
 original stays and gets the import's audio and video checks. The decision line has the outcome
@@ -1473,25 +1547,38 @@ order or size than mkvmerge and ffmpeg. The decision log holds each answer in `r
 An old muxer could take a sidecar in a legacy codepage for cp1252. It wrote each byte as the character
 cp1252 gives it, so Greek "Καλημέρα, φίλε μου" became "ÊáëçìÝñá, ößëå ìïõ". Such text is *garbled*. The muxer also
 cut a cue at a byte cp1252 leaves undefined: 0x81, 0x8D, 0x8F, 0x90 and 0x9D. mkvmerge still does. Garbled subtitle
-repair gives such a track its text back, or takes it out of the file when it cannot.
+repair gives a track its text back when the repair checks itself. Else the track leaves the file, and its bytes go
+beside the video, see "Unreadable subtitles". Data a player cannot read right is broken, and AMG removes it unless a
+fix is easy and sure.
 
-**Where it runs.** `--sub-check`, `--sub-time` and the deep analysis check every SubRip track of a
-Matroska file. An import does not. The muxes that garbled text are old, and old mkvmerge versions
-wrote no Cues entries for subtitle blocks. So only a read of the whole file reaches their text. These
-runs make that read, and an import never does.
+**Where it runs.** `--sub-check`, `--sub-time` and the deep analysis check every SubRip, ASS, SSA and WebVTT track of a
+Matroska file, and every UTF-8 `.srt` sidecar beside it. An import does not. The muxes that garbled text are old, and
+old mkvmerge versions wrote no Cues entries for subtitle blocks. So only a read of the whole file reaches their text.
+These runs make that read, and an import never does.
 
 **The check.** The cp1252 bytes of garbled text are the sidecar's bytes. `decide.recode()` *reads them back*: it decodes
 them as UTF-8 and as each other codepage of `CODEPAGES`, see "Subtitle text". A character that cp1252 does not write,
 such as a "♪" a later tool added, stays as it is, and the text around it reads back. A reading counts when every cue
 decodes, it changes 1 percent of the letters at least (`GARBLE_SHARE`), and its text reads as a language the codepage
 writes. Text in its right encoding changes only in a few borrowed words. A UTF-8 reading counts with no language too,
-because text in another codepage holds no pairs such as "Ã©" that decode as UTF-8. A track of 300 letters or more is
+because text in another codepage holds no pairs such as "Ã©" that decode as UTF-8. When the text as it stands reads
+as a language, or a cut cue holds a letter before its cut, a UTF-8 reading counts only when one character decodes
+whole. Right text whose only letters outside ASCII end its cues, as "José" in English or Indonesian dialogue, reads as
+UTF-8 cut at each of those cues, and decodes no character. A Hebrew track whose every cue the muxer cut in its first
+character, the right-to-left mark, decodes none either, but its text reads as no language, and no cue holds a letter
+before its cut. A track of 300 letters or more is
 garbled when a reading counts. A UTF-8 reading wins over every other. Else the reading in the language of the track's
-tag wins.
+tag wins. The check reads the dialogue of an ASS, SSA or WebVTT cue: override blocks such as `{\an8}`, karaoke tags,
+the drawing commands after `{\p1}` and WebVTT tags drop out, see `subtitles.dialogue()`. A no-break space stays,
+because garbled "à" holds one.
 
-**The repair rule.** A garbled track is repaired when its reading reads as the language of its tag.
-Else it leaves the file, see "A track that cannot be repaired". The rule holds for Latin text such as
-French, whose garbled words still read as French, because most of them are plain ASCII.
+**The repair rule.** A garbled SubRip track is repaired when its reading is UTF-8 and reads as the language of its tag.
+Every character of a UTF-8 read-back must decode, so the read-back checks itself. A one-byte codepage decodes almost
+every byte. When the muxer lost a byte, the read-back drops or changes letters and nothing shows it. Persian in cp1256
+loses letters such as پ, چ and گ that way. A latin-1 muxer leaves control characters that read back as wrong letters.
+So any other reading leaves the file. So does a reading that matches no language or another language than the tag,
+and a garbled ASS, SSA or WebVTT track, because the proof checks the new text of a SubRip track only. The rule holds
+for Latin text such as French, whose garbled words still read as French, because most of them are plain ASCII.
 
 **The word check.** The word check of "Subtitle match" compares the heard words with the cue text, so it cannot judge
 garbled text. A garbled track whose words do not match keeps its place: its verdict becomes `unknown` with `held`, and
@@ -1503,18 +1590,10 @@ alerts and nothing is pending, see "Long subtitle track handling".
 rebuilds the text from the same inputs, so it shows that the remux wrote the plan, never that the plan
 is right. These guards carry that:
 
-- The track's own text is read back. In a one-byte codepage a character keeps its garbled form when its read-back would
-  be neither a letter the tag's language writes (`ALPHABETS`) nor a symbol such as "№" or "€" (`SYMBOLS`). A right
-  "Señor" in Romanian text then stays, where cp1250 would give "Seńor". Marks such as "ˇ" and "˛" are no symbols there,
-  so a right "¡" or "²" stays too. A Latin letter right after an ASCII digit stays, as the "º" of "40.5ºC", unless a
-  lowercase letter follows it. Then it starts a word joined to a number, as "9876şase". In Cyrillic, Greek, Hebrew and
-  Arabic text a word that holds ASCII letters keeps its letters, as a right "Café". A garbled word of those scripts
-  holds none, because their codepages write every letter above 0x7F. `decide.kept()` holds these rules.
-- A cue cut inside a character gets U+FFFD there and counts as cut. A cue cut between two characters
-  only ends early, and nothing marks it. In a one-byte codepage every cut is of that kind, such as at
-  Ť and ť of cp1250, so `REPAIR_CUT` cannot count them. The repair loses nothing the garbled track
-  still held. When more than 2 percent of the cues are cut (`REPAIR_CUT`), the track is not repaired. The
-  remux counts again over every cue it writes, and a cue that does not read back stops it.
+- The track's own text is read back from UTF-8.
+- A cue cut inside a character gets U+FFFD there and counts as cut. When more than 2 percent of the cues are cut
+  (`REPAIR_CUT`), the track is not repaired. The remux counts again over every cue it writes, and a cue that does not
+  read back stops it.
 - A track whose read was cut short is never repaired or taken out, because its later cues were never
   judged. Its verdict holds `capped`, and it only alerts.
 - A sidecar beside the file fills in the cues the muxer cut short when it is the track's source. Its name and its text
@@ -1536,18 +1615,77 @@ is right. These guards carry that:
   so it still shows every packet the same.
 - A repaired track gets no other change in the run, such as new times. A later run judges its times.
 
-**A track that cannot be repaired.** A track the check finds garbled but cannot repair leaves the file
-in the same proven remux, as a removal does (`subtitle_garbled_removed`). The original is kept for
-`KEEP_ORIGINALS_DAYS`, so with `0` the track stays and alerts. Its bytes go beside the video as
-`<name>.<language>.garbled.txt`, which players skip. A taken name gets a number, as `.garbled.1.txt`, and
-no file is ever written over. The remux's ffmpeg read writes the track's packets as they are into a
-SubRip file, and `proof.packet_text()` shows each cue's bytes equal to its packet's md5. The copy beside
-the video is read back and must hold the same bytes. A dry run, `SUBTITLES=check` and a track with a cut
-read only alert. A track the check misses is never touched.
+**A track that cannot be repaired.** A garbled track that is not repaired leaves the file in the same proven remux, as
+a removal does (`subtitle_garbled_removed`). The original is kept for `KEEP_ORIGINALS_DAYS`, so with `0` the track
+stays and alerts. Its bytes go beside the video in its own format, see "Unreadable subtitles". The remux's ffmpeg
+read writes the packets of a SubRip track as SubRip, and `proof.packet_text()` shows each cue's bytes equal to its
+packet's md5. The same read writes the packets of an ASS, SSA or WebVTT track as they are. mkvextract then writes the
+track's file with its header from the codec private data: the script info and styles of ASS and SSA, and the WebVTT
+header, cue settings and identifiers. `proof.event_text()` shows the text of every packet in that file, byte for byte.
+A dry run, `SUBTITLES=check` and a track with a cut read only alert. A track the check misses is never touched.
 
-The decision log holds each verdict under `garbled`, and `later` on a repaired track whose times or
-words wait for the next run. The remux names the repaired tracks in `subremux.recoded`, with the reason
-`subtitle_repaired`, and the tracks taken out with their file names in `subremux.stripped`.
+**A garbled sidecar.** A UTF-8 `.srt` sidecar gets the same check, with the language of its name as its tag. A
+sidecar with no language in its name takes the language its UTF-8 read-back reads as, and the check of the repaired
+text holds it to that. The check reads each cue as the file holds it, so the no-break space of a garbled "à" stays.
+The repair rule holds as for a track, with the same proof: the read-back and the check of the repaired text. No cue
+may stay cut, because no muxer cut a sidecar's cues, and U+FFFD at a cut would stand where a right letter was. The word check, the
+timing and the flash check read a sidecar to repair, as they read a garbled track. A mismatch of its words waits, and
+so do its new times, its moved lines and its flash ends. The run then stays pending, so the next run judges the
+readable text. A mismatch that another check finds moves the sidecar to the kept originals, as a removal takes out a
+garbled track.
+
+`subtitles.side_repair()` writes the text of each cue read back, see `remux.repair_text()`. Every other byte stays, a
+BOM and the line ending of each line too. The new text must hold each cue of the old one at its times, with its repaired text, as
+the proof holds a repaired track. The original goes to the kept originals, as for a retimed sidecar. So with
+`KEEP_ORIGINALS_DAYS` `0` the sidecar stays and alerts. A sidecar that changed since the check stays.
+
+Every other garbled sidecar is renamed, and so is one whose repair fails its proof at the check or at the write. Its
+bytes move to the name of "Unreadable subtitles", so a player, the apps and Bazarr no longer read it. The move needs no
+kept original. `subtitles.broken_side()` makes a hard link of the sidecar at the new name and checks the link's bytes.
+On a share that refuses a hard link, `keep_broken()` writes a copy. The sidecar's name then goes only while it names
+the same file, with the inode, size and mtime of that check. So a sidecar Bazarr writes during the move stays, and the
+new name goes. The word check, the timing and the flash check leave a sidecar to rename out. A sidecar in another
+charset is not checked, see "Subtitle text". Bazarr may fetch a new sidecar after the move, and the next run checks it.
+
+The decision log holds each track's verdict under `garbled`, and `later` on a repaired track whose times or words wait
+for the next run. The remux names the repaired tracks in `subremux.recoded`, with the reason `subtitle_repaired`, and
+the tracks taken out with their file names in `subremux.stripped`. A garbled sidecar is a `sidecars` entry with the
+action `repair` or `rename` and its verdict in `garbled`. A rename holds the new name in `to`. A repair holds the kept
+original in `kept`, and `later` when its times or words wait for the next run.
+
+## Unreadable subtitles
+
+AMG keeps the bytes of subtitles it takes out because no player reads them right in one file beside the video. Three
+callers use one path, `remux.broken_plan()`, `keep_broken()` and `drop_broken()`: a conversion that removes a broken
+MP4 timed-text track, see "Conversion", a subtitle remux that removes a garbled track, and the move of a garbled
+sidecar, see "Garbled subtitle repair".
+
+**The name.** The file is `<name>.<language>.broken-encoding.<format>.txt`, as `Film (2001).per.broken-encoding.srt.txt`.
+The language is the track's tag, or the language part of a sidecar's name. A track with no tag has no language part.
+The format is `srt`, `ass`, `ssa` or `vtt`, the track's own. Players, the apps and Bazarr skip a `.txt` file, and AMG's
+own sidecar scans read `.srt` files only. AMG never writes over a file. A file with the same bytes stays, as when the
+same release converts again or Bazarr fetches the same sidecar again. When a file of other bytes holds the name, or
+two entries share the language part and the format, the name takes a number in front of `.broken-encoding`: the
+track's number, as `Film (2001).per.3.broken-encoding.srt.txt`, or 1 and up for a sidecar. No two entries take one
+name. A dry run names each file before the bytes are read, so a name a file holds counts as taken there. A subtitle
+remux plans the same way before its remux. A garbled track whose names all hold files stays in the file then, and the
+alert says why. The remux makes its other fixes.
+
+**The write.** `keep_broken()` writes the file with the owner and mode of the file it came from, see `own_like()`, and
+reads it back. It creates the file with that mode, as `new_tmp()` does, so a share that refuses chmod keeps it. It writes after the proof and the swap's checks, and before the rename, so a failed write keeps the
+original. When a later step fails, or an undo puts the original back, `drop_broken()` removes each file it wrote. A
+file it reused stays. The entry of each file holds `sidecar`, `reused`, `written` and `removed`, and the decision line
+keeps them. A subtitle remux names each file in `subremux.garbled_text`, and a failed one the files it removed again
+in `subremux.garbled_text_removed`.
+
+**The notice.** `report.unreadable_finding()` builds the one alert, "Unreadable subtitles". It names each track as
+track N of the original file and each sidecar by its name, with the file that holds its bytes. A conversion's alert
+starts with the conversion. A run posts one such alert, and it also says each repair of the run, see
+`subtitles.sub_findings()`. When a run converts the file and then takes out garbled tracks or renames sidecars, the
+alert names the conversion first, then the tracks taken out after it, see `process.after_edit()`. Such a track goes
+by its number in the original file when it came from one of the original's tracks, see `process.conversion()`. A
+track the conversion added, as a muxed sidecar, goes as track N of the converted file. It posts with `DISCORD_POSTS`
+issues, from the deep analysis and a recheck too. With `all` it is the only post of a conversion and of the repairs.
 
 ## Subtitle match
 
@@ -1811,6 +1949,10 @@ A check is stale when its registry entry says a newer version can fix its findin
 recheck job of each stale file in the background queue, behind the imports, the burn-in jobs, the whole-file checks
 and the deep analyses,
 and ahead of the jobs a backfill queued. A recheck makes the checks of the run that saved the result, and none deeper.
+Garbled subtitle repair 2 checks `.srt` sidecars and ASS, SSA and WebVTT tracks, and takes out a track that reads back
+only from a one-byte codepage. A track version 1 repaired in place from such a codepage is UTF-8 now, so the recheck
+finds no reading in it. It stays as it is, with any wrong letters of that repair. A saved result names no codec, so every result of version 1 of `--sub-check`, `--sub-time` or
+the deep analysis is stale once, and the first start after the update queues one recheck of each such file.
 
 **Flash cues.** A release can store right starts with ends a tenth of a second later, so a player flashes each line.
 The check reads the CueDuration of each subtitle entry from the Cues, which mkvmerge and ffmpeg write, so it reads no
@@ -1833,10 +1975,11 @@ spaces. The rank applies only when every ReadOrder of the track is a whole numbe
 are equal. Otherwise each packet must keep its ReadOrder. The proof names the counts of packets that changed in
 `read_order` and `space_cut`. The order of the events stays, and libass draws a line the same without its trailing
 spaces.
-mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as LF or CRLF. mkvmerge 92 stores
-CRLF, and a newer mkvmerge may store LF. So the proof compares each packet of a SubRip track that went through the round
-trip with each CRLF as LF, in both files, and names the count of packets that changed in `crlf`. A track that ffmpeg
-copies from the source file keeps the strict rule, also when `-itsoffset` moves it. Any other change of a byte fails.
+mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as LF or CRLF. mkvmerge 92 and
+102 store CRLF, and the mkvmerge that made a source may have stored LF. So the proof compares each packet of a SubRip
+track that went through the round trip with each CRLF as LF, in both files, and names the count of packets that changed
+in `crlf`. A track that ffmpeg copies from the source file keeps the strict rule, also when `-itsoffset` moves it. Any
+other change of a byte fails.
 The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake writes starts in milliseconds. The
 round trip puts each start on the centisecond grid, up to 5 ms away. So such a track gets one plan of every start and
 end, with each start on the nearest centisecond, and the proof holds both to it. The log counts in `starts_rounded` the
@@ -1921,9 +2064,13 @@ that hearing of a library would take weeks.
   windows. The spans of speech come from one read of the whole track, and the onsets from reads of 10 minutes each.
   The deep analysis yields to an import between two pairs, during the read of the speech and between two onset reads.
 
-  The hearing runs on the CPU of the container, at about 1.9 CPU seconds a window. A deep analysis takes a median of
-  about 5 minutes per hour of video. One file in four takes 15 minutes or more per hour. The deep analysis of 2.7.0
-  spent about 75 CPU seconds on an episode in time.
+  The hearing runs on the CPU of the container, with one Whisper thread, so its CPU time is about its wall time. On
+  an Intel i9-13900H in October 2026, a deep analysis took a median of 15.6 minutes per hour of video. Three in four
+  took under 17.1 minutes per hour. The slowest took 29.1. Each heard window cost about 1.9 CPU seconds there. An hour
+  of steady dialogue holds up to about 480 heard windows, so the time follows the amount of speech. An older CPU
+  without AVX-VNNI, the instructions for fast 8-bit integer math that the int8 model uses, took about 6 seconds a
+  window. That was an AMD Ryzen 5 2600X in a VM. The deep analysis of 2.7.0 spent about 75 CPU seconds on an episode
+  in time.
 - **Whole-file timing.** `subtitles.sub_whole()` times every line of each subtitle the word check matched. It hears
   each audio track once, in the language the word check heard it in. `align.run()` then times each subtitle on those
   words in the subtitle's own language, whose stopwords never align. It takes the lines in start order, in five steps.
