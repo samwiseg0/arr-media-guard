@@ -138,6 +138,34 @@ def test_burned_in_sets_the_burned_in_subtitle_check_and_fix_is_the_default(tmp_
     assert load(tmp_path, "REGRAB='audio,burned_in'\n").CFG.regrab == {"audio", "burned_in"}
 
 
+def test_the_selftest_names_the_workers_and_warns_when_background_workers_is_over_the_cores(tmp_path, capsys):
+    cores = load(tmp_path).cores()
+    for n in (int(cores), int(cores) + 1):
+        load(tmp_path, f"BACKGROUND_WORKERS='{n}'\n").main(["--selftest"])
+        out = capsys.readouterr().out
+        warned = f"warning: BACKGROUND_WORKERS {n} is more than the {cores:g} cores this script may use, so the jobs share the cores"
+        assert f"workers: 2 import jobs and {n} background jobs at once\n" in out and (warned in out) == (n > cores), out
+    load(tmp_path, "HOOK_WORKERS='1'\n").main(["--selftest"])
+    assert "workers: 1 import job and 1 background job at once\n" in capsys.readouterr().out
+
+
+def test_the_cores_follow_the_cpu_quota_of_the_cgroup_or_a_parent(tmp_path):
+    """cpu.max of cgroup v2 holds the quota and its period. The least share of the cgroup and its parents counts, and
+    the CPU affinity when that is less. No cgroup file leaves the affinity."""
+    m, affinity = load(tmp_path), len(os.sched_getaffinity(0))
+    (tmp_path / "cgroup").write_text("1:cpu:/x\n0::/a/b\n")
+    for d, quota in (("fs/a", "150000 100000"), ("fs/a/b", "max 100000")):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "cpu.max").write_text(quota + "\n")
+    cores = lambda proc="cgroup": m.cores(str(tmp_path / proc), str(tmp_path / "fs"))
+    assert cores() == min(affinity, 1.5)
+    (tmp_path / "fs/a/b/cpu.max").write_text("50000 100000\n")
+    assert cores() == min(affinity, 0.5)
+    (tmp_path / "fs/a/cpu.max").write_text("max 100000\n")
+    (tmp_path / "fs/a/b/cpu.max").write_text(f"{(affinity + 2) * 100000} 100000\n")
+    assert cores() == affinity and cores("no-cgroup") == affinity
+
+
 @pytest.mark.parametrize("level", ["off", "check", "fix"])
 def test_the_selftest_warns_when_burned_in_is_on_and_the_check_is_not_installed(tmp_path, capsys, level):
     """The burned-in subtitle check needs its models. A setup without them still passes, and says why no import gets
@@ -301,6 +329,7 @@ WHOLE = "is not a whole number of {} or more, so it counts as {}."
     ("CONVERT_MAX_FILES='0'", "convert_max", 1, "CONVERT_MAX_FILES '0' " + WHOLE.format(1, 1)),
     ("SCAN_WORKERS='2.5'", "scan_workers", 1, "SCAN_WORKERS '2.5' " + WHOLE.format(1, 1)),
     ("CONVERT_WORKERS='-1'", "convert_workers", 1, "CONVERT_WORKERS '-1' " + WHOLE.format(1, 1)),
+    ("BACKGROUND_WORKERS='0'", "background_workers", 1, "BACKGROUND_WORKERS '0' " + WHOLE.format(1, 1)),
     ("REPACK_MAX_GB='lots'", "repack_max", 0, "REPACK_MAX_GB 'lots' is no number, so the cap is 0 GB and every remux is skipped."),
     ("SUBTITLES=''", "subtitles", "check", "SUBTITLES '' is no level, so the subtitle check of an import runs as check. The levels are "
                                            "off, check, fix, deep."),
@@ -319,20 +348,20 @@ def test_each_parser_reads_a_bad_value_the_safest_way_and_the_selftest_names_it(
         m.main(["--selftest"])
 
 
-FIELDS = ("keep_days", "hook_workers", "convert_max", "scan_workers", "convert_workers", "regrab_cap", "repack_max", "header_repair",
+FIELDS = ("keep_days", "hook_workers", "convert_max", "scan_workers", "convert_workers", "background_workers", "regrab_cap", "repack_max", "header_repair",
           "restore", "convert", "keep_replaced", "audit_time", "policy_file")
 
 
 def test_a_missing_key_takes_its_default_and_an_empty_one_its_empty_reading(tmp_path):
     """An empty AUDIT_TIME runs no nightly audit. Every other empty key in FIELDS takes its default, KEEP_ORIGINALS_DAYS
     too. So an unset ${VAR} in compose never drops the kept originals at once."""
-    defaults = (7, 2, 200, 1, 1, 30, 30e9, True, True, False, False, "07:30", POLICY)
+    defaults = (7, 2, 200, 1, 1, 1, 30, 30e9, True, True, False, False, "07:30", POLICY)
     m = load(tmp_path)
     assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults and m.CFG.errors == []
     m = load(tmp_path, "".join(f"{k}=''\n" for k in ("KEEP_ORIGINALS_DAYS", "HOOK_WORKERS", "CONVERT_MAX_FILES", "SCAN_WORKERS", "CONVERT_WORKERS",
-                                                     "REGRAB_CAP", "REPACK_MAX_GB", "HEADER_REPAIR", "RESTORE", "CONVERT", "KEEP_REPLACED",
+                                                     "BACKGROUND_WORKERS", "REGRAB_CAP", "REPACK_MAX_GB", "HEADER_REPAIR", "RESTORE", "CONVERT", "KEEP_REPLACED",
                                                      "AUDIT_TIME")))
-    assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults[:11] + ("", POLICY) and m.CFG.errors == []
+    assert tuple(getattr(m.CFG, f) for f in FIELDS) == defaults[:12] + ("", POLICY) and m.CFG.errors == []
 
 
 def test_a_value_reads_with_spaces_and_in_any_case(tmp_path):

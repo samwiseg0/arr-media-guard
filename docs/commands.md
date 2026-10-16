@@ -36,7 +36,8 @@ On a host, leave out `docker exec -it arr-media-guard`.
   runs each job as `--check PATH --apply` runs the file, see [Check one file](#check-one-file). So the job does what an
   import does under your settings, and posts its alerts. It never re-grabs. Its conversion keeps no original, as an
   import's does.
-- The jobs wait behind the imports and run one at a time, after the deep analyses of imports and the rechecks. A job
+- The jobs wait behind the imports and run `BACKGROUND_WORKERS` at a time, after the deep analyses of imports and the
+  rechecks. A job
   gives way to an import that waits before a conversion and before a remux, until it changed the file. The jobs stay
   in the queue across a restart. `--backfill --drop-queued` drops them, and `--backfill <instance> --drop-queued`
   drops those of one instance. A job that runs then ends first.

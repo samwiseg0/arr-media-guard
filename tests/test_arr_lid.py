@@ -195,12 +195,41 @@ def test_the_speech_runs_on_the_files_clock_when_the_audio_starts_late(tmp_path,
         assert a == pytest.approx(at, abs=0.05) and b == pytest.approx(at + 2, abs=0.1), (path, a, b)
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
+def test_the_speech_read_asks_waits_with_its_job(tmp_path, monkeypatch):
+    src = tmp_path / "a.mkv"
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=12", "-c:a", "flac", str(src)], check=True)
+    np = pytest.importorskip("numpy")
+    vad = type(sys)("faster_whisper.vad")
+    vad.get_vad_model = lambda: lambda a: np.zeros(len(a) // 512, np.float32)
+    monkeypatch.setitem(sys.modules, "faster_whisper", type(sys)("faster_whisper"))
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
+    monkeypatch.setattr(arr_lid, "SPEECH_SECS", 4)
+    asked = []
+    monkeypatch.setattr(arr_lid, "waits", lambda gate, queue, job=None: asked.append((queue, job)) or False)
+    assert arr_lid.speech(str(src), 0, str(tmp_path / "lid.sqlite"), None, "q", ("deep-analysis-x.json", 3, 2))["spans"] == []
+    assert asked and set(asked) == {("q", ("deep-analysis-x.json", 3, 2))}, asked
+
+
+def test_a_run_takes_the_model_lock_of_its_turn(tmp_path, monkeypatch, capsys):
+    """--slot K names the hook's turn at the model, see checks.lid_turn(). identify() and listen() then lock
+    cache.lock.K, so hearings of other turns run at once. A run with no turn takes cache.lock."""
+    cache = str(tmp_path / "lid.sqlite")
+    monkeypatch.setattr(arr_lid, "SLOT", 0)
+    assert arr_lid.model_lock(cache) == cache + ".lock"
+    locks = []
+    monkeypatch.setattr(arr_lid, "identify", lambda *a, **k: locks.append(arr_lid.model_lock(a[6])) or {"lang": "eng"})
+    assert arr_lid.main(["f.mkv", "0", "600", "--cache", cache, "--slot", "2"]) == 0 and locks == [cache + ".lock.2"], locks
+    capsys.readouterr()
+
+
 def test_the_speech_read_yields_between_its_chunks(tmp_path, monkeypatch, capsys):
     """--speech passes the gate and the queue to speech(), and checks.lid_speech() passes them to lid.py. speech()
     asks waits() after each chunk, stops ffmpeg, and caches nothing."""
     got = []
-    monkeypatch.setattr(arr_lid, "speech", lambda path, idx, cache, gate=None, queue=None: got.append((gate, queue)) or {"yielded": True})
-    assert arr_lid.main(["f.mkv", "0", "600", "--speech", "--yield-queue", "q.sqlite"]) == 0 and got == [(None, "q.sqlite")], got
+    monkeypatch.setattr(arr_lid, "speech", lambda path, idx, cache, gate=None, queue=None, job=None: got.append((gate, queue, job)) or {"yielded": True})
+    assert arr_lid.main(["f.mkv", "0", "600", "--speech", "--yield-queue", "q.sqlite", "--yield-job", "deep-analysis-x.json", "4", "2"]) == 0, got
+    assert got == [(None, "q.sqlite", ("deep-analysis-x.json", 4, 2))], got
     assert json.loads(capsys.readouterr().out.strip())["yielded"]
 
 
@@ -473,6 +502,23 @@ def test_the_sweep_yields_between_groups_when_a_job_or_a_hearing_waits(monkeypat
         db.execute("INSERT INTO jobs (name, at, job) VALUES ('1-2.json', 0, '{}')")
     got = arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0, 190.0], "eng", 2, gate=str(gate), queue=queue)
     assert got["yielded"] and calls == [[10.0, 70.0]] and len(got["windows"]) == 2
+    calls.clear()   # in a job process the import counts only while every slot is taken, see queued()
+    job = lambda k: (f"deep-analysis-{k}.json", 3, 2)
+    assert "yielded" not in arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=queue, job=job(0)) and len(calls) == 2
+    with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
+        db.executemany("INSERT INTO jobs (name, at, job, claimed) VALUES (?, 0, '{}', 1)", [(f"deep-analysis-{k}.json",) for k in range(3)])
+    calls.clear()
+    assert arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=queue, job=job(0)).get("yielded") and len(calls) == 1
+    calls.clear()   # job 0 yields, so its slot is free for the import, and job 1 goes on. Job 0 yields at every ask.
+    assert "yielded" not in arr_lid.sweep("f.mkv", 0, [10.0, 70.0, 130.0], "eng", 2, gate=str(gate), queue=queue, job=job(1)) and len(calls) == 2
+    assert arr_lid.queued(queue, job(0)) and not arr_lid.queued(queue, job(2))
+    with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
+        db.execute("DELETE FROM jobs WHERE claimed = 1")
+    swept, real = [], arr_lid.sweep
+    monkeypatch.setattr(arr_lid, "sweep", lambda *a, **k: swept.append(a) or {"windows": []})
+    assert arr_lid.main(["f.mkv", "0", "600", "--words", "eng", "10", "--group", "2", "--yield-queue", queue, "--yield-job", *map(str, job(0))]) == 0
+    assert swept[0][7:9] == (queue, job(0)), swept
+    monkeypatch.setattr(arr_lid, "sweep", real)
     with contextlib.closing(sqlite3.connect(queue, isolation_level=None)) as db:
         db.execute("DELETE FROM jobs WHERE name = '1-2.json'")
     (tmp_path / "queue").mkdir()   # a job file the hook wrote while the store was busy

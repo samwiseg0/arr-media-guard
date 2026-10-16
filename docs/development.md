@@ -291,7 +291,8 @@ files stay as they are until they change.
   of the code, `config.VERSION`. The state store marks it as done once every app answered. After a stop part way, the
   next start queues the rest, and a file whose job waits or runs gets no second one.
 - A recheck is a job of the *background queue*, the jobs in the state store. Imports always go first. After them come
-  the burned-in subtitle checks, the deep analyses and the rechecks, one at a time and only while no import waits.
+  the burned-in subtitle checks, the deep analyses and the rechecks, `BACKGROUND_WORKERS` at a time and only while no
+  import waits.
 - A recheck repeats the checks of the run that saved the result, and never checks deeper. A result of an import gets
   the import's subtitle checks only, with no read of the whole file, no Foreign subtitle timing and no Garbled
   subtitle repair. A result of `--sub-check`, `--sub-time` or the deep analysis gets that run's checks.

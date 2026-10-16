@@ -48,7 +48,7 @@ On a host, it needs these instead of Docker:
 - `mkvtoolnix` and `ffmpeg`, for `mkvpropedit`, `mkvmerge`, `ffprobe` and `ffmpeg`. AMG supports mkvtoolnix 102
   from [MKVToolNix's Debian repository](https://mkvtoolnix.download/downloads.html#debian), as the image ships it.
   Debian 13's own mkvtoolnix is 92, and `--selftest` warns about any mkvmerge older than 102. AMG is tested with ffmpeg
-  7.1 (Debian 13). mkvtoolnix 82 reports no frame counts, so AMG refuses every header repair with it.
+  7.1 (Debian 13).
 - Optional: the language detection venv, about 450 MB, and its model, 464 MB. It needs Python 3.13 on x86_64 or aarch64,
   because its pinned wheels are built for CPython 3.13. The burned-in subtitle check uses the same venv, plus three
   text models of 24.6 MB.
@@ -393,7 +393,8 @@ With file system snapshots (ZFS, Btrfs), `KEEP_REPLACED` is optional. A broken u
 | `BURNED_IN` | `fix` | What the burned-in subtitle check does. `off`: nothing. `check`: alerts only. `fix`: also turns off the English subtitle tracks when English subtitles are burned into the picture and the audio is in another language. When the burned-in subtitles are in another language, AMG re-grabs the file if `REGRAB` includes `burned_in`. AMG changes a file only when a second check on other frames agrees. An unknown value acts as `check`, and `--selftest` fails on it. See [docs/features.md](docs/features.md#burned-in-subtitles). |
 | `RECHECK_ON_UPDATE` | `true` | After an update, check again each file whose saved subtitle check the new version can improve. The first start of the new version puts one recheck per file in the background queue, behind the imports. A recheck does what `SUBTITLES` allows. `false`: no recheck. See [docs/features.md](docs/features.md#recheck-after-an-update). |
 | `SCAN_WORKERS` | `1` | Files a library scan or a dry-run backfill reads at a time. |
-| `HOOK_WORKERS` | `2` | Jobs the worker runs at once, each in a process of its own. `1` runs each job inside the worker. A season pack still runs at most this many. |
+| `HOOK_WORKERS` | `2` | Import jobs the worker runs at once, each in a process of its own. `1` with `BACKGROUND_WORKERS=1` runs each job inside the worker. A season pack still runs at most this many. |
+| `BACKGROUND_WORKERS` | `1` | Jobs of the background queue the worker runs at once while no import waits: deep analyses, rechecks, whole-file checks, burned-in subtitle checks and the jobs of a backfill. One of them gives its place to an import that waits for one. A job of a backfill gives it only before a conversion or a remux, so an import that finds every place held by such jobs runs in one more process. Two jobs of one file never run at once. Each one hears with a speech model of its own, about 0.8 GB of memory. `--selftest` warns when the value is more than the cores AMG may use, a CPU limit of its container or service included. |
 
 ### Subtitle hunter
 

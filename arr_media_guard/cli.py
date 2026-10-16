@@ -380,7 +380,7 @@ def backfill_queue(app, a, work):
                 store.put("scan", name, state)
     print(f"{app}: {n} file{'s' if n != 1 else ''} {'queued' if a.apply else 'to queue, dry run'}, {minutes / 60:.1f} hours of video, "
           f"{len(set(order) - set(state['done']))} of {len(work)} files left in this pass. They wait in the background queue behind the "
-          "imports and run one at a time.", flush=True)
+          f"imports and run {config.CFG.background_workers} at a time.", flush=True)
 
 
 def sub_count(c, rec, took):
@@ -1217,6 +1217,35 @@ def mkvmerge_lines():
     return [f"mkvmerge version: {version}"] + ([f"warning: mkvmerge {version} is older than {MKVMERGE_MIN}. {see}"] if int(m[1]) < MKVMERGE_MIN else [])
 
 
+def worker_lines():
+    """The --selftest lines of the worker: the jobs it runs at once, and one warning when BACKGROUND_WORKERS is over the
+    cores this program may use, see cores()."""
+    c, n, jobs = config.CFG, cores(), lambda k, kind: f"{k} {kind} job{'s' if k != 1 else ''}"
+    out = [f"workers: {jobs(c.hook_workers, 'import')} and {jobs(c.background_workers, 'background')} at once"]
+    if c.background_workers > n:
+        out.append(f"warning: BACKGROUND_WORKERS {c.background_workers} is more than the {n:g} cores this {config.here()} may use, "
+                   "so the jobs share the cores")
+    return out
+
+
+def cores(proc="/proc/self/cgroup", root="/sys/fs/cgroup"):
+    """The cores this program may use: its CPU affinity, or the CPU quota of its cgroup or of a parent when that is less.
+    cpu.max of cgroup v2 holds the quota and its period in microseconds, so 150000 100000 is 1.5 cores."""
+    n = len(os.sched_getaffinity(0))
+    try:
+        with open(proc) as f:
+            d = os.path.normpath(root + "/" + next(line for line in f if line.startswith("0::"))[3:].strip())
+    except (OSError, StopIteration):
+        return n
+    while d.startswith(root):
+        with contextlib.suppress(OSError, ValueError):
+            with open(os.path.join(d, "cpu.max")) as f:
+                quota, period = f.read().split()
+            n = n if quota == "max" else min(n, int(quota) / int(period))
+        d = os.path.dirname(d)
+    return n
+
+
 def main(argv):
     mode = argv[:1]
     # A deploy tool may run --selftest on every dry run, which must change nothing on the host. So the selftest records
@@ -1237,7 +1266,7 @@ def main(argv):
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:
             sys.exit(f"selftest failed: {config.policy_help()}")
-        print(*mkvmerge_lines(), sep="\n")
+        print(*mkvmerge_lines(), *worker_lines(), sep="\n")
         for app in config.CFG.apps:   # a warning only: an app this host does not run has no key here
             try:
                 apps.api_key(app)

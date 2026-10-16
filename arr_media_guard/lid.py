@@ -42,6 +42,7 @@ MODEL_SHA256 = "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671
 MODEL_FILES = ("config.json", "tokenizer.json", "vocabulary.txt")   # the rest of the model. A killed download can leave one out.
 MODEL_DIR = "/opt/arr-media-guard-lid/models"     # one directory per model, downloaded at deploy time, never at run time
 CACHE = "/var/lib/arr-media-guard/lid.sqlite"
+SLOT = 0                                 # the hook's turn at the model, see checks.lid_turn() and model_lock(). main() sets it.
 THREADS = 4                              # a few cores, so Sonarr and Radarr keep running
 # Where samples start, as a share of the duration, in the order they are taken. 0.20 and 0.80 stay clear of an
 # anime opening and ending.
@@ -318,9 +319,9 @@ def identify(path, audio_index, duration_s, expect=(), model=MODEL, model_dir=MO
     samples = None if fresh else cache_get(cache, path, audio_index, key, duration_s)
     cached = samples is not None
     if not cached:
-        # One model per host at a time. It takes hundreds of MB, and the host may have no swap. The subhunt and the hook worker both call.
+        # One model per turn at a time. It takes hundreds of MB, and the host may have no swap. The subhunt and the hook worker both call.
         os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
-        with open(cache + ".lock", "w") as lock:
+        with open(model_lock(cache), "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             samples = None if fresh else cache_get(cache, path, audio_index, key, duration_s)   # the other caller may have just heard it
             cached = samples is not None
@@ -334,6 +335,12 @@ def identify(path, audio_index, duration_s, expect=(), model=MODEL, model_dir=MO
                                    [(path, st.st_size, st.st_mtime_ns, audio_index, at, SAMPLE_SECS, pcm, time.time()) for at, pcm in kept.items()])
     lang, prob, why = combine(samples, expect)
     return dict(out, lang=lang, prob=prob, why=why, samples=samples, cached=cached, took=round(time.time() - t0, 2))
+
+
+def model_lock(cache):
+    """The model lock of this process's turn, see checks.lid_turn(): cache.lock for the first turn, cache.lock.K for
+    turn K. A caller with no turn takes the first one's."""
+    return cache + ".lock" + (f".{SLOT}" if SLOT else "")
 
 
 def hear(path, audio_index, duration_s, whisper, kept=None):
@@ -411,7 +418,7 @@ def listen(path, audio_index, starts, lang, secs=WORD_SECS, model=MODEL, model_d
     if row is not None:
         return {"windows": row, "cached": True, "reused": 0, "model": key, "took": round(time.time() - t0, 2)}
     os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
-    with open(cache + ".lock", "w") as lock:   # the one model per host, as identify() takes it
+    with open(model_lock(cache), "w") as lock:   # one model per turn, as identify() takes it
         fcntl.flock(lock, fcntl.LOCK_EX)
         row = words_get(cache, path, audio_index, key, lang, starts, secs)   # the other caller may have just heard it
         if row is not None:
@@ -475,7 +482,7 @@ def start_delay(path, audio_index):
         return 0.0
 
 
-def speech(path, audio_index, cache=CACHE, gate=None, queue=None):
+def speech(path, audio_index, cache=CACHE, gate=None, queue=None, job=None):
     """The spans of speech of the whole of ffmpeg audio stream audio_index of path, for the speech layout check
     (docs/design.md, "Incorrect subtitle identification"). One ffmpeg read at nice 19 and idle I/O decodes the
     stream, mono at 16 kHz. Silero VAD, which faster-whisper bundles, gives a speech probability for each frame,
@@ -502,7 +509,7 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None):
         while chunk := p.stdout.read(SPEECH_SECS * 16000 * 2):
             audio = np.frombuffer(chunk[:len(chunk) // 2 * 2], np.int16).astype(np.float32) / 32768
             probs.append(model(np.pad(audio, (0, -len(audio) % 512))))   # the model reads frames of 512 samples
-            if waits(gate, queue):
+            if waits(gate, queue, job):
                 p.kill()
                 return {"yielded": True, "cached": False, "took": round(time.time() - t0, 2)}
     except BaseException:
@@ -520,32 +527,57 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None):
     return {"spans": spans, "cached": False, "took": round(time.time() - t0, 2)}
 
 
-def waits(gate, queue):
+def waits(gate, queue, job=None):
     """Another hearing waits for the host's model: it holds gate, the lid.turn.gate file of the hook, while it waits for
-    its turn. Or an import job waits in the queue of queue, the hook's state store, or as a file in the queue folder
-    beside it. Either one makes sweep() yield. A store that does not read is no import."""
-    if queue:
-        folder = os.path.join(os.path.dirname(queue), "queue")   # the job files of a busy store, see runner.queue_job()
-        if os.path.isdir(folder) and any(not n.startswith(".") for n in os.listdir(folder)):
-            return True
-        try:
-            with closing(sqlite3.connect(f"file:{queue}?mode=ro", uri=True, timeout=5)) as db:   # the jobs table of the hook's store.py
-                if db.execute("SELECT 1 FROM jobs WHERE claimed = 0 AND due <= ? AND name NOT LIKE 'deep-analysis-%'",
-                              (time.time_ns(),)).fetchone():
-                    return True
-        except sqlite3.Error:
-            pass
+    its turn. Or an import job waits for this job's slot, see queued(). Either one makes sweep() yield. The test takes
+    the gate shared, so the test of another sweep or of a background taker, see checks.lid_turn(), is no waiter."""
+    if queue and queued(queue, job):
+        return True
     if not gate:
         return False
     with open(gate, "a") as f:
         try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
     return False
 
 
-def sweep(path, audio_index, starts, lang, group, secs=WORD_SECS, gate=None, queue=None, **kw):
+WAITING = "SELECT 1 FROM jobs WHERE claimed = 0 AND due <= ? AND name NOT LIKE 'deep-analysis-%'"   # an import job waits, see runner.queued()
+# The yield of a claimed job of the background queue to an import that waits, in a job process. One UPDATE marks the
+# job yielding, so of two jobs that ask at once one alone yields: the second sees the first one's mark. The job yields
+# while an import waits, the claimed jobs that do not yield fill every slot, and the imports have a slot of theirs
+# left. The UPDATE reads the waiting import itself, so an import that the worker claims after the caller's own read
+# makes no mark. A job marked yielding yields at every later ask too. Arguments: the job's name, 1 when a job file
+# waits in the queue folder, the time in nanoseconds, the worker's slots, HOOK_WORKERS.
+YIELD = ("UPDATE jobs SET yielding = 1 WHERE name = ? AND claimed = 1 AND (yielding = 1 OR ((? OR EXISTS (" + WAITING + ")) "
+         "AND (SELECT count(*) FROM jobs WHERE claimed = 1 AND yielding = 0) >= ? "
+         "AND (SELECT count(*) FROM jobs WHERE claimed = 1 AND name NOT LIKE 'deep-analysis-%') < ?))")
+
+
+def queued(queue, job=None):
+    """Whether this run yields to an import job that waits in the queue of queue, the hook's state store, or as a file
+    in the queue folder beside it. job is (the job's name, the worker's slots, HOOK_WORKERS) when the run is part of a
+    job of a job process. It then yields only by YIELD, as runner.import_waits() does. A store that does not read is no
+    import."""
+    folder = os.path.join(os.path.dirname(queue), "queue")   # the job files of a busy store, see runner.queue_job()
+    filed = os.path.isdir(folder) and any(not n.startswith(".") for n in os.listdir(folder))
+    try:
+        with closing(sqlite3.connect(f"file:{queue}?mode={'rw' if job else 'ro'}", uri=True, timeout=5, isolation_level=None)) as db:
+            if not (filed or db.execute(WAITING, (time.time_ns(),)).fetchone()):
+                return False
+            if not job:
+                return True
+            db.execute("BEGIN IMMEDIATE")   # the counts of YIELD stay true until its change is in
+            try:
+                return db.execute(YIELD, (job[0], filed, time.time_ns(), *job[1:])).rowcount == 1
+            finally:
+                db.execute("COMMIT")
+    except sqlite3.Error:
+        return filed
+
+
+def sweep(path, audio_index, starts, lang, group, secs=WORD_SECS, gate=None, queue=None, job=None, **kw):
     """listen() over the windows of starts, group of them at a time, in this one process, for the hearings of --sub-time
     and the deep analysis, such as the whole-file hearing. The model loads once, each group is one clip, and each
     group's words are cached as listen() caches them. Before each group after the first it yields when another hearing or a job waits, see waits(): it returns what it heard,
@@ -553,7 +585,7 @@ def sweep(path, audio_index, starts, lang, group, secs=WORD_SECS, gate=None, que
     every group was."""
     out = {"windows": [], "cached": True, "reused": 0, "took": 0.0, "profile": {}}
     for k in range(0, len(starts), group):
-        if k and waits(gate, queue):
+        if k and waits(gate, queue, job):
             out["yielded"] = True
             break
         r = listen(path, audio_index, starts[k:k + group], lang, secs, **kw)
@@ -643,6 +675,11 @@ def lower_priority(threads):
         pass
 
 
+def job_arg(v):
+    """The job of queued() from the three words of --yield-job, or None."""
+    return (v[0], int(v[1]), int(v[2])) if v else None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Identify the spoken language of one audio stream. Prints one JSON line.")
     ap.add_argument("path", nargs="?"); ap.add_argument("index", type=int, nargs="?"); ap.add_argument("duration", type=float, nargs="?")
@@ -658,20 +695,25 @@ def main(argv=None):
     ap.add_argument("--group", type=int, help="hear the --words windows this many at a time in this process, for the whole-file hearing, see sweep()")
     ap.add_argument("--yield-gate", help="sweep() and the speech read yield while another hearing holds this gate file, see waits()")
     ap.add_argument("--yield-queue", help="sweep() and the speech read yield while an import job waits in this state store, see waits()")
+    ap.add_argument("--yield-job", nargs=3, metavar=("NAME", "SLOTS", "HOOK_WORKERS"), help="with --yield-queue, the run is part of "
+                    "the job NAME of a job process, which yields only for its slot, see queued()")
     ap.add_argument("--then-words", metavar="FILE", help="after the language check, the subtitle check's hearings in FILE, see jobs()")
     ap.add_argument("--speech", action="store_true", help="the spans of speech of the whole stream, for the speech layout check, see speech()")
+    ap.add_argument("--slot", type=int, default=0, help="the hook's turn at the model, whose model lock this run takes, see model_lock()")
     a = ap.parse_args(argv)
     if a.fetch:
         print(fetch(a.model_dir))
         return 0
     if a.duration is None: ap.error("PATH, INDEX and DURATION are required")
+    global SLOT
+    SLOT = a.slot
     try:
         if a.speech:
-            r = speech(a.path, a.index, a.cache, a.yield_gate, a.yield_queue)
+            r = speech(a.path, a.index, a.cache, a.yield_gate, a.yield_queue, job_arg(a.yield_job))
         elif a.words:
             more = [None if x == "-" else float(x) for x in a.more] if a.more else None
             if a.group:
-                r = sweep(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.group, a.secs, a.yield_gate, a.yield_queue, model=a.model,
+                r = sweep(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.group, a.secs, a.yield_gate, a.yield_queue, job_arg(a.yield_job), model=a.model,
                           model_dir=a.model_dir, cache=a.cache)
             else:
                 r = listen(a.path, a.index, [float(x) for x in a.words[1:]], a.words[0], a.secs, model=a.model, model_dir=a.model_dir, cache=a.cache,

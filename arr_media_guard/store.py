@@ -17,13 +17,19 @@ KEEP_DECISIONS = 14 * 86400   # seconds a decision row and an editing mark stay,
 TABLES = (
     "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (ns, key))",
     # name is <time in nanoseconds>-<pid>.json. claimed is 1 while a job process of runner.coordinate() runs the job. due
-    # is the time in nanoseconds that a job put back for a later try waits for.
+    # is the time in nanoseconds that a job put back for a later try waits for. yielding is 1 while a claimed job of the
+    # background queue ends for an import, see lid.YIELD. dropped is 1 for a claimed job that --drop-queued dropped, see
+    # runner.drop_backfill().
     "CREATE TABLE IF NOT EXISTS jobs (name TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, due INTEGER NOT NULL DEFAULT 0, "
-    "at REAL NOT NULL, pid INTEGER, settled INTEGER NOT NULL DEFAULT 0, job TEXT NOT NULL, PRIMARY KEY (name, claimed))",
+    "at REAL NOT NULL, pid INTEGER, settled INTEGER NOT NULL DEFAULT 0, job TEXT NOT NULL, yielding INTEGER NOT NULL DEFAULT 0, "
+    "dropped INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (name, claimed))",
     "CREATE TABLE IF NOT EXISTS decisions (at REAL NOT NULL, app TEXT, path TEXT, rec TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS decisions_at ON decisions (at)",
     "CREATE INDEX IF NOT EXISTS decisions_path ON decisions (path)",
-    "PRAGMA user_version = 1")
+    "PRAGMA user_version = 2")
+UPGRADES = {2: ("ALTER TABLE jobs ADD COLUMN yielding INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN dropped INTEGER NOT NULL DEFAULT 0")}   # what brings a store of the version before up to each version
+VERSION = max(UPGRADES)
 LOCAL = threading.local()   # db(): the connection of this thread
 
 
@@ -57,12 +63,29 @@ def db():
             c.execute("PRAGMA journal_mode = WAL")
             for t in TABLES:
                 c.execute(t)
+        elif c.execute("PRAGMA user_version").fetchone()[0] < VERSION:
+            upgrade(c)
     except BaseException:   # as on a store that reads as no database. The close frees its files for fork() now, and changes none.
         c.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
         c.close()
         raise
     LOCAL.db = (pid, here, ino, c)
     return c
+
+
+def upgrade(c):
+    """Bring the store of connection c up to VERSION with the changes of UPGRADES, in one transaction. A second process
+    that upgrades at the same time waits, and then finds the store up to date. An older AMG still reads the store."""
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        for v in range(c.execute("PRAGMA user_version").fetchone()[0] + 1, VERSION + 1):
+            for sql in UPGRADES[v]:
+                c.execute(sql)
+        c.execute(f"PRAGMA user_version = {VERSION}")
+    except BaseException:
+        c.execute("ROLLBACK")
+        raise
+    c.execute("COMMIT")
 
 
 def close():

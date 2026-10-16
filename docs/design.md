@@ -645,10 +645,12 @@ a worker if none runs, and exits 0.
 `worker.lock` keeps one worker. The worker runs the queue oldest first and checks it once more after
 it drops its lock, so no job is lost. A job older than a day is dropped.
 
-`HOOK_WORKERS` (2) sets how many jobs run at a time. Set it to about the cores the host can spare.
-With more than 1, the worker claims each job by one change in the state store, forks one process
-per job, and sends every Plex analyze itself, so the idle-section gate holds. A season pack of 200
-episodes runs at most `HOOK_WORKERS` processes at a time. A job process that crashes writes one decision line with
+`HOOK_WORKERS` (2) sets how many import jobs run at a time. `BACKGROUND_WORKERS` (1) sets how many jobs of the
+background queue run at a time, see "Deep analysis". Set the two to about the cores the host can spare.
+When either is more than 1, the worker claims each job by one change in the state store, forks one process
+per job, and sends every Plex analyze itself, so the idle-section gate holds. The worker runs at most the larger of the
+two at a time, `config.slots()`. An import that finds every place held by jobs a backfill queued starts in one more
+process, see "Backfill". A season pack of 200 episodes runs at most `HOOK_WORKERS` processes at a time. A job process that crashes writes one decision line with
 outcome `error`, the exception and a short trace, because its stderr is often `/dev/null`. A job whose processes crash
 `CRASH_TRIES` times in one worker run is not claimed again in that run, also when the store lost its crash count.
 
@@ -674,7 +676,7 @@ first passes `lock.gate`, so a waiting edit stops new readers and waits only for
 flight. Linux flock gives a waiting exclusive lock no preference, so without the gate a scan could
 keep an edit out. flock cannot upgrade a lock, so a job that takes it exclusive checks the file's
 inode, size, mtime and the re-grab unit of its download again, and runs again when one changed. Hearing holds no
-lock, because it may wait for the one model. A conversion in a job process builds the new file under the shared lock,
+lock, because it may wait for a turn at the model. A conversion in a job process builds the new file under the shared lock,
 as a backfill worker does, so the other jobs keep checking and converting. The rest of that job runs under the
 exclusive lock. Under the shared lock a conversion creates its temp file only when none is there. A second job of the
 same file finds it, lets the lock go, and waits until the first job's swap removes it, `SWAP_POLL` (600) seconds at most.
@@ -689,7 +691,9 @@ app's import of the new file skips that file, and the conversion's job then chec
 
 **Deep analysis.** With `SUBTITLES=deep`, an import job queues one deep analysis job for its file in the state store,
 named by the path, so a newer import of the path replaces it. The job holds the inode, size and mtime of the file the
-import left. The worker runs one only when no import job waits, one at a time per host, and never drops one by age. A
+import left. The worker starts one only when no import job waits, `BACKGROUND_WORKERS` at a time per host, and never
+drops one by age. It never runs two jobs of one file at once, see `runner.next_jobs()`, because a burn-in mute or a
+remux of the file would make a whole-file check of it drop with no verdict. A
 job drops itself with one decision line when its file is gone or has another inode, as after an upgrade, whose import
 queues a job of its own. When the file is gone at its start, the job first asks the app by the file id where it is now,
 see `runner.app_file()`. After a rename or a move, which queues no import, it goes on at the new path and logs a
@@ -698,10 +702,14 @@ it takes the file lock, after its remux and after an error, because the app hold
 counts. A conversion of its own before a yield gives the job the new file's inode, size and mtime. The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its whole-file
 hearing hears two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
-job waits in the queue. It also stops for a waiting import job after the whole-file read, before each read and each fit
+job waits for its place, see `runner.import_waits()`. The worker that runs each job itself yields to every waiting
+import. With job processes, a job yields only while every place is taken and the imports have a place of theirs left.
+One change of the state store marks the job yielding, see `lid.YIELD`, so of the jobs that ask at once one alone
+yields, and the other jobs go on. That change itself reads whether an import still waits, so no job yields to an
+import that took a place meanwhile. A job marked yielding stops at its next step. It also stops for a waiting import job after the whole-file read, before each read and each fit
 of a track, after each 10 minutes of audio of the speech read, see "Incorrect subtitle identification", and before the
 remux. It then goes back to its queue. Its next run finds the words heard so far in the cache, and the whole-file read
-in the state store. With `HOOK_WORKERS=1` an import job so waits at most for one step: the whole-file read of one film,
+in the state store. With `HOOK_WORKERS=1` and `BACKGROUND_WORKERS=1` an import job so waits at most for one step: the whole-file read of one film,
 the read or fit of one track, one pair of windows, 10 minutes of audio of the speech read, or one remux. With more
 workers it runs in a job process of its own. A deep analysis decides with the inputs its import stored in the job: the
 original language, the release name, the kids flag and the rest, so it asks no app for them. It never hears the language
@@ -713,8 +721,8 @@ words do not match the audio loses its default and forced flags.
 **Burn-in job.** When the quick burned-in subtitle check flags a file, or cannot tell, the import queues a burn-in job
 for it, see "Burned-in subtitles". It works like a deep analysis job. Its name comes from the path, and it records the
 inode, size and mtime of the file. It follows a move, drops itself when the file is gone or replaced, and yields to an
-import. Its name starts like a deep analysis job's name, so it waits behind the imports and runs one at a time with the
-deep analyses and rechecks. Burn-in jobs run before deep analyses, so the burn-in job of an import ends before its deep
+import. Its name starts like a deep analysis job's name, so it waits behind the imports and shares the
+`BACKGROUND_WORKERS` places with the deep analyses and rechecks. Burn-in jobs run before deep analyses, so the burn-in job of an import ends before its deep
 analysis starts.
 
 **Whole-file check job.** Every import queues one, see "Whole-file check". It works like a burn-in job, and
@@ -733,8 +741,8 @@ asks again. A second import of one release can delete the job's file record and 
 or another item then drops the job as `file_gone` with no alert, and the note says the app replaced the file. The
 newer import's own job checks the new file. Another API error ends the job as an error. The `ManualImport` of a
 conversion gives the file a new id, and so does an undo that imports the original again. The queue keeps the new id
-when the app gives one, so a re-run asks the app for it. With `HOOK_WORKERS=1` a job holds the lock exclusive and never
-re-plans, so a replace during the checks still reads the copy. With `HOOK_WORKERS=1` the worker also runs a deep
+when the app gives one, so a re-run asks the app for it. With `HOOK_WORKERS=1` and `BACKGROUND_WORKERS=1` a job holds
+the lock exclusive and never re-plans, so a replace during the checks still reads the copy. The worker then also runs a deep
 analysis in its own process, so no crash count covers it. A deep analysis that kills the worker runs again at the next
 start, and the subtitle alerts its import held wait. A count of starts would count each stop of the container too,
 because a stop ends the worker the same way.
@@ -770,7 +778,7 @@ the worker, so that job runs on the new store.
 
 These stay files of their own: the decision log, `status.json` (a monitoring agent reads it),
 `lid.sqlite` (the language detection reads it), the locks (`lock`, `lock.gate`, `lid.turn`,
-`lid.turn.gate`, `worker.lock`, `subhunt.lock`), and the lists for a person: `convert-<app>.txt` and
+`lid.turn.<n>`, `lid.turn.gate`, `worker.lock`, `subhunt.lock`), and the lists for a person: `convert-<app>.txt` and
 the scan's `<kind>-scan-<app>.txt`, or `<kind>-scan-<app>-ids.txt` for a scan with `--ids`.
 
 In Docker, `STATE_DIR` is `/config/state`, a named volume of its own. SQLite in WAL mode needs a local disk, and
@@ -782,7 +790,8 @@ The worker forks from the app, so it and its children (ffmpeg, mkvmerge, languag
 the app's cgroup. Under the systemd default `OOMPolicy=stop`, an OOM kill of any child stops Sonarr
 or Radarr, and `Restart=on-failure` starts it again mid-import. Set `OOMPolicy=continue` on both
 units, then run `systemctl daemon-reload`. The app needs no restart, because systemd reads
-`OOMPolicy` when the OOM event arrives.
+`OOMPolicy` when the OOM event arrives. Each turn at the language model takes about 0.8 GB, so `BACKGROUND_WORKERS=4`
+can take about 3 GB while the background queue hears.
 
 ```
 # /etc/systemd/system/radarr.service.d/arr-media-guard.conf, the same for sonarr.service
@@ -854,10 +863,13 @@ a move and drops a file that is gone or replaced, as a deep analysis does, see `
 
 A job yields to an import that waits before a conversion and before a remux, see `process.Ctx`.
 After a conversion or a repair of its file the job yields no more, see `process.refresh()`. A yield
-then would lose the post and the decision line of the change. So with `HOOK_WORKERS=1` an import
+then would lose the post and the decision line of the change. So with `HOOK_WORKERS=1` and `BACKGROUND_WORKERS=1` an import
 waits until the running job ends or reaches its first conversion or remux. The checks of the job run
-under an import's time limit. A conversion or a remux that started runs to its end. With more
-workers the import runs beside the job. It waits only while the job holds the file lock exclusive.
+under an import's time limit. A conversion or a remux that started runs to its end. With job
+processes an import never waits for such a job. When every place is taken and no running job of the background queue
+can free one, the import starts in one more process, up to `HOOK_WORKERS` imports, see `runner.next_jobs()`. Any other
+job of the background queue can free its place, and so can a job that yields already. The import waits only while
+the job holds the file lock exclusive.
 The job holds it for a flag edit and for the swap of a conversion. Before a remux the job takes it
 and runs its checks again.
 
@@ -1449,11 +1461,24 @@ a relative of the tag or the original language (`KIN`) is withheld.
 
 **Limits.** Hearing a file takes tens of CPU seconds and several hundred MB of memory. The CLI sets
 `oom_score_adj` to 1000, so the kernel kills it first under memory pressure. Set
-`OOMPolicy=continue`, see "Memory". One model runs per machine at a time. The workers of a backfill
-ask for it one at a time, so a hook job waits for one hearing at most. In a hook job all tracks of a
-file share 120 seconds, cut to the time left less `LID_RESERVE` for the audio samples. With too
-little time left, or a file under 60 seconds, the hook skips detection. No answer leaves the
-decision as it was.
+`OOMPolicy=continue`, see "Memory". A machine has `BACKGROUND_WORKERS` turns at the model, the locks
+`lid.turn`, `lid.turn.1` and so on, so each background job can hear at once. Each turn loads a model of its own, about
+0.8 GB, and lid.py takes the model lock of its turn. The workers of a backfill ask for a turn one at a time, so a hook
+job waits for one hearing at most. A hook job that waits holds `lid.turn.gate`, so a background sweep gives its turn
+up after its current pair of windows, and the hook job takes the first turn that frees, see "Yield to an import". A
+background job in a job process waits for a turn without the gate, so it makes no sweep yield. It takes a turn only
+while the gate is free, so a hook job still goes first. A sweep and a background job test the gate with a shared lock,
+so neither looks like a waiting hook job to the other. In a hook job all tracks of a file share 120 seconds, cut to
+the time left less `LID_RESERVE` for the audio samples. With too little time left, or a file under 60 seconds, the
+hook skips detection. No answer leaves the decision as it was.
+
+**Yield to an import.** An import that needs a hearing takes a free turn when one exists. No sweep then yields. When
+background sweeps hold every turn, each sweep checks the gate after each pair of windows, about every 4 seconds on a
+fast CPU. The first sweep that finds the gate held gives its turn up. The import tries the turns every 0.2 seconds, see
+`checks.lid_turn()`, so it takes that turn almost at once. The other sweeps keep their turns. A second sweep also gives
+its turn up only when its own check falls inside that short wait. That is rare. Each extra yield costs one model load
+of a few CPU seconds. No heard window is lost, because the cache keeps each pair. The job takes the next free turn and
+goes on. The limits of `HOOK_WORKERS` and `BACKGROUND_WORKERS` hold the whole time.
 
 **Cache.** `STATE_DIR/lid.sqlite` keys each answer by path, size, mtime, stream, model and duration.
 The model name carries its revision, so a model bump misses the old rows. A hit applies the current

@@ -638,19 +638,19 @@ def quick(path, audio_index, duration):
             "b": b, "took": round(time.time() - t0, 2), "cpu": round(lid.cpu_now() - c0, 2)}
 
 
-def full(path, audio_index, duration, second=False, gate=None, queue=None, cache=lid.CACHE, model_dir=lid.MODEL_DIR):
+def full(path, audio_index, duration, second=False, gate=None, queue=None, cache=lid.CACHE, model_dir=lid.MODEL_DIR, job=None):
     """The background check that decides. {"label": "full", "partial", "none" or "unsure" (under MIN_SPEECH_FRAMES
     speech frames), "english": True, False or None (the
     reader cannot tell), "text_lang", "script", see language(), "speech_share", "silence_share", "lift", "spread",
     "speech_frames", "silence_frames", "lines", "lines_read", "second", "spans_cached", "took": wall seconds, "cpu": CPU
     seconds}. second samples frames that are no keyframe, so none of them is a frame of the first pass. Many files
     hold too few keyframes in speech for a second set of keyframes. lid.speech() yields
-    its speech read at gate and queue, see lid.waits(). The sampling asks the same after every 10 frames. A yield
+    its speech read at gate, queue and job, see lid.waits(). The sampling asks the same after every 10 frames. A yield
     answers {"yielded": True, "took"}. Raises when a decode or a model fails."""
     t0, c0 = time.time(), lid.cpu_now()
     sm = Sampler(path)   # a file with no video fails before the speech read
     try:
-        sp = lid.speech(path, audio_index, cache, gate, queue)
+        sp = lid.speech(path, audio_index, cache, gate, queue, job)
         if sp.get("yielded"):
             return {"yielded": True, "took": round(time.time() - t0, 2)}
         spans, starts = sp["spans"], [x[0] for x in sp["spans"]]
@@ -665,7 +665,7 @@ def full(path, audio_index, duration, second=False, gate=None, queue=None, cache
                 return None
             bx = ocr.boxes(rgb)
             return {"boxes": bx, "rgb": rgb if keep(bx) else None}
-        frames = sample(sm, want, lambda k: kind_in_file(k, spans, starts), look, exact=second, stop=lambda: lid.waits(gate, queue))
+        frames = sample(sm, want, lambda k: kind_in_file(k, spans, starts), look, exact=second, stop=lambda: lid.waits(gate, queue, job))
     finally:
         sm.close()
     if frames is None:
@@ -740,6 +740,8 @@ def main(argv=None):
     ap.add_argument("--model-dir", default=lid.MODEL_DIR)
     ap.add_argument("--yield-gate", help="yield while another hearing holds this gate file, see lid.waits()")
     ap.add_argument("--yield-queue", help="yield while an import job waits in this state store, see lid.waits()")
+    ap.add_argument("--yield-job", nargs=3, metavar=("NAME", "SLOTS", "HOOK_WORKERS"), help="with --yield-queue, the run is part of "
+                    "the job NAME of a job process, which yields only for its slot, see lid.queued()")
     a = ap.parse_args(argv)
     if a.fetch:
         print(fetch(a.model_dir))
@@ -751,7 +753,7 @@ def main(argv=None):
         if a.quick:
             r = quick(a.path, a.index, a.duration)
         else:
-            r = full(a.path, a.index, a.duration, a.second, a.yield_gate, a.yield_queue, a.cache, a.model_dir)
+            r = full(a.path, a.index, a.duration, a.second, a.yield_gate, a.yield_queue, a.cache, a.model_dir, lid.job_arg(a.yield_job))
     except Exception as e:   # the hook reads one JSON line either way
         r = {"error": f"{type(e).__name__}: {e}"[:300]}
     print(json.dumps(r))

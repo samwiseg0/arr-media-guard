@@ -281,7 +281,7 @@ arr-media-guard: recheck: this version can improve the subtitle check of 12 file
 On a host install, the first nightly audit of the new version queues them, and they run after the next import.
 
 The rechecks wait in the background queue with every other job. Imports always go first. After them come the burned-in
-subtitle checks, the whole-file checks, the deep analyses and the rechecks, one at a time. A recheck repeats the check
+subtitle checks, the whole-file checks, the deep analyses and the rechecks, `BACKGROUND_WORKERS` at a time. A recheck repeats the check
 that saved the result, and never checks deeper. A file that only an import checked gets the import's subtitle checks
 again, and no more.
 `SUBTITLES` decides what a recheck may do, as for an import. At `check` it only alerts, and a later
@@ -354,9 +354,9 @@ With `SUBTITLES=deep`, each problem gets one alert. The import holds back its su
 checks those subtitles again. The deep analysis then posts once, and only what it still finds wrong. A subtitle problem
 it fixes gets no alert. With `DISCORD_POSTS=all` it gets the one post of the change. A held alert still posts when
 nothing judged its subtitles again. That happens after an error, when AMG could not hear the audio or its listening
-stopped part way, or when `SUBTITLES` is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` at 2 or more, it also posts when
-the deep analysis crashes three times. With `HOOK_WORKERS=1`, a deep analysis that crashes the worker runs again at the
-next start, and its held alert waits. A held alert waits with the deep analysis job in the background queue, so a
+stopped part way, or when `SUBTITLES` is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` or `BACKGROUND_WORKERS` at 2 or
+more, it also posts when the deep analysis crashes three times. With both at 1, a deep analysis that crashes the worker
+runs again at the next start, and its held alert waits. A held alert waits with the deep analysis job in the background queue, so a
 restart keeps it. When the app renames or moves the file, the deep analysis asks the app where it is and checks it
 there. A held alert goes unposted only when the app replaced the file, or the app says it no longer has the file for
 that item. When the app lists the file where AMG cannot see it, as while a mount is down, the held alert posts. With

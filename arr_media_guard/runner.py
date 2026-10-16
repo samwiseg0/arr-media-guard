@@ -227,11 +227,14 @@ def backfill_jobs():
 
 def drop_backfill(app=None):
     """Drop the jobs that a backfill queued, of the instance app or of every instance. A job names its instance first,
-    see queue_listed(). A job that runs goes on until it ends, and it does not come back, because its end and its
-    requeue() find no row. A job of the path that an import queued since stays, and so do the jobs that a backfill job
-    queued, see queue_after(). Returns the count."""
-    head = '{"app": %s, ' % json.dumps(app)
-    return store.write(f"DELETE FROM jobs WHERE {BACKFILL} > 0 AND (? OR instr(job, ?) = 1)", app is None, head).rowcount
+    see queue_listed(). A job that runs goes on until it ends, and it does not come back. Its row stays, marked
+    dropped, so it still counts in its slot, see lid.YIELD, and its end or its requeue() removes it. A job of the path
+    that an import queued since stays, and so do the jobs that a backfill job queued, see queue_after(). Returns the
+    count."""
+    head, which = '{"app": %s, ' % json.dumps(app), f"{BACKFILL} > 0 AND (? OR instr(job, ?) = 1)"
+    with store.tx():
+        return store.write(f"UPDATE jobs SET dropped = 1 WHERE claimed = 1 AND dropped = 0 AND {which}", app is None, head).rowcount + \
+            store.write(f"DELETE FROM jobs WHERE claimed = 0 AND {which}", app is None, head).rowcount
 
 
 def job_of(name, claimed=False):
@@ -244,8 +247,9 @@ def job_of(name, claimed=False):
 
 def claim(name):
     """Claim the queued job name for a job process, see coordinate(). One change of the store does it, so of two
-    workers one alone gets the job. False when it is gone or claimed."""
-    return store.write("UPDATE OR IGNORE jobs SET claimed = 1 WHERE name = ? AND claimed = 0", name).rowcount == 1
+    workers one alone gets the job. The claim clears a yielding mark that an older AMG left on the row. False when it is
+    gone or claimed."""
+    return store.write("UPDATE OR IGNORE jobs SET claimed = 1, yielding = 0 WHERE name = ? AND claimed = 0", name).rowcount == 1
 
 
 def put_job(name, job, claimed=False):
@@ -366,8 +370,8 @@ GRAB_KEYS = ("owner", "file_id", "episode_ids", "download_id", "deleted", "recyc
 
 def burn_name(path):
     """The name of the burn-in job of path, see burn_in(). It starts as the name of a deep analysis job does, so every
-    rule of the background queue holds for it: it waits while an import waits, runs one at a time with the deep
-    analyses and rechecks, and yields to an import. A newer import of the path replaces a queued one."""
+    rule of the background queue holds for it: it waits while an import waits, shares the BACKGROUND_WORKERS places
+    with the deep analyses and rechecks, and yields to an import. A newer import of the path replaces a queued one."""
     return f"{BURN_PREFIX}{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
 
 
@@ -433,7 +437,7 @@ def queue_whole(job, rec, inputs):
 
 def deep_name(path):
     """The name of the job of the background queue for path, a deep analysis or a recheck. The worker runs a job of
-    this name only while no import waits, one at a time."""
+    this name only while no import waits, BACKGROUND_WORKERS at a time, see next_jobs()."""
     return f"deep-analysis-{hashlib.sha1(path.encode()).hexdigest()[:16]}.json"
 
 
@@ -455,7 +459,7 @@ def queue_listed(app, f, info, **extra):
 def queue_rechecks():
     """Queue a recheck job for each file whose saved subtitle result a newer check can fix, see subtitles.sub_stale(),
     once per version of the code. RECHECK_ON_UPDATE false or SUBTITLES off queues nothing. A recheck is a job of the
-    background queue, as a deep analysis is, so imports and then deep analyses go first, and one runs at a time. The
+    background queue, as a deep analysis is, so imports and then deep analyses go first. The
     job takes the inputs of its item from the app now, as --sub-check does. A job of the path that waits or runs
     already stays. The mark of the version goes in only after every app answered. So after a stop or a failure part
     way, the next start or nightly audit queues the rest. One line on stdout and in the decision log gives the count,
@@ -916,10 +920,27 @@ def kept_off(after, got):
 
 
 def deep_waits():
-    """Raise Yielded when an import job waits in the queue. The deep analysis asks between two steps, see deep_analysis()."""
-    if queued():
+    """Raise Yielded when an import job waits for the slot of this job, see import_waits(). The deep analysis asks
+    between two steps, see deep_analysis()."""
+    if import_waits():
         raise subtitles.Yielded("an import waits")
     return False
+
+
+def import_waits():
+    """Whether a job of the background queue yields to an import: an import job waits in the queue, and it waits for
+    the slot of this job. The worker that runs each job itself has one slot, so it yields to every waiting import. A
+    job of a job process, see coordinate(), yields by lid.YIELD: one change of the store marks it yielding while every
+    slot is taken and the imports have a slot of theirs left. So of the jobs that ask at once one alone frees its slot,
+    and the others go on. A job once marked yields at every later ask. lid.queued() asks the same in a lid.py or
+    burnin.py process."""
+    waits = bool(queued())
+    if not config.JOB:
+        return waits
+    if not waits:
+        return bool(store.read("SELECT 1 FROM jobs WHERE name = ? AND claimed = 1 AND yielding = 1", config.JOB))
+    from . import lid
+    return store.write(lid.YIELD, config.JOB, 0, time.time_ns(), config.slots(), config.CFG.hook_workers).rowcount == 1
 
 
 def deep_analysis(name, pending, claimed=False):
@@ -1665,8 +1686,8 @@ def check_store():
 
 
 def worker(lock):
-    """Drain the queue, with the pending Plex lookups in between. Exits when both are empty. HOOK_WORKERS 1 runs one
-    file job at a time in this process. A larger value hands the jobs to coordinate()."""
+    """Drain the queue, with the pending Plex lookups in between. Exits when both are empty. HOOK_WORKERS and
+    BACKGROUND_WORKERS 1 run one job at a time in this process. A larger value of either hands the jobs to coordinate()."""
     check_store()
     stale_work_dirs()
     prune_kept()
@@ -1680,8 +1701,8 @@ def worker(lock):
     if config.CFG.from_env and not config.SERVE:   # a host hook reads the app's environment, where a stray key such as LOG wins
         logs.log(dict(source="hook", result="warning", note=f"keys from the environment win over the env file: {', '.join(config.CFG.from_env)}"))
     pending = plex.load_plex()   # plex_job() dicts, the analyze of each edited file, with those a stopped worker kept
-    if config.CFG.hook_workers > 1:
-        return coordinate(lock, config.CFG.hook_workers, pending)
+    if config.slots() > 1:
+        return coordinate(lock, pending)
     warned = False
     while True:
         jobs = queued()
@@ -1705,9 +1726,12 @@ def worker(lock):
             return             # a new event started its own worker
 
 
-def coordinate(lock, n, pending):
-    """The worker when HOOK_WORKERS is over 1. It claims queued jobs oldest first, each by one change in the store, so
-    no two processes ever run one job. It forks a job process per job, at most n at a time. A job process runs
+def coordinate(lock, pending):
+    """The worker when HOOK_WORKERS or BACKGROUND_WORKERS is over 1. It claims queued jobs oldest first, each by one
+    change in the store, so no two processes ever run one job. It forks a job process per job, at most config.slots()
+    at a time. Import jobs take HOOK_WORKERS of them at most, and an import that would wait for jobs a backfill queued
+    starts in one more process. The jobs of the background queue take BACKGROUND_WORKERS at most, and start only while
+    no import waits, see next_jobs(). A job process runs
     run_job() with the file lock shared for its checks, see process(), and sends its Plex analyze back through a pipe.
     This process alone sends analyze requests, one at a time, so the section gate and the fresh read before each PUT
     hold as with one worker. The job processes inherit worker.lock, so no second worker starts while one of them runs.
@@ -1732,9 +1756,8 @@ def coordinate(lock, n, pending):
     while True:
         jobs = live(queued())
         warned = backlog(jobs, warned)
-        if not jobs and not any(x[1].startswith("deep-analysis-") for x in running.values()):   # one deep analysis job at a time, when no import waits
-            jobs = live(deep_analysis_queued())[:1]
-        while jobs and len(running) < n and not stop:
+        jobs = next_jobs(jobs, [x[1] for x in running.values()], live)
+        while jobs and not stop:
             name = jobs.pop(0)
             if not claim(name):   # gone since the listing
                 continue
@@ -1799,6 +1822,40 @@ def coordinate(lock, n, pending):
                                   "worker run, and the store still holds the job, so this worker does not run it again"))
 
 
+def next_jobs(imports, names, live):
+    """The jobs coordinate() claims next, in order, while names run: the import jobs of imports while fewer than
+    HOOK_WORKERS imports run and a slot is free, see config.slots(). With no slot free and no running job that can free
+    one, see frees_slot(), an import starts in one more job process. So an import never waits for a job a backfill
+    queued, which yields only before a conversion and a remux. With no import waiting, the jobs of the background queue
+    while fewer than BACKGROUND_WORKERS of them run and a slot is free, never two jobs of one file at once, see
+    file_tag(). A burn-in mute or a remux of a file would make a whole-file check of it drop with no verdict. live drops
+    the jobs that crashed too often."""
+    background, free = [x for x in names if x.startswith("deep-analysis-")], config.slots() - len(names)
+    if imports:
+        room = config.CFG.hook_workers - (len(names) - len(background))   # the import places left
+        return imports[:max(0, room if free < room and not frees_slot() else min(room, free))]
+    busy, out = {file_tag(x) for x in background}, []
+    for x in live(deep_analysis_queued()):
+        if len(out) + len(background) >= config.CFG.background_workers or len(out) >= free:
+            break
+        if file_tag(x) not in busy:
+            busy.add(file_tag(x))
+            out.append(x)
+    return out
+
+
+def frees_slot():
+    """Whether a running job of the background queue can free its slot for an import: it yields already, or it is no
+    job a backfill queued. Such a job yields at its next step, see import_waits()."""
+    return bool(store.read(f"SELECT 1 FROM jobs WHERE claimed = 1 AND name LIKE 'deep-analysis-%' AND (yielding = 1 OR {BACKFILL} = 0) LIMIT 1"))
+
+
+def file_tag(name):
+    """The hash of the path that ends the name of a job of the background queue, see deep_name(). The burn-in job, the
+    whole-file check and the deep analysis of one path share it."""
+    return name[-21:]
+
+
 def still_queued(name):
     """Whether the store holds the job name. A store that does not read counts as holding it."""
     try:
@@ -1815,6 +1872,7 @@ def job_process(name, w, sigmask):
     code, started = 1, time.time()
     try:
         STOP.update(held=False, asked=False, term=None)   # a fresh job, whatever the parent process had done
+        config.JOB = name
         signal.signal(signal.SIGTERM, job_term)
         signal.pthread_sigmask(signal.SIG_SETMASK, sigmask)
         pending = []
@@ -1857,8 +1915,10 @@ def finished(name, status, out, pending):
 def requeue(name, crash=None):
     """Put a claimed job back in the queue. crash says how its process ended, and a job stopped by SIGTERM or left by a
     dead worker has none. A crash counts in the job, and the CRASH_TRIES-th drops the job with an error line, so a file
-    that kills its process never loops."""
+    that kills its process never loops. A job that --drop-queued dropped while it ran goes, see drop_backfill()."""
     try:
+        if store.write("DELETE FROM jobs WHERE name = ? AND claimed = 1 AND dropped = 1", name).rowcount:
+            return
         if crash:
             job = job_of(name, True)
             job["crashes"] = job.get("crashes", 0) + 1
@@ -1874,7 +1934,7 @@ def requeue(name, crash=None):
                      note=f"the job process {crash}, so the job goes back to the queue, try {job['crashes'] + 1} of {config.CRASH_TRIES}"))
         with store.tx():   # a newer deep analysis job of the path stays, and this one goes
             store.write("DELETE FROM jobs WHERE name = ? AND claimed = 1 AND EXISTS (SELECT 1 FROM jobs WHERE name = ? AND claimed = 0)", name, name)
-            store.write("UPDATE jobs SET claimed = 0, pid = NULL, settled = 0 WHERE name = ? AND claimed = 1", name)
+            store.write("UPDATE jobs SET claimed = 0, pid = NULL, settled = 0, yielding = 0 WHERE name = ? AND claimed = 1", name)
     except (sqlite3.Error, OSError, ValueError) as ex:
         logs.log(dict(source="hook", job=name, result="warning", note=config.mask(f"the job did not go back to the queue: {type(ex).__name__}: {ex}")[:200]))
 

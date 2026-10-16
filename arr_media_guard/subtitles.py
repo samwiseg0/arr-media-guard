@@ -864,7 +864,7 @@ def sweep_hear(path, idx, j, lang, starts, facts, deep, what):
             facts["failed"].append(f'audio {idx}: {config.mask(str(got.get("why") or "no words"))[:120]}')
         if not got.get("yielded") or not got.get("windows"):
             break
-        if deep and runner.queued():
+        if deep and runner.import_waits():
             raise Yielded(f"an import waits, after {len(heard)} of {len(starts)} {what} windows")
         left = left[len(got["windows"]):]
     return heard
@@ -910,7 +910,7 @@ def whole_heard(path, j, idx, lang, deep=False):
                            **({} if spans is not None else {"why": config.mask(str(got.get("why") or "no spans"))[:200]}))
     times, facts["onsets"] = [], {"cpu": 0.0, "took": 0.0}
     for k in range(math.ceil(dur / WHOLE_ONSET_PART)):
-        if deep and runner.queued():
+        if deep and runner.import_waits():
             raise Yielded(f"an import waits, during the onset read at {content.hms(k * WHOLE_ONSET_PART)}")
         times += onsets(path, j, idx, [(k * WHOLE_ONSET_PART, min((k + 1) * WHOLE_ONSET_PART, dur))], facts["onsets"])
     if facts["onsets"].get("onset_why"):   # each part of a bad stream gives the same reason

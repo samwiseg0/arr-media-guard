@@ -237,8 +237,9 @@ def test_cli_prints_one_json_line(tmp_path, capsys, monkeypatch, priority):
     assert rc == 1 and json.loads(capsys.readouterr().out)["error"] and priority == [1]   # one thread, nice 10
     got = []
     monkeypatch.setattr(burnin, "full", lambda *a: got.append(a) or {"yielded": True, "took": 0.0})
-    assert burnin.main(["f.mkv", "1", "60", "--full", "--second", "--yield-gate", "g", "--model-dir", "m", "--cache", "c"]) == 0
-    assert got == [("f.mkv", 1, 60.0, True, "g", None, "c", "m")] and json.loads(capsys.readouterr().out)["yielded"]
+    assert burnin.main(["f.mkv", "1", "60", "--full", "--second", "--yield-gate", "g", "--model-dir", "m", "--cache", "c",
+                        "--yield-job", "deep-analysis-burnin-x.json", "4", "2"]) == 0
+    assert got == [("f.mkv", 1, 60.0, True, "g", None, "c", "m", ("deep-analysis-burnin-x.json", 4, 2))] and json.loads(capsys.readouterr().out)["yielded"]
     for argv in (["f.mkv", "0", "60"], ["f.mkv", "0", "60", "--quick", "--full"]):
         with pytest.raises(SystemExit):
             burnin.main(argv)
@@ -252,7 +253,7 @@ def test_the_cli_runs_by_path(tmp_path):
 
 def test_full_yields_when_the_speech_read_yields(monkeypatch):
     """The speech read yields first, before any model loads."""
-    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate, queue: {"yielded": True, "cached": False})
+    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate, queue, job: {"yielded": True, "cached": False})
     monkeypatch.setattr(burnin, "Ocr", None)
     monkeypatch.setattr(burnin, "Sampler", lambda path: FakeSampler())
     assert burnin.full("f.mkv", 0, 600, gate="g")["yielded"]
@@ -303,7 +304,7 @@ def fake_full(monkeypatch, spans, burned=lambda t: False, sampler=None):
     sm = sampler or FakeSampler()
     monkeypatch.setattr(burnin, "Sampler", lambda path: sm)
     monkeypatch.setattr(burnin, "Ocr", lambda model_dir: FakeDetector(burned))
-    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate=None, queue=None: {"spans": spans, "cached": True})
+    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate=None, queue=None, job=None: {"spans": spans, "cached": True})
     return sm
 
 
@@ -368,8 +369,8 @@ def test_full_fails_when_nothing_decodes_and_before_the_speech_read_without_vide
 
 def test_full_yields_inside_the_sampling(monkeypatch):
     sm = fake_full(monkeypatch, SPANS)
-    monkeypatch.setattr(burnin.lid, "waits", lambda gate, queue: (gate, queue) == ("g", "q"))
-    assert burnin.full("f.mkv", 0, 1200.0, gate="g", queue="q") == {"yielded": True, "took": pytest.approx(0, abs=5)} and sm.closed
+    monkeypatch.setattr(burnin.lid, "waits", lambda gate, queue, job: (gate, queue, job) == ("g", "q", ("j", 4, 2)))
+    assert burnin.full("f.mkv", 0, 1200.0, gate="g", queue="q", job=("j", 4, 2)) == {"yielded": True, "took": pytest.approx(0, abs=5)} and sm.closed
     assert burnin.full("f.mkv", 0, 1200.0)["label"] == "none"
 
 
@@ -531,7 +532,7 @@ def fake(monkeypatch):
     monkeypatch.setitem(sys.modules, "faster_whisper", type(sys)("faster_whisper"))
     monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
     spans = [[k * CYCLE + ON, k * CYCLE + OFF] for k in range(15)]
-    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate=None, queue=None: {"spans": spans, "cached": True})
+    monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate=None, queue=None, job=None: {"spans": spans, "cached": True})
     return spans
 
 

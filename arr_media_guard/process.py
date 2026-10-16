@@ -421,7 +421,7 @@ def languages(ctx):
     ctx.content_lang = decide.content_language(ctx.original, ctx.asked[0]) if mkv and ctx.app and not ctx.background else None
     ctx.flag_hear, flag_read = decide.flag_checks(j, ctx.content_lang)
     if (lid_when or ask) and decide.duration(j) >= config.LID_MIN_SECONDS and not ctx.background:   # the import heard the language
-        if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock and an edit never queues behind it
+        if ctx.shared:   # a hearing waits for a turn at the host's model, so it runs without the file lock and an edit never queues behind it
             fcntl.flock(ctx.lock, fcntl.LOCK_UN)
         keep = ctx.subs_on and mkv and checks.lid_ready() and bool(any((t.get("properties") or {}).get("codec_id") in config.SUB_CODECS
                                                                        for t in j.get("tracks") or []) or subtitles.side_stats(path))
@@ -481,7 +481,7 @@ def subtitle_checks(ctx):
         sides = {n: s for n, s in subtitles.mkv_sidecars(path, d).items() if n not in gone_sides}
         if subtitles.sub_targets(j, d) or sides:
             items = subtitles.sub_items(path, j, d, sides, full) if decide.duration(j) >= config.SUB_MIN_SECONDS else {}   # read under the file lock
-            if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock, as above
+            if ctx.shared:   # a hearing waits for a turn at the host's model, so it runs without the file lock, as above
                 fcntl.flock(ctx.lock, fcntl.LOCK_UN)
             before = (rec.get("repack") or {}).get("subcheck") or {}   # a conversion checked the tracks already: the same windows
             sync = subtitles.sub_match(path, j, d, {r["audio"]: r["starts"] for r in before.values() if r.get("starts")} or None, sides, ctx.known,
@@ -664,7 +664,7 @@ def flag_hearing(ctx):
         rec["flag_matched"] = proven
     heard = {}
     if rest and decide.duration(ctx.j) >= config.LID_MIN_SECONDS:
-        if ctx.shared:   # a hearing waits for the host's one model, so it runs without the file lock, as in languages()
+        if ctx.shared:   # a hearing waits for a turn at the host's model, so it runs without the file lock, as in languages()
             fcntl.flock(ctx.lock, fcntl.LOCK_UN)
         heard, rec["flag_heard"] = checks.hear(ctx.path, ctx.j, ctx.d, ctx.original, only=rest)
         if ctx.shared:

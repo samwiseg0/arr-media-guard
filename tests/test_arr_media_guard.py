@@ -1507,7 +1507,7 @@ def test_a_ctrl_c_during_an_edit_of_a_backfill_ends_that_file_and_stops(env, mon
     backfill_films(env, monkeypatch, tmp_path, 2)
     real = hook.subprocess.run
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: (argv[0] == "mkvpropedit" and not env["mkvpropedit"]
-                                                                   and os.kill(os.getpid(), signal.SIGINT)) or real(argv, **k))
+                                                                   and signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)) or real(argv, **k))
     handler = signal.signal(signal.SIGINT, signal.SIG_IGN) if ignored else signal.getsignal(signal.SIGINT)
     try:
         hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
@@ -1809,7 +1809,8 @@ def test_a_backfill_with_no_instance_skips_one_not_set_up_and_names_a_broken_one
 
 def test_drop_queued_drops_only_the_jobs_a_backfill_queued(env, monkeypatch, settings, capsys):
     """--drop-queued drops the waiting and the running jobs a backfill queued, of one instance or of every one. The deep
-    analysis of an import stays. --selftest counts the jobs."""
+    analysis of an import stays. --selftest counts the jobs. A running job keeps its row, marked dropped, so its slot
+    still counts, and a requeue at its yield removes it."""
     lists, _ = libraries(env, monkeypatch, settings, SHOWS)
     settings(subtitles="deep")
     deep = queue_analysis(env, env["path"])
@@ -1820,7 +1821,10 @@ def test_drop_queued_drops_only_the_jobs_a_backfill_queued(env, monkeypatch, set
     hook.main(["--backfill", "radarr", "--drop-queued"])
     assert set(queued_paths().values()) == {"sonarr"} and "dropped 2 jobs that a backfill queued" in capsys.readouterr().out
     hook.main(["--backfill", "--drop-queued"])
-    assert hook.deep_analysis_queued() == [deep] and claimed() == [] and "dropped 2 jobs" in capsys.readouterr().out
+    running = hook.deep_name(lists["sonarr"][1])
+    assert hook.deep_analysis_queued() == [deep] and claimed() == [running] and "dropped 2 jobs" in capsys.readouterr().out
+    hook.requeue(running)
+    assert hook.deep_analysis_queued() == [deep] and claimed() == []
 
 
 def test_imports_and_rechecks_go_before_the_jobs_a_backfill_queued(env, monkeypatch, settings):
@@ -3189,14 +3193,17 @@ def test_a_tagged_track_changes_only_when_the_heard_language_agrees(env, monkeyp
     assert heard == "jpn" or 'a1 keeps eng/en: eng (tagged eng, heard eng); jpn (the title "Japanese")' in rec["notes"], rec["notes"]
 
 
-def test_the_limit_on_hearing_starts_after_the_wait_for_the_model(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_the_limit_on_hearing_starts_after_the_wait_for_the_model(tmp_path, monkeypatch, workers):
     """Another hearing holds the host's model for 1.5 s. A run with a 1-second limit waits for the turn and then hears,
-    where it used to spend its second waiting on arr_lid.py's model lock and get no answer."""
+    where it used to spend its second waiting on arr_lid.py's model lock and get no answer. HOOK_WORKERS 2, the
+    default, keeps the one turn of BACKGROUND_WORKERS 1."""
     py = fake_lid(tmp_path, monkeypatch, 0.3)
+    monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, hook_workers=workers))
     order = []
     def other():
         with hook.LID_ONE:   # another backfill worker, in the middle of its hearing
-            turn = hook.lid_turn(float("inf")); order.append("other"); time.sleep(1.5); turn.close()
+            turn, _ = hook.lid_turn(float("inf")); order.append("other"); time.sleep(1.5); turn.close()
     t = threading.Thread(target=other); t.start(); time.sleep(0.2)
     got = hook.lid_run("/m/x.mkv", 0, UND_AUDIO, ["und", "eng"], 1)
     t.join()
@@ -3204,22 +3211,61 @@ def test_the_limit_on_hearing_starts_after_the_wait_for_the_model(tmp_path, monk
     assert py.exists()
 
 
-def test_a_hook_hearing_waits_for_at_most_one_backfill_hearing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_a_hook_hearing_waits_for_at_most_one_backfill_hearing(tmp_path, monkeypatch, workers):
     """Three backfill workers need the model, 0.8 s each. A hook job asks while the first one hears. The backfill sends
     one worker at a time, and the gate goes to whoever waits first, so the hook job hears second."""
     fake_lid(tmp_path, monkeypatch, 0.8)
+    monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, hook_workers=workers))
     got, order = {}, []
     real = hook.lid_cli
-    monkeypatch.setattr(hook, "lid_cli", lambda path, *a: order.append(path) or real(path, *a))
+    monkeypatch.setattr(hook, "lid_cli", lambda path, *a, **k: order.append(path) or real(path, *a, **k))
     backfill = [threading.Thread(target=lambda i=i: got.setdefault(i, hook.lid_run(f"/m/b{i}.mkv", 0, UND_AUDIO, ["und"], 30))) for i in range(3)]
     for b in backfill: b.start()
     time.sleep(0.3)
     started = time.monotonic()
-    turn = hook.lid_turn(started + 30)   # the hook job, another process in life, so it never queues at the backfill's LID_ONE
+    turn, _ = hook.lid_turn(started + 30)   # the hook job, another process in life, so it never queues at the backfill's LID_ONE
     order.append("hook"); waited = time.monotonic() - started; turn.close()
     for b in backfill: b.join()
     assert waited < 1.2 and order.index("hook") == 1, (waited, order)
     assert [got[i]["lang"] for i in range(3)] == ["eng"] * 3
+
+
+def test_each_background_worker_has_a_turn_at_the_model_and_an_import_still_goes_first(tmp_path, monkeypatch, settings):
+    """BACKGROUND_WORKERS 3 gives three turns, lid.turn, lid.turn.1 and lid.turn.2, so three hearings run at once. A
+    fourth taker waits, and holds the gate while it waits. The first background sweep that finds the gate held gives
+    its turn up after its current pair, see "Yield to an import" in docs/design.md. The taker gets the first turn a
+    hearing frees. lid_cli() names the turn, so lid.py takes the model lock of the same turn."""
+    fake_lid(tmp_path, monkeypatch, 0)
+    settings(background_workers=3)
+    held = [hook.lid_turn(time.monotonic() + 1) for _ in range(3)]
+    assert sorted(k for _, k in held) == [0, 1, 2] and {os.path.basename(f.name) for f, _ in held} == {"lid.turn", "lid.turn.1", "lid.turn.2"}
+    gate = str(tmp_path / "lid.turn.gate")
+    assert hook.lid_turn(time.monotonic() + 0.3) is None and not hook.arr_lid.waits(gate, None)
+    got = []
+    t = threading.Thread(target=lambda: got.append(hook.lid_turn(time.monotonic() + 10)))
+    t.start()
+    for _ in range(100):
+        if hook.arr_lid.waits(gate, None): break
+        threading.Event().wait(0.02)
+    assert hook.arr_lid.waits(gate, None)   # the waiting taker holds the gate
+    held[1][0].close()
+    t.join()
+    assert got[0][1] == held[1][1] and not hook.arr_lid.waits(gate, None)
+    seen = []
+
+    class P:
+        pid = 1
+        def __init__(self, argv, **k): seen.append(argv)
+        def communicate(self, timeout=None): return ('{"lang": "eng"}', "")
+        def poll(self): return 0
+    monkeypatch.setattr(hook.subprocess, "Popen", P)
+    hook.lid_cli("/m/x.mkv", 0, UND_AUDIO, ["und"], 60, False, slot=2)
+    hook.lid_cli("/m/x.mkv", 0, UND_AUDIO, ["und"], 60, False)
+    assert seen[0][seen[0].index("--slot") + 1] == "2" and "--slot" not in seen[1], seen
+    next(f for f, k in held if k == 2).close()   # turn 2 alone is free, and turn 1 is the waiter's
+    hook.lid_run("/m/y.mkv", 0, UND_AUDIO, ["und"], 60)
+    assert seen[2][seen[2].index("--slot") + 1] == "2", seen[2]
 
 
 def test_an_import_edit_waits_for_the_files_in_flight_never_for_queued_hearings(env, monkeypatch, tmp_path):
@@ -5111,6 +5157,23 @@ def test_the_jobs_of_a_store_with_a_broken_index_go_to_the_new_store(env):
     (line,) = [r for r in log_lines(env) if r.get("outcome") == "store_corrupt"]
     assert line["result"].endswith(". 3 queued jobs went to the new one, and 1 did not read."), line["result"]
     assert hook.store.corrupt() is None and hook.queued() == sorted(names) and not claimed()
+
+
+def test_a_store_of_version_1_gets_the_marks_of_the_jobs_and_keeps_its_jobs(env):
+    """A store that an older AMG made has no yielding and dropped columns. The first open adds them, once, and the
+    queued and claimed jobs stay as they were."""
+    hook.store.close()
+    os.remove(hook.store.path())
+    with contextlib.closing(sqlite3.connect(hook.store.path(), isolation_level=None)) as db:
+        db.execute("CREATE TABLE jobs (name TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, due INTEGER NOT NULL DEFAULT 0, "
+                   "at REAL NOT NULL, pid INTEGER, settled INTEGER NOT NULL DEFAULT 0, job TEXT NOT NULL, PRIMARY KEY (name, claimed))")
+        db.execute("INSERT INTO jobs (name, claimed, at, job) VALUES ('1-1.json', 0, 0, '{}'), ('deep-analysis-a.json', 1, 0, '{}')")
+        db.execute("PRAGMA user_version = 1")
+    assert hook.store.read("SELECT name, claimed, yielding, dropped FROM jobs ORDER BY name") == [("1-1.json", 0, 0, 0), ("deep-analysis-a.json", 1, 0, 0)]
+    assert hook.store.read("PRAGMA user_version") == [(hook.store.VERSION,)]
+    hook.store.close()
+    hook.store.db()   # a second open changes nothing
+    assert len(hook.store.read("SELECT * FROM jobs")[0]) == 9
 
 
 def test_a_job_that_always_crashes_stops_in_one_worker_run_when_the_store_loses_its_count(pool, monkeypatch):
@@ -11637,7 +11700,7 @@ def test_a_sigterm_during_the_relink_lets_the_job_finish(convertible, tmp_path, 
     monkeypatch.setitem(hook.STOP, "asked", False)
 
     def relink(app, owner, old, items, target, imports=None):
-        os.kill(os.getpid(), signal.SIGTERM)   # blocked here, delivered when no_stop() ends
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)   # blocked here, delivered when no_stop() ends
         return True, {"import": "completed", "file_id": 12, "listed": [target], "remonitored": []}
     monkeypatch.setattr(hook, "relink", relink)
     old = signal.signal(signal.SIGTERM, hook.job_term)
@@ -16152,6 +16215,51 @@ def test_the_whole_file_hearing_yields_to_an_import_at_each_step(monkeypatch, tm
     assert hook.whole_heard(str(media), j, 0, "eng")["facts"]["failed"] == [] and seen["speech"] is None
 
 
+def test_the_whole_file_hearing_of_a_job_process_goes_on_while_a_slot_is_free(monkeypatch, tmp_path, settings):
+    """With job processes an import that waits stops the hearing only while every slot is taken. With a slot free the
+    hearing goes on past the pair at which it gave its turn up, and through the onset reads."""
+    settings(state_dir=str(tmp_path), hook_workers=2, background_workers=2)
+    monkeypatch.setattr(hook, "JOB", "deep-analysis-a.json")
+    media = tmp_path / "f.mkv"
+    media.write_bytes(b"x")
+    j, calls = {"container": {"properties": {"duration": 100 * 10**9}}}, []
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES ('1-1.json', 0, '{}')")   # the import that waits
+    hook.store.write("INSERT INTO jobs (name, at, job, claimed) VALUES ('deep-analysis-a.json', 0, '{}', 1)")
+    monkeypatch.setattr(hook, "lid_run", lambda path, index, j, expect, timeout, words=None, yield_to=None, **kw: calls.append(1) or {
+        "windows": [{"at": a, "secs": 10.0, "words": []} for a in words[1][:2]], "yielded": True})
+    monkeypatch.setattr(hook, "lid_speech", lambda path, idx, j, timeout, yield_to=None: {"spans": []})
+    monkeypatch.setattr(hook, "onsets", lambda path, j, idx, ps, facts: [])
+    got = hook.whole_heard(str(media), j, 0, "eng", deep=True)
+    assert len(got["windows"]) == 13 and len(calls) == 7, (calls, got)
+    hook.store.write("INSERT INTO jobs (name, at, job, claimed) VALUES ('deep-analysis-b.json', 0, '{}', 1)")   # both slots taken now
+    media.write_bytes(b"xy")   # a new file, so the cache holds none of its words
+    with pytest.raises(hook.Yielded, match="after 2 of 13 whole windows"):
+        hook.whole_heard(str(media), j, 0, "eng", deep=True)
+    monkeypatch.setattr(hook, "lid_run", lambda path, index, j, expect, timeout, words=None, yield_to=None, **kw: {
+        "windows": [{"at": a, "secs": 10.0, "words": []} for a in words[1]]})
+    with pytest.raises(hook.Yielded, match="during the onset read at 0:00$"):
+        hook.whole_heard(str(media), j, 0, "eng", deep=True)
+
+
+def test_hook_workers_1_runs_one_import_at_a_time_beside_more_background_workers(pool, monkeypatch, settings):
+    settings(hook_workers=1, background_workers=3)
+    paths = films(pool, 3)
+    real = hook.process
+
+    def process(ctx):
+        trace("import start", name=ctx.path); real_wait(0.2)
+        try:
+            return real(ctx)
+        finally:
+            trace("import end", name=ctx.path)
+    monkeypatch.setattr(hook, "process", process)
+    for n, p in enumerate(paths):
+        enqueue(pool, n, p, owner=str(n + 1))
+    run_worker()
+    assert most_at_once(runs("import")) == 1 and len(runs("import")) == 3 and set(finals(pool).values()) == {"edited"}
+    assert os.getpid() not in {r["pid"] for r in traced("import start")}   # each in a job process
+
+
 def onset_audio(tmp_path, layout):
     """A Matroska file of 30 s whose speech is a 440 Hz tone in the first second of every 3. It starts at 0, 3, 6 and so
     on, after 2 s of silence. A 5.1 file holds it in the centre channel, under a steady tone in the other channels, so
@@ -17853,6 +17961,670 @@ def test_job_processes_run_one_deep_analysis_at_a_time(pool, monkeypatch, settin
     rows = [r["what"] for r in traced() if r["what"] in ("deep start", "deep end")]
     assert rows == ["deep start", "deep end"] * 2 and len({r["pid"] for r in traced("deep start")}) == 2, traced()
     assert hook.deep_analysis_queued() == [] and not claimed()
+
+
+def background_jobs(k, prefix=None, first=0):
+    """k jobs of the background queue, as rows of the store, one file each from file first on. prefix names them as
+    hook.burn_name() or hook.whole_name() do, else hook.deep_name(). Their age orders them."""
+    names = []
+    for i in range(first, first + k):
+        path = f"/media/Film {i}.mkv"
+        names.append((prefix or hook.deep_name)(path))
+        hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", names[-1], i, json.dumps({"app": "radarr", "path": path}))
+    return names
+
+
+def fake_background(monkeypatch, body=lambda name: real_wait(0.3)):
+    """Each job of the background queue runs body(name) between a start and an end line of the trace, then drops, as
+    deep_analysis() does. A Yielded from body puts it back in the queue, as a yield does."""
+    def background(name, pending, claimed=False):
+        trace("bg start", name=name)
+        try:
+            body(name)
+        except hook.Yielded:
+            trace("bg yield", name=name)
+            hook.requeue(name) if claimed else None
+            return
+        finally:
+            trace("bg end", name=name)
+        hook.drop_job(name, claimed)
+    monkeypatch.setattr(hook, "background", background)
+
+
+def runs(what="bg"):
+    """[(name, start, end)] of each run in the trace, in start order."""
+    ends = {}
+    for r in traced(f"{what} end"):
+        ends.setdefault(r["name"], []).append(r["t"])
+    starts = {}
+    for r in traced(f"{what} start"):
+        starts.setdefault(r["name"], []).append(r["t"])
+    return sorted((n, a, b) for n in starts for a, b in zip(starts[n], ends.get(n, [])))
+
+
+def most_at_once(spans):
+    """The most spans of [(name, start, end)] that overlap at one time."""
+    return max(sum(a <= t < b for _, a, b in spans) for _, t, _ in spans)
+
+
+@pytest.mark.parametrize("hook_workers, background, want", [(3, 1, 1), (1, 3, 3), (2, 3, 3), (3, 2, 2)])
+def test_background_workers_run_that_many_background_jobs_at_once(pool, monkeypatch, settings, hook_workers, background, want):
+    """BACKGROUND_WORKERS sets the background jobs at once, beside HOOK_WORKERS. HOOK_WORKERS 1 with more runs them in
+    job processes too."""
+    settings(hook_workers=hook_workers, background_workers=background)
+    fake_background(monkeypatch)
+    names = background_jobs(5)
+    run_worker()
+    spans = runs()
+    assert sorted(n for n, _, _ in spans) == sorted(names) and most_at_once(spans) == want, spans
+    assert os.getpid() not in {r["pid"] for r in traced("bg start")} and hook.deep_analysis_queued() == [] and not claimed()
+
+
+def test_the_worker_runs_each_job_itself_at_one_and_one(pool, monkeypatch, settings):
+    settings(hook_workers=1, background_workers=1)
+    fake_background(monkeypatch, lambda name: None)
+    background_jobs(2)
+    run_worker()
+    assert {r["pid"] for r in traced("bg start")} == {os.getpid()} and hook.deep_analysis_queued() == []
+
+
+def test_two_background_jobs_of_one_file_never_run_at_once(pool, monkeypatch, settings):
+    """The burn-in job, the whole-file check and the deep analysis of a file wait for each other. A job of another file
+    runs beside them."""
+    settings(background_workers=3)
+    fake_background(monkeypatch)
+    one = background_jobs(1, hook.burn_name) + background_jobs(1, hook.whole_name) + background_jobs(1)
+    (other,) = background_jobs(1, first=1)
+    run_worker()
+    spans = runs()
+    mine = [s for s in spans if s[0] in one]
+    assert len(mine) == 3 and most_at_once(mine) == 1 and most_at_once(spans) == 2, spans
+    assert {n for n, _, _ in spans} == {*one, other} and hook.deep_analysis_queued() == []
+
+
+def test_an_import_takes_the_slot_of_one_background_job_and_the_others_go_on(pool, monkeypatch, settings):
+    """Three background jobs fill the three slots, and an import arrives. The first job that asks yields, and the
+    import takes its slot. The yield is slow to end, so its slot stays taken in the coordinator for a while. The other
+    two find a slot free in the store, so they go on. The yielded job runs again after the import."""
+    settings(hook_workers=3, background_workers=3)
+    (path,) = films(pool, 1)
+    names = background_jobs(3)
+    real_requeue = hook.requeue
+    monkeypatch.setattr(hook, "requeue", lambda name, crash=None: real_requeue(name, crash) or real_wait(0.6))
+
+    def body(name):   # each job asks in its own tenth of each 0.3 s, so no two ask at once
+        k = names.index(name)
+        while len({r["name"] for r in traced("bg start")}) < 3:
+            real_wait(0.02)
+        if k == 0 and not traced("queued"):
+            enqueue(pool, 0, path, owner="1")
+            trace("queued")
+        for _ in range(8):
+            while int(time.perf_counter() * 10) % 3 != k:
+                real_wait(0.01)
+            hook.deep_waits()
+            real_wait(0.1)
+    fake_background(monkeypatch, body)
+    run_worker()
+    yields = traced("bg yield")
+    assert len(yields) == 1 and len(traced("bg start")) == 4 and finals(pool) == {path: "edited"}, traced()
+    assert hook.deep_analysis_queued() == [] and hook.queued() == [] and not claimed()
+
+
+def test_a_background_job_never_yields_for_an_import_that_waits_for_an_import_slot(pool, monkeypatch, settings):
+    """HOOK_WORKERS 1 and BACKGROUND_WORKERS 3. An import runs beside two background jobs, and a second import arrives.
+    It waits for the first import, so a yield would free nothing for it. No background job yields, the third one starts
+    only after the second import started, and the second import runs after the first."""
+    settings(hook_workers=1, background_workers=3)
+    a, b = films(pool, 2)
+    enqueue(pool, 0, a, owner="1")
+    real = hook.process
+
+    def process(ctx):
+        trace("import start", name=ctx.path)
+        try:
+            if ctx.path == a:
+                while len(traced("bg start")) < 2:
+                    real_wait(0.02)
+                enqueue(pool, 1, b, owner="2")
+                real_wait(1.0)
+            return real(ctx)
+        finally:
+            trace("import end", name=ctx.path)
+    monkeypatch.setattr(hook, "process", process)
+
+    def body(name):
+        for _ in range(15):
+            hook.deep_waits()
+            real_wait(0.1)
+    fake_background(monkeypatch, body)
+    background_jobs(3)
+    run_worker()
+    imports = runs("import")
+    assert [n for n, _, _ in imports] == [a, b] and imports[0][2] <= imports[1][1], imports
+    third = sorted(a for _, a, _ in runs())[2]   # the third background job started only once the second import ran
+    assert not traced("bg yield") and third > imports[1][1] and set(finals(pool).values()) == {"edited"}, (runs(), imports)
+    assert hook.deep_analysis_queued() == [] and not claimed()
+
+
+def test_a_crash_of_one_background_job_leaves_the_others_running(pool, monkeypatch, settings):
+    settings(background_workers=3)
+    names = background_jobs(3)
+
+    def body(name):
+        real_wait(0.3)
+        if name == names[1] and len(traced("bg start")) <= 3:   # its first run only
+            os.kill(os.getpid(), signal.SIGKILL)
+    fake_background(monkeypatch, body)
+    run_worker()
+    assert [n for n, _, _ in runs()] == sorted(names) and len(traced("bg start")) == 4, traced()
+    notes = [r["note"] for r in log_lines(pool) if r.get("result") == "warning"]
+    assert notes == ["the job process died by signal 9, so the job goes back to the queue, try 2 of 3"], notes
+    assert hook.deep_analysis_queued() == [] and not claimed()
+
+
+def test_sigterm_puts_every_running_background_job_back(pool, monkeypatch, settings):
+    settings(background_workers=3)
+    names = background_jobs(4)
+    fake_background(monkeypatch, lambda name: real_wait(30))
+    coordinator = real_fork()
+    if not coordinator:   # the worker in its own process, so the SIGTERM never reaches pytest
+        try:
+            run_worker()
+        finally:
+            REAL_EXIT(0)
+    for _ in range(200):
+        if len(traced("bg start")) == 3: break
+        real_wait(0.05)
+    os.kill(coordinator, signal.SIGTERM)
+    for _ in range(200):
+        done, status = os.waitpid(coordinator, os.WNOHANG)
+        if done: break
+        real_wait(0.05)
+    assert done and os.waitstatus_to_exitcode(status) == 0 and len(traced("bg start")) == 3
+    assert sorted(hook.deep_analysis_queued()) == sorted(names) and not claimed()
+    assert not any(json.loads(j).get("crashes") for j, in hook.store.read("SELECT job FROM jobs"))
+    assert [r["note"] for r in log_lines(pool)] == ["stopped by SIGTERM, 0 Plex analyze requests kept for the next worker"]
+
+
+def test_drop_queued_while_backfill_jobs_run_ends_each_once(pool, monkeypatch, settings):
+    """--drop-queued runs while three jobs a backfill queued run. Each ends once, none goes back to the queue, and the
+    job that waited is gone."""
+    settings(background_workers=3)
+    names = background_jobs(4)
+    for n in names:
+        hook.store.write("UPDATE jobs SET job = ? WHERE name = ?", json.dumps({"app": "radarr", "path": n, "backfill": True}), n)
+
+    def body(name):
+        while len(traced("bg start")) < 3:
+            real_wait(0.02)
+        if name == names[0]:
+            trace("dropped", n=hook.drop_backfill())
+        real_wait(0.3)
+    fake_background(monkeypatch, body)
+    run_worker()
+    assert [r["n"] for r in traced("dropped")] == [4] and sorted(n for n, _, _ in runs()) == sorted(names[:3])
+    assert hook.store.read("SELECT count(*) FROM jobs")[0][0] == 0 and not os.path.exists(hook.CFG.log)   # no line: no requeue, no crash
+
+
+def backfill_rows(names):
+    """Mark the jobs of names as jobs a backfill queued, as cli.backfill_queue() writes them."""
+    for n in names:
+        job = json.loads(hook.store.read("SELECT job FROM jobs WHERE name = ?", n)[0][0])
+        hook.store.write("UPDATE jobs SET job = ? WHERE name = ?", json.dumps(dict(job, backfill=True)), n)
+    return names
+
+
+def timed_imports(monkeypatch, secs):
+    """Each import job traces its start and its end and takes secs."""
+    real = hook.process
+
+    def process(ctx):
+        trace("import start", name=ctx.path)
+        try:
+            real_wait(secs)
+            return real(ctx)
+        finally:
+            trace("import end", name=ctx.path)
+    monkeypatch.setattr(hook, "process", process)
+
+
+def import_waits_of():
+    """{path: seconds from its queueing to its start} of each import in the trace."""
+    queued = {r["name"]: r["t"] for r in traced("enq")}
+    return {r["name"]: round(r["t"] - queued[r["name"]], 3) for r in traced("import start") if r["name"] in queued}
+
+
+@pytest.mark.parametrize("hook_workers, background", [(2, 2), (2, 4), (1, 2)])
+def test_an_import_never_waits_for_jobs_a_backfill_queued(pool, monkeypatch, settings, hook_workers, background):
+    """Jobs a backfill queued fill every slot. Such a job yields only before a conversion and a remux, so no import
+    would get a slot for up to its time limit. Each import starts in one more job process instead, up to HOOK_WORKERS
+    imports. The next import waits for an import place, and no job yields."""
+    settings(hook_workers=hook_workers, background_workers=background)
+    paths = films(pool, hook_workers + 1)
+    timed_imports(monkeypatch, 0.6)
+    names = backfill_rows(background_jobs(background))
+
+    def body(name):   # the checks of a job a backfill queued, with no yield
+        while len(traced("bg start")) < background:
+            real_wait(0.02)
+        if name == names[0]:
+            for n, p in enumerate(paths):
+                enqueue(pool, n, p, owner=str(n + 1))
+                trace("enq", name=p)
+        real_wait(3.0)
+    fake_background(monkeypatch, body)
+    run_worker()
+    waits, imports = import_waits_of(), runs("import")
+    assert sorted(waits) == sorted(paths) and all(waits[p] < 1.0 for p in paths[:hook_workers]) and waits[paths[-1]] >= 0.5, waits
+    assert most_at_once(imports) == hook_workers and most_at_once(runs() + imports) == background + hook_workers, (runs(), imports)
+    assert not traced("bg yield") and set(finals(pool).values()) == {"edited"} and hook.deep_analysis_queued() == [] and not claimed()
+
+
+def test_an_import_waits_for_the_yield_of_a_job_that_can_yield(pool, monkeypatch, settings):
+    """A job a backfill queued and a deep analysis fill the two slots. The deep analysis can yield, so the import waits
+    for its slot, and no third process starts. The deep analysis asks less often than the worker looks at the queue."""
+    settings(hook_workers=2, background_workers=2)
+    (path,) = films(pool, 1)
+    timed_imports(monkeypatch, 0.2)
+    (bf,), (deep,) = backfill_rows(background_jobs(1)), background_jobs(1, first=1)
+
+    def body(name):
+        while len(traced("bg start")) < 2:
+            real_wait(0.02)
+        if name == bf:
+            if len(traced("bg start")) == 2:
+                enqueue(pool, 0, path, owner="1")
+                trace("enq", name=path)
+            real_wait(2.0)
+            return
+        for _ in range(4):
+            hook.deep_waits()
+            real_wait(0.5)
+    fake_background(monkeypatch, body)
+    run_worker()
+    assert [r["name"] for r in traced("bg yield")] == [deep] and import_waits_of()[path] < 1.5, traced()
+    assert most_at_once(runs() + runs("import")) == 2 and hook.deep_analysis_queued() == [] and not claimed()
+
+
+@pytest.mark.parametrize("period, lat", [(0.0, 0.0), (0.5, 0.3)])
+@pytest.mark.parametrize("rep", range(2))
+def test_one_import_makes_one_job_yield_also_when_the_jobs_ask_at_once(pool, monkeypatch, settings, period, lat, rep):
+    """Four background jobs fill every slot, and an import arrives. Each job asks as lid.py and burnin.py ask, at its
+    own phase of period, a period 0 at the same instant. A job that yields takes lat seconds to exit, as lid.py does,
+    and it keeps its claim until then. Its mark in the store frees its slot at once, so one job alone yields."""
+    settings(hook_workers=2, background_workers=4)
+    (path,) = films(pool, 1)
+    timed_imports(monkeypatch, 0.2)
+    names = background_jobs(4)
+    phase = {n: random.Random(rep).random() * period for n in names}
+
+    def body(name):
+        while len({r["name"] for r in traced("bg start")}) < 4:
+            real_wait(0.01)
+        if len(traced("bg start")) > 4:   # the run after the yield ends at once
+            return
+        if name == names[0]:
+            at = time.perf_counter()
+            enqueue(pool, 0, path, owner="1")
+            trace("enq", name=path)
+            trace("queued at", at=at)
+        while not traced("queued at"):
+            real_wait(0.005)
+        q, k = traced("queued at")[0]["at"], 0
+        while time.perf_counter() - q < 3:
+            due = q + 0.1 + phase[name] + k * max(period, 0.05)
+            while time.perf_counter() < due:
+                real_wait(0.002)
+            if hook.arr_lid.queued(hook.store.path(), (hook.JOB, hook.slots(), hook.CFG.hook_workers)):
+                real_wait(lat)
+                raise hook.Yielded("an import waits, during the speech read")
+            k += 1
+    fake_background(monkeypatch, body)
+    run_worker()
+    assert len(traced("bg yield")) == 1 and import_waits_of()[path] < 1.5 and finals(pool) == {path: "edited"}, traced()
+    assert hook.deep_analysis_queued() == [] and not claimed()
+
+
+def test_drop_queued_keeps_the_slot_of_a_running_job_counted(pool, monkeypatch, settings):
+    """--drop-queued while a job a backfill queued and a deep analysis fill both slots. The running job keeps its row,
+    marked dropped, so the store counts both slots taken. The deep analysis yields to the import, and the dropped job
+    ends once with no return to the queue."""
+    settings(hook_workers=2, background_workers=2)
+    (path,) = films(pool, 1)
+    timed_imports(monkeypatch, 0.1)
+    (bf,), (deep,) = backfill_rows(background_jobs(1)), background_jobs(1, first=1)
+
+    def body(name):
+        while len(traced("bg start")) < 2:
+            real_wait(0.01)
+        if name == bf:
+            if len(traced("bg start")) > 2:   # a run after the yield, which a dropped job never gets
+                return
+            trace("dropped", n=hook.drop_backfill())
+            enqueue(pool, 0, path, owner="1")
+            trace("enq", name=path)
+            real_wait(2.0)
+            raise hook.Yielded("an import waits, before a conversion")   # its yield ends it, as its end would
+        for _ in range(80):
+            hook.deep_waits()
+            real_wait(0.05)
+    fake_background(monkeypatch, body)
+    run_worker()
+    assert [r["n"] for r in traced("dropped")] == [1] and [r["name"] for r in traced("bg yield")] == [deep, bf], traced()
+    assert import_waits_of()[path] < 1.0 and [n for n, _, _ in runs()].count(bf) == 1
+    assert hook.store.read("SELECT count(*) FROM jobs")[0][0] == 0
+
+
+def test_a_job_marked_yielding_yields_at_each_ask_until_it_goes_back(env, monkeypatch, settings):
+    """lid.py marked the job yielding, and its import started in a slot that freed meanwhile. The hook's next ask still
+    yields, so the job never runs on while its slot counts as free. Its requeue clears the mark. Its claim clears a
+    mark that 2.16.0 left on the queued row after a downgrade, so the claimed job yields for no import."""
+    settings(hook_workers=2, background_workers=2)
+    (name,) = background_jobs(1)
+    hook.store.write("UPDATE jobs SET yielding = 1 WHERE name = ?", name)   # 2.16.0 put the job back with its mark
+    assert hook.claim(name)
+    monkeypatch.setattr(hook, "JOB", name)
+    assert not hook.import_waits()
+    hook.store.write("UPDATE jobs SET yielding = 1 WHERE name = ?", name)
+    assert hook.import_waits()
+    hook.requeue(name)
+    assert hook.store.read("SELECT claimed, yielding FROM jobs WHERE name = ?", name) == [(0, 0)]
+
+
+@pytest.mark.parametrize("who", ["lid.py", "hook"])
+def test_a_job_makes_no_mark_for_an_import_that_the_worker_claims_after_its_read(env, monkeypatch, settings, who):
+    """Four jobs fill every slot, and the first one yielded to an import. A third job reads that the import waits. Then
+    the worker puts the first job back and claims the import, before the third job's YIELD runs. lid.py waits for the
+    write lock meanwhile, and the hook asks right after its read. YIELD reads the queue again and makes no mark."""
+    settings(hook_workers=2, background_workers=4)
+    a, _, c, _ = names = background_jobs(4)
+    for n in names:
+        assert hook.claim(n)
+    imp = enqueue(env, 0, "/media/x.mkv")
+    hook.store.write("UPDATE jobs SET yielding = 1 WHERE name = ?", a)
+    if who == "lid.py":
+        connect, read = sqlite3.connect, threading.Event()
+
+        class Conn:   # lid.py's connection, which says when it has read the queue
+            def __init__(self, *a, **k):
+                self.c = connect(*a, **k)
+
+            def execute(self, sql, *args):
+                read.set() if sql == "BEGIN IMMEDIATE" else None
+                return self.c.execute(sql, *args)
+
+            def close(self):
+                self.c.close()
+        hold = connect(hook.store.path(), isolation_level=None, timeout=5)
+        hold.execute("BEGIN IMMEDIATE")   # the worker holds the write lock
+        monkeypatch.setattr(hook.arr_lid.sqlite3, "connect", Conn)
+        got = []
+        t = threading.Thread(target=lambda: got.append(hook.arr_lid.queued(hook.store.path(), (c, 4, 2))))
+        t.start()
+        assert read.wait(5)
+        hold.execute("UPDATE jobs SET claimed = 0, yielding = 0 WHERE name = ?", (a,))   # as requeue() and claim() do
+        hold.execute("UPDATE jobs SET claimed = 1 WHERE name = ?", (imp,))
+        hold.execute("COMMIT")
+        t.join()
+        hold.close()
+    else:
+        real = hook.queued
+
+        def queued():
+            got = real()
+            hook.requeue(a)
+            assert hook.claim(imp)
+            return got
+        monkeypatch.setattr(hook, "queued", queued)
+        monkeypatch.setattr(hook, "JOB", c)
+        got = [hook.import_waits()]
+    assert got == [False] and hook.store.read("SELECT name FROM jobs WHERE yielding = 1") == [], got
+
+
+def test_a_hearing_of_a_background_job_in_a_job_process_waits_without_the_gate(env, monkeypatch):
+    """lid_run() asks lid_turn() for a background turn only in a job process of a job of the background queue."""
+    monkeypatch.setattr(hook, "lid_ready", lambda: True)
+    monkeypatch.setattr(hook, "lid_cached", lambda *a, **k: False)
+    asked = []
+    monkeypatch.setattr(hook, "lid_turn", lambda deadline, background=False: asked.append(background))
+    for job in (None, "17-1.json", hook.deep_name("/m/a.mkv"), hook.burn_name("/m/a.mkv")):
+        monkeypatch.setattr(hook, "JOB", job)
+        hook.lid_run("/m/a.mkv", 0, UND_AUDIO, ["und"], 60)
+    assert asked == [False, False, True, True], asked
+
+
+def test_the_default_workers_keep_one_turn_at_the_model(tmp_path, settings):
+    """HOOK_WORKERS 2 and BACKGROUND_WORKERS 1, the defaults: one turn, so a second taker waits."""
+    settings(hook_workers=2, background_workers=1, state_dir=str(tmp_path))
+    held = hook.lid_turn(time.monotonic() + 1)
+    assert held and hook.lid_turn(time.monotonic() + 0.3) is None
+    held[0].close()
+
+
+def test_an_import_starts_past_the_slots_only_while_no_running_job_can_free_one(env, settings):
+    """Two jobs a backfill queued hold both slots, so two imports start, one more import place each. Once one of the
+    jobs yields, or a deep analysis holds a slot, the imports wait for the slot it frees."""
+    settings(hook_workers=2, background_workers=2)
+    imports = ["9-1.json", "10-1.json", "11-1.json"]
+    a, b = backfill_rows(background_jobs(2))
+    (deep,) = background_jobs(1, first=2)
+    for n in (a, b, deep):
+        assert hook.claim(n)
+    hook.store.write("UPDATE jobs SET claimed = 0 WHERE name = ?", deep)
+    assert hook.next_jobs(imports, [a, b], lambda x: x) == imports[:2]
+    assert hook.next_jobs(imports, [a, b, imports[0]], lambda x: x) == imports[:1]
+    hook.store.write("UPDATE jobs SET yielding = 1 WHERE name = ?", a)
+    assert hook.next_jobs(imports, [a, b], lambda x: x) == []
+    hook.store.write("UPDATE jobs SET yielding = 0 WHERE name = ?", a)
+    hook.store.write("UPDATE jobs SET claimed = 1 WHERE name = ?", deep)
+    assert hook.next_jobs(imports, [a, deep], lambda x: x) == []
+
+
+def test_no_background_job_starts_while_an_import_waits_for_an_import_place(env, settings):
+    """A slot is free, but the waiting import has no HOOK_WORKERS place. Background jobs start only while no import
+    waits, so none starts."""
+    settings(hook_workers=2, background_workers=3)
+    background_jobs(1)
+    assert hook.next_jobs(["9-q.json"], ["1-a.json", "2-b.json"], lambda x: x) == []
+
+
+def test_a_background_taker_waits_for_a_turn_without_the_gate(tmp_path, settings):
+    """A background taker never holds lid.turn.gate while it waits, so no sweep sees a waiter and yields to it. It takes
+    no turn while another taker holds the gate, so an import that waits there still goes first. A sweep that tests the
+    gate is no waiter, to another sweep or to a background taker."""
+    settings(background_workers=2, state_dir=str(tmp_path))
+    gate, held, got = str(tmp_path / "lid.turn.gate"), [hook.lid_turn(time.monotonic() + 1) for _ in range(2)], []
+    t = threading.Thread(target=lambda: got.append(hook.lid_turn(time.monotonic() + 5, background=True)))
+    t.start()
+    for _ in range(20):
+        assert not hook.arr_lid.waits(gate, None)
+        real_wait(0.02)
+    with open(gate, "w") as g:   # an import's taker waits at the gate, and a turn frees
+        fcntl.flock(g, fcntl.LOCK_EX)
+        held[1][0].close()
+        real_wait(0.5)
+        assert not got
+    t.join()
+    assert got[0][1] == 1
+    for f, _ in (held[0], got[0]):
+        f.close()
+    with open(gate, "a") as probe:   # a sweep tests the gate at this instant
+        fcntl.flock(probe, fcntl.LOCK_SH)
+        assert not hook.arr_lid.waits(gate, None)
+        got = hook.lid_turn(time.monotonic() + 0.5, background=True)
+        assert got
+        got[0].close()
+
+
+def test_sweeps_that_take_their_turns_again_make_no_other_sweep_yield(env, settings):
+    """Three background sweeps hold the three turns, and an import's taker waits at the gate. A sweep whose pair ends
+    while the taker waits gives its turn up, and the import gets one. The sweeps take a turn again without the gate, so
+    no test of the gate finds a waiter after that. The test counts the tests of the gate, so no clock decides it."""
+    settings(background_workers=3)
+    gate = os.path.join(hook.CFG.state_dir, "lid.turn.gate")
+    took, before, after, got, stop = [], [], [], [], threading.Event()
+
+    def sweep():
+        while not stop.is_set():
+            turn = hook.lid_turn(time.monotonic() + 30, background=True)
+            if turn is None:
+                continue
+            took.append(1)
+            try:
+                while not stop.is_set():
+                    real_wait(0.1)   # one pair
+                    seen = after if got else before   # once the taker has its turn, lid_turn() let the gate go before this test
+                    seen.append(hook.arr_lid.waits(gate, None))
+                    if seen[-1]:
+                        break
+            finally:
+                turn[0].close()
+            real_wait(0.05)   # lid.py exits, the next one starts
+    ts = [threading.Thread(target=sweep) for _ in range(3)]
+    for t in ts:
+        t.start()
+    try:
+        for _ in range(3000):   # the sweeps hold every turn
+            if len(took) >= 3:
+                break
+            real_wait(0.01)
+        got.append(hook.lid_turn(time.monotonic() + 30))
+        for _ in range(3000):
+            if len(after) >= 30:
+                break
+            real_wait(0.01)
+    finally:
+        stop.set()
+        if got and got[0]:
+            got[0][0].close()
+        for t in ts:
+            t.join()
+    assert got[0] and any(before) and not any(after), (before, after)
+
+
+def slot_lid(tmp_path, settings, secs):
+    """A lid.py stand-in: it writes its pid, locks the model lock of its --slot, sleeps secs and answers eng."""
+    lid_dir = tmp_path / "lid"
+    (lid_dir / "venv" / "bin").mkdir(parents=True)
+    (lid_dir / "ready").write_text("")
+    py = lid_dir / "venv" / "bin" / "python"
+    py.write_text(f"#!{sys.executable}\nimport fcntl, json, os, sys, time\ncache = sys.argv[sys.argv.index('--cache') + 1]\n"
+                  "slot = sys.argv[sys.argv.index('--slot') + 1] if '--slot' in sys.argv else ''\n"
+                  f"open(os.path.join({str(tmp_path)!r}, 'lidpid.' + str(os.getpid())), 'w').write(slot)\n"
+                  "with open(cache + '.lock' + ('.' + slot if slot else ''), 'w') as f:\n"
+                  f"    fcntl.flock(f, fcntl.LOCK_EX); time.sleep({secs})\n"
+                  "print(json.dumps({'lang': 'eng', 'prob': 0.95, 'why': None, 'cached': False, 'took': 0.1}))\n")
+    py.chmod(0o755)
+    settings(lid_dir=str(lid_dir))
+
+
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split()[2] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+def lid_pids(tmp_path):
+    return [int(n.split(".")[1]) for n in os.listdir(tmp_path) if n.startswith("lidpid.")]
+
+
+def test_sigterm_during_model_turns_frees_every_turn(pool, monkeypatch, settings, tmp_path):
+    """SIGTERM to the worker while three background jobs each hear with a turn of their own. Every turn and every model
+    lock is free after, no hearing outlives its job, and each job is back in the queue with no crash."""
+    settings(hook_workers=2, background_workers=3)
+    slot_lid(tmp_path, settings, 30)
+    names = background_jobs(3)
+    fake_background(monkeypatch, lambda name: hook.lid_run(f"/m/{name}.mkv", 0, UND_AUDIO, ["und"], 60))
+    coordinator = real_fork()
+    if not coordinator:
+        try:
+            run_worker()
+        finally:
+            REAL_EXIT(0)
+    for _ in range(400):
+        if len(lid_pids(tmp_path)) == 3: break
+        real_wait(0.05)
+    pids = lid_pids(tmp_path)
+    assert sorted(open(tmp_path / f"lidpid.{p}").read() for p in pids) == ["", "1", "2"]
+    os.kill(coordinator, signal.SIGTERM)
+    for _ in range(400):
+        done, status = os.waitpid(coordinator, os.WNOHANG)
+        if done: break
+        real_wait(0.05)
+    st = hook.CFG.state_dir
+    locks = [os.path.join(st, n) for n in ("lid.turn", "lid.turn.1", "lid.turn.2", "lid.turn.gate", "lid.sqlite.lock", "lid.sqlite.lock.1",
+                                           "lid.sqlite.lock.2")]
+    assert done and os.waitstatus_to_exitcode(status) == 0 and not any(alive(p) for p in pids)
+    for p in locks:
+        with open(p, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises while a lock is held
+    assert sorted(hook.deep_analysis_queued()) == sorted(names) and not claimed()
+    assert not any(json.loads(j).get("crashes") for j, in hook.store.read("SELECT job FROM jobs"))
+
+
+def test_a_job_process_killed_during_its_hearing_goes_back_and_runs_again(pool, monkeypatch, settings, tmp_path):
+    """A job process that holds a turn dies by SIGKILL. Its turn frees at once. Its hearing, in its own session, keeps
+    the model lock of that turn until it ends, so the next taker of the turn waits for it. The job runs again."""
+    settings(hook_workers=2, background_workers=2)
+    slot_lid(tmp_path, settings, 2)
+    background_jobs(2)
+
+    def body(name):
+        trace("hearing", name=name)
+        hook.lid_run(f"/m/{name}.mkv", 0, UND_AUDIO, ["und"], 60)
+    fake_background(monkeypatch, body)
+    killer = real_fork()
+    if not killer:
+        try:
+            for _ in range(400):
+                if len(lid_pids(tmp_path)) >= 2: break
+                real_wait(0.05)
+            os.kill(traced("hearing")[0]["pid"], signal.SIGKILL)
+        finally:
+            REAL_EXIT(0)
+    run_worker()
+    os.waitpid(killer, 0)
+    notes = [r["note"] for r in log_lines(pool) if r.get("result") == "warning"]
+    assert notes == ["the job process died by signal 9, so the job goes back to the queue, try 2 of 3"], notes
+    assert len(traced("bg start")) == 3 and hook.deep_analysis_queued() == [] and not claimed()
+
+
+@pytest.mark.parametrize("hook_workers, background, taken, imports, waits", [
+    (2, 4, ["d1", "d2", "d3"], 0, False),          # a slot is free, and the coordinator claims the import
+    (2, 4, ["d1", "d2", "d3"], 1, True),           # every slot is taken, and an import slot is free
+    (2, 4, ["d1", "d2"], 2, False),                # the imports use their HOOK_WORKERS, so a yield frees nothing for it
+    (1, 1, [], 0, True),                           # the worker runs each job itself, so it yields to every import
+    (3, 2, ["d1", "d2"], 1, True)])
+def test_a_background_job_yields_only_for_a_slot_an_import_can_take(env, monkeypatch, settings, hook_workers, background, taken, imports, waits):
+    """runner.import_waits() in the worker and lid.queued() in lid.py and burnin.py give one answer, with or without
+    an import waiting. Of two jobs that ask, one alone yields. lid_cli() gives lid.py the job only when it runs in a
+    job process."""
+    settings(hook_workers=hook_workers, background_workers=background)
+    for n in taken:
+        hook.store.write("INSERT INTO jobs (name, at, job, claimed) VALUES (?, 0, '{}', 1)", f"deep-analysis-{n}.json")
+    for k in range(imports):
+        hook.store.write("INSERT INTO jobs (name, at, job, claimed) VALUES (?, 0, '{}', 1)", f"{k}-1.json")
+    if hook.slots() > 1:   # a job process asks for its own job, see job_process()
+        monkeypatch.setattr(hook, "JOB", "deep-analysis-d1.json")
+    job = (hook.JOB, hook.slots(), hook_workers) if hook.JOB else None
+    other = job and ("deep-analysis-d2.json", *job[1:])
+    assert not hook.import_waits() and not hook.arr_lid.queued(hook.store.path(), job)
+    enqueue(env, 9, env["path"])
+    assert hook.import_waits() == waits and hook.arr_lid.queued(hook.store.path(), job) == waits
+    assert not other or not hook.arr_lid.queued(hook.store.path(), other)   # d1 yields, or no slot frees for the import
+    seen = []
+
+    class P:
+        pid = 1
+        def __init__(self, argv, **k): seen.append(argv)
+        def communicate(self, timeout=None): return ('{"spans": []}', "")
+        def poll(self): return 0
+    monkeypatch.setattr(hook.subprocess, "Popen", P)
+    hook.lid_cli(env["path"], 0, env["probe"], (), 60, False, yield_to=(None, "/s/q"), speech=True)
+    assert (seen[0][-4:] == ["--yield-job", *map(str, job)]) if job else "--yield-job" not in seen[0], seen
 
 
 @pytest.mark.parametrize("code, result", [("subtitle_remux_failed", "subtitle remux failed: the original could not be kept, so it stays"),

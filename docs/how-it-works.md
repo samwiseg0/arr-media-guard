@@ -13,8 +13,8 @@ and [design.md](design.md) the rules behind it. These words come up often.
 - The *state store* is a small database, `STATE_DIR/state.sqlite`. It holds the background queue and AMG's other
   records.
 - The *background queue* is the line of jobs in the state store. Imports always go first. After them come the burned-in
-  subtitle checks, the whole-file checks, the deep analyses and the rechecks, one at a time and only while no import
-  waits.
+  subtitle checks, the whole-file checks, the deep analyses and the rechecks, `BACKGROUND_WORKERS` at a time (1 by
+  default) and only while no import waits.
 - The *decision log* is the file `LOG` names. It gets a line for each file AMG checks.
 - A *remux* writes a file again with the same video and audio. AMG never re-encodes.
 - A *re-grab* deletes a broken file through the app and marks the grab as failed, so the app searches again.
@@ -90,13 +90,14 @@ One worker runs at a time. On a host the Custom Script starts it, so it runs ins
 At its start the worker checks the state store. A broken store moves aside as `state.sqlite.corrupt-<time>`, and a new
 one starts with the jobs it could read. Once a day the worker also removes kept originals older than
 `KEEP_ORIGINALS_DAYS`. It puts back in the background queue the jobs a stopped worker left, and takes over the Plex
-updates it saved. It then takes the jobs, oldest first. With `HOOK_WORKERS` above 1, it checks that many files at once.
+updates it saved. It then takes the jobs, oldest first. With `HOOK_WORKERS` above 1, it checks that many imports at once. With
+`BACKGROUND_WORKERS` above 1, it runs that many jobs of the background queue at once.
 
 The worker skips a job when an earlier re-grab of the same download deleted its file. When the file is not at its path,
 it asks the app, and follows a file the app moved or renamed. It drops a job whose file is gone, and a job older than a
 day. At the start of each run of a job, it asks the app about the file. A job runs again when its file or its download
 changed, and that run asks too. It drops a job whose file the app deleted and replaced at the same path, as when the
-app imports one release twice. The newer import's job checks that file. With `HOOK_WORKERS=1` a job never runs again
+app imports one release twice. The newer import's job checks that file. With `HOOK_WORKERS=1` and `BACKGROUND_WORKERS=1` a job never runs again
 for a changed file, so a replace during the checks still reads the copy. When the [policy file](policy.md) does not
 load, it skips the job, and one alert names the error. A job whose check crashes three times is dropped with an error
 line.

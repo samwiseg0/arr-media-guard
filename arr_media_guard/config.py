@@ -77,6 +77,7 @@ CRASH_TRIES = 3                                  # a job whose process died this
 SCHEMA = 2                                       # the decision log's line format. Raise it when a field changes meaning.
 HOST = os.uname().nodename
 SERVE = False   # True in the listener and the worker and daily jobs it starts, all as --serve. serve.main() sets it.
+JOB = None      # in a job process of runner.coordinate(), the name of its claimed job, see runner.import_waits()
 IMAGE = os.environ.get("ARR_MEDIA_GUARD_IMAGE") == "1"   # docker/Dockerfile sets it. No app runs a Custom Script in the image.
 
 
@@ -170,7 +171,8 @@ class Settings:
     convert_max: int         # CONVERT_MAX_FILES, the conversions one backfill run applies. Then it stops, for the NAS load.
     convert_workers: int
     scan_workers: int
-    hook_workers: int        # job processes of the worker. 1 runs each job in the worker itself.
+    hook_workers: int        # import jobs the worker runs at once. 1 with BACKGROUND_WORKERS 1 runs each job in the worker itself.
+    background_workers: int  # jobs of the background queue the worker runs at once while no import waits, see runner.coordinate()
     apps: dict               # instance name: AppSettings. The default instances radarr and sonarr come first, then APP_INSTANCES.
     errors: list
     from_env: tuple          # the keys the environment gave, sorted. --selftest names them.
@@ -339,10 +341,17 @@ def settings(path, environ=os.environ):
         keep_days=number("KEEP_ORIGINALS_DAYS", 7, 7, "is not a whole number of 0 or more, so it counts as {}.", least=0),
         repack_max=repack_max, subtitles=subtitles, burned_in=burned_in, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),
+        background_workers=number("BACKGROUND_WORKERS", 1, 1, whole, least=1),
         hook_workers=hook_workers, errors=errors, apps=apps, from_env=tuple(sorted(env.taken)))
 
 
 CFG = settings(ENV_FILE)
+
+
+def slots():
+    """The jobs the worker runs at once: the larger of HOOK_WORKERS and BACKGROUND_WORKERS. At 1 it runs each job in
+    itself, else each in a job process, see runner.coordinate()."""
+    return max(CFG.hook_workers, CFG.background_workers)
 
 
 def own_version():

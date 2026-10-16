@@ -1013,27 +1013,44 @@ def lid_ready():
 LID_ONE = threading.Lock()   # the workers of a backfill ask for the model one at a time, see lid_turn()
 
 
-def lid_turn(deadline):
-    """The host's one turn at the language model, the lock lid.turn in the state directory, as an open file to close after
-    the hearing. None when time.monotonic() passes deadline first. A taker holds lid.turn.gate while it waits, and a
-    backfill sends one worker at a time (LID_ONE). So a hook job waits for the one hearing in progress, never behind a
-    queue of backfill files. lid.py still takes its own model lock, which is free by then."""
+def lid_turn(deadline, background=False):
+    """A turn at the language model: (the open lock file to close after the hearing, the turn's number). None when
+    time.monotonic() passes deadline first. The host has BACKGROUND_WORKERS turns, the locks lid.turn, lid.turn.1 and so
+    on in the state directory, so each background job can hear at once. A taker holds lid.turn.gate while it waits, and
+    a backfill sends one worker at a time (LID_ONE). So a hook job waits for the first turn a hearing in progress gives
+    up, never behind a queue of backfill files. lid.py takes the model lock of the same turn, which is free by then.
+    A background taker, a job of the background queue in a job process, holds the gate shared, and only while it tries
+    the turns. A sweep tests the gate shared too, see lid.waits(). So the taker waits for a free turn and makes no sweep
+    yield, and it takes no turn while another taker holds the gate."""
     base = os.path.join(config.CFG.state_dir, "lid.turn")
-    gate, turn = open(base + ".gate", "w"), open(base, "w")
+    gate, turns, got = open(base + ".gate", "w"), [open(base + (f".{k}" if k else ""), "w") for k in range(config.CFG.background_workers)], None
     try:
-        for f in (gate, turn):
-            while True:
-                try:
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        turn.close()
-                        return None
-                    select.select([], [], [], 0.2)
-        return turn
+        gated = False
+        while got is None:
+            gated = gated or flocked(gate, background)
+            got = next((k for k, f in enumerate(turns) if gated and flocked(f)), None)
+            if gated and background:
+                fcntl.flock(gate, fcntl.LOCK_UN)
+                gated = False
+            if got is None:
+                if time.monotonic() >= deadline:
+                    return None
+                select.select([], [], [], 0.2)
+        return turns[got], got
     finally:
         gate.close()
+        for k, f in enumerate(turns):
+            if k != got:
+                f.close()
+
+
+def flocked(f, shared=False):
+    """Whether this process now holds the open file f locked, exclusive or shared, with no wait."""
+    try:
+        fcntl.flock(f, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
 
 
 def lid_cached(path, index, j, words=None):
@@ -1057,20 +1074,23 @@ def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None
     or None): the run then gives the words of those windows for the subtitle check instead, see lid.listen(). then
     is a file of the subtitle check's hearings that a language check runs after its own, with the model loaded, see
     lid.jobs(). yield_to is (the gate file, the state store or None) at which a hearing of many windows yields, see lid.waits().
-    A run that must hear first waits for the host's turn at the model, see lid_turn(). timeout starts after that wait,
+    A run that must hear first waits for a turn at the model, see lid_turn(). timeout starts after that wait,
     and a job's time limit caps it then. A wait of a second or more comes back as "waited"."""
     if not lid_ready():
         return {"why": "language detection is not installed"}
     start, cached = time.monotonic(), not fresh and lid_cached(path, index, j, words)
     with contextlib.nullcontext() if cached else LID_ONE:
         left = config.DEADLINE.left()   # a hook job waits only while its time limit leaves room to hear
-        turn = None if cached else lid_turn(start + (left - config.LID_RESERVE - 10 if left else float("inf")))
+        turn = None if cached else lid_turn(start + (left - config.LID_RESERVE - 10 if left else float("inf")),
+                                            (config.JOB or "").startswith("deep-analysis-"))
         waited = time.monotonic() - start
         if not cached and turn is None:
             return {"why": f"another hearing held the model for {waited:.0f} seconds", "waited": waited}
+        turn, slot = turn or (None, 0)
         try:
             left = config.DEADLINE.left()
-            got = lid_cli(path, index, j, expect, min(timeout, left - config.LID_RESERVE) if left else timeout, fresh, keep, words, then, yield_to)
+            got = lid_cli(path, index, j, expect, min(timeout, left - config.LID_RESERVE) if left else timeout, fresh, keep, words, then, yield_to,
+                          slot=slot)
             return dict(got, waited=waited) if waited >= 1 else got
         finally:
             if turn:
@@ -1086,10 +1106,10 @@ def lid_speech(path, index, j, timeout, yield_to=None):
     return lid_cli(path, index, j, (), timeout, False, yield_to=yield_to, speech=True)
 
 
-def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None, speech=False, burn=()):
+def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None, speech=False, burn=(), slot=0):
     """The lid.py process of lid_run() or lid_speech(), killed with its process group after timeout seconds. burn holds
     the flags of a burnin.py run instead, the burned-in subtitle check, which runs in the same venv, see
-    process.burn_run()."""
+    process.burn_run(). slot is the turn at the model that lid_run() holds, see lid_turn()."""
     argv = [os.path.join(config.CFG.lid_dir, "venv", "bin", "python"), os.path.join(os.path.dirname(__file__), "burnin.py" if burn else "lid.py"),
             path, str(index), str(decide.duration(j)), "--cache", os.path.join(config.CFG.state_dir, "lid.sqlite"),
             "--model-dir", os.path.join(config.CFG.lid_dir, "models")]
@@ -1104,6 +1124,9 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
     else:
         argv += (["--fresh"] if fresh else []) + (["--keep-pcm"] if keep else []) + ["--expect", *expect] + (["--then-words", then] if then else [])
     argv += [a for opt, v in zip(("--yield-gate", "--yield-queue"), yield_to or ()) if v for a in (opt, v)]
+    argv += ["--slot", str(slot)] if slot else []
+    if (yield_to or (None, None))[1] and config.JOB:   # a job process yields only for its slot, see runner.import_waits()
+        argv += ["--yield-job", config.JOB, str(config.slots()), str(config.CFG.hook_workers)]
     t0 = time.time()
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
