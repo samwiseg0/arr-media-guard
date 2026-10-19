@@ -1240,13 +1240,16 @@ def queue_line():
 def job_proc(pid):
     """The start of the arr-media-guard process pid in clock ticks since boot, or None when it is gone, a zombie or
     another program. A job process is a fork of the worker, so its command line names the launcher arr-media-guard, as
-    the Custom Script and the listener run it. A zombie's command line is empty."""
+    the Custom Script and the listener run it. The launcher is a Python script, so Python is the program. tini in the
+    image names the launcher too, but runs as root, and its open files do not read for PUID. A zombie's command line is
+    empty."""
     try:
         with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
             argv = f.read().split(b"\0")
     except (OSError, TypeError, ValueError):
         return None
-    return convert.proc_start(pid) if any(os.path.basename(a) == b"arr-media-guard" for a in argv) else None
+    ours = os.path.basename(argv[0]).startswith(b"python") and any(os.path.basename(a) == b"arr-media-guard" for a in argv)
+    return convert.proc_start(pid) if ours else None
 
 
 def worker_held():

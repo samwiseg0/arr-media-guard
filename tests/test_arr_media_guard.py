@@ -2002,6 +2002,25 @@ def test_queue_says_unknown_when_the_open_files_of_a_process_do_not_read(env, se
     assert queue_out(capsys)[1] == "worker: running"
 
 
+def test_queue_leaves_out_a_program_that_runs_the_launcher(env, settings, capsys, monkeypatch):
+    """tini runs the launcher in the image, so its command line names arr-media-guard too. It runs as root and --queue
+    runs as PUID, so its open files do not read. It is another program, so --queue says none, never unknown."""
+    settings(hook_workers=2, background_workers=2)
+    open(os.path.join(hook.CFG.state_dir, "worker.lock"), "w").close()
+    p, listdir = subprocess.Popen(["sh", "-c", "sleep 60; :", "/usr/local/bin/arr-media-guard"]), os.listdir
+
+    def denied(d):
+        if d == f"/proc/{p.pid}/fd":
+            raise PermissionError(13, "Permission denied", d)
+        return listdir(d)
+    monkeypatch.setattr(os, "listdir", denied)
+    try:
+        assert queue_out(capsys)[1] == "worker: none, the next import starts one"
+    finally:
+        p.kill()
+        p.wait()
+
+
 def test_queue_reads_the_store_in_one_snapshot(env, capsys, monkeypatch):
     """--queue reads the store in one snapshot. An import that another process queues between two reads changes no
     count, so it does not read as one that waits to retry."""
