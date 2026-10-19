@@ -161,7 +161,8 @@ def packet_read(path, index):
     video, where each stream ends, held, the seconds from the first audio packet to the audio end less every gap over
     decide.HOLE_GAP, hole, the longest gap between two audio packets, video_gap, the longest gap between two video
     packets or the longest video packet duration, as a broken MP4 stts entry gives one frame 20,000 s, subs,
-    [end, events, text] of each subtitle track, and the codec. held reads no bit rate and no rounded packet duration.
+    [end, events, text] of each subtitle track, and the codec. The video is the film's, see decide.main_video(). held
+    reads no bit rate and no rounded packet duration.
     Only running sums are kept, so a TrueHD track of 8 million packets needs no memory. A skip, a missing ffprobe, a
     failure or a timeout returns {"error": why}, never a verdict."""
     t, (timeout, skipped) = time.monotonic(), read_time(path, "the packet read")
@@ -175,7 +176,6 @@ def packet_read(path, index):
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as ex:
         return {"error": f"ffprobe did not run: {type(ex).__name__}"}
     au = [x for x in streams if x.get("codec_type") == "audio"]
-    vi = [x["index"] for x in streams if x.get("codec_type") == "video" and not (x.get("disposition") or {}).get("attached_pic")]
     if index >= len(au):
         return {"error": "ffprobe lists no such audio stream" if streams else "ffprobe failed"}
     try:
@@ -183,7 +183,7 @@ def packet_read(path, index):
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
     except OSError as ex:
         return {"error": f"ffprobe did not run: {type(ex).__name__}"}
-    a, v = au[index]["index"], vi[0] if vi else None
+    a, v = au[index]["index"], (decide.main_video(streams) or {}).get("index")
     subs = {x["index"]: [0.0, 0, x.get("codec_name") not in decide.BITMAP_SUBS] for x in streams if x.get("codec_type") == "subtitle"}
     out = dict(codec=au[index].get("codec_name"), profile=au[index].get("profile"), audio=None, hole=None, video=None, video_gap=0.0)
     timer, rc, first, afirst, gaps = threading.Timer(timeout, p.kill), None, None, None, 0.0
@@ -314,6 +314,61 @@ def seeks(f, b, ds):
     return seek, read, lost
 
 
+SEEKHEAD_MAX = 16 << 20   # bytes layout_fault() reads of one SeekHead. An old mkvmerge lists every Cluster in one, before its Chapters.
+# The level-1 elements by name, for layout_fault()
+TOP_NAMES = {decide.SEEKHEAD: "SeekHead", decide.INFO: "Info", decide.TRACKS: "Tracks", 0x1043A770: "Chapters", decide.CLUSTER: "Cluster",
+             decide.CUES: "Cues", 0x1941A469: "Attachments", 0x1254C367: "Tags"}
+
+
+def layout_fault(f, ds):
+    """Why the top level of the open Matroska file f breaks RFC 9559, or None. ds is where the Segment data starts.
+    Info and Tracks must sit before the first Cluster or be listed in a SeekHead before it (6.1). A second SeekHead,
+    one that a front SeekHead lists, may list Clusters only (6.3). When mkvpropedit grows the Tracks of a file with
+    no room behind its front SeekHead, it moves Tracks to the end, copies the SeekHead there and leaves a front one
+    that lists only that copy and the Tags. MediaInfo then shows no track. Tracks at the end that the front SeekHead
+    lists are valid, as Lavf writes them and as the zero padding case of the whole-file check holds them, and so is an
+    old mkvmerge's second SeekHead of Clusters. The front is walked by element headers, so a large front element
+    is no limit. A walk that meets no Cluster, and a listed SeekHead that does not read, give None. Each SeekHead is
+    read once and whole, up to SEEKHEAD_MAX, and SEEK_HEADS of the others in all."""
+    front, listed, heads, p = set(), {}, set(), ds
+    for _ in range(64):   # up to the first Cluster
+        f.seek(p); e = decide.element(f.read(12), 0)
+        if not e or e[0] not in decide.LEVEL1 or e[2] is None:
+            return None
+        if e[0] == decide.CLUSTER:
+            break
+        front.add(e[0])
+        if e[0] == decide.SEEKHEAD:
+            heads.add(p - ds)
+            f.seek(p); b = f.read(min(e[1] + e[2], SEEKHEAD_MAX))
+            decide.seek_entries(b, e[1], len(b), listed)
+        p += e[1] + e[2]
+    else:
+        return None
+    missing = [TOP_NAMES[i] for i in (decide.INFO, decide.TRACKS) if i not in front and i not in listed]
+    if missing:
+        return f"{' and '.join(missing)} {'sit' if len(missing) > 1 else 'sits'} after the first Cluster, and no SeekHead before it lists {'them' if len(missing) > 1 else 'it'}"
+    for pos in [x for x in listed.get(decide.SEEKHEAD, []) if x not in heads][:config.SEEK_HEADS]:
+        f.seek(ds + pos); e = decide.element(f.read(12), 0)
+        if not e or e[0] != decide.SEEKHEAD or e[2] is None:
+            continue
+        f.seek(ds + pos); b = f.read(min(e[1] + e[2], SEEKHEAD_MAX))
+        other = sorted({TOP_NAMES.get(i, hex(i)) for i in decide.seek_entries(b, e[1], e[1] + e[2], {}) if i != decide.CLUSTER})
+        if other:
+            return f"a second SeekHead lists {', '.join(other)}, and only Clusters may be listed there"
+    return None
+
+
+def layout_of(path):
+    """layout_fault() of the Matroska file path, None for another file or one that does not open."""
+    try:
+        with open(path, "rb") as f:
+            seg = decide.segment_start(f.read(64))
+            return layout_fault(f, seg[0]) if seg else None
+    except OSError:
+        return None
+
+
 def header_probe(path, j):
     """The header check of a Matroska file (docs/design.md, "Header repair"), None for another container. j is its mkvmerge -J
     probe. It reads the start of the file and the Cues. It reads the last HEADER_TAIL bytes of the Segment only when
@@ -350,6 +405,7 @@ def header_probe(path, j):
         short = None if seg_size is None else ds + seg_size - size
         (seek, more, lost), cues, cue_end = seeks(f, b, ds), "no SeekHead lists the Cues", None
         read += more
+        layout = layout_fault(f, ds)
         if any(x >= size for x in lost):
             cues = "the SeekHead that lists the Cues sits past the end of the file"
         for pos in seek.get(decide.CUES, []):
@@ -371,7 +427,7 @@ def header_probe(path, j):
         little = failed and short < decide.SHORT_CERTAIN   # the hook's own failed edit cut the file's end
         out = dict(duration=round(dur, 3), cues=cues, cue_end=cue_end, short=short, failed_edit=failed, video=None, audio=None, end=None,
                    read=read, issue=[], blocked=[], tail=-short if short is not None and -short > config.TAIL_MIN else 0)
-        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not out["tail"]:
+        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not out["tail"] and not layout:
             return out   # the common case, read in two small parts
         kinds, ends = [k for k in ("video", "audio") if k in tracks.values()], None
         stop = size + min(0, short or 0)   # the Segment end. The bytes past it may hold the Clusters of an older copy.
@@ -390,6 +446,8 @@ def header_probe(path, j):
         out["issue"].append(f"the file holds {out['tail']} bytes past the end of its Matroska Segment")
     if cues is not True:
         out["issue"].append(f"no usable Cues index: {cues}")
+    if layout:   # a remux writes a new layout, see layout_fault()
+        out["issue"].append(f"the header layout breaks the Matroska rules: {layout}")
     got = {k: [e for i, e in (ends or {}).items() if tracks.get(i) == k] for k in ("video", "audio")}
     if ends is None:
         out["blocked"].append("no stream end could be read from the last clusters")
@@ -818,18 +876,53 @@ def watch(p, why):
     return None
 
 
-def window(path, start, secs):
+def main_stream(path):
+    """ffprobe's stream of the film in path, see decide.main_video(), with its index and duration, or None. behind is
+    True when a still-image track comes before it. An ffmpeg -ss then seeks by that track's index, and the film decodes
+    from a frame that is no keyframe. So window() decodes such a film through PyAV."""
+    r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,duration:stream_disposition=attached_pic",
+                     "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
+    try:
+        streams = json.loads(r.stdout).get("streams") or []
+        v = decide.main_video(streams)
+    except (ValueError, AttributeError):
+        return None
+    first = next((s for s in streams if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")), None)   # V:0
+    return v and dict(v, behind=v is not first)
+
+
+STILL_FIRST = "a still image comes before the video, and a seek goes by its index"   # why no window runs with no PyAV
+
+
+def window_stream(path):
+    """{"stream": the film's ffprobe index} for window() when a still image comes before the film, see main_stream().
+    Else {}, and window() runs ffmpeg."""
+    v = main_stream(path)
+    return {"stream": v["index"]} if v and v["behind"] else {}
+
+
+def window(path, start, secs, stream=None):
     """Decode secs seconds of the main video stream from start, parsed by decide.parse_window(). Read-only, so it
     may be killed. A seek with no usable index reads the file from the start, and a seek into zeros reads to the next
     intact cluster. So the window stops at VIDEO_MAX_READ bytes or VIDEO_TIMEOUT seconds. 0:V:0 skips cover art.
-    Skipping the loop filter saves time and parses the same bitstream. watch() waits for ffmpeg. Its bytes read are the
-    change of our own count across the reap, under REAP, so the other scan workers do not add to it."""
+    Skipping the loop filter saves time and parses the same bitstream. watch() waits for the decoder. Its bytes read
+    are the change of our own count across the reap, under REAP, so the other scan workers do not add to it.
+
+    stream is the film's ffprobe index when a still image comes before the film, see main_stream(). ffmpeg's -ss
+    seeks by the first video stream, so avwindow.py decodes the window instead, in the venv of language detection.
+    PyAV seeks by the film's own stream, and the stderr has the shape of ffmpeg's. Its window logs via "pyav"."""
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-threads", "2", "-skip_loop_filter", "all",
            "-ss", f"{start:.2f}", "-t", f"{secs:.2f}", "-i", path, "-map", "0:V:0", "-an", "-sn", "-dn", "-vf", "showinfo=checksum=0",
-           "-f", "null", "-"]
+           "-f", "null", "-"] if stream is None else \
+        [os.path.join(config.CFG.lid_dir, "venv", "bin", "python"), os.path.join(os.path.dirname(__file__), "avwindow.py"), path, str(stream),
+         f"{start:.2f}", f"{secs:.2f}"]
     t0, stopped = time.monotonic(), None
     with tempfile.TemporaryFile("w+", errors="replace", dir=config.CFG.state_dir) as err:   # a file, so a long stderr never blocks ffmpeg
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+        except OSError as ex:   # the venv's Python is gone, as after an upgrade of the host's Python: the window did not run
+            return dict(decide.parse_window(f"[fatal] {ex}", 1), at=round(start), stopped=None, took=round(time.monotonic() - t0, 2), read=0,
+                        error=config.mask(str(ex))[:200], **({} if stream is None else {"via": "pyav"}))
         try:
             stopped = watch(p, lambda: f"ran over {decide.VIDEO_TIMEOUT} s" if time.monotonic() - t0 > decide.VIDEO_TIMEOUT else
                             f"read over {decide.VIDEO_MAX_READ >> 20} MiB" if rchar(p.pid) > decide.VIDEO_MAX_READ else None)
@@ -841,10 +934,10 @@ def window(path, start, secs):
                 p.kill(); p.wait()
         err.seek(0)
         return dict(decide.parse_window(err.read(), 1 if stopped else p.returncode), at=round(start), stopped=stopped,
-                    took=round(time.monotonic() - t0, 2), read=read)
+                    took=round(time.monotonic() - t0, 2), read=read, **({} if stream is None else {"via": "pyav"}))
 
 
-def check_video(path, dur, again=False, hp=None, pcm=None):
+def check_video(path, dur, again=False, hp=None, pcm=None, by=None):
     """(certain reason or None, [doubts], log fields) for one file of dur seconds, the shape of check_audio().
 
     Three read-only stages, each only when the earlier ones found nothing certain. header: a Matroska file shorter
@@ -870,9 +963,11 @@ def check_video(path, dur, again=False, hp=None, pcm=None):
     check. Digital silence in PCM audio is zero bytes, so in such a file the zero probe's hits are logged only, and the
     windows run all the same. The whole-file check judges the zeros, because its read pass confirms each run. The hits
     still block a header repair, as they do in any other file. Another container keeps the probe's verdict.
+
+    by is the stream option of window(), see window_stream(). None reads it from the file.
     """
     pcm = pcm_audio(path) if pcm is None else pcm
-    certain, doubts, fields = video_stages(path, dur, again, hp, pcm)
+    certain, doubts, fields = video_stages(path, dur, again, hp, pcm, by)
     h = fields["header"]
     if hp and hp["issue"]:
         z, w = fields.get("zeros") or {}, fields.get("windows") or {}
@@ -890,8 +985,9 @@ def check_video(path, dur, again=False, hp=None, pcm=None):
     return certain, doubts, fields
 
 
-def video_stages(path, dur, again, hp, pcm=False):
-    """The three stages of check_video(). With pcm the zero probe's hits give no verdict, and the windows run."""
+def video_stages(path, dur, again, hp, pcm=False, by=None):
+    """The three stages of check_video(). With pcm the zero probe's hits give no verdict, and the windows run. by is
+    as in check_video()."""
     left = lambda: config.DEADLINE.left() or float("inf")   # None means no time limit, as in a scan
     took = lambda t: round(time.monotonic() - t, 2)
     fields, doubts, t = {"fault": None}, [], time.monotonic()
@@ -922,12 +1018,14 @@ def video_stages(path, dur, again, hp, pcm=False):
         return None, doubts, fields
     windows, skipped, t = [], None, time.monotonic()
     if len(hits) < 2 or pcm:
+        by = (window_stream(path) if by is None else by) if dur >= 60 else {}
         for share in decide.VIDEO_AGAIN if again else decide.VIDEO_AT:
             skipped = "the duration is under 60 s" if dur < 60 else \
+                STILL_FIRST if by and not lid_ready() else \
                 f"{left():.0f} s left of the job's time limit" if left() < decide.VIDEO_TIMEOUT + config.VIDEO_RESERVE else None
             if skipped:
                 break
-            windows.append(window(path, dur * share, min(decide.VIDEO_SECS, dur * (1 - share))))
+            windows.append(window(path, dur * share, min(decide.VIDEO_SECS, dur * (1 - share)), **by))
         fields["windows"] = dict(list=windows, took=took(t), read=sum(w["read"] for w in windows), **({"skipped": skipped} if skipped else {}))
     if sum(bool(w.get("nodecoder")) for w in windows) >= 2 and not any(w.get("encrypted") for w in windows) and encrypted_video(path):
         for w in windows:   # ffmpeg named no encryption, but the bytes show it
@@ -943,7 +1041,7 @@ def video_seconds(j, hp=None):
     if hp and hp.get("video"):
         return hp["video"]
     app = (((j or {}).get("container") or {}).get("properties") or {}).get("writing_application") or ""
-    p = next(((t.get("properties") or {}) for t in (j or {}).get("tracks") or [] if t.get("type") == "video"), {})
+    p = (decide.main_video((j or {}).get("tracks") or []) or {}).get("properties") or {}
     if app.startswith("mkvmerge") and p.get("tag__statistics_writing_app", app) == app and p.get("tag_duration"):   # ffmpeg copies stale tags
         return decide.tag_seconds(p["tag_duration"])
     return None
@@ -966,10 +1064,12 @@ def pcm_tracks(j):
 
 
 def video_inputs(path, j=None, hp=None):
-    """(the duration for the windows, header_probe() or None, pcm_tracks()) of one file for check_video(). A .mkv file
-    is probed with mkvmerge when j is not given. A probe that fails reads as none, so the zero probe and the windows
-    still run. The duration is video_seconds(), else the video stream's own for a file that is not Matroska, else the
-    format duration."""
+    """(the duration for the windows, header_probe() or None, pcm_tracks(), the stream option of window() or None) of
+    one file for check_video(). A .mkv file is probed with mkvmerge when j is not given. A probe that fails reads as
+    none, so the zero probe and the windows still run. The duration is video_seconds(), else the video stream's own for
+    a file that is not Matroska, else the format duration. A Matroska file whose probe lists one video track and no
+    warning holds no still image before the film, so window() needs no ffprobe, see window_stream(). mkvmerge skips a
+    track it cannot read and warns, as in an MP4."""
     if path.lower().endswith(".mkv") and j is None:
         try:
             j = mkvmerge(path)
@@ -979,17 +1079,17 @@ def video_inputs(path, j=None, hp=None):
             j = {}
     hp = hp or (header_of(path, j) if j else None)
     matroska = ((j or {}).get("container") or {}).get("type") == "Matroska"   # ffprobe reads no stream duration from Matroska
-    return video_seconds(j, hp) or (None if matroska else video_stream_seconds(path)) or ffprobe_duration(path) or 0, hp, pcm_tracks(j)
+    one = matroska and not j.get("warnings") and sum(t.get("type") == "video" for t in j.get("tracks") or []) == 1
+    return video_seconds(j, hp) or (None if matroska else video_stream_seconds(path)) or ffprobe_duration(path) or 0, hp, pcm_tracks(j), \
+        {} if one else None
 
 
 def video_stream_seconds(path):
-    """The duration ffprobe reads for the main video stream, or None. Matroska gives none. The format duration can come
-    from a stray packet of another stream."""
-    r = run_bounded(["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries", "stream=duration", "-of", "csv=p=0", path],
-                    120, capture_output=True, text=True, errors="replace")
+    """The duration ffprobe reads for the main video stream, see main_stream(), or None. Matroska gives none. The format
+    duration can come from a stray packet of another stream."""
     try:
-        return float(r.stdout.split()[0]) or None
-    except (ValueError, IndexError):
+        return float((main_stream(path) or {}).get("duration") or 0) or None
+    except ValueError:
         return None
 
 
@@ -999,8 +1099,8 @@ def video_check(path, again=False, j=None, hp=None):
     verdict. Its log fields then carry error and code video_check_error. So the check never costs the flag edit, and a
     second check that fails keeps the file. The time limit outside the check still stops the job."""
     try:
-        dur, hp, pcm = video_inputs(path, j, hp)
-        return check_video(path, dur, again, hp, pcm)
+        dur, hp, pcm, by = video_inputs(path, j, hp)
+        return check_video(path, dur, again, hp, pcm, by)
     except Exception as ex:
         return None, [], {"fault": None, "error": config.mask(f"{type(ex).__name__}: {ex}")[:200], "code": "video_check_error"}
 
@@ -1188,14 +1288,18 @@ def hear(path, j, d, original, fresh=False, only=None, keep=False, then=None):
 
 LANGS = []
 def langs():
-    """mkvmerge's language table for decide.retag(), read once per process. Empty when mkvmerge cannot list it:
-    then no two tags of a track are compared, and a language still changes on two agreeing signals."""
+    """mkvmerge's language table for decide.retag() and remux.props_fault(), read once per process. Empty when mkvmerge
+    cannot list it: then no two tags of a track are compared, and a language still changes on two agreeing signals.
+    An empty table is never kept, so the next call reads again. With none, props_fault() refuses a BCP 47 tag that
+    mkvmerge wrote for a track with none."""
     if not LANGS:
         try:
-            LANGS.append(decide.language_table(run_bounded(["mkvmerge", "--list-languages"], 60, capture_output=True, text=True,
-                                                               errors="replace").stdout))
+            got = decide.language_table(run_bounded(["mkvmerge", "--list-languages"], 60, capture_output=True, text=True, errors="replace").stdout)
         except Exception:   # the table only lets retag() compare two tags, so a failure never stops a job
-            LANGS.append(({}, {}))
+            return {}, {}
+        if not got[1]:
+            return got
+        LANGS.append(got)
     return LANGS[0]
 
 

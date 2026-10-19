@@ -373,6 +373,7 @@ FINDINGS = {
     "submatch": ("Wrong subtitles", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
     "subtiming": ("Subtitles out of sync", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
     "burned_in": ("Burned-in subtitles", lambda f, t: burned(f, t)),
+    "cover": ("Cover picture not moved", lambda f, t: cover_line(f)),
 }
 # The title of a certain fault the hook acted on. Its action code adds the end, see ACTIONS. Red, or amber when unconfirmed.
 FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Broken video", "damage": "Damaged file", "burned_in": "Burned-in subtitles"}
@@ -582,6 +583,26 @@ def remux_why(result):
     return REWRITE_FAILED
 
 
+def cover_line(x, t=None):
+    """The sentences of the cover pictures that a remux did not move out of the video tracks x["tracks"], see
+    process.after_edit(). also: the sentence joins the alert of the subtitle fixes of the same remux, which says why it
+    failed. same names the attachments that hold the same pictures, so the remux was to remove the tracks. name is the
+    attachment of one track, and only an attachment named cover is the file's cover art."""
+    one = len(x["tracks"]) == 1
+    where = bold(f'video track{"" if one else "s"} {and_list(p[1:] for p in x["tracks"])}')
+    if x.get("also"):
+        return f"The cover picture in {where} stays a video track too, so a player may show it in place of the video." if one else \
+            f"The cover pictures in {where} stay video tracks too, so a player may show one in place of the video."
+    if x.get("same"):
+        did = f'The file holds the same picture{"" if len(x["same"]) == 1 else "s"} as {and_list(bold(n) for n in x["same"])}. ' \
+              f'AMG tried to remove the track{"" if one else "s"}'
+    else:
+        did = "AMG tried to move them out of the video tracks" if not one else f"AMG tried to store it as the attachment {bold(x['name'])}" \
+            if os.path.splitext(x.get("name") or "cover")[0].lower() != "cover" else "AMG tried to store it as the file's cover art"
+    head = f"The cover picture is stored as {where}, so a player may show it" if one else f"Cover pictures are stored as {where}, so a player may show one"
+    return f"{head} in place of the video. {did}{fix_failed(x['result'])}. The original file was not changed."
+
+
 def fix_failed(result):
     """The end of a sentence on a fix that a remux did not make: ", but the fix failed, because" and its reason, see
     remux_why(), or ", but rewriting the file failed"."""
@@ -772,6 +793,7 @@ SUB_LINES = {
                                        else "--apply would replace them with the same subtitles in readable characters." if x.get("repair")
                                        else f'--apply would rename the file to {bold(x["to"])}.'),
     "live": live_line,
+    "cover": cover_line,
 }
 
 
@@ -827,7 +849,8 @@ CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "
 FINDING_STEPS = {"language": None, "runtime": None, "duration": None, "episode": None, "content": None, "audio": None, "video": None,
                  "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "unreadable": None, "header": WRITE, "cut": None,
                  "subtitle": None, "sublang": None, "edit": WRITE, "policy": None, "submatch": None, "subtiming": None,
-                 "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None}
+                 "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None,
+                 "cover": WRITE}
 # Per action code. A setting or the daily limit stops a re-grab before it starts, and so does a second check that did
 # not find the fault again.
 ACTION_STEPS = {"regrabbed": REPLACE, "searched": REPLACE, "restored": REPLACE, "deleted": REPLACE, "would_regrab": None, "check": None, "unconfirmed": None,
@@ -842,7 +865,7 @@ LINE_STEPS = {
     "stays": lambda x: None if x.get("kept_back") else WRITE,
     "sidecar": sidecar_step, "converted_sidecar": sidecar_step, "sidecar_left": sidecar_step, "garbled_sidecar": sidecar_step,
     "off": lambda x: SHIFT if x.get("offsets") or "moved" in x else None if x.get("would") else HEAR if x.get("unheard") else TEST,   # see off_line()
-    "not_retimed": WRITE,
+    "not_retimed": WRITE, "cover": WRITE,
     "garbled": lambda x: WRITE if x.get("kept_back") == "names" else None if x.get("kept_back") else WRITE if "result" in x
     else None if x["repair"] and not x["flags_off"] else TEST,
     "live": lambda x: None if not x["flags_off"] else HEAR if x.get("hearing_stopped") else SHIFT,
@@ -985,11 +1008,24 @@ REPAIRS = {"header_repaired": "Repaired the file. Its video, audio and subtitles
 
 
 def repair_change(rec, told):
-    """A header repair: its removal and its trim, as one repair may do both, else the words of its code."""
-    hr = rec.get("header_repair") or {}
+    """A header repair: its removal and its trim, as one repair may do both, else the words of its code. A cover picture
+    that the subtitle remux moved out of the video tracks adds its sentence."""
+    hr, rm, out = rec.get("header_repair") or {}, rec.get("subremux") or {}, []
     if hr.get("code") in REPAIRS:
         both = [REPAIRS[c] for c, k in (("subtitle_removed", "removed"), ("subtitle_trimmed", "trimmed")) if hr.get(k)]
-        return "File repaired", " ".join(both or [REPAIRS[hr["code"]]]) + kept(hr)
+        out.append(" ".join(both or [REPAIRS[hr["code"]]]) + kept(hr))
+    if rm.get("done") and rm.get("covers"):
+        tracks = lambda ps: bold(f'video track{"s" if len(ps) > 1 else ""} {and_list(p[1:] for p in ps)} of the original file')
+        moved, copies, names = [p for p in rm["covers"] if p not in (rm.get("copies") or [])], rm.get("copies") or [], rec.get("covers") or {}
+        for p in moved:   # only an attachment named cover is the file's cover art
+            name = names.get(p, {}).get("name") or ""
+            out.append(f"Moved the cover picture out of {tracks([p])} into the file's cover art." if os.path.splitext(name)[0].lower() == "cover" else
+                       f"Moved the picture in {tracks([p])} into the attachment {bold(name)}.")
+        for name in dict.fromkeys(names.get(p, {}).get("name") for p in copies):   # one sentence for each picture
+            out.append(f"Removed {tracks([p for p in copies if names.get(p, {}).get('name') == name])}, which held the same picture as {bold(name)}.")
+        out.append("The video and audio stayed the same." + kept(rm))
+    if out:
+        return "File repaired", " ".join(out)
 
 
 def retime_change(rec, told):
@@ -1291,7 +1327,8 @@ def missed(rec):
         return rec["result"][:200]
     if hr.get("code") in ("header_repair_failed", "header_repair_skipped"):
         return hr["result"][:200]
-    if (rm.get("fixed") or rm.get("ended") or rm.get("timed") or rm.get("remove") or rm.get("recoded") or rm.get("stripped")) and not rm.get("done"):
+    if (rm.get("fixed") or rm.get("ended") or rm.get("timed") or rm.get("remove") or rm.get("recoded") or rm.get("stripped") or rm.get("covers")) \
+            and not rm.get("done"):
         return rm.get("result", "the subtitle remux did not run")[:200]
     left = [e["name"] for e in rec.get("sidecars") or [] if e.get("result") == "left"]
     return f'the sidecar {", ".join(left)} stays as it was' if left else None

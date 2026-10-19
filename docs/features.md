@@ -162,7 +162,8 @@ subtitles" names each file. It runs in the deep analysis and with `--sub-check` 
 ## Broken audio and corrupt video
 
 At import, AMG decodes three samples of the audio that will play. It checks that the video is not cut short or filled
-with empty data, and decodes three short parts of it. A sure fault gets a second check from scratch. When that finds it
+with empty data, and decodes three short parts of it. A cover picture stored as a video track never counts as the
+video. A sure fault gets a second check from scratch. When that finds it
 too, AMG deletes the file through the app and marks the grab as failed, so the app searches again. This is a *re-grab*.
 When AMG is unsure, an alert such as "Audio may be broken" says why. `REGRAB` picks the faults that re-grab, and
 `REGRAB_CAP` allows 30 a day by default for each Sonarr or Radarr instance. When either stops a re-grab, an alert says
@@ -237,16 +238,28 @@ minutes for a 4K remux. The second look reuses the speech the first one read.
 ## Header repair
 
 A Matroska file can carry a wrong header, such as a wrong length or a missing seek index. It can also hold junk data at
-its end. A SubRip subtitle, the text format of `.srt` files, can run past the end of the video. After a video check
+its end, or a layout the Matroska rules forbid. One case is a track list that sits after the video data where no index
+at the start points to it. MediaInfo then shows no tracks. Another is a second index that lists more than the video
+data. A SubRip subtitle, the text format of `.srt` files, can run past the end of the video. After a video check
 finds no real damage, AMG repairs the file in a remux. It trims those lines, or removes a track made for another cut.
 Other subtitle formats cannot be trimmed, so an alert names them. It runs at import and in a backfill with `--apply`.
 `HEADER_REPAIR=false` turns it off.
+
+## Cover track
+
+Some MKV files store the poster of the film as a second video track, and some players show it in place of the film.
+When every frame of that track is the same image, AMG moves the image into the file's cover art, `cover.jpg`, in the
+same rewrite as the subtitle fixes. It proves the video and audio stay the same and the cover art holds the same
+bytes. The file keeps one copy of each picture. A track whose picture an attachment holds already goes. Tracks that
+repeat one picture go too, and share one attachment. A file that has other cover art keeps a track of a new picture.
+A move that fails leaves the file as it is and posts an alert. See [design.md](design.md#cover-track).
 
 ## Conversion
 
 AMG can turn a file in another container, such as AVI, MP4, M4V, TS or WebM, into Matroska. The streams stay the same,
 and the sidecars go into the new file. A subtitle whose words do not match the audio stays out. AMG checks every stream
-of the new file, packet by packet, before it removes the source file. In an MP4 with HEVC, MPEG-1 or MPEG-2 video,
+of the new file, packet by packet, before it removes the source file. Every packet must also sit in the file near its
+time, as in the source. In an MP4 with HEVC, MPEG-1 or MPEG-2 video,
 mkvmerge would drop the last frames when a subtitle or audio track ends first. AMG reads such a video on its own, so it keeps
 every frame. An MP4 subtitle track must hold its text in UTF-8.
 A track with any line in an older character set, such as Windows-1256, shows as garbage in every player. AMG removes

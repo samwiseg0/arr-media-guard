@@ -32,6 +32,7 @@ The hunter imports the package, and the package never imports the hunter.
 | `judge.py` | the timing outcome of each subtitle, after the moves and the write, and the record the alerts read |
 | `lid.py` | language detection. The venv in `LID_DIR` runs it by its path. |
 | `burnin.py` | the burned-in subtitle check, `quick()` and `full()`. Like `lid.py`, the venv in `LID_DIR` runs it by its path. |
+| `avwindow.py` | the video windows of a file with a still image before the film, in PyAV. The venv in `LID_DIR` runs it by its path. |
 | `health.py` | `status.json` for a monitoring agent |
 | `store.py` | the state store, one SQLite file in `STATE_DIR` |
 
@@ -51,6 +52,8 @@ The tests need pytest. The tests on real media files need `ffmpeg` and mkvtoolni
 missing. The README's [Install on a host](../README.md#install-on-a-host) installs mkvtoolnix 102.
 The burned-in subtitle tests on media in `tests/test_burnin.py` also need numpy, onnxruntime, PyAV and the text
 models, and skip without them.
+The tests of the PyAV video windows need a language detection install with PyAV, at `ARR_LID_DIR` (default
+`/opt/arr-media-guard-lid`), and skip without one.
 With pytest-xdist installed, `python -m pytest -q -n auto` runs them on every core, as CI does.
 
 The tests make their own clips with ffmpeg. `amg.ffmpeg()` in [tests/amg.py](../tests/amg.py) keeps each clip in

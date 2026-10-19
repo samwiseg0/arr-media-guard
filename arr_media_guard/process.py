@@ -12,7 +12,7 @@ def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=
     status.json only after a live answer, because a cache hit says nothing about the key. fresh is a second check
     before a re-grab, see tmdb_ask(). asked is the tmdb_ask() the decision already made, so TMDB is asked once. nfo is
     the episode title of the release's NFO, see release_nfo_title(). It wins over the title in the release name."""
-    trusted = content.trusted_duration(j, size, content.last_packet(path))
+    trusted = content.trusted_duration(j, size, content.last_packet(path, probe=j))
     token, ids = config.CFG.tmdb_token or None, item.get("ids") or {}
     cache = "tmdb-recheck" if fresh else "tmdb"
     expected, t0 = asked or checks.tmdb_ask(app, item, fresh)
@@ -599,7 +599,13 @@ def subtitle_checks(ctx):
     st = ctx.st
     if (subtitles.FULL.get((path, st.st_size, st.st_mtime_ns)) or {}).get("tracks"):
         rec["full_read"] = {k: v for k, v in subtitles.FULL[(path, st.st_size, st.st_mtime_ns)].items() if k != "cues"}
-    if fixes or remove or ends or moves or recode or strip:
+    # A cover picture stored as a video track goes into an attachment in the same remux, see remux.cover_tracks()
+    covers = remux.cover_tracks(path, j) if mkv and subs_on and subtitles.sub_fixes(ctx.source) else {}
+    if covers:
+        rec["covers"] = {e["place"]: {k: e[k] for k in ("codec", "frames", "name", "copy", "there", "why") if e.get(k) is not None}
+                         for e in covers.values()}
+    covers = {i: e for i, e in covers.items() if not e.get("why")}
+    if fixes or remove or ends or moves or recode or strip or covers:
         if ctx.waits:   # a remux of a film takes minutes, so an import that waits goes first
             runner.deep_waits()
         if ctx.shared and ctx.apply:
@@ -609,14 +615,18 @@ def subtitle_checks(ctx):
         code, result, info = remux.resub(path, j, st, ctx.apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove), dict(zip(by_id(ends), ends.values())),
                                          **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}),
                                          **({"recode": dict(zip(by_id(recode), recode.values()))} if recode else {}),
-                                         **({"strip": dict(zip(by_id(strip), strip.values()))} if strip else {}))
+                                         **({"strip": dict(zip(by_id(strip), strip.values()))} if strip else {}),
+                                         **({"covers": covers} if covers else {}))
         if "warnings" in info:
             ctx.rearm()   # resub() ran its remux with the time limit off, whatever came of it
         done = code == "subtitles_remuxed"
         rec["subremux"] = dict(info, result=result, done=done, fixed=sorted(fixes), ended=sorted(ends), remove=remove, removed=remove if done else [],
                                codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_blocks_retimed", set(moves) - set(kept)), ("subtitle_ends_lengthened", ends),
-                                                     ("subtitle_mismatch_removed", remove), ("subtitle_repaired", recode), ("subtitle_garbled_removed", strip))
+                                                     ("subtitle_mismatch_removed", remove), ("subtitle_repaired", recode), ("subtitle_garbled_removed", strip),
+                                                     ("cover_attached", covers))
                                                     if x] if done else [code],
+                               **({"covers": sorted(e["place"] for e in covers.values())} if covers else {}),
+                               **({"copies": c} if (c := sorted(e["place"] for e in covers.values() if e.get("copy"))) else {}),
                                **({"timed": sorted(set(moves) - set(kept))} if set(moves) - set(kept) else {}), **({"recoded": sorted(recode)} if recode else {}),
                                **({"stripped": {p: info["garbled_text"][str(i)] for p, i in zip(strip, by_id(strip))}} if strip else {}))
         if done:
@@ -803,18 +813,21 @@ def act(ctx):
 def sub_outcome(rec):
     """(outcome, result) of a run whose subtitle step changed a file and no flag, or None when it changed none. The
     outcome is subtitles_remuxed after a remux, else sidecars_changed. The result names what happened to each track and
-    sidecar, as "subtitles remuxed: s2 retimed, s1 lines moved, s3 repaired, Film.en.srt retimed". A partial shift of
-    the speech layout adds how many lines kept their times, see subsync.shifted()."""
+    sidecar, as "subtitles remuxed: s2 retimed, s1 lines moved, s3 repaired, Film.en.srt retimed". A remux that moved
+    only a cover picture says "remuxed". A partial shift of the speech layout adds how many lines kept their times, see
+    subsync.shifted()."""
     rm = rec.get("subremux") or {}
+    rm = dict(rm, moved=[p for p in rm.get("covers") or [] if p not in (rm.get("copies") or [])])
     did = (("fixed", "retimed"), ("timed", "lines moved"), ("ended", "ends lengthened"), ("removed", "removed"), ("recoded", "repaired"),
-           ("stripped", "taken out as garbled")) \
+           ("stripped", "taken out as garbled"), ("moved", "cover picture to an attachment"), ("copies", "removed as a copy of a cover picture")) \
         if rm.get("done") else ()
     kept = lambda p: ((rec.get("subtime") or {}).get(p) or {}).get("timing", {}) or {}   # a partial shift names the lines it kept
     left = lambda p: f', {n} lines kept their times' if (n := kept(p).get("kept")) else ""
     what = [f"{p} {x}" + (left(p) if k == "fixed" else "") for k, x in did for p in rm.get(k) or []] + \
         [f'{e["name"]} {e["result"]}' + (left(e["name"]) if e["result"] == "retimed" else "") for e in rec.get("sidecars") or []
          if e.get("result") in ("retimed", "moved", "renamed", "repaired")]
-    code, head = ("subtitles_remuxed", "subtitles remuxed") if rm.get("done") else ("sidecars_changed", "sidecars changed")
+    head = "subtitles remuxed" if any(rm.get(k) for k, _ in did if k not in ("moved", "copies")) or not rm.get("covers") else "remuxed"
+    code, head = ("subtitles_remuxed", head) if rm.get("done") else ("sidecars_changed", "sidecars changed")
     return (code, f"{head}: " + ", ".join(what)) if what else None
 
 
@@ -837,6 +850,17 @@ def after_edit(ctx):
     if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
         rec.update(outcome=named[0], result=named[1])
     found = subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
+    rm = rec.get("subremux") or {}
+    # A cover move that failed or could not run. With subtitle fixes, the alert that says why the rewrite failed takes
+    # one more sentence for it, so the run posts once. Only a sentence of a subtitle fix in this remux holds its result.
+    if rm.get("covers") and not rm["done"] and ctx.apply:
+        host = next((f for f in found if any(x.get("result") for x in f.get("lines") or []) and report.posts(f, rec)), None)
+        if host:
+            host["lines"].append({"code": "cover", "tracks": rm["covers"], "also": True})
+        else:
+            held = [(rec.get("covers") or {}).get(p) or {} for p in rm["covers"]]
+            same = list(dict.fromkeys(e.get("name") for e in held)) if all(e.get("there") for e in held) else []
+            found.append({"kind": "cover", "tracks": rm["covers"], "result": rm["result"], "name": held[0].get("name"), **({"same": same} if same else {})})
     remux = next((f for f in found if f["kind"] == "unreadable"), None)
     if remux and (rec.get("repack") or {}).get("new_size"):   # the run converted the file first, so one notice names both
         found.remove(remux)
@@ -992,7 +1016,7 @@ def alerts(ctx):
     except Exception as ex:   # a finding must never cost the decision line or the Plex analyze of an edited file
         rec["alert_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         problems = ctx.first + ctx.rest
-    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in (*logs.DEEP_KINDS, "unreadable")]
+    rec["findings"] = [p for p in problems if not ctx.background or p["kind"] in (*logs.DEEP_KINDS, "unreadable", "cover")]
     rec["alert_kinds"] = [p["kind"] for p in rec["findings"]]
     if ctx.post:   # after the edit, so a failed post never blocks one
         ctx.held = [] if ctx.mode == "import" and runner.deep_wanted(rec) else None
@@ -1093,7 +1117,9 @@ def propedit_args(edits, i):
 
 
 def edit(rec, j, edits, apply, replan=None, ts=None):
-    """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result.
+    """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result. When the
+    header layout of the edited file breaks the Matroska rules, layout says why, see checks.layout_fault(). The edit
+    stays, and the next header check of the file repairs the layout with a remux.
     replan(after) plans the edited file again. Its edit count and the invariants of the new state go in "recheck",
     which the audit reads instead of probing the file again. ts is the tracks of the plan, for mute_rule()."""
     edits = [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG)
@@ -1126,6 +1152,8 @@ def edit(rec, j, edits, apply, replan=None, ts=None):
         return rec
     after = checks.mkvmerge(path)
     rec["after"] = runner.flags(after)
+    if layout := checks.layout_of(path):   # mkvpropedit can move Tracks past the Clusters. The next header check repairs it.
+        rec["layout"] = layout
     if decide.unapplied(after, edits):
         return dict(rec, outcome="verify_failed", result="VERIFY FAILED, flags did not change")
     rec = dict(rec, outcome="edited", result="edited")

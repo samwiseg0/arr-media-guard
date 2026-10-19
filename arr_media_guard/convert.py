@@ -174,7 +174,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
              for a in ("--track-name", f"{t['id']}:{(t.get('properties') or {}).get('track_name') or ''}")]
     kept = [str(t["id"]) for t in j.get("tracks") or [] if t.get("type") == "subtitles" and t.get("id") not in (None, *drop)]
     skip = (["-s", ",".join(kept)] if kept else ["-S"]) if drop else []   # mkvmerge 92 and 102 warn of each id of -s !N in an MP4
-    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order]   # each frame its own block, see times_fault()
+    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order]   # each frame its own block, see proof.lace_times()
     if own:
         pick = lambda keep: [a for p in zip(names[::2], names[1::2]) if int(p[1].partition(":")[0]) in keep for a in p]   # their --track-name
         for v, ms in own.items():

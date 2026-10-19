@@ -1040,8 +1040,8 @@ def scan_file(kind, app, w, stop):
     try:
         with runner.locked(shared=True):
             if kind == "video":
-                dur, hp, pcm = checks.video_inputs(path)
-                certain, doubts, detail = checks.check_video(path, dur, hp=hp, pcm=pcm)
+                dur, hp, pcm, by = checks.video_inputs(path)
+                certain, doubts, detail = checks.check_video(path, dur, hp=hp, pcm=pcm, by=by)
             else:
                 j = checks.mkvmerge(path)
                 d = decide.decide(j, original, kids, "") if path.lower().endswith(".mkv") else None
@@ -1189,6 +1189,7 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --burn-in [PATH ...] [--app <instance> --ids ID ...]   the burned-in subtitle check, report only
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
+  arr-media-guard --queue             the worker, the queue counts and the jobs that run now
   arr-media-guard --test-discord      post a test message to DISCORD_WEBHOOK and print Discord's answer
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
@@ -1228,6 +1229,124 @@ def worker_lines():
     return out
 
 
+def queue_line():
+    """The background queue line of --selftest and --queue, see runner.backfill_jobs(). Both only look, so the close of
+    the connection skips its checkpoint, which would write the -wal file into the store."""
+    store.db().setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    jobs, ours, left = runner.backfill_jobs()
+    return f"background queue: {jobs} jobs, {ours} of them from a backfill ({left} file{'s' if left != 1 else ''} still to check)"
+
+
+def job_proc(pid):
+    """The start of the arr-media-guard process pid in clock ticks since boot, or None when it is gone, a zombie or
+    another program. A job process is a fork of the worker, so its command line names the launcher arr-media-guard, as
+    the Custom Script and the listener run it. A zombie's command line is empty."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except (OSError, TypeError, ValueError):
+        return None
+    return convert.proc_start(pid) if any(os.path.basename(a) == b"arr-media-guard" for a in argv) else None
+
+
+def worker_held():
+    """True when a process holds worker.lock, None when the open files of an arr-media-guard process of another user do
+    not read, else False. It only reads /proc, because a try with LOCK_NB could make a hook skip its worker, see
+    runner.ensure_worker(). /proc/locks lists the worker's flock() by its inode. In a PID namespace of its own, as in a
+    container, it leaves the lock out once the process that took it is gone, as the hook that forks a host worker is.
+    So an arr-media-guard process with the file open counts too. The scan reads only the names of the open files, as
+    store.fork() does. A stat() of a file on a network share can hang."""
+    lock = os.path.join(config.CFG.state_dir, "worker.lock")
+    try:
+        st = os.stat(lock)
+    except OSError:
+        return False
+    with open("/proc/locks") as f:   # ponytail: the inode alone, as stat() on btrfs gives another device than /proc/locks
+        if any("FLOCK" in x and f":{st.st_ino} " in x for x in f):
+            return True
+    lock, held = os.path.realpath(lock), False
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if job_proc(pid) is not None:
+            try:
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    with contextlib.suppress(OSError):   # a descriptor that closed
+                        if os.readlink(f"/proc/{pid}/fd/{fd}") == lock:
+                            return True
+            except PermissionError:   # a process of another user, read only by root or that user
+                held = None
+            except OSError:   # a process that ended
+                pass
+    return held
+
+
+def queue():
+    """--queue: the time, whether a worker runs, the background queue line, the imports that wait, and the busy places
+    of the import and the background workers, each with its claimed jobs: the kind, the start and run time of the job
+    process, and the file. A job the worker claimed and has not started yet says starting. A claimed job whose process
+    is gone prints apart, with a count of its own, and so does each claimed job while no worker runs. Nothing runs it
+    until the next worker puts it back in the queue. The kind is the source of the job's log lines. It changes no
+    record and creates no store, but store.db() upgrades a store of an older version. A store that does not read exits
+    1."""
+    from . import lid
+    now = time.time()
+    print(time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now)))
+    folder = runner.queue_dir()   # the job files of a busy store, read only as runner.waiting() reads them
+    filed = sum(not n.startswith(".") for n in os.listdir(folder)) if os.path.isdir(folder) else 0
+    said = {True: "worker: running", None: "worker: unknown, run this as root or as the worker's user",
+            False: f"worker: none, {'the listener starts one within a minute when a job waits' if config.IMAGE else 'the next import starts one'}"}
+    if not os.path.exists(store.path()):
+        print(said[worker_held()], "background queue: 0 jobs", f"imports waiting: {filed}", sep="\n")
+        return
+    store.wait = store.HOOK_WAIT   # a busy store answers within seconds, as for hook()
+    try:
+        c = store.db()
+        c.execute("BEGIN")   # one snapshot for the reads. A deferred BEGIN takes no write lock, where store.tx() takes one.
+        with c:   # its end commits the read
+            line, waiting = queue_line(), len(store.read(lid.WAITING, time.time_ns()))
+            later = store.read("SELECT count(*) FROM jobs WHERE claimed = 0 AND name NOT LIKE 'deep-analysis-%'")[0][0] - waiting
+            rows = store.read("SELECT name, pid, job FROM jobs WHERE claimed = 1 ORDER BY name")
+    except sqlite3.Error as ex:
+        sys.exit(f"the store did not read: {ex}")
+    jobs, bad = [], 0
+    for name, pid, raw in rows:
+        try:
+            job = json.loads(raw)
+            kind = "burn_in" if name.startswith(runner.BURN_PREFIX) else "whole_file" if name.startswith(runner.WHOLE_PREFIX) else \
+                "hook" if not name.startswith("deep-analysis-") else "recheck" if job.get("recheck") else "backfill_job" if job.get("backfill") \
+                else "deep_analysis"   # as runner.background() and deep_analysis() name the source
+            jobs.append((kind, pid, job_proc(pid) if pid else None, job.get("path")))
+        except (TypeError, ValueError, AttributeError):   # a job that does not read, as store.carry() counts one
+            bad += 1
+    held = any(tick is not None for _, _, tick, _ in jobs) or worker_held()   # a running job process holds the worker's lock
+    # the boot time, as lxcfs gives an LXC its own /proc/uptime while the ticks of a process count from the host's boot
+    with open("/proc/stat") as f:
+        boot = next(int(x.split()[1]) for x in f if x.startswith("btime"))
+    busy, gone = {True: [], False: []}, []   # busy: whether a job is an import -> (its start, its line)
+    for kind, pid, tick, path in jobs:
+        # ponytail: a pid that another arr-media-guard process took reads as running, as in runner.job_alive()
+        if tick is not None:
+            start = boot + tick / os.sysconf("SC_CLK_TCK")
+            when = f"started {time.strftime('%H:%M:%S', time.localtime(start))}, {datetime.timedelta(seconds=int(now - start))}"
+            busy[kind == "hook"].append((start, f"  {kind:<13} {when:<26} {path}"))
+        elif held and not pid:   # the worker claims a job, then forks its process and stores the pid, see runner.coordinate()
+            busy[kind == "hook"].append((float("inf"), f"  {kind:<13} {'starting':<26} {path}"))
+        else:
+            gone.append(f"  {kind:<13} {'process gone':<26} {path}")
+    lines = [said[held]]
+    if config.slots() == 1:   # the worker runs each job in itself and claims none, see runner.worker()
+        lines.append("one place: the worker runs each job in itself, so the counts below leave its job out")
+    lines += [line, f"imports waiting: {waiting + filed}" + (f", {later} more wait to retry" if later else "")]
+    # One pool of config.slots() places. An import never takes more than HOOK_WORKERS of them, a background job never more
+    # than BACKGROUND_WORKERS, see runner.next_jobs(). So a count passes its setting only after a change of it.
+    for imports, total in ((True, config.CFG.hook_workers), (False, config.CFG.background_workers)):
+        lines.append(f"{'import' if imports else 'background'} workers: {len(busy[imports])} of {total} busy")
+        lines += [x for _, x in sorted(busy[imports])]
+    lines += [f"process gone: {len(gone)}", *gone] if gone else []
+    if bad:
+        lines.append(f"claimed jobs that do not read: {bad}")
+    print(*lines, sep="\n")
+
+
 def cores(proc="/proc/self/cgroup", root="/sys/fs/cgroup"):
     """The cores this program may use: its CPU affinity, or the CPU quota of its cgroup or of a parent when that is less.
     cpu.max of cgroup v2 holds the quota and its period in microseconds, so 150000 100000 is 1.5 cores."""
@@ -1260,8 +1379,7 @@ def main(argv):
         print(f"keys from the environment: {', '.join(config.CFG.from_env) or 'none'}")   # the names only, as a value may be a secret
         if os.path.exists(store.path()):   # a selftest creates no store
             with contextlib.suppress(sqlite3.Error):
-                jobs, ours, left = runner.backfill_jobs()
-                print(f"background queue: {jobs} jobs, {ours} of them from a backfill ({left} file{'s' if left != 1 else ''} still to check)")
+                print(queue_line())
         if config.CFG.errors:
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:
@@ -1285,6 +1403,8 @@ def main(argv):
         for w in apps.path_warnings(plex_warned=bool(dict(results).get("plex"))):
             print(f"warning: {w}")
         print("selftest ok")
+    elif argv == ["--queue"]:
+        queue()
     elif mode == ["--test-discord"]:
         ok, line = logs.discord_test()
         if not ok:

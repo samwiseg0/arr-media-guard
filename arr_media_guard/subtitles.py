@@ -1386,7 +1386,8 @@ def garbled_tracks(path, j, sides, full=False):
                 if not decide.lang_key(side_code(s)) == decide.lang_key(tags[p]) == decide.lang_key(s["read"][0]):
                     continue
                 blocks = remux.side_blocks(s)
-                if len(blocks) != len(cues) or any(abs(a / 1000 - c[0]) > 0.002 or abs(b / 1000 - c[1]) > 0.002 for (a, b, _), c in zip(blocks, cues)):
+                if len(blocks) != len(cues) or any(max(abs(a * 1000 - proof.us(c[0])), abs(b * 1000 - proof.us(c[1]))) > proof.us(proof.TIME_SLACK)
+                                                   for (a, b, _), c in zip(blocks, cues)):   # whole microseconds, see proof.us()
                     continue
                 fit = remux.repaired(texts, g["codepage"], [t for _, _, t in blocks])
                 if fit and fit[1]:   # it fills a cut cue

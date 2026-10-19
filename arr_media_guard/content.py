@@ -316,13 +316,30 @@ def tmdb_item(kind, tid, season=None, token=None):
     return rec, eps
 
 
-def last_packet(path, timeout=30):
-    """Seconds to the last video packet: ffprobe seeks to the last index point and reads to the end. None when that
-    fails. Video only, because a stray subtitle event may set the header an hour past the end of the film.
-    A file without an index would be read whole, so the timeout ends it."""
+def last_packet(path, timeout=30, probe=None):
+    """Seconds to the last packet of the film, see decide.main_video(): ffprobe seeks to the last index point and reads
+    to the end. None when that fails or the file has no film. Video only, because a stray subtitle event may set the
+    header an hour past the end of the film. A file without an index would be read whole, so the timeout ends it. The
+    read selects the film alone, so ffprobe seeks by the film's index and never by a cover picture before it. probe,
+    mkvmerge -J or ffprobe JSON of path, counts the video tracks. With one, it is the film, ffprobe's V:0. mkvmerge
+    skips a track it cannot read, as an MP4 cover with no esds atom, and warns. So its count holds only for a
+    Matroska file with no warnings. Else, or with no probe, a first ffprobe names the film's stream. The interval has an end, because ffprobe 7.1 reads the end
+    of "999999999%" from memory it never set, and then printed no packet or all of them, by chance."""
+    probe = probe or {}
+    whole = "streams" in probe or ((probe.get("container") or {}).get("type") == "Matroska" and not probe.get("warnings"))
+    vs = [t for t in (probe.get("tracks") or probe.get("streams") or [] if whole else [])
+          if "video" in (t.get("type"), t.get("codec_type")) and not (t.get("disposition") or {}).get("attached_pic")]
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", "v:0", "-show_entries", "packet=pts_time:format=start_time",
-                            "-read_intervals", "999999999%", path], capture_output=True, text=True, errors="replace",
+        if len(vs) == 1:
+            film = "V:0"
+        else:
+            r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", "V", "-show_entries", "stream=index,codec_type,codec_name",
+                                path], capture_output=True, text=True, errors="replace", timeout=DEADLINE.bound(timeout))
+            if not (film := decide.main_video((json.loads(r.stdout or "{}") or {}).get("streams") or [])):
+                return None
+            film = str(film["index"])
+        r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", film, "-show_entries", "packet=pts_time:format=start_time",
+                            "-read_intervals", "999999999%+999999999", path], capture_output=True, text=True, errors="replace",
                            timeout=DEADLINE.bound(timeout))
         d = json.loads(r.stdout or "{}")
         pts = [float(p["pts_time"]) for p in d.get("packets") or [] if p.get("pts_time") not in (None, "N/A")]
@@ -338,7 +355,8 @@ def trusted_duration(probe, size, last_packet=None):
 
     Sources: the container header, the stream durations, the size over the summed bitrate, and the last packet. The
     stream durations and bitrates are mkvmerge's statistics tags, used only when the app that wrote the file wrote
-    them, because ffmpeg copies stale tags from its source. An ffprobe probe gives stream durations instead.
+    them, because ffmpeg copies stale tags from its source. An ffprobe probe gives stream durations instead. A cover
+    picture, see decide.cover(), leaves the sums, and its bytes leave the size, as the attachments do.
     trust: "agree" (the header and another source agree), "bitrate" (the header is off, two other sources agree),
     "header" (the header alone) or "conflict" (no two sources agree, or two pairs disagree). seconds is None unless
     two sources agree.
@@ -346,15 +364,18 @@ def trusted_duration(probe, size, last_packet=None):
     """
     c = (probe.get("container") or {}).get("properties") or {}
     app = c.get("writing_application") or ""
-    props = [t.get("properties") or {} for t in probe.get("tracks") or []]
-    av = [t.get("properties") or {} for t in probe.get("tracks") or [] if t.get("type") in ("audio", "video")]
+    tracks = probe.get("tracks") or []
+    pics = [t.get("properties") or {} for t in tracks if decide.cover(t, tracks)]
+    props = [t.get("properties") or {} for t in tracks if not decide.cover(t, tracks)]
+    av = [t.get("properties") or {} for t in tracks if t.get("type") in ("audio", "video") and not decide.cover(t, tracks)]
     fresh = lambda p: app.startswith("mkvmerge") and p.get("tag__statistics_writing_app", app) == app
     src = {"header": decide.duration(probe)}
     if av and all(fresh(p) and p.get("tag_duration") for p in av):
         src["streams"] = max(decide.tag_seconds(p["tag_duration"]) for p in av)
     if av and all(fresh(p) and str(p.get("tag_bps", "")).isdigit() for p in av):   # subtitles count when tagged
         bps = sum(int(p["tag_bps"]) for p in props if fresh(p) and str(p.get("tag_bps", "")).isdigit())
-        src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])) * 8 / bps if bps else 0
+        src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])
+                          - sum(int(n) for p in pics if fresh(p) and str(n := p.get("tag_number_of_bytes")).isdigit())) * 8 / bps if bps else 0
     ff = [float(s["duration"]) for s in probe.get("streams") or [] if s.get("codec_type") in ("audio", "video") and s.get("duration")]
     if ff: src["streams"] = max(ff)
     src["last_packet"] = last_packet

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import contextlib, fractions, os, re, shutil, signal, subprocess, threading, time
+import contextlib, filecmp, fractions, hashlib, math, os, re, shutil, signal, subprocess, threading, time
 
 from . import align, checks, config, decide, logs, proof, runner, subsync, vault
 
@@ -10,24 +10,43 @@ from . import align, checks, config, decide, logs, proof, runner, subsync, vault
 KEEP_PROPS = (("language", "und"), ("track_name", None), ("default_track", True), ("forced_track", False), ("enabled_track", True),
               ("flag_original", False), ("flag_commentary", False), ("flag_hearing_impaired", False), ("flag_visual_impaired", False),
               ("flag_text_descriptions", False), ("codec_private_data", None))
-# mkvmerge's option for each flag in KEEP_PROPS, for the SubRip file that replaces a trimmed track
+# mkvmerge's option for each flag in KEEP_PROPS, for a track that a remux writes again, see track_args()
 FLAG_OPTS = (("--default-track-flag", "default_track", True), ("--forced-display-flag", "forced_track", False),
              ("--track-enabled-flag", "enabled_track", True), ("--original-flag", "flag_original", False),
              ("--commentary-flag", "flag_commentary", False), ("--hearing-impaired-flag", "flag_hearing_impaired", False),
              ("--visual-impaired-flag", "flag_visual_impaired", False), ("--text-descriptions-flag", "flag_text_descriptions", False))
+# The spread in seconds, (low, high), of an audio track's stored block times around an even frame clock that marks
+# ffmpeg's estimates of laced frame times, see lace_guess(). Matroska stores whole milliseconds, so true times spread
+# under 1 ms: 0.98 ms at most in the real files measured on 2026-10-18. ffmpeg's copies of laced audio spread
+# 1.67 ms (DTS) to 2.4 ms (AAC) in their first 500 packets, and its estimates of DTS with no default duration run up to
+# 5 ms early. Mixed frame lengths or a gap spread far more (Vorbis 286 ms, a 1 s gap 997 ms) and mark nothing.
+LACE_GUESS = (0.0015, 0.010)
+# The share of an audio track's steps from block to block, at least, that falls outside floor..ceil of the frame
+# length times the frames between the blocks, see lace_guess(). ffmpeg's estimates catch up once per lace: 4.2 to 10
+# percent of the steps. True times with one jump of a few milliseconds, or a slow wander of about 1 ms, have 0 to 0.2
+# percent (measured 2026-10-18).
+LACE_STEPS = 0.03
 
 
-def header_fault(j, tmp, new, old_size, hp, info):
+# The mkvmerge hacks of resub() and ended_track() (mkvmerge --engage list). By default mkvmerge trims the spaces and
+# tabs at the ends of each line of a text subtitle packet, and puts the codec header units in front of each HEVC
+# keyframe. Both change packets that resub() copies or ended_track() writes again, and the proof refuses them.
+KEEP_PACKETS = ("--engage", "keep_whitespaces_in_text_subtitles", "--engage", "dont_normalize_parameter_sets")
+
+
+def header_fault(j, tmp, new, old_size, hp, info, folder):
     """Why the remuxed file tmp may not replace a Matroska original whose header has an issue, or None. j and new are
-    their mkvmerge probes, hp is the header stage of check_video() for the original. The checks compare against the
-    stream ends hp read from the last clusters, never the old header. info gets the new duration, the new Cues, the
-    frame count and the windows.
+    their mkvmerge probes, hp is the header stage of check_video() for the original, folder the work folder of the
+    remux. The checks compare against the stream ends hp read from the last clusters, never the old header. info gets
+    the new duration, the new Cues, the frame count, the windows and the worst lag of each stream. With a still image
+    before the film and no PyAV, no window runs, and info["windows_skipped"] says why.
 
     Every track keeps its type, codec, language, name, flags, codec private data and UID, a trimmed one all but its UID.
     The new video track must hold as many frames as its end over its default duration, less FRAME_SLACK. mkvmerge drops
     a damaged cluster with no warning. A track with no
     default duration passes only when every window of the check decoded clean. A trimmed track must hold its events
-    less the ones the trim dropped."""
+    less the ones the trim dropped. No packet may trail the packets before it in the new file by more than LAG_SLACK,
+    see proof.lags(). The bound holds whatever the original's lag, so a repair must put late packets in place."""
     kind = (new.get("container") or {}).get("type")
     if kind != "Matroska": return f"the new file reads as {kind}"
     trim, remove = set(hp.get("trim") or ()), set(hp.get("remove") or ())
@@ -48,7 +67,8 @@ def header_fault(j, tmp, new, old_size, hp, info):
     for i in trim:   # one block per event
         n, t = (new["tracks"][[x.get("id") for x in kept["tracks"]].index(i)].get("properties") or {}).get("tag_number_of_frames"), info["trimmed"][i]
         if str(n) != str(t["events"] - t["dropped"]): return f"the trimmed track {i} holds {n} events, not {t['events'] - t['dropped']}"
-    p = next(((x.get("properties") or {}) for x in new["tracks"] if x.get("type") == "video"), None)
+    p = decide.main_video(new["tracks"])   # the film, never a cover picture
+    p = None if p is None else p.get("properties") or {}
     if p is not None:
         info["frames"] = n = int(p.get("tag_number_of_frames") or 0)
         if p.get("default_duration"):
@@ -59,11 +79,33 @@ def header_fault(j, tmp, new, old_size, hp, info):
     size, old_size = os.path.getsize(tmp), old_size - (hp.get("tail") or 0)   # the bytes past the Segment end go
     if abs(size - old_size) > config.REPACK_SIZE * old_size: return f"the size changed from {old_size} to {size} bytes"
     video = hp["video"] or 0
-    info["windows"] = ws = [checks.window(tmp, video * s, min(decide.VIDEO_SECS, video * (1 - s))) for s in decide.VIDEO_AT] if video >= 60 else []
+    by = checks.window_stream(tmp) if video >= 60 else {}   # a still image first: PyAV seeks by the film
+    if by and not checks.lid_ready():   # no PyAV, so no window, as in checks.video_stages()
+        info["windows_skipped"], video = checks.STILL_FIRST, 0
+    info["windows"] = ws = [checks.window(tmp, video * s, min(decide.VIDEO_SECS, video * (1 - s)), **by) for s in decide.VIDEO_AT] if video >= 60 else []
     certain, doubts = decide.video_verdict([], ws)
     doubts += [decide.stopped_doubt(w) for w in ws if decide.read_capped(w)]   # the new file has Cues, so a read-cap stop is no clean window
     if certain or doubts: return "a video window of the new file is not clean: " + (certain or "; ".join(doubts))
+    info["lag"] = lag = {i: round(x, 3) for i, x in proof.lags(proof.packet_places(tmp, folder, max(600, size / proof.PROOF_RATE))).items()}
+    late = max(lag, key=lag.get, default=None)
+    if late is not None and lag[late] > proof.LAG_SLACK: return f"stream {late} sits up to {lag[late]:.1f} s behind the other streams in the new file"
     return None
+
+
+def track_args(p):
+    """mkvmerge options that give track 0 of the next file the language, BCP 47 tag, name and flags of the mkvmerge
+    -J properties p."""
+    args = ["--language", f"0:{p.get('language_ietf') or p.get('language') or 'und'}"]
+    args += ["--track-name", f"0:{p['track_name']}"] if p.get("track_name") else []
+    return args + [a for opt, key, default in FLAG_OPTS for a in (opt, f"0:{int(bool(p.get(key, default)))}")]
+
+
+def compression_args(tracks, tid=None):
+    """mkvmerge options that keep each of tracks, mkvmerge -J tracks, uncompressed when its source holds it so.
+    mkvmerge compresses PGS and VobSub tracks with zlib by default, and some hardware players read none. tid gives a
+    track's id in its input, its own id by default. A track the source compresses keeps mkvmerge's default."""
+    return [a for t in tracks if not (t.get("properties") or {}).get("content_encoding_algorithms")
+            for a in ("--compression", f"{t.get('id') if tid is None else tid}:none")]
 
 
 def trim_inputs(path, j, hp, folder):
@@ -96,12 +138,56 @@ def trim_inputs(path, j, hp, folder):
         counts[i] = n
         with open(f, "w", encoding="utf-8") as fh:
             fh.write(text)
-        args += ["--sub-charset", "0:UTF-8", "--language", f"0:{p.get('language_ietf') or p.get('language') or 'und'}"]
-        args += ["--track-name", f"0:{p['track_name']}"] if p.get("track_name") else []
-        for opt, key, default in FLAG_OPTS:
-            args += [opt, f"0:{int(bool(p.get(key, default)))}"]
-        args.append(f)
+        args += ["--sub-charset", "0:UTF-8", *track_args(p), f]
     return args, counts, removed
+
+
+def lace_guess(path, j, n=500):
+    """(the ffprobe indexes of the audio streams of path whose block times hold ffmpeg's estimates of laced frame
+    times, why mkvmerge must not lace them again or None). ffmpeg copies a lace frame by frame, each frame in its own
+    block at the time it estimated from floored durations. ffprobe reads the first n packets of each audio track of j.
+    The frames of one block share its position, so each block counts once, at the number of frames before it. Two
+    signs together mark the estimates. The block times spread around a least-squares frame clock within LACE_GUESS.
+    At least LACE_STEPS of the steps from block to block fall outside floor..ceil of the clock's frame length times
+    the frames between the blocks, as ffmpeg's estimates catch up once per lace. When any audio track starts before the
+    first video keyframe, a lace there would cost audio at a seek to 0, so the estimates stay. A read that fails finds
+    none, and a video keyframe that does not read keeps the estimates."""
+    tracks, video = (sum(t.get("type") == kind for t in j.get("tracks") or []) for kind in ("audio", "video"))
+    read = lambda which, entries, count: subprocess.run(
+        ["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", which, "-show_entries", f"packet={entries}",
+         "-read_intervals", f"%+#{count}", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=120)
+    lines = lambda r: [p.split(",") for p in (r.stdout if r and not r.returncode else "").splitlines()]
+    try:
+        r = read("a", "stream_index,pts_time,pos", n * tracks) if tracks else None
+    except subprocess.TimeoutExpired:
+        return [], None
+    rows, out = {}, []
+    for p in lines(r):
+        if len(p) >= 3 and p[0].isdigit() and "N/A" not in p[1:3]:
+            rows.setdefault(int(p[0]), []).append((float(p[1]), p[2]))
+    for i, pk in rows.items():
+        b = [(k, t) for k, (t, pos) in enumerate(pk) if not k or pos != pk[k - 1][1]]
+        if len(b) < 20:
+            continue
+        mx, my = sum(k for k, _ in b) / len(b), sum(t for _, t in b) / len(b)
+        slope = sum((k - mx) * (t - my) for k, t in b) / sum((k - mx) ** 2 for k, _ in b)
+        res = [t - my - slope * (k - mx) for k, t in b]
+        odd = sum(not math.floor(slope * (k2 - k1) * 1000) <= round((t2 - t1) * 1000) <= math.ceil(slope * (k2 - k1) * 1000)
+                  for (k1, t1), (k2, t2) in zip(b, b[1:]))
+        if LACE_GUESS[0] < max(res) - min(res) <= LACE_GUESS[1] and odd >= LACE_STEPS * (len(b) - 1):
+            out.append(i)
+    if not out or not video:
+        return out, None
+    try:
+        v = read("v:0", "pts_time,flags", 300)
+    except subprocess.TimeoutExpired:
+        v = None
+    key = next((float(p[0]) for p in lines(v) if len(p) >= 2 and "K" in p[1] and p[0] != "N/A"), None)
+    held = f"audio stream {', '.join(map(str, out))} keeps ffmpeg's estimated times"
+    if key is None:
+        return out, f"{held}, as the first video keyframe did not read"
+    lead = round(key - min(pk[0][0] for pk in rows.values()), 3)
+    return out, f"{held}, as audio starts {lead * 1000:.0f} ms before the first video keyframe" if lead > 0 else None
 
 
 def repack_block(path, st, keep=True):
@@ -302,12 +388,21 @@ def repack(path, j, st, apply, hp):
 
     mkvmerge writes repack_tmp() in hide_dir beside the original at nice 19 and idle I/O, with no time limit, so a slow
     NAS never stops a remux halfway. --track-order keeps the tracks in their order. By default mkvmerge puts video
-    first, and a file may hold subtitles, audio, video in that order. The track UIDs and the Segment UID stay. Any mkvmerge warning is a
-    fault: it resyncs past a damaged cluster and drops it. The temp file is synced, and header_fault() compares it to
-    the original. The original must still be the file st describes, else the app replaced it meanwhile
-    (repack_source_changed). On any fault the temp file goes and the original stays. Otherwise the temp file takes the
-    original's owner and mode. The original is hard-linked into originals_root() for keep_days, then the temp file is
-    renamed over it. Any exception removes the temp file: Ctrl+C, the time limit, and SIGTERM through stopped()."""
+    first, and a file may hold subtitles, audio, video in that order. The track UIDs and the Segment UID stay. mkvmerge
+    reads one input in file order, so a subtitle packet that sits minutes late in the file stays late, and a player
+    never shows it. The ffmpeg subtitle remux of 1.4.0 to 2.17.0 left such files. So the subtitle tracks come from a
+    second input of the same file, which mkvmerge reads on its own and writes by time. The chapters, the tags and the
+    attachments come from the first input only. Each track that the source holds uncompressed stays so, see
+    compression_args(). --disable-lacing writes each audio frame in its own block, as
+    convert_cmd() does. A player that seeks to 0 skips each block before the first video keyframe, and a lace there
+    holds up to 170 ms of audio. A file whose audio holds ffmpeg's estimates of laced frame times, see lace_guess(),
+    is laced again, so each lace start takes the true time of its first frame, as before ffmpeg's copy. info["relaced"]
+    lists those streams, and the dry run's result names them. When an audio track starts before the first video
+    keyframe, the estimates stay, and info["relace_skipped"] says why. Any mkvmerge warning is a fault: it resyncs past a damaged cluster and drops it. The
+    temp file is synced, and header_fault() compares it to the original. The original must still be the file st
+    describes, else the app replaced it meanwhile (repack_source_changed). On any fault the temp file goes and the
+    original stays. Otherwise the temp file takes the original's owner and mode. The original is hard-linked into
+    originals_root() for keep_days, then the temp file is renamed over it. Any exception removes the temp file: Ctrl+C, the time limit, and SIGTERM through stopped()."""
     info = {"container": (j.get("container") or {}).get("type"), "old_size": st.st_size, "tracks": checks.track_list(j)}
     trim, remove = list(hp.get("trim") or ()), list(hp.get("remove") or ())
     tracks = {t.get("id"): t for t in j.get("tracks") or []}
@@ -324,11 +419,19 @@ def repack(path, j, st, apply, hp):
     why = repack_skip(path, st)
     if why:   # a hard link, the cap, low space or no place for the original: nothing is written
         return "header_repair_skipped", f"{skip}, {why}: {what}", info
+    relace, held = lace_guess(path, j)   # before the dry run returns, so its result names them
+    if held:   # mkvmerge 102 laces all tracks or none
+        relace, info["relace_skipped"] = [], held
+    elif relace:
+        info["relaced"] = relace
+    what += f", lace audio stream {', '.join(map(str, relace))} again, its times hold ffmpeg's estimates" if relace else f", {held}" if held else ""
     if not apply:
         return "would_repair_header", f"{would}: {what}", info
-    tmp, folder = repack_tmp(path), runner.work_dir("trim") if trim or remove else None
+    tmp, folder = repack_tmp(path), runner.work_dir("trim")   # trim_inputs() and the packet read of header_fault() write there
     ids = [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in remove]   # a removed track leaves the file
-    order = ["--track-order", ",".join(f"{trim.index(i) + 1}:0" if i in trim else f"0:{i}" for i in ids)] if ids and None not in ids else []
+    subs = [i for i in ids if i not in trim and tracks[i].get("type") == "subtitles"] if None not in ids else []   # input 1, see above
+    order = ["--track-order", ",".join(f"{trim.index(i) + 1 + bool(subs)}:0" if i in trim else f"{int(i in subs)}:{i}" for i in ids)] \
+        if ids and None not in ids else []
     uid = ((j.get("container") or {}).get("properties") or {}).get("segment_uid")
     keep = ["--segment-uid", uid] if uid else []   # an ordered chapter of another file may point at it
     sw = Swap(path, st, tmp, info)
@@ -337,15 +440,17 @@ def repack(path, j, st, apply, hp):
         extra = []
         if trim or remove:
             extra, info["trimmed"], info["removed"] = trim_inputs(path, j, hp, folder)
-        r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", "-o", tmp, *keep, *order,
-                            *(["-s", "!" + ",".join(map(str, trim + remove))] if trim or remove else []), path, *extra],
-                           capture_output=True, text=True, errors="replace")
+        input0 = ["-S"] if subs else ["-s", "!" + ",".join(map(str, trim + remove))] if trim or remove else []
+        input1 = ["-D", "-A", "-B", "-M", "--no-chapters", "--no-global-tags", "-s", ",".join(map(str, subs)),
+                  *compression_args(tracks[i] for i in subs), path] if subs else []
+        r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", *([] if relace else ["--disable-lacing"]), "-o", tmp, *keep, *order,
+                            *input0, path, *input1, *extra], capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         if r.returncode or info["warnings"]:
             raise RuntimeError(f"mkvmerge exited {r.returncode}: {info['warnings']}")
         sw.sync()
         new = checks.mkvmerge(tmp)
-        fault = header_fault(j, tmp, new, st.st_size, hp, info)
+        fault = header_fault(j, tmp, new, st.st_size, hp, info, folder)
         if fault: raise RuntimeError(fault)
         size = sw.own()
         sw.check("the app replaced or renamed the original during the header repair", config.CFG.keep_days)
@@ -363,51 +468,27 @@ def repack(path, j, st, apply, hp):
     return *done, info
 
 
-# The properties a retime puts back with mkvpropedit after ffmpeg's remux, as (mkvmerge -J name, mkvpropedit name).
-# ffmpeg writes new UIDs and no BCP 47 tag, and the plan's flag edits name the tracks by UID.
-PROP_EDITS = (("uid", "track-uid"), ("language_ietf", "language-ietf"), ("track_name", "name"), ("default_track", "flag-default"),
-              ("forced_track", "flag-forced"), ("enabled_track", "flag-enabled"), ("flag_original", "flag-original"),
-              ("flag_commentary", "flag-commentary"), ("flag_hearing_impaired", "flag-hearing-impaired"),
-              ("flag_visual_impaired", "flag-visual-impaired"), ("flag_text_descriptions", "flag-text-descriptions"))
-
-
 # The Format line of the [Events] section that mkvextract writes for an ASS or SSA header without one, by codec. mkvmerge
 # reads it back into the header, see header_kept().
 EVENTS_FORMAT = {"S_TEXT/ASS": "Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text",
                  "S_TEXT/SSA": "Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"}
 
 
-# The Matroska codec of HEVC video, whose codec private data is an hvcC record, see hvcc_cleared()
-HEVC = "V_MPEGH/ISO/HEVC"
+# The Matroska codecs whose header mkvmerge 102 writes again in a remux, see header_kept()
+AVC, VC1 = "V_MPEG4/ISO/AVC", "V_MS/VFW/FOURCC"
 
 
-def hvcc_cleared(b):
-    """The hvcC record b with the array_completeness bit of each NAL array cleared, or None when b does not parse.
-    ffmpeg 7.1's Matroska muxer writes the hvcC again with that bit 0 and keeps every other byte. A 0 only says the
-    stream may hold more NAL units of the array's type, so the decoder reads the same video. The record holds 22 bytes
-    of fields, then a byte with the count of arrays. Each array has a byte with the bit and the NAL type, a 2-byte NAL
-    count, and each NAL after a 2-byte length."""
-    b, at = bytearray(b), 23
-    if len(b) < at or b[0] != 1:
-        return None
-    for _ in range(b[22]):
-        if at + 3 > len(b):
-            return None
-        b[at] &= 0x7f
-        count, at = int.from_bytes(b[at + 1:at + 3], "big"), at + 3
-        for _ in range(count):
-            if at + 2 > len(b):
-                return None
-            at += 2 + int.from_bytes(b[at:at + 2], "big")
-    return bytes(b) if at <= len(b) else None
-
-
-def header_kept(old, new, codec):
-    """Whether the codec private data new, in hex, keeps old for a track of codec. It must be the same. An HEVC
-    header may also be old with the array_completeness bits cleared, see hvcc_cleared(). After ended_track(), a
-    HandBrake ASS header ends in a NUL byte and has no [Events] section. mkvmerge drops the NUL and adds the
-    section, so such a header may also be old less that byte, then a blank line, "[Events]" and the Format line of
-    EVENTS_FORMAT. A section name matches in any case, as libass reads it, so an old header with "[events]" fails too.
+def header_kept(old, new, codec, ended=False):
+    """Whether the codec private data new, in hex, keeps old for a track of codec. It must be the same, but for the
+    bytes mkvmerge writes again, in place.
+    - An AVC header (avcC): bytes 1 to 3, the profile, the compatibility flags and the level, may become those of its
+      first SPS. mkvmerge 4.9.1 wrote them as 0, and mkvmerge 102 writes them from the SPS.
+    - A VC-1 header (a BITMAPINFOHEADER of FourCC WVC1): biSize may become the header's length, and biXPelsPerMeter
+      and biYPelsPerMeter 1 where they are 0. ffmpeg writes a byte of padding past biSize and both as 0.
+    - ended is true for a track that ended_track() wrote again. A HandBrake ASS header ends in a NUL byte and has no
+      [Events] section. mkvmerge drops the NUL and adds the section, so such a header may also be old less that byte,
+      then a blank line, "[Events]" and the Format line of EVENTS_FORMAT. A section name matches in any case, as libass
+      reads it, so an old header with "[events]" fails too.
     Any other change fails."""
     if new == old:
         return True
@@ -415,10 +496,19 @@ def header_kept(old, new, codec):
         a, b = bytes.fromhex(old or ""), bytes.fromhex(new or "")
     except ValueError:
         return False
-    if codec == HEVC:
-        return b == hvcc_cleared(a)
+    if codec == AVC:
+        sps = a[8:8 + int.from_bytes(a[6:8], "big")] if len(a) > 8 and a[5] & 0x1f else b""
+        return len(sps) >= 4 and len(a) == len(b) and b[1:4] == sps[1:4] and a[:1] + a[4:] == b[:1] + b[4:]
+    if codec == VC1:
+        if len(a) != len(b) or len(a) < 40 or a[16:20] != b"WVC1":
+            return False
+        want = bytearray(a)
+        want[0:4] = len(a).to_bytes(4, "little")
+        for at in (24, 28):
+            want[at:at + 4] = b"\1\0\0\0" if a[at:at + 4] == b"\0\0\0\0" else a[at:at + 4]
+        return b == bytes(want)
     events = f"\r\n[Events]\r\nFormat: {EVENTS_FORMAT.get(codec)}\r\n\r\n".encode()
-    return codec in EVENTS_FORMAT and a.endswith(b"\0") and b"[events]" not in a.lower() and b == a[:-1] + events
+    return ended and codec in EVENTS_FORMAT and a.endswith(b"\0") and b"[events]" not in a.lower() and b == a[:-1] + events
 
 
 def grid_plan(plan, fix, codec):
@@ -441,19 +531,22 @@ def grid_moved(plan, fix):
 
 def props_fault(j, new, drop=(), ended=()):
     """Why the tracks of the remuxed probe new differ from those of j less the track ids in drop, or None: the type,
-    codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, and the count of attachments
-    and chapters. The codec private data of an HEVC track, and of a track in ended, must pass header_kept(). ended holds
-    the track ids of j that ended_track() wrote again."""
-    j = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop])
+    codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, the count of attachments, and
+    the count of chapters in each edition. The codec private data of a track must pass header_kept(). ended holds the
+    track ids of j that ended_track() wrote again. mkvmerge writes a BCP 47 tag for a track that has none, the one
+    checks.langs() maps its legacy language to, and that passes."""
+    j, ietf = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop]), checks.langs()[1]
+    entries = lambda x: [c.get("num_entries") for c in x.get("chapters") or []]   # per edition
     if checks.track_list(j) != checks.track_list(new): return f"the tracks changed from {checks.track_list(j)} to {checks.track_list(new)}"
     for a, b in zip(j.get("tracks") or [], new.get("tracks") or []):
         pa, pb = a.get("properties") or {}, b.get("properties") or {}
-        own = a.get("id") in ended or pa.get("codec_id") == HEVC   # a header that header_kept() may pass
         diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)
-                and not (k == "codec_private_data" and own and header_kept(pa.get(k), pb.get(k), pa.get("codec_id")))]
+                and not (k == "codec_private_data" and header_kept(pa.get(k), pb.get(k), pa.get("codec_id"), a.get("id") in ended))
+                and not (k == "language_ietf" and pa.get(k) is None and pb.get(k) == ietf.get(pa.get("language") or "und"))]
         if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"
-    for k in ("attachments", "chapters"):
-        if len(j.get(k) or []) != len(new.get(k) or []): return f"the {k} changed from {len(j.get(k) or [])} to {len(new.get(k) or [])}"
+    if len(j.get("attachments") or []) != len(new.get("attachments") or []):
+        return f"the attachments changed from {len(j.get('attachments') or [])} to {len(new.get('attachments') or [])}"
+    if entries(j) != entries(new): return f"the chapters changed from {entries(j)} to {entries(new)} entries"
     return None
 
 
@@ -579,10 +672,10 @@ def set_ends(text, ass, plan):
         if m:
             g = m.groups()
             start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3].ljust(3, "0")[:3]) / 1000
-            if k >= len(plan) or abs(start - plan[k][0]) > 0.0015:
+            if k >= len(plan) or abs(proof.us(start) - proof.us(plan[k][0])) > 1500:   # whole us: exactly 2 ms is no float edge
                 raise RuntimeError(f"cue {k + 1} of the extracted text starts at {start:.3f} s, and the plan's at {plan[k][0] if k < len(plan) else None}")
             end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7].ljust(3, "0")[:3]) / 1000
-            if abs(end - plan[k][2]) > 0.002:
+            if abs(proof.us(end) - proof.us(plan[k][2])) > 2000:
                 raise RuntimeError(f"cue {k + 1} of the extracted text ends at {end:.3f} s, and the plan's at {plan[k][2]:.3f} s, so its end is not known")
             head = line[:m.start(5)].rstrip().removesuffix("-->").rstrip() if abs(plan[k][3] - start) < 0.0005 else fmt(plan[k][3])
             lines[i] = f"{head} --> {fmt(plan[k][4])}{g[8]}"
@@ -595,13 +688,13 @@ def set_ends(text, ass, plan):
 def ended_track(path, j, tid, plan, folder, text=None):
     """The path of a Matroska file in folder that holds only subtitle track tid of path, with the new times of plan, a
     time_plan() or a flash_plan(). mkvextract writes the track's text, set_ends() puts the times in, and mkvmerge reads
-    it back. That round trip keeps the packets and the ASS header byte for byte, with four exceptions. HandBrake ends each
-    ASS event and its header with a NUL byte and writes no [Events] section, and the round trip drops each NUL and
-    adds the section. mkvmerge numbers the ASS events from 0 in ReadOrder order, so the events of a track whose
-    ReadOrders skip a number, as HandBrake's may, take new ones. mkvmerge also drops the spaces and tabs at the end of
-    each ASS event. mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as CRLF.
+    it back. That round trip keeps the packets and the ASS header byte for byte, with three exceptions. HandBrake ends
+    each ASS event and its header with a NUL byte and writes no [Events] section, and the round trip drops each NUL
+    and adds the section. mkvmerge numbers the ASS events from 0 in ReadOrder order, so the events of a track whose
+    ReadOrders skip a number, as HandBrake's may, take new ones. KEEP_PACKETS keeps the spaces and tabs at the ends of
+    each line. mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge may store it as CRLF.
     mkvmerge 92 and 102 do, and a source's mkvmerge may store LF. prove() and header_kept() pass only those changes.
-    The language goes in here, as ffmpeg copies it. The flags and names come back later with mkvpropedit, see resub().
+    resub() gives the track its UID, language, name and flags, see track_args().
     text takes the place of plan for a repair, see resub(): the new SubRip text, which needs no mkvextract, or a
     function of the extracted text."""
     p = next(t.get("properties") or {} for t in j.get("tracks") or [] if t.get("id") == tid)
@@ -617,7 +710,7 @@ def ended_track(path, j, tid, plan, folder, text=None):
             text = text(f.read()) if text else set_ends(f.read(), ext != "srt", plan)
     with open(raw, "w", encoding="utf-8", newline="") as f:
         f.write(text)
-    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", "-o", out, "--sub-charset", "0:UTF-8", "--language",
+    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", *KEEP_PACKETS, "-o", out, "--sub-charset", "0:UTF-8", "--language",
                         f"0:{p.get('language_ietf') or p.get('language') or 'und'}", raw], capture_output=True, text=True, errors="replace")
     if r.returncode:
         raise RuntimeError(f"mkvmerge exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
@@ -796,50 +889,212 @@ def events_file(path, tid, codec, folder):
     return out
 
 
-def cover_edits(path, j, pics, folder):
-    """mkvpropedit arguments that add back the image attachments of path that ffmpeg read as the cover picture streams
-    pics, with their name, MIME type, description and UID. mkvextract writes each one into folder first."""
-    names = {(x.get("tags") or {}).get("filename") for x in pics}
-    want = [a for a in j.get("attachments") or [] if a.get("file_name") in names]
-    if not want:
-        return []
-    files = {a["id"]: os.path.join(folder, f"cover-{a['id']}") for a in want}
-    r = subprocess.run(["mkvextract", path, "attachments", *[f"{i}:{f}" for i, f in files.items()]], capture_output=True, text=True, errors="replace")
-    if r.returncode:
-        raise RuntimeError(f"mkvextract exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-300:]}")
-    out = []
-    for a in want:
-        out += ["--attachment-name", a["file_name"], "--attachment-mime-type", a.get("content_type") or "application/octet-stream"]
-        out += ["--attachment-description", a["description"]] if a.get("description") else []
-        out += ["--attachment-uid", str(a["properties"]["uid"])] if (a.get("properties") or {}).get("uid") else []
-        out += ["--add-attachment", files[a["id"]]]
+# The attachment of a cover picture, by ffmpeg's codec name of its track: its file name and MIME type, see cover_tracks()
+COVER_FILES = {"mjpeg": ("cover.jpg", "image/jpeg"), "png": ("cover.png", "image/png"), "bmp": ("cover.bmp", "image/bmp"), "gif": ("cover.gif", "image/gif")}
+COVER_READS = {}   # (path, size, mtime_ns, what, ffprobe indexes) -> what cover_tracks() read, so a pass that Replan runs again reads none twice
+COVER_LOCK = threading.Lock()   # the workers of a backfill share COVER_READS
+
+
+def cover_read(key, read):
+    """COVER_READS[key], from read(folder) the first time, with a work folder that goes after it. A read that raises
+    stores nothing. COVER_LOCK guards each change of COVER_READS, never the read."""
+    if (value := COVER_READS.get(key)) is not None:
+        return value
+    folder = runner.work_dir("resub")
+    try:
+        value = read(folder)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    with COVER_LOCK:
+        while len(COVER_READS) >= 8:   # the files a backfill's workers read now, never the whole library
+            COVER_READS.pop(next(iter(COVER_READS)))
+        COVER_READS[key] = value
+    return value
+
+
+def cover_images(path, indexes, images, folder, timeout):
+    """({ffprobe index: the md5 of its first packet}, {attachment id: the md5 of its bytes}) of path, for the
+    streams in indexes and the attachments in images, as mkvmerge -J lists them. ffmpeg stops after the first packet
+    of each stream, which a cover picture has near the start of the file."""
+    sums, names = {}, {}
+    if indexes:
+        out = os.path.join(folder, "first.md5")
+        r = checks.run_bounded(["ffmpeg", "-nostdin", "-v", "error", "-i", path, *[a for i in indexes for a in ("-map", f"0:{i}")], "-c", "copy",
+                                "-copyinkf", "-frames:v", "1", "-f", "framemd5", out], timeout, capture_output=True, text=True, errors="replace")
+        if r.returncode:
+            raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-150:]}")
+        with open(out) as f:
+            for line in f:
+                if line[:1].isdigit():
+                    sums.setdefault(indexes[int(line.split(",")[0])], line.split(",")[5].strip())
+    files = cover_files(path, images, folder, "att", timeout)
+    for a in images:
+        with open(files[a["id"]], "rb") as f:
+            names[a["id"]] = hashlib.md5(f.read()).hexdigest()
+    return sums, names
+
+
+def cover_files(path, atts, folder, tag, timeout=None):
+    """{attachment id: the file in folder that one mkvextract call writes it to} for the attachments atts of path, as
+    mkvmerge -J lists them."""
+    files = {a["id"]: os.path.join(folder, f"{tag}-{a['id']}") for a in atts}
+    if files:
+        r = checks.run_bounded(["mkvextract", path, "attachments", *[f"{i}:{f}" for i, f in files.items()]], timeout, capture_output=True, text=True,
+                               errors="replace")
+        if r.returncode:
+            raise RuntimeError(f"mkvextract exited {r.returncode}: {config.mask((r.stdout + r.stderr).strip())[-150:]}")
+    return files
+
+
+def cover_tracks(path, j):
+    """{mkvmerge track id: entry} of each video track of path that is a still image and not the film, see
+    decide.still() and decide.main_video(). An entry holds the track's place among the video tracks (v2), its ffprobe
+    index, its codec, its count of frames, its track name as title, and name, the attachment that holds its image after
+    resub(), with its MIME type, see COVER_FILES. md5 is the md5 of its image, and hashed says every packet hashes to
+    it. copy says the track goes and adds nothing, because the file holds its
+    image as an attachment already (there), or an earlier track of this remux adds it. att is the id of the
+    attachment that holds the image of a copy that is there. why says why a track stays.
+
+    A track counts when every packet holds the same image. mkvmerge's frame count of 1, for this file, needs no read.
+    The others are read once with -c copy, see proof.packet_hashes(), within the job's time left less SUB_RESERVE.
+    The file keeps one copy of each image. A track whose image an image attachment holds byte for byte goes, and the
+    attachment stays as it is. Tracks of one image that no attachment holds go into one new attachment, cover.jpg, or
+    cover2.jpg, cover3.jpg when an attachment has that file name, or an image attachment that stem, such as cover.png.
+    A font named cover.ttf takes no name. A track whose image no other track or attachment holds
+    becomes cover.jpg, unless the file holds an image attachment named cover, or this remux adds one first. Then it
+    stays. The md5s of the images decide, see cover_images(), and resub() proves them byte for byte. A 1-frame track
+    is read only when there is something to compare it with. A file with one video track, or whose film is a still image too, has none."""
+    vids = [t for t in j.get("tracks") or [] if t.get("type") == "video"]
+    if len(vids) < 2:
+        return {}
+    try:
+        streams = proof.ff_streams(path)[1]
+    except RuntimeError:   # ffprobe read no stream: no cover move
+        return {}
+    vs = [s for s in streams if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")]
+    if len(vs) != len(vids) or not (film := decide.main_video(vs)) or decide.still(film):
+        return {}
+    app = ((j.get("container") or {}).get("properties") or {}).get("writing_application") or ""
+    fresh = lambda p: app.startswith("mkvmerge") and p.get("tag__statistics_writing_app", app) == app   # ffmpeg copies stale tags
+    out = {t["id"]: {"place": f"v{k}", "index": x["index"], "codec": x["codec_name"], "name": COVER_FILES[x["codec_name"]][0],
+                     "mime": COVER_FILES[x["codec_name"]][1], **({"title": p["track_name"]} if (p := t.get("properties") or {}).get("track_name") else {}),
+                     "frames": 1 if fresh(p) and str(p.get("tag_number_of_frames")) == "1" else None}
+           for k, (t, x) in enumerate(zip(vids, vs), 1) if decide.still(x)}
+    pics = {(s.get("tags") or {}).get("filename") for s in streams if (s.get("disposition") or {}).get("attached_pic")}
+    images = [a for a in j.get("attachments") or [] if a.get("file_name") in pics]   # the attachments ffmpeg reads as pictures
+    st = os.stat(path)
+    left = config.DEADLINE.left()
+    timeout = min(max(600, st.st_size / proof.PROOF_RATE), left - config.SUB_RESERVE if left else float("inf"))
+    key = lambda what, xs: (path, st.st_size, st.st_mtime_ns, what, tuple(xs))
+    read = [e["index"] for e in out.values() if e["frames"] is None]
+    one_md5 = lambda m: "" if not m else bytes(m[:16]).hex() if bytes(m) == bytes(m[:16]) * (len(m) // 16) else None
+    packets = lambda folder: {i: (h["count"], one_md5(h["md5s"]))   # {index: (packets, the md5 of each, "" for none, None when they differ)}
+                              for i, h in proof.packet_hashes(path, read, {}, [], folder, timeout)[0].items()}
+    got, failed = {}, None
+    if read and (key("packets", read) in COVER_READS or timeout > 0):
+        try:
+            got = cover_read(key("packets", read), packets)
+        except (RuntimeError, subprocess.TimeoutExpired) as ex:
+            failed = f"its frames were not all read: {config.mask(str(ex))[:150]}"
+    for e in out.values():
+        if e["frames"] is None:
+            e["frames"], md5 = got.get(e["index"], (0, ""))
+            if why := failed or (None if got else "its frames were not read in the time left") or (md5 is None and "its frames differ") \
+                    or (md5 == "" and "it holds no frame"):
+                e["why"] = why
+            else:
+                e.update(md5=md5, hashed=True)   # every packet hashes to md5, so the remux reads them no second time
+    keep, have = [e for e in out.values() if "why" not in e], {}
+    if keep and (images or len(keep) > 1):   # something to compare
+        one = [e["index"] for e in keep if "md5" not in e]   # a 1-frame track whose image was not read
+        k = key("images", [*one, *(a["id"] for a in images)])
+        try:
+            if k not in COVER_READS and timeout <= 0:
+                raise RuntimeError("no time left")
+            sums, names = cover_read(k, lambda folder: cover_images(path, one, images, folder, timeout))
+        except (RuntimeError, subprocess.TimeoutExpired) as ex:
+            sums, names = {}, {}
+            for e in keep:
+                e["why"] = f"its picture was not compared: {config.mask(str(ex))[:150]}"
+        for e in keep:
+            if not e.setdefault("md5", sums.get(e["index"])):
+                e.setdefault("why", "its picture was not read")
+        keep, have = [e for e in keep if "why" not in e], {m: i for i, m in reversed(names.items())}   # the first attachment of each image
+    many = {m for m in (e.get("md5") for e in keep) if m and sum(x.get("md5") == m for x in keep) > 1}
+    stem_of, added = lambda a: os.path.splitext(a.get("file_name") or "")[0].lower(), {}
+    taken = {(a.get("file_name") or "").lower() for a in j.get("attachments") or []}
+    stems = {stem_of(a) for a in images}   # a player shows an image named cover
+    shown = "cover" in stems
+    name_of = {a["id"]: a.get("file_name") for a in images}
+    for e in keep:
+        m = e.get("md5")
+        if m in have:
+            e.update(name=name_of[have[m]], att=have[m], copy=True, there=True)
+        elif m in added:
+            e.update(name=added[m], copy=True)
+        elif m in many or not shown:
+            ext = os.path.splitext(e["name"])[1]
+            stem = next(s for s in ("cover", *(f"cover{k}" for k in range(2, len(stems) + len(taken) + 3))) if s not in stems and s + ext not in taken)
+            stems.add(stem)
+            shown = shown or stem == "cover"
+            e["name"] = stem + os.path.splitext(e["name"])[1]
+            added.update({m: e["name"]} if m else {})   # a lone track had nothing to compare, so it has no md5
+        else:
+            e["why"] = "the file has a cover picture already"
     return out
 
 
-# The name of ffmpeg's default decoder of a codec, where it is not the codec's name, see copy_fault(). ffmpeg 7.1 shows
-# each in its lines. A copy of a damaged MS-MPEG4 v3 frame in Matroska printed nothing, but a decode prints msmpeg4.
-DECODER = {"mp3": "mp3float", "dts": "dca", "av1": "libdav1d", "msmpeg4v3": "msmpeg4"}
+def moved_tracks(moves):
+    """Write each move of moves, [(src, stream index, fix of subsync.timing(), out, track)], alone into the Matroska
+    file out, each time moved by the fix to (time - offset) / rate and each duration scaled by 1 / rate. One ffmpeg call reads
+    each src once. resub() takes it for every track a fix moves. mkvmerge reorders the packets of one input only
+    within about 20 MB, so a track that --sync moved earlier than that in a file of many tracks stayed late. A file of
+    one stream holds its packets in time order. A cue the fix moves before 0 starts at 0, as srt_moved() does, and a
+    cue that ends before 0 keeps 1 ms. With a length of 0 the proof refused the remux. -itsoffset moves every stream of
+    an input, so the setts filter makes the whole move, in the ms that Matroska stores. -copyts keeps the times of src,
+    which ffmpeg would move by the file's start time. Each file keeps the track's tags. The chapters and global tags
+    ffmpeg copies there stay out of the merge, see resub(). track is the track id a refusal names.
+
+    ffmpeg's muxer changes a decode time that is lower than the one before it to that one, and logs "Non-monotonic
+    DTS". A source that stores a track out of time order would then get its cues seconds late. So the call reads the
+    warnings, see levels(), and such a warning refuses the move before mkvmerge writes a merge. ffmpeg 7.1 logs a step
+    back of 2 ms or less at debug level only, and prove() refuses that move, see proof.STORED_SLACK. Every other
+    warning is left out, and the rest goes to proof.bad_lines(), as a read with -v error gives it."""
+    srcs = list(dict.fromkeys(src for src, *_ in moves))
+    argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "level+warning", "-y", "-copyts", *[a for src in srcs for a in ("-i", src)]]
+    for src, at, fix, out, _ in moves:
+        n, k = srcs.index(src), repr(1 / float(fractions.Fraction(fix["rate"])))
+        # The moved time in ms, so it rounds once. In a finer source time base, setts rounded to its tick, and the
+        # muxer rounded that to ms again. A cue then sat up to 0.5 ms plus half a tick off the fix.
+        t = lambda ts: f"({ts}-({float(fix['offset'])!r})/TB)*{k}*TB*1000"
+        clamp = (f"setts=time_base=1/1000:pts=max({t('PTS')}\\,0):dts=max({t('DTS')}\\,0)"
+                 f":duration=if(lt({t('PTS')}\\,0)\\,max(1\\,{t('PTS')}+DURATION*{k}*TB*1000)\\,DURATION*{k}*TB*1000)")
+        argv += ["-map", f"{n}:{at}", "-c", "copy", "-bsf:0", clamp, "-f", "matroska", out]
+    r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+    lines = levels(r.stderr)
+    for level, line in lines:   # "[sost#2:0/copy @ 0x..] Non-monotonic DTS; ...": output file 2 is the third move
+        if level == "warning" and (m := re.match(r"\[\w+#(\d+):\d+/\w+ @ 0x[0-9a-f]+\] Non-monotonic DTS", line)):
+            raise RuntimeError(f"subtitle track {moves[int(m[1])][4]} stores its packets out of time order, so ffmpeg cannot move it")
+    err = "\n".join(line for level, line in lines if level != "warning")
+    if r.returncode or proof.bad_lines(err):
+        raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(err.strip())[-300:]}")
+    return [out for _, _, _, out, _ in moves]
 
 
-def copy_fault(text, streams):
-    """The lines of text, the output of an ffmpeg stream copy, that fail it. streams are the ffprobe streams of its
-    source. ffmpeg decodes a few frames of each stream while it opens a file, and the decoder of a damaged frame
-    prints there, as in "[eac3 @ 0x...] error decoding the audio block". A copy decodes nothing. So a line of the
-    decoder of an audio or video stream of streams passes, and a "Last message repeated" line after it too. The
-    decoder's name is the codec's name, or its name in DECODER. Every other line fails: a muxer line such as
-    "[matroska @ 0x...]", a filter line and a plain error."""
-    names = {n for s in streams if s.get("codec_type") in ("audio", "video")
-             for n in (s.get("codec_name"), DECODER.get(s.get("codec_name")))}
-    bad, passed = [], False
-    for line in text.splitlines():
-        if line.strip():
-            m = re.match(r"\[(\w+) @ 0x[0-9a-f]+\] ", line)
-            passed = bool(m and m[1] in names or passed and re.match(r"\s+Last message repeated", line))
-            bad += [] if passed else [line]
-    return bad
+def levels(stderr):
+    """[(level, line)] of the stderr of an ffmpeg call with -v level+warning, each line without its level tag:
+    "[matroska @ 0x..] [error] text" gives ("error", "[matroska @ 0x..] text"). A line with no tag goes on with the
+    message before it and takes its level, as "Consider increasing the value for the 'analyzeduration'" does after
+    a warning. A first line with no tag counts as an error."""
+    out, level = [], "error"
+    for line in stderr.splitlines():
+        if m := re.match(r"(\[[^\]]+ @ 0x[0-9a-f]+\] )?\[(warning|error|fatal|panic)\] (.*)", line):
+            level, line = m[2], (m[1] or "") + m[3]
+        out.append((level, line))
+    return out
 
 
-def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None, strip=None):
+def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None, strip=None, covers=None):
     """Remux a Matroska file in place with new times for the subtitle tracks in fixes, {mkvmerge track id: fix of
     subsync.timing()}, new cue ends for the text tracks in ends, {mkvmerge track id: the plan of flash_plan()}, new
     times for the text tracks in timed, {mkvmerge track id: time_plan()}, new text for the garbled SubRip tracks in
@@ -848,61 +1103,80 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     info). result is "subtitles remuxed", "would remux subtitles: ...", "subtitle remux failed: ..." or "subtitle remux
     skipped, ...", and code subtitles_remuxed, would_remux_subtitles, subtitle_remux_failed or subtitle_remux_skipped.
 
-    A track in recode comes from its own input as a track in ends does, with the text of its repair, see repair_text().
+    A track in recode comes from its own file as a track in ends does, with the text of its repair, see repair_text().
     Its times stay. A repair with default_off turns its default flag off in the same remux. The proof holds each cue to
     the repair's text and to the original's times, see prove().
 
-    A track with new ends comes from its own input: mkvextract writes its text, set_ends() puts each new end in, and
+    A track with new ends comes from its own file: mkvextract writes its text, set_ends() puts each new end in, and
     mkvmerge makes a file of that one track. The text, the starts and the ASS header stay byte for byte, but for the
-    NUL bytes of a HandBrake ASS track, the ReadOrders of an ASS track, which become their ranks, the spaces and tabs
-    at the end of each ASS event, which go, and the line breaks of a SubRip cue, see ended_track(). The proof holds
+    NUL bytes of a HandBrake ASS track, the ReadOrders of an ASS track, which become their ranks, and the line breaks
+    of a SubRip cue, see ended_track(). The proof holds
     each end to the plan. An ASS track whose starts fall between centiseconds goes in as a track in timed, with each
     start on the nearest centisecond, see grid_plan(). Its log and what text stay those of new ends.
     info["starts_rounded"] counts the starts that the grid moved off the time its fix gives, see grid_moved().
 
-    A track in timed comes from its own input the same way, with every start and end of its plan. Its plan holds its
-    fix and its flash ends, so it gets no -itsoffset or -itsscale. Its entries in fixes and ends only go to the log and
+    A track in timed comes from its own file the same way, with every start and end of its plan. Its plan holds its
+    fix and its flash ends, so moved_tracks() never moves it. Its entries in fixes and ends only go to the log and
     the what text, and the what text names the cues its blocks move past that fix, see blocks_moved(). The proof holds
-    each start and end to the plan. ended_track() takes SubRip, ASS and SSA only.
+    each start and end to the plan. ended_track() takes SubRip, ASS and SSA only. info["timed_cues"] counts the cues of
+    each plan by track id. The caller's record uses "timed" for the places of the moved tracks.
 
-    ffmpeg copies every other stream with -copyinkf, and reads each retimed track from a second input of the same file
-    with -itsoffset and -itsscale, so its cues move to (time - offset) / rate. A line that ffmpeg prints fails the
-    remux, but for the line of a decoder that reads a damaged frame while ffmpeg opens the file, see copy_fault().
-    info["warnings"] keeps every line. mkvmerge moves the times of laced AAC
-    frames by up to 2 ms in a Matroska to Matroska remux, and the proof refuses that. ffmpeg keeps the times it reads,
-    and the proof passes. mkvpropedit then puts back each kept track's UID, BCP 47 tag, name and flags, and the Segment
-    UID, which ffmpeg does not keep. The new file must keep every other track and its properties (props_fault()), and
-    prove() must show every packet of every kept stream the same, the retimed tracks' times as the fix moves them.
+    One mkvmerge call writes the new file (docs/design.md, "Subtitle match"). It copies every other track with its
+    packets, see KEEP_PACKETS, its UID, language, BCP 47 tag, name and flags, and the file's attachments, chapters,
+    tags and Segment UID. --track-order keeps the order of the tracks. A retimed track comes from its own file of
+    moved_tracks(), its cues moved to (time - offset) / rate, so its packets are in time order. mkvmerge reads each
+    input in file order and holds back only about 20 MB of it. A track that --sync moved earlier than 20 MB of the
+    other tracks stayed late in the new file, where no player shows it, and mkvmerge drops a cue that --sync moves
+    before 0. A track from its own file gets the language, name and flags of the original with track_args(), and
+    mkvpropedit gives that file the original's UID first. mkvpropedit never edits the new file. A copied subtitle track
+    that the source stores late would stay late too. So the subtitle tracks it copies come from a second input of the
+    same file, which mkvmerge reads on its own and writes by time. The chapters, tags and attachments come from the first input only. Each track that the
+    source holds uncompressed stays so, see compression_args(). Any line mkvmerge prints fails the remux, as in repack(), and info["warnings"] keeps
+    it. The new file must keep every other track and its properties (props_fault()), and prove() must show every
+    packet of every kept stream the same, the retimed tracks' times as the fix moves them.
 
     A garbled text track in strip, {mkvmerge track id: its language tag}, leaves the file, and its bytes go beside the
-    video under the name of broken_plan(), in the track's own format. The remux's ffmpeg also writes its packets: a
-    SubRip track's as SubRip, and proof.packet_text() shows each cue's bytes equal to its packet's. An ASS, SSA or
+    video under the name of broken_plan(), in the track's own format. Before the remux, one ffmpeg read of the
+    original writes its packets and their md5s: a SubRip track's as SubRip, and proof.packet_text() shows each cue's bytes equal to its packet's. An ASS, SSA or
     WebVTT track's go as they are, and mkvextract writes the file with its header, see events_file(). proof.event_text()
     shows the text of each packet in it. After the proof and the kept original, keep_broken() writes the bytes beside
     the video. A failure after that removes each new file, see drop_broken(). info["garbled_text"] names each file,
     and info["garbled_text_removed"] each one the failure removed again.
 
+    A cover picture track in covers, {mkvmerge track id: its entry of cover_tracks()}, leaves the file, and its image
+    becomes an attachment with the entry's name and MIME type, and its track name as the description. The ffmpeg read
+    before the remux also writes its first packet, and the md5 of each of its packets, unless cover_tracks() hashed
+    them already (hashed). Every md5 must be the same, and the first packet must hash to it. The same mkvmerge call adds that packet as the attachment. A copy adds nothing.
+    mkvextract reads the attachment of each cover track back from the new file, and its bytes must be the track's
+    packet: the one this remux adds, or for a copy the one the file keeps or an earlier track adds. prove() leaves the
+    track out, as it does a removed subtitle. The first input drops it (-d), and it gets no --compression option.
+    info["cover_names"] names each attachment. A remux that moves only covers says so in its result.
+
     It runs like repack(): the temp file in hide_dir, no time limit during the remux, and SIGTERM removes the temp file.
     The original must still be the file st describes. The temp file takes its owner and mode, the original is kept in
     originals_root() for keep_days, and the temp file is renamed over it. A removal needs that kept original, so with
-    KEEP_ORIGINALS_DAYS 0 the caller never asks for one. The extracted text, the proof's reads and the cover
-    attachments go into a folder under STATE_DIR, never the system temp dir, which is often a small tmpfs."""
-    ends, timed, recode, strip = ends or {}, timed or {}, recode or {}, strip or {}
+    KEEP_ORIGINALS_DAYS 0 the caller never asks for one. The extracted text, the files of single tracks, the cover
+    pictures and the proof's reads go into a folder under STATE_DIR, never the system temp dir, which is often a small
+    tmpfs."""
+    ends, timed, recode, strip, covers = ends or {}, timed or {}, recode or {}, strip or {}, covers or {}
     drop = [*drop, *strip]
     place = {i: f"s{n}" for n, i in enumerate((t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
     codec = {t.get("id"): (t.get("properties") or {}).get("codec_id") for t in j.get("tracks") or []}
     broken = {i: {"lang": lang, "data": None, "ext": TEXT_EXT[codec[i]]} for i, lang in strip.items()}
     broken_plan(path, {place[i]: e for i, e in broken.items()})   # the plan's names. The write names them again with the bytes.
     info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()},
-            **({"timed": {str(i): len(plan) for i, plan in timed.items()}} if timed else {}),
+            **({"timed_cues": {str(i): len(plan) for i, plan in timed.items()}} if timed else {}),
             **({"recode": {str(i): repair_name(r) for i, r in recode.items()}} if recode else {}),
-            **({"garbled_text": {str(i): os.path.basename(e["sidecar"]) for i, e in broken.items()}} if strip else {})}
+            **({"garbled_text": {str(i): os.path.basename(e["sidecar"]) for i, e in broken.items()}} if strip else {}),
+            **({"cover_names": {str(i): e["name"] for i, e in covers.items()}} if covers else {})}
     what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
                      + [f"track {i}: new ends for {sum(e != o for _, _, o, e in plan)} of {len(plan)} cues" for i, plan in ends.items()]
                      + [f"track {i}: {blocks_moved(plan, fixes.get(i)) or f'new times for {len(plan)} cues'}" for i, plan in timed.items()]
                      + [f"track {i}: {repair_name(r)}" + (", default flag off" if r.get("default_off") else "") for i, r in recode.items()]
                      + [f"remove track {i}" for i in drop if i not in strip]
-                     + [f"take out track {i}, its bytes to {os.path.basename(e['sidecar'])}" for i, e in broken.items()])
+                     + [f"take out track {i}, its bytes to {os.path.basename(e['sidecar'])}" for i, e in broken.items()]
+                     + [f"track {i}: " + (f"removed, the attachment {e['name']} holds its picture" if e.get("copy") else
+                                          f"cover picture to the attachment {e['name']}") for i, e in covers.items()])
     grid = {i: x for i, plan in ends.items() if i not in timed and (x := grid_plan(plan, fixes.get(i), codec.get(i)))}
     if grid:   # the starts on the ASS grid, see grid_plan()
         timed = {**timed, **grid}
@@ -916,62 +1190,103 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     subs = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]   # the k-th of them is ffprobe's k-th
     sw = Swap(path, st, tmp, info)
     try:
-        streams = proof.ff_streams(path)[1]
-        text = [x["index"] for x in streams if x.get("codec_type") == "subtitle"]
+        text = [x["index"] for x in proof.ff_streams(path)[1] if x.get("codec_type") == "subtitle"]
         if len(text) != len(subs):
             raise RuntimeError(f"ffprobe reads {len(text)} subtitle streams and mkvmerge {len(subs)}")
-        moved, gone = {text[subs.index(i)]: f for i, f in fixes.items() if i not in timed}, {text[subs.index(i)] for i in drop}
-        ended = {text[subs.index(i)]: ended_track(path, j, i, plan, folder) for i, plan in {**ends, **timed}.items()}
-        repairs = {i: repair_text(r) for i, r in recode.items()}   # (the new text for ended_track(), the cues for the proof)
-        ended.update({text[subs.index(i)]: ended_track(path, j, i, None, folder, new) for i, (new, _) in repairs.items()})
+        index = dict(zip(subs, text))
+        gone = {index[i] for i in drop} | {e["index"] for e in covers.values()}   # a cover picture comes back as an attachment
         j = dict(j, tracks=[dict(t, properties=dict(t.get("properties") or {}, default_track=False)) if (recode.get(t.get("id")) or {}).get("default_off")
-                            else t for t in j.get("tracks") or []])   # the new flags, for mkvpropedit and props_fault()
-        argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
-        own = sorted(set(moved) | set(ended))
-        for x in own:   # one input per track: -itsoffset holds for a whole input
-            f, at = moved.get(x), 0 if x in ended else x   # the stream of this track in its input
-            argv += ["-itsoffset", f"{-f['offset']:.3f}", f"-itsscale:{at}", repr(1 / float(fractions.Fraction(f["rate"])))] if f else []
-            argv += ["-i", ended.get(x, path)]
-        # ffmpeg reads an image attachment as a cover picture stream and would write it back as a video track, so it
-        # stays out of the map, and mkvpropedit adds it back below.
-        pics = [x for x in streams if (x.get("disposition") or {}).get("attached_pic")]
-        source, kept = {x: n for n, x in enumerate(own, 1)}, [x["index"] for x in streams if x["index"] not in gone and x not in pics]
-        argv += [a for x in kept for a in ("-map", f"{source.get(x, 0)}:{0 if x in ended else x}")]
-        # A cue the fix moves before 0 starts at 0, as srt_moved() does. A negative time would make ffmpeg move every stream.
-        # A cue that ends before 0 keeps 1 ms, as in srt_moved(). With a length of 0 the proof refused the remux.
-        # -itsscale scales the times and leaves each duration, so the filter scales it too, and a cue ends where the fix moves its end.
-        clamp = lambda k: (f"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=if(lt(PTS\\,0)\\,max(1\\,PTS+DURATION*{k})\\,DURATION*{k})")
-        argv += [a for n, x in enumerate(kept) if x in moved for a in (f"-bsf:{n}", clamp(repr(1 / float(fractions.Fraction(moved[x]["rate"])))))]
-        argv += ["-c", "copy", "-copyinkf", "-default_mode", "passthrough", "-f", "matroska", tmp]
-        # The same read writes the packets of a track in strip: as SubRip, or as they are for mkvextract's file, see below
+                            else t for t in j.get("tracks") or []])   # the new flags, for track_args() and props_fault()
+        props = {t.get("id"): t.get("properties") or {} for t in j.get("tracks") or []}
+        own = {i: ended_track(path, j, i, plan, folder) for i, plan in {**ends, **timed}.items()}   # {track id: the file it comes from}
+        repairs = {i: repair_text(r) for i, r in recode.items()}   # (the new text for ended_track(), the cues for the proof)
+        own.update({i: ended_track(path, j, i, None, folder, new) for i, (new, _) in repairs.items()})
+        moved = [i for i in fixes if i not in timed]   # a time plan holds its fix
+        if moved:
+            own.update(zip(moved, moved_tracks([(own.get(i, path), 0 if i in own else index[i], fixes[i], os.path.join(folder, f"{i}.moved.mkv"), i)
+                                                for i in moved])))
+        # The packets of a track in strip, from a read of their own: as SubRip, or as they are for mkvextract's file, see below
         texts = {i: (os.path.join(folder, f"{i}.garbled.{'srt' if codec[i] == 'S_TEXT/UTF8' else 'bin'}"), os.path.join(folder, f"{i}.md5")) for i in strip}
-        for i, (srt, md5) in texts.items():
-            x = text[subs.index(i)]
-            argv += ["-map", f"0:{x}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{x}", "-c", "copy", "-f", "srt" if srt.endswith(".srt") else "data", srt]
-        new_tmp(tmp, st)
-        r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
-        info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None   # the lines copy_fault() passes too
-        bad = copy_fault(r.stdout + r.stderr, streams)
-        if r.returncode or bad:
-            raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(chr(10).join(bad))[-500:] or info['warnings']}")
+        pics = {i: (os.path.join(folder, f"cover-track-{i}"), os.path.join(folder, f"cover-track-{i}.md5")) for i in covers}   # its first packet, its md5s
+        if texts or pics:
+            argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
+            for i, (srt, md5) in texts.items():
+                argv += ["-map", f"0:{index[i]}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{index[i]}", "-c", "copy",
+                         "-f", "srt" if srt.endswith(".srt") else "data", srt]
+            for i, (img, md5) in pics.items():   # a GIF frame is no keyframe, and a copy drops it without -copyinkf
+                x = covers[i]["index"]
+                argv += [*([] if covers[i].get("hashed") else ["-map", f"0:{x}", "-c", "copy", "-copyinkf", "-f", "framemd5", md5]),
+                         "-map", f"0:{x}", "-c", "copy", "-copyinkf", "-frames:v", "1", "-f", "data", img]
+            r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+            if r.returncode or proof.bad_lines(r.stderr):
+                raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-300:]}")
         for i, (srt, md5) in texts.items():   # an ASS, SSA or WebVTT file holds its header too, which mkvextract writes
             out = srt if srt.endswith(".srt") else events_file(path, i, codec[i], folder)
             if why := (proof.packet_text(srt, md5) if out == srt else proof.event_text(out, md5, srt, codec[i])):
                 raise RuntimeError(f"the bytes of track {i} were not written whole: {why}")
             texts[i] = (out, md5)
+        for i, (img, md5) in pics.items():
+            with open(img, "rb") as g:
+                pic = hashlib.md5(g.read()).hexdigest()
+            if covers[i].get("hashed"):
+                sums = {covers[i]["md5"]}
+            else:
+                with open(md5) as f:
+                    sums = {line.split(",")[5].strip() for line in f if line[:1].isdigit()}
+            if sums != {pic}:
+                raise RuntimeError(f"the packets of cover track {i} are not all its image: {len(sums)} different" if sums else
+                                   f"ffmpeg wrote no packet of cover track {i}")
+        added = {}   # each attachment this remux adds, by name: (the track, its image). A copy adds nothing.
+        for i, (img, _) in pics.items():
+            if not covers[i].get("there"):
+                added.setdefault(covers[i]["name"], (i, img))
+        for i, f in own.items():   # mkvmerge keeps the UID a file gives its track
+            e = subprocess.run(["mkvpropedit", f, "--edit", "track:1", "--set", f"track-uid={props[i]['uid']}"], capture_output=True, text=True,
+                               errors="replace") if props[i].get("uid") else None
+            if e and e.returncode not in (0, 1):   # a signal gives a negative code
+                raise RuntimeError(f"mkvpropedit exited {e.returncode}: {config.mask((e.stdout + e.stderr).strip())[-300:]}")
+        files, ids = list(own), [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in drop and t.get("id") not in covers]
+        copied = [i for i in ids if i in index and i not in own]   # the subtitle tracks of input 1, see above
+        first = 1 + bool(copied)   # the input of the first file of one track
         uid = ((j.get("container") or {}).get("properties") or {}).get("segment_uid")
-        edits = ["--edit", "info", "--set", f"segment-uid=0x{uid}"] if uid else []
-        for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("id") not in drop), 1):   # the n-th track of the new file
-            p = t.get("properties") or {}
-            sets = [f"{name}={int(v) if isinstance(v, bool) else v}" for k, name in PROP_EDITS if (v := p.get(k)) is not None]
-            edits += ["--edit", f"track:{n}"] + [a for x in sets for a in ("--set", x)] if sets else []
-        edits += cover_edits(path, j, pics, folder)
-        e = subprocess.run(["mkvpropedit", tmp, *edits], capture_output=True, text=True, errors="replace")
-        if e.returncode not in (0, 1):   # a signal gives a negative code
-            raise RuntimeError(f"mkvpropedit exited {e.returncode}: {config.mask((e.stdout + e.stderr).strip())[-300:]}")
+        # Each frame its own block, as in convert_cmd(). A player that seeks to 0 skips a whole lace that starts before the
+        # first video keyframe, up to 170 ms of AAC audio (docs/design.md, "Subtitle match").
+        argv = ["ionice", "-c3", "nice", "-n", "19", "mkvmerge", "-q", "--disable-lacing", *KEEP_PACKETS, "-o", tmp,
+                *(["--segment-uid", uid] if uid else []),
+                *[a for name, (i, img) in added.items() for a in ("--attachment-name", name, "--attachment-mime-type", covers[i]["mime"],
+                                                                   *(["--attachment-description", covers[i]["title"]] if covers[i].get("title") else []),
+                                                                   "--attach-file", img)],
+                "--track-order", ",".join(f"{files.index(i) + first}:0" if i in own else f"{int(i in copied)}:{i}" for i in ids),
+                *compression_args(t for t in j.get("tracks") or [] if t.get("id") not in index and t.get("id") not in covers),
+                *(["-d", "!" + ",".join(map(str, sorted(covers)))] if covers else []), "-S", path]
+        if copied:   # the same file again, its subtitle tracks alone, so mkvmerge reads them on their own and writes them by time
+            argv += ["-D", "-A", "-B", "-M", "--no-chapters", "--no-global-tags", "-s", ",".join(map(str, copied)),
+                     *compression_args(t for t in j.get("tracks") or [] if t.get("id") in copied), path]
+        for i in files:   # the track alone, never the chapters or tags of its file
+            argv += [*track_args(props[i]), *compression_args([{"properties": props[i]}], 0),
+                     "--no-chapters", "--no-global-tags", own[i]]
+        new_tmp(tmp, st)
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+        info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
+        if r.returncode or info["warnings"]:   # a warning may say mkvmerge left data out, as in repack()
+            raise RuntimeError(f"mkvmerge exited {r.returncode}: {info['warnings']}")
         sw.sync()
         new = checks.mkvmerge(tmp)
-        fault = props_fault(j, new, drop, {*ends, *timed, *recode})   # the tracks of ended_track()
+        fault = props_fault(dict(j, attachments=[*(j.get("attachments") or []), *({"file_name": n} for n in added)]), new, [*drop, *covers],
+                            {*ends, *timed, *recode})   # the tracks of ended_track()
+        uid = lambda a: (a.get("properties") or {}).get("uid")   # each cover track's image must be its attachment's, byte for byte
+        uids = {a.get("id"): uid(a) for a in j.get("attachments") or []}   # mkvmerge keeps the UID of each attachment it copies
+        # The attachment of each cover in the new file: one that stays by its UID, one this remux adds by its name, which
+        # no attachment of the original has, see cover_tracks()
+        at = {i: next((a for a in new.get("attachments") or [] if (uid(a) == uids.get(c.get("att")) if c.get("there") else
+                                                                 a.get("file_name") == c["name"])), None) for i, c in covers.items()}
+        try:   # read back byte for byte
+            back = cover_files(tmp, {a["id"]: a for a in at.values() if a}.values(), folder, "back") if not fault else {}
+        except RuntimeError as ex:
+            fault = str(ex)
+        for i, (img, _) in pics.items():
+            if not fault and not (at[i] and filecmp.cmp(img, back[at[i]["id"]], shallow=False)):
+                fault = f"the attachment {covers[i]['name']} does not hold the image of track {i}"
         if not fault:
             kept = [i for i in subs if i not in drop]
             refused, info["proof"] = proof.prove(path, tmp, [], folder, dropped=gone, absolute=True,
@@ -1005,4 +1320,5 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     if info.get("kept"):
         vault.prune_originals(vault.originals_root(path))
     info["new_size"] = size
-    return "subtitles_remuxed", "subtitles remuxed", info
+    return "subtitles_remuxed", "subtitles remuxed" if fixes or drop or ends or timed or recode or not covers else \
+        "cover picture moved to an attachment" if not all(e.get("copy") for e in covers.values()) else "cover picture track removed as a copy", info

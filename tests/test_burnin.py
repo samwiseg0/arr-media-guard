@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -679,7 +680,8 @@ def test_the_video_is_the_first_stream_that_is_no_cover(clips, tmp_path, monkeyp
     """Cover art comes as a video stream marked attached_pic, and it may come first. A file with no other video
     fails."""
     import av
-    stream = lambda disposition, width: type("V", (), {"disposition": disposition, "codec_context": type("C", (), {"width": width, "height": 360, "color_trc": 1})()})()
+    stream = lambda disposition, width: type("V", (), {"disposition": disposition, "codec_context": type("C", (), {"width": width, "height": 360, "color_trc": 1,
+                                                                                                                 "name": "h264"})()})()
     cover, video = stream(av.stream.Disposition.attached_pic, 200), stream(av.stream.Disposition.default, 640)
     box_ = type("Box", (), {"start_time": None, "close": lambda self: None})()
     box_.streams = type("S", (), {"video": [cover, video]})()
@@ -694,6 +696,73 @@ def test_the_video_is_the_first_stream_that_is_no_cover(clips, tmp_path, monkeyp
     amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=5", audio], check=True)
     with pytest.raises(ValueError, match="no video"):
         burnin.Sampler(audio)
+
+
+def test_the_video_is_never_a_still_image_track_before_it(monkeypatch):
+    """A cover picture can come as a video track of a still-image codec. The sampler takes the film after it, and a file
+    of still images alone takes its first, see decide.main_video(). A fake av module, so it runs without PyAV."""
+    stream = lambda name, pic=0: types.SimpleNamespace(disposition=pic, codec_context=types.SimpleNamespace(width=640, height=360, color_trc=1, name=name))
+    cover, still, film = stream("png", 1), stream("mjpeg"), stream("h264")
+    box_ = types.SimpleNamespace(start_time=None, close=lambda: None, streams=types.SimpleNamespace(video=[cover, still, film]))
+    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path: box_, stream=types.SimpleNamespace(
+        Disposition=types.SimpleNamespace(attached_pic=1))))
+    assert burnin.Sampler("film.mkv").v is film
+    box_.streams.video = [cover, still]
+    assert burnin.Sampler("film.mkv").v is still
+    box_.streams.video = [film, types.SimpleNamespace(disposition=0, codec_context=None)]   # PyAV has no decoder for the second track
+    assert burnin.Sampler("film.mkv").v is film
+
+
+def test_a_seek_goes_by_the_films_own_index(monkeypatch):
+    """A seek with no stream goes by the first video stream, so with a cover picture first it landed at 0. The sampler
+    seeks by the film, with the time in the film's time base. A fake av module, so it runs without PyAV."""
+    import fractions
+    seeks = []
+    cc = lambda name: types.SimpleNamespace(width=640, height=360, color_trc=1, name=name, flush_buffers=lambda: None)
+    cover, film = (types.SimpleNamespace(disposition=0, time_base=fractions.Fraction(1, 1000), codec_context=cc(n)) for n in ("mjpeg", "h264"))
+    box_ = types.SimpleNamespace(start_time=2_000_000, close=lambda: None, streams=types.SimpleNamespace(video=[cover, film]),
+                                 seek=lambda *a, **k: seeks.append((a, k)), demux=lambda v: iter(()), decode=lambda v: iter(()))
+    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path: box_, stream=types.SimpleNamespace(
+        Disposition=types.SimpleNamespace(attached_pic=1))))
+    sm = burnin.Sampler("film.mkv")
+    assert sm.keyframe(30) == (None, None) and sm.frame_at(60) == (None, None)
+    assert seeks == [((32000,), {"backward": True, "any_frame": False, "stream": film}), ((62000,), {"backward": True, "any_frame": False, "stream": film})]
+
+
+SAMPLES = """import json, sys
+sys.path.insert(0, sys.argv[1])
+from arr_media_guard import burnin
+sm = burnin.Sampler(sys.argv[2])
+try:
+    print(json.dumps([sm.v.codec_context.name, [sm.keyframe(t)[0] for t in (30, 60, 90)], [round(sm.frame_at(t)[0]) for t in (30, 60, 90)]]))
+finally:
+    sm.close()
+"""   # the sampler's film and its samples at 30, 60 and 90 s, in a Python that holds PyAV
+
+
+def pyav_python():
+    """This Python when it holds PyAV, else the venv of the language detection install that ARR_LID_DIR names, where
+    the burn-in check runs. Skips with neither."""
+    for py in (sys.executable, os.path.join(os.environ.get("ARR_LID_DIR", "/opt/arr-media-guard-lid"), "venv", "bin", "python")):
+        if os.path.exists(py) and subprocess.run([py, "-c", "import av"], capture_output=True).returncode == 0:
+            return py
+    pytest.skip("needs PyAV here or in the venv of ARR_LID_DIR")
+
+
+@pytest.mark.parametrize("cover", ["first", "second", "none"])
+def test_the_samples_of_a_film_with_a_cover_track_land_where_asked(tmp_path, cover):
+    """A real file of 2 minutes with a keyframe every 2 s, and a one-frame MJPEG cover before or after the film."""
+    py = pyav_python()
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    run = lambda *argv: subprocess.run(argv, check=True, capture_output=True)
+    run("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24:duration=120", "-c:v", "libx264", "-preset", "ultrafast", "-g",
+        "48", "-threads", "1", str(tmp_path / "film.mkv"))
+    run("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=120x180", "-frames:v", "1", "-c:v", "mjpeg", str(tmp_path / "cover.mkv"))
+    parts = {"first": ["cover.mkv", "film.mkv"], "second": ["film.mkv", "cover.mkv"], "none": ["film.mkv"]}[cover]
+    run("mkvmerge", "-q", "-o", str(tmp_path / "f.mkv"), *[str(tmp_path / p) for p in parts])
+    got = json.loads(run(py, "-c", SAMPLES, FILES, str(tmp_path / "f.mkv")).stdout)
+    assert got == ["h264", [30.0, 60.0, 90.0], [30, 60, 90]], got
 
 
 def test_method_b_needs_enough_strokes_with_dark_on_both_sides():

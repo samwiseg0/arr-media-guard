@@ -850,8 +850,13 @@ def writes(cp):
 
 
 def reads_as(texts, cp):
-    """The language text_language() reads in texts, when the codepage cp writes it, else None."""
+    """The language text_language() reads in the list of cue texts texts, when the codepage cp writes it, else None.
+    Latin credit lines that open an Arabic track make its text mixed, see text_language(). So when the texts read as no
+    language, and cp is not UTF-8, those that hold a character outside ASCII read again. Texts that read as a language
+    cp does not write, as English with a block of Greek lines, do not read again."""
     lang = text_language(texts)[0]
+    if not lang and cp != "utf-8":
+        lang = text_language([t for t in texts if not t.isascii()])[0]
     return lang if lang and (cp == "utf-8" or lang_key(lang) in writes(cp)) else None
 
 
@@ -895,8 +900,8 @@ def recode(texts, readable=False):
     muxer that took a sidecar's bytes for cp1252 wrote each byte as the character cp1252 gives it. So the cp1252 bytes
     of the text are the sidecar's bytes, and read_back() reads them as the codepage they were in. A codepage counts
     when every text decodes, the read-back changes GARBLE_SHARE of the letters at least, and the texts read as a
-    language it writes. UTF-8 counts with no language too, as when the muxer cut most cues. Text in another codepage
-    does not decode as UTF-8, because that needs pairs such as "Ã©" that real text does not hold. The language is
+    language it writes, see reads_as(). UTF-8 counts with no language too, as when the muxer cut most cues. Text in
+    another codepage does not decode as UTF-8, because that needs pairs such as "Ã©" that real text does not hold. The language is
     None then. In a codepage of more than one byte, each character outside ASCII that cp1252 writes counts as changed. The muxer
     cut a cue at a byte cp1252 leaves undefined. A cue cut inside a character, as UTF-8 always cuts it, gets U+FFFD
     there and counts as cut. A cue cut between two characters only ends early, and the count misses it. In a one-byte
@@ -972,7 +977,9 @@ def checks(j, size, runtime, shorter_only=False):
 
     duration: the container duration disagrees with the size. The BPS statistics tags give the expected length, but
     only when mkvmerge wrote the file and every audio and video track carries one. ffmpeg copies stale tags from its
-    source. Otherwise a bitrate ceiling decides: 50 Mbit/s up to 1080p (the Blu-ray mux rate is 48), 150 above.
+    source. A cover picture, see cover(), leaves the sum, and its bytes leave the size.
+    Otherwise a bitrate ceiling for the film's height decides: 50 Mbit/s up to 1080p (the Blu-ray mux rate is 48), 150
+    above.
     runtime:  the file runs more than 40 percent off the listed runtime. Listed runtimes under 10 minutes are skipped.
     shorter_only (Sonarr) alerts only under 0.6 x the listed runtime, because double episodes and premieres run long.
     A long episode needs content.runtime_verdict(), which knows the season, the episode count and a trusted duration.
@@ -981,19 +988,19 @@ def checks(j, size, runtime, shorter_only=False):
     dur, out = duration(j), []
     if not dur: return out
     items = j.get("tracks") or j.get("streams") or []
-    av = [(t.get("properties") or {}) for t in items if t.get("type") in ("video", "audio")]
+    av = [(t.get("properties") or {}) for t in items if t.get("type") in ("video", "audio") and not cover(t, items)]
     app = ((j.get("container") or {}).get("properties") or {}).get("writing_application") or ""
     bps = sum(int(p["tag_bps"]) for p in av) if app.startswith("mkvmerge") and av and all(str(p.get("tag_bps", "")).isdigit() for p in av) else 0
+    pics = sum(int(n) for t in items if cover(t, items) and str(n := (t.get("properties") or {}).get("tag_number_of_bytes")).isdigit())
     mmss = f"{int(dur // 3600)}:{int(dur % 3600 // 60):02d}:{int(dur % 60):02d}" if dur >= 3600 else f"{int(dur // 60)}:{int(dur % 60):02d}"
     if bps:
-        est = size * 8 / bps
+        est = (size - pics) * 8 / bps
         if abs(dur - est) > 0.4 * est:
             out.append(("duration", {"why": f"The file says it runs {mmss}, but at its own bitrate {size / 1e9:.1f} GB lasts about {est / 60:.0f} "
                                             "minutes."}))
     else:
-        dims = [(t.get("properties") or {}).get("pixel_dimensions") or f'{t.get("width", 0)}x{t.get("height", 0)}'
-                for t in items if t.get("type") == "video" or t.get("codec_type") == "video"]
-        height = max([int(d.split("x")[1]) for d in dims if "x" in d] or [0])
+        v = main_video(items) or {}
+        height = int(((v.get("properties") or {}).get("pixel_dimensions") or f'0x{v.get("height", 0)}').partition("x")[2] or 0)
         if size * 8 / dur > (150e6 if height > 1080 else 50e6):
             out.append(("duration", {"why": f"The file says it runs {mmss}, but that would mean {size * 8 / dur / 1e6:.0f} Mbit/s for "
                                             f"{size / 1e9:.1f} GB, far more than a real video."}))
@@ -1085,9 +1092,9 @@ def audio_verdict(j, a_index, samples, runtime=0):
     if lost: doubts.append(f"part of the audio is missing, and only {', '.join(lost)} of it plays where it was checked")
     items = j.get("tracks") or []
     app = ((j.get("container") or {}).get("properties") or {}).get("writing_application") or ""
-    au = [t for t in items if t.get("type") == "audio"]; vi = [t for t in items if t.get("type") == "video"]
+    au, vi = [t for t in items if t.get("type") == "audio"], main_video(items)
     if app.startswith("mkvmerge") and vi and a_index < len(au):
-        a, v = (tag_seconds((x.get("properties") or {}).get("tag_duration")) for x in (au[a_index], vi[0]))
+        a, v = (tag_seconds((x.get("properties") or {}).get("tag_duration")) for x in (au[a_index], vi))
         if a and v and a < SHORT_AUDIO * v:
             doubts.append(f"the audio stops at {clock(a)}, but the video runs to {clock(v)}")
     return None, doubts
@@ -1251,6 +1258,31 @@ NO_DECODER = "no decoder found"   # ffmpeg has no decoder for the video track, s
 ENCRYPTED = re.compile(r"\bencv\b|\benc_key_id\b")
 DEMUX = ("[matroska", "[mov,", "[avi @", "[mpegts @", "[asf @", "[mpeg @", "[flv @")   # container errors count anywhere
 FRAME = re.compile(r"Parsed_showinfo.*\bn:\s*\d+.*\bpts_time:\s*(-?[0-9.]+)")
+STILL = ("mjpeg", "png", "bmp", "gif")   # ffmpeg's names of the still-image codecs a cover picture comes in
+
+
+def still(s):
+    """Whether the video stream s, an ffprobe stream dict or a track of mkvmerge -J, is a still image. For ffprobe its
+    codec is one of STILL. mkvmerge names MJPEG V_MJPEG, the PNG that ffmpeg writes by its FourCC MPNG, and the GIF that
+    ffmpeg writes as a QuickTime track whose codec private data holds the FourCC "gif "."""
+    p = s.get("properties") or {}
+    return s.get("codec_name") in STILL or p.get("codec_id") == "V_MJPEG" or '"MPNG"' in (s.get("codec") or "") \
+        or p.get("codec_id") == "V_QUICKTIME" and (p.get("codec_private_data") or "")[8:16] == "67696620"
+
+
+def main_video(streams):
+    """The stream of the film among streams, or None. streams are ffprobe's stream dicts or the tracks of mkvmerge -J.
+    A cover picture can come as a video track of a still-image codec, see still(), and it may come first. So the film
+    is the first video stream that is no still image and no attached picture. A file with only still images falls back
+    to the first video stream that is no attached picture, the one ffmpeg's V:0 maps."""
+    vs = [s for s in streams if "video" in (s.get("codec_type"), s.get("type")) and not (s.get("disposition") or {}).get("attached_pic")]
+    return next((s for s in vs if not still(s)), vs[0] if vs else None)
+
+
+def cover(s, streams):
+    """Whether the stream s of streams is a cover picture: a still image, see still(), that is not the film, see
+    main_video(). A film in MJPEG is a still image too."""
+    return still(s) and s is not main_video(streams)
 
 
 def parse_window(stderr, rc=0):

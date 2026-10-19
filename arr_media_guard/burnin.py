@@ -156,7 +156,11 @@ class Sampler:
         import av
         self.av = av
         self.c = av.open(path)
-        self.v = next((v for v in self.c.streams.video if not v.disposition & av.stream.Disposition.attached_pic), None)
+        from . import decide   # here, as the image fetches the models with burnin.py and lid.py alone
+        vs = list(self.c.streams.video)
+        v = decide.main_video([{"index": k, "codec_type": "video", "codec_name": getattr(x.codec_context, "name", None),   # None: no decoder
+                                "disposition": {"attached_pic": bool(x.disposition & av.stream.Disposition.attached_pic)}} for k, x in enumerate(vs)])
+        self.v = vs[v["index"]] if v else None
         if self.v is None:   # cover art is no video
             self.c.close()
             raise ValueError("the file has no video stream")
@@ -182,11 +186,16 @@ class Sampler:
         e = self.v.index_entries
         return not len(e) or float(e[-1].timestamp * self.v.time_base) - self.start < duration / 2
 
+    def seek(self, t):
+        """Seek to the keyframe at or before t by the film's own index. A seek with no stream goes by the first video
+        stream, and a cover picture before the film then lands at 0."""
+        self.c.seek(int(max(0.0, t + self.start) / self.v.time_base), backward=True, any_frame=False, stream=self.v)
+        self.v.codec_context.flush_buffers()
+
     def keyframe(self, t):
         """(time, packet) of the keyframe at or before t, or (None, None). A TS file has no index, so its seek lands on
         any packet, and the next keyframe comes back."""
-        self.c.seek(int(max(0.0, t + self.start) * self.av.time_base), backward=True, any_frame=False)
-        self.v.codec_context.flush_buffers()
+        self.seek(t)
         for n, p in enumerate(self.c.demux(self.v)):
             if n > LIMITS["max_packets"]:
                 break
@@ -198,8 +207,7 @@ class Sampler:
     def frame_at(self, t):
         """(time, frame) of the first frame at or after t that is no keyframe, decoded from the keyframe before t, or
         (None, None)."""
-        self.c.seek(int(max(0.0, t + self.start) * self.av.time_base), backward=True, any_frame=False)
-        self.v.codec_context.flush_buffers()
+        self.seek(t)
         self.v.codec_context.skip_frame = "DEFAULT"
         for n, f in enumerate(self.c.decode(self.v)):
             if n > LIMITS["max_packets"]:

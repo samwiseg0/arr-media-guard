@@ -59,7 +59,8 @@ On a host, leave out `docker exec -it arr-media-guard`.
 - With no instance it takes every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`. A line
   `== <instance>` starts each one. It skips an instance you did not set up. An instance that fails, as one that does
   not answer, ends with one line, and the run goes on to the next one. The exit code is then 1.
-- On a host the worker starts with the next event of an app, as an import or a Test.
+- On a host the worker starts with the next import of an app. `--queue` shows the jobs that run, see
+  [The queue](#the-queue).
 
 A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. It fixes the default tracks and
 language tags of the Matroska files the app lists, at the lowest CPU and disk priority, and never posts to Discord. It
@@ -375,6 +376,61 @@ The selftest prints only the warnings, as `warning: Discord refused the token in
 - The start check reads the Plex library folders after the Plex check, so a Plex that starts beside the listener has its
   folders checked.
 
+## The queue
+
+`--queue` shows what the worker does now. It changes no record, so it is safe to run while the worker runs. Run it
+where the worker runs, with `docker exec` in Docker. A one-off container sees no process of the service. A state store
+that an older AMG wrote gets its upgrade first, as with every command.
+
+```
+docker exec -it arr-media-guard arr-media-guard --queue
+```
+
+On a host, leave out `docker exec -it arr-media-guard`.
+
+```
+2026-10-18 09:30:00 EDT
+worker: running
+background queue: 12 jobs, 9 of them from a backfill (1 file still to check)
+imports waiting: 1, 2 more wait to retry
+import workers: 1 of 2 busy
+  hook          started 09:29:58, 0:00:02  /movies/Film (2001)/Film (2001).mkv
+background workers: 3 of 4 busy
+  deep_analysis started 09:12:40, 0:17:20  /tv/Show/Season 1/Show - S01E01.mkv
+  whole_file    started 09:29:02, 0:00:58  /movies/Film (2001)/Film (2001).mkv
+  backfill_job  starting                   /movies/New (2010)/New (2010).mkv
+process gone: 1
+  backfill_job  process gone               /movies/Other (1999)/Other (1999).mkv
+```
+
+- `worker:` says whether a worker runs. `--queue` reads it from `/proc` and never tries the worker's lock. With no
+  worker, the next import starts one on a host. In Docker the listener starts one within a minute when a job waits.
+  `worker: unknown` means `--queue` could not read the open files of another user's arr-media-guard process. On a
+  host, run it as root or as the app's user.
+- The background queue line is the one of `--selftest`. `imports waiting` counts the imports that wait for a place,
+  with the job files a busy store left in the queue folder. Then it counts the imports that wait to retry, as after an
+  app that did not answer.
+- The worker has one pool of places, the larger of `HOOK_WORKERS` and `BACKGROUND_WORKERS`. Each count is the busy
+  places of its kind, against its own setting. Imports take up to `HOOK_WORKERS` places. Jobs of the background queue
+  take up to `BACKGROUND_WORKERS`, only in places no import holds, and start only while no import waits. Such a job
+  gives its place up to an import that waits. An import that finds every place held by jobs a backfill queued starts in
+  one more process, see `BACKGROUND_WORKERS` in the [README](../README.md#settings). A count over its setting means the
+  worker started before the setting changed.
+- Each busy place has one line with the kind of its job, the time its process started, how long it has run, and its
+  file. The kind is the `source` of the job's lines in the decision log. An import is `hook`. A job of the background
+  queue is `burn_in`, `whole_file`, `deep_analysis`, `recheck` or `backfill_job`. A job the worker took and has not
+  started yet says `starting`.
+- A job whose process is gone stays marked as running, so no process runs it. The next worker puts it back in the
+  queue. With no worker, each such job counts as gone. `claimed jobs that do not read` counts the ones whose record
+  does not read.
+- Two cases read wrong for a while. A job that just ended says `process gone` until the worker records its end. When
+  the worker is killed while a job runs, that job keeps `worker: running` until it ends. A job that says `starting`
+  then waits for the next worker.
+- With `HOOK_WORKERS` and `BACKGROUND_WORKERS` at 1, the worker runs each job itself, and the store does not record
+  which. `--queue` then says so under the worker line, `one place:`.
+- With no state store yet, it says `background queue: 0 jobs`. When the store does not read, it prints the time and
+  `the store did not read:` with the error, and exits 1.
+
 ## Test the Discord webhook
 
 `--test-discord` posts one short test message to `DISCORD_WEBHOOK`. When Discord takes it, AMG prints the HTTP status.
@@ -428,6 +484,7 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard` | none, the Webhook listener takes its place | none | |
 | `arr-media-guard --serve` | the service itself | none | API, Media, LID, Plex, Discord |
 | `arr-media-guard --selftest` | `$RUN --selftest` | `$EXEC --selftest` | |
+| `arr-media-guard --queue` | none, it sees no process of the service | `$EXEC --queue` | |
 | `arr-media-guard --test-discord` | `$RUN --test-discord` | `$EXEC --test-discord` | Discord |
 | `arr-media-guard --backfill [sonarr] [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--restart]` | `$RUN --backfill ...` | `$EXEC --backfill ...` | API. The jobs need what the service needs. |
 | `arr-media-guard --backfill [sonarr] --drop-queued` | `$RUN --backfill --drop-queued` | `$EXEC --backfill --drop-queued` | |

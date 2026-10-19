@@ -72,7 +72,8 @@ SUB_ROLES = ("full", "sdh", "dub")   # the subtitle roles the check takes. A for
 # verdict and never hears them.
 NO_SPACES = frozenset({"jpn", "chi", "tha"})
 REPAIRED = ("header_repaired", "subtitle_trimmed", "subtitle_removed", "tail_removed", "subtitle_retimed", "subtitle_blocks_retimed",
-            "subtitle_mismatch_removed", "subtitle_ends_lengthened", "subtitle_repaired", "subtitle_garbled_removed")   # the reason codes of a remux that replaced the file
+            "subtitle_mismatch_removed", "subtitle_ends_lengthened", "subtitle_repaired", "subtitle_garbled_removed",
+            "cover_attached")   # the reason codes of a remux that replaced the file
 CRASH_TRIES = 3                                  # a job whose process died this often is dropped, see requeue()
 SCHEMA = 2                                       # the decision log's line format. Raise it when a field changes meaning.
 HOST = os.uname().nodename

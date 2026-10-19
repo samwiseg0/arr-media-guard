@@ -434,6 +434,28 @@ def flags(j, heard=None, read=None, original="jpn", checked=None, notes=False):
     return (got, [n for n in r["notes"] if "original language flag" in n]) if notes else got
 
 
+def test_a_cover_picture_track_is_no_part_of_the_film():
+    """A still image is a cover picture, see decide.still(). mkvmerge names ffmpeg's GIF a QuickTime track of the FourCC
+    "gif ". The length check leaves a cover's BPS tag out of the sum and its bytes out of the size. A one-frame cover has
+    a high tag, and a cover shown for the whole film has many bytes. The film's height picks the bitrate ceiling, and
+    the film's DURATION tag is the video end of the audio check."""
+    film = {"type": "video", "codec": "AVC/H.264/MPEG-4p10", "properties": {"codec_id": "V_MPEG4/ISO/AVC", "pixel_dimensions": "1920x1080",
+                                                                           "tag_bps": "9400000", "tag_duration": "01:30:00.000000000"}}
+    gif = {"type": "video", "codec": "QuickTime", "properties": {"codec_id": "V_QUICKTIME", "codec_private_data": "0000005a67696620" + "00" * 82}}
+    assert decide.still(gif) and decide.main_video([gif, film]) is film and not decide.still(dict(gif, properties={"codec_id": "V_QUICKTIME"}))
+    audio = {"type": "audio", "properties": {"tag_bps": "448000", "tag_duration": "01:00:00.000000000"}}
+    mkv = lambda *tracks: {"container": {"properties": {"duration": 3720 * 10**9, "writing_application": "mkvmerge v102.0"}}, "tracks": list(tracks)}
+    one = {"type": "video", "codec": "MJPEG", "properties": {"codec_id": "V_MJPEG", "pixel_dimensions": "1000x2000", "tag_bps": "40000000",
+                                                             "tag_number_of_bytes": "200000", "tag_duration": "00:00:00.040000000"}}
+    whole = dict(one, properties=dict(one["properties"], tag_bps="8000000", tag_number_of_bytes=str(3720 * 10**6)))
+    size = 3720 * 9848000 / 8   # 62 minutes of film and audio
+    assert decide.checks(mkv(one, film, audio), size + 200000, 62) == [] and decide.checks(mkv(film, whole, audio), size + 3720 * 10**6, 62) == []
+    lavf = {"container": {"properties": {"duration": 3600 * 10**9, "writing_application": "Lavf61.7.100"}}, "tracks": [one, film]}
+    assert [k for k, _ in decide.checks(lavf, 3600 * 100e6 / 8, 0)] == ["duration"]   # 100 Mbit/s is over the ceiling of a 1080p film
+    ok = {"n": 1922128, "max": -4.0, "errors": 0, "window": 20, "ran": True, "cut": False, "rate": 48000, "ch": 2}
+    assert decide.audio_verdict(mkv(one, film, audio), 0, [ok, ok, ok]) == (None, ["the audio stops at 1:00:00, but the video runs to 1:30:00"])
+
+
 def test_the_original_language_flag_marks_the_tracks_in_the_content_language(monkeypatch):
     """Matroska: FlagOriginal is set if the track is in the content's original language. Owner 2026-10-06: hear before
     flagging. An audio track needs its heard language, or a tag and title that agree. A subtitle needs its read text.

@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import threading
 import time
+import types
 import urllib.error
 
 import pytest
@@ -401,10 +402,20 @@ def test_radarr_token(tmp_path):
 
 
 def test_last_packet(monkeypatch):
-    class R:
-        stdout = json.dumps({"packets": [{"pts_time": "10.5"}, {"pts_time": "12.0"}, {"pts_time": "N/A"}], "format": {"start_time": "1.400000"}})
-    monkeypatch.setattr(M.subprocess, "run", lambda *a, **k: R)
-    assert M.last_packet("/x.mkv") == 10.6
+    """The first ffprobe names the film, here stream 2 after a cover picture, and the read of that stream gives its
+    last packet. A Matroska probe with one video track needs no first ffprobe. A file with no video has no last packet."""
+    streams = {"streams": [{"index": 1, "codec_type": "video", "codec_name": "mjpeg"}, {"index": 2, "codec_type": "video", "codec_name": "h264"}]}
+    packets = {"packets": [{"pts_time": "10.5"}, {"pts_time": "12.0"}, {"pts_time": "N/A"}], "format": {"start_time": "1.400000"}}
+    calls = []
+    def run(argv, *a, **k):
+        calls.append(argv[argv.index("-select_streams") + 1])
+        return types.SimpleNamespace(stdout=json.dumps(streams if "stream=index,codec_type,codec_name" in argv else packets))
+    monkeypatch.setattr(M.subprocess, "run", run)
+    assert (M.last_packet("/x.mkv"), calls) == (10.6, ["V", "2"])
+    calls.clear()
+    assert (M.last_packet("/x.mkv", probe={"container": {"type": "Matroska"}, "tracks": [{"type": "video"}, {"type": "audio"}]}), calls) == (10.6, ["V:0"])
+    streams, calls[:] = {"streams": []}, []
+    assert (M.last_packet("/x.m4a"), calls) == (None, ["V"])
 
     def slow(*a, **k):
         raise M.subprocess.TimeoutExpired("ffprobe", 30)

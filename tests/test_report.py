@@ -179,6 +179,28 @@ FINDINGS = [
      "Film A (1979).per.broken-encoding.srt.txt. The Polish SDH subtitles (track 10 of the original file) can't be read as text, so they were "
      "removed and saved beside the file as Film A (1979).pol.10.broken-encoding.ass.txt. The subtitles in Film A (1979).pl.srt can't be read "
      "as text, so the file was renamed to Film A (1979).pl.broken-encoding.srt.txt. The original file is kept at /k/F.mkv."),
+    ({"kind": "cover", "tracks": ["v1"], "name": "cover.jpg", "result": "subtitle remux failed: the attachment cover.jpg does not hold the image of track 0"},
+     "Cover picture not moved", "amber", "The cover picture is stored as video track 1, so a player may show it in place of the video. AMG tried to "
+     "store it as the file's cover art, but rewriting the file failed. The original file was not changed."),
+    ({"kind": "cover", "tracks": ["v2"], "name": "cover.jpg", "result": "subtitle remux skipped, hardlinked: track 1: cover picture to the attachment cover.jpg"},
+     "Cover picture not moved", "amber", "The cover picture is stored as video track 2, so a player may show it in place of the video. AMG tried to "
+     "store it as the file's cover art, but the fix failed, because the file has another hard link, such as the download client's copy. The "
+     "original file was not changed."),
+    ({"kind": "cover", "tracks": ["v2"], "name": "poster.jpg", "same": ["poster.jpg"],
+      "result": "subtitle remux failed: the attachment poster.jpg does not hold the image of track 1"},
+     "Cover picture not moved", "amber", "The cover picture is stored as video track 2, so a player may show it in place of the video. The file "
+     "holds the same picture as poster.jpg. AMG tried to remove the track, but rewriting the file failed. The original file was not changed."),
+    # Each track the remux was to move, and an attachment that is no cover art by its name
+    ({"kind": "cover", "tracks": ["v2", "v3"], "name": "cover.jpg", "result": "subtitle remux failed: the attachment cover.jpg does not hold the image of track 2"},
+     "Cover picture not moved", "amber", "Cover pictures are stored as video tracks 2 and 3, so a player may show one in place of the video. AMG "
+     "tried to move them out of the video tracks, but rewriting the file failed. The original file was not changed."),
+    ({"kind": "cover", "tracks": ["v2", "v3"], "name": "cover.jpg", "same": ["cover.jpg", "poster.jpg"], "result": "subtitle remux failed: mkvmerge exited 2: x"},
+     "Cover picture not moved", "amber", "Cover pictures are stored as video tracks 2 and 3, so a player may show one in place of the video. The "
+     "file holds the same pictures as cover.jpg and poster.jpg. AMG tried to remove the tracks, but rewriting the file failed. The original file "
+     "was not changed."),
+    ({"kind": "cover", "tracks": ["v2"], "name": "cover2.jpg", "result": "subtitle remux failed: mkvmerge exited 2: x"},
+     "Cover picture not moved", "amber", "The cover picture is stored as video track 2, so a player may show it in place of the video. AMG tried to "
+     "store it as the attachment cover2.jpg, but rewriting the file failed. The original file was not changed."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -486,6 +508,10 @@ SUB_LINES = [
      "different parts of the file, up to 1.0 s early. One shift can't fix that, so they were left as they are.", None),
     ({"code": "garbled_sidecar", "name": "F.pl.srt", "to": "F.pl.broken-encoding.srt.txt", "left": None},
      "The subtitles in F.pl.srt show garbled characters. --apply would rename the file to F.pl.broken-encoding.srt.txt.", None),
+    ({"code": "cover", "tracks": ["v1"], "also": True},
+     "The cover picture in video track 1 stays a video track too, so a player may show it in place of the video.", None),
+    ({"code": "cover", "tracks": ["v2", "v4"], "also": True},
+     "The cover pictures in video tracks 2 and 4 stay video tracks too, so a player may show one in place of the video.", None),
 ]
 
 def test_every_template_has_a_golden():
@@ -870,6 +896,17 @@ def test_a_repair_that_removes_and_trims_says_both():
                                                 "lines that kept going past the end of the video and audio.")]
 
 
+def test_a_cover_move_names_an_attachment_that_is_no_cover_art():
+    """Only an attachment named cover is the file's cover art. Picture B came first and took cover.jpg, so the two
+    tracks of picture A went into cover2.jpg, and the post names that attachment."""
+    rec = decision(edits=[], findings=[], subremux={"done": True, "covers": ["v2", "v3", "v4"], "copies": ["v4"]},
+                   covers={"v2": {"name": "cover.jpg"}, "v3": {"name": "cover2.jpg"}, "v4": {"name": "cover2.jpg", "copy": True}})
+    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [
+        ("File repaired", "Moved the cover picture out of **video track 2 of the original file** into the file's cover art.\nMoved the picture in "
+                          "**video track 3 of the original file** into the attachment **cover2.jpg**.\nRemoved **video track 4 of the original "
+                          "file**, which held the same picture as **cover2.jpg**.\nThe video and audio stayed the same.")]
+
+
 def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings):
     """The change posts follow the voice of the issue posts. A broken fact costs only its own change: it posts nothing,
     its line in change_result says why, and the other changes still post. It never costs the decision line."""
@@ -1138,7 +1175,8 @@ def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
 # shows it. Every other golden tried no fix, or its fix worked, so it shows only the Check field.
 STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file",
                         22: "Writing the file", 23: "Writing the file", 24: "Writing the file", 25: "Writing the file",
-                        32: "Writing the file", 33: "Writing the file", 40: "Writing the file", 41: "Writing the file"},
+                        32: "Writing the file", 33: "Writing the file", 40: "Writing the file", 41: "Writing the file", 45: "Writing the file",
+                        46: "Writing the file", 47: "Writing the file", 48: "Writing the file", 49: "Writing the file", 50: "Writing the file"},
            "actions": {5: "Replacing the file", 8: "Replacing the file", 10: "Replacing the file", 11: "Replacing the file",
                        15: "Replacing the file", 16: "Replacing the file", 19: "Replacing the file"},
            "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file",
@@ -1149,7 +1187,7 @@ STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "
                          40: "Testing the fix", 41: "Testing the fix", 42: "Finding the shift", 43: "Finding the shift",
                          44: "Finding the shift", 45: "Finding the shift", 46: "Finding the shift", 47: "Finding the shift",
                          48: "Finding the shift", 49: "Finding the shift", 50: "Finding the shift", 51: "Finding the shift",
-                         52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift"}}
+                         52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift", 56: "Writing the file", 57: "Writing the file"}}
 
 
 def test_every_alert_code_has_its_step():
