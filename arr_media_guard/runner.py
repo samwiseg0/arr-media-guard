@@ -975,7 +975,7 @@ def deep_analysis(name, pending, claimed=False):
     process.Ctx. A conversion stores the new path and file id in the job, so a run after a kill or a yield starts from
     the new file. Then it queues the burn-in job and the deep analysis an import queues, see queue_after(), unless an
     import of the path queued its own meanwhile. A file whose saved deep analysis still holds gets none."""
-    started, rec, want, job, ctx, check = time.time(), dict(source="deep_analysis", job=name), None, {}, None, None
+    started, rec, want, job, ctx, check = time.time(), dict(id=uuid.uuid4().hex[:12], source="deep_analysis", apply=True, job=name), None, {}, None, None
     try:
         job = job_of(name, claimed)
         app, got = job["app"], job.get("inputs") or {}
@@ -1047,7 +1047,7 @@ def deep_analysis(name, pending, claimed=False):
             rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
         else:
             rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500])
-            rec["trace"] = traceback.format_exc(limit=3)[-800:]
+            rec["trace"] = traceback.format_exc(limit=4)[-800:]   # deep_analysis, run, process.process and the step that raised
             if getattr(ctx, "rec", None):   # what the run changed before the error, see held_after()
                 rec.update({k: ctx.rec[k] for k in ("subremux", "sidecars") if k in ctx.rec})
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
@@ -2033,7 +2033,7 @@ def run_job(name, pending, shared=False, claimed=False):
     the lock exclusive from the start, after a log line that says why."""
     if name.startswith("deep-analysis-"):   # a job process of coordinate() runs a job of the background queue too
         return background(name, pending, claimed)
-    rec, want, started, path, again, run = dict(source="hook", job=name), None, time.time(), None, None, None
+    rec, want, started, path, again, run = dict(id=uuid.uuid4().hex[:12], source="hook", job=name), None, time.time(), None, None, None
     job = {}   # restore_log() reads it after an error too
     try:
         job = job_of(name, claimed)

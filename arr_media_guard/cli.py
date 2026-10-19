@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The command line: main(), the backfill, --sub-time, --check, the audit and the scans."""
-import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, types, uuid
+import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, traceback, types, uuid
 
 from . import apps, checks, config, content, convert, decide, logs, plex, process, regrab, report, runner, store, subsync, subtitles, vault
 
@@ -91,8 +91,9 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
     except Exception as ex:
         if isinstance(ex, (subsync.Broken, subtitles.Yielded)):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
             raise
-        rec = dict(app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path, outcome="error",
-                   result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
+        rec = dict(id=uuid.uuid4().hex[:12], app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path,
+                   outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300],
+                   trace=traceback.format_exc(limit=4)[-800:])   # backfill_file, run, process.process and the step of process.STEPS that raised
     return time.time() - started, rec
 
 
@@ -884,15 +885,19 @@ def a_result(r):
     return r.get("source") in RESULTS and "class" in r and not r.get("deep") and r["class"] not in runner.BURN_CLASSES.values()
 
 
-def open_problem(what, r, result, edited_at):
+def open_problem(what, r, result, edited_at, latest):
     """Whether the nightly audit posts the problem what of the decision line r, see audit(). A file that is gone counts
-    no more. A problem of the line counts only when the line is the file's latest result in result. A problem of the
-    check after an edit counts unless a later result came after that edit. A failed conversion or a failed repair counts
-    only when its alert did not go out, see process.conversion() and process.faults(). alert_result says "sent" or
-    "already sent" for an alert that went out. A line without it, as of a backfill, keeps the problem."""
+    no more. An error counts while r is the latest line of its source for the file in latest, so a later line of that
+    check that ended otherwise clears it. Any other problem of the line counts only when the line is the file's latest
+    result in result. A problem of the check after an edit counts unless a later result came after that edit. A failed
+    conversion or a failed repair counts only when its alert did not go out, see process.conversion() and
+    process.faults(). alert_result says "sent" or "already sent" for an alert that went out. A line without it, as of a
+    backfill, keeps the problem."""
     path = r.get("path")
     if not os.path.exists(path or ""):
         return False
+    if what == "error":
+        return latest[path, r.get("source")] is r
     if what in ("further", "reprobe") or what.startswith("broken:"):
         return edited_at[path] >= result.get(path, (-1,))[0]
     code = {"convert": r["outcome"], "repair": (r.get("header_repair") or {}).get("code")}.get(what)
@@ -944,18 +949,19 @@ def audit(argv):
                   + lines_field("Header repaired", headers) + lines_field("Skipped", skipped))
     else:
         # seen: (a problem code, its decision line), see logs.audit_problem(). result: per path the place and line of its
-        # latest result, and edited_at the place of its last edit, see open_problem().
-        start, last, day, seen, result, edited_at = since_time(a.since), {}, [], [], {}, {}
+        # latest result, edited_at the place of its last edit, and latest per path and source its latest line, see open_problem().
+        start, last, day, seen, result, edited_at, latest = since_time(a.since), {}, [], [], {}, {}, {}
         for n, (raw,) in enumerate(store.read("SELECT rec FROM decisions WHERE app = ? AND at >= ? ORDER BY rowid", app, start.timestamp())):
             r = json.loads(raw)   # a decision line of this app and window, as logs.decision() keeps it
             day.append(r)   # every source, for the TMDB status
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
+            latest[r.get("path"), r.get("source")] = r
             if a_result(r):
                 result[r.get("path")] = n, r
             if (r.get("header_repair") or {}).get("code") in ("header_repair_failed", "header_repair_skipped"):
                 seen.append(("repair", r))
-            if r["outcome"] in ("undecided", "dropped"):
+            if r["outcome"] in ("undecided", "dropped", "error"):
                 seen.append((r["outcome"], r))
             elif r["outcome"] == "not_matroska" or r["outcome"].startswith("repack_"):   # a repack that failed or was skipped
                 seen.append(("convert", r))
@@ -1005,8 +1011,8 @@ def audit(argv):
         k = collections.Counter(what.partition(":")[0] for what, _ in seen)
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", k["further"] + k["reprobe"]), ("undecided", k["undecided"]), ("dropped", k["dropped"]),
-                          ("broken", k["broken"]), ("tmdb", tmdb)]))
-        files = logs.audit_files([(what, r) for what, r in seen if open_problem(what, r, result, edited_at)])
+                          ("broken", k["broken"]), ("errors", k["error"]), ("tmdb", tmdb)]))
+        files = logs.audit_files([(what, r) for what, r in seen if open_problem(what, r, result, edited_at, latest)])
         title = f"Open problems: {len(files)} file{'' if len(files) == 1 else 's'} · {logs.app_name(app)}"
         text = f"{len(files)} file{'' if len(files) == 1 else 's'} with an open problem since {start.isoformat(timespec='minutes')}." + \
             "".join(f"\n{label}: {problems}" for label, problems, _ in files)

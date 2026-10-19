@@ -2007,7 +2007,7 @@ def test_queue_leaves_out_a_program_that_runs_the_launcher(env, settings, capsys
     runs as PUID, so its open files do not read. It is another program, so --queue says none, never unknown."""
     settings(hook_workers=2, background_workers=2)
     open(os.path.join(hook.CFG.state_dir, "worker.lock"), "w").close()
-    p, listdir = subprocess.Popen(["sh", "-c", "sleep 60; :", "/usr/local/bin/arr-media-guard"]), os.listdir
+    p, listdir = subprocess.Popen(["sh", "-c", "sleep 60; :", "/usr/local/bin/arr-media-guard"], start_new_session=True), os.listdir
 
     def denied(d):
         if d == f"/proc/{p.pid}/fd":
@@ -2016,8 +2016,8 @@ def test_queue_leaves_out_a_program_that_runs_the_launcher(env, settings, capsys
     monkeypatch.setattr(os, "listdir", denied)
     try:
         assert queue_out(capsys)[1] == "worker: none, the next import starts one"
-    finally:
-        p.kill()
+    finally:   # the group, so the sleep that sh runs goes too
+        os.killpg(p.pid, signal.SIGKILL)
         p.wait()
 
 
@@ -10853,6 +10853,41 @@ def test_the_lines_of_check_after_its_own_checks_hide_no_problem(env, first):
     assert post["embeds"][0]["description"] == f"**Show K S01E01**: {problem}"
 
 
+def error_line(label, source="backfill_job", result="error: OutOfTime: stopped after 300 seconds", **kw):
+    """An error decision line of the check source on episode 1 of label, as the store keeps it. It has no plan."""
+    keep = {k: v for k, v in audit_line(label, 1, []).items() if k not in ("before", "edits", "edit_rules", "recheck", "tmdb", "class")}
+    return dict(keep, source=source, outcome="error", result=result, **kw)
+
+
+@pytest.mark.parametrize("later, posts", [(None, True), ("backfill_job", False), ("deep_analysis", True), ("hook", True)])
+def test_an_error_counts_until_a_later_line_of_its_check(env, later, posts):
+    """Tester 2026-10-16: a job a backfill queued ran out of time, and the nightly audit did not count it. An error is
+    an open problem while it is the latest line of its check for the file. A later run of that check that ended
+    otherwise clears it. A line of another check leaves it open."""
+    lines = [error_line("Show K")] + ([dict(audit_line("Show K", 1, []), source=later, outcome="no_change", result="no change")] if later else [])
+    got = post_audit(env, lines)
+    assert [p["embeds"][0]["description"] for p in got] == ["**Show K S01E01**: the backfill check ran out of time"] * posts
+
+
+def test_the_audit_leaves_out_the_error_of_a_gone_file_or_a_dry_run(env):
+    """An error of a file that is gone, or of a dry run, posts nothing. Any other error gives its reason, cut short. The
+    syslog summary counts each error line of the day, the gone file too."""
+    why = "CalledProcessError: Command 'ffprobe' returned non-zero exit status 1. " * 3
+    gone, dry = error_line("Show M"), error_line("Show N", source="check", apply=False)
+    hook_error = {k: v for k, v in error_line("Show P", source="hook", result="error: " + why).items() if k != "apply"}   # as run_job() logs it
+    (post,) = post_audit(env, [gone, dry, hook_error], gone=[gone["path"]])
+    assert post["embeds"][0]["description"] == f"**Show P S01E01**: the import check failed: {why[:100]}"
+    assert " broken=0 errors=2 tmdb=" in env["syslog"][-1], env["syslog"]
+
+
+def test_the_audit_keeps_one_line_for_a_file_whose_error_reason_has_several_sentences(env):
+    """An error reason can hold several sentences, as the reason of an import that was never checked does. The post
+    still gives its file one line."""
+    why = "the Sonarr API did not answer. The last try: HTTP Error 503. A day passed, so the import was never checked"
+    (post,) = post_audit(env, [error_line("Show P", result="error: " + why)])
+    assert post["embeds"][0]["description"] == f"**Show P S01E01**: the backfill check failed: {why[:100]}"
+
+
 def test_the_audit_links_each_problem_to_its_item(env, settings):
     """A problem line links its item to its page in the app, from the slug its decision line keeps. A line with no slug
     stays bold."""
@@ -19479,6 +19514,7 @@ def test_a_file_not_found_in_a_step_drops_the_deep_analysis_only_when_its_file_i
         assert rec["note"] == f"FileNotFoundError: [Errno 2] No such file or directory: '{path}'"
     else:
         assert (rec["outcome"], rec["result"]) == ("error", "error: FileNotFoundError: [Errno 2] No such file or directory: '/usr/bin/ffprobe'"), rec
+        assert ", in after_edit\n" in rec["trace"] and len(rec["id"]) == 12 and rec["apply"] is True, rec   # the step, and the audit counts it
     assert hook.deep_analysis_queued() == [] and not [u for m, u, b in env["http"] if m == "POST"]
 
 
@@ -24777,6 +24813,25 @@ def test_a_backfill_job_whose_file_went_or_that_fails_drops(env, monkeypatch, fa
     (rec,) = checked(env, "backfill_job")
     assert rec["outcome"] == ("file_gone" if fault == "gone" else "error") and posted(env) == [] and hook.store.read("SELECT name FROM jobs") == [], rec
     assert hook.DEADLINE.end is None
+
+
+@pytest.mark.parametrize("run", ["import", "backfill_job"])
+def test_an_error_line_keeps_an_id_and_names_the_step_that_raised(env, monkeypatch, run):
+    """Tester 2026-10-16: a job a backfill queued ran out of time, and its error line had no id and no trace. The error
+    line of an import and of such a job keeps an id, and its trace names the step of process.STEPS that raised."""
+    def out(*a):
+        raise hook.arr_meta.OutOfTime("stopped after 300 seconds")
+    if run == "import":
+        monkeypatch.setattr(hook, "tmdb_ask", out)
+        hook.main([])
+    else:
+        check_listed(env, monkeypatch)
+        name = backfill_job(env, monkeypatch)
+        monkeypatch.setattr(hook, "tmdb_ask", out)
+        hook.background(name, [])
+    (rec,) = checked(env, "hook" if run == "import" else "backfill_job")
+    assert (rec["outcome"], rec["result"], len(rec["id"])) == ("error", "error: OutOfTime: stopped after 300 seconds", 12), rec
+    assert ", in header\n    ctx.asked = checks.tmdb_ask(" in rec["trace"], rec["trace"]
 
 
 @pytest.mark.parametrize("first, pending, kept", [("deep", False, "deep"), ("deep", True, "import"), ("import", False, "import")])

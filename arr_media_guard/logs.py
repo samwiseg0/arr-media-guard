@@ -314,6 +314,9 @@ def audit_problem(what, r):
         return SKIPPED.get((r.get("header_repair") or {}).get("code"), "the file repair failed")
     if what == "convert":
         return SKIPPED.get(r.get("outcome"), "the conversion to MKV was skipped")
+    if what == "error":   # the check as an alert names it, and the reason from the line's result
+        check, why = report.CHECKS.get(r.get("source"), "check").lower(), (r.get("result") or "").removeprefix("error: ")
+        return f"the {check} ran out of time" if why.startswith("OutOfTime:") else f"the {check} failed: {why[:100]}"
     return {"reprobe": "the file couldn't be read again for the check", "further": "a check after the change still finds tracks to change"}[what]
 
 
@@ -337,7 +340,7 @@ def audit_embed(app, title, files, tmdb):
     body = []
     for k, (label, text, url) in enumerate(files):
         shown = report.link(label, url)
-        line = f"{report.bold(label) if shown == label else shown}: {text}"
+        line = f"{report.bold(label) if shown == label else shown}: {report.glued(text)}"   # one line per file, see markdown()
         if sum(len(report.markdown(x)) + 1 for x in body + [line]) > AUDIT_CHARS:
             body.append(f"and {len(files) - k} more")
             break

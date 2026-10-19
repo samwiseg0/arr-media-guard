@@ -824,7 +824,9 @@ command. It also holds the audio and video verdicts, the metadata evidence, and 
 conversion, a header repair and Plex did. `outcome` holds the outcome code, `result` a sentence, and
 `recheck` the plan right after an edit, which the audit reads. `findings` holds each finding with its
 facts and its action, `alert_kinds` their kinds, and `alerts` their text, see "Alerts". A job whose file the re-grab of
-its download deleted logs `deleted_with_download`, with the fault kind of that re-grab in `fault`.
+its download deleted logs `deleted_with_download`, with the fault kind of that re-grab in `fault`. An error line of a run
+of `process.STEPS` has an `id`, the exception in `result` and its first frames in `trace`. The frames reach the step that
+raised, and its line.
 
 The outcome, reason and Plex codes are stable, so queries and alerts can match on them. Each step
 that makes a result gives its outcome code with it, and a result with no code logs `other`. The
@@ -940,7 +942,12 @@ without one.
 Schedule `arr-media-guard --audit <app> --since 24h --post` each night for each app, with a systemd
 timer or cron. Its post, "Open problems: 2 files · Radarr <INSTANCE>", lists only the files that still have a problem. A problem is
 a re-check that still plans an edit, an undecided or dropped plan, a broken invariant, a failed or skipped repair or
-conversion, or a probe that failed. The audit posts nothing when no file has an open problem.
+conversion, a probe that failed, or an error. The audit posts nothing when no file has an open problem.
+
+An error counts while it is the latest line of its check for the file, by the line's source. A later line of the same
+check that ended otherwise clears it. A line of another check leaves it open, because each check runs its own steps.
+The post names the check as an alert does. A time limit reads "the backfill check ran out of time", and any other
+error gives its exception, cut to 100 characters.
 
 Each file counts once, by its latest result. A result is a decision line of an import, `--check`, a backfill or a job
 a backfill queued. These runs decide the flags and the container. The deep analysis and a recheck keep the flags. The

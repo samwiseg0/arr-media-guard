@@ -301,8 +301,8 @@ imports, `--source backfill` only the backfills, and `--source check` only `--ch
 Discord, titled "Open problems: 2 files", when a file has an open problem.
 
 The list has one line per file, with its problems in plain words. Each file counts once, by its latest import, check or
-backfill. The list leaves out a file that is gone, and a failed conversion or file repair that already had its own
-alert. See "Audit" in [design.md](design.md#audit).
+backfill. An error counts until a later run of the same check ends otherwise. The list leaves out a file that is gone,
+and a failed conversion or file repair that already had its own alert. See "Audit" in [design.md](design.md#audit).
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 

@@ -1416,7 +1416,7 @@ def test_under_the_listener_the_audit_writes_only_its_summary_line(app, monkeypa
     monkeypatch.setattr(h, "SERVE", False)   # main() sets it, and the test ends with it unset
     arr_serve.main(["--audit", "radarr", "--since", "24h"])
     (line,) = sent
-    assert line.startswith("arr=radarr source=audit outcome=summary edited=0 further=0 undecided=0 dropped=0 broken=0 tmdb=")
+    assert line.startswith("arr=radarr source=audit outcome=summary edited=0 further=0 undecided=0 dropped=0 broken=0 errors=0 tmdb=")
     assert capsys.readouterr().out == line + "\n"
     monkeypatch.setattr(h, "SERVE", False)
     h.main(["--audit", "radarr", "--since", "24h"])   # in a terminal, only the text
