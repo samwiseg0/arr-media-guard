@@ -1,0 +1,95 @@
+{
+ "_comment": "The full mkvmerge -J of a real episode whose audio track holds legacy und and BCP 47 unk, a subtag that names no language. file_name, segment_uid and the track UIDs are made up. The file has no title and no track names.",
+ "probe": {
+  "attachments": [],
+  "chapters": [],
+  "container": {
+   "properties": {
+    "container_type": 17,
+    "date_local": "2026-09-27T07:02:07-04:00",
+    "date_utc": "2026-09-27T11:02:07Z",
+    "duration": 1733666000000,
+    "is_providing_timestamps": true,
+    "muxing_application": "libebml v1.4.5 + libmatroska v1.7.1",
+    "segment_uid": "5f2d0c8e1a4b7c3d9e6f0a1b2c3d4e5f",
+    "timestamp_scale": 1000000,
+    "writing_application": "mkvmerge v92.0 ('Everglow') 64-bit"
+   },
+   "recognized": true,
+   "supported": true,
+   "type": "Matroska"
+  },
+  "errors": [],
+  "file_name": "/data/tv/Show A/Season 6/Show A - S06E29 - Episode A - WEBRip-1080p.mkv",
+  "global_tags": [
+   {
+    "num_entries": 1
+   }
+  ],
+  "identification_format_version": 20,
+  "track_tags": [],
+  "tracks": [
+   {
+    "codec": "AVC/H.264/MPEG-4p10",
+    "id": 0,
+    "properties": {
+     "codec_id": "V_MPEG4/ISO/AVC",
+     "codec_private_data": "014d4028ffe10019674d4028eca03c0113f2c2000003000200000300781e30632c01000568ebecb200",
+     "codec_private_length": 41,
+     "default_duration": 33366666,
+     "default_track": true,
+     "display_dimensions": "1920x1080",
+     "display_unit": 0,
+     "enabled_track": true,
+     "forced_track": false,
+     "language": "und",
+     "language_ietf": "und",
+     "minimum_timestamp": 66000000,
+     "num_index_entries": 866,
+     "number": 1,
+     "packetizer": "mpeg4_p10_video",
+     "pixel_dimensions": "1920x1080",
+     "tag__statistics_tags": "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES",
+     "tag__statistics_writing_app": "mkvmerge v92.0 ('Everglow') 64-bit",
+     "tag__statistics_writing_date_utc": "2026-09-27 11:02:07",
+     "tag_bps": "3548491",
+     "tag_duration": "00:28:53.600000000",
+     "tag_number_of_bytes": "768958159",
+     "tag_number_of_frames": "51956",
+     "uid": 12345678901234567890
+    },
+    "type": "video"
+   },
+   {
+    "codec": "AAC",
+    "id": 1,
+    "properties": {
+     "audio_channels": 2,
+     "audio_sampling_frequency": 48000,
+     "codec_id": "A_AAC",
+     "codec_private_data": "1190",
+     "codec_private_length": 2,
+     "default_duration": 21333333,
+     "default_track": true,
+     "enabled_track": true,
+     "forced_track": false,
+     "language": "und",
+     "language_ietf": "unk",
+     "minimum_timestamp": 0,
+     "num_index_entries": 0,
+     "number": 2,
+     "tag__statistics_tags": "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES",
+     "tag__statistics_writing_app": "mkvmerge v92.0 ('Everglow') 64-bit",
+     "tag__statistics_writing_date_utc": "2026-09-27 11:02:07",
+     "tag_bps": "96481",
+     "tag_duration": "00:28:53.616000000",
+     "tag_number_of_bytes": "20907767",
+     "tag_number_of_frames": "81264",
+     "uid": 10987654321098765432
+    },
+    "type": "audio"
+   }
+  ],
+  "warnings": []
+ }
+}

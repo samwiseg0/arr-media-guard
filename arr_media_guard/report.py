@@ -1062,7 +1062,8 @@ def retime_change(rec, told):
 def edit_change(rec, told):
     """The track edit of rec, one sentence per kind: the default flags, the forced flags, the Original language flags,
     and each language tag. The title names the kinds. A flag an alert says was turned off is left out, see said(). Each
-    track goes by its place after the run, as the probe after the edit has it."""
+    track goes by its place after the run, as the probe after the edit has it. A language tag edit names the language
+    the track had before it, from both old tags, see decide.track_tag()."""
     if "edited" not in (rec.get("result"), rec.get("edit_result")):
         return None
     after = {t["sel"]: t for t in rec.get("after") or []}
@@ -1080,9 +1081,14 @@ def edit_change(rec, told):
     if on or no:
         heads.append("original language flag" + ("s" if len(on + no) > 1 else ""))
     tags = [e for e in edits if decide.prop(e) == decide.LANG_EDIT]
+    # The old BCP 47 tag of each track with a LANG_IETF edit. Any other track had the BCP 47 tag of its legacy
+    # language, so its legacy tag alone reads the same.
+    ietf = {e[0]: e[2] for e in edits if decide.prop(e) == decide.LANG_IETF}
     for e in tags:
-        was, now = lang_word(e[2]), lang_word(after[e[0]]["lang"])
-        out.append(f"Wrote the language tag of {name(e)} in its standard form." if was == now else
+        legacy, now = lang_word(e[2]), lang_word(after[e[0]]["lang"])
+        was = lang_word(decide.track_tag({"language": e[2], "language_ietf": ietf.get(e[0])}))   # the language before the edit
+        out.append(f"Wrote the language tag of {name(e)} in its standard form." if legacy == was == now else
+                   f"Made the two language tags of {name(e)} agree." if was == now else
                    f"Changed the language of {name(e, False)} from {was} to {bold(now)}." if was else
                    f"Tagged {name(e, False)} as {bold(now)}.")
     if tags:
@@ -1195,9 +1201,10 @@ def cli_line(rec, t, head=None):
     pos = {x["sel"]: x["pos"] for x in rec.get("before", [])}
     rp = rec.get("repack") or {}
     heard = ", ".join(f'{k} {v["lang"] or "no answer"}' for k, v in (rec.get("heard") or {}).items())
+    hr = (rec.get("header_repair") or {}).get("result") or ""   # "header " leads only a result that does not name the header
     return ((head or f'{rec["result"][:60]:<12} {rec.get("label")}') + (f" | {e}" if (e := edit_text(pos, rec.get("edits", []))) else "")
             + (" | heard " + heard if heard else "")
-            + (" | header " + rec["header_repair"]["result"][:150] if "header_repair" in rec else "")
+            + (" | " + ("" if "header" in hr.partition(":")[0] else "header ") + hr[:300] if hr else "")
             + (" | subtitles " + sub_text(rec, t) if rec.get("subcheck") or rec.get("flash") or rec.get("garbled") else "")
             + (" | forced, the proof refused: " + rp["forced"][:150] if rp.get("forced") else "")
             + (" | not forced: " + rp["not_forced"][:150] if rp.get("not_forced") else "")

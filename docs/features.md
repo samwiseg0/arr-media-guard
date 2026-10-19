@@ -332,14 +332,14 @@ a setting turned off, and a doubt all post, once for the same file. A problem AM
 syslog only. Examples are a re-grab, a removed or repaired subtitle, and new subtitle times. With `DISCORD_POSTS=all`,
 AMG also posts each change it makes to a file, unless an alert already says it. Imports, the burned-in subtitle check,
 the deep analysis and the recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the
-worker starts or a `--convert` run finds it. `--check --apply` and the jobs a backfill queues post the alerts of a file with an item. The flag
-backfill, `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when it finds a problem.
+worker starts or a `--convert` run finds it. `--check --apply`, the jobs a backfill queues and the flag backfill's `--apply` post the alerts of a file with an
+item. `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when it finds a problem.
 `arr-media-guard --test-discord` posts a test message and prints Discord's answer.
 
 Each alert shows two short fields side by side, under its text and above the item and file. **Check** names the check
 that found the problem. The checks are Import check, Burned-in subtitle check, Deep analysis, Recheck, Backfill check,
 Command line check, Worker start and Command line run. Backfill check is a job that `--backfill --apply` queued, and
-Command line check is `--check`. Worker start and Command line run find a
+Command line check is `--check`. Command line run is the flag backfill. Worker start and Command line run also name a
 conversion that a stop left unfinished, when the worker starts or in a `--convert` run. **Stopped at** names the step
 where AMG's fix stopped. The steps are the same for every kind of alert.
 A subtitle shows one step, the furthest its fix reached.

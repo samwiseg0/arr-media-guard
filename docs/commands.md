@@ -63,13 +63,15 @@ On a host, leave out `docker exec -it arr-media-guard`.
   [The queue](#the-queue).
 
 A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. It fixes the default tracks and
-language tags of the Matroska files the app lists, at the lowest CPU and disk priority, and never posts to Discord. It
-shares a lock with the imports, so the two never change one file at the same time. It skips a file with one audio
-track, no subtitle and a right language tag, which plays that track anyway.
+language tags of the Matroska files the app lists, at the lowest CPU and disk priority. Its `--apply` posts as a job
+above does. It posts each problem not posted yet, once per file and kind. With `DISCORD_POSTS=all` it posts each
+change too. A dry run posts nothing. It shares a lock with the imports, so the two never change one file at the same
+time. It skips a file with one audio track, no subtitle and a right language tag, which plays that track anyway.
 
 Run a large flag backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one
 file. A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them.
-A *canary* is a small sample, spread across the plan groups, that you apply first.
+A *canary* is a small sample, spread across the plan groups, that you apply first. At `DISCORD_POSTS=all` an apply
+posts once or more for each file it changes.
 
 ```
 arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                        # dry run, one plan per line
@@ -77,6 +79,7 @@ arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl           
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20   # 20 files across plan groups
 arr-media-guard --audit radarr --since 2026-01-01T10:00                                        # the open problems since the canary
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl               # the rest
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --only-header # or only the header repairs
 ```
 
 With no instance, one plan file holds the plans of every instance, and `--canary N` takes N files of each.
@@ -106,7 +109,14 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
   refuses it.
 - `--limit N` stops after N files that need a change. A scan checks N files, and a queue takes the next N files of
   each instance.
+- The flag backfill and `--sub-check` print one line for each file with something to show. The line starts with the
+  result. `dry run` says that `--apply` would write the file or a sidecar, with a flag edit, a header repair, a subtitle
+  remux or a sidecar fix. `no change` says that it would write nothing. An apply names its change, as `edited`,
+  `header repaired` or `subtitles remuxed: s2 retimed`. `header not repaired:` and `header repair skipped` give the
+  reason first, then the issue.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
+- `--only-header` with `--plan-from` takes only the files the plan gives a header repair. Each file still gets its
+  whole plan, flag edits too. `--canary N` and `--paths` narrow it. It does not go with `--only-undecided`.
 - `--sub-check` and `--sub-time` are the subtitle check, see [subtitles.md](subtitles.md). `--sub-check` runs only with
   the backfill, never with `--convert` or a scan.
 - `--sub-check` skips a file whose saved result still holds. `--recheck` checks it again anyway, and needs
@@ -488,10 +498,10 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --test-discord` | `$RUN --test-discord` | `$EXEC --test-discord` | Discord |
 | `arr-media-guard --backfill [sonarr] [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--restart]` | `$RUN --backfill ...` | `$EXEC --backfill ...` | API. The jobs need what the service needs. |
 | `arr-media-guard --backfill [sonarr] --drop-queued` | `$RUN --backfill --drop-queued` | `$EXEC --backfill --drop-queued` | |
-| `arr-media-guard --backfill sonarr --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]` | `$RUN --backfill sonarr --plan-out /config/plans/FILE ...` | `$EXEC --backfill sonarr --plan-out /config/plans/FILE ...` | API, Media, LID, Plex |
+| `arr-media-guard --backfill sonarr --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]` | `$RUN --backfill sonarr --plan-out /config/plans/FILE ...` | `$EXEC --backfill sonarr --plan-out /config/plans/FILE ...` | API, Media, LID, Plex, Discord |
 | `arr-media-guard --backfill sonarr --sub-check [--apply] [--recheck] [--ids ID ...] [--paths PATH ...]` | `$RUN --backfill sonarr --sub-check ...` | `$EXEC --backfill sonarr --sub-check ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/plans/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/plans/FILE ...` | API, Media, LID, Plex |
-| `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | API, Media, LID, Plex |
+| `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/plans/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/plans/FILE ...` | API, Media, LID, Plex, Discord |
+| `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | API, Media, LID, Plex, Discord |
 | `arr-media-guard --backfill sonarr --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]` | `$RUN --backfill sonarr --convert ...` | `$EXEC --backfill sonarr --convert ...` | API, Media, Plex |
 | `arr-media-guard --backfill sonarr --convert --apply --force-convert PATH ...` | `$RUN --backfill sonarr --convert --apply --force-convert PATH ...` | `$EXEC --backfill sonarr --convert --apply --force-convert PATH ...` | API, Media, Plex |
 | `arr-media-guard --plex-flush sonarr` | `$RUN --plex-flush sonarr` | `$EXEC --plex-flush sonarr` | Plex |

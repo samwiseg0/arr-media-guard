@@ -240,7 +240,7 @@ the audit and the rotation off. An old `last_hook_run` in `status.json` shows th
 
 The worker checks only new imports. Commands run the same checks over the files you already have. A backfill is dry
 unless you add `--apply`, and no command re-grabs. `--check --apply` and the jobs a backfill queues post the alerts of
-a file with an item. A scan
+a file with an item. The flag backfill's `--apply` posts them too. A scan
 and the audit with `--post` post a summary, and `--test-discord` posts a test message.
 
 - `--backfill --apply` puts one job per file of every instance in the background queue. The worker runs each one as

@@ -116,7 +116,7 @@ def broken_tracks(path, j, streams, folder, size):
     for s in tt:
         if not all(proof.utf8(t) for _, _, t in read[s["index"]]):
             t = tracks[subs.index(s)]
-            out[f"s{subs.index(s) + 1}"] = {"stream": s["index"], "id": t.get("id"), "lang": (t.get("properties") or {}).get("language") or "und",
+            out[f"s{subs.index(s) + 1}"] = {"stream": s["index"], "id": t.get("id"), "lang": decide.track_tag(t.get("properties") or {}),
                                             "cues": read[s["index"]]}
     return out
 

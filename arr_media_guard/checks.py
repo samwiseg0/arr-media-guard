@@ -454,7 +454,12 @@ def header_probe(path, j):
         return out
     missing = [k for k in kinds if not got[k]]
     if missing or not kinds:
-        out["blocked"].append(f"the last {len(t) >> 20} MiB hold no {missing[0]} block" if missing else "the file has no video or audio track")
+        found = [k for k in kinds if got[k]]
+        if found and len(t) < stop:   # the read starts inside the Segment, so the missing stream ends before it
+            out["blocked"].append(f"the {found[0]} ends at {content.hms(secs(max(got[found[0]])))}, and the {missing[0]} ends before "
+                                  f"the last {len(t) >> 20} MiB of the file")
+        else:
+            out["blocked"].append(f"the last {len(t) >> 20} MiB hold no {missing[0]} block" if missing else "the file has no video or audio track")
         return out
     out.update(video=secs(max(got["video"])) if got["video"] else None, audio=secs(max(got["audio"])) if got["audio"] else None,
                end=secs(max(ends.values())))
@@ -1289,13 +1294,13 @@ def hear(path, j, d, original, fresh=False, only=None, keep=False, then=None):
 LANGS = []
 def langs():
     """mkvmerge's language table for decide.retag() and remux.props_fault(), read once per process. Empty when mkvmerge
-    cannot list it: then no two tags of a track are compared, and a language still changes on two agreeing signals.
+    cannot list it: then a tag edit writes the 639-2 code, and a language still changes on two agreeing signals.
     An empty table is never kept, so the next call reads again. With none, props_fault() refuses a BCP 47 tag that
     mkvmerge wrote for a track with none."""
     if not LANGS:
         try:
             got = decide.language_table(run_bounded(["mkvmerge", "--list-languages"], 60, capture_output=True, text=True, errors="replace").stdout)
-        except Exception:   # the table only lets retag() compare two tags, so a failure never stops a job
+        except Exception:   # retag() takes only the BCP 47 form of a new tag from the table, so a failure never stops a job
             return {}, {}
         if not got[1]:
             return got
@@ -1335,8 +1340,8 @@ def spoken_of(expected):
 
 
 def track_list(j):
-    """(type, codec, language) of each track of an mkvmerge -J probe. A missing language reads as und."""
-    return [(t.get("type"), t.get("codec"), (t.get("properties") or {}).get("language") or "und") for t in j.get("tracks") or []]
+    """(type, codec, language) of each track of an mkvmerge -J probe, see decide.track_tag(). A missing language reads as und."""
+    return [(t.get("type"), t.get("codec"), decide.track_tag(t.get("properties") or {})) for t in j.get("tracks") or []]
 
 
 def ffprobe_duration(path):

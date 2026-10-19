@@ -250,6 +250,13 @@ def changed(rec, repack=True):
         or bool({*config.REPAIRED, *(["repacked"] if repack else [])} & set(rec.get("reasons", [])))
 
 
+def wrote(rec):
+    """Whether the run of rec wrote its file, or as a dry run plans to. It counts a flag edit, a header repair and a
+    subtitle remux. It counts a conversion only as a dry run plans it. A backfill's --limit counts these files."""
+    return rec["outcome"] in ("edited", "dry_run", "would_repack") \
+        or bool({*config.REPAIRED, "would_repair_header", "would_remux_subtitles"} & set(rec.get("reasons", [])))
+
+
 def start(ctx):
     """The record, the skip of a file that is not .mkv and does not convert, and the probe."""
     ctx.item = ctx.item or {"listed": ctx.runtime}
@@ -398,7 +405,7 @@ def header(ctx):
         code, result, info = "subtitle_overrun_unfixable", "not repaired, a subtitle runs past the end: " + "; ".join(h.get("blocked") or []), {}
     else:
         code, result, info = "header_not_repaired", "not repaired: " + "; ".join(
-            h.get("blocked") or [f'the video check failed: {ctx.vpre[2].get("error")}']), {}
+            h.get("blocked") or [f'the video check failed: {ctx.vpre[2].get("error")}']) + ". The issue: " + "; ".join(hp["issue"]), {}
     rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
     if code in config.REPAIRED:
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
@@ -831,6 +838,18 @@ def sub_outcome(rec):
     return (code, f"{head}: " + ", ".join(what)) if what else None
 
 
+def quiet_result(rec, apply, source):
+    """The result of a run of rec that changed no flag, when another step writes the file or a sidecar, else None. A dry
+    run that plans a write says "dry run", see wrote(). A sidecar fix counts only where --apply makes it, see
+    subtitles.sub_fixes(). An applied header repair gives its own result, as "header repaired". sub_outcome() names an
+    applied subtitle remux and a sidecar change first."""
+    if not apply:
+        side = subtitles.sub_fixes(source) and any(e.get("result") == "dry run" for e in rec.get("sidecars") or [])
+        return "dry run" if wrote(rec) or side else None
+    hr = rec.get("header_repair") or {}
+    return hr["result"] if hr.get("code") in config.REPAIRED else None
+
+
 def after_edit(ctx):
     """The rescans after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
     rec, d = ctx.rec, ctx.d
@@ -849,6 +868,8 @@ def after_edit(ctx):
                                                 **({"timed": ctx.side_moves} if ctx.side_moves else {}))
     if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
         rec.update(outcome=named[0], result=named[1])
+    elif rec["outcome"] == "no_change" and (said := quiet_result(rec, ctx.apply, ctx.source)):   # the outcome stays, so every count stays
+        rec["result"] = said
     found = subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
     rm = rec.get("subremux") or {}
     # A cover move that failed or could not run. With subtitle fixes, the alert that says why the rewrite failed takes

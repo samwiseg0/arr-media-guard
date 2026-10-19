@@ -876,6 +876,13 @@ def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
      ("Language tag changed", "Changed the language of the **audio (track 1)** from English to **Spanish**.")),
     ([["track:=2", "en-US", "eng", "language"]], "eng", ("Language tag changed", "Wrote the language tag of the **English audio (track 1)** in its "
                                                                              "standard form.")),
+    ([["track:=2", "es", "eng", "language"]], "spa", ("Language tag changed", "Changed the language of the **audio (track 1)** from English to **Spanish**.")),
+    ([["track:=2", "ja", "eng", "language"], ["track:=2", "ja", "ja", "language-ietf"]], "jpn",
+     ("Language tag changed", "Made the two language tags of the **Japanese audio (track 1)** agree.")),
+    ([["track:=2", "en", "eng", "language"], ["track:=2", "en", "ja", "language-ietf"]], "eng",
+     ("Language tag changed", "Changed the language of the **audio (track 1)** from Japanese to **English**.")),
+    ([["track:=2", "en", "eng", "language"], ["track:=2", "en", "unk", "language-ietf"]], "eng",
+     ("Language tag changed", "Tagged the **audio (track 1)** as **English**.")),
     ([["track:=2", 0, 1, "flag-forced"], ["track:=4", 0, 1, "flag-forced"]], "eng",
      ("Forced flags changed", "Turned the forced flag off for the **English audio (track 1)** and the **English subtitles (track 1)**.")),
     ([["track:=2", 1, None, "flag-original"]], "jpn",
@@ -884,7 +891,9 @@ def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
      ("Original language flags changed", "Marked the **English audio (track 1)** as the original language. Marked the **English subtitles "
                                          "(track 1)** as not the original language."))])
 def test_a_track_edit_says_each_kind_it_made_and_only_those(edits, after, want):
-    """A language tag edit alone is no change of the default tracks. The title follows the kinds of edit."""
+    """A language tag edit alone is no change of the default tracks. The title follows the kinds of edit. A language tag
+    edit names the language the track had before it, from its two old tags, see decide.track_tag(). So eng/ja had
+    Japanese and eng/unk had none."""
     rec = decision(edits=edits, findings=[], after=[{"sel": "track:=2", "pos": "a1", "lang": after, "default": True},
                                                     {"sel": "track:=4", "pos": "s1", "lang": "eng", "default": False}])
     assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [want]
@@ -1545,10 +1554,20 @@ def test_the_cli_target_is_the_backfill_line():
            "flash": {"s2": {"lengthened": 3, "cues": 40}}, "sidecars": [{"name": "B.en.srt", "action": "move", "result": "dry run"}],
            "subremux": {"codes": ["would_remux_subtitles"], "result": "would remux subtitles: remove track 2"},
            "repack": {"forced": "the packets differ", "not_forced": "x", "forced_name": "S01E02"}, "apply": False}
-    assert h.render(rec, "cli") == ("would repack: the container is MP4/QuickTime Film B | header would repair header: x | subtitles s1 mismatch "
+    assert h.render(rec, "cli") == ("would repack: the container is MP4/QuickTime Film B | would repair header: x | subtitles s1 mismatch "
                                     "5%/10% (the words differ); s2 flashes, 3 of 40 ends lengthened; B.en.srt: move dry run | --apply would remux | "
                                     "forced, the proof refused: the packets differ | not forced: x | name forced: S01E02")
     assert "| would remux subtitles: remove track 2 |" in h.render(rec, "cli", "done")
+
+
+@pytest.mark.parametrize("result, column", [
+    ("would repair header: x", "would repair header: x"), ("header repaired", "header repaired"),
+    ("header repair skipped, the file has another hard link: x", "header repair skipped, the file has another hard link: x"),
+    ("subtitles trimmed", "header subtitles trimmed"), ("not repaired: y. The issue: x", "header not repaired: y. The issue: x"),
+    ("not repaired: " + "y" * 300, "header not repaired: " + "y" * 286)])
+def test_the_header_column_says_header_once_and_keeps_300_characters(result, column):
+    rec = {"result": "no change", "label": "Film B", "header_repair": {"result": result}, "apply": False}
+    assert h.render(rec, "cli") == f"no change    Film B | {column}"
 
 
 def test_the_tense_comes_from_the_apply_flag_and_a_dry_run_says_what_apply_would_do(tmp_path):

@@ -34,6 +34,34 @@ ALIAS = [{"jpn", "jap", "japanese"}, {"ger", "deu", "german"}, {"fre", "fra", "f
          {"alb", "sqi", "albanian"}, {"arm", "hye", "armenian"}, {"baq", "eus", "basque"}, {"geo", "kat", "georgian"}, {"mac", "mkd", "macedonian"},
          {"por", "pob", "portuguese"}, {"lav", "latvian"}, {"gle", "irish"}, {"mlt", "maltese"}]
 UNTAGGED = {"und", "mul", "zxx", ""}
+# ISO 639-1 -> ISO 639-2 codes, as mkvmerge lists them (`mkvmerge --list-languages`). mkvmerge 92 also lists bh, which
+# 102 dropped. A BCP 47 tag names a language by its 639-1 code when it has one, see track_tag().
+ISO639_1 = dict(x.split(":") for x in """
+ab:abk aa:aar af:afr ak:aka sq:alb am:amh ar:ara an:arg hy:arm as:asm av:ava ae:ave ay:aym az:aze bm:bam ba:bak eu:baq
+be:bel bn:ben bh:bih bi:bis bs:bos br:bre bg:bul my:bur ca:cat ch:cha ce:che zh:chi cu:chu cv:chv kw:cor co:cos cr:cre hr:hrv
+cs:cze da:dan dv:div nl:dut dz:dzo en:eng eo:epo et:est ee:ewe fo:fao fj:fij fi:fin fr:fre ff:ful gl:glg lg:lug ka:geo
+de:ger el:gre gn:grn gu:guj ht:hat ha:hau he:heb hz:her hi:hin ho:hmo hu:hun is:ice io:ido ig:ibo id:ind ia:ina ie:ile
+iu:iku ik:ipk ga:gle it:ita ja:jpn jv:jav kl:kal kn:kan kr:kau ks:kas kk:kaz km:khm ki:kik rw:kin ky:kir kv:kom kg:kon
+ko:kor kj:kua ku:kur lo:lao la:lat lv:lav li:lim ln:lin lt:lit lu:lub lb:ltz mk:mac mg:mlg ms:may ml:mal mt:mlt gv:glv
+mi:mao mr:mar mh:mah mn:mon na:nau nv:nav ng:ndo ne:nep nd:nde se:sme nb:nob nn:nno no:nor ny:nya oc:oci oj:oji or:ori
+om:orm os:oss pi:pli pa:pan fa:per pl:pol pt:por ps:pus qu:que ro:rum rm:roh rn:run ru:rus sm:smo sg:sag sa:san sc:srd
+gd:gla sr:srp sn:sna ii:iii sd:snd si:sin sk:slo sl:slv so:som nr:nbl st:sot es:spa su:sun sw:swa ss:ssw sv:swe tl:tgl
+ty:tah tg:tgk ta:tam tt:tat te:tel th:tha bo:tib ti:tir to:ton ts:tso tn:tsn tr:tur tk:tuk tw:twi ug:uig uk:ukr ur:urd
+uz:uzb ve:ven vi:vie vo:vol wa:wln cy:wel fy:fry wo:wol xh:xho yi:yid yo:yor za:zha zu:zul""".split())
+# The 3-letter codes whose language decide knows, see track_tag(). They are every ISO 639-2 code mkvmerge lists, the
+# 3-letter codes of ALIAS, and und, mul and zxx. The local-use codes qaa to qtz and mis (uncoded languages) name no language.
+KNOWN_CODES = set(ISO639_1.values()) | {c for s in ALIAS for c in s if len(c) == 3} | set("""
+ace ach ada ady afa afh ain akk ale alg alt ang anp apa arc arn arp art arw ast ath aus awa bad bai bal ban bas bat
+bej bem ber bho bih bik bin bla bnt bra btk bua bug byn cad cai car cau ceb cel chb chg chk chm chn cho chp chr chy
+cmc cnr cop cpe cpf cpp crh crp csb cus dak dar day del den dgr din doi dra dsb dua dum dyu efi egy eka elx enm ewo
+fan fat fil fiu fon frm fro frr frs fur gaa gay gba gem gez gil gmh goh gon gor got grb grc gsw gwi hai haw hil him
+hit hmn hsb hup iba ijo ilo inc ine inh ira iro jbo jpr jrb kaa kab kac kam kar kaw kbd kha khi kho kmb kok kos kpe
+krc krl kro kru kum kut lad lah lam lez lol loz lua lui lun luo lus mad mag mai mak man map mas mdf mdr men mga mic
+min mkh mnc mni mno moh mos mul mun mus mwl mwr myn myv nah nai nap nds new nia nic niu nog non nqo nso nub nwc nym
+nyn nyo nzi osa ota oto paa pag pal pam pap pau peo phi phn pon pra pro raj rap rar roa rom rup sad sah sai sal sam
+sas sat scn sco sel sem sga sgn shn sid sio sit sla sma smi smj smn sms snk sog son srn srr ssa suk sus sux syc syr
+tai tem ter tet tig tiv tkl tlh tli tmh tog tpi tsi tum tup tut tvl tyv udm uga umb und vai vot wak wal war was wen
+xal yao yap ypk zap zbl zen zgh znd zun zxx zza""".split())
 # Language words a track title may name. A word followed by Dub, Score or Sub names something else: "UK Dub / Japanese Score".
 LANGWORDS = {"english": "eng", "anglais": "eng", "ingles": "eng", "inglés": "eng", "french": "fre", "français": "fre", "francais": "fre",
              "indonesian": "ind", "japanese": "jpn", "日本語": "jpn", "korean": "kor", "한국어": "kor", "spanish": "spa", "castellano": "spa",
@@ -148,12 +176,29 @@ def events_per_minute(j, props):
     return int(frames) / (2 if props.get("codec_id") == "S_HDMV/PGS" else 1) / minutes
 
 
+def track_tag(p):
+    """The language tag of a track from its mkvmerge -J properties p, as a 639-2 code (docs/design.md, "Language tags").
+    A BCP 47 tag wins, as RFC 9559 and Plex read it. A file that holds only a BCP 47 tag reads as eng in mkvmerge's
+    legacy language, because eng is the Matroska default. The legacy tag stays when it names the language of the BCP 47
+    tag, see lang_key(), so ger beside de and chi beside yue keep their code. A 3-letter BCP 47 language counts only
+    when it is in KNOWN_CODES, such as zxx, und, haw or yue. Another one, such as zsm (Standard Malay) beside may, is
+    often a language inside the legacy tag's macrolanguage, and mkvmerge writes that macrolanguage as the legacy tag.
+    unk names no language. The legacy tag then stays, as it does for a BCP 47 tag that does not parse or a 2-letter
+    language with no 639-2 code. A legacy eng is the exception and reads as und, because it may be the default."""
+    legacy, ietf = (p.get("language") or "und").lower(), p.get("language_ietf")
+    m = BCP47.match(ietf or "")
+    code = m and ISO639_1.get(m[1].lower(), m[1].lower())
+    if code not in KNOWN_CODES:   # a BCP 47 tag that names no language decide knows, or none
+        code = "und" if ietf and legacy == "eng" else legacy
+    return legacy if lang_key(code) == lang_key(legacy) else code
+
+
 def classify(j, heard=None):
     """mkvmerge -J or ffprobe JSON -> the audio and subtitle tracks in file order, each read once.
 
-    Each track has its mkvpropedit selector, lang and conf (see language()), role, and the signals behind the role.
-    Audio roles: main, commentary, description. Subtitle roles: full, sdh, forced, dub (a transcript of the English
-    dub) and commentary. A subtitle is forced by a "forced" or signs title, by density under POLICY["sparse_events"],
+    Each track has its mkvpropedit selector, tag (see track_tag()), lang and conf (see language()), role, and the
+    signals behind the role. Audio roles: main, commentary, description. Subtitle roles: full, sdh, forced, dub (a
+    transcript of the English dub) and commentary. A subtitle is forced by a "forced" or signs title, by density under POLICY["sparse_events"],
     or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. "conflict" is (kind, sentence)
     when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
     original is the track's Original language flag: 1, 0, or None when the file holds none.
@@ -165,7 +210,7 @@ def classify(j, heard=None):
         p = t.get("properties")
         if p is not None:   # mkvmerge -J. A missing default flag means default, as in the Matroska spec.
             kind = {"audio": "a", "subtitles": "s"}.get(t.get("type"))
-            f = dict(lang=p.get("language"), title=p.get("track_name"), ch=p.get("audio_channels"), default=p.get("default_track", True),
+            f = dict(lang=track_tag(p), title=p.get("track_name"), ch=p.get("audio_channels"), default=p.get("default_track", True),
                      forced=p.get("forced_track"), comment=p.get("flag_commentary"), described=p.get("flag_visual_impaired"), original=p.get("flag_original"),
                      sdh=p.get("flag_hearing_impaired"), uid=p.get("uid"), codec=t.get("codec"), events=events_per_minute(j, p) if kind == "s" else None)
         else:               # ffprobe
@@ -446,7 +491,8 @@ def invariants(ts, edits, cls, orig):
 
 
 # Language tags (docs/design.md, "Language tags"). mkvmerge -J reports a track's legacy ISO 639-2 language and its BCP 47
-# language_ietf as the file holds them, and no language_ietf when the file has none. mkvpropedit --set language=<tag>
+# language_ietf as the file holds them, and no language_ietf when the file has none. track_tag() reads the track's
+# language from them, and the BCP 47 tag wins. mkvpropedit --set language=<tag>
 # writes both elements, and maps the legacy one the way mkvmerge does. A language edit is [selector, new tag, old tag,
 # LANG_EDIT]. A LANG_IETF edit follows it when the undo must bring back a BCP 47 tag that --set language cannot, or
 # delete the one --set language writes (old tag None).
@@ -457,8 +503,7 @@ KEEP_TAGS = {"mul", "zxx"}   # multiple languages and no speech are statements, 
 
 def language_table(text):
     """`mkvmerge --list-languages` -> ({ISO 639-1, 639-2 or 639-3 code: its 639-2 code}, {639-2 code: the BCP 47
-    language mkvmerge writes for it}). A language with no 639-2 code, such as yue or cmn, is in neither map, so its
-    tags are never judged."""
+    language mkvmerge writes for it}). A language with no 639-2 code, such as yue or cmn, is in neither map."""
     legacy, ietf = {}, {}
     for row in text.splitlines():
         c = [x.strip() for x in row.split("|")]
@@ -498,12 +543,12 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
     "reasons", "set", "ask", "to_read", "mismatch", "wrong"}. heard maps an audio track's position to the language lid.py
     heard, and read a subtitle track's position to the language text_language() read in its text. known holds the
     item's original languages, the app's and TMDB's, and spoken TMDB's spoken languages, all as 639-2 codes. table is
-    language_table().
+    language_table(). Its BCP 47 forms name the new tag of an edit.
 
     A language changes only when two signals agree, and one of them is the heard or the read language. An und subtitle
     takes its read language alone, because its tag makes no claim, unless a title or a BCP 47 tag names a language. The
-    track signals are the legacy tag, a BCP 47 tag that names another language, the heard or read language and the
-    language the title names. The item's original language is one more signal for a main audio track. A spoken language is one
+    track signals are the track's tag (see track_tag()), a legacy tag that names another language than the BCP 47 tag,
+    the heard or read language and the language the title names. The item's original language is one more signal for a main audio track. A spoken language is one
     only for an und track, because TMDB lists English dialogue as spoken in many foreign films, so it would back
     every lying eng tag. A language wins with two signals or more when no other language has as many. The track
     signals break a tie. Only a main audio track is heard and only a subtitle is read, so no other track changes its
@@ -527,7 +572,7 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
     this run. A picture subtitle has no text to read. A track AMG is not sure of keeps its flag, and a note says why.
     checked maps more tracks to the language heard or read for the flag alone, so they change no tag and no other
     finding."""
-    legacy_of, ietf_of = table
+    ietf_of = table[1]
     key = lang_key
     known, spoken, tags = {key(x) for x in known if x}, {key(x) for x in spoken if x}, language_tags(j)
     readable = {key(x) for x in TEXT_LANGS}
@@ -535,15 +580,13 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
     for t in classify(j):
         if t["pos"] not in tags:   # an ffprobe probe has no BCP 47 tag
             continue
-        (tag, ietf), pos = tags[t["pos"]], t["pos"]
-        m = BCP47.match(ietf or "")
-        bcp = legacy_of.get(m[1].lower()) if m else None   # the 639-2 language of the BCP 47 tag, None when mkvmerge has none
-        split = bool(bcp) and key(bcp) != key(tag)          # the two tags name different languages
+        (legacy, ietf), pos, tag = tags[t["pos"]], t["pos"], t["tag"]   # tag is the track's language, see track_tag()
+        split = key(tag) != key(legacy)   # the BCP 47 tag names another language than the legacy tag
         main = t["kind"] == "a" and t["role"] == "main"
         h = (heard or {}).get(pos) if main else (read or {}).get(pos)   # read holds subtitle positions only
         said = f"heard {h}" if main else f"the text reads {h}"
         votes = {}   # language key: [its code, [the signals that name it]]
-        for x, why in ((tag, f"tagged {tag}"), (bcp if split else None, f"BCP 47 tag {ietf}"), (h, said),
+        for x, why in ((tag, f"BCP 47 tag {ietf}" if split else f"tagged {tag}"), (legacy if split else None, f"legacy tag {legacy}"), (h, said),
                        (title_language(t["title"], t["kind"]), f'the title "{t["title"]}"')):
             if x and x not in UNTAGGED:
                 votes.setdefault(key(x), [x, []])[1].append(why)
@@ -560,24 +603,23 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
         why = "; ".join(votes[win][1]) + (f", and {item(win)}" if main and item(win) else "") + (", and the und tag names no language" if alone else "") if win else ""
         value = rule = None
         if win and (split or win != key(tag)) and tag not in KEEP_TAGS and heard_it:
-            named = key(bcp or m[1].lower()) if m else None   # the language of the BCP 47 tag, a macrolanguage for yue or cmn
-            value = ietf_form(ietf) if named == win else ietf_of.get(votes[win][0], votes[win][0])
+            value = ietf_form(ietf) if key(tag) == win else ietf_of.get(votes[win][0], votes[win][0])
             rule = "language tag set" if tag == "und" and not split else "language tag corrected"
             if win != key(tag):
                 out["set"][pos] = votes[win][0]
         elif ietf and ietf_form(ietf) not in (None, ietf) and not split:
             value, rule, why = ietf_form(ietf), "language tag form", "the form keeps the language, a script and a region"
-        elif len(votes) > 1 or split or (tag == "und" and h):   # a tag that looks wrong, or an und track, keeps its language
-            out["notes"].append(f"{pos} keeps {tag}{'/' + ietf if ietf else ''}: " + "; ".join(f'{c} ({", ".join(s)})' for c, s in votes.values())
+        elif tag not in KEEP_TAGS and (len(votes) > 1 or split or (tag == "und" and h)):   # a tag that looks wrong, or an und track, keeps its language
+            out["notes"].append(f"{pos} keeps {legacy}{'/' + ietf if ietf else ''}: " + "; ".join(f'{c} ({", ".join(s)})' for c, s in votes.values())
                                 + ("" if h else ", no heard language" if t["kind"] == "a" else ", no text read"))
             out["reasons"] += [] if "language_tag_kept" in out["reasons"] else ["language_tag_kept"]
         if value:
-            out["edits"].append([t["sel"], value, tag, LANG_EDIT])
+            out["edits"].append([t["sel"], value, legacy, LANG_EDIT])
             out["rules"].append(rule)
-            if ietf != ietf_of.get(tag, tag):   # --set language=<old legacy tag> writes another BCP 47 tag, so the undo sets or deletes it
+            if ietf != ietf_of.get(legacy, legacy):   # --set language=<old legacy tag> writes another BCP 47 tag, so the undo sets or deletes it
                 out["edits"].append([t["sel"], value, ietf, LANG_IETF])
                 out["rules"].append(rule)
-            out["notes"].append(f'{pos} {tag}{"/" + ietf if ietf else ""} -> {value}: {why}')
+            out["notes"].append(f'{pos} {legacy}{"/" + ietf if ietf else ""} -> {value}: {why}')
             code = rule.replace(" ", "_")
             out["reasons"] += [] if code in out["reasons"] else [code]
         now = out["set"].get(pos, tag)   # the track's language after this run

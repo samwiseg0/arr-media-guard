@@ -34,6 +34,16 @@ LACE_STEPS = 0.03
 KEEP_PACKETS = ("--engage", "keep_whitespaces_in_text_subtitles", "--engage", "dont_normalize_parameter_sets")
 
 
+def prop_changed(pa, pb, k, d):
+    """Whether a remux changed the property k, Matroska default d, of a track whose mkvmerge -J properties are pa before
+    it and pb after it. mkvmerge writes a legacy tag for a track that has only a BCP 47 tag, so eng/it, as such a
+    track reads, becomes ita/it. A new legacy tag beside a BCP 47 tag passes when it is the track's language, see
+    decide.track_tag()."""
+    if k == "language" and pa.get("language_ietf") and decide.track_tag(pb) == (pb.get("language") or "und").lower():
+        return False
+    return pa.get(k, d) != pb.get(k, d)
+
+
 def header_fault(j, tmp, new, old_size, hp, info, folder):
     """Why the remuxed file tmp may not replace a Matroska original whose header has an issue, or None. j and new are
     their mkvmerge probes, hp is the header stage of check_video() for the original, folder the work folder of the
@@ -41,7 +51,8 @@ def header_fault(j, tmp, new, old_size, hp, info, folder):
     the new duration, the new Cues, the frame count, the windows and the worst lag of each stream. With a still image
     before the film and no PyAV, no window runs, and info["windows_skipped"] says why.
 
-    Every track keeps its type, codec, language, name, flags, codec private data and UID, a trimmed one all but its UID.
+    Every track keeps its type, codec, language, name, flags, codec private data and UID, a trimmed one all but its UID,
+    see prop_changed().
     The new video track must hold as many frames as its end over its default duration, less FRAME_SLACK. mkvmerge drops
     a damaged cluster with no warning. A track with no
     default duration passes only when every window of the check decoded clean. A trimmed track must hold its events
@@ -56,7 +67,7 @@ def header_fault(j, tmp, new, old_size, hp, info, folder):
     if gone & {(t.get("properties") or {}).get("uid") for t in new.get("tracks") or []}: return "a removed subtitle track is still in the file"
     for a, b in zip(kept["tracks"], new["tracks"]):
         pa, pb = a.get("properties") or {}, b.get("properties") or {}
-        diff = [k for k, d in KEEP_PROPS + ((("uid", None),) if a.get("id") not in trim else ()) if pa.get(k, d) != pb.get(k, d)]
+        diff = [k for k, d in KEEP_PROPS + ((("uid", None),) if a.get("id") not in trim else ()) if prop_changed(pa, pb, k, d)]
         if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"
     info["new_duration"] = d1 = round(decide.duration(new), 3)
     if abs(d1 - hp["expect"]) > decide.REPAIR_END: return f"the new header says {d1} seconds, but the streams end at {hp['expect']}"
@@ -132,7 +143,7 @@ def trim_inputs(path, j, hp, folder):
                                f"{'remove' if i in remove else 'trim'} it no longer holds")
         p = tracks[i].get("properties") or {}
         if i in remove:
-            removed[i] = {"language": p.get("language"), "name": p.get("track_name"), "codec": tracks[i].get("codec"), "lines": n["events"],
+            removed[i] = {"language": decide.track_tag(p), "name": p.get("track_name"), "codec": tracks[i].get("codec"), "lines": n["events"],
                           "late": n["dropped"]}
             continue
         counts[i] = n
@@ -407,7 +418,7 @@ def repack(path, j, st, apply, hp):
     trim, remove = list(hp.get("trim") or ()), list(hp.get("remove") or ())
     tracks = {t.get("id"): t for t in j.get("tracks") or []}
     lines = hp.get("sublines") or {}
-    info["removed"] = {i: {"language": (tracks[i].get("properties") or {}).get("language"), "name": (tracks[i].get("properties") or {}).get("track_name"),
+    info["removed"] = {i: {"language": decide.track_tag(tracks[i].get("properties") or {}), "name": (tracks[i].get("properties") or {}).get("track_name"),
                            "codec": tracks[i].get("codec"), "lines": (lines.get(i) or [None])[0], "late": (lines.get(i) or [None, None])[1]}
                        for i in remove}   # the plan. The remux counts again, see trim_inputs().
     gone = ", ".join(f'{i} ({r["language"]}, {r["late"]} of {r["lines"]} lines start after the end)' for i, r in info["removed"].items())
@@ -531,16 +542,17 @@ def grid_moved(plan, fix):
 
 def props_fault(j, new, drop=(), ended=()):
     """Why the tracks of the remuxed probe new differ from those of j less the track ids in drop, or None: the type,
-    codec and language of each track in order, its KEEP_PROPS, its UID and BCP 47 tag, the count of attachments, and
-    the count of chapters in each edition. The codec private data of a track must pass header_kept(). ended holds the
-    track ids of j that ended_track() wrote again. mkvmerge writes a BCP 47 tag for a track that has none, the one
-    checks.langs() maps its legacy language to, and that passes."""
+    codec and language of each track in order (see checks.track_list()), its KEEP_PROPS, its UID and BCP 47 tag, the
+    count of attachments, and the count of chapters in each edition. The codec private data of a track must pass
+    header_kept(). ended holds the track ids of j that ended_track() wrote again. mkvmerge writes a BCP 47 tag for a
+    track that has none, the one checks.langs() maps its legacy language to, and that passes. A new legacy tag passes
+    as prop_changed() says."""
     j, ietf = dict(j, tracks=[t for t in j.get("tracks") or [] if t.get("id") not in drop]), checks.langs()[1]
     entries = lambda x: [c.get("num_entries") for c in x.get("chapters") or []]   # per edition
     if checks.track_list(j) != checks.track_list(new): return f"the tracks changed from {checks.track_list(j)} to {checks.track_list(new)}"
     for a, b in zip(j.get("tracks") or [], new.get("tracks") or []):
         pa, pb = a.get("properties") or {}, b.get("properties") or {}
-        diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if pa.get(k, d) != pb.get(k, d)
+        diff = [k for k, d in KEEP_PROPS + (("uid", None), ("language_ietf", None)) if prop_changed(pa, pb, k, d)
                 and not (k == "codec_private_data" and header_kept(pa.get(k), pb.get(k), pa.get("codec_id"), a.get("id") in ended))
                 and not (k == "language_ietf" and pa.get(k) is None and pb.get(k) == ietf.get(pa.get("language") or "und"))]
         if diff: return f"track {a.get('id')} changed its {', '.join(diff)}"

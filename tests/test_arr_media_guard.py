@@ -3866,6 +3866,33 @@ def test_only_undecided_replans_the_undecided_files_of_a_plan(env, monkeypatch, 
         hook.main(["--backfill", "radarr", "--only-undecided"])
 
 
+def test_only_header_replans_the_header_repair_files_of_a_plan(env, monkeypatch, tmp_path, capsys):
+    """A tester asked to run only the 19 header repairs of a plan with 1059 changes. --only-header takes the plan
+    lines with a header repair, and process() plans each file again, flags included. A canary and --paths narrow it."""
+    movies = [{"id": i, "title": f"Movie {i}", "year": 2000, "originalLanguage": {"name": "English"}, "runtime": 120,
+               "movieFile": {"path": f"/m/Movie {i}.mkv", "mediaInfo": {"audioStreamCount": 2}}} for i in (1, 2, 3, 4)]
+    rows = [plan_line("Movie 1", "x", [["track:=2", 0, 1]]), dict(plan_line("Movie 2", "x", [["track:=2", 0, 1]]), header_repair="would_repair_header"),
+            plan_line("Movie 3", "undecided", undecided="the app says Spanish"), dict(plan_line("Movie 4", "no change"), header_repair="would_repair_header")]
+    plans = tmp_path / "plans.jsonl"
+    plans.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    seen = []
+    monkeypatch.setattr(hook, "arr", lambda app, p: movies)
+    monkeypatch.setattr(hook, "process", lambda ctx: seen.append(ctx.path) or {"outcome": "no_change", "result": "no change"})
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--plan-from", str(plans), "--only-header"])   # a dry run
+    assert seen == ["/m/Movie 2.mkv", "/m/Movie 4.mkv"]
+    seen.clear(); hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans), "--only-header", "--canary", "1"])
+    assert seen == ["/m/Movie 2.mkv"]   # one file of the first class
+    seen.clear(); hook.main(["--backfill", "radarr", "--plan-from", str(plans), "--only-header", "--paths", "/m/Movie 1.mkv", "/m/Movie 4.mkv"])
+    assert seen == ["/m/Movie 4.mkv"]
+    capsys.readouterr()
+    for argv, said in ((["--only-header"], "--only-header needs --plan-from"),
+                       (["--plan-from", str(plans), "--only-header", "--only-undecided"], "not allowed with argument")):
+        with pytest.raises(SystemExit):
+            hook.main(["--backfill", "radarr", *argv])
+        assert said in capsys.readouterr().err
+
+
 def test_own_version_leaves_out_a_module_that_is_not_deployed(monkeypatch):
     v = hook.own_version()
     monkeypatch.setattr(hook, "LIB", hook.LIB + ("arr_gone.py",))
@@ -7406,7 +7433,7 @@ def test_a_header_issue_with_real_damage_is_never_repaired(env, monkeypatch):
     hook.main([])
     rec = decided(env)
     assert calls["repairs"] == [] and len(calls["checks"]) == 1 and rec["reasons"][0] == "header_not_repaired"
-    assert rec["header_repair"]["result"] == "not repaired: zero-filled regions at 18 of 256 offsets"
+    assert rec["header_repair"]["result"] == f'not repaired: zero-filled regions at 18 of 256 offsets. The issue: {HEADER_HP["issue"][0]}'
     assert rec["findings"] == [{"kind": "video", "doubts": ["the file has a blank gap at 30% of the file size"]}]
 
 
@@ -7449,6 +7476,118 @@ def test_a_backfill_reports_repairs_and_both_audits_count_them(env, monkeypatch,
     assert analyzes(env) == ["/library/metadata/7101/analyze"]
     hook.main(["--audit", "radarr", "--since", "24h"])
     assert "0 files with an open problem since" in capsys.readouterr().out   # a repair is no problem
+
+
+def header_backfill(env, monkeypatch, tmp_path, capsys, repairable=True, result=("header_repaired", "header repaired")):
+    """A flag backfill dry run of a file whose header has an issue and whose flags stay. result is what an applied
+    repair gives, see header_issue(). Returns the plan file, the printed line of the file and the run's summary."""
+    calls = header_issue(env, monkeypatch, repairable=repairable, result=result)
+    env["probe"] = {"container": {"properties": {"duration": 7200 * 10**9}},   # English plays first, so no flag edit
+                    "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6), mk("subtitles", "eng", 3, False)]}
+    env["movies"]["movie"] = [dict(env["movies"]["movie/7"], id=7, movieFile={"id": 70, "movieId": 7, "path": env["path"],
+                                                                              "mediaInfo": {"audioStreamCount": 2}})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    plans = tmp_path / "plans.jsonl"
+    capsys.readouterr()
+    hook.main(["--backfill", "radarr", "--plan-out", str(plans)])
+    out = capsys.readouterr().out.splitlines()
+    assert decided(env)["outcome"] == "no_change" and calls["repairs"] == ([False] if repairable else [])
+    return plans, [x for x in out if " | " in x], [x for x in out if x.startswith("summary:")]
+
+
+def test_a_dry_run_that_plans_only_a_header_repair_says_dry_run(env, monkeypatch, tmp_path, capsys):
+    """Tester 2026-10-19: the first column said "no change" for a header that a dry run would repair. The outcome
+    stays no_change, so the counts stay."""
+    _, lines, summary = header_backfill(env, monkeypatch, tmp_path, capsys)
+    assert lines == [f'dry run      {decided(env)["label"]} | would repair header: {HEADER_HP["issue"][0]}'], lines
+    assert decided(env)["result"] == "dry run" and summary == ['summary: {"no_change": 1, "would_repair_header": 1}']
+
+
+def test_a_backfill_limit_counts_a_file_whose_only_write_is_a_header_repair(env, monkeypatch, tmp_path):
+    """Reviewer 2026-10-19: --limit counts the files process.wrote() names. A dry run of two files that each plan only a
+    header repair stops after the first one with --limit 1. A count of outcomes alone ran both."""
+    calls = header_issue(env, monkeypatch)
+    env["probe"] = {"container": {"properties": {"duration": 7200 * 10**9}},   # English plays first, so no flag edit
+                    "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6), mk("subtitles", "eng", 3, False)]}
+    other = tmp_path / "media" / "Other (2000).mkv"
+    other.write_bytes(b"x")
+    env["files"][str(other)] = copy.deepcopy(env["probe"])
+    movie = dict(env["movies"]["movie/7"], id=7, movieFile={"id": 70, "movieId": 7, "path": env["path"], "mediaInfo": {"audioStreamCount": 2}})
+    env["movies"]["movie"] = [movie, dict(movie, id=8, title="Other", year=2000, movieFile={"id": 80, "movieId": 8, "path": str(other),
+                                                                                            "mediaInfo": {"audioStreamCount": 2}})]
+    monkeypatch.setattr(hook.os, "nice", lambda n: None)
+    hook.main(["--backfill", "radarr", "--plan-out", str(tmp_path / "plans.jsonl"), "--workers", "1"])
+    assert calls["repairs"] == [False, False]   # both files plan a header repair
+    calls["repairs"].clear()
+    hook.main(["--backfill", "radarr", "--plan-out", str(tmp_path / "plans.jsonl"), "--workers", "1", "--limit", "1"])
+    assert calls["repairs"] == [False]
+
+
+def test_an_applied_header_repair_with_no_flag_edit_names_the_repair(env, monkeypatch, tmp_path, capsys):
+    plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys)
+    hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans)])
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    lines = [x for x in capsys.readouterr().out.splitlines() if " | " in x]
+    assert (rec["outcome"], rec["result"]) == ("no_change", "header repaired")
+    assert lines == [f'header repaired {rec["label"]} | header repaired'], lines
+
+
+def test_a_flag_backfill_apply_posts_a_failed_header_repair_once(env, monkeypatch, tmp_path, capsys):
+    """Tester 2026-10-19: a flag backfill never posted. Its --apply now posts as a queued backfill job does. At the
+    default DISCORD_POSTS issues a failed repair posts once. A second --apply posts it no more, and the audit leaves it
+    out, because its alert went out."""
+    plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys, result=("header_repair_failed", "header repair failed: the size changed"))
+    for sent in ("sent", "already sent"):
+        hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans)])
+        assert [r for r in log_lines(env) if "schema" in r][-1]["alert_result"] == [sent]
+    assert posted(env) == [("File repair failed", "Couldn't repair the file.\nThe size changed.\nThe original file was not changed.")]
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    assert "0 files with an open problem since" in capsys.readouterr().out
+
+
+def test_an_applied_header_repair_posts_its_change_at_discord_posts_all(env, monkeypatch, tmp_path, capsys, settings):
+    settings(discord_posts="all")
+    plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys)
+    hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans)])
+    assert posted(env) == [("File repaired", "Repaired the file. Its video, audio and subtitles stayed the same.")]
+
+
+@pytest.mark.parametrize("run", ["sub-check", "sub-time", "flag-backfill"])
+def test_with_apply_the_flag_backfill_posts_its_alert_and_sub_check_and_sub_time_post_none(env, monkeypatch, tmp_path, capsys, run):
+    """The flag backfill's dry run finds the wrong runtime and posts nothing. With --apply each run finds it again.
+    --sub-check and --sub-time post nothing. The flag backfill posts it, see cli.backfill_file()."""
+    env["movies"]["movie/7"]["runtime"] = 60
+    plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys)
+    assert [f["kind"] for f in decided(env)["findings"]] == ["runtime"] and posted(env) == []
+    hook.main({"sub-check": ["--backfill", "radarr", "--sub-check", "--apply"], "sub-time": ["--sub-time", env["path"], "--apply"],
+               "flag-backfill": ["--backfill", "radarr", "--apply", "--plan-from", str(plans)]}[run])
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    want = ["Wrong runtime"] if run == "flag-backfill" else []
+    assert (rec["apply"], [f["kind"] for f in rec["findings"]], [t for t, _ in posted(env)]) == (True, ["runtime"], want)
+
+
+def test_a_header_not_repaired_names_its_issue_and_a_dry_run_with_no_write_says_no_change(env, monkeypatch, tmp_path, capsys):
+    """The tester's line said why the repair was blocked, and never what was wrong with the header."""
+    _, lines, _ = header_backfill(env, monkeypatch, tmp_path, capsys, repairable=False)
+    assert lines == [f'no change    {decided(env)["label"]} | header not repaired: zero-filled regions at 18 of 256 offsets. '
+                     f'The issue: {HEADER_HP["issue"][0]}'], lines
+
+
+@pytest.mark.parametrize("apply, source, rec, want", [
+    (False, "backfill", {"outcome": "no_change", "reasons": ["would_repair_header"]}, "dry run"),
+    (False, "backfill", {"outcome": "no_change", "reasons": ["would_remux_subtitles"]}, "dry run"),
+    (False, "backfill", {"outcome": "no_change", "reasons": [], "sidecars": [{"name": "A.en.srt", "result": "dry run"}]}, "dry run"),
+    (False, "check", {"outcome": "no_change", "reasons": [], "sidecars": [{"name": "A.en.srt", "result": "dry run"}]}, None),   # SUBTITLES check
+    (False, "backfill", {"outcome": "no_change", "reasons": ["header_not_repaired", "subtitle_remux_skipped"],
+                         "sidecars": [{"name": "A.en.srt", "result": "left"}]}, None),
+    (True, "backfill", {"outcome": "no_change", "reasons": ["subtitle_trimmed"],
+                        "header_repair": {"code": "subtitle_trimmed", "result": "subtitles trimmed"}}, "subtitles trimmed"),
+    (True, "backfill", {"outcome": "no_change", "reasons": ["header_repair_failed"],
+                        "header_repair": {"code": "header_repair_failed", "result": "header repair failed: x"}}, None),
+])
+def test_a_run_with_no_flag_edit_names_the_write_it_plans_or_made(settings, apply, source, rec, want):
+    settings(subtitles="check")
+    assert hook.quiet_result(rec, apply, source) == want
 
 
 def test_a_video_scan_lists_a_header_issue_and_never_repairs_it(env, monkeypatch, tmp_path):
@@ -13618,6 +13757,142 @@ def test_an_und_subtitle_takes_its_read_language_alone():
     assert d.retag(und(), read={}, table=table)["edits"] == []   # short or mixed text reads as nothing
 
 
+# --- the BCP 47 tag sets a track's language (docs/design.md, "Language tags") ------------------------------------
+
+def test_a_bcp47_zxx_track_is_no_main_english_track():
+    """A music track tagged zxx by its BCP 47 tag alone reads eng/zxx in mkvmerge, because eng is the Matroska default.
+    It is no main English track and never the default. It is never heard, and its tag stays with no note."""
+    d = hook.arr_decide
+    j = tracks(("audio", "fre", None, 1, True, {"audio_channels": 6}), ("audio", "eng", None, 2, False, {"audio_channels": 2}),
+               ("audio", "eng", "zxx", 3, False, {"audio_channels": 8, "track_name": "Music"}))
+    plan = d.decide(j, "English")
+    assert [t["lang"] for t in plan["tracks"]] == ["fre", "eng", "zxx"] and "several_main_tracks" not in plan["reasons"], plan
+    assert plan["edits"] == [["track:=1", 0, 1], ["track:=2", 1, 0]], plan   # the English track plays, not the 8-channel score
+    r = d.retag(j, table=hook.langs())
+    assert (r["edits"], r["ask"], r["notes"]) == ([], set(), []), r
+
+
+def test_a_bcp47_ja_track_reads_as_japanese_with_no_hearing():
+    """A Japanese track tagged ja by its BCP 47 tag alone reads eng/ja in mkvmerge. It is Japanese, so a Japanese film
+    plays it with nothing heard. The two tags disagree, so the track is heard, and the legacy tag stays one signal."""
+    d = hook.arr_decide
+    j = tracks(("audio", "eng", None, 1, True, {"audio_channels": 6}), ("audio", "eng", "ja", 2, False, {"audio_channels": 2}))
+    plan = d.decide(j, "Japanese")
+    assert [(t["lang"], t["conf"]) for t in plan["tracks"]] == [("eng", d.TAG_ONLY), ("jpn", d.TAG_ONLY)], plan
+    assert plan["edits"] == [["track:=1", 0, 1], ["track:=2", 1, 0]] and plan["path"] == "foreign original, original audio", plan
+    assert d.retag(j, table=hook.langs())["ask"] == {"a2"}
+    assert d.retag(j, {}, {"jpn"}, hook.langs())["notes"] == ["a2 keeps eng/ja: jpn (BCP 47 tag ja); eng (legacy tag eng), no heard language"]
+    tag = lambda legacy, ietf: d.track_tag({"language": legacy, "language_ietf": ietf})
+    assert [tag("eng", "mul"), tag("fre", "und"), tag("und", "yue-Hant"), tag("und", "fil-PH"), tag("und", "pt-BR")] == ["mul", "und", "yue", "fil", "por"]
+    r = d.retag(j, {"a2": "jpn"}, {"jpn"}, hook.langs())   # heard Japanese: the legacy tag follows the BCP 47 tag
+    assert r["edits"] == [["track:=2", "ja", "eng", "language"], ["track:=2", "ja", "ja", "language-ietf"]] and r["set"] == {}, r
+    r = d.retag(j, {"a2": "eng"}, {"jpn"}, hook.langs())   # heard English and the legacy tag beat the BCP 47 tag and the item
+    assert r["edits"][0] == ["track:=2", "en", "eng", "language"] and r["set"] == {"a2": "eng"}, r
+    assert r["notes"] == ["a2 eng/ja -> en: legacy tag eng; heard eng"], r
+
+
+def test_two_tags_of_one_language_keep_the_legacy_code():
+    """A BCP 47 tag that names the legacy tag's language, by decide.lang_key(), leaves the legacy code."""
+    d = hook.arr_decide
+    tag = lambda legacy, ietf: d.track_tag({"language": legacy, "language_ietf": ietf})
+    assert [tag("eng", "en-US"), tag("ger", "de"), tag("chi", "yue"), tag("chi", "zh-Hant"), tag("nor", "nb")] == ["eng", "ger", "chi", "chi", "nor"]
+    j = tracks(("audio", "ger", "de", 1, True, {}), ("subtitles", "eng", "en-US", 2, False, {}))
+    assert [(t["tag"], t["lang"]) for t in d.classify(j)] == [("ger", "ger"), ("eng", "eng")]
+
+
+def test_a_legacy_tag_counts_when_no_bcp47_tag_is_there():
+    """With no BCP 47 tag, or one that does not parse or names no language in decide.KNOWN_CODES, the legacy tag counts,
+    unless it is eng.
+    unk is no language. zsm, lvs and arb are languages inside the legacy macrolanguage, which mkvmerge writes as the
+    legacy tag. khk, ekk and cht have no code that decide knows. The plan is then the plan of the legacy tags alone."""
+    d = hook.arr_decide
+    assert [d.track_tag({"language": "fre"}), d.track_tag({}), d.track_tag({"language": "ENG"}),
+            d.track_tag({"language": "fre", "language_ietf": "x-bad"}), d.track_tag({"language": "srp", "language_ietf": "sh"})] \
+        == ["fre", "und", "eng", "fre", "srp"]
+    # a 3-letter language outside decide.KNOWN_CODES: mkvmerge writes its macrolanguage as the legacy tag, or it is no language
+    tag = lambda legacy, ietf: d.track_tag({"language": legacy, "language_ietf": ietf})
+    assert [tag("may", "zsm"), tag("lav", "lvs"), tag("und", "khk-Cyrl"), tag("und", "unk"), tag("enm", "enm")] == ["may", "lav", "und", "und", "enm"]
+    # a legacy eng beside a BCP 47 tag may be the Matroska default, so it never counts: a language decide does not know reads und
+    assert [tag("eng", "unk"), tag("eng", "zsm"), tag("eng", "x-bad"), tag("eng", "haw"), tag("eng", "en-GB")] == ["und", "und", "und", "haw", "eng"]
+    rows = [("audio", "und", "unk", 1, True, {"audio_channels": 6}), ("audio", "eng", None, 2, False, {"audio_channels": 2}),
+            ("subtitles", "may", "zsm", 3, False, {}), ("subtitles", "lav", "lvs", 4, False, {}), ("subtitles", "ara", "arb", 5, True, {}),
+            ("subtitles", "und", "khk-Cyrl", 6, False, {}), ("subtitles", "und", "ekk", 7, False, {}), ("subtitles", "und", "cht", 8, False, {})]
+    j, bare = tracks(*rows), tracks(*[r[:2] + (None,) + r[3:] for r in rows])
+    assert [t["tag"] for t in d.classify(j)] == ["und", "eng", "may", "lav", "ara", "und", "und", "und"]
+    for orig in ("English", "Arabic", "Malay"):
+        assert d.decide(j, orig)["edits"] == d.decide(bare, orig)["edits"], orig
+    pick = lambda r: (r["edits"], r["ask"], r["to_read"], r["set"])
+    assert pick(d.retag(j, table=hook.langs())) == pick(d.retag(bare, table=hook.langs())) == ([], {"a1"}, {"s4", "s5", "s6"}, {})
+    assert [t["tag"] for t in d.classify(tracks(("audio", "fre", None, 1, True, {}), ("subtitles", None, None, 2, False, {})))] == ["fre", "und"]
+
+
+def test_a_real_bcp47_unk_track_reads_as_und():
+    """tests/fixtures/bcp47_unk.json holds the full probe of a real episode whose audio track is und/unk. unk names no
+    language, so the track reads und, the plan is the plan of its legacy tag alone, and the track is heard. With legacy
+    eng, as a file that holds only the BCP 47 tag reads, it reads und too, never eng and never a language "unk"."""
+    d = hook.arr_decide
+    j = json.load(open(os.path.join(os.path.dirname(__file__), "fixtures", "bcp47_unk.json")))["probe"]
+    bare = copy.deepcopy(j)
+    for t in bare["tracks"]:
+        t["properties"].pop("language_ietf")
+    only = copy.deepcopy(j)
+    only["tracks"][1]["properties"]["language"] = "eng"
+    for probe in (j, only):
+        a1, = [t for t in d.classify(probe) if t["kind"] == "a"]
+        assert (a1["tag"], a1["lang"]) == ("und", "und"), a1
+        plan = d.decide(probe, "English")
+        assert plan["edits"] == d.decide(bare, "English")["edits"] == [] and "audio_untagged_or_missing" in plan["reasons"], plan
+        assert not plan["wrong_language"] and d.retag(probe, table=hook.langs())["ask"] == {"a1"}
+
+
+def test_the_readers_beside_classify_take_the_bcp47_tag(monkeypatch):
+    """checks.track_list(), the broken timed text of a conversion and the garbled subtitle check read a track's language
+    through decide.track_tag(), so a track tagged by its BCP 47 tag alone has that tag's language there too."""
+    sub = lambda ietf, **kw: {"type": "subtitles", "id": 2, "properties": dict(language="eng", language_ietf=ietf, **kw)}
+    assert hook.track_list({"tracks": [sub("fa"), {"type": "audio", "properties": {"language": "eng", "language_ietf": "zxx"}}]}) \
+        == [("subtitles", None, "per"), ("audio", None, "zxx")]
+    monkeypatch.setattr(hook, "timed_packets", lambda path, streams, folder, timeout: {5: [(1.0, 2.0, b"\xff\xfe")]})
+    got = hook.broken_tracks("/x/Film.mp4", {"tracks": [sub("fa")]}, [{"index": 5, "codec_type": "subtitle", "codec_name": "mov_text"}], "/x", 10)
+    assert got["s1"]["lang"] == "per", got
+    pol = scene("pol", 2) + ["Łódź."]   # Ł is cut in UTF-8 at 0x81, as in the sidecar test above
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": [(1.0 + 2 * k, 2.0 + 2 * k, t) for k, t in enumerate(old_mux(pol, "utf-8"))]})
+    g = hook.garbled_tracks("/x/Film.mkv", {"tracks": [sub("pl", codec_id="S_TEXT/UTF8")]}, [])["s1"]
+    assert g["tag"] == "pol" and g["repair"], g
+
+
+def test_a_remux_of_tracks_tagged_by_their_bcp47_tag_alone(mkvs, tmp_path, settings):
+    """othercut.mkv with both subtitles tagged by their BCP 47 tag alone, so mkvmerge reads them eng/fr and eng/it. The
+    plan and the remux that take out the Italian track name it Italian. mkvmerge writes fre/fr for the kept track,
+    and the remux check passes it."""
+    if not shutil.which("mkvpropedit"):
+        pytest.skip("needs mkvtoolnix")
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = tmp_path / "othercut.mkv"; shutil.copy(mkvs / "othercut.mkv", path)
+    for track, tag in (("track:s1", "fr"), ("track:s2", "it")):
+        REAL_RUN(["mkvpropedit", "-q", str(path), "--edit", track, "--delete", "language"], check=True)   # this deletes both tags
+        REAL_RUN(["mkvpropedit", "-q", str(path), "--edit", track, "--set", f"language-ietf={tag}"], check=True)
+    tags = lambda j: [(t["properties"].get("language"), t["properties"].get("language_ietf")) for t in j["tracks"]][2:]
+    j = hook.mkvmerge(str(path))
+    assert tags(j) == [("eng", "fr"), ("eng", "it")]
+    h = hook.video_check(str(path))[2]["header"]
+    _, _, plan = hook.repack(str(path), j, os.stat(path), False, h)
+    _, result, info = hook.repack(str(path), j, os.stat(path), True, h)
+    assert result == "subtitles removed" and plan["removed"][3]["language"] == info["removed"][3]["language"] == "ita", (result, plan, info)
+    assert tags(hook.mkvmerge(str(path))) == [("fre", "fr")]
+
+
+def test_the_language_maps_hold_mkvmerges_rows():
+    """decide.ISO639_1 holds every row of `mkvmerge --list-languages` with a 639-1 and a 639-2 code, and
+    decide.KNOWN_CODES every 639-2 code but the local-use codes qaa to qtz and mis."""
+    if not shutil.which("mkvmerge"):
+        pytest.skip("needs mkvtoolnix")
+    legacy, _ = hook.arr_decide.language_table(REAL_RUN(["mkvmerge", "--list-languages"], capture_output=True, text=True, check=True).stdout)
+    rows = {k: v for k, v in legacy.items() if len(k) == 2}
+    assert len(rows) > 180 and {k: hook.arr_decide.ISO639_1.get(k) for k in rows} == rows
+    named = {c for c in legacy.values() if not re.fullmatch("q[a-t][a-z]", c)} - {"mis"}
+    assert len(named) > 480 and named <= hook.arr_decide.KNOWN_CODES and "mis" not in hook.arr_decide.KNOWN_CODES
+
+
 def last_forced(j, forced=True):
     """j with the forced flag of its last track set, which mk() writes as False."""
     j["tracks"][-1]["properties"]["forced_track"] = forced
@@ -14628,10 +14903,16 @@ def test_props_fault_names_what_a_remux_lost():
         assert hook.props_fault(j, new) == why
     # mkvmerge writes the BCP 47 tag of the legacy language for a track that has none, and only that tag passes
     j["tracks"][3]["properties"].pop("language_ietf")
-    for tag, why in (("en", None), ("en-US", "track 3 changed its language_ietf"), ("fr", "track 3 changed its language_ietf")):
+    for tag, why in (("en", None), ("en-US", "track 3 changed its language_ietf"), ("fr", "the tracks changed from")):
         new = copy.deepcopy(j)
         new["tracks"][3]["properties"]["language_ietf"] = tag
-        assert hook.props_fault(j, new) == why, tag
+        assert (hook.props_fault(j, new) or "").startswith(why or "") and bool(hook.props_fault(j, new)) == bool(why), tag
+    # a track that has only a BCP 47 tag reads eng/it, and mkvmerge writes ita/it: the same language passes, another one fails
+    j["tracks"][3]["properties"]["language_ietf"] = "it"
+    for legacy, why in (("ita", None), ("fre", "track 3 changed its language")):
+        new = copy.deepcopy(j)
+        new["tracks"][3]["properties"]["language"] = legacy
+        assert (hook.props_fault(j, new) or "").startswith(why or "") and bool(hook.props_fault(j, new)) == bool(why), legacy
 
 
 def test_srt_moved_moves_only_the_times():
@@ -15670,7 +15951,7 @@ def test_a_language_check_runs_the_subtitle_hearings_with_its_model(env, monkeyp
     with the cues of the English track, so the model loads once. The file is gone afterwards."""
     env["movies"]["movie/7"].update(originalLanguage={"name": "Spanish"}, runtime=round(talk.DURATION / 60))
     env["probe"] = sub_probe(("eng", False, {}), audio=(("eng", True),))
-    env["probe"]["tracks"][1]["properties"]["language_ietf"] = "es"   # the two tags disagree, so the language check runs
+    env["probe"]["tracks"][1]["properties"].update(language="spa", language_ietf="en")   # the two tags disagree, so the language check runs
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, stop=None: {"s1": talk.cues(talk.RIGHT)} if "s1" in want else {})
     seen = []
@@ -25345,6 +25626,29 @@ def test_seeks_follows_a_chain_of_seekheads_and_reads_each_once(tmp_path):
             seek, _, lost = hook.seeks(f, f.read(hook.HEADER_READ), seg)
             assert (seek.get(D.CUES), lost, f.reads - 1) == ([at[2] - seg] if found else None, [], reads), name
         assert hook.header_probe(str(path), j)["cues"] == (True if found else "no SeekHead lists the Cues"), name
+
+
+def test_the_header_check_names_the_stream_end_when_the_tail_holds_one_stream(tmp_path, monkeypatch):
+    """A tester read "the last 128 MiB hold no audio block" as damage. The video ended at 2:07:15 and the audio at
+    2:03:21, so the audio blocks sat before the read. The text names where the video ends and says the audio ends
+    earlier. With no video or audio block in the read, or a read of the whole Segment, the old text stays."""
+    D = hook.arr_decide
+    info = el(D.INFO, el(D.TIMESTAMP_SCALE, (10 ** 6).to_bytes(4, "big")))
+    cluster = lambda ms, track: el(D.CLUSTER, el(D.TIMESTAMP, ms.to_bytes(4, "big")) + el(D.SIMPLEBLOCK, bytes([0x80 | track, 0, 0, 0x80]) + b"data"))
+    gap = el(D.VOID, bytes(3 << 20))
+    j = {"container": {"properties": {"timestamp_scale": 10 ** 6, "duration": 7635042 * 10 ** 6}}, "tracks": [
+        {"type": "video", "properties": {"number": 1, "default_duration": 41708333}}, {"type": "audio", "properties": {"number": 2, "default_duration": 32 * 10 ** 6}},
+        {"type": "subtitles", "id": 2, "properties": {"number": 3}},
+        {"type": "video", "properties": {"number": 4, "default_duration": 41708333}}]}   # a second video track ends a second earlier
+    path = tmp_path / "Film.mkv"
+    blocked = lambda body: made_mkv(path, body) and hook.header_of(str(path), j)["blocked"]
+    film = [info, cluster(7401000, 2), gap, cluster(7634000, 4), cluster(7635000, 1)]   # the audio ends at 2:03:21, 3 MiB before the video
+    assert blocked(film) == ["the video ends at 2:07:15 and the audio at 2:03:21"]   # a read of the whole Segment finds both
+    assert blocked([info, gap, cluster(7635000, 1)]) == ["the last 3 MiB hold no audio block"]   # the read starts at the Segment start
+    monkeypatch.setattr(hook, "HEADER_TAIL", (1 << 20, 2 << 20))   # the last 2 MiB stand for the last 128 MiB
+    assert blocked(film) == ["the video ends at 2:07:15, and the audio ends before the last 2 MiB of the file"]
+    assert blocked([info, cluster(7400000, 1), gap, cluster(7635000, 2)]) == ["the audio ends at 2:07:15, and the video ends before the last 2 MiB of the file"]
+    assert blocked([info, film[1], gap, cluster(7635000, 3)]) == ["the last 2 MiB hold no video block"]   # only a subtitle block
 
 
 def test_the_play_time_of_a_byte_comes_from_its_cluster(tmp_path):

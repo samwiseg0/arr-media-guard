@@ -1366,7 +1366,7 @@ def garbled_tracks(path, j, sides, full=False):
     or when the new text fails decide.repair_fault(). With full, a track the Cues do not index comes from full_read(). A
     track the read cannot take gets no verdict. A track whose read was cut short, see Cut, is never repaired, and its
     verdict holds "capped", because the cues past the cut were never judged."""
-    tags = {f"s{n}": ((t.get("properties") or {}).get("language") or "und")
+    tags = {f"s{n}": decide.track_tag(t.get("properties") or {})
             for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
     codecs = sub_codecs(j)
     want = {p for p, c in codecs.items() if c in config.SUB_CODECS}

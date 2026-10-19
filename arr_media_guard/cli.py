@@ -56,7 +56,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
     lock, and its conversion runs under the shared lock, see convert(). A re-run converts under the exclusive lock.
     --convert takes every file that is not .mkv, so selected() does not apply. With --sub-check a file whose subtitle
     check is saved and asks for nothing more is skipped, and the result is "checked", unless --recheck is given, see
-    subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks.
+    subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks. An apply of the flag backfill
+    posts its alerts as a job does, by DISCORD_POSTS. --convert, --sub-check and --sub-time post none here.
 
     job is the job of a --check run, see check(). The file then runs as an import, under an import's time limit, or as
     the deep analysis after it when job holds deep. An apply posts its alerts when an app names the file. The caller
@@ -69,8 +70,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
     def run(lock, shared, pool):
         if mode == "import":   # an import's time limit, as runner.run_job() starts it
             config.DEADLINE.start(config.BUDGET)
-        c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=bool(job and app) and a.apply, kids=kids,
-                        release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
+        c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=a.apply and bool(app) and mode in ("import", "deep", "backfill"),
+                        kids=kids, release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
                         force=a.force.get(path), job=job, save=save)
         if job:
             job["run"] = c
@@ -141,8 +142,9 @@ def backfill_args(argv):
     ap = argparse.ArgumentParser(prog="arr-media-guard --backfill", description="Run the hook's checks and decision over the "
                                  "library of one instance, or of every instance in turn, at nice 19 and idle I/O priority. With no "
                                  "pass flag and no plan option, --apply puts one job per file in the background queue. The worker runs "
-                                 "each as --check --apply runs a file, after the imports. Otherwise a backfill prints its alerts and "
-                                 "never posts them.")
+                                 "each as --check --apply runs a file, after the imports. A plan option with --apply posts the alerts as "
+                                 "those jobs do. --convert and --sub-check print the alerts of each file and post none. --convert --apply posts "
+                                 "an alert for each conversion that a stopped run left.")
     ap.add_argument("app", nargs="?", choices=sorted(config.CFG.apps), help="the instance. With none the run takes every instance in turn")
     ap.add_argument("--apply", action="store_true", help="edit the files. Without it the run is dry and changes nothing")
     ap.add_argument("--ids", type=int, nargs="+", default=[], help="only these items: movie ids for radarr, series ids for sonarr")
@@ -158,7 +160,9 @@ def backfill_args(argv):
     ap.add_argument("--plan-out", metavar="FILE", help="write each file's plan as a JSON line")
     ap.add_argument("--plan-from", metavar="FILE", help="apply only to the files the plan of a dry run edits")
     ap.add_argument("--canary", type=int, default=0, help="apply to N files of the plan per instance, spread across its classes")
-    ap.add_argument("--only-undecided", action="store_true", help="take the files the plan left undecided, for language detection")
+    only = ap.add_mutually_exclusive_group()
+    only.add_argument("--only-undecided", action="store_true", help="take the files the plan left undecided, for language detection")
+    only.add_argument("--only-header", action="store_true", help="take the files the plan gives a header repair. Each one gets its whole plan")
     ap.add_argument("--convert", action="store_true", help="convert the files that are not .mkv into Matroska")
     ap.add_argument("--plex-later", action="store_true", help="list the folders a conversion changed for --plex-flush")
     ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH", help="convert these files past the refusal the "
@@ -191,6 +195,8 @@ def backfill_args(argv):
         ap.error("--canary needs --apply and --plan-from, the dry run's plan file")
     if a.only_undecided and not a.plan_from:
         ap.error("--only-undecided needs --plan-from, the dry run's plan file")
+    if a.only_header and not a.plan_from:
+        ap.error("--only-header needs --plan-from, the dry run's plan file")
     if a.workers is not None and (a.workers < 1 or (a.workers > 1 and a.apply and not a.convert)):
         ap.error("--workers takes 1 or more, and more than 1 only in a dry run, a scan or --convert --apply")
     return a
@@ -249,10 +255,11 @@ def backfill_app(app, a, out):
         work = unconverted
         with contextlib.suppress(OSError):   # a new pass starts a new list of refused and failed conversions
             open(os.path.join(config.CFG.state_dir, f"convert-{app}.txt"), "w").close()
-    if a.plan_from:   # only the files the dry run planned edits for, or left undecided. Each one is probed and planned again.
+    if a.plan_from:   # the files the dry run planned a change for, left undecided or gave a header repair. Each is probed and planned again.
         listed = {w[0]["path"] for w in work}   # so a canary with --ids takes its sample from those items
         plans = [r for r in a.plans[app] if r["path"] in listed
-                 and (r["undecided"] if a.only_undecided else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
+                 and (r["undecided"] if a.only_undecided else r.get("header_repair") == "would_repair_header" if a.only_header
+                      else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
     for given in filter(None, (a.paths, a.force_convert)):   # the run takes only the listed files
@@ -332,8 +339,7 @@ def backfill_app(app, a, out):
         if converted[0] >= config.CFG.convert_max and not stop.is_set():
             print(f"stopped after {converted[0]} conversions, the cap of one run (CONVERT_MAX_FILES)", flush=True)
             stop.set()
-        needed += rec["outcome"] in ("edited", "dry_run", "would_repack") \
-            or bool({*config.REPAIRED, "would_repair_header", "would_remux_subtitles"} & set(rec.get("reasons", [])))
+        needed += process.wrote(rec)
         if a.limit and needed >= a.limit: stop.set()
         if stop.is_set() and not pool: break   # a pool lets its files in flight end, see backfill_files()
     if ex: ex.shutdown(cancel_futures=True)
@@ -891,8 +897,8 @@ def open_problem(what, r, result, edited_at, latest):
     check that ended otherwise clears it. Any other problem of the line counts only when the line is the file's latest
     result in result. A problem of the check after an edit counts unless a later result came after that edit. A failed
     conversion or a failed repair counts only when its alert did not go out, see process.conversion() and
-    process.faults(). alert_result says "sent" or "already sent" for an alert that went out. A line without it, as of a
-    backfill, keeps the problem."""
+    process.faults(). alert_result says "sent" or "already sent" for an alert that went out. A line without it, as of
+    --convert or --sub-check, keeps the problem."""
     path = r.get("path")
     if not os.path.exists(path or ""):
         return False

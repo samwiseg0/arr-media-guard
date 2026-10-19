@@ -98,13 +98,37 @@ stays on. After an edit the hook probes the file again and checks every flag.
 
 ## Language tags
 
-A Matroska track has a legacy ISO 639-2 tag (`eng`) and a newer BCP 47 tag (`en`, `en-US`). The BCP
-47 tag wins when both are there. `mkvpropedit --set language=<tag>` writes both, in the same call as
-the flag edits.
+A Matroska track has a legacy ISO 639-2 tag (`eng`) and a newer BCP 47 tag (`en`, `en-US`).
+`decide.track_tag()` reads the track's language from both. The BCP 47 tag sets the language when
+its code is known and names another language than the legacy tag, as RFC 9559 says and Plex shows.
+The legacy tag sets it in every other case. So `ger` beside `de` stays `ger`, and `chi` beside
+`yue` stays `chi`. A legacy `eng` beside a BCP 47 tag with no known code reads as `und`, because
+`eng` may be the Matroska default.
+
+`decide.ISO639_1` maps a 2-letter BCP 47 language to its 639-2 code. It holds the 639-1 rows of
+mkvmerge's language table. A 3-letter code is known when `decide.KNOWN_CODES` holds it. That set
+holds every ISO 639-2 code mkvmerge lists, the 3-letter codes of `ALIAS` such as `yue`, and `und`,
+`mul` and `zxx`. Another code, such as `zsm` (Standard Malay), is often a language inside a
+macrolanguage. mkvmerge writes the macrolanguage (`may`) as the legacy tag of such a track. `unk`
+names no language. A BCP 47 tag that does not parse has no code.
+
+`decide.classify()` reads each track of a mkvmerge probe with this rule. So the default tracks, the
+language edits, the Original language flag, the subtitle checks and the alerts use it. The track
+lists that the remux checks compare use it too, see `checks.track_list()`. Some readers take the
+tags as the file holds them. `decide.language_tags()` gives both tags to `retag()` for its votes
+and its undo, and to `unapplied()` to verify an edit. `process.conversion()` matches the subtitles
+of a converted file to the original's by their legacy tags. `remux.track_args()` writes the BCP 47
+tag, else the legacy tag, as the `--language` of a remuxed track. The ffprobe branch of
+`classify()` reads the one tag that ffprobe reports.
+
+A file that holds only a BCP 47 tag reads as `eng` in mkvmerge's legacy field, because `eng` is the
+Matroska default. So a music track that holds only `zxx` reads `eng/zxx`, and its language is
+`zxx`. `mkvpropedit --set language=<tag>` writes both tags, in the same call as the flag edits.
 
 A tag changes only when two signals agree and one of them is the heard or the read language. The
-signals are the legacy tag, a BCP 47 tag that names another language, the heard language of an audio
-track, the read language of a subtitle, and the title's language, see "Subtitle text".
+signals are the track's tag, a legacy tag that names another language than the BCP 47 tag, the heard
+language of an audio track, the read language of a subtitle, and the title's language, see "Subtitle
+text".
 A main audio track also has the item's original language. TMDB's spoken languages count only for an
 `und` track, because TMDB lists English as spoken for many foreign films. The language with the most
 signals wins when it has two or more and no other language has as many.
@@ -120,7 +144,8 @@ signals wins when it has two or more and no other language has as many.
 - A new language keeps a BCP 47 tag that names it or a language inside it, so `yue` and `cmn-Hant`
   stay. A kept language keeps its BCP 47 language, script and region. The script stays, because Plex
   shows Traditional and Simplified Chinese both as 中文 without it.
-- `mul` and `zxx` stay. An undecided or dropped plan gets no tag edit.
+- `mul` and `zxx` stay, from either tag, and get no note. A `zxx` audio track is no main track of a
+  language, so a decision never picks it to play first. An undecided or dropped plan gets no tag edit.
 
 The undo restores both tags, with a second `language-ietf` edit or a `--delete language-ietf` where
 needed. Plex shows the BCP 47 tag, else the legacy tag, and it shows `und` audio as English. Hearing
@@ -148,8 +173,8 @@ TMDB gives none or one with no 639-2 code, no flag changes.
   `flag_heard`. What is matched, heard or read for the flag alone goes to `retag()` as `checked`, so it changes no tag
   and no default flag. A missing install, a failed run or no time left gives no answer, so no flag changes, and a
   note names the track.
-- A track tagged by its BCP 47 tag alone reads as `eng` beside it. The tag rules hear it, and that heard language
-  decides it.
+- A track tagged by its BCP 47 tag alone has that tag's language. Its legacy tag reads `eng` beside it, so the two
+  tags disagree, and its flag changes only on a heard or read language.
 - A track in the original language gets 1. A 1 on a track in another language goes to 0. A right flag, and a missing
   flag that would be 0, stay. An edit is `[selector, new, old, ORIGINAL_FLAG]`, with old `None` for a missing flag,
   whose undo is `--delete flag-original`. `edit()` drops a no-op, and `unapplied()` verifies it, a missing flag
@@ -232,10 +257,11 @@ and its file, and the sentence `report.UNTOLD` in place of the error. Its line i
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
-`hook`, `burn_in`, `whole_file`, `deep_analysis`, `recheck` and `check`. A conversion that a stopped run left has `worker` when the worker
-finds it as it starts, and `backfill` when a `--convert` run finds it, see `convert.pending_recover()`. Stopped at names
-the step where the fix stopped, one of `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its
-step from `ACTION_STEPS`. A subtitle finding takes it from the sentences that did not fix their subtitle, see
+`hook`, `burn_in`, `whole_file`, `deep_analysis`, `recheck`, `check` and `backfill`, the flag backfill.
+A conversion that a stopped run left has `worker` when the worker finds it as it starts, and `backfill` when a
+`--convert` run finds it, see `convert.pending_recover()`. Stopped at names the step where the fix stopped, one of
+`report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its step from `ACTION_STEPS`. A subtitle
+finding takes it from the sentences that did not fix their subtitle, see
 `LINE_STEPS`. Any other finding takes it from `FINDING_STEPS`. Each step there is a name, `None`, or a function of the
 facts. `None` means the program tried no fix: a doubt, a check that only reports, a fix that a setting or a limit turned
 off, and a dry run. A sidecar left in place names no step when its reason starts with a setting, see
@@ -836,8 +862,10 @@ out before each edit, so a crashed edit still has a record. A repack, a header r
 remux each write a line before anything else runs, with the code of the step in `outcome`. A subtitle remux
 that changes no flag gives the decision line the outcome `subtitles_remuxed`, and its result names each change, as
 `subtitles remuxed: s2 retimed, s1 lines moved`. When only sidecars changed, the outcome is `sidecars_changed`, as
-`sidecars changed: Film.en.srt retimed`. Only a
-decision line has `schema`. A missing or broken policy file never
+`sidecars changed: Film.en.srt retimed`. A header repair that changes no flag keeps the outcome `no_change`, and its
+result names the repair, as `header repaired`. A dry run that plans a header repair, a subtitle remux or a sidecar fix
+and no flag edit keeps `no_change` too, and its result is `dry run`, see `process.quiet_result()`. So the counts stay.
+Only a decision line has `schema`. A missing or broken policy file never
 stops the hook. It logs `no_policy` and alerts once. A backfill or an audit refuses to start. Rotate
 the log weekly with compression. The code never reads the log back, see "State".
 
@@ -905,7 +933,9 @@ So such a file gets one deep analysis. `--drop-queued` drops the jobs a backfill
 jobs they queued stay.
 
 **The flag backfill.** A plan option runs the flag backfill, which fixes the default tracks and
-language tags. It never posts to Discord. It runs at nice 19 and idle I/O, with the hook's file lock
+language tags. Its `--apply` posts the alerts as a job a backfill queued does, through
+`logs.alert_findings()`. A problem posts once per file, kind and size. With `DISCORD_POSTS=all` each change posts
+too. A dry run posts nothing. It runs at nice 19 and idle I/O, with the hook's file lock
 for each file. It runs language detection, the metadata checks and the header check like the hook,
 but it never re-grabs. It reads each `.mkv` file's own tracks, because the app's stored media info goes stale. It
 takes a file with two or more audio tracks, any subtitle, a tag to fix or another container inside.
@@ -961,8 +991,8 @@ counts until a later result. The post leaves out these files and problems:
   import's new line as its latest result. The store drops the size and time of a decision line, so the audit cannot
   tell a replaced file in another way.
 - A failed conversion or file repair whose own alert went out. Its line says so in `alert_kinds` and `alert_result`,
-  with `sent` or `already sent`. A failure whose alert failed or never posted stays in the post. A backfill posts no
-  alert, so its failure stays too.
+  with `sent` or `already sent`. A failure whose alert failed or never posted stays in the post. A failure in
+  `--convert` or `--sub-check` posts no alert, so it stays too.
 
 The post has one line per file, with its problems in plain words. The name of each file links to its page in the app,
 as in an alert. Its footer names TMDB only when TMDB had trouble that day. The terminal prints the same files. The
@@ -1316,7 +1346,8 @@ showed no track in such a file. Tracks at the end that the front SeekHead lists 
 a flag edit of a file with zero padding leaves them (see "Zero padding"). An old mkvmerge's second SeekHead of
 Clusters is valid too. `checks.seeks()` still follows a second SeekHead to the Cues, so such a file reads as before.
 A flag edit checks the layout of its result. When mkvpropedit broke it, the record names why in `layout`, and the
-next header check repairs it.
+next header check repairs it. mkvtoolnix keeps this mkvpropedit behaviour on purpose
+([issue 6322](https://codeberg.org/mbunkus/mkvtoolnix/issues/6322), 2026-10-19), so the repair stays.
 
 The remux runs only when the video check ran all its stages and found no certain fault and no doubt.
 The video and the audio must also end at most 60 seconds apart. It runs like a conversion, but it
@@ -1388,7 +1419,10 @@ with the EBML id `1A45DFA3` are a second file joined with `cat`, and they stay.
 
 A failure keeps the original and posts one amber embed, and the flag edit still runs. On success the
 decision runs on the new file, and the app rescans the item. A backfill dry run reports
-`would_repair_header`, and `--apply` repairs.
+`would_repair_header`, and `--apply` repairs. The line of the dry run starts with `dry run`, as for a flag edit. A
+doubt or a fault that blocks the repair gives `header_not_repaired`. Its result names the block, then the issue, as
+`not repaired: the video ends at 1:54:58 and the audio at 1:50:12. The issue: the header says 13:23:33, but the streams
+end at 1:54:58`. The line of a backfill shows the first 300 characters of a header result.
 
 ## Cover track
 
@@ -2091,7 +2125,11 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   mkvmerge compresses PGS and VobSub tracks with zlib by default, and some hardware players read none. So a track that
   the source holds uncompressed stays uncompressed. It copies every other track with its UID, language, BCP 47 tag, name
   and flags, and the file's attachments, chapters, tags and Segment UID (`--segment-uid`). `--track-order` keeps the
-  order of the tracks. A track that has no BCP 47 tag gets the one of its legacy language, and that passes.
+  order of the tracks. A track that has no BCP 47 tag gets the one of its legacy language, and that passes. A track
+  that has only a BCP 47 tag gets the legacy tag that mkvmerge writes for that language (`eng/it` becomes `ita/it`).
+  That passes when `decide.track_tag()` reads the same language from both pairs, as for `it` and `zh-Hant`. mkvmerge
+  writes `chi` for `yue` and `cmn-Hant`, `may` for `zsm`, and `qaa` for `qaa`. These tracks read `yue`, `cmn` or
+  `und` before the remux and `chi`, `may` or `qaa` after it. So the track list changes, and AMG refuses the remux.
 - Two `--engage` options of mkvmerge keep the copied packets as they are. `keep_whitespaces_in_text_subtitles` keeps
   the spaces at the ends of each line of a text subtitle, which mkvmerge trims by default.
   `dont_normalize_parameter_sets` keeps each HEVC keyframe as it is, where mkvmerge would put the header units in
