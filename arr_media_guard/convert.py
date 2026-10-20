@@ -701,6 +701,13 @@ def settle_extras(app, owner, keys):
     return out
 
 
+def left_converted(app, path):
+    """The keys of the pending conversions of app whose new file is path and whose extras still wait, see
+    pending_edit(). A stop after the swap leaves them, see process.stop_line(), and the next run of the import settles
+    them, see process.after_edit()."""
+    return sorted(k for k, e in pending_edit().items() if e.get("app") == app and e.get("state") == "converted" and e.get("new") == path)
+
+
 # Where a conversion stopped, per state of its pending entry, see convert()
 STOPPED = {"swapping": ", before it hid the original", "held": ", after it hid the original", "stranded": ", and putting the original back failed"}
 
@@ -710,7 +717,9 @@ def pending_recover(app, settle_them):
     settle() a kill cut short, when settle_them. Any other stopped between the swap and the import: its original may
     still hide under held_name(), and its extras in hide_dir. Those are printed and logged for a person, posted once per
     pending entry, and nothing moves. Returns the entries it reported. Only a --convert run settles, so the post names
-    it as the check, and the worker's names the worker's start, see report.CHECKS.
+    it as the check, and the worker's names the worker's start, see report.CHECKS. The worker's leaves out a converted
+    one whose new file is the path of a queued import job. A stop cut that job, and its next run settles it, see
+    left_converted().
 
     G5: the pid of an entry of another pid namespace, as of a container beside the host, means nothing here. So such
     an entry counts as owned while it is younger than JOB_MAX_AGE, and as stopped after that. A restart of a container
@@ -726,7 +735,8 @@ def pending_recover(app, settle_them):
             return time.time() - datetime.datetime.fromisoformat(e["time"]).timestamp() < config.JOB_MAX_AGE
         except (KeyError, TypeError, ValueError):
             return False
-    rest = {k: e for k, e in pending_edit().items() if e.get("app") == app and not alive(e)}
+    queued = set() if settle_them else {json.loads(j).get("path") for j, in store.read("SELECT job FROM jobs WHERE name NOT LIKE 'deep-analysis-%'")}
+    rest = {k: e for k, e in pending_edit().items() if e.get("app") == app and not alive(e) and not (e.get("state") == "converted" and e.get("new") in queued)}
     done = collections.defaultdict(list)
     for k, e in rest.items():
         if e.get("state") == "converted" and settle_them:
@@ -899,7 +909,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         for e in broken.values():
             e["data"] = proof.timed_srt(e["cues"], shift)
         why = said("repack_name_taken", remux.broken_plan(path, broken))
-        facts = {x["i"]: x for x in logs.track_log(decide.classify(j))}   # the role and title of the alert's track name
+        facts = {x["i"]: x for x in logs.track_log(decide.classify(j, original=min(known, default=None)))}   # the role and title of the alert's track name
         info["broken"] = {p: {"stream": e["stream"], "lang": e["lang"], "sidecar": e.get("sidecar"), "reused": e.get("reused"),
                               **{k: (facts.get(p) or {}).get(k) for k in ("role", "name", "sdh", "forced")}} for p, e in broken.items()}
         what += "".join(f", take out subtitle track {p[1:]}, its bytes to {os.path.basename(e['sidecar'])}" for p, e in broken.items() if e.get("sidecar"))
@@ -931,6 +941,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             pass   # the create below fails the same way, and the conversion fails with it
     sw = remux.Swap(path, st, tmp, info)
     try:
+        sw.start()
         remux.new_tmp(tmp, st)
         if sync := [] if unreadable else avi_sync(path, j, streams):   # the decision log shows why a stream starts late
             info["start_sync"] = sync
@@ -1070,8 +1081,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             remux.drop_broken(broken.values())
             for p, e in broken.items():
                 info["broken"][p].update({"removed": True} if e.get("removed") else {})
-        if not isinstance(ex, Exception):
-            raise
+        if sw.stop(ex):
+            return "repack_failed", "repack failed: the run was stopped", info, path
         if undo == "completed":
             info.update(new_size=size, new_tracks=checks.track_list(new_j))
             return "repacked", "repacked", info, new

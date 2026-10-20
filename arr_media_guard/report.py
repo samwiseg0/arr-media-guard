@@ -365,6 +365,9 @@ FINDINGS = {
     "header": ("File repair failed", lambda f, t: f'Couldn\'t repair the file. {cap(f["why"])}. The original file was not changed.'),
     "cut": ("File may be cut short", lambda f, t: f'{cap(f["why"])}. The file may be cut short, or the subtitles may belong to another version. '
                                                  "Nothing was changed."),
+    "frame_rate": ("Variable frame rate", lambda f, t: f'The video has a {bold("variable frame rate")}. {f["off"]:.0%} of the frames checked '
+                                                       "stay on the screen longer or shorter than most frames. A player that follows the "
+                                                       "frame times plays it right. Nothing was changed."),
     "subtitle": ("Subtitles run past the end", overrun),
     "sublang": ("Subtitle language may be wrong", sublang),
     "edit": ("Track flag change failed", lambda f, t: f'Couldn\'t change which tracks play by default. '
@@ -851,7 +854,7 @@ CONVERT, HEAR, SHIFT, TEST, WRITE, REPLACE = FIX_STEPS = ("Converting to MKV", "
 # subtitle finding the steps of its sentences, see LINE_STEPS. None: the program tried no fix. A conversion that
 # finished, whose extras wait for the app to take the new file, stopped at the swap of the file in the app.
 FINDING_STEPS = {"language": None, "runtime": None, "duration": None, "episode": None, "content": None, "audio": None, "video": None,
-                 "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "unreadable": None, "header": WRITE, "cut": None,
+                 "damage": None, "repack": lambda f: REPLACE if f.get("state") == "converted" else CONVERT, "unreadable": None, "header": WRITE, "cut": None, "frame_rate": None,
                  "subtitle": None, "sublang": None, "edit": WRITE, "policy": None, "submatch": None, "subtiming": None,
                  "burned_in": lambda f: WRITE if f.get("edit") in ("hardlinked", "read_only", "edit_failed", "verify_failed") else None,
                  "cover": WRITE}
@@ -1332,12 +1335,15 @@ def repair_how(g):
 
 def missed(rec):
     """Why a change that --sub-time --apply planned for the file of rec did not happen, or None: an error, a flag edit
-    that failed or was not made, a subtitle remux that failed or was skipped, or a sidecar left as it was."""
+    that failed or was not made, a header repair that failed, was skipped or was stopped, a stop before the writes of
+    the run, a subtitle remux that failed or was skipped, or a sidecar left as it was."""
     rm, hr = rec.get("subremux") or {}, rec.get("header_repair") or {}
     if rec.get("outcome") in ("error", "edit_failed", "verify_failed", "hardlinked", "read_only"):
         return rec["result"][:200]
-    if hr.get("code") in ("header_repair_failed", "header_repair_skipped"):
+    if hr.get("code") in ("header_repair_failed", "header_repair_skipped") or hr.get("stopped"):
         return hr["result"][:200]
+    if {"act", "after_edit"} & set(rec.get("not_run") or ()):   # a stop came before the writes of the run, see process.stop_line()
+        return f'the run was stopped before {", ".join(rec["not_run"])}'[:200]
     if (rm.get("fixed") or rm.get("ended") or rm.get("timed") or rm.get("remove") or rm.get("recoded") or rm.get("stripped") or rm.get("covers")) \
             and not rm.get("done"):
         return rm.get("result", "the subtitle remux did not run")[:200]

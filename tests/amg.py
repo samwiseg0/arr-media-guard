@@ -101,6 +101,11 @@ def deadlines():
     return [m.DEADLINE for k, m in list(sys.modules.items()) if k.endswith(".content") and hasattr(m, "DEADLINE")]
 
 
+def stops():
+    """The stop state, runner.STOP, of each copy of the package loaded so far."""
+    return [m.STOP for k, m in list(sys.modules.items()) if k.endswith(".runner") and hasattr(m, "STOP")]
+
+
 MEDIA = os.environ.get("AMG_TEST_MEDIA") or os.path.join(os.path.expanduser("~"), ".cache", "arr-media-guard", "test-media")
 MEDIA = MEDIA if MEDIA == "off" else os.path.abspath(MEDIA)   # a test that changes folder keeps the same cache
 STOPS = r"\s:,'|=\[\];"   # the characters that end a path inside an argument

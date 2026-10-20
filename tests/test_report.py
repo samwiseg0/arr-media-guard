@@ -201,6 +201,9 @@ FINDINGS = [
     ({"kind": "cover", "tracks": ["v2"], "name": "cover2.jpg", "result": "subtitle remux failed: mkvmerge exited 2: x"},
      "Cover picture not moved", "amber", "The cover picture is stored as video track 2, so a player may show it in place of the video. AMG tried to "
      "store it as the attachment cover2.jpg, but rewriting the file failed. The original file was not changed."),
+    ({"kind": "frame_rate", "off": 0.365}, "Variable frame rate", "amber",
+     "The video has a variable frame rate. 36% of the frames checked stay on the screen longer or shorter than most frames. A player that "
+     "follows the frame times plays it right. Nothing was changed."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -1173,6 +1176,29 @@ def test_every_output_names_a_track_alike():
     failed = {"kind": "edit", "error": "VERIFY FAILED, flags did not change", "unread": None, "on": ["s1 eng"]}
     (e,) = h.render(dict(edited, findings=[failed]), "embed")
     assert e["description"].endswith('its default tracks are the **English forced subtitles (track 1, "Signs & Songs")**.'), e["description"]
+
+
+@pytest.mark.parametrize("songs_on, want", [
+    (False, "Turned the default flag off for the English subtitles (track 1)."),
+    (True, 'Turned the default flag off for the English subtitles (track 1) and the English subtitles (track 3, "Songs").')],
+    ids=["songs_off", "songs_on"])
+def test_an_edit_post_never_calls_a_lyrics_track_forced(tmp_path, settings, monkeypatch, songs_on, want):
+    """Owner 2026-10-20: a "Songs" subtitle in the original language holds the lyrics. It is never forced, so no post
+    names it so. The edit post takes each track's role from the file after the edit and the item's original language."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge") and shutil.which("mkvpropedit")):
+        pytest.skip("needs ffmpeg and mkvtoolnix")
+    monkeypatch.setattr(h.arr_decide, "POLICY", h.arr_decide.POLICY)
+    h.arr_decide.set_policy(json.load(open(os.path.join(ROOT, "examples", "policy.json"))))
+    src, srt, path = tmp_path / "src.mka", tmp_path / "s.srt", tmp_path / "Film A (2000).mkv"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=2", "-c:a", "aac", str(src)], check=True)
+    srt.write_text("1\n00:00:00,500 --> 00:00:01,500\nLa la la\n")
+    subs = [a for k, name in enumerate(("English", "English SDH", "Songs", "Songs (SDH)"))
+            for a in ("--language", "0:eng", "--track-name", f"0:{name}", "--default-track-flag", f"0:{int(k == 0 or (songs_on and k == 2))}", str(srt))]
+    subprocess.run(["mkvmerge", "-q", "-o", str(path), "--language", "0:eng", "--default-track-flag", "0:1", str(src), *subs], check=True)
+    settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
+    j = h.mkvmerge(str(path))
+    rec = h.edit({"path": str(path), "label": "Film A (2000)", "original": "English"}, j, h.arr_decide.decide(j, "English")["edits"], True)
+    assert rec["outcome"] == "edited" and h.unmarked(h.edit_change(rec, {"flags": set()})[1]) == want, rec
 
 
 def test_tracks_with_a_role_or_a_title_keep_their_own_names():

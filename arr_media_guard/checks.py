@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks of one file: the probes, the header check, broken audio, corrupt video and the spoken language."""
-import bisect, contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
+import bisect, collections, contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
 
-from . import config, content, decide, store, subsync, subtitles
+from . import config, content, decide, matroska, store, subsync, subtitles
 
 
 def run_bounded(argv, timeout, **kw):
@@ -369,21 +369,25 @@ def layout_of(path):
         return None
 
 
-def header_probe(path, j, edit=False):
+def header_probe(path, j):
     """The header check of a Matroska file (docs/design.md, "Header repair"), None for another container. j is its mkvmerge -J
-    probe. It reads the start of the file and the Cues. It reads the last HEADER_TAIL bytes of the Segment only when
-    those point at an issue: no usable Cues, a last video or audio cue far from the header duration, a Segment size past
-    the end after the hook's own failed edit, more than TAIL_MIN bytes past the Segment end, or any issue below. The
-    stream ends come from the Clusters, so a file whose index is lost reads too. tail is the bytes past the Segment end
-    when over TAIL_MIN, else 0. A remux drops them, but only when the video and the audio reach the header duration, so
-    the Segment is whole. not_whole then says why the Segment may be cut, and check_video() makes it a doubt. Bytes past
-    the Segment end that start another Matroska file block the remux too.
-    edit_tail is the count of bytes past the Segment end, whatever their content, else 0. mkvpropedit grows Tracks into
-    the first Void that holds it. When none does, it writes Tracks at the end of the file and extends the Segment over
-    those bytes. So a flag edit of such a file rides a remux. edit_tail is no issue. With edit, such a file reads its
-    stream ends as a file with an issue does. edit_blocked then lists why that remux must not run, by the guards of
-    tail. A subtitle event far past the streams sets the stated length, so it skips the cut-off guard. Without edit, the
-    file reads what a clean file reads, and edit_blocked is None. It is [] when edit_tail is 0.
+    probe. It reads the start of the file, the Cues and the elements of the RFC 9559 check, see matroska.check(). It
+    reads the last HEADER_TAIL bytes of the Segment only when those point at an issue: no usable Cues, a last video or
+    audio cue far from the header duration, a Segment size past the end after the hook's own failed edit, bytes past
+    the Segment end, an RFC 9559 fault, or any issue below. The stream ends come from the Clusters, so a file whose
+    index is lost reads too. tail is the bytes past the Segment end when over TAIL_MIN, else 0. A remux drops them, but
+    only when the video and the audio reach the header duration, so the Segment is whole. not_whole then says why the
+    Segment may be cut, and check_video() makes it a doubt. Bytes past the Segment end that start another Matroska file
+    block the remux too.
+    edit_tail is the count of bytes past the Segment end, whatever their content, else 0. Any count is an issue (owner
+    2026-10-20). mkvpropedit grows Tracks into the first Void that holds it. When none does, it writes Tracks at the end
+    of the file and extends the Segment over those bytes. So a flag edit of such a file rides a remux, see
+    process.edit(). edit_blocked lists why that remux must not run, by the guards of tail. A subtitle event far past the
+    streams sets the stated length, so it skips the cut-off guard. It is [] when edit_tail is 0.
+    rfc holds the faults of the RFC 9559 check by kind, see docs/design.md, "RFC 9559 check". The kinds are those of
+    matroska.check(), padding (bytes past the Segment end, up to TAIL_MIN), tail (more), enclosed and layout. Each fault
+    is an issue. notes holds the elements RFC 9559 does not define, which readers skip.
+    took is the seconds of its reads, the ffprobe read of the subtitles left out.
     enclosed is the first byte of a zero run that such an edit left inside the Segment, by zero_pad()'s rule, else
     None. It is an issue. enclosed_size is the byte count of that run, else 0. The walk for it runs only when a SeekHead
     lists an element that starts past the end of the Cues. It reads 16 bytes for each element there, and a zero run up
@@ -410,12 +414,14 @@ def header_probe(path, j, edit=False):
     secs = lambda tick: round(tick * scale / 1e9, 3)
     dur = decide.duration(j)
     off = lambda a, b: abs(a - b) > max(decide.HEADER_OFF, decide.HEADER_SHARE * b)
+    t0 = time.monotonic()
     with open(path, "rb") as f:
         size = f.seek(0, 2); f.seek(0); b = f.read(config.HEADER_READ)
         seg, read = decide.segment_start(b), len(b)
         if not seg:
             return None
         ds, seg_size = seg
+        cue_data = None   # (its file offset, its bytes), for matroska.check()
         short = None if seg_size is None else ds + seg_size - size
         (seek, more, lost), cues, cue_end = seeks(f, b, ds), "no SeekHead lists the Cues", None
         read += more
@@ -432,7 +438,7 @@ def header_probe(path, j, edit=False):
                 cues = True
                 break
             else:
-                f.seek(ds + pos + e[1]); c = f.read(e[2]); read += len(c); last = decide.last_cues(c)
+                f.seek(ds + pos + e[1]); c = f.read(e[2]); read += len(c); last, cue_data = decide.last_cues(c), (ds + pos + e[1], c)
                 if last:   # mkvmerge cues subtitles too, so the video and audio cues say where those end
                     cues, cue_end = True, max((secs(t) for n, t in last.items() if tracks.get(n) in ("video", "audio")), default=None)
                     break
@@ -443,13 +449,16 @@ def header_probe(path, j, edit=False):
         after = cues is True and pos + e[1] + e[2]   # where the Cues end in the Segment data
         if after and short is not None and short <= 0 and any(x > after for xs in seek.values() for x in xs):
             gap, more = zero_gap(f, ds + after, ds + seg_size); read += more   # an element listed past the Cues end
+        found, notes, more = matroska.check(f, b, ds, size if seg_size is None else min(size, ds + seg_size), edit_tail, cue_data)
+        rfc = dict(found, **({"padding" if edit_tail <= config.TAIL_MIN else "tail": [f"{edit_tail} bytes past the Segment end"]} if edit_tail else {}),
+                   **({"enclosed": [f"{gap[1]} zero bytes after the Cues"]} if gap else {}), **({"layout": [layout]} if layout else {}))
         out = dict(duration=round(dur, 3), cues=cues, cue_end=cue_end, short=short, failed_edit=failed, video=None, audio=None, end=None,
-                   read=read, issue=[], blocked=[], tail=-short if short is not None and -short > config.TAIL_MIN else 0,
-                   edit_tail=edit_tail, edit_blocked=None if edit_tail else [], enclosed=gap and gap[0], enclosed_size=gap[1] if gap else 0,
-                   first=bool(little or cues is not True or gap))
-        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not out["tail"] and not layout and not gap and not (edit and edit_tail):
-            return out   # the common case, read in two small parts
-        out["edit_blocked"] = []
+                   read=read + more, issue=[], blocked=[], tail=-short if short is not None and -short > config.TAIL_MIN else 0,
+                   edit_tail=edit_tail, edit_blocked=[], enclosed=gap and gap[0], enclosed_size=gap[1] if gap else 0,
+                   first=bool(little or cues is not True or gap), rfc=rfc, notes=notes)
+        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not rfc:
+            out["took"] = round(time.monotonic() - t0, 3)
+            return out   # the common case, read in a few small parts
         kinds, ends = [k for k in ("video", "audio") if k in tracks.values()], None
         # The Segment end. The bytes past it may hold the Clusters of an older copy. stream_ends() cannot walk enclosed zeros.
         stop = gap[0] if gap else size + min(0, short or 0)
@@ -464,16 +473,19 @@ def header_probe(path, j, edit=False):
                 joined = "the bytes past the Segment end start another Matroska file"
                 out["blocked"] += [joined] if out["tail"] else []
                 out["edit_blocked"].append(joined)
+    out["took"] = round(time.monotonic() - t0, 3)
     if little:
         out["issue"].append(f"the Segment size promises {short} bytes past the end of the file after the hook's own edit of it failed")
-    if out["tail"]:   # a shorter copy written over an older one leaves the old bytes behind
-        out["issue"].append(f"the file holds {out['tail']} bytes past the end of its Matroska Segment")
+    if edit_tail:   # padding, or a shorter copy written over an older one leaves the old bytes behind
+        out["issue"].append(f"the file holds {edit_tail} bytes past the end of its Matroska Segment")
     if cues is not True:
         out["issue"].append(f"no usable Cues index: {cues}")
     if layout:   # a remux writes a new layout, see layout_fault()
         out["issue"].append(f"the header layout breaks the Matroska rules: {layout}")
     if gap:
         out["issue"].append(f"the Matroska Segment holds {gap[1]} zero bytes after its Cues, and no element starts there")
+    if found:
+        out["issue"].append(rfc_issue(found))
     got = {k: [e for i, e in (ends or {}).items() if tracks.get(i) == k] for k in ("video", "audio")}
     if ends is None:
         out["blocked"].append("no stream end could be read from the last clusters")
@@ -533,13 +545,37 @@ def header_probe(path, j, edit=False):
     return out
 
 
-def header_of(path, j=None, edit=False):
+RFC_ISSUE = "the header breaks RFC 9559: "   # the start of the issue of matroska.check()'s faults
+RFC_SHOWN = 3   # faults the issue names
+
+
+def rfc_issue(found):
+    """The issue of the faults of matroska.check(), {kind: [text]}: RFC_ISSUE, then the first RFC_SHOWN faults."""
+    texts = [x for k in matroska.KINDS for x in found.get(k, ())]
+    return RFC_ISSUE + "; ".join(texts[:RFC_SHOWN]) + (f", and {len(texts) - RFC_SHOWN} more" if len(texts) > RFC_SHOWN else "")
+
+
+def rfc_again(now, hp):
+    """The faults of matroska.check() in the header stage now of a remux when the header stage hp of its original
+    holds each of them too. mkvmerge then wrote them again. [] when there is none, or when one is new."""
+    texts = lambda h: [x for k in matroska.KINDS for x in ((h or {}).get("rfc") or {}).get(k, ())]
+    new = texts(now)
+    return new if new and set(new) <= set(texts(hp)) else []
+
+
+def padding_only(hp):
+    """Whether the only issue of the header stage hp is padding. Padding is up to TAIL_MIN bytes past the Segment end,
+    which no reader notices. The library pass leaves such a file alone, see docs/design.md, "RFC 9559 check"."""
+    return bool(hp) and list(hp.get("rfc") or ()) == ["padding"] and len(hp["issue"]) == 1
+
+
+def header_of(path, j=None):
     """header_probe() of a .mkv file, None for another file or when the probe fails. A failure never costs the video
-    check. The job's time limit passes. edit is as in header_probe()."""
+    check. The job's time limit passes."""
     if not path.lower().endswith(".mkv"):
         return None
     try:
-        return header_probe(path, j or mkvmerge(path), edit)
+        return header_probe(path, j or mkvmerge(path))
     except content.OutOfTime:
         raise
     except Exception:
@@ -816,7 +852,8 @@ def whole_check(path, stop=lambda: None):
     outlives the check. The zeros field holds the runs in bytes, in "at" as shares of the size, and in "count" the runs
     that count. fault is zero-filled for a certain verdict. A byte of the read pass that starts the file's zero_pad()
     moves from pos to padding, because no player reads it. when holds the play_times() of the other bytes, and in the
-    zeros field those of the first byte of each run."""
+    zeros field those of the first byte of each run. When the pass printed a line, tail holds the count of bytes past
+    the Segment end, and tail_errors says whether they make ffmpeg read the last element again, see tail_errors()."""
     size, t0, pcm = os.path.getsize(path), time.monotonic(), pcm_audio(path)
     bound = max(WHOLE_MIN, size / WHOLE_RATE)
     took = lambda t: round(time.monotonic() - t, 1)
@@ -843,6 +880,8 @@ def whole_check(path, stop=lambda: None):
                     keep = [b for b in out["pos"] if b != pad]
                     out.update(pos=keep, at=[round(b / size, 4) for b in keep], padding=pad)
                 out["when"] = play_times(path, out["pos"])
+            if out and out["lines"] and (short := segment_short(path) or 0) < 0:   # bytes past the Segment end, see decide.whole_verdict()
+                out.update(tail=-short, tail_errors=tail_errors(path))
             ff = dict(out or {"skipped": stopped}, took=took(t0), code=p.returncode)
     finally:
         if p.poll() is None:   # a stop or an error: no ffmpeg outlives the check
@@ -851,6 +890,17 @@ def whole_check(path, stop=lambda: None):
         p.stderr.close()
     certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
     return certain, zero, more, {"zeros": zeros, "ffmpeg": ff, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
+
+
+def tail_errors(path):
+    """Whether the bytes past the Segment end of the Matroska file path make ffmpeg read its last element again, the
+    tail_errors fault of matroska.check(). False for another file and for a file with no such bytes."""
+    with open(path, "rb") as f:
+        size = f.seek(0, 2); f.seek(0); b = f.read(config.HEADER_READ)
+        seg = decide.segment_start(b)
+        if not seg or seg[1] is None or seg[0] + seg[1] >= size:
+            return False
+        return "tail_errors" in matroska.check(f, b, seg[0], seg[0] + seg[1], size - seg[0] - seg[1])[0]
 
 
 def stream_gap(path, video):
@@ -1009,9 +1059,17 @@ def check_video(path, dur, again=False, hp=None, pcm=None, by=None):
     still block a header repair, as they do in any other file. Another container keeps the probe's verdict.
 
     by is the stream option of window(), see window_stream(). None reads it from the file.
+
+    frame_rate holds the share of the windows' frame steps that are off the film's usual frame length, and whether that
+    makes the rate variable, see decide.off_rate(). It is logged only.
     """
     pcm = pcm_audio(path) if pcm is None else pcm
     certain, doubts, fields = video_stages(path, dur, again, hp, pcm, by)
+    steps = collections.Counter()
+    for w in (fields.get("windows") or {}).get("list") or []:
+        steps.update(w.get("steps") or {})
+    if (off := decide.off_rate(steps)) is not None:
+        fields["frame_rate"] = {"off": round(off, 4), "variable": off >= decide.VFR_SHARE}
     h = fields["header"]
     if hp and hp["issue"]:
         z, w = fields.get("zeros") or {}, fields.get("windows") or {}

@@ -418,6 +418,49 @@ def test_the_decision_rules(monkeypatch):
         pass
 
 
+def songs_probe(*subs):
+    """A mkvmerge -J probe of 100 minutes: one English audio track titled English, then English subtitles (title,
+    default, forced flag, frames). UIDs count from 1. frames None leaves out mkvmerge's statistics tag."""
+    ts = [{"type": "audio", "properties": {"language": "eng", "track_name": "English", "default_track": True, "uid": 1}}]
+    ts += [{"type": "subtitles", "properties": dict(language="eng", track_name=title, default_track=dflt, forced_track=forced, uid=k,
+                                                    **({} if frames is None else {"tag_number_of_frames": str(frames)}))}
+           for k, (title, dflt, forced, frames) in enumerate(subs, 2)]
+    return {"container": {"properties": {"duration": 6000 * 10**9, "writing_application": "mkvmerge v102.0"}}, "tracks": ts}
+
+
+# A full English default, an SDH track and the song lyrics of an English film, with no statistics tags
+REPORTED = (("English", True, False, None), ("English SDH", False, False, None), ("Songs", False, False, None), ("Songs (SDH)", False, False, None))
+
+
+def test_a_songs_track_in_the_original_language_is_lyrics(monkeypatch):
+    """Owner 2026-10-20: a subtitle whose title names songs and no other signs word, in the item's original language,
+    holds the lyrics. A viewer of the original audio hears the songs, so the track is never forced and never becomes a
+    default. In another language it translates the songs and stays forced."""
+    monkeypatch.setattr(decide, "POLICY", decide.POLICY)
+    decide.set_policy(TEST_POLICY)
+    # in the reported file, the full English default goes off, and nothing turns on
+    d = decide.decide(songs_probe(*REPORTED), "English")
+    assert d["edits"] == [["track:=2", 0, 1]] and "forced_english_on" not in d["reasons"], d
+    assert [t["role"] for t in d["tracks"]] == ["main", "full", "sdh", "lyrics", "sdh"]
+    # a sparse lyrics track stays off too. Its density never gives it the forced role
+    d = decide.decide(songs_probe(("English", True, False, 1500), ("Songs", False, False, 30)), "English")
+    assert d["edits"] == [["track:=2", 0, 1]], d
+    # a lyrics track the release flags forced keeps the flag and loses its default, sparse or dense
+    for frames in (30, 900):
+        d = decide.decide(songs_probe(("English", True, False, 1500), ("Songs", True, True, frames)), "English")
+        assert d["edits"] == [["track:=2", 0, 1], ["track:=3", 0, 1]] and not d["undecided"], d
+    # in an English dub of a Japanese film, the English "Songs" track translates the songs. It stays forced and turns on
+    d = decide.decide(songs_probe(*REPORTED), "Japanese")
+    assert d["edits"] == [["track:=2", 0, 1], ["track:=4", 1, 0]] and d["tracks"][3]["role"] == "forced", d
+    # "Signs & Songs" names signs too, so it stays forced in an English film. So does "Songs" with no original language.
+    signs = [("Signs & Songs",) + x[1:] if x[0] == "Songs" else x for x in REPORTED]
+    for j, original in ((songs_probe(*signs), "English"), (songs_probe(*REPORTED), None)):
+        d = decide.decide(j, original)
+        assert d["edits"] == [["track:=2", 0, 1], ["track:=4", 1, 0]] and d["tracks"][3]["role"] == "forced", d
+    # the Original language flag of a song track in the original language follows its read text, as before
+    assert flags(tracks(("subtitles", "jpn", {"track_name": "Songs"})), read={"s1": "jpn"}) == {"track:=1": (1, None)}
+
+
 TABLE = decide.language_table("English language name | ISO 639-3 code | ISO 639-2 code | ISO 639-1 code\n-----+-----\n"
                               "English | eng | eng | en\nJapanese | jpn | jpn | ja\nFrench | fre | fre | fr\nUndetermined | und | und |")
 

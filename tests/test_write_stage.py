@@ -9,38 +9,43 @@ import copy
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
+import threading
 import types
 
 import pytest
 
-from test_arr_media_guard import (HEADER_HP, REAL_FLOCK, REF, SHAPES, analyzes, burn, decided, english_film, enqueue, env, garbled_av,  # noqa: F401
-                                  garbled_run, hearing, hook, japanese_burn, last_decided, layouts, log_lines, mk, queue_analysis, sub_probe,
-                                  sub_time_film, talk, verdict)
+from test_arr_media_guard import (FLAG_PASS, HEADER_HP, REAL_EXIT, REAL_FLOCK, REF, SHAPES, SILENCE, analyzes, backfill_films, burn, claimed,  # noqa: F401
+                                  convertible, decided, english_film, enqueue, env, films, finals, garbled_av, garbled_run, grabbed, hearing, hook,
+                                  japanese_burn, last_decided, late_english_film, layouts, log_lines, mk, mkvs, mp4_import, mp4_named_mkv,
+                                  one_alert_film, pool, posted, queue_analysis, radarr_extras, real_convert, real_fork, real_wait, regrabs_counted,
+                                  run_worker, silent, sub_probe, sub_time_film, talk, took_out, trace, traced, two_lines, upgrade, verdict,
+                                  wrong_film)
 
 D = hook.arr_decide
+REAL_RESUB = hook.resub
 TRACKS_LATE = "Tracks sits after the first Cluster, and no SeekHead before it lists it"
 LAYOUT = f"the header layout breaks the Matroska rules: {TRACKS_LATE}"
 LAYOUT_HP = dict(HEADER_HP, issue=[f"{LAYOUT}"], first=False, edit_tail=0, edit_blocked=[], enclosed=None, tail=0)
 JOINED = "the bytes past the Segment end start another Matroska file"
 
 
-def header_issue(env, monkeypatch, result=("header_repaired", "header repaired"), after=None, repairable=True, on_edit=(), **hp):
-    """A file whose header has the layout issue LAYOUT_HP, with the fields hp, until a remux ran. The probe with edit
-    gives edit_blocked on_edit for edit_blocked None. The video check finds damage unless repairable, and records the issue
-    it got. repack() records (apply, its edits) for each call. An applied one that works writes the new file under a
-    new inode, as Swap's rename leaves it: one more byte, and the probe after, else the file's probe with the edits
-    applied. result is what an applied repack() gives. Returns the calls."""
-    calls = {"probes": 0, "checks": [], "repairs": [], "done": False, "edit": []}
+def header_issue(env, monkeypatch, result=("header_repaired", "header repaired"), after=None, repairable=True, **hp):
+    """A file whose header has the layout issue LAYOUT_HP, with the fields hp, until a remux ran. The video check finds
+    damage unless repairable, and records the issue it got. repack() records (apply, its edits) for each call. An
+    applied one that works writes the new file under a new inode, as Swap's rename leaves it: one more byte, and the
+    probe after, else the file's probe with the edits applied. result is what an applied repack() gives. Returns the
+    calls."""
+    calls = {"probes": 0, "checks": [], "repairs": [], "done": False}
     issue = dict(LAYOUT_HP, **hp)
     for i, t in enumerate(env["probe"]["tracks"]):   # mkvmerge -J numbers the tracks, and a remux maps the edits by them
         t["id"] = i
 
-    def header_of(path, j=None, edit=False):
+    def header_of(path, j=None):
         calls["probes"] += 1
-        calls["edit"].append(edit)
-        return None if calls["done"] else dict(copy.deepcopy(issue), **({"edit_blocked": issue["edit_blocked"] or list(on_edit)} if edit else {}))
+        return None if calls["done"] else copy.deepcopy(issue)
 
     def video_check(path, again=False, j=None, hp=None):
         calls["checks"].append(hp and hp["issue"])
@@ -125,23 +130,26 @@ def test_a_failed_remux_of_a_file_with_a_tail_keeps_its_flags(env, monkeypatch):
 
 
 TAIL = "a flag edit would put the 700 bytes past its end inside the Matroska Segment"
+PAD = "the file holds 700 bytes past the end of its Matroska Segment"
+PADDED = dict(issue=[PAD], edit_tail=700, rfc={"padding": ["700 bytes past the Segment end"]})   # the header stage of 700 bytes of padding
 
 
-def test_flag_edits_of_a_file_with_a_tail_ride_one_remux(env, monkeypatch):
-    """A tail with no issue plans no remux. The flag edits then take one header repair in place of mkvpropedit, after
-    the probe with edit and the video check that any header repair gets."""
-    calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, result=("tail_removed", "tail removed"))
+def test_a_tail_and_the_flag_edits_take_one_remux(env, monkeypatch):
+    """Owner 2026-10-20: bytes past the Segment end are a header issue at any count. The import plans the header
+    repair, and the flag edits ride it in place of mkvpropedit. The video check of the import looks for damage first."""
+    calls = header_issue(env, monkeypatch, **PADDED, result=("tail_removed", "tail removed"))
     hook.main([])
     rec = decided(env)
     assert rec["edits"] and calls["repairs"] == [(True, rec["edits"])] and env["mkvpropedit"] == [], calls
-    assert calls["edit"] == [False, True] and calls["checks"] == [[], [TAIL]], calls   # the import's video check, then the one of the remux
+    assert calls["checks"] == [[PAD]], calls
     assert (rec["outcome"], rec["reasons"][0], rec["header_repair"]["code"]) == ("edited", "tail_removed", "tail_removed"), rec
-    assert rec["header_repair"]["issue"] == [TAIL]
+    assert rec["header_repair"]["issue"] == [PAD] and rec["rfc"] == PADDED["rfc"]
 
 
 def test_damage_keeps_the_flags_of_a_file_with_a_tail(env, monkeypatch):
-    """The video check of the remux finds damage, and mkvpropedit would enclose the tail, so the run writes nothing."""
-    calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, repairable=False)
+    """The video check finds damage, so no repair runs, and mkvpropedit would enclose the tail, so the run writes
+    nothing."""
+    calls = header_issue(env, monkeypatch, **PADDED, repairable=False)
     hook.main([])
     rec = decided(env)
     assert calls["repairs"] == [] and env["mkvpropedit"] == [] and rec["outcome"] == "edit_failed", rec
@@ -150,12 +158,13 @@ def test_damage_keeps_the_flags_of_a_file_with_a_tail(env, monkeypatch):
 
 def test_an_edit_blocked_tail_writes_nothing(env, monkeypatch):
     """Another Matroska file past the Segment end blocks the remux. The run writes nothing, keeps the flags and alerts."""
-    calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=[JOINED])
+    calls = header_issue(env, monkeypatch, **dict(PADDED, edit_blocked=[JOINED]))
     hook.main([])
     rec = decided(env)
     assert calls["repairs"] == [] and env["mkvpropedit"] == [] and rec["outcome"] == "edit_failed", rec
     assert rec["result"] == f"not edited, as a flag edit would put the 700 bytes past its end inside the Matroska Segment: {JOINED}"
-    assert [f["kind"] for f in rec["findings"]] == ["edit"] and "header_repair" not in rec and rec["after"] == rec["before"]
+    assert [f["kind"] for f in rec["findings"]] == ["edit"] and rec["after"] == rec["before"]
+    assert (rec["header_repair"]["code"], rec["header_repair"]["edit"]) == ("header_repair_skipped", True), rec["header_repair"]
     assert rec["alerts"][0].endswith("The file still opens, and its default tracks are the Portuguese audio (track 1) and the Portuguese subtitles (track 1)."), rec["alerts"]
 
 
@@ -301,10 +310,10 @@ def test_a_failed_remux_keeps_the_flags_of_a_garbled_track_it_was_to_take_out(en
 
 
 def test_edit_blocked_bytes_stop_the_subtitle_remux_too(env, monkeypatch):
-    """The subtitle remux would drop another Matroska file past the Segment end, which the probe with edit finds. The
+    """The subtitle remux would drop another Matroska file past the Segment end, which the header check finds. The
     run writes nothing."""
     calls, got, rec = subtitle_run(env, monkeypatch, [("eng", True, {})], {"s1": talk.cues(talk.RIGHT, offset=1.2)},
-                                   issue=[], edit_tail=700, edit_blocked=None, on_edit=[JOINED])
+                                   **dict(PADDED, edit_blocked=[JOINED]))
     assert got == [] and calls["repairs"] == [] and env["mkvpropedit"] == [] and rec["outcome"] == "edit_failed", rec
     assert rec["subremux"]["result"] == f"subtitle remux skipped, {JOINED}" and rec["subremux"]["codes"] == ["subtitle_remux_skipped"]
 
@@ -386,7 +395,8 @@ def made(layouts, tmp_path, name, tail=b""):
 
 
 def no_room(src, dst):
-    """src, ffmpeg's file, with the Void after its first SeekHead turned into an empty SeekHead that holds it. A grown
+    """src, ffmpeg's file, with the Void after its first SeekHead turned into a second SeekHead that holds it. That one
+    lists the first Cluster, as RFC 9559 wants a Seek in each SeekHead and only Clusters in a second one. A grown
     SeekHead then has no room in front, so mkvpropedit moves Tracks past the Clusters and chains a second SeekHead."""
     b = bytearray(src.read_bytes())
     ds = D.segment_start(bytes(b[:64]))[0]
@@ -394,7 +404,8 @@ def no_room(src, dst):
     v = D.element(bytes(b), sh[1] + sh[2])
     assert sh[0] == D.SEEKHEAD and v[0] == D.VOID, (sh, v)
     at, n = sh[1] + sh[2], v[1] + v[2] - sh[1] - sh[2]
-    b[at:at + n] = D.SEEKHEAD.to_bytes(4, "big") + bytes([0x80 | n - 5, D.VOID, 0x80 | n - 7]) + bytes(n - 7)
+    seek = bytes.fromhex("4dbb8e53ab841f43b67553ac84") + (bytes(b).find(D.CLUSTER.to_bytes(4, "big"), ds) - ds).to_bytes(4, "big")
+    b[at:at + n] = D.SEEKHEAD.to_bytes(4, "big") + bytes([0x80 | n - 5]) + seek + bytes([D.VOID, 0x80 | n - 7 - len(seek)]) + bytes(n - 7 - len(seek))
     dst.write_bytes(b)
     return str(dst)
 
@@ -428,8 +439,8 @@ def test_an_edit_that_breaks_the_layout_is_repaired_in_the_same_run(layouts, tmp
     seen = runs(monkeypatch)
     rec = hook.edit({"path": path}, j, edits, True)
     assert (rec["outcome"], rec["header_repair"]["code"], writes(seen), blocked) == ("edited", "header_repaired", (1, 1), [False]), rec
-    assert rec["header_repair"]["issue"] == [LAYOUT] and "layout" not in rec
-    assert hook.layout_of(path) is None and D.unapplied(hook.mkvmerge(path), edits) == [] and hook.muted(path)
+    assert rec["header_repair"]["issue"] == [LAYOUT, hook.RFC_ISSUE + "Segment: 3 SeekHead elements, where RFC 9559 allows 2"] and "layout" not in rec
+    assert hook.layout_of(path) is None and D.unapplied(hook.mkvmerge(path), edits) == [] and hook.muted(path) and hook.header_of(path)["rfc"] == {}
     assert [r.get("outcome", r["result"]) for r in log_lines(None)] == ["editing", "header_repaired"]
 
 
@@ -530,10 +541,10 @@ def test_the_content_checks_run_after_a_repair_inside_the_flag_edit(env, monkeyp
     Either replaces the file. The run then probes the new file, so the metadata checks read it, and the decision line
     holds its size."""
     if fix == "tail":
-        calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, result=("tail_removed", "tail removed"))
+        calls = header_issue(env, monkeypatch, **PADDED, result=("tail_removed", "tail removed"))
     else:   # the header check finds no issue, and the edit breaks the layout
         calls, fake = header_issue(env, monkeypatch), hook.header_of
-        monkeypatch.setattr(hook, "header_of", lambda path, j=None, edit=False: fake(path, j, edit) if env["mkvpropedit"] else dict(fake(path, j, edit), issue=[]))
+        monkeypatch.setattr(hook, "header_of", lambda path, j=None: fake(path, j) if env["mkvpropedit"] else dict(fake(path, j), issue=[]))
         monkeypatch.setattr(hook, "layout_of", lambda path: None if calls["done"] else TRACKS_LATE)
     hook.mute_mark(env["path"])   # a burn-in job turned the subtitles off before, and the new file keeps its mark
     hook.main([])
@@ -587,7 +598,7 @@ def test_unedited_takes_back_both_language_tags():
 
 
 def test_a_failed_tail_remux_inside_the_flag_edit_keeps_the_flags(env, monkeypatch):
-    calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, result=("header_repair_failed", "header repair failed: mkvmerge exited 2"))
+    calls = header_issue(env, monkeypatch, **PADDED, result=("header_repair_failed", "header repair failed: mkvmerge exited 2"))
     hook.main([])
     rec = decided(env)
     assert len(calls["repairs"]) == 1 and env["mkvpropedit"] == [] and rec["outcome"] == "edit_failed", rec
@@ -629,10 +640,10 @@ def test_a_deep_analysis_checks_edit_blocked_before_its_remux(env, monkeypatch, 
     the Segment end stops the subtitle remux, which would drop it."""
     settings(subtitles="deep")
     got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
-    calls = header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, on_edit=[JOINED])
+    calls = header_issue(env, monkeypatch, **dict(PADDED, edit_blocked=[JOINED]))
     hook.deep_analysis(queue_analysis(env, env["path"]), [])
     rec = [r for r in log_lines(env) if r.get("source") == "deep_analysis" and "schema" in r][-1]
-    assert got == [] and calls["edit"] == [False, True] and rec["subremux"]["codes"] == ["subtitle_remux_skipped"], (got, rec.get("subremux"))
+    assert got == [] and calls["probes"] and rec["subremux"]["codes"] == ["subtitle_remux_skipped"], (got, rec.get("subremux"))
 
 
 def stop_in_layout_repair(layouts, tmp_path, settings, monkeypatch, sig, handler):
@@ -640,7 +651,7 @@ def stop_in_layout_repair(layouts, tmp_path, settings, monkeypatch, sig, handler
     arrives while the repair writes its temp file, with handler as the process's own handler of sig. Returns (the
     record, the path, the edits)."""
     settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
-    monkeypatch.setattr(hook, "STOP", {"held": False, "asked": False, "term": None})
+    monkeypatch.setattr(hook, "STOP", {"held": False, "asked": False, "term": None, "skipped": False})
     (tmp_path / "Movie (2000)").mkdir()
     path = no_room(layouts["ffmpeg"], tmp_path / "Movie (2000)" / "chain.mkv")
     j = hook.mkvmerge(path)
@@ -654,11 +665,12 @@ def stop_in_layout_repair(layouts, tmp_path, settings, monkeypatch, sig, handler
         signal.signal(sig, old)
 
 
-def test_a_stop_during_the_layout_repair_lets_a_job_run_to_its_end(layouts, tmp_path, settings, monkeypatch):
+def test_a_stop_during_the_layout_repair_lets_a_job_end_with_its_line(layouts, tmp_path, settings, monkeypatch):
     """A job process runs job_term(). SIGTERM during fix 1's remux removes its temp file and keeps the edit. The job
-    then runs to its end and writes its decision line, as after any edit."""
+    then ends the step in flight and writes its decision line. The cut repair marks the job to go back."""
     rec, path, edits = stop_in_layout_repair(layouts, tmp_path, settings, monkeypatch, signal.SIGTERM, hook.job_term)
-    assert (rec["outcome"], rec["header_repair"]["code"], hook.STOP) == ("edited", "header_not_repaired", {"held": True, "asked": True, "term": None}), rec
+    assert (rec["outcome"], rec["header_repair"]["code"], hook.STOP) == \
+        ("edited", "header_not_repaired", {"held": True, "asked": True, "term": None, "skipped": True}), rec
     assert rec["header_repair"]["result"].startswith("not repaired: the run was stopped. ") and hook.layout_of(path) == TRACKS_LATE
     assert D.unapplied(hook.mkvmerge(path), edits) == [] and not os.path.exists(hook.repack_tmp(path))
 
@@ -678,6 +690,528 @@ def test_a_stop_during_the_layout_repair_reaches_the_backfill(layouts, tmp_path,
     got = []
     rec, path, edits = stop_in_layout_repair(layouts, tmp_path, settings, monkeypatch, sig, lambda s, _: got.append(s))
     assert (rec["outcome"], rec["header_repair"]["code"], got, hook.STOP["term"]) == ("edited", "header_not_repaired", [sig], None), rec
+
+
+def stop_in_backfill(env, monkeypatch, tmp_path, sig, at, argv=FLAG_PASS):
+    """A one-worker backfill apply of two films, run with argv. sig reaches this process when the first remux of the
+    first film calls at, the first step inside its Swap, as Ctrl+C or a stop of the unit does during the remux. With
+    sig None the test sends its own stop. Asserts that the run ends after that film with its decision line, and that
+    the stop raised nothing. The original stays, and no temp file or hidden folder is left. Returns the decision line
+    and the calls of at."""
+    run = hook.subprocess.run
+    backfill_films(env, monkeypatch, tmp_path, 2)
+    monkeypatch.setattr(hook.subprocess, "run", run)   # the env fixture's, which runs a conversion's ionice calls
+    monkeypatch.setattr(hook, "STOP", {"held": False, "asked": False, "term": None, "skipped": False})
+    real, calls = getattr(hook, at), []
+
+    def step(*a, **k):
+        calls.append(a)
+        out = real(*a, **k)
+        if len(calls) == 1 and sig:
+            os.kill(os.getpid(), sig)   # the handler runs here, inside the Swap
+        return out
+    monkeypatch.setattr(hook, at, step)
+    before = open(env["path"], "rb").read()
+    try:
+        hook.main(["--backfill", "radarr", *argv, "--apply"])
+    except BaseException as ex:   # a KeyboardInterrupt or SystemExit here prints a traceback in a terminal
+        pytest.fail(f"the stop raised {ex!r}")
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [r["path"] for r in lines] == [env["path"]], lines   # the second film never starts
+    assert open(env["path"], "rb").read() == before and not os.path.exists(os.path.dirname(hook.repack_tmp(env["path"])))
+    return lines[0], calls
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_a_stop_during_the_header_repair_before_the_checks_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path, sig):
+    """Tester 2026-10-20: Ctrl+C while a header repair remuxed the file printed a KeyboardInterrupt traceback, and the
+    file got no decision line. The repair now hands the stop to the backfill's handler. The issue stays. The run then
+    skips the steps left, so the flag edit and its second remux of the file with bytes past its end never start."""
+    repack = hook.repack
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True, expect=6898.0, edit_tail=700, edit_blocked=None)
+    monkeypatch.setattr(hook, "repack", repack)
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, sig, "new_tmp")
+    hr, stopped = rec["header_repair"], f'not repaired: the run was stopped. The issue: {HEADER_HP["issue"][0]}'
+    assert (hr["code"], hr["result"], hr["stopped"], len(calls), env["mkvpropedit"]) == ("header_not_repaired", stopped, True, 1, []), hr
+    assert (rec["outcome"], rec["result"], rec["not_run"][0], "act" in rec["not_run"]) == \
+        ("stopped", "not checked: the run was stopped", "languages", True), rec
+
+
+@pytest.mark.parametrize("tail", [{}, {"edit_tail": 700, "edit_blocked": None}])
+def test_a_stop_during_the_one_write_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path, tail):
+    """The header repair of the one write carries the flag edits. After a stop there, edit() makes no flag edit, as no
+    write starts after a stop, see refuse(). A file with bytes past its Segment end gets no second remux for them."""
+    repack = hook.repack
+    header_issue(env, monkeypatch, expect=6898.0, **tail)
+    monkeypatch.setattr(hook, "repack", repack)
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp")
+    hr = rec["header_repair"]
+    assert (hr["code"], hr["stopped"], len(calls)) == ("header_not_repaired", True, 1), hr
+    assert hr["result"].startswith("not repaired: the run was stopped. ") and env["mkvpropedit"] == []
+    assert rec["outcome"] == "edit_failed" and "the run was stopped" in rec["result"], rec["result"]
+
+
+def test_a_stop_during_the_remux_of_a_flag_edit_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path):
+    """A flag edit of a file with bytes past its Segment end runs as a remux, see edit(). A stop there leaves the flags,
+    and the line says why."""
+    repack = hook.repack
+    header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, expect=6898.0)
+    monkeypatch.setattr(hook, "repack", repack)
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp")
+    assert (rec["outcome"], rec["header_repair"]["code"], len(calls), env["mkvpropedit"]) == ("edit_failed", "header_not_repaired", 1, []), rec
+    assert ": not repaired: the run was stopped. " in rec["result"], rec["result"]
+
+
+def test_a_stop_during_a_subtitle_remux_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path):
+    """--sub-check --apply retimes a late SubRip track in a remux. A stop there keeps the times, and the line says so."""
+    resub = hook.resub
+    late_english_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "resub", resub)
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "ff_streams", ["--sub-check"])
+    rm = rec["subremux"]
+    assert (rm["result"], rm["done"], rm["stopped"], rm["codes"], len(calls)) == \
+        ("subtitle remux failed: the run was stopped", False, True, ["subtitle_remux_failed"], 1), rm
+
+
+def test_a_stop_during_a_conversion_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path):
+    """A .mkv that holds MP4 converts in a flag backfill. A stop during the remux keeps the original, and the line
+    says why."""
+    mp4_named_mkv(env)
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp")
+    assert (rec["outcome"], rec["result"], rec["repack"]["stopped"], len(calls)) == ("repack_failed", "repack failed: the run was stopped", True, 1), rec
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_a_stop_during_a_sub_time_remux_ends_the_run_after_the_file(env, monkeypatch, sig):
+    """--sub-time --apply of two files. A stop during the first file's remux keeps its times and gives its decision
+    line, as in a backfill. The second file never starts, and the exit code says a planned change did not happen."""
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    monkeypatch.setattr(hook, "STOP", {"held": False, "asked": False, "term": None, "skipped": False})
+    other = env["path"][:-4] + " Other.mkv"
+    shutil.copy(env["path"], other)
+    env["movies"]["movie"].append(dict(env["movies"]["movie/7"], id=8, tmdbId=90002, movieFile={"id": 12, "path": other}))
+    real, calls = hook.ff_streams, []
+    monkeypatch.setattr(hook, "ff_streams", lambda *a, **k: [calls.append(a), real(*a, **k), len(calls) == 1 and os.kill(os.getpid(), sig)][1])
+    before, got = open(env["path"], "rb").read(), None
+    try:
+        hook.main(["--sub-time", env["path"], other, "--apply"])
+    except BaseException as ex:   # a KeyboardInterrupt here prints a traceback in a terminal
+        got = ex
+    assert isinstance(got, SystemExit) and got.code == hook.SUB_TIME_MISSED, repr(got)
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [r["path"] for r in lines] == [env["path"]] and len(calls) == 1, lines   # the second file never starts
+    rm = lines[0]["subremux"]
+    assert (rm["result"], rm["done"], rm["stopped"]) == ("subtitle remux failed: the run was stopped", False, True), rm
+    assert open(env["path"], "rb").read() == before and not os.path.exists(os.path.dirname(hook.repack_tmp(env["path"])))
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_a_stop_between_two_sub_time_files_names_the_file_it_never_ran(env, monkeypatch, capsys, sig):
+    """Reviewer 2026-10-20: a stop after the first file's work, outside any remux, ended --sub-time --apply with exit
+    code 0, and nothing named the second path. The run now names it and exits SUB_TIME_MISSED."""
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
+    other = env["path"][:-4] + " Other.mkv"
+    shutil.copy(env["path"], other)
+    env["movies"]["movie"].append(dict(env["movies"]["movie/7"], id=8, tmdbId=90002, movieFile={"id": 12, "path": other}))
+    real, got = hook.backfill_file, None
+    monkeypatch.setattr(hook, "backfill_file", lambda *a, **k: [real(*a, **k), os.kill(os.getpid(), sig)][0])   # after the file's work
+    try:
+        hook.main(["--sub-time", env["path"], other, "--apply"])
+    except BaseException as ex:   # a KeyboardInterrupt here prints a traceback in a terminal
+        got = ex
+    assert isinstance(got, SystemExit) and got.code == hook.SUB_TIME_MISSED, repr(got)
+    lines = [r for r in log_lines(env) if "schema" in r]
+    assert [(r["path"], r["subremux"]["done"]) for r in lines] == [(env["path"], True)], lines   # the first file's remux ran
+    out = capsys.readouterr().out
+    assert f"--sub-time --apply did not make every change:\n  {other}: not run, the run was stopped\n" in out, out
+
+
+def test_a_stop_during_a_remux_after_a_write_lets_a_job_end_with_its_line(mkvs, tmp_path, monkeypatch, settings):
+    """A job process that has written, as by a conversion, ends the step in flight on SIGTERM and writes its line, see
+    job_term(). A header repair after that write now follows the same rule. Before, stopped() ended the job there, with
+    no decision line. The cut repair marks the job to go back to the queue, see job_process()."""
+    settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
+    monkeypatch.setattr(hook, "STOP", {"held": True, "asked": False, "term": None, "skipped": False})
+    path = tmp_path / "Movie (2000)" / "long.mkv"
+    path.parent.mkdir()
+    shutil.copy(mkvs / "long.mkv", path)
+    before, j = path.read_bytes(), hook.mkvmerge(str(path))
+    real = hook.new_tmp
+    monkeypatch.setattr(hook, "new_tmp", lambda tmp, st, excl=False: real(tmp, st, excl) or os.kill(os.getpid(), signal.SIGTERM))
+    old = signal.signal(signal.SIGTERM, hook.job_term)
+    try:
+        code, result, info = hook.repack(str(path), j, os.stat(path), True, hook.header_of(str(path), j))
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    assert (code, info["stopped"], hook.STOP) == ("header_not_repaired", True, {"held": True, "asked": True, "term": None, "skipped": True}), result
+    assert path.read_bytes() == before and os.listdir(path.parent) == ["long.mkv"]
+
+
+def posts(env):
+    """The Discord posts of the run."""
+    return [b for m, u, b in env["http"] if m == "POST" and "discord.invalid" in u]
+
+
+@pytest.mark.parametrize("case", ["conversion", "tail"])
+def test_a_stop_in_a_backfill_posts_no_alert(env, monkeypatch, tmp_path, case):
+    """Owner 2026-10-20: a stop is the owner's own act, so nothing posts for it. A stopped conversion posted "Conversion
+    to MKV failed". A stopped header repair of a file with bytes past its Segment end made the flag edit refuse its
+    remux and post "Track flag change failed". The decision line still names the stop."""
+    if case == "conversion":
+        mp4_named_mkv(env)
+    else:
+        repack = hook.repack
+        header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True, expect=6898.0, edit_tail=700, edit_blocked=None)
+        monkeypatch.setattr(hook, "repack", repack)
+    rec, _ = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp")
+    assert posts(env) == [], rec.get("alert_result")
+    assert "the run was stopped" in rec["result"] and set(rec.get("alert_result") or []) <= {"not posted, the run was stopped"}, rec
+
+
+def test_a_stop_during_a_subtitle_remux_of_a_job_posts_no_alert(env, monkeypatch):
+    """A job process that has written, as by a conversion, ends the step in flight on SIGTERM and writes its line. A
+    stop that cut its subtitle remux posted the subtitle timing alert, which said the rewrite failed. Now nothing posts."""
+    late_english_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    monkeypatch.setattr(hook, "STOP", {"held": True, "asked": False, "term": None, "skipped": False})
+    real, calls = hook.ff_streams, []
+    monkeypatch.setattr(hook, "ff_streams", lambda *a, **k: [calls.append(a), real(*a, **k), len(calls) == 1 and os.kill(os.getpid(), signal.SIGTERM)][1])
+    old = signal.signal(signal.SIGTERM, hook.job_term)
+    try:
+        hook.main([])
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    rec = decided(env)
+    assert (posts(env), len(calls)) == ([], 1), rec.get("alert_result")
+    assert (rec["subremux"]["result"], rec["not_run"]) == \
+        ("subtitle remux failed: the run was stopped", ["after_edit", "content_checks", "quick_check", "alerts"]), rec
+
+
+def test_a_remux_after_a_passed_stop_never_starts(env, monkeypatch, tmp_path):
+    """Reviewer 2026-10-20 (R2): a stop during the header repair before the checks ended that remux, and the run then
+    started the planned subtitle remux of the same file. The live container gives 60 seconds from docker stop to
+    SIGKILL, and a remux has no time limit. Once a stop is asked, no write starts, see refuse(), and no step runs after
+    the one in flight, see process.stop_line(). The line names the steps left out."""
+    late_english_film(env, monkeypatch)
+    monkeypatch.setattr(hook, "resub", REAL_RESUB)
+    repack = hook.repack
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True, expect=6898.0)
+    monkeypatch.setattr(hook, "repack", repack)
+    real, read = hook.ff_streams, []
+    monkeypatch.setattr(hook, "ff_streams", lambda *a, **k: read.append(a) or real(*a, **k))   # the first step of the subtitle remux
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp", ["--sub-check"])
+    hr, rm = rec["header_repair"], rec.get("subremux")
+    assert (hr["code"], hr["stopped"], len(calls)) == ("header_not_repaired", True, 1), hr
+    assert ("subremux" in rec, read, "act" in rec.get("not_run", ())) == (False, [], True), rm
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")   # Python prints the stop a finalizer drops
+def test_a_stop_while_mkvmerge_fails_ends_the_backfill_after_the_file(env, monkeypatch, tmp_path):
+    """Reviewer 2026-10-20 (R4): Ctrl+C kills mkvmerge too, and CPython can drop the raise of stopped() in a finalizer.
+    The remux then failed with an Exception, and the file said "header repair failed". The backfill never set its stop,
+    so the next write raised KeyboardInterrupt as a traceback. A stop that stopped() recorded now makes that failure
+    the stop, and the run ends after the file with its line."""
+    repack = hook.repack
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True, expect=6898.0)
+    monkeypatch.setattr(hook, "repack", repack)
+
+    class Dropped:   # the handler runs inside this finalizer, as in Popen.__del__ after the remux, and its raise is lost
+        def __del__(self):
+            os.kill(os.getpid(), signal.SIGINT)
+    env["during_repack"] = Dropped
+    env["repack_rc"] = 2   # mkvmerge died of the same Ctrl+C
+    rec, calls = stop_in_backfill(env, monkeypatch, tmp_path, None, "new_tmp")
+    hr = rec["header_repair"]
+    assert (hr["code"], hr["stopped"], len(calls), env["mkvpropedit"]) == ("header_not_repaired", True, 1, []), hr
+    assert hr["result"] == f'not repaired: the run was stopped. The issue: {HEADER_HP["issue"][0]}', hr["result"]
+
+
+def test_a_re_grab_after_a_stop_never_starts(env, monkeypatch, settings):
+    """A job process that has written, as by a conversion, ends the step in flight on SIGTERM and writes its line. A stop
+    during its wrong-content check let the re-grab after it delete the file. Now the re-grab runs no second check,
+    counts nothing against REGRAB_CAP and changes nothing. Nothing posts, and the line names the steps left out."""
+    wrong_film(env, monkeypatch)
+    settings(regrab={"audio", "video", "content"})
+    monkeypatch.setattr(hook, "STOP", {"held": True, "asked": False, "term": None, "skipped": False})
+    real = hook.content_probe
+    monkeypatch.setattr(hook, "content_probe", lambda *a, **k: [os.kill(os.getpid(), signal.SIGTERM), real(*a, **k)][1])
+    old = signal.signal(signal.SIGTERM, hook.job_term)
+    try:
+        hook.main([])
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    rec = decided(env)
+    assert (env["writes"], posts(env), hook.store.get("regrabs", "radarr")) == ([], [], None), env["writes"]
+    assert (rec["outcome"], rec["regrab"], rec["not_run"]) == ("regrab_failed", "failed", ["quick_check", "alerts"]), rec
+    assert rec["findings"][0]["action"]["step"] == "the second check" and rec["alert_result"] == [hook.STOPPED_RESULT], rec["findings"]
+
+
+def test_a_conversion_in_a_thread_never_swaps_after_a_stop(convertible, tmp_path, monkeypatch):
+    """A --convert apply converts in threads, and a stop never cuts a remux there. The swap after the remux then never
+    starts. The original stays, and the result names the stop."""
+    mp4 = real_convert(convertible, tmp_path, monkeypatch)
+    before, stop, got = mp4.read_bytes(), threading.Event(), []
+    monkeypatch.setattr(hook, "STOP", {"held": False, "asked": False, "term": None, "skipped": False})
+    monkeypatch.setattr(hook, "relink", lambda app, owner, old, items, target, imports=None:
+                        (True, {"import": "completed", "file_id": 12, "listed": [target], "remonitored": []}))
+    prove = hook.prove
+
+    def proof(*a, **k):   # the stop comes during the proof, and the main thread's handler takes it
+        os.kill(os.getpid(), signal.SIGTERM)
+        for _ in range(500):
+            if hook.STOP["asked"]:
+                break
+            real_wait(0.01)
+        return prove(*a, **k)
+    monkeypatch.setattr(hook, "prove", proof)
+    with hook.stops(stop):
+        t = threading.Thread(target=lambda: got.append(hook.convert("radarr", str(mp4), hook.mkvmerge(str(mp4)), os.stat(mp4), True,
+                                                                    {"app_id": 7, "file_id": 11})))
+        t.start()
+        t.join()
+    _, result, info, now = got[0]
+    assert (result, info.get("stopped"), now, stop.is_set()) == ("repack failed: the run was stopped", True, str(mp4), True), result
+    assert mp4.read_bytes() == before and not os.path.exists(hook.held_name(str(mp4))) and not (mp4.parent / "Movie (2020).mkv").exists()
+
+
+def test_a_job_that_a_stop_kept_from_a_write_goes_back_to_the_queue(pool, monkeypatch):
+    """Docket 66: docker stop gives a job process 60 seconds before SIGKILL, and a remux has no time limit. SIGTERM
+    during mkvpropedit lets the edit end. The layout repair after it then never starts. The job writes its line, keeps
+    its Plex analyze, exits soon, and goes back to the queue, so the next start repairs the file."""
+    (path,) = films(pool, 1)
+    run, edited = hook.subprocess.run, []
+
+    def edit(argv, **kw):   # the stop reaches the coordinator while mkvpropedit writes
+        if argv[0] == "mkvpropedit":
+            trace("sigterm")
+            os.kill(os.getppid(), signal.SIGTERM)
+            real_wait(1.0)
+            edited.append(argv)
+        return run(argv, **kw)
+    monkeypatch.setattr(hook.subprocess, "run", edit)
+    monkeypatch.setattr(hook, "header_of", lambda p, j=None, edit=False: dict(LAYOUT_HP, expect=6898.0) if edited else None)
+    monkeypatch.setattr(hook, "layout_of", lambda p: TRACKS_LATE)   # mkvpropedit moved Tracks past the Clusters
+    monkeypatch.setattr(hook, "whole_plan", lambda rec: {"gap": None})   # an import queues its whole-file check
+    no_damage(monkeypatch)
+    real_tmp = hook.new_tmp
+    monkeypatch.setattr(hook, "new_tmp", lambda tmp, st, excl=False: trace("tmp") or real_tmp(tmp, st, excl))
+    name = enqueue(pool, 0, path, owner="1")
+    coordinator = real_fork()
+    if not coordinator:
+        try:
+            run_worker()
+        finally:
+            REAL_EXIT(0)
+    assert os.waitstatus_to_exitcode(os.waitpid(coordinator, 0)[1]) == 0
+    took = hook.time.perf_counter() - traced("sigterm")[0]["t"]
+    hr = finals(pool, "header_repair")[path]
+    assert (finals(pool)[path], hr["code"], hr.get("stopped"), traced("tmp")) == ("edited", "header_not_repaired", True, []), hr
+    assert hook.queued() == [name] and not claimed(), hook.queued()   # back in the queue, with no crash counted
+    assert hook.store.read("SELECT name FROM jobs") == [(name,)]   # its next run queues the jobs that follow an import
+    assert [k["path"] for k in hook.store.get("plex", "pending")] == [path] and took < 30, took
+
+
+def term(sig=signal.SIGTERM):
+    """sig to the main thread. os.kill() signals the process, and while no_stop() blocks sig in the main thread, another
+    thread of the test worker can take it and hand it on steps later, under load. The 2.17.0 round fixed that flake so."""
+    signal.pthread_kill(threading.main_thread().ident, sig)
+
+
+def job_run(name=None, held=False):
+    """One run of a job as a job process runs it, see runner.job_process(): the job claimed, SIGTERM to job_term() and
+    STOP fresh. held is a job that has written before, as by a conversion. With no name, it queues the job of the app's
+    event first, as hook() does. Returns the name. requeue() then puts the job back, as finished() does."""
+    name = name or hook.queue_job(hook.Event.from_env("radarr").job())
+    assert hook.claim(name)
+    hook.STOP.update(held=held, asked=False, term=None, skipped=False)
+    old = signal.signal(signal.SIGTERM, hook.job_term)
+    try:
+        hook.run_job(name, [], claimed=True)
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    return name
+
+
+def at_import(env):
+    """SIGTERM while the app imports the converted file, inside the swap's no_stop(). job_term() runs when the swap ends."""
+    real = env["on_write"]
+    env["on_write"] = lambda a, p, method, body: (p == "command" and body["name"] == "ManualImport" and term()) \
+        or real(a, p, method, body)
+    return real
+
+
+def titles(env):
+    return [e["title"] for b in posts(env) for e in b["embeds"]]
+
+
+def test_a_stop_after_an_import_conversion_lets_the_next_run_settle_its_extras(env, monkeypatch):
+    """Reviewer 2026-10-20 (P8): SIGTERM during the import of the converted file let the swap end, and the job stopped
+    before after_edit(). The two extras Radarr listed stayed hidden, and the next worker start posted "Stopped
+    conversion". The job goes back, and its next run settles them, as after_edit() does. The worker start leaves the
+    pending conversion of a queued job to that run. It still reports a converted entry of another path and a held entry
+    of the job's path. The job's run settles neither."""
+    mp4, mkv, extras, rows, recycled = radarr_extras(env, monkeypatch)
+    real = at_import(env)
+    name = job_run()
+    folder, ((key, entry),) = os.path.dirname(mkv), hook.pending_edit().items()
+    assert (decided(env)["outcome"], sorted(os.listdir(os.path.join(folder, hook.CFG.hide_dir))), entry["state"]) == ("stopped", extras, "converted")
+    env["on_write"] = real
+    hook.requeue(name)
+    entry = dict(entry, pid=entry["pid"] + 1)   # the job process exited
+    hook.pending_edit(key, entry)
+    other = os.path.join(os.path.dirname(folder), "Film B (1981)", "Film B (1981).mkv")
+    others = {"radarr:8:other": dict(entry, owner=8, path=other[:-4] + ".mp4", new=other, old_id=21, extras=[]),
+              "radarr:7:held": dict(entry, state="held", extras=[])}   # a kill cut this one before the import
+    for k, e in others.items():
+        hook.pending_edit(k, e)
+    monkeypatch.setattr(hook, "job_alive_pid", lambda pid, start=None: False)
+    assert (sorted(hook.pending_recover("radarr", False)), len(posts(env))) == (sorted(others), 2)   # the worker start
+    job_run(name)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (rec["path"], rec["settle"].get("linked"), sorted(hook.pending_edit())) == (mkv, 2, sorted(others)), rec.get("settle")
+    assert set(extras) <= set(os.listdir(folder)) and hook.CFG.hide_dir not in os.listdir(folder) and len(posts(env)) == 2, os.listdir(folder)
+
+
+def test_a_stop_after_an_import_conversion_still_posts_its_unreadable_notice(env, monkeypatch):
+    """Reviewer 2026-10-20 (P1): the conversion of an import took out a broken subtitle track, then SIGTERM landed during
+    the import of the new file. The notice that names the track never posted, and the next run finds nothing to take
+    out. It now posts."""
+    mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
+    took_out(monkeypatch, mkv)
+    at_import(env)
+    job_run()
+    rec = decided(env)
+    assert (rec["outcome"], rec["alert_kinds"], rec["alert_result"], titles(env)) == ("stopped", ["unreadable"], ["sent"], ["Unreadable subtitles"]), rec
+
+
+def test_a_stop_after_a_restore_that_deleted_the_file_still_posts_it(env, monkeypatch):
+    """Reviewer 2026-10-20 (P1): a manual import with broken audio, and its old file left the bin. The restore deletes
+    the import, so the item has no file. SIGTERM during the delete lets the restore end. The run posted nothing, its
+    line named no action, and the next run found the file gone. The alert of the delete now posts."""
+    env["movies"]["movie/7"]["monitored"] = False
+    old, rb = upgrade(env, monkeypatch, "Film A (1979) HDTV-720p.mkv", grab=False)
+    silent(env, monkeypatch, env["path"])
+    env["at_delete"] = lambda: os.remove(rb) or term()   # no_stop() holds it until the restore ends
+    job_run()
+    rec = decided(env)
+    assert ([f["action"]["code"] for f in rec["findings"]], rec["alert_result"], titles(env)) == (["deleted"], ["sent"], ["Broken audio"]), rec
+
+
+def test_a_stop_after_a_re_grab_still_posts_its_change(env, monkeypatch, settings):
+    """Reviewer 2026-10-20 (P1, P6): with DISCORD_POSTS all, SIGTERM during the delete of a re-grab of broken audio lets
+    the re-grab end. Its change posted nothing, and the next run logs deleted_with_download, which posts nothing. The
+    change of the re-grab now posts."""
+    settings(discord_posts="all")
+    env["ffmpeg_out"] = [SILENCE]
+    grabbed(env, monkeypatch)
+    env["on_write"] = lambda app, p, method, body: method == "DELETE" and term()
+    job_run()
+    rec = decided(env)
+    assert ([f["action"]["code"] for f in rec["findings"]], rec["alert_result"], titles(env)) == (["regrabbed"], ["log only"], ["Broken audio, re-grabbed"]), rec
+
+
+def test_a_stop_after_a_flag_edit_still_posts_its_change(env, monkeypatch, settings):
+    """Reviewer 2026-10-20 (P6): with DISCORD_POSTS all, SIGTERM during mkvpropedit lets the edit end. The change post
+    of the edit never went out, and the next run finds nothing left to change. The change now posts."""
+    settings(discord_posts="all")
+    run = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: [argv[0] == "mkvpropedit" and term(), run(argv, **kw)][1])
+    job_run()
+    rec = decided(env)
+    assert (rec["outcome"], rec["not_run"][0], rec["change_result"], len(titles(env))) == ("edited", "after_edit", ["sent"], 1), rec
+    assert titles(env)[0].endswith(" changed"), titles(env)
+
+
+def test_a_stopped_conversion_is_no_open_problem_of_the_nightly_audit(env, monkeypatch, tmp_path, capsys):
+    """Reviewer 2026-10-20 (P3): a stopped conversion posts no alert, so the nightly audit counted it as an open problem
+    whose alert never went out. A stop is the owner's own act, and the next run converts the file."""
+    mp4_named_mkv(env)
+    rec, _ = stop_in_backfill(env, monkeypatch, tmp_path, signal.SIGINT, "new_tmp")
+    capsys.readouterr()
+    hook.main(["--audit", "radarr", "--since", "24h"])
+    out = capsys.readouterr().out
+    assert rec["repack"]["stopped"] and "0 files with an open problem" in out and "the conversion to MKV failed" not in out, out
+
+
+@pytest.mark.parametrize("kind", ["content", "restore"])
+def test_a_stop_during_the_second_check_counts_no_re_grab(env, monkeypatch, settings, kind):
+    """Reviewer 2026-10-20 (P4): in a job that has written, SIGTERM during the second check of a re-grab let
+    count_regrab() count it, and no_stop() then refused the delete. The next run counted the same re-grab again. Now the
+    stop counts nothing and posts nothing, and the next run counts it once."""
+    if kind == "content":
+        wrong_film(env, monkeypatch)
+        settings(regrab={"audio", "video", "content"})
+    else:
+        old, rb = upgrade(env, monkeypatch, "Film A (1979) HDTV-720p.mkv", grab=False)
+        silent(env, monkeypatch, env["path"])
+    name = f"{kind}_probe" if kind == "content" else "audio_probe"
+    real = getattr(hook, name)
+
+    def probe(*a, **k):
+        check = real(*a, **k)
+        return lambda path, f, fresh=False: [fresh and term(), check(path, f, fresh=fresh)][1]
+    monkeypatch.setattr(hook, name, probe)
+    job = job_run(held=True)
+    rec = decided(env)
+    assert (hook.store.get("regrabs", "radarr"), titles(env)) == (None, []), rec
+    (f,) = [f for f in rec["findings"] if f.get("action")]
+    assert (f["action"]["step"], rec["alert_result"]) == ("the delete", [hook.STOPPED_RESULT]), rec
+    monkeypatch.setattr(hook, name, real)
+    hook.requeue(job)
+    job_run(job)
+    assert regrabs_counted("radarr") == 1
+
+
+def test_a_stop_after_the_header_repair_before_the_checks_rescans_the_file_at_the_end_of_the_backfill(env, monkeypatch, tmp_path):
+    """Reviewer 2026-10-20 (P8, P10): a stop right after the header repair before the checks ended the backfill's file
+    before after_edit(). Its line keeps header_repaired, which queues the Plex analyze, but the app got no rescan of the
+    new file. The backfill now sends that rescan at its end, as for any other file."""
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True, expect=6898.0)
+    fake = hook.repack
+    monkeypatch.setattr(hook, "repack", lambda *a, **k: [fake(*a, **k), term(signal.SIGINT)][0])
+    run = hook.subprocess.run
+    backfill_films(env, monkeypatch, tmp_path, 2)
+    monkeypatch.setattr(hook.subprocess, "run", run)
+    hook.main(["--backfill", "radarr", *FLAG_PASS, "--apply"])
+    (rec,) = [r for r in log_lines(env) if "schema" in r]
+    assert (rec["outcome"], rec["reasons"], rec["header_repair"]["rescan"], hook.changed(rec)) == ("stopped", ["header_repaired"], "after the run", True), rec
+    assert [r["ids"] for r in log_lines(env) if r.get("result") == "rescan"] == [{"app_id": None}], log_lines(env)   # the item of the fixture has no id
+
+
+def test_a_job_that_a_stop_cut_after_a_header_repair_rescans_in_its_next_run(env, monkeypatch):
+    """Reviewer 2026-10-20 (P8): in a job that has written, as by a conversion, SIGTERM came during the header repair
+    before the checks. The job stopped before after_edit(), so the app never got the rescan of the new file, and the
+    next run had nothing to repair. The job keeps the rescan for its next run."""
+    calls = header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
+    fake = hook.repack
+    monkeypatch.setattr(hook, "repack", lambda *a, **k: [fake(*a, **k), term()][0])
+    job = job_run(held=True)
+    first = decided(env)
+    assert (first["outcome"], first["reasons"], rescans(env)) == ("stopped", ["header_repaired"], []), first
+    hook.requeue(job)
+    job_run(job)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (calls["repairs"], [w[2]["name"] for w in rescans(env)], rec["rescan"]) == ([(True, [])], ["RescanMovie"], "sent"), rec
+
+
+def test_a_deep_analysis_that_a_stop_cut_keeps_its_held_alerts(env, monkeypatch, settings):
+    """Reviewer 2026-10-20 (P7): a deep analysis that a stop cut still ran held_after(), which posts or drops the alerts
+    the import held, and dropped its read of the subtitles. Its job goes back, and the next run did it all again. Now
+    only the run that ends does it."""
+    one_alert_film(env, monkeypatch, settings, "fixed")
+    hook.run_job(enqueue(env, 0, env["path"]), [])
+    name, real = hook.deep_name(env["path"]), hook.process
+    monkeypatch.setattr(hook, "process", lambda ctx: [real(ctx), hook.STOP.update(asked=True, skipped=True)][0])   # the stop lands in the last step
+    assert hook.claim(name)
+    hook.deep_analysis(name, [], claimed=True)
+    _, (deep,) = two_lines(env)
+    assert ("held_result" in deep, posted(env), claimed(), bool(hook.store.get("deep-read", name))) == (False, [], [name], True), deep
+    monkeypatch.setattr(hook, "process", real)
+    hook.STOP.update(asked=False, skipped=False)
+    hook.requeue(name)
+    hook.deep_analysis(name, [])
+    assert two_lines(env)[1][-1]["held_result"] == ["checked again"], two_lines(env)[1]
 
 
 def test_a_repair_inside_a_burn_in_edit_keeps_the_queued_jobs_of_the_file(env, monkeypatch, settings):
@@ -704,7 +1238,7 @@ def test_a_file_the_app_removes_after_the_write_keeps_its_line(env, monkeypatch,
     if not edits:
         monkeypatch.setattr(hook, "needed", lambda j, e: [])
     if edits == "repair":
-        header_issue(env, monkeypatch, issue=[], edit_tail=700, edit_blocked=None, result=("tail_removed", "tail removed"))
+        header_issue(env, monkeypatch, **PADDED, result=("tail_removed", "tail removed"))
     real = hook.edit
     monkeypatch.setattr(hook, "edit", lambda rec, *a, **k: [real(rec, *a, **k), os.remove(rec["path"])][0])
     hook.main([])

@@ -23,6 +23,7 @@ POLICY is the policy file (POLICY_FILE), JSON. The hook passes it to set_policy(
 docs/design.md explains the rules behind it.
 """
 import codecs
+import collections
 import re
 import statistics
 import unicodedata
@@ -105,7 +106,7 @@ FORCED_FLAG = "flag-forced"   # the mkvpropedit property of an edit that clears 
 ORIGINAL_FLAG = "flag-original"   # the mkvpropedit property of an edit of the Original language flag, see retag()
 # The roles whose Original language flag retag() sets or clears. A commentary or an audio description is no part of the
 # content's own speech, so its flag stays as it is.
-ORIGINAL_ROLES = {"a": ("main",), "s": ("full", "sdh", "forced", "dub")}
+ORIGINAL_ROLES = {"a": ("main",), "s": ("full", "sdh", "forced", "dub", "lyrics")}
 
 
 def set_policy(policy):
@@ -193,17 +194,20 @@ def track_tag(p):
     return legacy if lang_key(code) == lang_key(legacy) else code
 
 
-def classify(j, heard=None):
+def classify(j, heard=None, original=None):
     """mkvmerge -J or ffprobe JSON -> the audio and subtitle tracks in file order, each read once.
 
     Each track has its mkvpropedit selector, tag (see track_tag()), lang and conf (see language()), role, and the
     signals behind the role. Audio roles: main, commentary, description. Subtitle roles: full, sdh, forced, dub (a
-    transcript of the English dub) and commentary. A subtitle is forced by a "forced" or signs title, by density under POLICY["sparse_events"],
-    or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. "conflict" is (kind, sentence)
-    when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
-    original is the track's Original language flag: 1, 0, or None when the file holds none.
+    transcript of the English dub), lyrics and commentary. A subtitle is forced by a "forced" or signs title, by density under
+    POLICY["sparse_events"], or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. A lyrics
+    track never has the forced role. Its title names songs and no other signs word, and it is in the item's original language.
+    "conflict" is (kind, sentence) when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
+    A track's original is its FlagOriginal: 1, 0, or None when the file holds none.
     heard maps an audio track's position ("a2") to the language lid.py heard on it, see language(). It may also map a
     subtitle position to the language retag() gives it from its text.
+    The argument original is the item's original language as decide() gets it, an app's name or a code. With none, no
+    track is lyrics.
     """
     out, n = [], {"a": 0, "s": 0}
     for t in j.get("tracks") or j.get("streams") or []:
@@ -227,8 +231,11 @@ def classify(j, heard=None):
         described = bool(f["described"] or re.search(r"descri", title, re.I) or re.search(r"\bAD\b|DVS", title))
         titled_forced = bool(FORCED_TITLE.search(title))
         signs = titled_forced or bool(SIGNS_TITLE.search(title) and not FULL_TITLE.search(title))
+        # Song lyrics in the original language. A viewer of the original audio hears the songs, so the track never has the forced role.
+        lyrics = kind == "s" and lang in codes(original) and {w.lower() for w in SIGNS_TITLE.findall(title)} == {"song"} \
+            and not FULL_TITLE.search(title)
         sparse = ev is not None and ev < POLICY["sparse_events"]
-        dense_flag = bool(f["forced"]) and ev is not None and ev >= POLICY["forced_flag_events"] and not titled_forced
+        dense_flag = bool(f["forced"]) and ev is not None and ev >= POLICY["forced_flag_events"] and not titled_forced and not lyrics
         full_title = kind == "s" and bool(FULL_TITLE.search(title) or f["sdh"])
         forced = signs or sparse or (bool(f["forced"]) and not dense_flag)
         sdh = bool(f["sdh"] or re.search(r"\bsdh\b|\bcc\b|hearing", title, re.I))
@@ -236,7 +243,7 @@ def classify(j, heard=None):
         if kind == "a":
             role = "commentary" if comment else "description" if described else "main"
         else:
-            role = "commentary" if comment or described else "dub" if dub else "forced" if forced else "sdh" if sdh else "full"
+            role = "commentary" if comment or described else "dub" if dub else "lyrics" if lyrics else "forced" if forced else "sdh" if sdh else "full"
         out.append(dict(kind=kind, sel=sel, pos=f"{kind}{n[kind]}", uid=f["uid"], tag=tag, lang=lang, conf=conf, lang_why=why, title=title,
                         ch=f["ch"] or 0, codec=f["codec"], default=int(bool(f["default"])), role=role, extra=role in ("commentary", "description"),
                         forced=forced, forced_flag=bool(f["forced"]), flagged=bool(f["forced"]) or titled_forced, sdh=sdh, events=ev, heard=h,
@@ -365,7 +372,7 @@ def decide(j, original, kids=False, release="", heard=None, spoken=None, wrong=N
     Empty edits means the file is right, nothing can be done, or the decision abstained.
     """
     if POLICY is None: raise RuntimeError("no policy loaded")
-    ts = classify(j, heard); au = [t for t in ts if t["kind"] == "a"]; su = [t for t in ts if t["kind"] == "s"]
+    ts = classify(j, heard, original); au = [t for t in ts if t["kind"] == "a"]; su = [t for t in ts if t["kind"] == "s"]
     orig = codes(original); main = [t for t in au if t["role"] == "main"]
     cls = "english" if "eng" in orig else "foreign_kids" if kids and orig else "foreign"
     plan = {"edits": [], "notes": [], "reasons": [], "wrong_language": False, "undecided": None, "abstain": None, "dropped": [], "invariants": [],
@@ -1333,7 +1340,8 @@ def parse_window(stderr, rc=0):
     errors: container error lines anywhere, and decoder error lines and corrupt-frame warnings after the first output
     frame. A decoder error before the first frame belongs to the seek. Clean windows log such lines, and a UHD remux
     seek logs "PPS changed between slices". A container error there counts, because a seek with no
-    index reads through the damage on its way. gap: the longest step between output frames. late: the first
+    index reads through the damage on its way. gap: the longest step between output frames. steps: the steps between
+    output frames, see frame_steps(), which tell a variable frame rate, see off_rate(). late: the first
     frame came over LATE seconds after the window start, so the seek found no video there. empty: no frame at all.
     noisy: an empty window logged errors. cut: the file ended early. ran: ffmpeg exited 0, or the file was cut.
     nodecoder: ffmpeg found no decoder for the video track, so the window could not run. encrypted: ffmpeg names an
@@ -1348,7 +1356,7 @@ def parse_window(stderr, rc=0):
             errors += bool(pts) or (line.startswith(DEMUX) and "[error]" in line)
             noisy = noisy or "[error]" in line
     cut = any(c in stderr for c in CUT)
-    return {"frames": len(pts), "errors": errors, "gap": round(max((b - a for a, b in zip(pts, pts[1:])), default=0), 2),
+    return {"frames": len(pts), "errors": errors, "gap": round(max((b - a for a, b in zip(pts, pts[1:])), default=0), 2), "steps": frame_steps(pts),
             "late": bool(pts) and pts[0] > LATE, "empty": not pts, "noisy": not pts and noisy, "cut": cut,
             "ran": (rc == 0 and "[fatal]" not in stderr) or cut, "nodecoder": NO_DECODER in stderr,
             "encrypted": bool(ENCRYPTED.search(stderr))}
@@ -1421,6 +1429,8 @@ UNREADABLE = ("Error opening input", "Error opening output")   # ffmpeg 7 cannot
 # "Element at 0x1f5dbf ending at 0x29312a exceeds containing master element". The end may lie past the file.
 POS = re.compile(r"\bpos (\d+)|\bElement at 0x([0-9a-f]+)")
 NEAR = 0.01                          # a share of the file around a zero run where the read pass's errors belong to that run
+TAIL_LINE = "Truncating packet of size"   # a line with no place that ffmpeg prints when bytes past the Segment end make it
+                                          # read a SeekHead at the end again, see matroska.check()
 WHOLE_BLOCK = 64 << 10               # the zero scan's grid. A run's ends sit within one block of the real ends of its zeros.
 
 
@@ -1456,12 +1466,13 @@ def parse_copy(stderr, rc, size):
     """The read pass's stderr and exit code -> a dict. lines: every line except NOISE, as the windows read it. A
     healthy file prints none. The null muxer's complaint of a repeated timestamp names no byte of the file, and
     healthy files print it. ran is False when ffmpeg could not open the file, which is no doubt. pos: the bytes the
-    lines name, and at: those as shares of size. loose: the lines that name no place. noise: the NOISE lines. first:
-    the first lines, for the log."""
+    lines name, and at: those as shares of size. loose: the lines that name no place. truncated: the loose lines that
+    start with TAIL_LINE. noise: the NOISE lines. first: the first lines, for the log."""
     lines = [x.strip() for x in stderr.splitlines() if x.strip() and not any(n in x for n in NOISE)]
     pos = sorted({b for x in lines for d, h in POS.findall(x) if (b := int(d or int(h, 16))) <= size})
     return {"ran": not (rc and any(u in x for x in lines for u in UNREADABLE)), "lines": len(lines), "pos": pos,
             "at": [round(b / size, 4) for b in pos] if size else [], "loose": sum(not POS.search(x) for x in lines),
+            "truncated": sum(x.startswith(TAIL_LINE) for x in lines if not POS.search(x)),
             "noise": sum(any(n in x for n in NOISE) for x in stderr.splitlines()), "first": lines[:3]}
 
 
@@ -1479,7 +1490,11 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
     confirmed runs count, and the others are only logged. In any other file every run counts. 2 or more runs that
     count are certain, and 1 is a doubt, worded as video_verdict() words the zero probe. The read pass is only ever a
     doubt. Its errors within NEAR of a run that counts belong to that run, so they add no doubt. A line that names no
-    place does."""
+    place does. In a file with bytes past its Segment end (read["tail"]), errors that all sit past the last Cluster are
+    the tail fault and add no doubt. Those bytes make ffmpeg read the last element again, see matroska.check(). When
+    the check finds that case (read["tail_errors"]), the TAIL_LINE lines are the tail fault too. Every other line
+    that names no place stays a doubt. Damage in the payload of the last Cluster prints such lines, and mkvmerge
+    copies that damage."""
     count = runs
     if pcm:
         apart = lambda r, b: max(r[0] - b, b - r[1], 0)   # bytes from b to the run r, 0 inside it
@@ -1495,9 +1510,11 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
         return certain, zero, [], count
     found = zip(read["at"], read.get("when") or [None] * len(read["at"]))
     away = [(a, w) for a, w in found if not any(s / size - NEAR <= a <= e / size + NEAR for s, e in count)]
+    if read.get("tail") and all(w == "end" for _, w in away):   # the tail fault, see docs/design.md, "RFC 9559 check"
+        away = []
     if away:
         return None, zero, [f"a full read of the file found damaged data {read_places(away)}"], count
-    n = read["loose"]
+    n = read["loose"] - (read.get("truncated", 0) if read.get("tail_errors") else 0)
     return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count
 
 
@@ -1516,6 +1533,11 @@ AV_APART = 60                         # seconds the video and the audio may end 
                                       # films may end tens of seconds apart.
 REPAIR_END = 1.0                      # seconds a repaired header may differ from the stream end
 FRAME_SLACK = 3                       # video frames a remux may come short of the video end over the default frame duration
+VFR_SHARE = 0.01                      # the share of the steps between video frames, at least, that marks a variable frame rate,
+                                      # see off_rate(). A lost cluster makes one step, so lost frames stay far under it.
+VFR_STEP = 0.1                        # the share of the usual frame length that a step may differ from it. Mixed rates differ
+                                      # by 15 percent or more (24 and 30 fps, 25 and 30, 50 and 60). Encoder jitter of 2.3 ms
+                                      # on 41.7 ms frames fits (measured 2026-10-20).
 REMOVE_SHARE = 0.10                   # a SubRip track with this share of its lines starting after the real end is timed for another
                                       # cut, so it is removed, not trimmed. A track that is wrong in general
                                       # is better gone.
@@ -1526,6 +1548,30 @@ CUT_END = 0.95     # the video and the audio of a complete file end at this shar
 REMOVE_END = 1.2   # a removed track ends past this share of the listed runtime
 TEXT_SUBS = ("S_TEXT/UTF8",)          # the subtitle codecs a trim can cut: SubRip
 SRT_TIME = re.compile(r"^\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})(.*)$")
+
+
+def frame_steps(times):
+    """{step in ms, to 0.1 ms: count} of the steps from one video frame to the next of times in seconds, in time
+    order. A time of None or NaN is left out, and so is a step of 0."""
+    t = sorted(x for x in times if x is not None and x == x)
+    return dict(collections.Counter(round((b - a) * 1000, 1) for a, b in zip(t, t[1:]) if b > a))
+
+
+def off_rate(steps, tick=0.001):
+    """The share of steps, frame_steps() of a video track or a window of it, that are not the track's usual frame
+    length, the median step. A step may differ from it by VFR_STEP of it, or by tick, the timestamp scale, when that is
+    larger. Matroska rounds each time to the tick. A share of VFR_SHARE or more is a variable frame rate. Mixed rates
+    make one, and so do repeated frames that an encoder dropped all through the track. A lost cluster and each frame an
+    encoder left out make one step each, so a constant rate that lost frames in a few places stays under it. The
+    DefaultDuration plays no part, as some files store the length of one field there. None when steps holds no step."""
+    n, k = sum(steps.values()), 0
+    if not n:
+        return None
+    for mid in sorted(steps):   # the median step
+        k += steps[mid]
+        if 2 * k >= n:
+            break
+    return sum(c for x, c in steps.items() if abs(x - mid) > max(tick * 1000, VFR_STEP * mid) + 0.06) / n   # in ms, 0.06 for the rounding
 
 
 def element(b, p):

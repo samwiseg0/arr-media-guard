@@ -49,6 +49,15 @@ def no_time_limit():
         d.stop()
 
 
+@pytest.fixture(autouse=True)
+def no_stop_left():
+    """runner.STOP is module state too. A stop that reaches a backfill's handler or job_term() sets it, and a later
+    remux would then refuse to start. So each test ends with no stop, in each copy of the package."""
+    yield
+    for s in amg.stops():
+        s.update(held=False, asked=False, term=None, skipped=False)
+
+
 LOCAL = ("127.0.0.1", "localhost", "::1")
 
 

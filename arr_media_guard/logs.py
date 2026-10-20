@@ -3,7 +3,7 @@
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
 import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error, urllib.request
 
-from . import apps, checks, config, content, decide, health, report, store
+from . import apps, checks, config, content, decide, health, report, runner, store
 
 
 def log(rec):
@@ -75,7 +75,7 @@ def to_syslog(line):
 # The fields of a decision line that the store keeps for the audit and for --force-convert, see store.decided()
 KEPT_KEYS = ("app", "source", "apply", "outcome", "result", "edit_result", "label", "path", "class", "container", "abstain", "undecided",
              "invariants", "recheck", "heard", "original", "kids", "release", "ids", "tmdb", "edits", "edit_rules", "before", "repack",
-             "header_repair", "alert_kinds", "alert_result", "deep")
+             "header_repair", "alert_kinds", "alert_result", "deep", "rfc")
 
 
 def decision(rec, started):
@@ -169,6 +169,7 @@ def post(app, emb):
 
 DEEP_KINDS = ("submatch", "subtiming")   # the alert kinds the deep analysis checks again, see alert_findings()
 HOLD_RESULT = "held for the deep analysis"   # what alert_findings() gives for an alert it holds
+STOPPED_RESULT = "not posted, the run was stopped"   # what alert_findings() gives for a finding the stop caused
 
 
 def alert_findings(rec, size, held=None):
@@ -186,6 +187,10 @@ def alert_findings(rec, size, held=None):
     turned off, and the conversion it names. The change posts of rec leave those out, see report.said(). held_changes()
     posts them when the held alert goes unposted, so each change posts once.
 
+    A stop is the owner's own act. A finding that the stop caused gives STOPPED_RESULT, see stop_caused(). The decision
+    line names it, and the next run of the file posts what it still finds. Every other finding posts as it would
+    without the stop. A re-grab that acted before the stop is one, and no later run finds it again.
+
     With DISCORD_POSTS all, each change the run made to the file posts too, see report.render() "changes". They skip the
     marker of alert(), because a second run finds nothing left to change. rec["change_result"] says what each post gave.
     A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line."""
@@ -193,6 +198,8 @@ def alert_findings(rec, size, held=None):
     for f, e in zip(rec["findings"], report.render(rec, "embed")):
         if not report.posts(f, rec):
             out.append("log only")
+        elif runner.STOP["skipped"] and stop_caused(f, rec):
+            out.append(STOPPED_RESULT)
         elif held is not None and f["kind"] in DEEP_KINDS:
             changes = report.held_posts(rec, f, report.tense_of(rec)) if config.CFG.discord_posts == "all" else []
             spans = report.named_spans(rec, f) if f["kind"] == "subtiming" else {}   # the places the deep analysis must hear again
@@ -207,6 +214,12 @@ def alert_findings(rec, size, held=None):
         except Exception as ex:
             rec["change_result"] = [config.mask(f"no text: {type(ex).__name__}: {ex}")[:200]]
     return out
+
+
+def stop_caused(f, rec):
+    """Whether a stop caused finding f of rec, see runner.STOP["skipped"]: a re-grab or a restore that the stop kept
+    from its step, see regrab.stop_action(), or a conversion whose remux the stop cut, see remux.Swap.stop()."""
+    return bool((f.get("action") or {}).get("stopped") or (f["kind"] == "repack" and (rec.get("repack") or {}).get("stopped")))
 
 
 def discord_test():

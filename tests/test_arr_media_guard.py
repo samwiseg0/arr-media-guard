@@ -3868,11 +3868,13 @@ def test_only_undecided_replans_the_undecided_files_of_a_plan(env, monkeypatch, 
 
 def test_only_header_replans_the_header_repair_files_of_a_plan(env, monkeypatch, tmp_path, capsys):
     """A tester asked to run only the 19 header repairs of a plan with 1059 changes. --only-header takes the plan
-    lines with a header repair, and process() plans each file again, flags included. A canary and --paths narrow it."""
+    lines with a header repair, and process() plans each file again, flags included. A canary and --paths narrow it.
+    A repair whose only fault is padding stays out (owner 2026-10-20)."""
     movies = [{"id": i, "title": f"Movie {i}", "year": 2000, "originalLanguage": {"name": "English"}, "runtime": 120,
-               "movieFile": {"path": f"/m/Movie {i}.mkv", "mediaInfo": {"audioStreamCount": 2}}} for i in (1, 2, 3, 4)]
+               "movieFile": {"path": f"/m/Movie {i}.mkv", "mediaInfo": {"audioStreamCount": 2}}} for i in (1, 2, 3, 4, 5)]
     rows = [plan_line("Movie 1", "x", [["track:=2", 0, 1]]), dict(plan_line("Movie 2", "x", [["track:=2", 0, 1]]), header_repair="would_repair_header"),
-            plan_line("Movie 3", "undecided", undecided="the app says Spanish"), dict(plan_line("Movie 4", "no change"), header_repair="would_repair_header")]
+            plan_line("Movie 3", "undecided", undecided="the app says Spanish"), dict(plan_line("Movie 4", "no change"), header_repair="would_repair_header"),
+            dict(plan_line("Movie 5", "no change"), header_repair="would_repair_header", padding_only=True)]   # the library pass leaves padding
     plans = tmp_path / "plans.jsonl"
     plans.write_text("".join(json.dumps(r) + "\n" for r in rows))
     seen = []
@@ -6736,15 +6738,20 @@ def test_a_swap_refuses_a_temp_file_written_after_its_checks(env):
     assert not os.path.exists(tmp)
 
 
-def test_sigterm_after_an_edit_finishes_the_job_and_keeps_its_plex_analyze(pool, monkeypatch):
+def test_sigterm_after_an_edit_skips_the_checks_left_and_puts_the_job_back(pool, monkeypatch):
+    """Owner 2026-10-20: docker stop gives the container 60 seconds, and the checks after an edit can take minutes. A
+    stop during mkvpropedit lets the edit end. The run then skips the steps left, as the slow metadata check here, and
+    writes its line at once with its Plex analyze. The job goes back to the queue, and the next worker runs it again
+    and sends the kept analyze."""
     (path,) = films(pool, 1)
-    run = hook.subprocess.run
+    run, real = hook.subprocess.run, hook.metadata
     def edit(argv, **kw):   # the stop reaches the coordinator while mkvpropedit writes
         if argv[0] == "mkvpropedit":
-            os.kill(os.getppid(), signal.SIGTERM); real_wait(1.0)
+            trace("sigterm"); os.kill(os.getppid(), signal.SIGTERM); real_wait(1.0)
         return run(argv, **kw)
     monkeypatch.setattr(hook.subprocess, "run", edit)
-    enqueue(pool, 0, path, owner="1")
+    monkeypatch.setattr(hook, "metadata", lambda *a, **k: [trace("metadata"), real_wait(20), real(*a, **k)][2])   # a slow check after the edit
+    name = enqueue(pool, 0, path, owner="1")
     coordinator = real_fork()
     if not coordinator:
         try:
@@ -6752,11 +6759,16 @@ def test_sigterm_after_an_edit_finishes_the_job_and_keeps_its_plex_analyze(pool,
         finally:
             REAL_EXIT(0)
     assert os.waitstatus_to_exitcode(os.waitpid(coordinator, 0)[1]) == 0
-    assert finals(pool) == {path: "edited"} and hook.queued() == [] and not claimed()   # the job finished and was not re-queued
+    took = hook.time.perf_counter() - traced("sigterm")[0]["t"]
+    (rec,) = [r for r in log_lines(pool) if "outcome" in r]
+    assert (traced("metadata"), rec["outcome"], rec.get("not_run")) == ([], "edited", ["after_edit", "content_checks", "quick_check", "alerts"]), rec
+    assert hook.queued() == [name] and not claimed() and took < 10, took   # back in the queue, long before the slow check would end
     kept = hook.store.get("plex", "pending")
     assert [k["path"] for k in kept] == [path] and traced("put") == []
-    run_worker()   # the next worker sends the kept analyze
-    assert [r["url"] for r in traced("put")] == ["/library/metadata/5001/analyze"]
+    monkeypatch.setattr(hook.subprocess, "run", run)
+    monkeypatch.setattr(hook, "metadata", real)
+    run_worker()   # the next worker runs the job again and sends the kept analyze
+    assert "/library/metadata/5001/analyze" in [r["url"] for r in traced("put")] and hook.queued() == [] and not claimed()
     assert hook.store.get("plex", "pending") is None
 
 
@@ -7384,7 +7396,8 @@ def test_an_interrupted_header_repair_leaves_no_temp_file(mkvs, tmp_path, tool, 
 
 
 HEADER_HP = {"duration": 48213.5, "cues": True, "cue_end": 6873.4, "short": 0, "failed_edit": False, "video": 6873.4, "audio": 6873.4,
-             "end": 6898.0, "read": 1, "issue": ["the header says 13:23:33, but the streams end at 1:54:58"], "blocked": [], "first": True}
+             "end": 6898.0, "read": 1, "issue": ["the header says 13:23:33, but the streams end at 1:54:58"], "blocked": [], "first": True, "rfc": {},
+             "notes": []}
 
 
 def header_issue(env, monkeypatch, repairable=True, result=("header_repaired", "header repaired"), doubts=()):
@@ -7929,14 +7942,15 @@ def test_the_mount_holds_the_originals_above_every_root_folder(tmp_path, monkeyp
 
 def test_a_remux_that_lost_frames_is_refused(mkvs, tmp_path, monkeypatch, settings):
     """mkvmerge can drop a damaged cluster with no warning, so a zero hole can cost frames. The
-    new video track must hold its end over its default duration in frames, less FRAME_SLACK. A track with no default
-    duration passes only when every window of the check decoded clean."""
+    new video track must hold its end over its default duration in frames, less FRAME_SLACK. A constant frame rate keeps
+    that rule when the original is at hand. A track with no default duration passes only when every window of the
+    check decoded clean."""
     settings(log=str(tmp_path / "log.jsonl"))
     path = str(mkvs / "good.mkv"); j = hook.mkvmerge(path)
     hp = {"expect": 120.023, "video": 120.0, "issue": ["x"], "trim": []}
     short = copy.deepcopy(j); short["tracks"][0]["properties"]["tag_number_of_frames"] = str(2880 - 32)
-    assert hook.header_fault(j, path, short, os.path.getsize(path), hp, {}, str(tmp_path)) == \
-        "the new file holds 2848 video frames, but the video end at 120.0 s needs 2880"
+    assert hook.header_fault(j, path, short, os.path.getsize(path), hp, {}, str(tmp_path), src=path) == \
+        "the new file holds 2848 video frames, but the video end at 120.0 s needs 2880"   # a constant rate, so no count of the original
     slack = copy.deepcopy(j); slack["tracks"][0]["properties"]["tag_number_of_frames"] = str(2880 - hook.arr_decide.FRAME_SLACK)
     assert hook.header_fault(j, path, slack, os.path.getsize(path), hp, {}, str(tmp_path)) is None
     vfr = copy.deepcopy(j); del vfr["tracks"][0]["properties"]["default_duration"]
@@ -13124,7 +13138,7 @@ def text_mp4(path, tracks, video_offset=0.0, audio=True, dur=8):
     argv += ["-map", "0", *(["-map", "1"] if audio else []), *(a for k in range(len(tracks)) for a in ("-map", str(n + k)))]
     argv += ["-c:v", "libx264", "-preset", "ultrafast", *(["-c:a", "aac"] if audio else []), "-c:s", "mov_text"]
     for k, t in enumerate(tracks):
-        argv += [f"-metadata:s:s:{k}", f"language={t['lang']}", *([f"-metadata:s:s:{k}", f"handler_name={t['title']}"] if t.get("title") else []),
+        argv += [f"-metadata:s:s:{k}", f"language={t['lang']}", *([f"-metadata:s:s:{k}", f"title={t['title']}"] if t.get("title") else []),
                  f"-disposition:s:{k}", "default" if t.get("default") else "0"]
     amg.ffmpeg(argv + ["-movflags", "+faststart", "-f", "mp4", str(path)], check=True)
     data = path.read_bytes()
@@ -13216,6 +13230,17 @@ def test_one_stray_byte_breaks_a_utf8_track(tmp_path, settings, enc):
         return
     assert kinds == ["video", "audio"] and sorted(os.listdir(path.parent)) == sorted([path.name, side.name])
     assert [t for _, _, t in sidecar_cues(side)] == ["I don’t know where she went.".encode(), "♪ Over the hills ♪".encode(), "Un café".encode("cp1252")]
+
+
+def test_the_notice_of_a_broken_songs_track_in_the_original_language_never_says_forced(tmp_path, settings):
+    """Owner 2026-10-20: a "Songs" subtitle in the original language holds the lyrics and is never forced. The English
+    "Songs" track of an English film has one stray cp1252 byte, so the conversion takes it out. Its notice names the
+    English subtitles with the track's title."""
+    settings(log=str(tmp_path / "log.jsonl"))
+    path = broken_film(tmp_path, [{"lang": "eng", "enc": "cp1252", "title": "Songs", "cues": [(1.0, 2.0, "♪ Over the hills ♪", None), (4.0, 5.0, "Un ", "café")]}])
+    _, result, info, _ = hook.convert("radarr", str(path), hook.mkvmerge(str(path)), os.stat(path), False, {"app_id": 7}, known={"eng"})
+    said = hook.unmarked(hook.texts(hook.unreadable_finding(info["broken"], None, "MP4/QuickTime"), "done", {})[0])
+    assert 'The English subtitles (track 1 of the original file, "Songs") can\'t be read as text' in said and "forced" not in said, (result, said)
 
 
 def test_two_broken_tracks_of_one_language_take_their_numbers(tmp_path, settings):
@@ -20634,6 +20659,11 @@ def test_the_whole_file_hearing_report_says_its_cost_or_that_its_words_came_from
      "header repair failed: the original could not be kept, so it stays: too little for a copy"),
     ({"outcome": "no_change", "result": "no change", "header_repair": {"result": "header repair skipped, hardlinked: x", "code": "header_repair_skipped"}},
      "header repair skipped, hardlinked: x"),
+    ({"outcome": "no_change", "result": "no change", "header_repair": {"result": "not repaired: the run was stopped. The issue: x",
+                                                                       "code": "header_not_repaired", "stopped": True}},
+     "not repaired: the run was stopped. The issue: x"),   # a stop cut the planned repair
+    ({"outcome": "no_change", "result": "no change", "header_repair": {"result": "not repaired: a blank gap. The issue: x", "code": "header_not_repaired"}},
+     None),   # the repair was never planned
     ({"outcome": "edited", "result": "edited", "subremux": {"fixed": ["s2"], "done": True},
       "header_repair": {"result": "header repaired", "code": "header_repaired"}}, None)])
 def test_missed_names_each_change_that_did_not_happen(rec, why):
@@ -20938,13 +20968,15 @@ def backfill_rows(names):
     return names
 
 
-def timed_imports(monkeypatch, secs):
-    """Each import job traces its start and its end and takes secs."""
+def timed_imports(monkeypatch, secs, k=1):
+    """Each import job traces its start and its end. It waits until k imports have started, see till_imports(), and
+    then takes secs."""
     real = hook.process
 
     def process(ctx):
         trace("import start", name=ctx.path)
         try:
+            till_imports(k)
             real_wait(secs)
             return real(ctx)
         finally:
@@ -20952,10 +20984,15 @@ def timed_imports(monkeypatch, secs):
     monkeypatch.setattr(hook, "process", process)
 
 
-def import_waits_of():
-    """{path: seconds from its queueing to its start} of each import in the trace."""
-    queued = {r["name"]: r["t"] for r in traced("enq")}
-    return {r["name"]: round(r["t"] - queued[r["name"]], 3) for r in traced("import start") if r["name"] in queued}
+WHOLE_RUN = 10.0   # seconds: a fake background job that waits for an import to start ends after this at most
+
+
+def till_imports(k=1):
+    """Wait until k imports have started, or for WHOLE_RUN seconds. A fake background job that calls it last ends after
+    those imports start. A test then checks that order, so the host's load sets no bound on the wait."""
+    end = time.perf_counter() + WHOLE_RUN
+    while len(traced("import start")) < k and time.perf_counter() < end:
+        real_wait(0.02)
 
 
 @pytest.mark.parametrize("hook_workers, background", [(2, 2), (2, 4), (1, 2)])
@@ -20963,11 +21000,11 @@ def test_an_import_never_waits_for_jobs_a_backfill_queued(pool, monkeypatch, set
     """Jobs a backfill queued fill every slot. Such a job yields only before a conversion and a remux, so no import
     would get a slot for up to its time limit. Each import starts in one more job process instead, up to HOOK_WORKERS
     imports. The next import waits for an import place, and no job yields. Each of those imports starts while every
-    job of the backfill still runs. The wait is about 0.2 s, and a bound of 1 s on it failed once on a loaded host, so
-    the bound is 2 s, which still fails a path that waits for a job to end (about 2.9 s)."""
+    job of the backfill still runs. A job, and each of those imports, runs until those imports start, see
+    till_imports(). Bounds of 1 s and 2 s on the wait failed on a loaded host."""
     settings(hook_workers=hook_workers, background_workers=background)
     paths = films(pool, hook_workers + 1)
-    timed_imports(monkeypatch, 0.6)
+    timed_imports(monkeypatch, 0.6, hook_workers)
     names = backfill_rows(background_jobs(background))
 
     def body(name):   # the checks of a job a backfill queued, with no yield
@@ -20976,20 +21013,20 @@ def test_an_import_never_waits_for_jobs_a_backfill_queued(pool, monkeypatch, set
         if name == names[0]:
             for n, p in enumerate(paths):
                 enqueue(pool, n, p, owner=str(n + 1))
-                trace("enq", name=p)
-        real_wait(3.0)
+        till_imports(hook_workers)
     fake_background(monkeypatch, body)
     run_worker()
-    waits, imports = import_waits_of(), runs("import")
+    imports = runs("import")
     starts, first_end = {r["name"]: r["t"] for r in traced("import start")}, min(r["t"] for r in traced("bg end"))
-    assert sorted(waits) == sorted(paths) and all(starts[p] < first_end and waits[p] < 2.0 for p in paths[:hook_workers]) and waits[paths[-1]] >= 0.5, waits
+    assert sorted(starts) == sorted(paths) and all(starts[p] < first_end for p in paths[:hook_workers]), (starts, first_end)
     assert most_at_once(imports) == hook_workers and most_at_once(runs() + imports) == background + hook_workers, (runs(), imports)
     assert not traced("bg yield") and set(finals(pool).values()) == {"edited"} and hook.deep_analysis_queued() == [] and not claimed()
 
 
 def test_an_import_waits_for_the_yield_of_a_job_that_can_yield(pool, monkeypatch, settings):
     """A job a backfill queued and a deep analysis fill the two slots. The deep analysis can yield, so the import waits
-    for its slot, and no third process starts. The deep analysis asks less often than the worker looks at the queue."""
+    for its slot, and no third process starts. The deep analysis asks less often than the worker looks at the queue.
+    The import starts while the job of the backfill runs, which runs until then."""
     settings(hook_workers=2, background_workers=2)
     (path,) = films(pool, 1)
     timed_imports(monkeypatch, 0.2)
@@ -21001,15 +21038,15 @@ def test_an_import_waits_for_the_yield_of_a_job_that_can_yield(pool, monkeypatch
         if name == bf:
             if len(traced("bg start")) == 2:
                 enqueue(pool, 0, path, owner="1")
-                trace("enq", name=path)
-            real_wait(2.0)
+            till_imports()
             return
         for _ in range(4):
             hook.deep_waits()
             real_wait(0.5)
     fake_background(monkeypatch, body)
     run_worker()
-    assert [r["name"] for r in traced("bg yield")] == [deep] and import_waits_of()[path] < 1.5, traced()
+    start = traced("import start")[0]["t"]
+    assert [r["name"] for r in traced("bg yield")] == [deep] and [start < end for n, _, end in runs() if n == bf] == [True], traced()
     assert most_at_once(runs() + runs("import")) == 2 and hook.deep_analysis_queued() == [] and not claimed()
 
 
@@ -21018,7 +21055,8 @@ def test_an_import_waits_for_the_yield_of_a_job_that_can_yield(pool, monkeypatch
 def test_one_import_makes_one_job_yield_also_when_the_jobs_ask_at_once(pool, monkeypatch, settings, period, lat, rep):
     """Four background jobs fill every slot, and an import arrives. Each job asks as lid.py and burnin.py ask, at its
     own phase of period, a period 0 at the same instant. A job that yields takes lat seconds to exit, as lid.py does,
-    and it keeps its claim until then. Its mark in the store frees its slot at once, so one job alone yields."""
+    and it keeps its claim until then. Its mark in the store frees its slot at once, so one job alone yields. The other
+    jobs ask until the import starts, so it starts while they run. A bound of 1.5 s on the wait failed on a loaded host."""
     settings(hook_workers=2, background_workers=4)
     (path,) = films(pool, 1)
     timed_imports(monkeypatch, 0.2)
@@ -21033,12 +21071,11 @@ def test_one_import_makes_one_job_yield_also_when_the_jobs_ask_at_once(pool, mon
         if name == names[0]:
             at = time.perf_counter()
             enqueue(pool, 0, path, owner="1")
-            trace("enq", name=path)
             trace("queued at", at=at)
         while not traced("queued at"):
             real_wait(0.005)
         q, k = traced("queued at")[0]["at"], 0
-        while time.perf_counter() - q < 3:
+        while not traced("import start") and time.perf_counter() - q < WHOLE_RUN:
             due = q + 0.1 + phase[name] + k * max(period, 0.05)
             while time.perf_counter() < due:
                 real_wait(0.002)
@@ -21048,14 +21085,16 @@ def test_one_import_makes_one_job_yield_also_when_the_jobs_ask_at_once(pool, mon
             k += 1
     fake_background(monkeypatch, body)
     run_worker()
-    assert len(traced("bg yield")) == 1 and import_waits_of()[path] < 1.5 and finals(pool) == {path: "edited"}, traced()
+    start, yielded = traced("import start")[0]["t"], {r["name"] for r in traced("bg yield")}
+    assert len(traced("bg yield")) == 1 and [start < end for n, _, end in runs() if n not in yielded] == [True] * 3, traced()
+    assert finals(pool) == {path: "edited"}
     assert hook.deep_analysis_queued() == [] and not claimed()
 
 
 def test_drop_queued_keeps_the_slot_of_a_running_job_counted(pool, monkeypatch, settings):
     """--drop-queued while a job a backfill queued and a deep analysis fill both slots. The running job keeps its row,
     marked dropped, so the store counts both slots taken. The deep analysis yields to the import, and the dropped job
-    ends once with no return to the queue."""
+    ends once with no return to the queue. The dropped job runs until the import starts."""
     settings(hook_workers=2, background_workers=2)
     (path,) = films(pool, 1)
     timed_imports(monkeypatch, 0.1)
@@ -21069,8 +21108,7 @@ def test_drop_queued_keeps_the_slot_of_a_running_job_counted(pool, monkeypatch, 
                 return
             trace("dropped", n=hook.drop_backfill())
             enqueue(pool, 0, path, owner="1")
-            trace("enq", name=path)
-            real_wait(2.0)
+            till_imports()
             raise hook.Yielded("an import waits, before a conversion")   # its yield ends it, as its end would
         for _ in range(80):
             hook.deep_waits()
@@ -21078,7 +21116,8 @@ def test_drop_queued_keeps_the_slot_of_a_running_job_counted(pool, monkeypatch, 
     fake_background(monkeypatch, body)
     run_worker()
     assert [r["n"] for r in traced("dropped")] == [1] and [r["name"] for r in traced("bg yield")] == [deep, bf], traced()
-    assert import_waits_of()[path] < 1.0 and [n for n, _, _ in runs()].count(bf) == 1
+    start = traced("import start")[0]["t"]
+    assert [start < end for n, _, end in runs() if n == bf] == [True], runs()
     assert hook.store.read("SELECT count(*) FROM jobs")[0][0] == 0
 
 
@@ -25644,9 +25683,12 @@ def test_the_read_pass_reads_only_ffmpegs_error_lines():
     D, size = hook.arr_decide, 1000
     line = "[matroska,webm @ 0x61c9] 0x00 at pos 500 (0x1f4) invalid as first byte of an EBML number"
     dts = "[null @ 0x5fdf] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 563000 >= 563000"
-    assert D.parse_copy("", 0, size) == {"ran": True, "lines": 0, "pos": [], "at": [], "loose": 0, "noise": 0, "first": []}
+    assert D.parse_copy("", 0, size) == {"ran": True, "lines": 0, "pos": [], "at": [], "loose": 0, "truncated": 0, "noise": 0, "first": []}
     assert D.parse_copy(f"{line}\n    Last message repeated 3 times\n{dts}\n", 0, size) == {
-        "ran": True, "lines": 1, "pos": [500], "at": [0.5], "loose": 0, "noise": 2, "first": [line]}
+        "ran": True, "lines": 1, "pos": [500], "at": [0.5], "loose": 0, "truncated": 0, "noise": 2, "first": [line]}
+    tail = "Truncating packet of size 5036 to 69"   # the line of the tail fault, see test_rfc_check.py
+    assert D.parse_copy(f"{tail}\n[h264 @ 0x1] Invalid NAL unit size (24154 > 24054).\n{line}\n", 0, size) == {
+        "ran": True, "lines": 3, "pos": [500], "at": [0.5], "loose": 2, "truncated": 1, "noise": 0, "first": [tail, "[h264 @ 0x1] Invalid NAL unit size (24154 > 24054).", line]}
     got = {"kept": [], "lines": 0, "noise": 0}   # a remux may log a NOISE line per packet before the one real error
     hook.copy_lines(io.StringIO(f"{dts}\n" * 20000 + f"\n{line}\n"), got)
     assert got == {"kept": [line], "lines": 1, "noise": 20000}

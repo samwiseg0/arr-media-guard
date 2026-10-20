@@ -124,15 +124,43 @@ def settle(name, on=True):
         store.write("UPDATE jobs SET settled = ? WHERE name = ? AND claimed = 1", int(on), name)
 
 
-STOP = {"held": False, "asked": False, "term": None}   # in a job process: a write has started, and a SIGTERM came since
+STOP = {"held": False, "asked": False, "term": None, "skipped": False}
+# held: in a job process, a write has started. asked: a handler of the process's own took a stop, job_term() after a
+# write or the backfill's, see cli.stops(). No write and no further step start after it, see stop_asked(). skipped: a
+# stop refused or cut a write or left a step out, so a finding the stop caused posts nothing, see logs.alert_findings(),
+# and a job process puts its job back, see job_process().
 # term: the SIGTERM or SIGINT that job_term() or stopped() raised on. CPython drops an exception that a handler raises
 # while a finalizer such as Popen.__del__ runs, so a later step that must not run past a stop raises it again.
 
 
+class Stopped(BaseException):
+    """A write that refuse() stops before it starts. It is no Exception, so the handler of a failed step never takes it
+    for a failure."""
+
+
+def stop_asked():
+    """Whether a stop was asked, see STOP. The caller then leaves its step out, so it marks the run as one that a stop
+    cut, STOP["skipped"]. docker stop gives a job process 60 seconds before SIGKILL, and a remux or a check can take
+    minutes. process.process() asks before each step, and regrab.regrab() before its second check."""
+    if STOP["asked"] or STOP["skipped"]:
+        STOP["skipped"] = True
+        return True
+    return False
+
+
+def refuse():
+    """Raise Stopped once a stop was asked, see stop_asked(). no_stop() and remux.Swap.start() call it, so no remux,
+    conversion, mkvpropedit or re-grab starts after a stop. The file in flight still writes its decision line, and the
+    run or the job ends soon after."""
+    if stop_asked():
+        raise Stopped("the run was stopped")
+
+
 def job_term(signum, _):
     """SIGTERM in a job process. Before any write the job stops at once and goes back to the queue. Once no_stop()
-    started an edit or a re-grab, the job runs to its end, so its decision line, its alerts and its Plex analyze are
-    written. job_process() then exits."""
+    started an edit or a re-grab, the job ends the step in flight and starts no write and no further step, see
+    stop_asked(). Its decision line and its Plex analyze are written, job_process() exits, and a job that the stop cut
+    goes back to the queue too."""
     if STOP["held"]:
         STOP["asked"] = True
     else:
@@ -141,15 +169,18 @@ def job_term(signum, _):
 
 
 def pass_stop():
-    """Hand the stop that remux.stopped() recorded during the layout repair after a flag edit to the handler that the
-    process runs, see process.relayout(). A job process then runs its job to its end, see job_term(), and a backfill
-    ends after the file, see cli.backfill_files(). A process with no handler of its own keeps the stop for its next
-    write, see raise_term()."""
+    """Hand the stop that remux.stopped() recorded during a remux to the handler that the process runs, see
+    remux.Swap.stop(). Returns True when that handler took it. A job process then ends its run with its decision line,
+    see job_term(), and a backfill ends after the file, see cli.backfill_files(). A process with no handler of its own
+    keeps the stop for its next write, see raise_term(). --check has none. It keeps Python's Ctrl+C handler and SIGTERM
+    at its default."""
     sig = STOP["term"]
     handler = signal.getsignal(sig) if sig else None
     if callable(handler) and handler is not signal.default_int_handler:
         STOP["term"] = None
         handler(sig, None)
+        return True
+    return False
 
 
 def raise_term():
@@ -165,19 +196,25 @@ def no_stop():
     """SIGTERM and SIGINT wait while mkvpropedit runs or a re-grab changes the app. A child inherits the blocked
     signals, so a stop that signals every process never cuts mkvpropedit mid-write. Ctrl+C in a terminal signals the
     whole foreground process group. The one-file worker then stops once the block ends: CPython runs the SIGINT
-    handler inside pthread_sigmask(), so a Ctrl+C raises right after the write. A job process finishes its job first
-    on SIGTERM, see job_term(). A stop whose raise a finalizer dropped stops it here, before the write."""
+    handler inside pthread_sigmask(), so a Ctrl+C raises right after the write. A job process ends the write first on
+    SIGTERM, see job_term(). A stop whose raise a finalizer dropped stops it here, before the write. A stop that a
+    handler of the process's own took raises Stopped here, see refuse(), also one whose handler ran inside
+    pthread_sigmask()."""
     raise_term()
     old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
-    STOP["held"] = True   # a job process now runs its job to the end, see job_term()
     try:
+        refuse()
+        STOP["held"] = True   # a SIGTERM in a job process now ends the write first, see job_term()
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
-def flags(j):
-    return [dict({k: t[k] for k in ("pos", "sel", "lang", "title", "default", "role", "original")}, forced=t["flagged"]) for t in decide.classify(j)]
+def flags(j, original=None):
+    """The flags and roles of the tracks of j for the edit record. original is the item's original language, so a lyrics
+    track keeps its role, see decide.classify()."""
+    return [dict({k: t[k] for k in ("pos", "sel", "lang", "title", "default", "role", "original")}, forced=t["flagged"])
+            for t in decide.classify(j, original=original)]
 
 
 def queue_dir():
@@ -269,6 +306,8 @@ def put_job(name, job, claimed=False):
 
 
 def drop_job(name, claimed=False):
+    if claimed and STOP["skipped"]:   # a stop cut the job, so it stays claimed and goes back, see job_process()
+        return
     store.write("DELETE FROM jobs WHERE name = ? AND claimed = ?", name, int(claimed))
 
 
@@ -356,11 +395,12 @@ def held_after(job, rec):
     record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(). A job
     that judged each subtitle a held alert names posted what it still found in its place, see judged(). A held timing
     alert also needs the times of each subtitle judged again, see times_judged(). Verdicts reach rec only when the run reached
-    its alerts, because every step after the subtitle checks runs. A job whose remux changed those subtitles before an
-    error counts too, see remuxed(). A dropped alert still posts the changes it keeps, see logs.held_changes(). A flag
-    edit that a posted alert of the job says already posts nothing. Every other held alert posts now, because nothing
-    judged its subtitles again. That is an error, a failed hearing, a word check that timed nothing, SUBTITLES off, or a
-    file the app moved during the run, or one the app lists where this container does not see it."""
+    its alerts. A job that a stop cut goes back to the queue with its held alerts, so only its next run gets here. A job
+    whose remux changed those subtitles before an error counts too, see remuxed(). A dropped alert still posts the
+    changes it keeps, see logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing.
+    Every other held alert posts now, because nothing judged its subtitles again. That is an error, a failed hearing, a
+    word check that timed nothing, SUBTITLES off, or a file the app moved during the run, or one the app lists where
+    this container does not see it."""
     app, out = job["app"], []
     if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
@@ -560,7 +600,10 @@ def queue_after(name, job, rec, run, inputs, deep=True):
     import. When no deep analysis queued, the alerts that run held for it post now, so none is lost. deep False says
     that a saved deep analysis of the file still holds, see subtitles.sub_cached(). It judged those subtitles, so the
     held alerts count as checked again. Only the change posts of DISCORD_POSTS=all go out, see logs.held_changes().
-    See run_job()."""
+    See run_job(). A job that a stop cut queues nothing, as it goes back to the queue, see drop_job(). Its next run
+    queues them."""
+    if STOP["skipped"]:
+        return
     held, queued = run and run.held, None   # the alerts the import held for the deep analysis, see process.alerts()
     if "tracks" in rec:   # process() ran: the deep analysis of the file, docs/design.md, "Subtitle match", its burn-in job and its whole-file check
         with contextlib.suppress(OSError, sqlite3.Error):
@@ -673,6 +716,9 @@ def whole_act(name, job, rec, pending, post=True):
     notes, left = [], len(fields["zeros"]["runs"]) - len(count)   # the runs of a file with PCM audio that the read pass did not confirm
     if left:
         notes.append(f"{left} zero run{'s' if left != 1 else ''} in a file with PCM audio, where the read pass found no error, logged only")
+    ff = fields["ffmpeg"]
+    if ff.get("tail") and (ff.get("tail_errors") or all(w == "end" for w in ff.get("when") or [None])) and not certain and not more:
+        notes.append(f"the read pass errors after the last Cluster come from the {ff['tail']} bytes past the Segment end, which the header repair removes")
     if (fields["ffmpeg"].get("ran") is False or "skipped" in fields["ffmpeg"]) and not certain:
         notes.append("the read pass " + ("could not open the file" if "skipped" not in fields["ffmpeg"] else fields["ffmpeg"]["skipped"]) +
                      ", so only the zero scan judged it")
@@ -870,7 +916,7 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
             if drop := deep_replaced(job):
                 return dict(rec, **drop)
             j = checks.mkvmerge(path)
-            ts = decide.classify(j)
+            ts = decide.classify(j, original=got.get("original"))
             on = burn_on(ts)
             rec["tracks"], f["tracks"] = logs.track_log(ts), [t["pos"] for t in on]
             if on and fix and not mkv:
@@ -1083,13 +1129,14 @@ def deep_analysis(name, pending, claimed=False):
                 rec.update({k: ctx.rec[k] for k in ("subremux", "sidecars") if k in ctx.rec})
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
         rec["from"] = job["from"]
-    if job.get("held"):
+    if job.get("held") and not STOP["skipped"]:   # a job that a stop cut goes back with its held alerts, see drop_job()
         rec["held_result"] = held_after(job, rec)
     rec = logs.decision(rec, started)
     path = rec.get("path")
     if want and path and os.path.exists(path) and process.changed(rec):
         pending.append(plex.plex_after(rec["app"], rec.get("source", "deep_analysis"), rec, want))
-    store.drop("deep-read", name)
+    if not STOP["skipped"]:   # the next run of a job that a stop cut reads the subtitles from it again
+        store.drop("deep-read", name)
     drop_job(name, claimed)   # first, because the deep analysis a backfill job queues takes its name
     if ctx and check and not any(still_queued(n(path)) for n in (deep_name, burn_name, whole_name)):   # an import of the path queued its own
         queue_after(name, dict(check, app=app), rec, ctx, got, deep=not subtitles.sub_cached(path, "deep"))
@@ -1778,8 +1825,8 @@ def coordinate(lock, pending):
     A job process that died leaves its job claimed, and requeue() puts it back. A job whose processes crash CRASH_TRIES
     times in one run is not claimed again in that run, also when the store lost the count of requeue(). SIGTERM starts no new job and passes
     SIGTERM on. A job process that has not written stops at once and its job goes back to the queue. One that has
-    edited or re-grabbed finishes its job first, see job_term(). This process then keeps the pending analyze requests
-    for the next worker, see save_plex(), and exits."""
+    edited or re-grabbed ends that write first and writes its line, see job_term(). This process then keeps the pending
+    analyze requests for the next worker, see save_plex(), and exits."""
     stop, crashes = [], collections.Counter()   # crashes: job name -> the crashes of its job processes in this run
     signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
     running, warned, told = {}, False, False   # running: the read end of a job's pipe -> [pid, job name, bytes read]
@@ -1899,17 +1946,20 @@ def job_process(name, w, sigmask):
     """A job process of coordinate(): run_job() on one claimed job with its own time limit, then its Plex analyze and
     the TMDB pause as JSON to the pipe w. It never returns. SIGTERM before a write raises SystemExit, see job_term().
     subprocess.run() and the other callers kill their child on the way out, so no ffmpeg or mkvmerge outlives the job.
-    The stopped job stays claimed, and coordinate() puts it back in the queue. After a write the job runs to its end."""
+    The stopped job stays claimed, and coordinate() puts it back in the queue. After a write the job ends the step in
+    flight and writes its line. When the stop left a step out or cut a write, the job stays claimed too, see drop_job(),
+    and the exit code is that of SIGTERM. The next run of the job reads the file as the stopped run left it and makes
+    the rest."""
     code, started = 1, time.time()
     try:
-        STOP.update(held=False, asked=False, term=None)   # a fresh job, whatever the parent process had done
+        STOP.update(held=False, asked=False, term=None, skipped=False)   # a fresh job, whatever the parent process had done
         config.JOB = name
         signal.signal(signal.SIGTERM, job_term)
         signal.pthread_sigmask(signal.SIG_SETMASK, sigmask)
         pending = []
         run_job(name, pending, shared=True, claimed=True)
         os.write(w, json.dumps({"plex": pending, "down": content.DOWN}).encode())
-        code = 0
+        code = 128 + signal.SIGTERM if STOP["skipped"] else 0   # a stopped job, which finished() puts back in the queue
     except SystemExit as ex:
         code = ex.code if isinstance(ex.code, int) else 1
     except BaseException as ex:   # its stderr may be /dev/null, so the line is its only trace. requeue() counts the crash.

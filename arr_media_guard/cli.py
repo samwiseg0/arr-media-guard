@@ -162,7 +162,8 @@ def backfill_args(argv):
     ap.add_argument("--canary", type=int, default=0, help="apply to N files of the plan per instance, spread across its classes")
     only = ap.add_mutually_exclusive_group()
     only.add_argument("--only-undecided", action="store_true", help="take the files the plan left undecided, for language detection")
-    only.add_argument("--only-header", action="store_true", help="take the files the plan gives a header repair. Each one gets its whole plan")
+    only.add_argument("--only-header", action="store_true", help="take the files the plan gives a header repair, except those whose only "
+                      "fault is padding. Each one gets its whole plan")
     ap.add_argument("--convert", action="store_true", help="convert the files that are not .mkv into Matroska")
     ap.add_argument("--plex-later", action="store_true", help="list the folders a conversion changed for --plex-flush")
     ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH", help="convert these files past the refusal the "
@@ -258,7 +259,8 @@ def backfill_app(app, a, out):
     if a.plan_from:   # the files the dry run planned a change for, left undecided or gave a header repair. Each is probed and planned again.
         listed = {w[0]["path"] for w in work}   # so a canary with --ids takes its sample from those items
         plans = [r for r in a.plans[app] if r["path"] in listed
-                 and (r["undecided"] if a.only_undecided else r.get("header_repair") == "would_repair_header" if a.only_header
+                 and (r["undecided"] if a.only_undecided else r.get("header_repair") == "would_repair_header" and not r.get("padding_only")
+                      if a.only_header
                       else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
@@ -423,7 +425,8 @@ def sub_time(argv):
     lists runs with no item, so no original language is known, and it keeps every flag except those a subtitle
     verdict turns off, see process(). A lookup that fails, by an error, a timeout or an app restart, is not the same:
     --apply then stops before any change, and a dry run says so. An app the user set up in part fails the same way, see
-    no_key()."""
+    no_key(). With --apply, SIGTERM or Ctrl+C ends the run after the file in flight, as in a backfill, see stops(). A
+    change the stop cut and each path the run never started give the exit code SUB_TIME_MISSED."""
     ap = argparse.ArgumentParser(prog="arr-media-guard --sub-time", description="The subtitle check of each Matroska file, with the "
                                  "reference timing and the whole-file timing, past the cache. See docs/subtitles.md.")
     ap.add_argument("paths", nargs="+", metavar="PATH")
@@ -460,26 +463,30 @@ def sub_time(argv):
         if len(unset) < len(config.CFG.apps):
             print(f"{'no app could be asked, so this dry run' if failed else 'no app lists it, so it'} knows no original language: {p}", flush=True)
         work.append((None, {"path": p}, (os.path.basename(p), None, 0, None, False, {"listed": 0})))
-    skipped, burst, missed, absent = set(), {}, [], []
-    for app, f, info in work:
-        if not os.path.isfile(f["path"]):
-            print(f"no file at the path, skipped: {f['path']}", flush=True)
-            absent.append(f["path"])
-            continue
-        if not f["path"].lower().endswith(".mkv"):
-            print(f"not a Matroska file, skipped: {f['path']}", flush=True)
-            continue
-        took, rec = backfill_file(app, f, info, a, False)
-        missed += [f'{f["path"]}: {why}'] if a.apply and (why := report.missed(rec)) else []
-        if a.apply and info[3] and config.CFG.plex_url and process.changed(rec, repack=False):
-            rec["plex"], rec["plex_reason"] = plex.plex_analyze(plex.plex_after(app, "backfill", rec, info[3]), skipped, burst=burst)
-        rec = logs.decision(rec, time.time() - took)
-        print(report.sub_time_report(rec, report.tense_of(rec)), flush=True)
-        if why := unheard(rec):
-            print(f"  {why}", flush=True)
-        owner = (rec.get("ids") or {}).get("app_id")
-        if owner and "after the run" in ((rec.get("subremux") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan")):
-            rescan_item(app, owner, None)
+    skipped, burst, missed, absent, stop = set(), {}, [], [], threading.Event()
+    with stops(stop) if a.apply else contextlib.nullcontext():   # an apply ends after the file in flight, as a backfill does
+        for app, f, info in work:
+            if stop.is_set():   # the run names each path it never started, and exits SUB_TIME_MISSED
+                missed.append(f'{f["path"]}: not run, the run was stopped')
+                continue
+            if not os.path.isfile(f["path"]):
+                print(f"no file at the path, skipped: {f['path']}", flush=True)
+                absent.append(f["path"])
+                continue
+            if not f["path"].lower().endswith(".mkv"):
+                print(f"not a Matroska file, skipped: {f['path']}", flush=True)
+                continue
+            took, rec = backfill_file(app, f, info, a, False)
+            missed += [f'{f["path"]}: {why}'] if a.apply and (why := report.missed(rec)) else []
+            if a.apply and info[3] and config.CFG.plex_url and process.changed(rec, repack=False):
+                rec["plex"], rec["plex_reason"] = plex.plex_analyze(plex.plex_after(app, "backfill", rec, info[3]), skipped, burst=burst)
+            rec = logs.decision(rec, time.time() - took)
+            print(report.sub_time_report(rec, report.tense_of(rec)), flush=True)
+            if why := unheard(rec):
+                print(f"  {why}", flush=True)
+            owner = (rec.get("ids") or {}).get("app_id")
+            if owner and "after the run" in ((rec.get("subremux") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan")):
+                rescan_item(app, owner, None)
     if missed:   # a change the apply planned did not happen
         print("--sub-time --apply did not make every change:\n  " + "\n  ".join(missed), flush=True)
         sys.exit(SUB_TIME_MISSED)
@@ -805,12 +812,11 @@ def backfill_files(work, one, workers, stop, converted):
     thread. More run one() in threads, and submit no file once stop is set or the conversions done
     and in flight reach convert_max. A conversion backfill runs twice as many threads as the pool has slots, so a
     thread that waits for the app's import leaves its slot to another file. SIGTERM or Ctrl+C sets stop, and the
-    files in flight end first: a stop never cuts a remux, a swap, an import or mkvpropedit, and every file that ran gets
-    its decision line. A process that ignores SIGINT keeps it ignored, as remux.Swap does."""
-    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set())) for s in (signal.SIGTERM, signal.SIGINT)
-                if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN}
-    try:
-        if workers == 1:   # the file ends and writes its decision line. convert() handles a stop itself during the remux.
+    files in flight end first. A stop never cuts a swap, an import or mkvpropedit, and every file that ran gets its
+    decision line. In a thread a stop never cuts a remux. With one worker, a stop during a remux ends the remux and
+    removes its temp file, and the file goes on as after a failed remux, see stops()."""
+    with stops(stop):
+        if workers == 1:   # the file ends and writes its decision line. A stop during a remux reaches stop through remux.Swap.stop().
             for w in work:
                 if stop.is_set():
                     return
@@ -825,6 +831,19 @@ def backfill_files(work, one, workers, stop, converted):
                     return
                 for fut in concurrent.futures.wait(running, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)[0]:
                     yield running.pop(fut), fut.result()
+
+
+@contextlib.contextmanager
+def stops(stop):
+    """SIGTERM and Ctrl+C set stop and HALT inside the block, and the caller starts no new file. The file in flight ends
+    with its decision line. A stop during its remux removes the temp file, and remux.Swap.stop() hands the stop to this
+    handler. The handler sets runner.STOP["asked"] too, so the file in flight starts no write after the stop, see
+    runner.refuse(). A backfill apply and --sub-time --apply run their files in it. A process that ignores SIGINT keeps
+    it ignored, as remux.Swap does."""
+    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set(), runner.STOP.update(asked=True))) for s in (signal.SIGTERM, signal.SIGINT)
+                if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN}
+    try:
+        yield
     finally:
         for s, h in handlers.items():
             signal.signal(s, h)
@@ -898,9 +917,10 @@ def open_problem(what, r, result, edited_at, latest):
     result in result. A problem of the check after an edit counts unless a later result came after that edit. A failed
     conversion or a failed repair counts only when its alert did not go out, see process.conversion() and
     process.faults(). alert_result says "sent" or "already sent" for an alert that went out. A line without it, as of
-    --convert or --sub-check, keeps the problem."""
+    --convert or --sub-check, keeps the problem. A conversion that a stop cut is none, as the stop is the owner's own
+    act, see logs.stop_caused()."""
     path = r.get("path")
-    if not os.path.exists(path or ""):
+    if not os.path.exists(path or "") or what == "convert" and (r.get("repack") or {}).get("stopped"):
         return False
     if what == "error":
         return latest[path, r.get("source")] is r
@@ -957,9 +977,12 @@ def audit(argv):
         # seen: (a problem code, its decision line), see logs.audit_problem(). result: per path the place and line of its
         # latest result, edited_at the place of its last edit, and latest per path and source its latest line, see open_problem().
         start, last, day, seen, result, edited_at, latest = since_time(a.since), {}, [], [], {}, {}, {}
+        rfc = {}   # per path the RFC 9559 fault kinds of its latest line with a header check, dry runs and scans too
         for n, (raw,) in enumerate(store.read("SELECT rec FROM decisions WHERE app = ? AND at >= ? ORDER BY rowid", app, start.timestamp())):
             r = json.loads(raw)   # a decision line of this app and window, as logs.decision() keeps it
             day.append(r)   # every source, for the TMDB status
+            if "rfc" in r:   # the faults the run found, which a repair of the same run ended
+                rfc[r.get("path")] = {} if (r.get("header_repair") or {}).get("code") in config.REPAIRED else r["rfc"]
             if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
             latest[r.get("path"), r.get("source")] = r
@@ -1015,14 +1038,17 @@ def audit(argv):
         runner.queue_rechecks()   # on a host the first nightly audit of a new version queues its rechecks
         # one summary line a night, so Loki sees each host even on a day without imports. It counts a file once per decision line.
         k = collections.Counter(what.partition(":")[0] for what, _ in seen)
+        kinds = collections.Counter(kind for path, found in rfc.items() if os.path.exists(path or "") for kind in found)   # files per kind
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", k["further"] + k["reprobe"]), ("undecided", k["undecided"]), ("dropped", k["dropped"]),
-                          ("broken", k["broken"]), ("errors", k["error"]), ("tmdb", tmdb)]))
+                          ("broken", k["broken"]), ("errors", k["error"]), ("tmdb", tmdb)] + [(f"rfc_{x}", n) for x, n in sorted(kinds.items())]))
         files = logs.audit_files([(what, r) for what, r in seen if open_problem(what, r, result, edited_at, latest)])
         title = f"Open problems: {len(files)} file{'' if len(files) == 1 else 's'} · {logs.app_name(app)}"
         text = f"{len(files)} file{'' if len(files) == 1 else 's'} with an open problem since {start.isoformat(timespec='minutes')}." + \
             "".join(f"\n{label}: {problems}" for label, problems, _ in files)
         fields = [("TMDB", tmdb)]   # the day's metadata checks: ok, unavailable n times, key broken, or no checks
+        if kinds:   # files with each RFC 9559 fault kind, by their latest header check in the window
+            fields.append(("RFC 9559 faults", ", ".join(f"{x} {n}" for x, n in sorted(kinds.items()))))
         worth = bool(files)   # the post goes out only for an open problem, the syslog line every night
     if not config.SERVE:   # the container log takes the summary line above, one line per event
         print(title); print(text)
@@ -1054,6 +1080,8 @@ def scan_file(kind, app, w, stop):
             if kind == "video":
                 dur, hp, pcm, by = checks.video_inputs(path)
                 certain, doubts, detail = checks.check_video(path, dur, hp=hp, pcm=pcm, by=by)
+                if hp:   # each RFC 9559 fault by kind, which --audit counts
+                    rec["rfc"] = hp["rfc"]
             else:
                 j = checks.mkvmerge(path)
                 d = decide.decide(j, original, kids, "") if path.lower().endswith(".mkv") else None
@@ -1156,7 +1184,8 @@ def scan(app, a, kind):
                     logs.decision(dict(rec, result=f"{report.FAULTS[kind][0]}: {certain}" if certain else report.FAULTS[kind][1],
                                   outcome=regrab.RESULT_CODES[kind][0] if certain else regrab.RESULT_CODES[kind][1], **{kind: summary}), started)
                     checked += 1
-                    header = (detail.get("header") or {}).get("issue") if kind == "video" else None   # listed, never repaired
+                    h = (detail.get("header") or {}) if kind == "video" else {}
+                    header = None if checks.padding_only(h) else h.get("issue")   # listed, never repaired. Padding alone is left.
                     if certain or doubts or header:
                         found += 1
                         line = dict(file_id=fid, label=label, path=path, certain=certain, doubts=doubts, header=header,

@@ -89,12 +89,12 @@ def tracks_fault(j, new, edits=(), drop=(), trim=(), ended=()):
     return f"the new file does not show the edits {missed}" if missed else None
 
 
-def header_fault(j, tmp, new, old_size, hp, info, folder, edits=()):
+def header_fault(j, tmp, new, old_size, hp, info, folder, edits=(), src=None):
     """Why the remuxed file tmp may not replace a Matroska original whose header has an issue, or None. j and new are
     their mkvmerge probes, hp is the header stage of check_video() for the original, folder the work folder of the
     remux. The tracks must hold the planned state of j less the tracks in hp["remove"], with edits applied, see
     tracks_fault(). A trimmed track keeps all but its UID, and must hold its events less the ones the trim dropped.
-    The rest are the header checks, see header_checks()."""
+    The rest are the header checks, see header_checks(). src is the original's path."""
     kind = (new.get("container") or {}).get("type")
     if kind != "Matroska": return f"the new file reads as {kind}"
     trim, remove = set(hp.get("trim") or ()), set(hp.get("remove") or ())
@@ -103,10 +103,10 @@ def header_fault(j, tmp, new, old_size, hp, info, folder, edits=()):
     for i in trim:   # one block per event
         n, t = (new["tracks"][ids.index(i)].get("properties") or {}).get("tag_number_of_frames"), info["trimmed"][i]
         if str(n) != str(t["events"] - t["dropped"]): return f"the trimmed track {i} holds {n} events, not {t['events'] - t['dropped']}"
-    return header_checks(tmp, new, old_size, hp, info, folder)
+    return header_checks(tmp, new, old_size, hp, info, folder, src)
 
 
-def header_checks(tmp, new, old_size, hp, info, folder):
+def header_checks(tmp, new, old_size, hp, info, folder, src=None):
     """Why the header of the remuxed file tmp, whose mkvmerge probe is new, fails the header repair of its original, or
     None. hp is the header stage of check_video() for the original, folder the work folder of the remux. The checks
     compare against the stream ends hp read from the last clusters, never the old header. info gets the new duration,
@@ -115,41 +115,71 @@ def header_checks(tmp, new, old_size, hp, info, folder):
 
     The new video track must hold as many frames as its end over its default duration, less FRAME_SLACK. mkvmerge drops
     a damaged cluster with no warning. A track with no default duration passes only when every window of the check
-    decoded clean. No packet may trail the packets before it in the new file by more than LAG_SLACK, see proof.lags().
+    decoded clean. info["frame_rate"] gets the share of the steps between the new file's frames that are not its usual
+    frame length, see decide.off_rate(), and whether that makes the rate variable. A variable rate holds fewer frames
+    than its end over its default duration. Such a track passes when it holds every frame time of the original src,
+    see same_frames(). No packet may trail the packets before it in the new file by more than LAG_SLACK, see proof.lags().
     The bound holds whatever the original's lag, so a repair must put late packets in place. The size may differ by
     REPACK_SIZE from old_size less the bytes past the Segment end (hp["tail"], hp["edit_tail"]) and less the zero run
     that mkvpropedit enclosed (hp["enclosed_size"]). mkvmerge reads the elements after that run through the SeekHead
-    and keeps them, see resynced()."""
+    and keeps them, see resynced(). An RFC 9559 fault of the new file that the original holds too fails no repair,
+    because mkvmerge wrote it again. info["rfc_left"] then names it, see checks.rfc_again()."""
     info["new_duration"] = d1 = round(decide.duration(new), 3)
     if abs(d1 - hp["expect"]) > decide.REPAIR_END: return f"the new header says {d1} seconds, but the streams end at {hp['expect']}"
     now = checks.header_probe(tmp, new)
     info["new_cues"] = (now or {}).get("cues")
-    if not now or now["cues"] is not True or now["issue"]:
-        return "the new file still has a header issue: " + "; ".join((now or {}).get("issue") or [f"no usable Cues, {info['new_cues']}"])
+    if again := checks.rfc_again(now, hp):
+        info["rfc_left"] = again
+    issue = [x for x in (now or {}).get("issue") or [] if not (again and x.startswith(checks.RFC_ISSUE))]
+    if not now or now["cues"] is not True or issue:
+        return "the new file still has a header issue: " + "; ".join(issue or [f"no usable Cues, {info['new_cues']}"])
+    size = os.path.getsize(tmp)
+    places, v = proof.packet_places(tmp, folder, max(600, size / proof.PROOF_RATE)), checks.main_stream(tmp)   # each packet's time and place
+    times = [None if t != t else t for t in places[v["index"]][0]] if v and v["index"] in places else []   # the film's frames
     p = decide.main_video(new["tracks"])   # the film, never a cover picture
     p = None if p is None else p.get("properties") or {}
     if p is not None:
         info["frames"] = n = int(p.get("tag_number_of_frames") or 0)
         if p.get("default_duration"):
             want = round(hp["video"] * 1e9 / p["default_duration"])
-            if n < want - decide.FRAME_SLACK: return f"the new file holds {n} video frames, but the video end at {hp['video']} s needs {want:.0f}"
+            tick = (((new.get("container") or {}).get("properties") or {}).get("timestamp_scale") or 1000000) / 1e9
+            off = decide.off_rate(decide.frame_steps(times), tick)
+            info["frame_rate"] = rate = {"off": None if off is None else round(off, 4), "variable": off is not None and off >= decide.VFR_SHARE}
+            if n < want - decide.FRAME_SLACK:
+                short = f"the new file holds {n} video frames, but the video end at {hp['video']} s needs {want:.0f}"
+                if not (rate["variable"] and src): return short
+                if fault := same_frames(src, times, folder, rate): return f"the video has a variable frame rate, and {fault}"
         elif not hp.get("windows_clean"):
             return "the video track has no default duration, so lost frames cannot be counted, and not every window of the check decoded clean"
     # The bytes past the Segment end go, once when both counts hold them, and so does the enclosed zero run
-    size, old_size = os.path.getsize(tmp), old_size - max(hp.get("tail") or 0, hp.get("edit_tail") or 0) - (hp.get("enclosed_size") or 0)
+    old_size = old_size - max(hp.get("tail") or 0, hp.get("edit_tail") or 0) - (hp.get("enclosed_size") or 0)
     if abs(size - old_size) > config.REPACK_SIZE * old_size: return f"the size changed from {old_size} to {size} bytes"
     video = hp["video"] or 0
-    by = checks.window_stream(tmp) if video >= 60 else {}   # a still image first: PyAV seeks by the film
+    by = {"stream": v["index"]} if video >= 60 and v and v["behind"] else {}   # a still image first: PyAV seeks by the film, see checks.window_stream()
     if by and not checks.lid_ready():   # no PyAV, so no window, as in checks.video_stages()
         info["windows_skipped"], video = checks.STILL_FIRST, 0
     info["windows"] = ws = [checks.window(tmp, video * s, min(decide.VIDEO_SECS, video * (1 - s)), **by) for s in decide.VIDEO_AT] if video >= 60 else []
     certain, doubts = decide.video_verdict([], ws)
     doubts += [decide.stopped_doubt(w) for w in ws if decide.read_capped(w)]   # the new file has Cues, so a read-cap stop is no clean window
     if certain or doubts: return "a video window of the new file is not clean: " + (certain or "; ".join(doubts))
-    info["lag"] = lag = {i: round(x, 3) for i, x in proof.lags(proof.packet_places(tmp, folder, max(600, size / proof.PROOF_RATE))).items()}
+    info["lag"] = lag = {i: round(x, 3) for i, x in proof.lags(places).items()}
     late = max(lag, key=lag.get, default=None)
     if late is not None and lag[late] > proof.LAG_SLACK: return f"stream {late} sits up to {lag[late]:.1f} s behind the other streams in the new file"
     return None
+
+
+def same_frames(src, times, folder, rate):
+    """Why the video frame times of a new file, times, are not the frame times of its original src, or None. A track
+    with a variable frame rate holds no frame for each default duration, so the original's frames are the count.
+    ffprobe reads every packet of src, and a line that names damage refuses, see proof.packet_places(). mkvmerge drops
+    a damaged cluster with no warning, and the frames of that cluster then miss in the new file. The times compare as
+    proof.times_fault() compares them. rate gets the original's frame count."""
+    v = checks.main_stream(src)
+    if not v:
+        return "ffprobe found no video stream in the original"
+    got = proof.packet_places(src, folder, max(600, os.path.getsize(src) / proof.PROOF_RATE), clean=True).get(v["index"], [[]])[0]
+    rate["original_frames"] = len(got)
+    return proof.times_fault(f"video {v['index']}", v.get("codec_name"), [None if t != t else t for t in got], times)[0]
 
 
 def track_args(p):
@@ -354,8 +384,8 @@ class SourceChanged(Exception):
 
 def stopped(signum, _):
     """SIGTERM during a repack, as a stop of the app's unit sends it, or Ctrl+C. It raises, so repack() removes its temp
-    file. It records the signal first, because CPython drops the raise when it lands in Popen.__del__ after a remux.
-    Swap.sync() and Swap.check() raise it again, see runner.raise_term()."""
+    file and hands the stop on, see Swap.stop(). It records the signal first, because CPython drops the raise when it
+    lands in Popen.__del__ after a remux. Swap.sync() and Swap.check() raise it again, see runner.raise_term()."""
     runner.STOP["term"] = signum
     runner.raise_term()
 
@@ -415,20 +445,26 @@ def drop_tmp(tmp):
 
 class Swap:
     """The steps repack(), resub() and convert() share to put tmp, a remux of path in hide_dir, in place of path, the
-    file st describes. Each caller runs them in its own order. sync() comes before its checks read tmp, own() and check()
-    after them, then the rename. unkeep() runs on a failure and close() at the end. Only the main thread sets the
-    SIGTERM and SIGINT handlers. A conversion worker of a backfill runs in another thread and sets none. A process that
-    ignores SIGINT keeps it ignored, as a backfill started with & from a script does."""
+    file st describes. Each caller runs them in its own order. start() comes first, sync() before its checks read tmp,
+    own() and check() after them, then the rename. unkeep() and stop() run on a failure and close() at the end. Only the
+    main thread sets the SIGTERM and SIGINT handlers. A conversion worker of a backfill runs in another thread and sets
+    none. A process that ignores SIGINT keeps it ignored, as a backfill started with & from a script does."""
 
     def __init__(self, path, st, tmp, info):
         """End the time limit, so no step of the remux, its proof or the swap stops at it. SIGTERM and Ctrl+C raise
-        through stopped(), so the caller removes the temp file. process() starts a new time limit on info["warnings"]."""
+        through stopped(), so the caller removes the temp file and calls stop(). process() starts a new time limit on
+        info["warnings"]."""
         self.path, self.st, self.tmp, self.info = path, st, tmp, info
         main = threading.current_thread() is threading.main_thread()
         config.DEADLINE.stop()
         info["warnings"] = None
         self.term = {s: signal.signal(s, stopped) for s in (signal.SIGTERM, signal.SIGINT)
                      if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN} if main else {}
+
+    def start(self):
+        """Refuse the remux once a stop was asked, see runner.refuse(). The caller calls it first in its try, so stop()
+        gives its result for "the run was stopped", and nothing is written."""
+        runner.refuse()
 
     def sync(self):
         """fsync tmp. A write error the NAS still holds shows here, before the checks read the file. A SIGTERM whose
@@ -483,6 +519,24 @@ class Swap:
         """Put the SIGTERM and SIGINT handlers of the caller back."""
         for s, h in self.term.items():
             signal.signal(s, h)
+
+    def stop(self, ex):
+        """Whether ex, the exception that ended the remux, is a stop that the caller's own handler took. An Exception
+        is a failure of the remux, and gives False, unless stopped() recorded a stop. mkvmerge then died of the same
+        Ctrl+C, and CPython dropped the raise. For a stop, put the caller's handlers back and hand the stop to them, see
+        runner.pass_stop(). The caller then returns its result for "the run was stopped", and info["stopped"] and
+        runner.STOP["skipped"] are True. A backfill ends after the file, and a job process that has written ends its run
+        with its decision line. A job process that has not written raises in job_term(), and its job goes back to the
+        queue. A stop that start() refused counts as taken. A process with no handler of its own, such as
+        --check, gets the stop raised again."""
+        if isinstance(ex, Exception) and not runner.STOP["term"]:
+            return False
+        self.release()
+        if not (runner.pass_stop() or runner.STOP["asked"]):
+            runner.raise_term()
+            raise ex
+        self.info["stopped"] = runner.STOP["skipped"] = True
+        return True
 
     def close(self, folder):
         """Put the signal handlers back, then remove the work folder and the temp file. After a rename only the hidden
@@ -542,7 +596,8 @@ def repack(path, j, st, apply, hp, edits=()):
     temp file is synced, and header_fault() compares it to the original and to the planned state of edits. The original must still be the file st
     describes, else the app replaced it meanwhile (repack_source_changed). On any fault the temp file goes and the
     original stays. Otherwise the temp file takes the original's owner and mode. The original is hard-linked into
-    originals_root() for keep_days, then the temp file is renamed over it. Any exception removes the temp file: Ctrl+C, the time limit, and SIGTERM through stopped()."""
+    originals_root() for keep_days, then the temp file is renamed over it. Any exception removes the temp file: Ctrl+C, the time limit, and SIGTERM through stopped().
+    A stop that the caller's own handler takes gives header_not_repaired, see Swap.stop()."""
     info = {"container": (j.get("container") or {}).get("type"), "old_size": st.st_size, "tracks": checks.track_list(j)}
     trim, remove = list(hp.get("trim") or ()), list(hp.get("remove") or ())
     tracks = {t.get("id"): t for t in j.get("tracks") or []}
@@ -571,6 +626,7 @@ def repack(path, j, st, apply, hp, edits=()):
     ids = [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in remove]   # a removed track leaves the file
     sw = Swap(path, st, tmp, info)
     try:
+        sw.start()
         new_tmp(tmp, st)
         own = {}
         if trim or remove:
@@ -583,15 +639,15 @@ def repack(path, j, st, apply, hp, edits=()):
             raise RuntimeError(f"mkvmerge exited {r.returncode}: {info['warnings']}")
         sw.sync()
         new = checks.mkvmerge(tmp)
-        fault = header_fault(j, tmp, new, st.st_size, hp, info, folder, edits)
+        fault = header_fault(j, tmp, new, st.st_size, hp, info, folder, edits, path)
         if fault: raise RuntimeError(fault)
         size = sw.own()
         sw.check("the app replaced or renamed the original during the header repair", config.CFG.keep_days)
         os.replace(tmp, path)
     except BaseException as ex:
         sw.unkeep(path)
-        if not isinstance(ex, Exception):
-            raise
+        if sw.stop(ex):   # the issue stays, as before the remux
+            return "header_not_repaired", "not repaired: the run was stopped. The issue: " + "; ".join(hp["issue"]), info
         return "header_repair_failed", config.mask(f"{failed}{', the original changed' if isinstance(ex, SourceChanged) else ''}: {ex}")[:500], info
     finally:
         sw.close(folder)
@@ -1337,6 +1393,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     info["relace_skipped"] says why.
 
     It runs like repack(): the temp file in hide_dir, no time limit during the remux, and SIGTERM removes the temp file.
+    A stop that the caller's own handler takes gives "subtitle remux failed: the run was stopped", see Swap.stop().
     The original must still be the file st describes. The temp file takes its owner and mode, the original is kept in
     originals_root() for keep_days, and the temp file is renamed over it. A removal needs that kept original, so with
     KEEP_ORIGINALS_DAYS 0 the caller never asks for one. The extracted text, the files of single tracks, the cover
@@ -1379,6 +1436,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     subs = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]   # the k-th of them is ffprobe's k-th
     sw = Swap(path, st, tmp, info)
     try:
+        sw.start()
         text = [x["index"] for x in proof.ff_streams(path)[1] if x.get("codec_type") == "subtitle"]
         if len(text) != len(subs):
             raise RuntimeError(f"ffprobe reads {len(text)} subtitle streams and mkvmerge {len(subs)}")
@@ -1473,7 +1531,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
                                                  recoded={kept.index(i): cues for i, (_, cues) in repairs.items()})
             fault = refused and refused[1]
         if not fault and head:
-            fault = header_checks(tmp, new, st.st_size, hp, info, folder)
+            fault = header_checks(tmp, new, st.st_size, hp, info, folder, path)
         if fault: raise RuntimeError(fault)
         size = sw.own()
         sw.check("the app replaced or renamed the original during the subtitle remux", config.CFG.keep_days)
@@ -1491,8 +1549,8 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         drop_broken(broken.values())
         if undone := sorted(os.path.basename(e["sidecar"]) for e in broken.values() if e.get("removed")):
             info["garbled_text_removed"] = undone
-        if not isinstance(ex, Exception):
-            raise
+        if sw.stop(ex):
+            return "subtitle_remux_failed", "subtitle remux failed: the run was stopped", info
         return "subtitle_remux_failed", config.mask(f"subtitle remux failed{', the original changed' if isinstance(ex, SourceChanged) else ''}: {ex}")[:500], info
     finally:
         sw.close(folder)

@@ -16,6 +16,7 @@ The hunter imports the package, and the package never imports the hunter.
 | `config.py` | the env file as `CFG`, the policy load, the tuning constants and `mask()` |
 | `apps.py` | Sonarr and Radarr behind one interface, `ARR[app]`, the HTTP client and the path maps |
 | `checks.py` | the probes, the header check, broken audio, corrupt video and the spoken language |
+| `matroska.py` | the RFC 9559 schema of the elements outside the Clusters, and the check of a file against it |
 | `subtitles.py` | the subtitle match check, and the saved results with their registry, `SUB_CHECKS` |
 | `remux.py` | the header repair, the subtitle remux, and the swap they share with the conversion |
 | `convert.py`, `proof.py` | the conversion into Matroska, and its packet proof |

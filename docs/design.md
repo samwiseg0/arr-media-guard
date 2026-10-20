@@ -37,10 +37,16 @@ only a policy change. A decision has four steps.
 - **Audio role.** Main, commentary or description ("AD", "DVS"). Only a main track plays first.
   "Commentary", "cmt" or "Comm" in the title makes a track commentary. So does a *notes title*, which has
   "Production Notes", "Trivia", "Info Text", "Fact Track", "Pop-up" or "Easter Eggs", or is just "Notes".
-- **Subtitle role.** Commentary, dub transcript ("English (dub)", "Dubtitle"), forced, SDH or full.
-  A "forced" or signs title (signs, songs, foreign parts, alien, titles only) makes a track forced.
-  So does a forced flag, or a density under `sparse_events` (1.5 events a minute). "SDH", "CC" or
+- **Subtitle role.** Commentary, dub transcript ("English (dub)", "Dubtitle"), lyrics, forced, SDH or full.
+  A "forced" or signs title (signs, songs except on a lyrics track, foreign parts, alien, titles only) makes a
+  track forced. So does a forced flag, or a density under `sparse_events` (1.5 events a minute). "SDH", "CC" or
   "full" in the title overrides the signs words.
+- **Lyrics.** A subtitle whose title names songs and no other signs word, in the item's original language, holds
+  the song lyrics. A viewer of the original audio hears the songs, so the track is never forced. A policy cannot
+  list the lyrics role, so the track never becomes a default. A forced flag on it stays. A "Songs" track in another
+  language translates the songs and stays forced, as in the English dub of a Japanese film. With no original
+  language, AMG cannot tell lyrics from a translation, so the track stays forced. The Original language flag
+  treats a lyrics track as a forced one.
 - **Notes titles.** A notes title makes an audio or a subtitle track commentary, so the subtitle check leaves it
   alone. "SDH", "CC" or "full" in the title overrides the notes words. The word "notes" inside a longer title, as in
   "TL Notes", keeps the track's role.
@@ -158,8 +164,8 @@ the language tags, as the mkvpropedit property `flag-original` (`decide.ORIGINAL
 language is TMDB's, see `decide.content_language()`. When the app lists another original language for the item, or
 TMDB gives none or one with no 639-2 code, no flag changes.
 
-- Only the roles of `decide.ORIGINAL_ROLES` change: main audio, and full, SDH, forced and dub subtitles. A commentary
-  or an audio description is no part of the content's own speech, so its flag stays.
+- Only the roles of `decide.ORIGINAL_ROLES` change: main audio, and full, SDH, forced, dub and lyrics subtitles. A
+  commentary or an audio description is no part of the content's own speech, so its flag stays.
 - AMG must be sure of the track's language, by the bar of `min_confidence` (owner 2026-10-06, "hear before
   flagging"). The track is tagged after this run, not `und`, `mul` or `zxx`, so an `und` track that the tag rules tag
   gets its flag in the same run. A main audio track needs its heard language to name its
@@ -252,8 +258,14 @@ other findings are log only. A `content` finding names each signal that scored, 
 points, so the `episode` finding posts. A `duration` finding is log only when the header repair fixed the file, or
 when a `header`, `cut` or `subtitle` finding of the file posts its cause. It posts when no repair ran, as with
 `HEADER_REPAIR` off or a repair that another fault blocked. The decision line keeps every finding, and its
-`alert_result` says `log only` for each one that did not post. An alert whose text fails still posts, with its title
-and its file, and the sentence `report.UNTOLD` in place of the error. Its line in `alerts` keeps the error.
+`alert_result` says `log only` for each one that did not post. A stop is the owner's own act. A finding that the stop
+caused posts nothing, and `alert_result` says `not posted, the run was stopped`, see `logs.stop_caused()`. That is a
+re-grab or a restore that the stop kept from its step, and a conversion whose remux it cut. A run that a stop ended
+before its alert step keeps its re-grabs and the unreadable notice of its conversion in the findings, see
+`process.stop_line()`. They post, because no later run finds them again. The change posts of `DISCORD_POSTS=all` go
+out too. The decision line names the stop, and the next run of the file posts what it still finds. An alert whose text
+fails still posts, with its title and its file, and the sentence `report.UNTOLD` in place of the error. Its line in
+`alerts` keeps the error.
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
@@ -465,6 +477,16 @@ window with no frame and an error is bad too. A decoder line before the first fr
 seek. The h264 `SEI type ... truncated` and mpeg4 `low_delay flag set incorrectly` lines never
 count, because clean files log them too.
 
+Each window logs the steps between its frames in `steps`. The check holds the steps of the three windows against
+their median, as the header repair does. See "A variable frame rate" under "Header repair". The decision line keeps
+the share of steps off the usual frame length and the verdict in `video.frame_rate`. An import whose video check finds
+a variable rate posts one amber "Variable frame rate" alert, the finding `frame_rate`. A fault or a doubt of the
+check posts in its place. The alert changes nothing. A job a backfill queued, `--check` and a `--check-video` scan only
+log the rate. So a library pass posts no alert per file. In 229 library files read in full, 5 hold a variable rate.
+The three windows named each of them and no other file. With 1116 more files read at the same three places, about
+190 of 34,000 library files hold one (0.55 percent). They are mixed-rate HandBrake encodes, DVD MPEG-2 with repeated
+fields, and encodes that dropped repeated frames.
+
 Clean encoders pad easy frames with short zero runs, so only a run of 256 KiB counts. The zero probe
 skips the Attachments and anything past the Segment end, where fonts and old copies can hold zeros.
 The doubt of one hit names a play time with the words of the whole-file check, see "Play times" under
@@ -563,6 +585,15 @@ file, which the front one lists. `checks.seeks()` reads that one too, as the hea
 such SeekHeads and reads each one once, 8 at most, so SeekHeads that list each other end the read. Since 2.18.4 a flag
 edit of a file with bytes past its Segment end runs as a remux, so it leaves no such zeros, see "Write stage". Zeros
 that an older edit left are a header issue, and the header repair drops them, see "Header repair".
+
+**The tail fault.** Bytes past the Segment end make ffmpeg read the last element again, see "RFC 9559 check". In a file
+with such bytes, read pass errors that all sit past the last Cluster are the tail fault. When the RFC 9559 check finds
+`tail_errors`, the "Truncating packet" lines are the tail fault too (`decide.TAIL_LINE`). Every other line that names no
+place stays a doubt. Damage in the payload of the last Cluster prints such lines, as "Invalid NAL unit size".
+mkvmerge copies that damage with no warning, so the header repair cannot end it. The tail fault adds no doubt, and the
+note of the decision line says the header repair removes it. The decision line keeps the count of those bytes in
+`whole.ffmpeg.tail` and the check's answer in `whole.ffmpeg.tail_errors`. `whole.ffmpeg.truncated` counts the
+"Truncating packet" lines. The same errors in a file with no such bytes stay a doubt.
 
 **Play times.** The doubts of the whole-file check and of the import's zero probe name play times, from the Cues, see
 `checks.play_times()`. So a gap reads the same whichever check found it. The read pass names the time of each byte, one
@@ -773,13 +804,32 @@ analysis and whole-file check of the file then take its new inode, size and mtim
 `runner.follow_up()` runs both. In each group of the queue it runs before the deep analyses, because a subtitle remux of
 a deep analysis replaces the file and drops the job.
 
-**Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
-job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
-inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. A stop during the layout repair right after
-a flag edit removes the temp file of the repair and keeps the edit. A job process then runs its job to its end, as
-after any edit, and writes the decision line of the edit. A backfill ends after the file. A run with Python's own
-Ctrl+C handler, as `--check`, stops at its next write. Pending Plex analyzes go into
-the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the
+**Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the job. SIGTERM
+starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job inside mkvpropedit or a re-grab's
+deletes blocks SIGTERM until they end. A stop during a remux removes its temp file, and the original stays. That
+covers a header repair, a subtitle remux, a conversion and the layout repair right after a flag edit, which keeps the
+edit. The remux hands the stop to the process's own handler, see `remux.Swap.stop()`. A backfill with one worker or
+`--sub-time --apply` then ends after the file, see `cli.stops()`. A job process that has written ends the step in
+flight and writes its line. One that has not written stops at once, and its job goes back to the queue. Once a handler of the
+process's own took a stop, no write starts, see `runner.refuse()`. `docker stop` gives the container 60 seconds before
+SIGKILL, and a remux or a check can take minutes. A remux and a conversion refuse to start in `remux.Swap.start()`,
+and mkvpropedit and a re-grab in `runner.no_stop()`. No further step of `process.process()` runs either, and a re-grab
+runs no second check, see `runner.stop_asked()`. The decision line then comes at once, and `not_run` lists the steps
+left out, see `process.stop_line()`. A run that stopped before its decision gets the outcome `stopped`, "not checked:
+the run was stopped", with the reason codes of what it wrote. No other code says that the decision never ran. The Plex
+analyze of a changed file still runs. A stopped or refused header repair gives `header_not_repaired`. A stopped
+subtitle remux gives `subtitle_remux_failed`, and a stopped conversion `repack_failed`. A refused flag edit gives
+`edit_failed` with "not edited: the run was stopped", and a refused re-grab the action `failed`. A stop posts no
+alert about itself, see "Alerts". A job process then keeps its job claimed, see `runner.drop_job()`, and exits as a
+stopped one. Its job goes back to the queue, and its next run reads the file as the stopped run left it and makes the
+rest. That next run queues the jobs that follow an import, see `runner.queue_after()`. It settles the extras that a
+converted import left hidden, see `convert.left_converted()`, and sends the app rescan of a write of the stopped run.
+A backfill sends that rescan at its end. A deep analysis that a stop cut keeps its held alerts for its next run.
+When mkvmerge fails after `remux.stopped()` recorded a stop, the failure counts as the stop, because the same Ctrl+C
+or SIGTERM killed mkvmerge. A run with no handler of its own, as `--check`, has Python's Ctrl+C handler and SIGTERM at
+its default. It keeps a stop during the layout repair, and its next write raises it. A stop during any other remux ends
+such a run at once. Pending Plex analyzes go into the state store for the next worker. With `KillMode=process` on the
+app's unit, a stop of the
 app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
 by the file's id. A 404 or another item drops the job as `file_gone`. When the file is at its path, each run of the
@@ -1001,13 +1051,16 @@ counts until a later result. The post leaves out these files and problems:
 The post has one line per file, with its problems in plain words. The name of each file links to its page in the app,
 as in an alert. Its footer names TMDB only when TMDB had trouble that day. The terminal prints the same files. The
 syslog summary line goes out every night. It counts each problem of each decision line of the day, also the problems
-the post leaves out. The audit also removes kept originals past their age and writes the policy status, see "Status
+the post leaves out. It also counts the files with each RFC 9559 fault kind, by the latest line of each file in the
+window that ran the header check, scans and dry runs included, as `rfc_version=3`. A repair in the run that found the
+faults clears them. The terminal prints the same counts. The audit also removes kept originals past their age and writes the policy status, see "Status
 file".
 
 `--check-audio` and `--check-video` scan every file of the app the way the worker checks an import.
 A scan never deletes, edits or re-grabs. It checks `SCAN_WORKERS` files at a time, and each worker
 pauses 2 seconds before a file. It keeps its place in the state store, so it resumes over days, and
-`--restart` starts a new pass. Problems go to a list file, `STATE_DIR/<kind>-scan-<app>.txt`. A run that finds a problem
+`--restart` starts a new pass. Problems go to a list file, `STATE_DIR/<kind>-scan-<app>.txt`. A video scan lists a header
+issue, except padding alone, see "RFC 9559 check". A run that finds a problem
 posts one summary embed, and a clean run posts none. On NFS, idle I/O
 priority has no effect on the file server, so the worker count and the pause are the throttles.
 
@@ -1056,17 +1109,18 @@ With no remux planned, mkvpropedit makes the edits. Two guards keep the Matroska
 
 - **Bytes past the Segment end.** mkvpropedit grows Tracks into the first Void that holds it. With none, it writes the
   grown Tracks at the end of the file and extends the Segment over the bytes past its end. Those bytes then sit inside
-  the Segment where no element starts, and mkvmerge warns on them. So the edits of a file with bytes past the Segment
-  end (`edit_tail`) go into one header repair in place of mkvpropedit. A file with no edit keeps its tail. The header
-  check then reads the stream ends, and the video check looks for real damage, as for any header repair. When the
-  remux must not run (`edit_blocked`: another Matroska file past the Segment end, or a Segment that may be cut, or a
-  block of the video check), or a remux of the file failed earlier in the run, the run writes nothing. The flags stay,
-  the outcome is `edit_failed`, and one alert says why. `edit_blocked` stops a subtitle remux too, because it drops
-  those bytes as well.
+  the Segment where no element starts, and mkvmerge warns on them. Bytes past the Segment end (`edit_tail`) are a
+  header issue at any count, so the header repair carries the edits, see "RFC 9559 check". This guard holds for a
+  caller with no header check, and when that repair was blocked or failed. The edits then go into one header repair in
+  place of mkvpropedit, after the video check looks for real damage. When the remux must not run (`edit_blocked`:
+  another Matroska file past the Segment end, or a Segment that may be cut, or a block of the video check), or a remux
+  of the file failed earlier in the run, the run writes nothing. The flags stay, the outcome is `edit_failed`, and one
+  alert says why. `edit_blocked` stops a subtitle remux too, because it drops those bytes as well. 2.18.4 (docket 54)
+  kept the bytes of a file with no flag edit. The owner changed that on 2026-10-20.
 - **A layout the edit broke.** After mkvpropedit, `checks.layout_fault()` reads the new layout. A broken one gets the
   header repair at once, after the video check of the edited file. The repair runs after the signal block of
   mkvpropedit ends, so a stop removes the temp file of the remux and leaves the edited file. The run then ends with its
-  decision line, see "Crashes and stops". A header repair that failed earlier in the run blocks it.
+  decision line, see "Crashes and stops". A header repair that failed or was stopped earlier in the run blocks it.
 
 After a repair inside the flag edit, the run probes the new file, so the metadata checks and the quick burned-in
 subtitle check read it. A file the app removed or replaced at the path meanwhile gets none of them, as in 2.18.3.
@@ -1395,16 +1449,17 @@ Segment duration, the Cues and the Segment size again from the streams. Real dam
 repaired and keeps its re-grab. `HEADER_REPAIR=false` turns the repair off, and the check still
 reports.
 
-`header_probe()` reads the file start and the Cues. It reads the last Clusters too when the Cues are
-missing or the Segment size runs past the file end. It also reads them when the last cue is far off
-the header duration, or when over 1 MiB (`TAIL_MIN`) follows the Segment end. When a subtitle may
-run past the end, ffprobe reads every subtitle packet. A remux fixes missing Cues, a wrong duration,
-a Segment size left by the hook's failed edit, a broken layout, a tail and enclosed zeros. A SubRip line past the end
-gets the trim or the removal. Another subtitle codec past the end has no fix and posts one amber embed. Missing Cues,
-a wrong duration, the Segment size of a failed edit, a subtitle past the end and enclosed zeros are repaired before
-the checks, because the checks cannot read through them (`hp["first"]`). mkvmerge reads no packet past enclosed zeros
-in a subtitle remux. A layout issue and a tail wait for the write stage, which carries the flag edits in the same
-remux, see "Write stage".
+`header_probe()` reads the file start, the Cues and the elements of the RFC 9559 check, see "RFC 9559 check". It
+reads the last Clusters too when the Cues are missing or the Segment size runs past the file end. It also reads them
+when the last cue is far off the header duration, when any byte follows the Segment end, or when the RFC 9559 check
+finds a fault. When a subtitle may run past the end, ffprobe reads every subtitle packet. A remux fixes missing Cues,
+a wrong duration, a Segment size left by the hook's failed edit, a broken layout, a tail, enclosed zeros and each
+fault of the RFC 9559 check. A SubRip line past the end gets the trim or the removal. Another subtitle codec past the
+end has no fix and posts one amber embed. Missing Cues, a wrong duration, the Segment size of a failed edit, a
+subtitle past the end and enclosed zeros are repaired before the checks, because the checks cannot read through them
+(`hp["first"]`). mkvmerge reads no packet past enclosed zeros in a subtitle remux. A layout issue, a tail and an RFC
+9559 fault wait for the write stage, which carries the flag edits in the same remux, see "Write stage". With no flag
+edit, the write stage runs the header repair alone.
 
 **The layout.** RFC 9559 wants Info and Tracks before the first Cluster, or listed in a SeekHead before it (6.1). A
 second SeekHead may list Clusters only (6.3). `checks.layout_fault()` walks the elements before the first Cluster by
@@ -1435,11 +1490,34 @@ these checks:
 - The same tracks, in the same order, with the same properties and UIDs.
 - The duration within 1 second of the last block, usable Cues, and no issue left.
 - A video frame count of at least the end over the frame duration, less 3 frames. mkvmerge can drop
-  a zero-filled Cluster with no warning, and this catches it.
+  a zero-filled Cluster with no warning, and this catches it. A variable frame rate counts against the
+  original instead, see below.
 - A size within 3 percent of the original Segment, and 3 clean decoded windows.
 - No packet over 1 second (`LAG_SLACK`) behind the packets before it in the file. A packet's lag is how
   far its time trails the latest time of the packets before it. The original's lag does not count, so a
   repair must put late packets in place. One ffprobe read of the new file gives the positions.
+
+**A variable frame rate.** Some files hold frames of more than one length in one video track. They still store one
+DefaultDuration. HandBrake mixes film parts at 23.976 fps and video parts at 29.97 fps from a telecined source. A
+DVD's MPEG-2 repeats fields, so some frames last 1.5 frames. An encoder that drops repeated frames leaves steps of 2
+or more frames all through the track. Such a track holds fewer frames than its end over its default duration. So the
+frame count above refuses every repair of it.
+
+The read that gives the lags also gives the time of each frame of the new file. A step from one frame to the next is
+off the rate when it differs from the median step, the track's usual frame length. It may differ by a tenth of that
+length (`VFR_STEP`), or by the timestamp scale when that is larger. Mixed rates differ by 15 percent or more. An
+encoder's jitter of 2.3 ms on a 41.7 ms frame fits. The DefaultDuration plays no part, because some files store the
+length of one field there. With 1 percent of the steps off (`VFR_SHARE`) or more, the rate is variable. A lost
+Cluster makes one long step. Each frame an encoder left out makes one step of two frames. So a constant rate that lost
+frames in a few places stays far under 1 percent, and it keeps the frame count.
+
+A variable rate takes its count from the original. ffprobe reads every packet of the original, and a line that names
+damage refuses. The new file must hold every video frame time of the original. The times compare as the conversion
+proof compares them. That costs one more read of the original, and it runs only when the frame count fails. The
+record keeps the share of steps off the rate, the verdict and the original's frame count in `frame_rate`. A HandBrake
+0.9.4 episode of 44437 frames has 36 percent of its steps off its usual 23.976 fps frame length. Its repair now
+passes. A constant rate whose encoder left frames out in a few places still fails the count. An old WEBRip with 12
+frames left out at 5 cuts does, because a frame left out and a frame lost look the same.
 
 **The subtitle tracks come from a second input.** A player reads the file in order and never shows a
 packet stored minutes after the packets of its time. The ffmpeg subtitle remux of 1.4.0 to 2.17.0 left
@@ -1490,9 +1568,12 @@ listed runtime, or when no runtime is listed. One amber "File may be cut short" 
 also covers a track from another episode, so check the last frames by hand.
 
 **The tail.** A download can write a shorter copy over an old file and leave the old bytes past the
-Segment end, and some players decode them. The remux cuts the tail when the video and the audio
-reach the header duration. A Segment that is itself cut stays, with a video doubt. Bytes that start
-with the EBML id `1A45DFA3` are a second file joined with `cat`, and they stay.
+Segment end, and some players decode them. Some muxers end a file with a few zero bytes past the Segment end, which
+the check calls padding. Bytes past the Segment end are a header issue at any count (owner 2026-10-20). The remux cuts
+them when the video and the audio reach the header duration. Over 1 MiB (`TAIL_MIN`), a Segment that is itself cut
+stays, with a video doubt. Up to `TAIL_MIN`, a Segment whose streams stop before its stated length blocks the repair
+(`edit_blocked`), and the repair is skipped. Bytes that start with the EBML id `1A45DFA3` are a second file joined with
+`cat`, and they stay.
 
 A failure keeps the original and posts one amber embed, and the flag edit still runs, see "Write stage". After a
 repair before the checks, they read the new file. After a repair in the write stage, the run plans the new file again.
@@ -1501,6 +1582,65 @@ The app rescans the item once. A backfill dry run reports
 doubt or a fault that blocks the repair gives `header_not_repaired`. Its result names the block, then the issue, as
 `not repaired: the video ends at 1:54:58 and the audio at 1:50:12. The issue: the header says 13:23:33, but the streams
 end at 1:54:58`. The line of a backfill shows the first 300 characters of a header result.
+
+## RFC 9559 check
+
+`header_probe()` holds the elements outside the Clusters to the Matroska schema, see `matroska.check()`. It reads the
+EBML header, each level-1 element before the first Cluster, and each one a SeekHead lists. It never reads a Cluster.
+It reads a master whole up to 1 MiB (`SPAN`), else by its element headers, so the fonts of an Attachments element cost a
+few headers. It uses the Cues that the header check read already. `matroska.TABLE` holds the 190 elements of RFC 9559
+section 5.1 outside the Clusters, with their place, type, occurrences, minver, range and length.
+
+| Kind | Fault | Who notices |
+| --- | --- | --- |
+| `padding` | 1 byte to `TAIL_MIN` past the Segment end | no reader |
+| `tail` | more than `TAIL_MIN` past the Segment end | players that decode the old bytes |
+| `enclosed` | zeros a flag edit left after the Cues, see "Enclosed zeros" | mkvmerge and ffmpeg |
+| `layout` | Info or Tracks out of reach, a second SeekHead of more than Clusters, see "The layout" | MediaInfo |
+| `version` | a DocTypeVersion below the minver of an element the file uses (RFC 9559 7) | mkvalidator |
+| `range` | a number out of its range, as a SamplingFrequency of 0 or a DisplayWidth of 0, or a size its type does not allow | mkvalidator |
+| `schema` | an element out of its place, as MuxingApp written as 0x80 in Info, a mandatory element missing, too many of one, a CRC-32 that does not match, a SeekHead entry where no such element starts | mkvalidator |
+| `framing` | an element in a header master that does not read, has an unknown size, or runs past its parent | ffmpeg and ebml_validator |
+| `tail_errors` | bytes past the Segment end after a last element that holds level-1 ids, as a libmkv SeekHead of Clusters | ffmpeg's read pass |
+
+`hp["rfc"]` maps each kind to its faults, and each fault is a header issue. Most faults name no byte, so a remux that
+writes one again names it the same way. A framing fault and a SeekHead fault name a byte. An element RFC 9559 does not
+define is a note in `hp["notes"]`. A reader skips it (RFC 9559 7). mkvmerge 102 writes two of them, EditionFlagHidden
+and ChapterFlagEnabled, when it makes chapters from a simple chapter file (`CHAPTER01=...`). A file with XML chapters
+holds neither. The decision line holds the kinds in `rfc`, and the header stage of the
+video check holds the faults, the notes, `read` and `took`.
+
+**tail_errors.** After a read error, ffmpeg looks for a level-1 id from the byte after the start of the last level-1
+element it read (`matroska_resync()`). A byte past the Segment end is such an error. When the last element is a SeekHead,
+ffmpeg finds a Cluster id in each of its entries and prints an error at each one. A libmkv file with one zero byte past
+its Segment end printed 651 lines, and none with that byte cut. A second SeekHead at the end that lists Cues gives
+"Truncating packet" lines that name no place. A library film printed 5 of them, and none with its byte cut. The
+whole-file check of 2.18.4 posted "Video may be broken" for both. The check finds the case without the read pass, and
+the whole-file check counts those lines as the tail fault, see "Whole-file check".
+
+**The repair.** Each kind is an issue, so an import, `--check --apply` and a backfill with `--apply` repair it when they
+find it. With a flag edit, the edit rides the repair. With none, the header repair runs alone. A dry run writes nothing.
+An alert goes out only when the repair fails, as for any header repair. mkvmerge 102 writes each element again from
+what it reads, and the made-up plant of each kind ends with no fault after the repair. `remux.header_checks()` refuses a
+new file that still has an issue. A fault of the schema kinds that the original held too fails no repair, because
+mkvmerge wrote it again. `header_repair.rfc_left` then names it, see `checks.rfc_again()`.
+
+**The library pass.** About 7.8 percent of a library holds padding of 1 to about 1,000 bytes, and a repair of each would
+rewrite terabytes. So the first pass over a library repairs the real faults only:
+
+1. `--backfill APP --check-video` lists each file with a header issue in `STATE_DIR/video-scan-APP.txt`. A file whose
+   only issue is padding gets its decision line and no list line.
+2. `--backfill APP --plan-out FILE` plans each file. A plan line whose header repair names padding alone holds
+   `"padding_only": true`.
+3. `--backfill APP --apply --plan-from FILE --only-header` repairs the files of the plan with a header repair, except
+   those with `padding_only`. A file it takes is repaired whole, padding too.
+4. `--audit APP --since START` counts the files of each kind, by the latest line of each file in the window.
+
+**Cost.** `header_probe()` of 229 library files over NFS, read cold under a load of about 60 (2026-10-20). A file with
+no issue read a median of 104 KB and at most 988 KB, of which the RFC 9559 check added a median of 1.2 KB and at most
+594 KB over 2.18.4. A file with an issue reads the last 16 MiB for the stream ends, as before. The probe took a median
+of 0.16 s, 0.86 s at the 90th percentile and 2.7 s at most. A walk of every Cluster header read 43 to 689 MB per file.
+The test `test_a_clean_file_reads_no_cluster` holds the bound, and the decision line holds `read` and `took`.
 
 ## Cover track
 

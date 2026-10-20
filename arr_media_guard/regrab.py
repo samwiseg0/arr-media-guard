@@ -131,6 +131,12 @@ RESULT_CODES = {"audio": ("broken_audio", "audio_checked"), "content": ("wrong_c
                 "burned_in": ("burned_in_full", "burned_in_checked")}
 
 
+def stop_action(step, **more):
+    """The action of a re-grab or a restore that a stop kept from step, see runner.stop_asked(). It changed nothing in
+    the app. "stopped" keeps its alert off Discord, see logs.alert_findings(), and the next run of the job checks again."""
+    return {"code": "failed", **more, "step": step, "error": "The run was stopped", "stopped": True}
+
+
 def regrab(app, job, fault, probe, kind="audio", alone=False):
     """A download is one unit. Check every file it imported, delete each faulty one, re-monitor their items, then
     mark the grab failed once. That order matters: the app searches at once, and a faulty file still on disk would
@@ -148,7 +154,8 @@ def regrab(app, job, fault, probe, kind="audio", alone=False):
 
     The job of --check has no download, and its run changes nothing in the app, see cli.check(). It returns after the
     second check, with check when an import would re-grab, else would_regrab as on an import. So no delete, failed mark,
-    search or restore can follow, whatever its caller does.
+    search or restore can follow, whatever its caller does. After a stop it gives the action of stop_action() with no
+    second check, see runner.stop_asked(). A stop during the second checks gives it too, and counts no re-grab.
     """
     if job.get("check"):
         try:
@@ -157,6 +164,8 @@ def regrab(app, job, fault, probe, kind="audio", alone=False):
         finally:
             config.DEADLINE.stop()
         return {"code": "check" if kind in config.CFG.regrab else "would_regrab", "kind": kind}
+    if runner.stop_asked():   # no second check and no change after a stop, see runner.refuse()
+        return stop_action("the second check")
     name, dry = apps.ARR[app].name, kind not in config.CFG.regrab
     records = []
     if job.get("download_id"):
@@ -201,30 +210,35 @@ def regrab(app, job, fault, probe, kind="audio", alone=False):
         plans = restore_plans(app, job, files, broken)   # read-only: which old files of an upgrade may come back
     finally:
         config.DEADLINE.stop()
+    if runner.stop_asked():   # a stop during the second checks counts no re-grab
+        return stop_action("the delete")
     if not unit["failed"] and not unit["deleted"] and not count_regrab(app):   # a new unit counts once, and only now that it acts
         return capped
     step, done = "the delete", {"code": "regrabbed", "name": name, "kind": kind, "n": len(broken)}
-    with runner.no_stop():   # the changes finish before a SIGTERM lands, so a stop never leaves a deleted file unmarked
-        try:
-            restoring(app, job, plans, broken)
-            for fid in sorted(broken):
-                apps.arr_write(app, f"{apps.ARR[app].file_kind}/{fid}", "DELETE")
-                unit["deleted"].append(fid)
-            step = "the restore"
-            back = restore(job, plans)   # after the delete: a delete after a same-name restore would take the old file
-            step = "the re-monitor"
-            apps.ARR[app].remonitor(sorted({i for fid in broken for i in files[fid]["items"]}))
-            rescan_back(app, back)
-            read_back(app, back, files)
-            if unit["failed"]:
-                return dict(done, failed_before=True, **restore_facts(app, job, back))
-            step = "marking the grab failed"
-            apps.arr_write(app, f'history/failed/{grabs[0]["id"]}', "POST")
-            unit["failed"] = True
-        except Exception as ex:
-            return {"code": "failed", "step": step, "error": config.mask(f"{type(ex).__name__}: {ex}")[:300]}
-        finally:
-            save_unit(app, job["download_id"], unit)   # a unit is written only under the exclusive file lock
+    try:
+        with runner.no_stop():   # the changes finish before a SIGTERM lands, so a stop never leaves a deleted file unmarked
+            try:
+                restoring(app, job, plans, broken)
+                for fid in sorted(broken):
+                    apps.arr_write(app, f"{apps.ARR[app].file_kind}/{fid}", "DELETE")
+                    unit["deleted"].append(fid)
+                step = "the restore"
+                back = restore(job, plans)   # after the delete: a delete after a same-name restore would take the old file
+                step = "the re-monitor"
+                apps.ARR[app].remonitor(sorted({i for fid in broken for i in files[fid]["items"]}))
+                rescan_back(app, back)
+                read_back(app, back, files)
+                if unit["failed"]:
+                    return dict(done, failed_before=True, **restore_facts(app, job, back))
+                step = "marking the grab failed"
+                apps.arr_write(app, f'history/failed/{grabs[0]["id"]}', "POST")
+                unit["failed"] = True
+            except Exception as ex:
+                return {"code": "failed", "step": step, "error": config.mask(f"{type(ex).__name__}: {ex}")[:300]}
+            finally:
+                save_unit(app, job["download_id"], unit)   # a unit is written only under the exclusive file lock
+    except runner.Stopped:   # a stop came before the changes, so none starts, see runner.refuse()
+        return stop_action(step)
     return dict(done, **restore_facts(app, job, back))
 
 
@@ -583,37 +597,42 @@ def restore_manual(app, job, fault, probe):
         config.DEADLINE.stop()
     if not any(p["back"] for p in plans.values()):
         return said("no_grab", restore(job, plans))
+    if runner.stop_asked():   # a stop during the second check counts no restore
+        return stop_action("the delete", manual=True)
     if not count_regrab(app):
         return {"code": "capped", "cap": config.CFG.regrab_cap}
     step = "reading which items are monitored"
-    with runner.no_stop():   # the changes finish before a SIGTERM lands
-        try:
-            for p in plans.values():   # the plan again, right before the delete
-                keep = [b for b in p["back"] if bin_sig(b[1]) == b[2] and (not os.path.lexists(b[0]) or b[0] == p["new"])]
-                p["not"] += [(b[0], "its recycle bin copy or its path changed before the delete") for b in p["back"] if b not in keep]
-                p["back"] = keep
-            if not any(p["back"] for p in plans.values()):
-                return said("no_grab", restore(job, plans))
-            watched = sorted(i for i, (m, _) in a.files(files[fid]["owner"], files[fid]["items"], read=False)[1].items() if m)
-            restoring(app, job, plans, [fid])
-            step = "the delete"
-            apps.arr_write(app, f"{a.file_kind}/{fid}", "DELETE")
-            step = "the restore"
-            back = restore(job, plans)
-            step = "the re-monitor"
-            if watched:
-                a.remonitor(watched)
-            if not any(r["result"] == "restored" for r in back) and not watched:   # an API search would grab an unmonitored item too
-                return said("deleted", back)
-            if not any(r["result"] == "restored" for r in back):   # the item has no file now, and no grab to fail
-                step = "the search"
-                apps.arr_write(app, "command", "POST", {"name": a.search, a.ids_key: watched})
-                return said("searched", back)
-            step = "the rescan"
-            rescan_back(app, back)
-            read_back(app, back, files, watched)
-        except Exception as ex:
-            return {"code": "failed", "manual": True, "step": step, "error": config.mask(f"{type(ex).__name__}: {ex}")[:300]}
+    try:
+        with runner.no_stop():   # the changes finish before a SIGTERM lands
+            try:
+                for p in plans.values():   # the plan again, right before the delete
+                    keep = [b for b in p["back"] if bin_sig(b[1]) == b[2] and (not os.path.lexists(b[0]) or b[0] == p["new"])]
+                    p["not"] += [(b[0], "its recycle bin copy or its path changed before the delete") for b in p["back"] if b not in keep]
+                    p["back"] = keep
+                if not any(p["back"] for p in plans.values()):
+                    return said("no_grab", restore(job, plans))
+                watched = sorted(i for i, (m, _) in a.files(files[fid]["owner"], files[fid]["items"], read=False)[1].items() if m)
+                restoring(app, job, plans, [fid])
+                step = "the delete"
+                apps.arr_write(app, f"{a.file_kind}/{fid}", "DELETE")
+                step = "the restore"
+                back = restore(job, plans)
+                step = "the re-monitor"
+                if watched:
+                    a.remonitor(watched)
+                if not any(r["result"] == "restored" for r in back) and not watched:   # an API search would grab an unmonitored item too
+                    return said("deleted", back)
+                if not any(r["result"] == "restored" for r in back):   # the item has no file now, and no grab to fail
+                    step = "the search"
+                    apps.arr_write(app, "command", "POST", {"name": a.search, a.ids_key: watched})
+                    return said("searched", back)
+                step = "the rescan"
+                rescan_back(app, back)
+                read_back(app, back, files, watched)
+            except Exception as ex:
+                return {"code": "failed", "manual": True, "step": step, "error": config.mask(f"{type(ex).__name__}: {ex}")[:300]}
+    except runner.Stopped:   # a stop came before the changes, so none starts, see runner.refuse()
+        return stop_action(step, manual=True)
     return said("restored", back)
 
 

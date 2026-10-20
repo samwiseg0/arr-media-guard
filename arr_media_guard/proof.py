@@ -466,7 +466,7 @@ def utf8(b):
     return True
 
 
-def packet_places(path, folder, timeout):
+def packet_places(path, folder, timeout, clean=False):
     """{stream index: (times, places, durations)} of path from one ffprobe read, each an array per packet with data,
     in file order: the time and the duration in seconds (NaN for none) and the file position (-1 for none). Every
     frame of a Matroska block of several frames (a lace) reads at that block's position, see lace_times(). Matroska
@@ -476,8 +476,10 @@ def packet_places(path, folder, timeout):
     in the file. ffprobe only demuxes, so it reads the times the file stores. A packet with no display time takes its
     decode time: a VC-1 track in VfW mode stores decode times, and ffprobe reads no display time there. The lines are
     read as they come, into arrays, so a film of a million packets holds about 24 MB. A timeout or an ffprobe error
-    raises. A decoder message of the stream probe may show, as in packet_hashes(), so only the exit code counts. A
-    packet with side data ends its line with one more field. stderr goes to a file in folder."""
+    raises. A decoder message of the stream probe may show, as in packet_hashes(), so only the exit code counts. With
+    clean, any other line of stderr raises too, see bad_lines(). ffprobe reads past damage that mkvmerge drops, and it
+    names the damage there. A packet with side data ends its line with one more field. stderr goes to a file in
+    folder."""
     argv = ["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-show_entries",
             "packet=stream_index,pts_time,dts_time,duration_time,size,pos", "-of", "csv=p=0", path]
     out, nan, late = {}, float("nan"), []
@@ -499,9 +501,11 @@ def packet_places(path, folder, timeout):
             timer.cancel()
         if late:
             raise subprocess.TimeoutExpired(argv, timeout)
-        if code:
-            err.seek(0)
-            raise RuntimeError(f"ffprobe did not read the packets of {os.path.basename(path)}: {config.mask(err.read().strip())[-200:]}")
+        err.seek(0)
+        text = err.read()
+        bad = bad_lines(text) if clean and not code else []
+        if code or bad:
+            raise RuntimeError(f"ffprobe did not read the packets of {os.path.basename(path)}: {config.mask((bad[0] if bad else text).strip())[-200:]}")
     return out
 
 

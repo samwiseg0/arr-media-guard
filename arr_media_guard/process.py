@@ -222,11 +222,52 @@ def process(ctx):
     """Probe one file and decide its flags, see Ctx. Hear the audio language when the decision needs it, check the
     subtitles, check the audio and the video (import only), then write the file once with the flag edits and any remux
     the checks planned, see write(), and verify. Then run the metadata checks and alert. A step that ends the run returns True. Returns the decision log record, which the
-    caller writes with decision()."""
-    for step in STEPS:
+    caller writes with decision(). Once a stop is asked, see runner.stop_asked(), no further step runs, see stop_line()."""
+    for i, step in enumerate(STEPS):
+        if i and runner.stop_asked():
+            stop_line(ctx, STEPS[i:])
+            break
         if step(ctx):
             break
     return ctx.rec
+
+
+def stop_line(ctx, left):
+    """The record of a run that a stop ended before the steps left, so its decision line comes at once. "not_run" names
+    those steps. A run that stopped before its decision gets the outcome stopped, with the reason codes of what it
+    wrote, so the Plex analyze of a changed file still runs. A job goes back to the queue, see runner.job_process(),
+    and its next run makes the rest. A backfill ends after the file.
+
+    No later run finds a re-grab that acted, or the subtitles a conversion took out. So the findings keep ctx.first and
+    the unreadable notice, and they post, with the change posts of the writes that finished, see
+    logs.alert_findings(). A finding that the stop caused posts nothing. The app rescan of a write waits. A job's next
+    run sends it, see after_edit(), and a backfill sends it at its end. A deep analysis or a recheck sends none."""
+    rec = ctx.rec
+    rec["not_run"] = [s.__name__ for s in left]
+    if "outcome" not in rec:   # a conversion that failed or was skipped set one, so "repack" here is a conversion that ran
+        wrote = (["repacked"] if "repack" in rec else []) + [c for c in [(rec.get("header_repair") or {}).get("code")] if c in config.REPAIRED]
+        rec.update(outcome="stopped", result="not checked: the run was stopped", reasons=rec.get("reasons") or wrote)
+    if after_edit in left and (parts := rescanned(ctx)):
+        if ctx.mode == "import" and ctx.save:
+            ctx.job["rescan"] = True
+            with contextlib.suppress(sqlite3.Error):   # a busy store costs the rescan, and the app's own refresh reads the file later
+                ctx.save()
+        elif not (ctx.mode == "import" or ctx.background):
+            for x in parts:
+                x["rescan"] = "after the run"
+    found = [f for f in [*getattr(ctx, "first", ()), getattr(ctx, "unreadable", None)] if f]   # faults() and conversion() set them
+    rec.update(findings=found, alert_kinds=[f["kind"] for f in found])
+    if ctx.post:
+        rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(ctx.path) if os.path.exists(ctx.path) else ctx.size)
+
+
+def rescanned(ctx):
+    """The parts of ctx.rec that name a write which replaced the file, so the app rescans it: a conversion that ran, a
+    header repair and a subtitle remux. A conversion that hid extras settles them in place of a rescan, see after_edit()."""
+    rec = ctx.rec
+    return [x for x, wrote in ((rec.get("repack"), "repack" in rec and not ctx.unconverted and not rec["repack"].get("pending")),
+                               (rec.get("header_repair"), (rec.get("header_repair") or {}).get("code") in config.REPAIRED),
+                               (rec.get("subremux"), (rec.get("subremux") or {}).get("done"))) if wrote]
 
 
 def refresh(ctx, duration=True):
@@ -388,6 +429,8 @@ def header(ctx):
     if ctx.mkv and config.CFG.header_repair and ctx.video and not ctx.background:
         ctx.hp = checks.header_of(path, j)
     hp = ctx.stage = ctx.hp
+    if hp:   # each RFC 9559 fault by kind, which --audit counts
+        rec["rfc"] = hp["rfc"]
     if not (hp and hp["issue"]):
         return
     cut = None
@@ -421,7 +464,7 @@ def header(ctx):
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
         refresh(ctx)
         ctx.stage = None   # the stage was of the original
-    elif code == "header_repair_failed":   # edit() tries no second remux of the file in this run
+    elif code == "header_repair_failed" or info.get("stopped"):   # edit() tries no second remux of the file in this run
         ctx.stage = dict(h, tried=result)
 
 
@@ -430,7 +473,7 @@ def languages(ctx):
     rec, j, path, mkv = ctx.rec, ctx.j, ctx.path, ctx.mkv
     spoken = ctx.spoken = checks.spoken_of(ctx.asked[0])
     d = decide.decide(j, ctx.original, ctx.kids, ctx.release, spoken=spoken) if mkv else {"edits": [], "notes": [], "reasons": [],
-                                                                                         "wrong_language": False, "tracks": decide.classify(j)}
+                                                                                         "wrong_language": False, "tracks": decide.classify(j, original=ctx.original)}
     heard, got, tags = {}, {}, None
     lid_when = config.LID_WHEN & set(d["reasons"])
     pre = decide.retag(j, table=checks.langs()) if mkv else {"ask": set(), "to_read": set()}
@@ -711,6 +754,8 @@ def decision_fields(ctx):
         rec["plan"] = cli.plan_record(ctx.app, ctx.label, ctx.path, d)
         if "header_repair" in rec:
             rec["plan"]["header_repair"] = rec["header_repair"]["code"]
+        if checks.padding_only(ctx.hp):   # --only-header leaves it, see docs/design.md, "RFC 9559 check"
+            rec["plan"]["padding_only"] = True
 
 
 def faults(ctx):
@@ -741,6 +786,9 @@ def faults(ctx):
             rec["reasons"] = rec["reasons"] + [ctx.vfields["code"]]
         if doubts:
             rest.append({"kind": "video", "doubts": doubts})
+        elif ctx.source == "hook" and not ctx.vcertain and (ctx.vfields.get("frame_rate") or {}).get("variable"):
+            # Only an import posts it. A backfill job or --check logs video.frame_rate, so a library pass posts no alert per file.
+            rest.append({"kind": "frame_rate", "off": ctx.vfields["frame_rate"]["off"]})
 
 
 def write_findings(ctx):
@@ -848,7 +896,7 @@ def write(ctx):
     if carried and subsync.INVARIANTS:
         mute_rule(path, ctx.d["tracks"], carried)
     # Either remux drops the bytes past the Segment end, so edit_blocked stops it, as another Matroska file there
-    hp = edit_probe(path, j, ctx.stage if ctx.stage is not None else checks.header_of(path, j) or {})
+    hp = ctx.stage if ctx.stage is not None else checks.header_of(path, j) or {}
     blocked = "; ".join(hp.get("edit_blocked") or [])
     if sub:
         code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {blocked}", {}) if blocked else \
@@ -883,9 +931,9 @@ def write(ctx):
             ctx.d = decide.decide(j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched)
             ctx.d = muted_plan(decide.with_tags(ctx.d, ctx.tags) if ctx.tags else ctx.d, ctx.muted)
         # After a failed remux, edit() keeps the flags of a file it would enclose bytes in (held), and after a failed
-        # header repair it tries no second one (tried)
-        stage = dict(hp, **{{"subtitle_remux_failed": "held", "header_repair_failed": "tried"}[code]: result}) \
-            if code in ("subtitle_remux_failed", "header_repair_failed") else hp
+        # header repair it tries no second one (tried). repack() gives header_not_repaired only to a stopped one.
+        mark = {"subtitle_remux_failed": "held", "header_repair_failed": "tried", "header_not_repaired": "tried"}.get(code)
+        stage = dict(hp, **{mark: result}) if mark else hp
         return edited(ctx, edit(ctx.rec, j, flag_edits(ctx, ctx.d, ctx.unmatched), ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=stage))
     # The original is kept a while, so its record is on disk before anything else runs. It names the undo of the edits it carried.
     logs.log(dict(rec, outcome=code, result=result, **({"undo": ["mkvpropedit", path] + propedit_args(carried, 2)} if carried else {})))
@@ -916,9 +964,9 @@ def write(ctx):
         with contextlib.suppress(sqlite3.Error):   # the edit of the take-back ended, see checks.hook_edit_failed()
             store.drop("editing", path)
     elif carried:   # the record names the change from the original, as for a flag edit
-        out.update(before=runner.flags(probe), edits=want, undo=["mkvpropedit", path] + propedit_args(want, 2))
+        out.update(before=runner.flags(probe, ctx.original), edits=want, undo=["mkvpropedit", path] + propedit_args(want, 2))
         if out["outcome"] == "no_change" and want:
-            out.update(outcome="edited", result="edited", after=runner.flags(ctx.j))
+            out.update(outcome="edited", result="edited", after=runner.flags(ctx.j, ctx.original))
             try:
                 out["recheck"] = rechecked(replan_of(ctx.j))
             except Exception as ex:
@@ -938,12 +986,6 @@ def edited(ctx, rec):
         except OSError:   # the app removed the file
             ctx.st = st
     decision_fields(ctx)
-
-
-def edit_probe(path, j, hp):
-    """hp, the header stage of the file j probes, with the stream ends and edit_blocked of header_of(edit=True) when it
-    holds bytes past the Segment end and was read without edit, see checks.header_probe()."""
-    return checks.header_of(path, j, edit=True) or hp if hp.get("edit_tail") and hp.get("edit_blocked") is None else hp
 
 
 def unedited(new, old, edits):
@@ -998,9 +1040,8 @@ def after_edit(ctx):
     rescan_now = lambda: "none, no app lists the file" if ctx.check == "outside" else \
         apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
     # One rescan after the last write that replaced the file. Each part of the record that names a remux holds what it gave.
-    parts = [x for x, wrote in ((rec.get("repack"), "repack" in rec and not ctx.unconverted and not rec["repack"].get("pending")),   # a pending one settles below, with no lock
-                                (rec.get("header_repair"), (rec.get("header_repair") or {}).get("code") in config.REPAIRED),
-                                (rec.get("subremux"), (rec.get("subremux") or {}).get("done"))) if wrote]
+    # A job whose stopped run wrote asks for it too, see stop_line(). The record then holds it.
+    parts = rescanned(ctx) or ([rec] if (ctx.job or {}).get("rescan") else [])
     said = rescan_now() if parts else None
     for x in parts:
         x["rescan"] = said
@@ -1057,9 +1098,12 @@ def after_edit(ctx):
                          "on": None if "after" not in rec else [f'{t["pos"]} {t["lang"]}' for t in rec["after"] if t["default"]]})
     if ctx.lock is not None:   # the edit is done, and the checks below only read the file
         fcntl.flock(ctx.lock, fcntl.LOCK_UN)
-    if (rec.get("repack") or {}).get("pending") and (ctx.mode == "import" or ctx.background):   # two waited rescans, see settle()
+    # A stopped run of the job left the extras of its conversion hidden, see stop_line(). This run settles them.
+    pending = (rec.get("repack") or {}).get("pending")
+    keys = [pending] if pending else convert.left_converted(ctx.app, ctx.path) if ctx.mode == "import" and ctx.apply else []
+    if keys and (ctx.mode == "import" or ctx.background):   # two waited rescans, see settle()
         config.DEADLINE.stop()
-        rec["repack"]["settle"] = convert.settle_extras(ctx.app, (ctx.ids or {}).get("app_id"), [rec["repack"]["pending"]])
+        (rec["repack"] if pending else rec)["settle"] = convert.settle_extras(ctx.app, (ctx.ids or {}).get("app_id"), keys)
 
 
 def short_error(text, path, limit=150):
@@ -1298,17 +1342,18 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
     With HEADER_REPAIR on, two guards keep the Matroska layout whole (docs/design.md, "Write stage"). hp is the header
     stage of the file as it is, see header(), else header_of() reads it. A file whose bytes past the Segment end
     (edit_tail) or zero run in it (enclosed) a flag edit would put inside the Segment takes the edits in one repack()
-    in place of mkvpropedit. The probe with edit reads the stream ends and edit_blocked, and the video check looks for
-    real damage first, as before any header repair. When that remux must not run (edit_blocked, a block of the video
-    check), or another remux of the file failed in this run (hp["held"], hp["tried"]), nothing is written: the outcome
-    is edit_failed, and the flags stay. After mkvpropedit, a header layout that breaks the Matroska rules, as when
-    mkvpropedit moves Tracks past the Clusters, is repaired at once, see relayout(). That runs after no_stop() ends, so
-    SIGTERM removes the temp file of the remux and leaves the edited file. header_repair records either remux."""
+    in place of mkvpropedit. The header check of such a file reads the stream ends and edit_blocked, and the video
+    check looks for real damage first, as before any header repair. When that remux must not run (edit_blocked, a block
+    of the video check), or another remux of the file failed in this run (hp["held"], hp["tried"]), nothing is
+    written: the outcome is edit_failed, and the flags stay. A stop before the write gives the same, see
+    runner.refuse(). After mkvpropedit, a header layout that breaks the Matroska rules, as when mkvpropedit moves
+    Tracks past the Clusters, is repaired at once, see relayout(). That runs after no_stop() ends, so SIGTERM removes
+    the temp file of the remux and leaves the edited file. header_repair records either remux."""
     edits = needed(j, edits)
     if not edits:
         return dict(rec, outcome="no_change", result="no change")
     path = rec["path"]
-    rec = dict(rec, before=runner.flags(j), edits=edits, undo=["mkvpropedit", path] + propedit_args(edits, 2))
+    rec = dict(rec, before=runner.flags(j, rec.get("original")), edits=edits, undo=["mkvpropedit", path] + propedit_args(edits, 2))
     before = os.stat(path)
     if vault.links(before) > 1:   # a hardlink shares the edit with the download client's copy
         return dict(rec, outcome="hardlinked", result="hardlinked, not edited")
@@ -1322,7 +1367,6 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
     remuxed = config.CFG.header_repair and bool(hp.get("edit_tail") or hp.get("enclosed") is not None)
     if remuxed:   # fix 2
         why, room = hp.get("tried") or hp.get("held"), f'the {hp["edit_tail"]} bytes past its end' if hp.get("edit_tail") else "a run of zero bytes"
-        hp = hp if why else edit_probe(path, j, hp)   # the stream ends and the guards of the remux
         if not why and "repairable" not in hp:   # the video check looks for real damage first, as for a header issue
             issue = hp["issue"] or [f"a flag edit would put {room} inside the Matroska Segment"]
             hp = checks.video_check(path, j=j, hp=dict(hp, issue=issue))[2].get("header") or dict(hp, issue=issue, repairable=False)
@@ -1336,23 +1380,26 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
                         after=rec["before"], **({"header_repair": dict(rec["header_repair"], edit=True)} if "header_repair" in rec else {}))   # nothing changed
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
     else:
-        with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
-            config.DEADLINE.stop()
-            logs.log(dict(rec, result="editing"))   # the undo record exists before the file changes
-            e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
+        try:
+            with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
+                config.DEADLINE.stop()
+                logs.log(dict(rec, result="editing"))   # the undo record exists before the file changes
+                e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
+        except runner.Stopped as ex:   # a stop came before the edit, so nothing changed
+            return dict(rec, outcome="edit_failed", result=f"not edited: {ex}", after=rec["before"])
     checks.lid_carry(path, before)
     runner.mute_mark(path, before)
     if not remuxed and e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
-            rec["after"] = runner.flags(checks.mkvmerge(path))
+            rec["after"] = runner.flags(checks.mkvmerge(path), rec.get("original"))
         except Exception as ex:
             rec["after_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:300]
         return rec
     after = checks.mkvmerge(path)
     if config.CFG.header_repair and not remuxed and not hp.get("tried") and checks.layout_of(path):   # fix 1
         after = relayout(rec, path, after)
-    rec["after"] = runner.flags(after)
+    rec["after"] = runner.flags(after, rec.get("original"))
     if decide.unapplied(after, edits):
         return dict(rec, outcome="verify_failed", result="VERIFY FAILED, flags did not change")
     rec = dict(rec, outcome="edited", result="edited")
@@ -1373,10 +1420,9 @@ def relayout(rec, path, j):
     if not (hp and hp["issue"]):   # the probe failed
         return j
     h = {} if hp.get("trim") or hp.get("remove") else checks.video_check(path, j=j, hp=hp)[2].get("header") or {}
-    try:
+    try:   # a stop removes the temp file and keeps the edit, see Swap.stop(). The run then writes the line of the edit.
         code, result, info = remux.repack(path, j, st, True, h) if h.get("repairable") else (None, None, {})
-    except (SystemExit, KeyboardInterrupt):   # the temp file is gone and the edit stays, so the run ends with its line first
-        runner.pass_stop()
+    except (SystemExit, KeyboardInterrupt):   # no handler of the process's own, as in --check. It keeps the stop for its next write.
         code, result, info = "header_not_repaired", "not repaired: the run was stopped. The issue: " + "; ".join(hp["issue"]), {}
     if code is None:
         code, result, info = "header_not_repaired", "not repaired: " + "; ".join(h.get("blocked") or [

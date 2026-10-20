@@ -34,8 +34,8 @@ On a host, leave out `docker exec -it arr-media-guard`.
 
 - `--apply` puts one job per file in the background queue, where the deep analyses and the rechecks wait. The worker
   runs each job as `--check PATH --apply` runs the file, see [Check one file](#check-one-file). So the job does what an
-  import does under your settings, and posts its alerts. It never re-grabs. Its conversion keeps no original, as an
-  import's does.
+  import does under your settings, and posts its alerts. The "Variable frame rate" alert is the exception. A job only
+  logs it in `video.frame_rate`. It never re-grabs. Its conversion keeps no original, as an import's does.
 - The jobs wait behind the imports and run `BACKGROUND_WORKERS` at a time, after the deep analyses of imports and the
   rechecks. A job
   gives way to an import that waits before a conversion and before a remux, until it changed the file. The jobs stay
@@ -79,7 +79,7 @@ arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl           
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --canary 20   # 20 files across plan groups
 arr-media-guard --audit radarr --since 2026-01-01T10:00                                        # the open problems since the canary
 arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl               # the rest
-arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --only-header # or only the header repairs
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --only-header # or only the header repairs, padding left
 ```
 
 With no instance, one plan file holds the plans of every instance, and `--canary N` takes N files of each.
@@ -113,13 +113,15 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
   result. `dry run` says that `--apply` would write the file or a sidecar, with a flag edit, a header repair, a subtitle
   remux or a sidecar fix. `no change` says that it would write nothing. An apply names its change, as `edited`,
   `header repaired` or `subtitles remuxed: s2 retimed`. `header not repaired:` and `header repair skipped` give the
-  reason first, then the issue. A remux carries the flag edits of its file, and the line still says `edited`. A file
-  with bytes past its Matroska Segment end gets its flag edits in a remux too, see
-  [Write stage](design.md#write-stage). When that remux must not run, the line starts `not edited, as a flag edit
-  would put`, and the flags stay.
+  reason first, then the issue. A remux carries the flag edits of its file, and the line still says `edited`. Bytes
+  past the Matroska Segment end and each fault of the RFC 9559 check are a header issue, so `--apply` repairs them, see
+  [RFC 9559 check](design.md#rfc-9559-check). When that remux must not run and the file has bytes past its Segment
+  end, the line starts `not edited, as a flag edit would put`, and the flags stay.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
-- `--only-header` with `--plan-from` takes only the files the plan gives a header repair. Each file still gets its
-  whole plan, flag edits too. `--canary N` and `--paths` narrow it. It does not go with `--only-undecided`.
+- `--only-header` with `--plan-from` takes only the files the plan gives a header repair. It leaves a file whose only
+  fault is padding, up to 1 MiB of bytes past the Segment end (`"padding_only": true` in the plan). This is the
+  library pass of the RFC 9559 check, see [RFC 9559 check](design.md#rfc-9559-check). Each file still gets its whole
+  plan, flag edits and padding too. `--canary N` and `--paths` narrow it. It does not go with `--only-undecided`.
 - `--sub-check` and `--sub-time` are the subtitle check, see [subtitles.md](subtitles.md). `--sub-check` runs only with
   the backfill, never with `--convert` or a scan.
 - `--sub-check` skips a file whose saved result still holds. `--recheck` checks it again anyway, and needs
@@ -172,7 +174,7 @@ arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --apply  
 ### What `--apply` changes
 
 - It changes the file as an import does. It posts the alerts to Discord and asks Plex to analyze the file. After a remux
-  the app rescans the item.
+  the app rescans the item. A variable frame rate posts no alert here. The decision line keeps it in `video.frame_rate`.
 - A remux and a header repair keep the original in the kept originals, as on an import. So does a conversion, and the
   app then takes the new name. The sidecar subtitles that the new file holds go to the kept originals too, beside the
   original. An import deletes the original and those sidecars.
@@ -269,7 +271,9 @@ Plex scan per Plex library folder that holds them, instead of one scan per chang
 `--check-audio` scans the library for broken audio, and `--check-video` for corrupt video. A scan only reads. It never
 deletes or re-grabs. It lists what it finds in `STATE_DIR`, and posts one summary to Discord when it finds a problem. It
 keeps its place, so a later run goes on where it stopped. `--restart` starts a new pass, and a scan with `--ids` always
-starts one.
+starts one. `--check-video` also runs the header check with its RFC 9559 check, and lists each header issue as
+`HEADER`. A file whose only fault is padding gets no list line. A dry `--plan-out` backfill and `--only-header --apply`
+then repair the listed faults, see [RFC 9559 check](design.md#rfc-9559-check).
 
 ## Convert files into Matroska
 
@@ -316,6 +320,9 @@ Discord, titled "Open problems: 2 files", when a file has an open problem.
 The list has one line per file, with its problems in plain words. Each file counts once, by its latest import, check or
 backfill. An error counts until a later run of the same check ends otherwise. The list leaves out a file that is gone,
 and a failed conversion or file repair that already had its own alert. See "Audit" in [design.md](design.md#audit).
+`--since` also counts the files with each RFC 9559 fault kind, by the latest header check of each file in that time,
+scans and dry runs included. It prints the counts as `RFC 9559 faults: padding 2, version 1`, and the syslog line holds
+them as `rfc_padding=2 rfc_version=1`.
 
 Schedule the nightly audit of each app on a host install, with a systemd timer or cron:
 
@@ -538,7 +545,17 @@ Each command needs `/config`. The last column of the table names what else it ne
 - A backfill with `--apply` lets the files in flight finish, then stops. A dry run stops at once. A stop ends the whole
   run, so the next instance does not start. A flag backfill keeps no place, so the next run goes through the whole
   list again. It finds nothing to change in the files already done. A backfill that queues keeps its place.
-- A conversion in progress with one worker stops, and the original stays as it was.
+- `--sub-time --apply` stops the same way. The file in flight finishes with its decision line, and the next path never
+  starts. A change the stop cut gives exit code 3. A dry run stops at once.
+- After that stop, `--sub-time --apply` names each path it did not run as "not run, the run was stopped" and exits 3.
+- A conversion, a header repair or a subtitle remux in progress with one worker stops, and the original stays as it
+  was. The file still gets its decision line, which says the run was stopped.
+- After a stop, the file in flight starts no new remux, conversion, flag edit or re-grab, and it runs no further check.
+  Its decision line comes at once and lists the steps left out in `not_run`. A file stopped before its decision gets
+  the outcome `stopped`. The next run of the file makes the rest.
+- A stop posts no alert about itself. A re-grab that acted before the stop still posts. So does the "Unreadable
+  subtitles" notice of a conversion that took out a track. With `DISCORD_POSTS=all`, the change posts of the writes that
+  finished go out too. The next run of the file posts what it still finds.
 - A command with no stop of its own, such as `--plex-flush`, ends at once. Its exit code is 143 after `docker stop` and
   130 after Ctrl+C.
 - A running flag edit, re-grab, or the last step of a conversion always finishes first.

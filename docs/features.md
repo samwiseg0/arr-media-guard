@@ -167,7 +167,9 @@ At import, AMG decodes three samples of the audio that will play. It checks that
 with empty data, and decodes three short parts of it. A cover picture stored as a video track never counts as the
 video. A sure fault gets a second check from scratch. When that finds it
 too, AMG deletes the file through the app and marks the grab as failed, so the app searches again. This is a *re-grab*.
-When AMG is unsure, an alert such as "Audio may be broken" says why. `REGRAB` picks the faults that re-grab, and
+When AMG is unsure, an alert such as "Audio may be broken" says why. A video whose frames do not all stay on the
+screen the same time has a *variable frame rate*. At import, one amber alert says so, and AMG changes nothing for it.
+A job a backfill queued only logs it. `REGRAB` picks the faults that re-grab, and
 `REGRAB_CAP` allows 30 a day by default for each Sonarr or Radarr instance. When either stops a re-grab, an alert says
 so. See [regrabs.md](regrabs.md#re-grabs).
 
@@ -242,10 +244,12 @@ minutes for a 4K remux. The second look reuses the speech the first one read.
 A Matroska file can carry a wrong header, such as a wrong length or a missing seek index. It can also hold junk data at
 its end, or a layout the Matroska rules forbid. One case is a track list that sits after the video data where no index
 at the start points to it. MediaInfo then shows no tracks. Another is a second index that lists more than the video
-data. A SubRip subtitle, the text format of `.srt` files, can run past the end of the video. After a video check
-finds no real damage, AMG repairs the file in a remux. It trims those lines, or removes a track made for another cut.
-Other subtitle formats cannot be trimmed, so an alert names them. It runs at import and in a backfill with `--apply`.
-`HEADER_REPAIR=false` turns it off.
+data. AMG also holds the elements outside the video data to the Matroska standard, RFC 9559. It finds a version number
+below the elements the file uses, a value out of range and an element out of its place. It also finds a few bytes past
+the end of the file's data. A SubRip subtitle, the text format of `.srt` files, can run past the end of the video. After
+a video check finds no real damage, AMG repairs the file in a remux. It trims those lines, or removes a track made for
+another cut. Other subtitle formats cannot be trimmed, so an alert names them. It runs at import and in a backfill with
+`--apply`. `HEADER_REPAIR=false` turns it off.
 
 ## Cover track
 
@@ -357,9 +361,10 @@ A subtitle shows one step, the furthest its fix reached.
 | Replacing the file | A re-grab of the broken file, putting the old file back, or the app taking a converted file in place of the original did not finish. |
 
 Alerts name a track by its language and its role, as a player lists it: "the English SDH subtitles (track 3)". The roles
-are SDH, forced, dub, commentary and audio description. An alert adds the track's own title in quotes only when the
-title adds something, cut at about 40 characters. A title that only repeats the language, the codec or the role is not
-shown. AMG never changes a track's title in the file.
+are SDH, forced, dub, commentary and audio description. A subtitle of song lyrics in the original language has no
+role word. Its title names it, as in "the English subtitles (track 3, "Songs")". An alert adds the track's own title
+in quotes only when the title adds something, cut at about 40 characters. A title that only repeats the language,
+the codec or the role is not shown. AMG never changes a track's title in the file.
 
 An alert where AMG tried no fix shows only Check. That is a doubt, a check that only reports, or a fix that a setting or
 the daily re-grab limit turned off. A change post, the audit post and a scan summary have neither field. The alert of a
