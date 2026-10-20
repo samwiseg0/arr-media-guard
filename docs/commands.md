@@ -122,6 +122,7 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
   fault is padding, up to 1 MiB of bytes past the Segment end (`"padding_only": true` in the plan). This is the
   library pass of the RFC 9559 check, see [RFC 9559 check](design.md#rfc-9559-check). Each file still gets its whole
   plan, flag edits and padding too. `--canary N` and `--paths` narrow it. It does not go with `--only-undecided`.
+  `--plan-from` names the plan file that a dry `--plan-out` run wrote, as in [Scans](#scans).
 - `--sub-check` and `--sub-time` are the subtitle check, see [subtitles.md](subtitles.md). `--sub-check` runs only with
   the backfill, never with `--convert` or a scan.
 - `--sub-check` skips a file whose saved result still holds. `--recheck` checks it again anyway, and needs
@@ -272,8 +273,19 @@ Plex scan per Plex library folder that holds them, instead of one scan per chang
 deletes or re-grabs. It lists what it finds in `STATE_DIR`, and posts one summary to Discord when it finds a problem. It
 keeps its place, so a later run goes on where it stopped. `--restart` starts a new pass, and a scan with `--ids` always
 starts one. `--check-video` also runs the header check with its RFC 9559 check, and lists each header issue as
-`HEADER`. A file whose only fault is padding gets no list line. A dry `--plan-out` backfill and `--only-header --apply`
-then repair the listed faults, see [RFC 9559 check](design.md#rfc-9559-check).
+`HEADER`. A file whose only fault is padding gets no list line. The list is for a person to read. The scan writes it
+again at the end of each run, and no other command reads it.
+
+To repair the header issues, plan them in a dry run, then apply that plan with `--only-header`.
+
+```
+arr-media-guard --backfill radarr --plan-out /config/plans/radarr-header.jsonl                         # dry run, a new plan file
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr-header.jsonl --only-header  # the header repairs
+```
+
+The dry run reads every `.mkv` file the app lists, unless `--ids` or `--paths` names some. It changes no media file.
+Name a new plan file outside `STATE_DIR`. The dry run empties the file first, and AMG owns the files in `STATE_DIR`.
+See [RFC 9559 check](design.md#rfc-9559-check).
 
 ## Convert files into Matroska
 

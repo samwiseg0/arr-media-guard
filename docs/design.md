@@ -1628,13 +1628,17 @@ mkvmerge wrote it again. `header_repair.rfc_left` then names it, see `checks.rfc
 **The library pass.** About 7.8 percent of a library holds padding of 1 to about 1,000 bytes, and a repair of each would
 rewrite terabytes. So the first pass over a library repairs the real faults only:
 
-1. `--backfill APP --check-video` lists each file with a header issue in `STATE_DIR/video-scan-APP.txt`. A file whose
-   only issue is padding gets its decision line and no list line.
-2. `--backfill APP --plan-out FILE` plans each file. A plan line whose header repair names padding alone holds
-   `"padding_only": true`.
-3. `--backfill APP --apply --plan-from FILE --only-header` repairs the files of the plan with a header repair, except
-   those with `padding_only`. A file it takes is repaired whole, padding too.
+1. `--backfill APP --check-video` shows which files have a header issue. It lists them for a person in
+   `STATE_DIR/video-scan-APP.txt`, and writes that list again at the end of each run. A file whose only issue is
+   padding gets its decision line and no list line. No later step reads the list.
+2. `--backfill APP --plan-out /config/plans/APP-header.jsonl` is a dry run. It reads each file and writes its plans to
+   that new plan file. It plans every `.mkv` file the app lists, unless `--ids` or `--paths` names some. It changes no
+   media file. A plan line whose header repair names padding alone holds `"padding_only": true`.
+3. `--backfill APP --apply --plan-from /config/plans/APP-header.jsonl --only-header` repairs the files of that plan with
+   a header repair, except those with `padding_only`. A file it takes is repaired whole, padding too.
 4. `--audit APP --since START` counts the files of each kind, by the latest line of each file in the window.
+
+The plan file must be a new file outside `STATE_DIR`, because step 2 empties it first and AMG owns the files there.
 
 **Cost.** `header_probe()` of 229 library files over NFS, read cold under a load of about 60 (2026-10-20). A file with
 no issue read a median of 104 KB and at most 988 KB, of which the RFC 9559 check added a median of 1.2 KB and at most

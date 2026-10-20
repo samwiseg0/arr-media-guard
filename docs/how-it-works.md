@@ -247,14 +247,16 @@ and the audit with `--post` post a summary, and `--test-discord` posts a test me
   `--check --apply`, after the imports. `--backfill <instance>` takes one instance.
 - `--backfill <instance> --plan-out FILE` runs the flag backfill. It fixes the default tracks and language tags of the
   Matroska files the app lists. It skips a file with one audio track and no subtitle, which plays that track anyway. It
-  runs at the lowest CPU and disk priority.
+  runs at the lowest CPU and disk priority. FILE is a new plan file outside `STATE_DIR`, as
+  `/config/plans/radarr.jsonl`. The run empties it first and writes each file's plan there as a JSON line.
 - `--backfill <instance> --convert` converts the files that are not `.mkv`. `--sub-check` adds the subtitle check, and
   `--sub-time PATH` runs the full subtitle check of the deep analysis on single files. `--sub-check` skips a file whose
   saved result still holds, and `--recheck` checks it anyway.
 - `--check PATH` runs every check of an import on single files, with the burned-in subtitle check, the whole-file
   check and the deep analysis that the import queues. It says "would re-grab" where an import would re-grab.
 - `--check-audio` and `--check-video` scan every file much as an import checks it, and only read. A scan resumes over
-  days, lists what it finds in `STATE_DIR`, and posts one summary when it finds a problem.
+  days, lists what it finds in `STATE_DIR`, and posts one summary when it finds a problem. The list is for a person to
+  read. A header repair takes its files from a plan file, see [Scans](commands.md#scans).
 
 Run a large flag backfill as a dry run first, check the plans, then try a small sample with `--canary N`, then the rest. See
 [commands.md](commands.md#dry-runs-and-the-backfill).
