@@ -369,20 +369,34 @@ def layout_of(path):
         return None
 
 
-def header_probe(path, j):
+def header_probe(path, j, edit=False):
     """The header check of a Matroska file (docs/design.md, "Header repair"), None for another container. j is its mkvmerge -J
     probe. It reads the start of the file and the Cues. It reads the last HEADER_TAIL bytes of the Segment only when
     those point at an issue: no usable Cues, a last video or audio cue far from the header duration, a Segment size past
-    the end after the hook's own failed edit, or more than TAIL_MIN bytes past the Segment end. The stream ends come from
-    the Clusters, so a file whose index is lost reads too. tail is the bytes past the Segment end when over TAIL_MIN,
-    else 0. A remux drops them, but only when the video and the audio reach the header duration, so the Segment is whole.
-    not_whole then says why the Segment may be cut, and check_video() makes it a doubt. Bytes past the Segment end that
-    start another Matroska file block the remux too.
+    the end after the hook's own failed edit, more than TAIL_MIN bytes past the Segment end, or any issue below. The
+    stream ends come from the Clusters, so a file whose index is lost reads too. tail is the bytes past the Segment end
+    when over TAIL_MIN, else 0. A remux drops them, but only when the video and the audio reach the header duration, so
+    the Segment is whole. not_whole then says why the Segment may be cut, and check_video() makes it a doubt. Bytes past
+    the Segment end that start another Matroska file block the remux too.
+    edit_tail is the count of bytes past the Segment end, whatever their content, else 0. mkvpropedit grows Tracks into
+    the first Void that holds it. When none does, it writes Tracks at the end of the file and extends the Segment over
+    those bytes. So a flag edit of such a file rides a remux. edit_tail is no issue. With edit, such a file reads its
+    stream ends as a file with an issue does. edit_blocked then lists why that remux must not run, by the guards of
+    tail. A subtitle event far past the streams sets the stated length, so it skips the cut-off guard. Without edit, the
+    file reads what a clean file reads, and edit_blocked is None. It is [] when edit_tail is 0.
+    enclosed is the first byte of a zero run that such an edit left inside the Segment, by zero_pad()'s rule, else
+    None. It is an issue. enclosed_size is the byte count of that run, else 0. The walk for it runs only when a SeekHead
+    lists an element that starts past the end of the Cues. It reads 16 bytes for each element there, and a zero run up
+    to ZERO_RUN.
 
     Returns duration (the header's seconds), cues (True, or why none is usable), cue_end, short, failed_edit, video and
     audio (where each ends), end (where the last block of any track ends, the duration a remux writes), read (bytes),
     issue and blocked. issue says what is wrong with the header. blocked says why a remux must not run or would not
     help: the video and the audio end apart, a subtitle event runs far past them, or no stream end could be read.
+    first is True when the issue must be repaired before the other checks read the file: no usable Cues, a header
+    duration far from the streams, a subtitle event far past them, the hook's own failed edit, or enclosed zeros.
+    ffmpeg cannot read past enclosed zeros, so a subtitle remux of such a file fails. A layout or tail issue alone
+    leaves it False.
     When the header is far from every block in the last clusters, or a subtitle block there runs far past the video
     and the audio, subtitle_ends() reads every subtitle event, because a long event that starts earlier sets the
     duration too. It runs only when a remux can follow. subtitles then maps each subtitle track to where it ends, and
@@ -425,21 +439,31 @@ def header_probe(path, j):
                 cues = "the Cues hold no cue point"
         failed = bool(short and short > 0) and hook_edit_failed(path)
         little = failed and short < decide.SHORT_CERTAIN   # the hook's own failed edit cut the file's end
+        edit_tail, gap = -short if short is not None and short < 0 else 0, None
+        after = cues is True and pos + e[1] + e[2]   # where the Cues end in the Segment data
+        if after and short is not None and short <= 0 and any(x > after for xs in seek.values() for x in xs):
+            gap, more = zero_gap(f, ds + after, ds + seg_size); read += more   # an element listed past the Cues end
         out = dict(duration=round(dur, 3), cues=cues, cue_end=cue_end, short=short, failed_edit=failed, video=None, audio=None, end=None,
-                   read=read, issue=[], blocked=[], tail=-short if short is not None and -short > config.TAIL_MIN else 0)
-        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not out["tail"] and not layout:
+                   read=read, issue=[], blocked=[], tail=-short if short is not None and -short > config.TAIL_MIN else 0,
+                   edit_tail=edit_tail, edit_blocked=None if edit_tail else [], enclosed=gap and gap[0], enclosed_size=gap[1] if gap else 0,
+                   first=bool(little or cues is not True or gap))
+        if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not out["tail"] and not layout and not gap and not (edit and edit_tail):
             return out   # the common case, read in two small parts
+        out["edit_blocked"] = []
         kinds, ends = [k for k in ("video", "audio") if k in tracks.values()], None
-        stop = size + min(0, short or 0)   # the Segment end. The bytes past it may hold the Clusters of an older copy.
+        # The Segment end. The bytes past it may hold the Clusters of an older copy. stream_ends() cannot walk enclosed zeros.
+        stop = gap[0] if gap else size + min(0, short or 0)
         for n in config.HEADER_TAIL:   # the larger read also when a stream has no block in the smaller one
             f.seek(max(0, stop - n)); t = f.read(stop - max(0, stop - n)); out["read"] += len(t)
             ends = decide.stream_ends(t, durations)
             if (ends is not None and {tracks.get(i) for i in ends} >= set(kinds)) or n >= stop:
                 break
-        if out["tail"]:   # two files joined with cat: ffmpeg plays the second one too, and a remux would drop it
-            f.seek(size - out["tail"])
+        if edit_tail:   # two files joined with cat: ffmpeg plays the second one too, and a remux would drop it
+            f.seek(size - edit_tail)
             if f.read(4) == decide.EBML_ID.to_bytes(4, "big"):
-                out["blocked"].append("the bytes past the Segment end start another Matroska file")
+                joined = "the bytes past the Segment end start another Matroska file"
+                out["blocked"] += [joined] if out["tail"] else []
+                out["edit_blocked"].append(joined)
     if little:
         out["issue"].append(f"the Segment size promises {short} bytes past the end of the file after the hook's own edit of it failed")
     if out["tail"]:   # a shorter copy written over an older one leaves the old bytes behind
@@ -448,6 +472,8 @@ def header_probe(path, j):
         out["issue"].append(f"no usable Cues index: {cues}")
     if layout:   # a remux writes a new layout, see layout_fault()
         out["issue"].append(f"the header layout breaks the Matroska rules: {layout}")
+    if gap:
+        out["issue"].append(f"the Matroska Segment holds {gap[1]} zero bytes after its Cues, and no element starts there")
     got = {k: [e for i, e in (ends or {}).items() if tracks.get(i) == k] for k in ("video", "audio")}
     if ends is None:
         out["blocked"].append("no stream end could be read from the last clusters")
@@ -466,9 +492,11 @@ def header_probe(path, j):
     out["streams"] = streams = max(x for x in (out["video"], out["audio"]) if x)
     if out["video"] and out["audio"] and abs(out["video"] - out["audio"]) > decide.AV_APART:
         out["blocked"].append(f"the video ends at {content.hms(out['video'])} and the audio at {content.hms(out['audio'])}")
-    if out["tail"] and any(off(dur, x) for x in (out["video"], out["audio"]) if x):   # the Segment itself may be cut. check_video() alerts.
-        out["not_whole"] = (f"the file has {out['tail']} bytes of extra data at its end, and the video and audio stop before its stated "
-                            f"length of {content.hms(dur)}, so the file may be cut off")
+    cut = any(off(dur, x) for x in (out["video"], out["audio"]) if x) and (
+        f"the file has {edit_tail} bytes of extra data at its end, and the video and audio stop before its stated length of {content.hms(dur)}, "
+        "so the file may be cut off")
+    if out["tail"] and cut:   # the Segment itself may be cut. check_video() alerts.
+        out["not_whole"] = cut
         out["blocked"].append(out["not_whole"])
     subs = [t for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
     if subs and (off(dur, out["end"]) or off(out["end"], streams)):   # a subtitle event that starts earlier may set the duration too
@@ -482,7 +510,9 @@ def header_probe(path, j):
     out["expect"] = out["end"]   # the duration a remux writes
     if off(dur, out["end"]):
         out["issue"].insert(0, f"the header says {content.hms(dur)}, but the streams end at {content.hms(out['end'])}")
+        out["first"] = True
     if off(out["end"], streams):   # an event can run an hour past the film's end. mkvmerge keeps it, --split too.
+        out["first"] = True
         out["issue"].append(f"a subtitle event runs to {content.hms(out['end'])}, past the video and the audio at {content.hms(streams)}")
         late = {i: e for i, e in (out.get("subtitles") or {}).items() if e > streams + decide.REPAIR_END}
         codec = {t["id"]: (t.get("properties") or {}).get("codec_id") or t.get("codec") for t in subs}
@@ -498,16 +528,18 @@ def header_probe(path, j):
             out["remove"] = sorted(i for i in text if decide.remove_track(*n(i)))
             out["trim"] = sorted(i for i in text if i not in out["remove"])
             out["expect"] = max([streams] + [e for i, e in out["subtitles"].items() if i not in text])
+    if edit_tail and cut and not off(out["end"], streams):   # a subtitle event far past the streams sets the stated length
+        out["edit_blocked"].append(cut)
     return out
 
 
-def header_of(path, j=None):
+def header_of(path, j=None, edit=False):
     """header_probe() of a .mkv file, None for another file or when the probe fails. A failure never costs the video
-    check. The job's time limit passes."""
+    check. The job's time limit passes. edit is as in header_probe()."""
     if not path.lower().endswith(".mkv"):
         return None
     try:
-        return header_probe(path, j or mkvmerge(path))
+        return header_probe(path, j or mkvmerge(path), edit)
     except content.OutOfTime:
         raise
     except Exception:
@@ -645,28 +677,35 @@ def zero_pad(path):
             cues = seg and seg[1] is not None and seeks(f, b, seg[0])[0].get(decide.CUES)
             if not cues or seg[0] + seg[1] > size:
                 return None
-            p, end, run = seg[0] + cues[0], seg[0] + seg[1], None
+            p = seg[0] + cues[0]
             f.seek(p); e = decide.element(f.read(16), 0)
             if not e or e[0] != decide.CUES or e[2] is None:
                 return None
-            p += e[1] + e[2]
-            for _ in range(64):   # a few elements: Tags, Chapters, Tracks, a Void
-                if p >= end:
-                    break
-                f.seek(p); h = f.read(16)
-                if h[:1] == b"\0" and run is None:
-                    f.seek(p); z = f.read(min(decide.ZERO_RUN, end - p)); k = len(z) - len(z.lstrip(b"\0"))
-                    if k == len(z):   # a run of ZERO_RUN or more, or one up to the Segment end
-                        return None
-                    run, p = p, p + k
-                    continue
-                e = decide.element(h, 0)
-                if not e or e[2] is None or e[0] not in decide.LEVEL1 or e[0] == decide.CLUSTER:
-                    return None
-                p += e[1] + e[2]
+            run = zero_gap(f, p + e[1] + e[2], seg[0] + seg[1])[0]
     except OSError:
         return None
-    return run if p == end else None
+    return run and run[0]
+
+
+def zero_gap(f, p, end):
+    """((the first byte, the length) of the zero padding, or None, bytes read) of the open Matroska file f, see
+    zero_pad(). p is where the Cues end, and end is the Segment end. It walks the elements from p by their headers."""
+    run, read = None, 0
+    for _ in range(64):   # a few elements: Tags, Chapters, Tracks, a Void
+        if p >= end:
+            break
+        f.seek(p); h = f.read(16); read += len(h)
+        if h[:1] == b"\0" and run is None:
+            f.seek(p); z = f.read(min(decide.ZERO_RUN, end - p)); k = len(z) - len(z.lstrip(b"\0")); read += len(z)
+            if k == len(z):   # a run of ZERO_RUN or more, or one up to the Segment end
+                return None, read
+            run, p = (p, k), p + k
+            continue
+        e = decide.element(h, 0)
+        if not e or e[2] is None or e[0] not in decide.LEVEL1 or e[0] == decide.CLUSTER:
+            return None, read
+        p += e[1] + e[2]
+    return (run if p == end else None), read
 
 
 def play_times(path, pos):

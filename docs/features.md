@@ -153,9 +153,11 @@ An old muxer could store a subtitle track in the wrong character set, so Greek "
 repairs such *garbled* text only when it was UTF-8 read the wrong way and reads as the track's language, because only
 that repair checks itself. A sidecar with the same lines fills in lines the old muxer cut short. Text from an older
 character set, such as Windows-1250 or Windows-1256, often lost letters on the way, so AMG takes that track out of the
-file. It does the same with a garbled ASS, SSA or WebVTT track. A garbled `.srt` sidecar gets the same repair, or else
+file. It does the same with a garbled ASS, SSA or WebVTT track, and with a SubRip track that holds bytes that are not
+valid text, which every player shows as broken characters. A garbled `.srt` sidecar gets the same repair, or else
 a new name. The bytes stay as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`, or `.ass.txt`, `.ssa.txt` or
-`.vtt.txt` for a track in those formats. Players, Sonarr, Radarr and Bazarr skip a `.txt` file. The alert "Unreadable
+`.vtt.txt` for a track in those formats. Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as
+a subtitle file, and Radarr may rename it when it renames the movie. The alert "Unreadable
 subtitles" names each file. It runs in the deep analysis and with `--sub-check` and `--sub-time`, see
 [subtitles.md](subtitles.md#garbled-subtitle-repair).
 
@@ -264,7 +266,8 @@ mkvmerge would drop the last frames when a subtitle or audio track ends first. A
 every frame. An MP4 subtitle track must hold its text in UTF-8.
 A track with any line in an older character set, such as Windows-1256, shows as garbage in every player. AMG removes
 it from the MKV and saves its bytes as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`.
-Players, Sonarr, Radarr and Bazarr skip a `.txt` file. An alert names each such track and its file. `CONVERT=true` turns it on for imports and for
+Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as a subtitle file, and Radarr may rename it
+when it renames the movie. An alert names each such track and its file. `CONVERT=true` turns it on for imports and for
 the jobs a backfill queues, and `--convert` for a backfill. When the conversion of an import shows a damaged source, AMG re-grabs only when `REGRAB`
 lists `damage`. Else the alert title ends "re-grab is off". Subtitle text that does not read is never damage. See
 [commands.md](commands.md#convert-files-into-matroska).

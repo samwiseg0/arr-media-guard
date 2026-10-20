@@ -552,17 +552,17 @@ A line that names a byte within 1 percent of the file of a run that counts belon
 cannot open, or whose streams it cannot set up, gives no doubt. Neither does a read pass that runs over `WHOLE_MIN`
 seconds or the time the file needs at `WHOLE_RATE`, whichever is longer.
 
-**Zero padding.** Some releases end with a few hundred zero bytes past the Segment end. The hook's flag edit can grow
-the Tracks, and mkvpropedit then writes them at the end of the file, after the zeros. The Segment then holds the zeros,
-and the read pass names the first one. `checks.zero_pad()` drops that byte when it starts the one zero run after the
-Cues. Only whole elements that are not Clusters may lie from the Cues to the Segment end, and at least one must follow
-the run. No player reads those zeros. The decision line keeps the byte in `whole.ffmpeg.padding`. An unknown Segment
-size, a Segment end past the file end, no SeekHead that lists the Cues, Cues before a Cluster and a run of 256 KiB or
-more keep the doubt. When mkvpropedit adds chapters, it can move the index to a second SeekHead at the end of the
+**Zero padding.** Some releases end with a few hundred zero bytes past the Segment end. The hook's flag edit up to
+2.18.3 could grow the Tracks, and mkvpropedit then wrote them at the end of the file, after the zeros. The Segment then
+holds the zeros, and the read pass names the first one. `checks.zero_pad()` drops that byte when it starts the one zero
+run after the Cues. Only whole elements that are not Clusters may lie from the Cues to the Segment end, and at least one
+must follow the run. No player reads those zeros. The decision line keeps the byte in `whole.ffmpeg.padding`. An unknown
+Segment size, a Segment end past the file end, no SeekHead that lists the Cues, Cues before a Cluster and a run of 256
+KiB or more keep the doubt. When mkvpropedit adds chapters, it can move the index to a second SeekHead at the end of the
 file, which the front one lists. `checks.seeks()` reads that one too, as the header check does. It follows a chain of
-such SeekHeads and reads each one once, 8 at most, so SeekHeads that list each other end the read. A file with such zero
-padding whose SeekHead another tool chained has a layout issue, see "Header repair", but its repair is blocked: the
-header check reads no stream end from the last Clusters, and mkvmerge would warn on the zeros.
+such SeekHeads and reads each one once, 8 at most, so SeekHeads that list each other end the read. Since 2.18.4 a flag
+edit of a file with bytes past its Segment end runs as a remux, so it leaves no such zeros, see "Write stage". Zeros
+that an older edit left are a header issue, and the header repair drops them, see "Header repair".
 
 **Play times.** The doubts of the whole-file check and of the import's zero probe name play times, from the Cues, see
 `checks.play_times()`. So a gap reads the same whichever check found it. The read pass names the time of each byte, one
@@ -705,11 +705,11 @@ closes the connection of the process first, and it refuses the fork while any de
 `db()` raises when it finds a connection of another process. The hook and the worker fork with one thread. The
 listener never forks, and the thread pools of a backfill or a scan share one process, which SQLite supports.
 
-**Time limit.** A job has 300 seconds from the file lock to mkvpropedit. mkvpropedit has no limit,
-because a kill mid-write can break the header. A remux, its proof and its swap have none either, and
-the checks after a remux get a new 300 seconds. The limit is a deadline, `content.DEADLINE`. Each
-subprocess, HTTP call and lock wait under it ends at it, and a long read checks it between two
-blocks. It raises `content.OutOfTime`, because a network handler would swallow a TimeoutError. The
+**Time limit.** A job has 300 seconds from the file lock to its write. mkvpropedit has no limit,
+because a kill mid-write can break the header. A remux, its proof and its swap have none either. The
+checks after a conversion or after a header repair that runs before them get a new 300 seconds. The limit is a
+deadline, `content.DEADLINE`. Each subprocess, HTTP call and lock wait under it ends at it, and a long read checks it
+between two blocks. It raises `content.OutOfTime`, because a network handler would swallow a TimeoutError. The
 metadata checks after the edit get a new 300 seconds. The quick burned-in subtitle check gets the time they leave, see
 "Burned-in subtitles". Every error is logged, and the import never sees one.
 
@@ -766,7 +766,8 @@ for it, see "Burned-in subtitles". It works like a deep analysis job. Its name c
 inode, size and mtime of the file. It follows a move, drops itself when the file is gone or replaced, and yields to an
 import. Its name starts like a deep analysis job's name, so it waits behind the imports and shares the
 `BACKGROUND_WORKERS` places with the deep analyses and rechecks. Burn-in jobs run before deep analyses, so the burn-in job of an import ends before its deep
-analysis starts.
+analysis starts. A repair inside the flag edit of a burn-in job replaces the file, see "Write stage". The queued deep
+analysis and whole-file check of the file then take its new inode, size and mtime, so they do not drop.
 
 **Whole-file check job.** Every import queues one, see "Whole-file check". It works like a burn-in job, and
 `runner.follow_up()` runs both. In each group of the queue it runs before the deep analyses, because a subtitle remux of
@@ -774,7 +775,10 @@ a deep analysis replaces the file and drops the job.
 
 **Crashes and stops.** A job process that dies goes back to the queue, and the third crash drops the
 job. SIGTERM starts no new job, kills each child ffmpeg or mkvmerge, and puts the job back. A job
-inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. Pending Plex analyzes go into
+inside mkvpropedit or a re-grab's deletes blocks SIGTERM until they end. A stop during the layout repair right after
+a flag edit removes the temp file of the repair and keeps the edit. A job process then runs its job to its end, as
+after any edit, and writes the decision line of the edit. A backfill ends after the file. A run with Python's own
+Ctrl+C handler, as `--check`, stops at its next write. Pending Plex analyzes go into
 the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the
 app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
@@ -917,8 +921,8 @@ processes an import never waits for such a job. When every place is taken and no
 can free one, the import starts in one more process, up to `HOOK_WORKERS` imports, see `runner.next_jobs()`. Any other
 job of the background queue can free its place, and so can a job that yields already. The import waits only while
 the job holds the file lock exclusive.
-The job holds it for a flag edit and for the swap of a conversion. Before a remux the job takes it
-and runs its checks again.
+The job holds it for the write stage and for the swap of a conversion, see "Write stage". Before a header repair that
+the checks need first, the job takes it and runs its checks again.
 
 Then the job queues the burn-in job, the whole-file check and the deep analysis as `run_job()` does, see
 `queue_after()`. It queues none when an import of the path queued its own while the job ran. The burn-in job and the
@@ -1012,6 +1016,68 @@ priority has no effect on the file server, so the worker count and the pause are
 Each edit logs `undo`, the complete mkvpropedit command with the old values, before mkvpropedit
 runs. The selectors are track UIDs, so they hold when the track order changed. monitoring.md shows how
 to run the undo of a file's last edit. A later import of the same item runs the hook again. Delete the connection in the app to stop that.
+A remux that carries the edits, see "Write stage", logs the same `undo` with its record, after the swap. The remux keeps
+every track UID, so the command holds for the new file. The kept original undoes the whole remux.
+
+## Write stage
+
+A run writes its file once, after every check and decision, see `process.write()`. The checks and the decision read
+the file as found. Two writes still come before them, because the checks cannot read through what they fix. The
+conversion comes first, as the checks read Matroska only. A header issue the checks cannot read through is repaired
+next: no usable Cues, a header duration far from the streams, a Segment size left by the hook's failed edit, a
+subtitle event far past the streams, and enclosed zeros, see "Header repair".
+
+The write runs after the re-grab decision, under the exclusive file lock that the flag edit takes. A planned remux
+runs once. A subtitle fix plans the subtitle remux, which repairs a layout or tail issue of the header in the same
+run. A header issue alone plans the header repair. The remux carries the flag and language edits of the
+tracks it keeps, as mkvmerge track options. Its proof holds each track of the new file to the planned state, the
+properties of the original with the edits applied. A track the remux takes out counts for the decision as a track that
+does not match, so it gets no flag. A read-only file gets no edits in the remux, so its record still says
+`read_only`.
+
+After the remux, the run probes the new file and plans it again, as the file reads with the carried edits taken back.
+That is the plan 2.18.3 made after its remux, so the record keeps its decision and reasons. Its edits are the change
+from the original. So they can name a BCP 47 tag of an edited track that 2.18.3 left out, because mkvmerge wrote that
+tag in its remux. When the plan takes back every carried edit, the record says no change, as in 2.18.3. mkvmerge
+writes statistics tags into a file another muxer wrote, and the rules read them. A removed track changes the places
+and can change a choice. So the plan can differ from the one the remux carried. mkvpropedit
+then makes its edits in the same run, and takes back a carried edit it no longer asks for. `replan_edits` in the
+record counts them. A repaired garbled track whose default flag goes, see "Garbled subtitle repair", keeps that edit
+in its repair.
+
+When the remux fails or cannot run, the original stays. mkvpropedit then makes the edits of the plan as it was before
+the remux: a track that does not match loses its default and forced flags. A dry run records those edits. A run tries
+no second remux after a failed one, except the layout repair below after a failed subtitle remux. A remux skipped for
+a hard link, the size cap or low space is no failure, so the guards below still run.
+
+With no remux planned, mkvpropedit makes the edits. Two guards keep the Matroska layout whole for every caller of
+`process.edit()`: an import, a backfill, `--check`, a recheck, the deep analysis and the burn-in mute.
+`HEADER_REPAIR=false` turns both off.
+
+- **Bytes past the Segment end.** mkvpropedit grows Tracks into the first Void that holds it. With none, it writes the
+  grown Tracks at the end of the file and extends the Segment over the bytes past its end. Those bytes then sit inside
+  the Segment where no element starts, and mkvmerge warns on them. So the edits of a file with bytes past the Segment
+  end (`edit_tail`) go into one header repair in place of mkvpropedit. A file with no edit keeps its tail. The header
+  check then reads the stream ends, and the video check looks for real damage, as for any header repair. When the
+  remux must not run (`edit_blocked`: another Matroska file past the Segment end, or a Segment that may be cut, or a
+  block of the video check), or a remux of the file failed earlier in the run, the run writes nothing. The flags stay,
+  the outcome is `edit_failed`, and one alert says why. `edit_blocked` stops a subtitle remux too, because it drops
+  those bytes as well.
+- **A layout the edit broke.** After mkvpropedit, `checks.layout_fault()` reads the new layout. A broken one gets the
+  header repair at once, after the video check of the edited file. The repair runs after the signal block of
+  mkvpropedit ends, so a stop removes the temp file of the remux and leaves the edited file. The run then ends with its
+  decision line, see "Crashes and stops". A header repair that failed earlier in the run blocks it.
+
+After a repair inside the flag edit, the run probes the new file, so the metadata checks and the quick burned-in
+subtitle check read it. A file the app removed or replaced at the path meanwhile gets none of them, as in 2.18.3.
+
+A zero run that an older flag edit left inside the Segment (`enclosed`) is a header issue, which the import repairs
+before its checks, see "Header repair". A caller of `process.edit()` that ran no header check, as the burn-in mute,
+gives such a file its edits in the repair.
+
+The run sends one app rescan after its last write. Each part of the record that names a remux holds its answer in
+`rescan`. Up to 2.18.3, a subtitle remux or a header repair in a job under the shared lock ran the whole job again
+under the exclusive lock, and a flag edit could follow a remux in the same run.
 
 ## Conversion
 
@@ -1333,8 +1399,12 @@ reports.
 missing or the Segment size runs past the file end. It also reads them when the last cue is far off
 the header duration, or when over 1 MiB (`TAIL_MIN`) follows the Segment end. When a subtitle may
 run past the end, ffprobe reads every subtitle packet. A remux fixes missing Cues, a wrong duration,
-a Segment size left by the hook's failed edit, a broken layout and a tail. A SubRip line past the end gets the trim
-or the removal. Another subtitle codec past the end has no fix and posts one amber embed.
+a Segment size left by the hook's failed edit, a broken layout, a tail and enclosed zeros. A SubRip line past the end
+gets the trim or the removal. Another subtitle codec past the end has no fix and posts one amber embed. Missing Cues,
+a wrong duration, the Segment size of a failed edit, a subtitle past the end and enclosed zeros are repaired before
+the checks, because the checks cannot read through them (`hp["first"]`). mkvmerge reads no packet past enclosed zeros
+in a subtitle remux. A layout issue and a tail wait for the write stage, which carries the flag edits in the same
+remux, see "Write stage".
 
 **The layout.** RFC 9559 wants Info and Tracks before the first Cluster, or listed in a SeekHead before it (6.1). A
 second SeekHead may list Clusters only (6.3). `checks.layout_fault()` walks the elements before the first Cluster by
@@ -1345,9 +1415,16 @@ Clusters, copied the SeekHead to the end and left a front SeekHead that lists on
 showed no track in such a file. Tracks at the end that the front SeekHead lists are valid, as Lavf writes them and as
 a flag edit of a file with zero padding leaves them (see "Zero padding"). An old mkvmerge's second SeekHead of
 Clusters is valid too. `checks.seeks()` still follows a second SeekHead to the Cues, so such a file reads as before.
-A flag edit checks the layout of its result. When mkvpropedit broke it, the record names why in `layout`, and the
-next header check repairs it. mkvtoolnix keeps this mkvpropedit behaviour on purpose
+A flag edit checks the layout of its result, and a layout it broke gets the repair in the same run, see "Write stage".
+mkvtoolnix keeps this mkvpropedit behaviour on purpose
 ([issue 6322](https://codeberg.org/mbunkus/mkvtoolnix/issues/6322), 2026-10-19), so the repair stays.
+
+**Enclosed zeros.** An older flag edit of a file with zeros past the Segment end left them inside the Segment, see
+"Zero padding". `header_probe()` finds the run by the rule of `checks.zero_pad()` and names its start in `enclosed`.
+That is a header issue. mkvmerge reads the file up to the run, warns that it resyncs, and finds no element after it.
+The repair accepts exactly those lines for each input of the file: the byte position, at or after the run, the last
+timestamp it read, at the end of the streams, and the failed resync. Any other line fails it. The size check counts the
+original up to the run.
 
 The remux runs only when the video check ran all its stages and found no certain fault and no doubt.
 The video and the audio must also end at most 60 seconds apart. It runs like a conversion, but it
@@ -1417,8 +1494,9 @@ Segment end, and some players decode them. The remux cuts the tail when the vide
 reach the header duration. A Segment that is itself cut stays, with a video doubt. Bytes that start
 with the EBML id `1A45DFA3` are a second file joined with `cat`, and they stay.
 
-A failure keeps the original and posts one amber embed, and the flag edit still runs. On success the
-decision runs on the new file, and the app rescans the item. A backfill dry run reports
+A failure keeps the original and posts one amber embed, and the flag edit still runs, see "Write stage". After a
+repair before the checks, they read the new file. After a repair in the write stage, the run plans the new file again.
+The app rescans the item once. A backfill dry run reports
 `would_repair_header`, and `--apply` repairs. The line of the dry run starts with `dry run`, as for a flag edit. A
 doubt or a fault that blocks the repair gives `header_not_repaired`. Its result names the block, then the issue, as
 `not repaired: the video ends at 1:54:58 and the audio at 1:50:12. The issue: the header says 13:23:33, but the streams
@@ -1853,6 +1931,17 @@ is right. These guards carry that:
   every packet the same.
 - A repaired track gets no other change in the run, such as new times. A later run judges its times.
 
+**Bytes that are not UTF-8.** A SubRip track can hold bytes that are not UTF-8, as when an old muxer stored a sidecar's
+cp1252 "é" as the one byte 0xE9. A player shows a broken character for each such byte. mkvextract and mkvmerge's copy
+of the track both write U+FFFD for it, so no remux can keep the bytes, and the track is broken. One such byte is
+enough, as for MP4 timed text, see "Conversion". The read of the cues already holds each block's bytes, see
+`subtitle_blocks()` and `full_read()`, so the check needs no other read. The track gets a verdict with `encoding` and
+no repair, whatever its text reads as, and it leaves the file as below. Its verdict's reason counts the cues that show
+U+FFFD. The alert says the track shows broken characters, because some of its bytes are not valid text. Garbled
+subtitle repair 3 adds this check. It rechecks no older result, because a recheck reads each checked file whole again.
+A backfill with `--sub-check` and the deep analysis skip a file whose saved result still holds. So a file checked
+before is found when it or its sidecars change, when a run names it, or while its result is pending.
+
 **A track that cannot be repaired.** A garbled track that is not repaired leaves the file in the same proven remux, as
 a removal does (`subtitle_garbled_removed`). The original is kept for `KEEP_ORIGINALS_DAYS`, so with `0` the track
 stays and alerts. Its bytes go beside the video in its own format, see "Unreadable subtitles". Before the remux, one
@@ -1895,13 +1984,15 @@ original in `kept`, and `later` when its times or words wait for the next run.
 
 AMG keeps the bytes of subtitles it takes out because no player reads them right in one file beside the video. Three
 callers use one path, `remux.broken_plan()`, `keep_broken()` and `drop_broken()`: a conversion that removes a broken
-MP4 timed-text track, see "Conversion", a subtitle remux that removes a garbled track, and the move of a garbled
-sidecar, see "Garbled subtitle repair".
+MP4 timed-text track, see "Conversion", a subtitle remux that removes a garbled track or a SubRip track with bytes
+that are not UTF-8, and the move of a garbled sidecar, see "Garbled subtitle repair".
 
 **The name.** The file is `<name>.<language>.broken-encoding.<format>.txt`, as `Film (2001).per.broken-encoding.srt.txt`.
 The language is the track's tag, or the language part of a sidecar's name. A track with no tag has no language part.
-The format is `srt`, `ass`, `ssa` or `vtt`, the track's own. Players, the apps and Bazarr skip a `.txt` file, and AMG's
-own sidecar scans read `.srt` files only. AMG never writes over a file. A file with the same bytes stays, as when the
+The format is `srt`, `ass`, `ssa` or `vtt`, the track's own. Players skip a `.txt` file. Bazarr skips this name,
+because it does not match the video's. Sonarr and Radarr count `.txt` as a subtitle extension, so a rescan records
+the file, and Radarr may rename it with its own language part when it renames the movie. AMG's own sidecar scans read
+`.srt` files only. AMG never writes over a file. A file with the same bytes stays, as when the
 same release converts again or Bazarr fetches the same sidecar again. When a file of other bytes holds the name, or
 two entries share the language part and the format, the name takes a number in front of `.broken-encoding`: the
 track's number, as `Film (2001).per.3.broken-encoding.srt.txt`, or 1 and up for a sidecar. No two entries take one
@@ -2236,8 +2327,11 @@ A sign drawn frame by frame, or a karaoke line, runs straight into its next even
 tracks show their median cue for a second or more, and a flash track for about a seventh of a second. Only a cue under
 0.5 seconds gets a new end: the next cue's start less two frames (0.083 s), at most the start plus twice the reading
 time, 3 seconds at least and 7 at most. The reading time counts the visible characters, 17 a second. A flash fix never
-shortens a cue. A built-in track gets its new ends in the remux of "Actions": mkvextract writes its text, the ends go
-in, and mkvmerge reads it back, which keeps each packet and the ASS header byte for byte, with the changes below.
+shortens a cue. A built-in track gets its new ends in the remux of "Actions". A SubRip track goes into a Matroska file
+of its own, each packet as it is at its new times, and mkvmerge reads that file. mkvmerge's SubRip reader drops the
+blank lines at the start of a cue, and mkvmerge 8 stored them as line breaks, so the packets never go through SubRip
+text. For an ASS or SSA track, mkvextract writes its text, the ends go in, and mkvmerge reads it back, which keeps
+each packet and the ASS header byte for byte, with the changes below.
 HandBrake ends each ASS event and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The
 round trip drops those NUL bytes and adds the section. The proof compares each packet that ended in a NUL without that
 one byte, and names their count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section
@@ -2247,10 +2341,13 @@ of its ReadOrder. The rank applies only when every ReadOrder of the track is a w
 and no two are equal. Otherwise each packet must keep its ReadOrder. The proof names the count of packets that changed
 in `read_order`. The order of the events stays. `--engage keep_whitespaces_in_text_subtitles` keeps the spaces at the
 ends of each line of the round trip, so a space at the end of an event stays, and the proof holds it.
-mkvextract writes each line break inside a SubRip cue as LF, and mkvmerge stores it as CRLF, in the round trip and
-in the remux of a copied track. The mkvmerge that made a source may have stored LF. So the proof compares each packet
-of every SubRip track with each CRLF as LF, in both files, and names the count of packets that changed in `crlf`. Any
-other change of a byte fails.
+mkvmerge stores each line break inside a SubRip cue as CRLF, in a timed track and in a copied one. The mkvmerge that
+made a source may have stored LF. So the proof compares each packet of every SubRip track with each CRLF as LF, in both
+files, and names the count of packets that changed in `crlf`. Any other change of a byte fails. mkvmerge writes U+FFFD
+for each byte of a SubRip packet that is not UTF-8, in any remux, and warns. So a run that reads whole files takes
+such a track out, see "Garbled subtitle repair". An import never makes that check. Any remux it plans for such a file
+fails on the track, so its subtitle fixes wait for a run that reads whole files. Its flag edits still land, and
+mkvpropedit makes them when the remux fails.
 The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake writes starts in milliseconds. The
 round trip puts each start on the centisecond grid, up to 5 ms away. So such a track gets one plan of every start and
 end, with each start on the nearest centisecond, and the proof holds both to it. The log counts in `starts_rounded` the

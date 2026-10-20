@@ -86,9 +86,9 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
                         return None
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: runner.reshared(lock, path, st)), pool)
-            except runner.Replan as ex:
+            except runner.Replan:
                 with runner.locked() as lock:
-                    rec = subtitles.swept_before(run(lock, False, None), ex)
+                    rec = run(lock, False, None)
     except Exception as ex:
         if isinstance(ex, (subsync.Broken, subtitles.Yielded)):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
             raise

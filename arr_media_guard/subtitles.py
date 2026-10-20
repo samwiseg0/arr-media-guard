@@ -71,17 +71,21 @@ def before_cut(heard, cues):
     return heard if end is None else [w for w in heard if w["at"] + w.get("secs", subsync.WINDOW) <= end]
 
 
-def subtitle_cues(path, j, want, full=False):
+def subtitle_cues(path, j, want, full=False, bad=None):
     """{track position: [(start, end, text)] in seconds, see timed()} of every cue of the text subtitle tracks at the
     positions in want, for the subtitle match check (docs/design.md, "Subtitle match"). SubRip, ASS, SSA and WebVTT
     tracks. A track whose Cues list CUE_MAX blocks or more gives a Cut, as the read stopped there, and so does a read
     that took READ_WALL seconds. A block that gives no cue still counts. With full, a track the Cues do not index comes
-    from full_read(). A track the read cannot take gets no entry."""
+    from full_read(). A track the read cannot take gets no entry. The set bad gets the position of each SubRip track
+    with a cue read that is not UTF-8."""
     capped = set()
-    got = subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None, capped)
+    got = subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None, capped, bad)
     got = {p: Cut(c) if p in capped else c for p, c in got.items() if c}
-    if full and set(want) - set(got):
-        got.update({p: c for p, c in full_read(path, j)["cues"].items() if p in set(want) - set(got) and c})
+    if full and (lost := set(want) - set(got)):
+        whole = full_read(path, j)
+        got.update({p: c for p, c in whole["cues"].items() if p in lost and c})
+        if bad is not None:
+            bad.update(set(whole.get("not_utf8") or ()) & lost)
     return got
 
 
@@ -141,7 +145,7 @@ def cue_less(path, j):
 
 
 def full_read(path, j):
-    """{"cues": {track position: [(start, end, text)] in seconds}, "tracks", "took", "cpu", "why"} of the subtitle tracks
+    """{"cues": {track position: [(start, end, text)] in seconds}, "tracks", "not_utf8", "took", "cpu", "why"} of the subtitle tracks
     of path that no cue entry indexes, from one ffmpeg read of the whole file at nice 19 and idle I/O (docs/design.md,
     "Subtitle match"). A film takes minutes, so only --sub-check and --sub-time ask for it, and an import never does.
     SubRip and ASS keep their text, WebVTT becomes SubRip, a PGS track gives its display sets, see pgs_shows(), and a
@@ -149,12 +153,13 @@ def full_read(path, j):
     the cue times and text as they arrive. A PGS track keeps only its PCS segments, see sup_pcs(). So the read writes
     no file and needs no free space. The result is kept for the file as it is, so a run reads a file whole once. A
     failure gives no cues and why. A track keeps CUE_MAX cues at most, PICTURE_MAX for pictures, and a read stops after
-    FULL_WALL seconds. A track cut short either way gives a Cut, and a stop gives why too."""
+    FULL_WALL seconds. A track cut short either way gives a Cut, and a stop gives why too. not_utf8 lists the SubRip
+    tracks whose bytes are not all UTF-8."""
     st = os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns)
     if key in FULL:
         return FULL[key]
-    out = {"cues": {}, "tracks": [], "took": 0.0, "cpu": 0.0, "why": None}
+    out = {"cues": {}, "tracks": [], "not_utf8": [], "took": 0.0, "cpu": 0.0, "why": None}
     lost, ends, proc = cue_less(path, j), {}, None
     try:
         streams = [x for x in proof.ff_streams(path)[1] if x.get("codec_type") == "subtitle"] if lost else []   # the k-th is mkvmerge's k-th subtitle track
@@ -203,6 +208,7 @@ def full_read(path, j):
                 data = bytes(keep[p]) if fmt == "sup" or not late else bytes(keep[p][:keep[p].rfind(b"\n") + 1])   # whole lines only
                 c, cap = full_cues(data, fmt), config.PICTURE_MAX if fmt in ("sup", "framecrc") else config.CUE_MAX
                 out["cues"][p] = Cut(c[:cap]) if late or len(c) >= cap else c
+                out["not_utf8"] += [p] if codec == "subrip" and not proof.utf8(data) else []   # SubRip copies its packets, see FULL_OUT
             if late:
                 out["why"] = f"the read stopped after {config.FULL_WALL} s, so each track holds only the cues read"
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as ex:
@@ -301,7 +307,7 @@ def same_cues(a, b):
     return sorted(round(c[0], 3) for c in a) == sorted(round(c[0], 3) for c in b)
 
 
-def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None):
+def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=None):
     """{track position: use(its blocks)} for the tracks of codecs at the positions in want. mkvmerge and ffmpeg index
     every subtitle block in the Cues, so the read takes the Cues and then each block by its index entry, one small read
     each. It never reads a Cluster in full, so the cost does not grow with the file size. use gets an iterator of
@@ -309,7 +315,8 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None):
     picture track gives the frame's bytes for its text, and a PGS block only its first bytes, see picture_cues(). A
     track with a content encoding other than zlib, and a track the Cues do not index get no entry, or failed(why). A
     failure keeps what was read. The job's time limit passes. A track's read stops after READ_WALL seconds. The set
-    capped gets the position of each track whose read stopped there, or whose Cues list cap blocks or more."""
+    capped gets the position of each track whose read stopped there, or whose Cues list cap blocks or more. The set bad
+    gets the position of each SubRip track with a block read that is not UTF-8."""
     tracks, n, out = {}, 0, {}
     for t in j.get("tracks") or []:
         p = t.get("properties") or {}
@@ -355,6 +362,8 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None):
                         data = zlib.decompressobj().decompress(frame) if packed else frame   # a cut PGS block gives its first bytes
                         start = (clusters[cp][1] + times[0]) * scale / 1e9 if times and clusters[cp][1] is not None else None
                         text = data if codec in config.PICTURE_CODECS else data.decode("utf-8", "replace")
+                        if bad is not None and codec == "S_TEXT/UTF8" and not proof.utf8(data):
+                            bad.add(tracks[number][0])
                         # An ASS event holds 8 fields before its text. HandBrake ends each event with a NUL byte, and mkvextract
                         # drops it. So the text of a cue leaves it out, and a plan pairs with the extracted text, see remux.set_ends().
                         yield start, times[1] * scale / 1e9 if times and times[1] is not None else None, \
@@ -830,18 +839,6 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
     return out, facts
 
 
-def swept_before(rec, ex):
-    """rec of a pass that followed Replan ex, with the facts of the whole-file hearing of the pass that raised it added
-    to its own, see sub_whole(). The second pass finds the words in the cache, so its facts alone would hide what the
-    first pass heard."""
-    f, g = (ex.args[1] if len(ex.args) > 1 else None) or {}, rec.get("whole_facts") or {}
-    add = lambda g, f: dict(g, windows=g["windows"] + f["windows"], cpu=round(g["cpu"] + f["cpu"], 1), took=round(g["took"] + f["took"], 1),
-                            runs=g["runs"] + f["runs"], cached=g["cached"] + f["cached"], failed=g["failed"] + [x for x in f["failed"] if x not in g["failed"]])
-    if f and g:
-        rec["whole_facts"] = {i: add(x, f[i]) if i in f else x for i, x in g.items()}
-    return rec
-
-
 class Yielded(Exception):
     """The deep analysis stopped between two steps, because an import waits. Its job stays queued, and the words heard so
     far stay cached, see deep_analysis()."""
@@ -1059,10 +1056,14 @@ SUB_CHECKS = {
     "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
-    "garbled_repair": {"version": 2, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
+    "garbled_repair": {"version": 3, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
                                                        # SSA or WebVTT track, and repairs or renames a garbled .srt sidecar.
                                                        # Version 1 checked no sidecar and no ASS, SSA or WebVTT track. A
                                                        # result names no codec, so each older result gets one recheck.
+                                                       # Version 3 takes out a SubRip track with bytes that are not UTF-8.
+                                                       # It adds no entry, because a recheck reads each checked file whole
+                                                       # again. A file checked before is found when it or its sidecars
+                                                       # change, a run names it, or its result is pending.
     "flash": {"version": 2, "fixes": {2: ["fix"]}},    # lines that flash by too fast to read. Version 2 writes the new
                                                        # ends of a HandBrake ASS track, whose events end in a NUL byte.
                                                        # Version 1 failed there, and its result says fix.
@@ -1365,15 +1366,23 @@ def garbled_tracks(path, j, sides, full=False):
     "side". "tag" is the track's language tag. The repair stops when more than decide.REPAIR_CUT of the cues stay cut,
     or when the new text fails decide.repair_fault(). With full, a track the Cues do not index comes from full_read(). A
     track the read cannot take gets no verdict. A track whose read was cut short, see Cut, is never repaired, and its
-    verdict holds "capped", because the cues past the cut were never judged."""
+    verdict holds "capped", because the cues past the cut were never judged.
+
+    A SubRip track with a byte that is not UTF-8 is broken whatever its text reads as, and it is never repaired. Every
+    remux, a copy too, writes U+FFFD for such a byte, see remux.srt_track(). Its verdict holds "encoding", and with
+    decide.garbled() giving none, codepage, lang and read are None and cut is 0."""
     tags = {f"s{n}": decide.track_tag(t.get("properties") or {})
             for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
     codecs = sub_codecs(j)
     want = {p for p, c in codecs.items() if c in config.SUB_CODECS}
-    out = {}
-    for p, cues in sorted(subtitle_cues(path, j, want, full).items(), key=lambda x: int(x[0][1:])) if want else ():
+    out, bad = {}, set()
+    for p, cues in sorted(subtitle_cues(path, j, want, full, bad).items(), key=lambda x: int(x[0][1:])) if want else ():
         texts = [dialogue(t, codecs[p]) for _, _, t in cues]
         g = decide.garbled(texts, tags[p])
+        if p in bad:
+            why = f"{sum(chr(0xfffd) in t for t in texts)} of {len(texts)} cues hold bytes that are not UTF-8, which every remux writes as U+FFFD"
+            g = dict(g or {"codepage": None, "lang": None, "read": None, "cut": 0, "cues": len(texts)}, repair=False, encoding=True,
+                     why=f'{g["why"]}, but {why}' if g else why)
         if not g:
             continue
         if g["repair"] and codecs[p] != "S_TEXT/UTF8":   # the proof checks the new text of a SubRip track only
@@ -1490,7 +1499,8 @@ def sub_findings(rec, sync, unmatched, starts=None):
                              ([p for p in rest if garbled[p].get("held")], False, {"kept_back": "names"}),
                              ([p for p in rest if garbled[p].get("capped")], False, {})):
         if ps and not ("result" in more and rm.get("done")):   # one sentence for the tracks that share their outcome
-            wrong.append({"code": "garbled", "tracks": sorted(ps, key=lambda p: int(p[1:])), "repair": repair, "flags_off": flags_off, **more})
+            wrong.append({"code": "garbled", "tracks": sorted(ps, key=lambda p: int(p[1:])), "repair": repair, "flags_off": flags_off, **more,
+                          **({"encoding": True} if all(garbled.get(p, {}).get("encoding") for p in ps) else {})})
     for e in rp.get("sidecars_unmatched", []):
         wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left")})
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so

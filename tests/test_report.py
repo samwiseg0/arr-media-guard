@@ -512,6 +512,25 @@ SUB_LINES = [
      "The cover picture in video track 1 stays a video track too, so a player may show it in place of the video.", None),
     ({"code": "cover", "tracks": ["v2", "v4"], "also": True},
      "The cover pictures in video tracks 2 and 4 stay video tracks too, so a player may show one in place of the video.", None),
+    # A SubRip track with bytes that are not UTF-8, see subtitles.garbled_tracks(): no repair is tried
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "encoding": True, "result": "subtitle remux failed: mkvmerge exited 2",
+      "names": ["F.spa.broken-encoding.srt.txt"], "block": {"code": "remux"}, "hardlinked": False},
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text, but rewriting the file failed. "
+     "The original file was not changed.",
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text. --apply would take them out of "
+     "the file and keep their text beside the video as F.spa.broken-encoding.srt.txt."),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "encoding": True, "result": "x", "names": ["F.spa.broken-encoding.srt.txt"],
+      "block": {"code": "cap", "why": "over the 30 GB repack cap"}},
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text, but rewriting the file failed. "
+     "The original file was not changed.",
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text. --apply would skip the remux, "
+     "because the file is over the 30 GB repack cap. Raise REPACK_MAX_GB to remux it."),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "encoding": True, "kept_back": "keep_days"},
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text. They're still in the file, "
+     "because KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original.", None),
+    ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "encoding": True},
+     "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text, so they were left as they are.",
+     None),
 ]
 
 def test_every_template_has_a_golden():
@@ -967,14 +986,16 @@ def test_a_post_waits_out_each_429_up_to_its_tries(monkeypatch, settings, tries,
 
 def test_an_overrun_alert_after_a_strip_names_the_track_that_runs_over():
     """The remux took out the garbled French track s1, and the English PGS track that runs past the end moved up to s1.
-    faults() maps it back past both a removal and a strip, so the alert names the English track by its place after the
-    run."""
+    write_findings() maps it back past both a removal and a strip, so the alert names the English track by its place
+    after the run."""
     rec = decision(edits=[], findings=[], header_repair={"code": "subtitle_overrun_unfixable"},
                    subremux={"done": True, "removed": [], "stripped": {"s1": "Film A.fre.srt"}, "kept": "/k/A.mkv",
                              "tracks_before": [{"i": "s1", "lang": "fre"}, {"i": "s2", "lang": "eng"}]})
     hp = {"issue": ["a subtitle runs past the end"], "unfixable": [{"track": "s1", "codec": "S_HDMV/PGS", "end": 7300.0, "streams": 6000.0}]}
-    ctx = types.SimpleNamespace(rec=rec, d={}, hp=hp, vpre=None, damaged=None, unconverted=None, unreadable=None, tags=None, mode="sub_time")
+    ctx = types.SimpleNamespace(rec=rec, d={}, hp=hp, vpre=None, damaged=None, unconverted=None, unreadable=None, tags=None, mode="sub_time",
+                                ended=False)
     h.faults(ctx)
+    h.write_findings(ctx)
     assert ctx.rest[0]["tracks"][0]["track"] == "s2"
     assert h.render(dict(rec, findings=ctx.rest), "embed")[0]["description"].startswith("The **English subtitles (track 1)** keep going until")
 
@@ -1196,7 +1217,8 @@ STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "
                          40: "Testing the fix", 41: "Testing the fix", 42: "Finding the shift", 43: "Finding the shift",
                          44: "Finding the shift", 45: "Finding the shift", 46: "Finding the shift", 47: "Finding the shift",
                          48: "Finding the shift", 49: "Finding the shift", 50: "Finding the shift", 51: "Finding the shift",
-                         52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift", 56: "Writing the file", 57: "Writing the file"}}
+                         52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift", 56: "Writing the file", 57: "Writing the file",
+                         58: "Writing the file", 59: "Writing the file", 61: "Testing the fix"}}
 
 
 def test_every_alert_code_has_its_step():

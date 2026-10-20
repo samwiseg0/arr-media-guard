@@ -113,7 +113,10 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
   result. `dry run` says that `--apply` would write the file or a sidecar, with a flag edit, a header repair, a subtitle
   remux or a sidecar fix. `no change` says that it would write nothing. An apply names its change, as `edited`,
   `header repaired` or `subtitles remuxed: s2 retimed`. `header not repaired:` and `header repair skipped` give the
-  reason first, then the issue.
+  reason first, then the issue. A remux carries the flag edits of its file, and the line still says `edited`. A file
+  with bytes past its Matroska Segment end gets its flag edits in a remux too, see
+  [Write stage](design.md#write-stage). When that remux must not run, the line starts `not edited, as a flag edit
+  would put`, and the flags stay.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
 - `--only-header` with `--plan-from` takes only the files the plan gives a header repair. Each file still gets its
   whole plan, flag edits too. `--canary N` and `--paths` narrow it. It does not go with `--only-undecided`.
@@ -391,6 +394,12 @@ The selftest prints only the warnings, as `warning: Discord refused the token in
 `--queue` shows what the worker does now. It changes no record, so it is safe to run while the worker runs. Run it
 where the worker runs, with `docker exec` in Docker. A one-off container sees no process of the service. A state store
 that an older AMG wrote gets its upgrade first, as with every command.
+
+A flag backfill, a backfill with `--plan-out` or `--plan-from`, runs in its own process and puts no job in the
+background queue, so `--queue` never lists it. So do `--convert` and `--sub-check`.
+Such a run prints its lines in its own terminal. Its decision lines have source `backfill` in the decision log, see
+[monitoring.md](monitoring.md), and `--audit <instance> --since 24h --source backfill` lists the files its `--apply`
+left with an open problem.
 
 ```
 docker exec -it arr-media-guard arr-media-guard --queue

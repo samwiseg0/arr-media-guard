@@ -346,7 +346,9 @@ file. An import does not. This check needs no language detection.
 
 A track whose text reads right only in an older character set, such as Windows-1250, often lost letters when the old
 muxer cut bytes. AMG cannot tell which ones, so it takes that track out of the file. It does the same with a garbled
-track it cannot repair for another reason, and with a garbled ASS, SSA or WebVTT track. It keeps the old file for
+track it cannot repair for another reason, and with a garbled ASS, SSA or WebVTT track. A SubRip track with bytes that
+are not valid text, such as one "é" stored in an older character set, goes out too. Every player shows those bytes as
+broken characters, and no rewrite of the file can keep them. It keeps the old file for
 `KEEP_ORIGINALS_DAYS`. The track's bytes go beside the video in its own format, for example
 `Film (2001).bul.broken-encoding.srt.txt` or `Film (2001).pol.broken-encoding.ass.txt`. An ASS file keeps its styles.
 With `KEEP_ORIGINALS_DAYS` at 0, the track stays, and the alert says why.
@@ -358,7 +360,8 @@ file stay as they are, and the next `--sub-check` checks its words and times. An
 whose repair AMG cannot prove, gets the name `<name>.<language>.broken-encoding.srt.txt` with its bytes as they are.
 Bazarr may then fetch a new sidecar.
 
-Players, Sonarr, Radarr and Bazarr skip a `.txt` file, and AMG never writes over a file. The alert "Unreadable
+Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as a subtitle file, and Radarr may rename it
+when it renames the movie. AMG never writes over a file. The alert "Unreadable
 subtitles" names each file. To fix such a file by hand, open it in a subtitle editor that reads other character sets,
 such as Subtitle Edit. Pick the set that makes it readable, save it as a UTF-8 `.srt`, then add it back.
 

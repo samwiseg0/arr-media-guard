@@ -5001,15 +5001,15 @@ def test_a_cover_alert_joins_only_the_alert_that_says_the_rewrite_failed(env, co
 
 
 def test_a_run_that_re_grabs_the_file_posts_no_cover_alert(env, cover_mkvs, monkeypatch, settings):
-    """At import the cover move runs before the audio check. When the audio is broken and the file is re-grabbed, the
-    re-grab fixed the file, so nothing posts. The decision log keeps the cover finding."""
+    """The cover move waits for the write stage, after the audio check. When the audio is broken and the file is
+    re-grabbed, no remux runs and nothing posts. The decision log keeps the cover finding."""
     settings(keep_days=0)
     monkeypatch.setattr(hook.filecmp, "cmp", lambda a, b, shallow=True: False)
     monkeypatch.setattr(hook, "check_audio", lambda *a, **k: ("the audio fails to play at all 3 places checked", [], []))
     monkeypatch.setattr(hook, "regrab", lambda app, job, fault, probe, kind="audio", alone=False: {"code": "regrabbed", "name": "Film A", "kind": kind, "n": 1})
     rec, posts = cover_run(env, monkeypatch, cover_mkvs / "one-first.mkv", mode="import")
-    assert rec["subremux"]["codes"] == ["subtitle_remux_failed"] and "cover" in rec["alert_kinds"], rec.get("subremux")
-    assert posts == [], posts
+    assert "subremux" not in rec and rec["covers"] and "cover" not in rec["alert_kinds"], rec.get("subremux")
+    assert posts == [] and len(REAL_MKVMERGE(env["path"])["tracks"]) == 3, posts
 
 
 def test_a_cover_moves_only_where_the_subtitle_remux_may_change_the_file(env, cover_mkvs, monkeypatch, settings):
@@ -6901,6 +6901,7 @@ def test_header_verdicts_on_generated_files(mkvs, tmp_path, monkeypatch, setting
     certain, doubts, fields = hook.video_check(path)
     h = fields["header"]
     assert h.get("repairable") is repairable, (certain, doubts, h)
+    assert h["first"] is (bool(h["issue"]) and name not in ("tail.mkv", "joined.mkv")), h   # a tail alone waits for the one write
     at = [w["at"] for w in (fields.get("windows") or {}).get("list", [])]
     if name == "good.mkv":   # the common case reads the start and the Cues, never the end
         assert h["issue"] == [] and h["cues"] is True and h["video"] is None and h["read"] < 1 << 20 and doubts == []
@@ -7001,12 +7002,14 @@ def test_the_header_check_flags_only_a_layout_matroska_forbids(layouts, tmp_path
     """RFC 9559 wants Info and Tracks before the first Cluster or listed in a SeekHead before it, and a second SeekHead
     may list only Clusters. The ffmpeg subtitle remux broke both, and MediaInfo then showed no track. Such a file has a
     header issue, and a remux with mkvmerge repairs it with every track and UID kept. Tracks at the end that the front
-    SeekHead lists, as Lavf writes them, and a second SeekHead of Clusters are valid."""
+    SeekHead lists, as Lavf writes them, and a second SeekHead of Clusters are valid. The zeros the flag edit of lavf_end
+    put inside its Segment are a header issue of their own, see test_header_room.py. Only those repair before the checks."""
     settings(log=str(tmp_path / "log.jsonl"))
     path = tmp_path / "Movie (2000)" / f"{name}.mkv"; path.parent.mkdir(); shutil.copy(layouts[name], path)
     assert hook.layout_of(str(path)) == layout
     j = hook.mkvmerge(str(path)); hp = hook.header_of(str(path), j)
-    assert hp["issue"] == ([f"the header layout breaks the Matroska rules: {layout}"] if layout else []), hp["issue"]
+    enclosed = ["the Matroska Segment holds 700 zero bytes after its Cues, and no element starts there"] if name == "lavf_end" else []
+    assert hp["issue"] == ([f"the header layout breaks the Matroska rules: {layout}"] if layout else enclosed) and hp["first"] is bool(enclosed), hp
     if layout:
         _, result, info = hook.repack(str(path), j, os.stat(path), True, dict(hp, windows_clean=True))
         assert result == "header repaired", (result, info)
@@ -7017,7 +7020,8 @@ def test_the_header_check_flags_only_a_layout_matroska_forbids(layouts, tmp_path
 
 def test_the_proof_refuses_a_broken_layout_and_the_flag_edit_names_it(layouts, tmp_path, settings):
     """A remux whose new file breaks the Matroska layout fails its proof before any packet is read. A flag edit that
-    leaves such a layout says so in its record, and the next header check repairs it."""
+    leaves such a layout gets the header repair in the same run, see test_write_stage.py. The video check of this
+    30-second file runs no window, so here the repair is blocked, and the record names the issue."""
     settings(log=str(tmp_path / "log.jsonl"), state_dir=str(tmp_path))
     assert REAL_PROVE(str(layouts["src"]), str(layouts["chained"]), [], str(tmp_path)) == \
         ((None, f"the header layout of the new file breaks the Matroska rules: {TRACKS_LATE}"), [])
@@ -7026,7 +7030,9 @@ def test_the_proof_refuses_a_broken_layout_and_the_flag_edit_names_it(layouts, t
         shutil.copy(layouts[name], path)
         j = REAL_MKVMERGE(str(path))
         rec = hook.edit({"path": str(path)}, j, [[f"track:={j['tracks'][2]['properties']['uid']}", 1, 0, "flag-forced"]], True)
-        assert rec["outcome"] == "edited" and bool(rec.get("layout")) == bool(layout) and rec.get("layout") == hook.layout_of(str(path)), rec
+        hr = rec.get("header_repair") or {}
+        assert rec["outcome"] == "edited" and "layout" not in rec and bool(hr) == layout, rec
+        assert not layout or (hr["code"], hr["issue"]) == ("header_not_repaired", [f"the header layout breaks the Matroska rules: {hook.layout_of(str(path))}"]), hr
 
 
 @pytest.fixture(scope="module")
@@ -7378,7 +7384,7 @@ def test_an_interrupted_header_repair_leaves_no_temp_file(mkvs, tmp_path, tool, 
 
 
 HEADER_HP = {"duration": 48213.5, "cues": True, "cue_end": 6873.4, "short": 0, "failed_edit": False, "video": 6873.4, "audio": 6873.4,
-             "end": 6898.0, "read": 1, "issue": ["the header says 13:23:33, but the streams end at 1:54:58"], "blocked": []}
+             "end": 6898.0, "read": 1, "issue": ["the header says 13:23:33, but the streams end at 1:54:58"], "blocked": [], "first": True}
 
 
 def header_issue(env, monkeypatch, repairable=True, result=("header_repaired", "header repaired"), doubts=()):
@@ -7822,6 +7828,7 @@ def test_a_subtitle_trim_cuts_late_lines_and_keeps_everything_else(mkvs, tmp_pat
         j["tracks"][2]["properties"]["codec_id"] = "S_HDMV/PGS"
         hp = hook.header_probe(str(mkvs / "subtitle.mkv"), j)
         assert hp["unfixable"] == [{"track": "s1", "codec": "S_HDMV/PGS", "end": 3540.0, "streams": 120.023}] and "trim" not in hp and "remove" not in hp
+        assert hp["first"] is True
         assert hp["blocked"] == ["subtitle track 2 (S_HDMV/PGS) runs past the end, and only a SubRip track can be trimmed"]
 
 
@@ -13855,7 +13862,7 @@ def test_the_readers_beside_classify_take_the_bcp47_tag(monkeypatch):
     got = hook.broken_tracks("/x/Film.mp4", {"tracks": [sub("fa")]}, [{"index": 5, "codec_type": "subtitle", "codec_name": "mov_text"}], "/x", 10)
     assert got["s1"]["lang"] == "per", got
     pol = scene("pol", 2) + ["Łódź."]   # Ł is cut in UTF-8 at 0x81, as in the sidecar test above
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": [(1.0 + 2 * k, 2.0 + 2 * k, t) for k, t in enumerate(old_mux(pol, "utf-8"))]})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: {"s1": [(1.0 + 2 * k, 2.0 + 2 * k, t) for k, t in enumerate(old_mux(pol, "utf-8"))]})
     g = hook.garbled_tracks("/x/Film.mkv", {"tracks": [sub("pl", codec_id="S_TEXT/UTF8")]}, [])["s1"]
     assert g["tag"] == "pol" and g["repair"], g
 
@@ -14253,7 +14260,7 @@ def test_the_reference_timing_skips_a_notes_track(env):
 def test_the_layout_check_skips_a_notes_track(env, monkeypatch):
     """A notes track is commentary, so the speech layout check never reads it."""
     j = notes_probe()
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {p: talk.show(12, n=170) for p in want})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: {p: talk.show(12, n=170) for p in want})
     monkeypatch.setattr(hook, "lid_speech", lambda path, index, j, timeout, yield_to=None: {"spans": talk.voice(REF), "cached": False, "took": 1.0})
     assert set(hook.sub_layout(env["path"], j, hook.arr_decide.decide(j, "English"), {}, {})[0]) == {"s3"}
 
@@ -14352,10 +14359,12 @@ def late_english_film(env, monkeypatch, lines=talk.RIGHT, **kw):
     env["movies"]["movie/7"]["runtime"] = round(talk.DURATION / 60)
     hearing(env, monkeypatch, {"s1": talk.cues(lines, **(kw or {"offset": 2.0}))})
     got = []
-    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None, edits=()):
         got.append((apply, fixes, list(drop)))
         if env.get("resub_fails"):
             return "subtitle_remux_failed", "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
+        if apply and edits:   # the remux carries the flag edits, see process.write()
+            env["files"][path] = hook.planned_state(j, edits)[0]
         return ("subtitles_remuxed", "subtitles remuxed", {"warnings": None, "new_size": 1000, "kept": "/kept/f.mkv"}) if apply else ("would_remux_subtitles", "would remux subtitles: track 2", {})
     monkeypatch.setattr(hook, "resub", fake_resub)
     return got
@@ -14387,13 +14396,14 @@ def test_a_subtitle_remux_keeps_the_duration_of_the_record(env, monkeypatch):
 
 
 def test_a_retime_in_a_job_process_takes_the_exclusive_lock_first(env, monkeypatch, tmp_path):
-    """A job process holds the file lock shared. A remux must not run under it, so the job plans again with the lock
-    exclusive, and the second run reads the cached words."""
-    got = late_english_film(env, monkeypatch)
-    shared = types.SimpleNamespace(exclusive=lambda st: None, reshare=lambda st: None, settle=lambda: None, turn=lambda: None)
-    with open(tmp_path / "lock", "w") as lock, pytest.raises(hook.Replan, match="a subtitle needs a remux"):
+    """A job process holds the file lock shared. A remux must not run under it, so the write stage takes the lock
+    exclusive first, and the checks run once."""
+    got, calls = late_english_film(env, monkeypatch), []
+    shared = types.SimpleNamespace(exclusive=lambda st: calls.append(("exclusive", len(got))), reshare=lambda st: None, settle=lambda: None,
+                                   turn=lambda: None)
+    with open(tmp_path / "lock", "w") as lock:
         hook.process(hook.Ctx("radarr", env["path"], "Film A (1979)", "English", 120, job={"app": "radarr"}, lock=lock, shared=shared))
-    assert got == []
+    assert calls == [("exclusive", 0)] and len(got) == 1, (calls, got)
 
 
 @pytest.mark.parametrize("kinds, settles", [({"audio", "video"}, 2), ({"audio", "video", "content"}, 1)])
@@ -14582,13 +14592,13 @@ def removal_film(env, monkeypatch, tmp_path, fails=False):
     monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, keep_days=7))
     got, env["resub_fails"] = [], fails
 
-    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None):
+    def fake_resub(path, j, st, apply, fixes, drop=(), ends=None, edits=()):
         got.append((apply, fixes, list(drop)))
         if fails:
             return "subtitle_remux_failed", "subtitle remux failed: the packet data of stream audio 1 (aac) differ", {"warnings": None}
         if not apply:
             return "would_remux_subtitles", "would remux subtitles: remove track 2", {}
-        p = env["files"][path]
+        p = env["files"][path] = hook.planned_state(j, edits)[0]   # the remux carries the flag edits, see process.write()
         p["tracks"] = [t for t in p["tracks"] if t.get("id") not in drop]
         return "subtitles_remuxed", "subtitles remuxed", {"warnings": None, "new_size": 1000, "kept": "/kept/f.mkv"}
     monkeypatch.setattr(hook, "resub", fake_resub)
@@ -16339,12 +16349,12 @@ def test_a_replan_names_its_reason_in_the_log(env, monkeypatch):
     def process(*a, **k):
         calls.append(1)
         if len(calls) == 1:
-            raise hook.Replan("a subtitle needs a remux", {"cpu": 1.0, "took": 1.0, "failed": [], "runs": 1, "cached": 0})
+            raise hook.Replan("the file needs a header repair")
         return real(*a, **k)
     monkeypatch.setattr(hook, "process", process)
     hook.run_job(enqueue(env, 0, env["path"]), [], shared=True)
     warning = [r for r in log_lines(env) if r.get("result") == "warning"][0]
-    assert warning["note"] == "re-planned with the file lock exclusive: a subtitle needs a remux", warning
+    assert warning["note"] == "re-planned with the file lock exclusive: the file needs a header repair", warning
 
 
 @pytest.mark.parametrize("report", ["sub_time_report", "sub_text"])
@@ -17383,8 +17393,8 @@ def srt_line(i, br=b"\n"):
 
 @pytest.mark.parametrize("br", [b"\n", b"\r\n"])
 def test_resub_times_a_subrip_track_whatever_its_line_breaks(hb_base, tmp_path, settings, br):
-    """A time plan of a SubRip track goes through the text round trip. mkvmerge may store each line break inside a cue
-    as LF or CRLF, so a track of either kind passes. The proof counts the packets whose line breaks changed in crlf.
+    """A time plan of a SubRip track goes through srt_track(). mkvmerge may store each line break inside a cue as LF or
+    CRLF, so a track of either kind passes. The proof counts the packets whose line breaks changed in crlf.
     Every other stream matches, and the times are the plan's."""
     path = hb_mkv(tmp_path / "srt.mkv", hb_base, [srt_line(i, br) for i in range(1, 21)], private=None, codec=b"S_TEXT/UTF8")
     settings(keep_days=0)
@@ -17400,6 +17410,58 @@ def test_resub_times_a_subrip_track_whatever_its_line_breaks(hb_base, tmp_path, 
     assert changed in (0, 20) and entry.get("crlf", 0) == changed, (changed, entry)   # 20 when this mkvmerge stores the other line break
     got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
     assert [(a, b) for a, b, _ in got] == [(pytest.approx(x[3], abs=0.0015), pytest.approx(x[4], abs=0.0015)) for x in plan], got[:6]
+
+
+LEAD_BLANK = b"\r\n\r\nLine 3\r\nnext"   # a cue whose first two lines are blank, as mkvmerge 8 stored it
+
+
+@pytest.mark.parametrize("cue, ok", [(LEAD_BLANK, True), (b"Line 3, caf\xe9", False)])
+def test_resub_times_each_subrip_packet_as_it_is(hb_base, tmp_path, settings, cue, ok):
+    """A fix with a kept run times a SubRip track whose packets go in as they are. mkvmerge 8 stored the blank lines at
+    the start of a cue as line breaks, and mkvmerge's SubRip reader drops them, so a cue that starts with one passes
+    only through srt_track(). A byte that is not UTF-8, as cp1252 writes "é", fails before the remux, because mkvmerge
+    writes U+FFFD for it and warns. The file stays as it was then."""
+    packets = [srt_line(i, b"\r\n") for i in range(1, 21)]
+    packets[2] = cue
+    path = hb_mkv(tmp_path / "srt.mkv", hb_base, packets, private=None, codec=b"S_TEXT/UTF8")
+    settings(keep_days=0)
+    j, before = REAL_MKVMERGE(path), open(path, "rb").read()
+    fix = {"rate": "1/1", "offset": -1.0}
+    plan = hook.time_plan(hook.subtitle_cues(path, j, {"s1"})["s1"], fix, hook.subsync.keep_blocks({"keep": [[34.0, None, 4]]}))
+    _, result, info = hook.resub(path, j, os.stat(path), True, {2: fix}, (), None, {2: plan})
+    if not ok:
+        assert result.startswith("subtitle remux failed: track 2: mkvmerge exited 1: ") and "invalid 8-bit characters" in result, result
+        assert open(path, "rb").read() == before
+        return
+    assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)
+    assert info["proof"][2]["timed"] == 20 and "crlf" not in info["proof"][2], info["proof"][2]
+    got = hook.subtitle_cues(path, REAL_MKVMERGE(path), {"s1"})["s1"]
+    assert got[2][2] == LEAD_BLANK.decode() and [(a, b) for a, b, _ in got] == [(x[3], x[4]) for x in plan], got[:4]
+    assert got[2][0] == 7.0 and got[-1][0] == 40.0   # moved by the fix, and kept by the run
+
+
+def test_srt_track_pairs_each_packet_or_refuses(hb_base, tmp_path):
+    """Each packet pairs with the plan by its place and must have the plan's old start within 1.5 ms. A file of another
+    TimestampScale reads in its own time base. A new start of 1.005 s stays 1005 ms, which a float cut to whole ms makes
+    1004. The file names its MuxingApp and WritingApp, as RFC 9559 asks. Another count of cues, a start 2 ms off and a
+    new start before the one before it refuse."""
+    path = hb_mkv(tmp_path / "srt.mkv", hb_base, [srt_line(i) for i in range(1, 21)], private=None, codec=b"S_TEXT/UTF8")
+    fine = str(tmp_path / "fine.mkv")   # 0.1 ms a tick
+    REAL_RUN(["mkvmerge", "-q", "--timestamp-scale", "100000", "-o", fine, path], check=True)
+    j = REAL_MKVMERGE(path)
+    plan = hook.time_plan(hook.subtitle_cues(path, j, {"s1"})["s1"], {"rate": "1/1", "offset": 0.995}, ())
+    assert plan[0][3:] == (1.005, 2.505), plan[0]
+    for src in (path, fine):
+        ok = str(tmp_path / "ok.mkv")
+        hook.srt_track(src, j, 2, plan, ok)
+        new = REAL_MKVMERGE(ok)
+        assert [(a, b) for a, b, _ in hook.subtitle_cues(ok, new, {"s1"}, full=True)["s1"]] == [(x[3], x[4]) for x in plan], src
+        assert {new["container"]["properties"][k] for k in ("muxing_application", "writing_application")} == {f"arr-media-guard {hook.config.VERSION}"}
+    for bad, why in ((plan[:19], "the track holds 20 cues, and the plan 19"),
+                     ([(2.002, *plan[0][1:])] + plan[1:], "cue 1 starts at 2.000 s, and the plan's at 2.002 s"),
+                     (plan[:1] + [(*plan[1][:3], 0.5, 1.0)] + plan[2:], "cue 2 would start at 0.500 s, before the cue before it")):
+        with pytest.raises(RuntimeError, match=f"^{re.escape(why)}$"):
+            hook.srt_track(path, j, 2, bad, str(tmp_path / "bad.mkv"))
 
 
 @pytest.mark.parametrize("old, new, why", [
@@ -17571,16 +17633,15 @@ def test_set_ends_pairs_each_cue_by_its_old_end_too():
 
 
 @pytest.mark.parametrize("case, why", [
-    ("srt", "the extracted text holds 2 cues, and the plan 3"),   # mkvextract leaves out a last SubRip cue with no duration
-    ("srt_gap", "cue 1 of the extracted text ends at 9.000 s, and the plan's at 7.000 s, so its end is not known"),
-    ("ass", "the ASS event at 2.000 s has no duration in the file, so its end is not known"),
-    ("srt_mid", "stream subtitle 2 holds 1 cue with no duration in the original, so its end is not known"),
+    ("srt", "track 2: cue 1 runs 2.000 to 2.000 s, and the plan's 2.000 to 4.000 s, so its end is not known"),
+    ("srt_gap", "track 2: cue 1 runs 2.000 to 2.000 s, and the plan's 2.000 to 7.000 s, so its end is not known"),
+    ("ass", "track 2: the ASS event at 2.000 s has no duration in the file, so its end is not known"),
+    ("srt_mid", "track 2: cue 2 runs 4.000 to 4.000 s, and the plan's 4.000 to 9.000 s, so its end is not known"),
 ])
 def test_resub_never_writes_made_up_ends_of_cues_with_no_duration(pic_mkv, tmp_path, settings, case, why):
-    """A cue whose block has no BlockDuration gets a made-up end from timed(). mkvextract writes a SubRip cue that ends
-    at the next start, and leaves out the last one. It writes an ASS event that ends at its start. set_ends() then
-    finds no pair. A cue in the middle whose made-up end is the next start pairs, and the proof refuses it. The file
-    stays as it was."""
+    """A cue whose block has no BlockDuration gets a made-up end from timed(). ffmpeg reads a SubRip packet with no
+    duration as ending at its start, so srt_track() finds no pair. mkvextract writes an ASS event that ends at its
+    start, and set_ends() finds no pair. The proof also refuses such a cue. The file stays as it was."""
     starts = (2.0, 9.0, 11.0) if case == "srt_gap" else (2.0, 4.0, 9.0)
     stamp = lambda x: f"00:00:{int(x):02d},{round(x % 1 * 1000):03d}"
     if case == "ass":
@@ -17603,18 +17664,24 @@ def test_resub_never_writes_made_up_ends_of_cues_with_no_duration(pic_mkv, tmp_p
     _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
     assert result == f"subtitle remux failed: {why}", (result, info)
     assert open(path, "rb").read() == before
+    if case == "srt_mid":   # the proof refuses it too, at the original's times
+        assert hook.prove(path, path, [], str(tmp_path), timed={0: [(s, e) for s, e, _ in cues]})[0] == \
+            (None, "stream subtitle 2 holds 1 cue with no duration in the original, so its end is not known")
 
 
-def test_ended_track_refuses_a_mkvextract_warning(pic_mkv, tmp_path, monkeypatch):
-    """mkvextract exits 1 on a warning. A fix never builds on one."""
+@pytest.mark.parametrize("place, tool, code, err", [("s1", "ffmpeg", 1, ""), ("s1", "ffmpeg", 0, "Warning: a gap"), ("s2", "mkvextract", 1, "Warning: a gap")])
+def test_ended_track_refuses_a_warning_of_its_read(pic_mkv, tmp_path, monkeypatch, place, tool, code, err):
+    """mkvextract exits 1 on a warning, and ffmpeg's read of a SubRip track fails on its exit code or an error line,
+    see proof.bad_lines(). A fix never builds on either. The reason names the track."""
     src = str(pic_mkv / "flash.mkv")
     j = REAL_MKVMERGE(src)
-    plan = hook.flash_check(src, j, [])["s1"]
+    plan = hook.flash_check(src, j, [])[place]
     real = hook.subprocess.run
-    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: types.SimpleNamespace(returncode=1, stdout="Warning: a gap", stderr="")
-                        if "mkvextract" in argv and real(argv, **k) else real(argv, **k))
-    with pytest.raises(RuntimeError, match="mkvextract exited 1: Warning: a gap"):
-        hook.ended_track(src, j, next(t["id"] for t in j["tracks"] if t["type"] == "subtitles"), plan, str(tmp_path))
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **k: types.SimpleNamespace(returncode=code, stdout="", stderr=err)
+                        if tool in argv and real(argv, **k) else real(argv, **k))
+    tid = [t["id"] for t in j["tracks"] if t["type"] == "subtitles"][int(place[1:]) - 1]
+    with pytest.raises(RuntimeError, match=f"^track {tid}: {tool} exited {code}: {err}$"):
+        hook.ended_track(src, j, tid, plan, str(tmp_path))
 
 
 def test_timed_ends_a_cue_with_no_duration_at_the_next_cue_or_after_5_s():
@@ -17861,7 +17928,7 @@ def test_sub_time_fixes_a_track_in_another_language_that_is_off_and_removes_one_
     hook.main(["--sub-time", env["path"], "--apply"])
     rec, out = decided(env), capsys.readouterr().out
     (apply, fixes, drop), = got
-    assert reads == [0, ("onsets", 0)] * 2 and apply and list(fixes) == [3] and abs(fixes[3]["offset"] - 2.0) < 0.1 and drop == [4], got   # the remux replans
+    assert reads == [0, ("onsets", 0)] and apply and list(fixes) == [3] and abs(fixes[3]["offset"] - 2.0) < 0.1 and drop == [4], got   # the remux replans
     assert rec["subremux"]["codes"] == ["subtitle_retimed", "subtitle_mismatch_removed"], rec["subremux"]
     s2, s3 = rec["subtime"]["s2"], rec["subtime"]["s3"]
     assert (s2["verdict"], s2["layout"]["verdict"], s3["verdict"], s3["layout"]["verdict"]) == ("unknown", "fit", "mismatch", "mismatch"), rec["subtime"]
@@ -18126,7 +18193,7 @@ def test_the_speech_read_of_the_deep_analysis_yields_to_an_import(env, monkeypat
     import job waits, and Yielded rises. Its job stays queued. --sub-time reads to the end."""
     j = sub_probe(("eng", False, {}), ("spa", False, {}), audio=(("eng", True),))
     seen = []
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s2": talk.show(12, n=170)})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: {"s2": talk.show(12, n=170)})
     monkeypatch.setattr(hook, "lid_speech", lambda path, index, j, timeout, yield_to=None: seen.append(yield_to) or (
         {"yielded": True, "cached": False, "took": 1.0} if yield_to else {"spans": talk.voice(REF), "cached": False, "took": 1.0}))
     run = lambda: hook.sub_layout(env["path"], j, hook.arr_decide.decide(j, "English"), {}, {}, deep=deep)
@@ -18624,8 +18691,7 @@ def test_the_reference_timing_takes_the_block_dense_hearing_found_in_the_referen
 
 
 def test_an_apply_moves_the_block_and_names_the_move_in_its_outcome(env, monkeypatch, capsys):
-    """The apply plans again under the exclusive lock and finds the words in the cache. The facts of the hearing count
-    both passes. The remux moves the lines, so the outcome and the first line of the report name it, as Loki shows
+    """The apply checks once and remuxes in its write stage. The remux moves the lines, so the outcome and the first line of the report name it, as Loki shows
     them."""
     sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF})
     got = block_stand_ins(env, monkeypatch)
@@ -18635,7 +18701,7 @@ def test_an_apply_moves_the_block_and_names_the_move_in_its_outcome(env, monkeyp
     assert (rec["outcome"], rec["result"], rec["findings"]) == ("subtitles_remuxed", "subtitles remuxed: s1 lines moved", []), rec
     assert "\nsubtitles remuxed: s1 lines moved | Film A (1979) | " in "\n" + out and f", {SHIFTED_LINES} lines moved\n" in out, out
     f = rec["whole_facts"]["0"]
-    assert (f["windows"], f["cpu"], f["runs"]) == (2 * 149, 2.0, 2), f
+    assert (f["windows"], f["cpu"], f["runs"]) == (149, 1.0, 1), f
     assert "outcome=subtitles_remuxed " in hook.render(rec, "logfmt") and hook.changed(rec, repack=False)
 
 
@@ -19246,7 +19312,7 @@ def test_the_flash_check_reads_no_track_once_stop_is_true(pic_mkv, monkeypatch):
     """An import stops at its deadline, and the deep analysis for a waiting import. Each track waits on stop()."""
     path = str(pic_mkv / "flash.mkv")
     j, reads, real = REAL_MKVMERGE(path), [], hook.subtitle_cues
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: reads.append(sorted(want)) or real(path, j, want, full))
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: reads.append(sorted(want)) or real(path, j, want, full))
     assert sorted(hook.flash_check(path, j, [], stop=lambda: len(reads) >= 1)) == ["s1"] and reads == [["s1"]]
 
 
@@ -19637,7 +19703,7 @@ def test_the_whole_file_read_runs_under_the_file_lock(env, monkeypatch, argv):
     real = hook.fcntl.flock
     monkeypatch.setattr(hook.fcntl, "flock", lambda f, op: (ops.append(op) if f.name.endswith("/lock") else None) or real(f, op))
     fake = hook.subtitle_cues
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: reads.append((full, bool(ops) and not ops[-1] & hook.fcntl.LOCK_UN))
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: reads.append((full, bool(ops) and not ops[-1] & hook.fcntl.LOCK_UN))
                         or fake(path, j, want, full))
     hook.main([x or env["path"] for x in argv])
     assert len(reads) >= 2 and all(full and held for full, held in reads), reads
@@ -19872,16 +19938,16 @@ def test_a_deep_analysis_leaves_the_header_check_to_its_import(env, monkeypatch,
 
 
 def test_a_deep_analysis_yields_before_its_remux_when_an_import_waits(env, monkeypatch, settings):
-    """The French track needs a fix of 2 s. The check runs again under the exclusive lock before a remux, and an import
-    arrives during its fit, so the remux waits for the next run."""
+    """The French track needs a fix of 2 s. An import arrives during its fit, so the remux of the write stage waits for
+    the next run."""
     settings(subtitles="deep")
     got = sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {})], {"s1": REF, "s2": talk.moved_to(REF, offset=2.0)})
     real, fits = hook.arr_subsync.reference, []
-    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: (fits.append(1) or len(fits) < 2 or enqueue(env, 1, env["path"])) and real(*a, **k))
+    monkeypatch.setattr(hook.arr_subsync, "reference", lambda *a, **k: (fits.append(1) or enqueue(env, 1, env["path"])) and real(*a, **k))
     name = queue_analysis(env, env["path"])
     hook.deep_analysis(name, [])
     yielded = [r for r in log_lines(env) if r.get("result") == "yielded"]
-    assert len(fits) == 2 and got == [] and len(yielded) == 1 and hook.deep_analysis_queued() == [name], (fits, got, yielded)
+    assert len(fits) == 1 and got == [] and len(yielded) == 1 and hook.deep_analysis_queued() == [name], (fits, got, yielded)
 
 
 def test_a_deep_analysis_that_converted_its_file_yields_before_its_remux(env, monkeypatch, settings):
@@ -20544,14 +20610,6 @@ def test_the_report_after_a_removal_names_each_track_as_the_check_saw_it():
     sync = rec["subcheck"]
     assert [x["by"] for x in hook.sub_findings(rec, sync, set())[0]["lines"]] == ["run"]
     assert [x["by"] for x in hook.sub_findings(dict(rec, source="hook"), sync, set())[0]["lines"]] == ["hook"]
-
-
-def test_swept_before_counts_the_hearing_of_the_pass_that_raised_replan():
-    rec = {"whole_facts": {0: {"windows": 0, "cpu": 0.0, "took": 0.2, "failed": [], "runs": 0, "cached": 0, "kept": 149}}}
-    first = {0: {"windows": 149, "cpu": 170.5, "took": 172.0, "failed": ["audio 0: no words"], "runs": 75, "cached": 0, "kept": 0}}
-    got = hook.swept_before(rec, hook.Replan("a subtitle needs a remux", first))["whole_facts"]
-    assert got == {0: {"windows": 149, "cpu": 170.5, "took": 172.2, "failed": ["audio 0: no words"], "runs": 75, "cached": 0, "kept": 149}}, got
-    assert hook.swept_before({"whole_facts": dict(rec["whole_facts"])}, hook.Replan("the file changed"))["whole_facts"] == rec["whole_facts"]
 
 
 @pytest.mark.parametrize("windows, cost", [(0, "words from the cache"), (12, "12 new windows, 30.5 CPU s, 31.0 s")])
@@ -21789,7 +21847,9 @@ def test_block_timing_5_rechecks_every_result_of_sub_time_and_the_deep_analysis_
 def test_garbled_repair_2_rechecks_every_result_that_made_the_check_once():
     """Version 2 checks .srt sidecars and ASS, SSA and WebVTT tracks, and takes out what version 1 read back from a
     one-byte codepage. A result names no codec, so each result of version 1 of a run that makes the check is stale,
-    with or without a finding. An import makes no garbled check, so its result stays, and so does one of version 2."""
+    with or without a finding. An import makes no garbled check, so its result stays, and so does one of version 2.
+    Version 3 takes out a SubRip track with bytes that are not UTF-8, and it rechecks no result."""
+    assert hook.SUB_CHECKS["garbled_repair"] == {"version": 3, "fixes": {2: None}}
     for mode in ("sub_check", "sub_time", "deep"):
         old = saved(mode)
         old["checks"]["garbled_repair"]["version"] = 1
@@ -22314,6 +22374,72 @@ def garbled_mkv(tmp_path_factory):
     return d
 
 
+def not_utf8_film(env, tmp_path):
+    """env["path"]: a real film of talk.DURATION with REF in English, the same lines 2 s late in French and Spanish, and
+    the late lines in Dutch with one cue that holds "café" in cp1252, a byte that is not UTF-8. ffmpeg copies the
+    Dutch track, written by hand, beside the others, so its packets keep that byte. Returns the Dutch cues."""
+    late = talk.moved_to(REF, offset=2.0)
+    dut = [(a, b, t + (" caf\xe9" if k == 5 else "")) for k, (a, b, t) in enumerate(late)]
+    av = tmp_path / "av.mp4"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=size=64x36:rate=1:duration={talk.DURATION}", "-f", "lavfi", "-i",
+                f"sine=sample_rate=8000:duration={talk.DURATION}", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(av)],
+               check=True)
+    argv = ["mkvmerge", "-q", "-o", str(tmp_path / "three.mkv"), "--language", "1:eng", str(av)]
+    for lang, cs in (("eng", REF), ("fre", late), ("spa", late)):
+        (tmp_path / f"{lang}.srt").write_text(srt_text(cs))
+        argv += ["--language", f"0:{lang}", "--default-track-flag", "0:0", str(tmp_path / f"{lang}.srt")]
+    REAL_RUN(argv, check=True)
+    u = lambda i, v, n=8: el(i, v.to_bytes(n, "big"))
+    head = el(0x1A45DFA3, u(0x4286, 1, 1) + u(0x42F7, 1, 1) + u(0x42F2, 4, 1) + u(0x42F3, 8, 1) + el(0x4282, b"matroska") + u(0x4287, 4, 1) + u(0x4285, 2, 1))
+    track = el(0xAE, u(0xD7, 1, 1) + u(0x73C5, 1) + u(0x83, 0x11, 1) + el(0x86, b"S_TEXT/UTF8") + el(0x22B59C, b"dut"))
+    ms = lambda t: round(t * 1000)
+    clusters = b"".join(el(0x1F43B675, u(0xE7, ms(a)) + el(0xA0, el(0xA1, b"\x81\x00\x00\x00" + t.encode("latin-1")) + u(0x9B, ms(b) - ms(a))))
+                        for a, b, t in dut)
+    (tmp_path / "dut.mkv").write_bytes(head + el(0x18538067, el(0x1549A966, u(0x2AD7B1, 1000000)) + el(0x1654AE6B, track) + clusters))
+    REAL_RUN(["ffmpeg", "-v", "error", "-y", "-i", str(tmp_path / "three.mkv"), "-i", str(tmp_path / "dut.mkv"), "-map", "0", "-map", "1", "-c", "copy",
+              env["path"]], check=True)
+    return dut
+
+
+def test_sub_time_takes_out_a_subrip_track_with_bytes_that_are_not_utf8(env, monkeypatch, settings, tmp_path, capsys):
+    """Three tracks run 2 s late against the English one, and the Dutch one also holds a byte that is not UTF-8. Every
+    remux writes U+FFFD for such a byte, so --sub-time --apply gives the Dutch track the garbled verdict with encoding
+    and no repair. The same proven remux retimes the French and the Spanish track and takes the Dutch one out. Its
+    packets go beside the video byte for byte, and the notice names that file. A dry run says what --apply would do."""
+    real_resub = hook.resub
+    dut = not_utf8_film(env, tmp_path)
+    late = talk.moved_to(REF, offset=2.0)
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {}), ("spa", False, {}), ("dut", False, {})], {"s1": REF, "s2": late, "s3": late, "s4": dut})
+    for name, real in (("resub", real_resub), ("subtitle_cues", REAL_SUBTITLE_CUES), ("mkvmerge", REAL_MKVMERGE), ("prove", REAL_PROVE), ("FULL", {})):
+        monkeypatch.setattr(hook, name, real)
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: None if argv[:2] == ["ionice", "-c3"] and "-p" in argv else REAL_RUN(argv, **kw))
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    side = env["path"][:-4] + ".dut.broken-encoding.srt.txt"
+    raw = REAL_RUN(["ffmpeg", "-v", "error", "-i", env["path"], "-map", "0:s:3", "-c", "copy", "-f", "srt", "-"], capture_output=True).stdout
+    assert b"caf\xe9" in raw   # the packet holds the byte
+    hook.main(["--sub-time", env["path"]])
+    rec, out = last_decided(env), capsys.readouterr().out
+    g = rec["garbled"]["s4"]
+    assert set(rec["garbled"]) == {"s4"} and (g["repair"], g["encoding"], g["cues"]) == (False, True, len(dut)), rec["garbled"]
+    assert g["why"] == f"1 of {len(dut)} cues hold bytes that are not UTF-8, which every remux writes as U+FFFD", g
+    assert "show broken characters, because some of their bytes aren't valid text. --apply would take them out of the file and keep their " \
+        f"text beside the video as {os.path.basename(side)}." in out, out
+    assert not os.path.exists(side)
+    assert rec["subremux"]["fixed"] == ["s2", "s3"] and near_fix(rec["subtime"]["s4"]["timing"]["fix"], 2.0), rec["subremux"]   # its own fix goes with it
+    hook.main(["--sub-time", env["path"], "--apply"])
+    rec, out = last_decided(env), capsys.readouterr().out
+    rm = rec["subremux"]
+    assert (rm["fixed"], rm["stripped"], rm["codes"]) == (["s2", "s3"], {"s4": os.path.basename(side)}, ["subtitle_retimed", "subtitle_garbled_removed"]), rm
+    assert all(e["match"] for e in rm["proof"]), rm["proof"]
+    assert open(side, "rb").read() == raw
+    new = REAL_MKVMERGE(env["path"])
+    assert [t["properties"]["language"] for t in new["tracks"] if t["type"] == "subtitles"] == ["eng", "fre", "spa"], new["tracks"]
+    got = REAL_SUBTITLE_CUES(env["path"], new, {"s2", "s3"})
+    assert all(abs(c[0][0] - REF[0][0]) < 0.02 for c in got.values()), {p: c[0] for p, c in got.items()}
+    assert f"can't be read as text, so they were removed and saved beside the file as {os.path.basename(side)}." in out, out
+
+
 def test_a_cut_read_gets_no_repair_and_no_flash_ends(garbled_mkv, pic_mkv, monkeypatch):
     """A remux rewrites every cue, and a read that stopped at CUE_MAX checked only the cues before it, see
     subtitles.Cut. So a garbled track read that way gets no repair, and a flash track no new ends."""
@@ -22417,7 +22543,7 @@ def test_a_sidecar_that_fills_a_cut_cue_may_sit_exactly_2_ms_off(monkeypatch, tm
     pol = scene("pol", 2) + ["Łódź."]   # Ł is cut in UTF-8 at 0x81
     bad = old_mux(pol, "utf-8")
     j = {"tracks": [{"type": "subtitles", "id": 2, "properties": {"language": "pol", "codec_id": "S_TEXT/UTF8"}}]}
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": [(1.980 + 2 * k, 2.980 + 2 * k, t) for k, t in enumerate(bad)]})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, *a: {"s1": [(1.980 + 2 * k, 2.980 + 2 * k, t) for k, t in enumerate(bad)]})
     stamp = lambda ms: f"00:{ms // 60000:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
     for off, fills in ((2, True), (3, False)):
         srt = tmp_path / f"Film.{off}.pol.srt"
@@ -22434,7 +22560,7 @@ def test_a_cut_read_is_never_repaired_and_the_remux_refuses_what_the_check_never
     pol = [t for t in scene("pol", 2) if "Ł" not in t]   # Ł is cut in UTF-8 at 0x81
     bad = old_mux(pol, "utf-8")
     j = {"tracks": [{"type": "subtitles", "id": 2, "properties": {"language": "pol", "codec_id": "S_TEXT/UTF8"}}]}
-    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": hook.Cut((1 + k, 2 + k, t) for k, t in enumerate(bad))})
+    monkeypatch.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, *a: {"s1": hook.Cut((1 + k, 2 + k, t) for k, t in enumerate(bad))})
     g = hook.garbled_tracks("/x/Film.mkv", j, [])["s1"]
     assert (g["repair"], g["capped"]) == (False, True) and g["why"].endswith(f"but only its first {len(bad)} cues were read"), g
     fix = hook.repair_text({"codepage": "utf-8", "lang": "pol"})[1]
@@ -22444,6 +22570,39 @@ def test_a_cut_read_is_never_repaired_and_the_remux_refuses_what_the_check_never
         fix(blocks(bad + ["Ã\x28 nie"]))
     with pytest.raises(RuntimeError, match=rf"^10 of {len(bad) + 10} cues were cut short$"):
         fix(blocks(bad + old_mux(["Łódź."] * 10, "utf-8")))
+
+
+@pytest.mark.parametrize("cues", [True, False])
+def test_a_subrip_track_with_bytes_that_are_not_utf8_is_never_repaired(hb_base, tmp_path, monkeypatch, cues):
+    """A SubRip track with a byte that is not UTF-8 gets the verdict with encoding and no repair, read through the Cues
+    or from the whole file. Right text gets a verdict of its own. Text that a UTF-8 read-back would repair keeps its
+    reading and loses the repair. The same track with no such byte keeps it. An ASS track gets no such verdict. A
+    clean track that mkvmerge stores with zlib gets none either, because the check reads each frame unpacked. Each
+    track is tagged Polish."""
+    monkeypatch.setattr(hook, "FULL", {})
+    right = [b"Line %d, a right line" % i for i in range(1, 21)]
+    pol = [t.encode() for t in old_mux([t for t in scene("pol", 2) if "\u0141" not in t], "utf-8")[:20]]   # Ł is cut in UTF-8 at 0x81
+    why = "1 of 20 cues hold bytes that are not UTF-8, which every remux writes as U+FFFD"
+    got = {}
+    for name, packets, codec in (("right", right, b"S_TEXT/UTF8"), ("pol", pol, b"S_TEXT/UTF8"), ("ass", hb_events(), b"S_TEXT/ASS")):
+        for broken in (False, True):
+            bad = [p + (b" caf\xe9" if broken and k == 3 else b"") for k, p in enumerate(packets)]
+            path = hb_mkv(tmp_path / f"{name}{broken}.mkv", hb_base, bad, private=HB_HEAD if codec == b"S_TEXT/ASS" else None, codec=codec, cues=cues)
+            REAL_RUN(["mkvpropedit", "-q", path, "--edit", "track:s1", "--set", "language=pol"], check=True)
+            j = REAL_MKVMERGE(path)
+            assert hook.cue_less(path, j) == (set() if cues else {"s1"}), name
+            got[name, broken] = hook.garbled_tracks(path, j, [], True).get("s1")
+            if name == "right" and not broken:   # its zlib copy, whose packed frames are not UTF-8
+                z = str(tmp_path / "zlib.mkv")
+                REAL_RUN(["mkvmerge", "-q", "-o", z, "--compression", "2:zlib", *([] if cues else ["--cues", "2:none"]), path], check=True)
+                jz = REAL_MKVMERGE(z)
+                assert (jz["tracks"][2]["properties"].get("content_encoding_algorithms"), hook.cue_less(z, jz)) == ("0", set() if cues else {"s1"}), jz
+                got["zlib", False] = hook.garbled_tracks(z, jz, [], True).get("s1")
+    assert got["right", False] is None and got["right", True] == {"repair": False, "codepage": None, "lang": None, "read": None, "cut": 0,
+                                                                   "cues": 20, "encoding": True, "why": why, "tag": "pol"}, got["right", True]
+    assert got["pol", False]["repair"] and "encoding" not in got["pol", False], got["pol", False]["why"]
+    assert got["pol", True] == dict(got["pol", False], repair=False, encoding=True, why=f'{got["pol", False]["why"]}, but {why}'), got["pol", True]
+    assert got["ass", False] is got["ass", True] is got["zlib", False] is None
 
 
 def test_the_bytes_of_a_garbled_track_must_match_its_packets(tmp_path):
@@ -23340,12 +23499,12 @@ def test_tags_and_drawings_never_make_right_text_garbled(codec, tag, texts):
     cues = [(1 + k, 2 + k, t) for k, t in enumerate(texts * 60)]
     j = {"tracks": [{"type": "subtitles", "id": 2, "properties": {"language": tag, "codec_id": codec}}]}
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": cues})
+        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: {"s1": cues})
         assert hook.garbled_tracks("/x/Film.mkv", j, [], True) == {}
     assert hook.dialogue(texts[0], codec) != texts[0] and hook.dialogue("<i>Hi</i>", "S_TEXT/UTF8") == "<i>Hi</i>"
     garbled = [(a, b, old_mux([t], "utf-8")[0]) for a, b, t in cues]
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False: {"s1": garbled})
+        mp.setattr(hook, "subtitle_cues", lambda path, j, want, full=False, bad=None: {"s1": garbled})
         got = hook.garbled_tracks("/x/Film.mkv", j, [], True)
     if any(c.isalpha() for c in hook.dialogue(texts[0], codec)):
         assert (got["s1"]["codepage"], got["s1"]["lang"], got["s1"]["repair"]) == ("utf-8", tag, False), got

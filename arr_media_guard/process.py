@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
-"""The checks and the flag edit of one file, process(), with the metadata checks it runs."""
+"""The checks and the one write of one file, process(), with the metadata checks it runs."""
 import contextlib, dataclasses, fcntl, os, sqlite3, statistics, subprocess, time, uuid
 
-from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, subsync, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, store, subsync, subtitles, vault
 
 
 def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=None, nfo=None):
@@ -164,14 +164,15 @@ class Ctx:
     says it would. A file that is not .mkv converts in an import at CONVERT and in a convert run. A .mkv file that holds
     another container converts in every run.
 
-    lock is the held file lock. It is released after the edit, because the metadata checks only read, and taken again
+    lock is the held file lock. It is released after the write, because the metadata checks only read, and taken again
     before a wrong-content re-grab deletes anything. shared means lock is held shared, in a job process of coordinate()
     or a backfill worker, and the checks run under it. shared.exclusive(st) then takes the lock exclusive before a
-    re-grab or an edit, and raises Replan when the file or its download changed meanwhile, see exclusive().
+    re-grab or the write, see write(), and raises Replan when the file or its download changed meanwhile, see
+    exclusive().
     shared.settle() tells younger jobs of the download that this one re-grabs nothing more. A conversion of an import
     builds the new file under the shared lock and takes the lock exclusive for its swap, see convert(). Everything after
-    it runs under the exclusive lock. Any other repack raises Replan at once, so it and everything after it run under
-    the exclusive lock. The language hearing runs without the lock, and shared.reshare(st) takes it shared again after
+    it runs under the exclusive lock. A header repair that the checks need first raises Replan at once, so it and
+    everything after it run under the exclusive lock, see header(). The language hearing runs without the lock, and shared.reshare(st) takes it shared again after
     it, see reshared().
 
     The steps set the state they hand on, such as rec, the decision log record, and the probe j, st and size, see
@@ -219,8 +220,8 @@ class Ctx:
 
 def process(ctx):
     """Probe one file and decide its flags, see Ctx. Hear the audio language when the decision needs it, check the
-    subtitles, check the audio and the video (import only), edit the flags when the rules say so, and verify. Then run
-    the metadata checks and alert. A step that ends the run returns True. Returns the decision log record, which the
+    subtitles, check the audio and the video (import only), then write the file once with the flag edits and any remux
+    the checks planned, see write(), and verify. Then run the metadata checks and alert. A step that ends the run returns True. Returns the decision log record, which the
     caller writes with decision()."""
     for step in STEPS:
         if step(ctx):
@@ -271,6 +272,7 @@ def start(ctx):
         remux.sweep_repack_tmp(os.path.dirname(ctx.path), ctx.source)
     refresh(ctx)
     ctx.muted = runner.muted(ctx.path, ctx.st)   # a burn-in job turned off the English subtitles, see decision_fields()
+    ctx.extra = []   # the reason codes faults() adds to the decision's, which decision_fields() keeps
 
 
 def conversion(ctx):
@@ -375,13 +377,17 @@ def conversion(ctx):
 
 
 def header(ctx):
-    """The header check of a Matroska file, and its repair, see header_of() and repack()."""
+    """The header check of a Matroska file, see header_of(). An issue the checks cannot read through is repaired here,
+    before them, see repack(): no usable Cues, a header duration far from the streams, or a subtitle event far past
+    them (hp["first"]). Any other issue waits for the one write of the run, see write(). ctx.head is then the header
+    stage of check_video() that write() repairs. ctx.stage is the header stage of the file as it is now, for edit()."""
     rec, j, path = ctx.rec, ctx.j, ctx.path
     ctx.asked = checks.tmdb_ask(ctx.app, ctx.item)   # the forced-flag clear of an English original needs TMDB's spoken languages. metadata() reuses it.
-    ctx.hp = ctx.vpre = None   # header_probe(), and the video check of a file with a header issue, which looks for real damage first
+    ctx.hp = ctx.vpre = ctx.head = None   # header_probe(), and the video check of a file with a header issue, which looks for real damage first
+    ctx.ended = False   # a subtitle remux ended a header issue that stayed, see write()
     if ctx.mkv and config.CFG.header_repair and ctx.video and not ctx.background:
         ctx.hp = checks.header_of(path, j)
-    hp = ctx.hp
+    hp = ctx.stage = ctx.hp
     if not (hp and hp["issue"]):
         return
     cut = None
@@ -389,12 +395,16 @@ def header(ctx):
         listed = ctx.runtime or (ctx.app in apps.ARR and apps.ARR[ctx.app].film and (ctx.asked[0] or {}).get("runtime")) or 0   # minutes, the app's else TMDB's
         trim, remove, cut = decide.subtitle_plan(hp["trim"], hp["remove"], hp["subtitles"], hp["streams"], listed)
         hp = ctx.hp = dict(hp, trim=trim, remove=remove, listed=listed)
-    if ctx.shared and ctx.apply and not hp["blocked"] and not cut and not remux.repack_skip(path, ctx.st):
+    if hp["first"] and ctx.shared and ctx.apply and not hp["blocked"] and not cut and not remux.repack_skip(path, ctx.st):
         raise runner.Replan("the file needs a header repair")
     ctx.vpre = checks.video_check(path, j=j, hp=hp)
     h = ctx.vpre[2].get("header") or {}
+    ctx.stage = h or dict(hp, repairable=False)
     if cut and h.get("repairable"):   # the subtitles of a cut file run to the full length and are good: keep the file
         code, result, info = "subtitle_file_may_be_cut", f"not repaired, the file may be cut: {cut}", {"listed": hp["listed"], "streams": h["streams"]}
+    elif h.get("repairable") and not hp["first"]:   # the one write of the run repairs it, with the flag edits
+        ctx.head = h
+        return
     elif h.get("repairable"):
         if ctx.waits:   # as before a subtitle remux
             runner.deep_waits()
@@ -410,6 +420,9 @@ def header(ctx):
     if code in config.REPAIRED:
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
         refresh(ctx)
+        ctx.stage = None   # the stage was of the original
+    elif code == "header_repair_failed":   # edit() tries no second remux of the file in this run
+        ctx.stage = dict(h, tried=result)
 
 
 def languages(ctx):
@@ -465,11 +478,12 @@ def languages(ctx):
 
 
 def subtitle_checks(ctx):
-    """The subtitle match check, the reference timing and the flash check, and the one remux they ask for, see
-    resub(). A track that does not match leaves the file, and a track whose times need a fix gets them. --sub-time and
-    the deep analysis hear the whole file and time every line of each track that matched, see subtitles.sub_whole().
-    When the remux fails, a track that does not match loses its flags instead. Sidecars beside the file are checked
-    too, see sidecar_fix(). The decision then counts each track that does not match."""
+    """The subtitle match check, the reference timing and the flash check, and the plan of the one remux they ask for,
+    see resub(). write() runs it. A track that does not match leaves the file, and a track whose times need a fix gets
+    them. --sub-time and the deep analysis hear the whole file and time every line of each track that matched, see
+    subtitles.sub_whole(). When the remux fails, a track that does not match loses its flags instead. Sidecars beside
+    the file are checked too, see sidecar_fix(). The decision counts each track that does not match, and each garbled
+    track the remux takes out."""
     rec, j, d, path, mkv, subs_on = ctx.rec, ctx.j, ctx.d, ctx.path, ctx.mkv, ctx.subs_on
     timing = ctx.depth in ("sub_time", "deep")   # the reference timing and the whole-file timing
     sync, unmatched, fixes, sides = {}, set(), {}, {}   # the subtitle match check, docs/design.md, "Subtitle match"
@@ -612,55 +626,26 @@ def subtitle_checks(ctx):
         rec["covers"] = {e["place"]: {k: e[k] for k in ("codec", "frames", "name", "copy", "there", "why") if e.get(k) is not None}
                          for e in covers.values()}
     covers = {i: e for i, e in covers.items() if not e.get("why")}
-    if fixes or remove or ends or moves or recode or strip or covers:
-        if ctx.waits:   # a remux of a film takes minutes, so an import that waits goes first
-            runner.deep_waits()
-        if ctx.shared and ctx.apply:
-            raise runner.Replan("a subtitle needs a remux", rec.get("whole_facts"))   # the facts of the hearing this pass made
-        ids_of = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
-        by_id = lambda ps: [ids_of[int(p[1:]) - 1] for p in ps]
-        code, result, info = remux.resub(path, j, st, ctx.apply, dict(zip(by_id(fixes), fixes.values())), by_id(remove), dict(zip(by_id(ends), ends.values())),
-                                         **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}),
-                                         **({"recode": dict(zip(by_id(recode), recode.values()))} if recode else {}),
-                                         **({"strip": dict(zip(by_id(strip), strip.values()))} if strip else {}),
-                                         **({"covers": covers} if covers else {}))
-        if "warnings" in info:
-            ctx.rearm()   # resub() ran its remux with the time limit off, whatever came of it
-        done = code == "subtitles_remuxed"
-        rec["subremux"] = dict(info, result=result, done=done, fixed=sorted(fixes), ended=sorted(ends), remove=remove, removed=remove if done else [],
-                               codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_blocks_retimed", set(moves) - set(kept)), ("subtitle_ends_lengthened", ends),
-                                                     ("subtitle_mismatch_removed", remove), ("subtitle_repaired", recode), ("subtitle_garbled_removed", strip),
-                                                     ("cover_attached", covers))
-                                                    if x] if done else [code],
-                               **({"covers": sorted(e["place"] for e in covers.values())} if covers else {}),
-                               **({"copies": c} if (c := sorted(e["place"] for e in covers.values() if e.get("copy"))) else {}),
-                               **({"timed": sorted(set(moves) - set(kept))} if set(moves) - set(kept) else {}), **({"recoded": sorted(recode)} if recode else {}),
-                               **({"stripped": {p: info["garbled_text"][str(i)] for p, i in zip(strip, by_id(strip))}} if strip else {}))
-        if done:
-            rec["subremux"]["tracks_before"] = logs.track_log(d["tracks"])   # the places the check named, before a removal moves the tracks up
-            logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
-            checks.lid_carry(path, st)   # the proof shows the same audio
-            refresh(ctx, duration=False)
-            if ctx.hp and ctx.hp["issue"]:   # ffmpeg wrote a new header, and a retime can end a subtitle overrun, see faults()
-                ctx.hp = checks.header_of(path, ctx.j) or ctx.hp
-            gone = set(remove) | set(strip)   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
-            ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
-            ctx.checked = subtitles.renumber(ctx.checked, gone)
-            unmatched = set(subtitles.renumber(dict.fromkeys(unmatched), gone))
-            ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)
-    stay = sorted({p for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others and r["verdict"] == "mismatch"}
-                  - set((rec.get("subremux") or {}).get("removed") or []))
-    if stay and not subtitles.sub_fixes(ctx.source):   # the tracks that stay, by their place before any remux, see report.KEPT_BACK
+    ctx.subplan, ctx.sub_ids = None, [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
+    if fixes or remove or ends or moves or recode or strip or covers:   # the one remux that write() runs, see resub()
+        by_id = lambda ps: [ctx.sub_ids[int(p[1:]) - 1] for p in ps]
+        ctx.subplan = dict(fixes=dict(zip(by_id(fixes), fixes.values())), drop=by_id(remove), ends=dict(zip(by_id(ends), ends.values())),
+                           **({"timed": dict(zip(by_id(moves), moves.values()))} if moves else {}),
+                           **({"recode": dict(zip(by_id(recode), recode.values()))} if recode else {}),
+                           **({"strip": dict(zip(by_id(strip), strip.values()))} if strip else {}), **({"covers": covers} if covers else {}))
+    # The tracks that stay, by their place before any remux, see report.KEPT_BACK. write() takes out the ones it removed.
+    stay = sorted({p for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others and r["verdict"] == "mismatch"})
+    if stay and not subtitles.sub_fixes(ctx.source):
         rec.setdefault("subremux", {}).update(kept_back="check")
     elif stay and not config.CFG.keep_days:
         rec.setdefault("subremux", {}).update(kept_back="keep_days")
-    if unmatched or (rec.get("subremux") or {}).get("done"):
-        d = decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, unmatched)
+    if unmatched or strip:   # the remux takes out the tracks in strip too, so the decision gives them no flag either
+        d = decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, unmatched | set(strip))
         if ctx.tags:
             d = decide.with_tags(d, ctx.tags)
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
     ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves, ctx.recode = fixes, remove, ends, flashy, moves, side_moves, recode
-    ctx.strip, ctx.later, ctx.bad_sides = strip, later | side_later, bad_sides
+    ctx.strip, ctx.later, ctx.bad_sides, ctx.covers, ctx.kept = strip, later | side_later, bad_sides, covers, kept
     ctx.starts = {k: sorted(c[0] for c in x[2]) for k, x in items.items()}   # the cue starts the timing judge counts, see judge.outcomes()
 
 
@@ -689,7 +674,8 @@ def flag_hearing(ctx):
     if proven or heard:
         ctx.checked = {**ctx.checked, **proven, **heard}
         ctx.tags = decide.retag(ctx.j, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)
-        ctx.d = decide.with_tags(decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched), ctx.tags)
+        ctx.d = decide.with_tags(decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong,
+                                               ctx.unmatched | set(ctx.strip)), ctx.tags)   # as subtitle_checks() decides
 
 
 def deep_drop(ctx):
@@ -703,7 +689,8 @@ def deep_drop(ctx):
 
 
 def decision_fields(ctx):
-    """The decision in the record, and the plan of a dry run, see plan_record()."""
+    """The decision in the record, and the plan of a dry run, see plan_record(). write() runs it again after its
+    write, so the record holds the decision of the file the run leaves and the reason codes of the write."""
     rec, d = ctx.rec, ctx.d
     if ctx.muted and (kept := muted_plan(d))["edits"] != d["edits"]:   # a run that keeps the flags plans none of these
         d = ctx.d = kept
@@ -718,6 +705,7 @@ def decision_fields(ctx):
         rec["reasons"] = [rec["header_repair"]["code"]] + rec["reasons"]
     if (rec.get("subremux") or {}).get("codes"):
         rec["reasons"] = rec["subremux"]["codes"] + rec["reasons"]
+    rec["reasons"] += ctx.extra
     rec["class"] = decide.plan_class(d)
     if ctx.keep_plan:
         rec["plan"] = cli.plan_record(ctx.app, ctx.label, ctx.path, d)
@@ -739,16 +727,7 @@ def faults(ctx):
         rest.append(ctx.unconverted[1])
     if ctx.unreadable:
         rest.append(ctx.unreadable)
-    if ctx.tags and ctx.tags["mismatch"]:
-        rest.append({"kind": "sublang", "mismatch": ctx.tags["mismatch"], "muted": [n for n in d["notes"] if " loses its default and forced flags, " in n]})
-    code = rec.get("header_repair", {}).get("code") if hp and hp["issue"] else None   # a subtitle remux can end the issue
-    if code in ("header_repair_failed", "subtitle_file_may_be_cut"):
-        why = rec["header_repair"]["result"].partition(": ")[2]
-        rest.append({"kind": "header", "why": why[:200]} if code == "header_repair_failed" else {"kind": "cut", "why": why})
-    if code == "subtitle_overrun_unfixable" and hp.get("unfixable"):   # the alerts name the places before a removal, see report.track_langs()
-        rm = rec.get("subremux") or {}
-        gone = [*(rm.get("removed") or []), *(rm.get("stripped") or {} if rm.get("done") else [])]   # the remux took both out
-        rest.append({"kind": "subtitle", "issue": hp["issue"], "tracks": [dict(x, track=place_before(x["track"], gone)) for x in hp["unfixable"]]})
+    ctx.at = len(rest)   # the place of the findings that write_findings() adds after the write
     if ctx.mode == "import" and ctx.audio:
         ctx.certain, doubts, samples = checks.check_audio(ctx.path, ctx.j, d["edits"], ctx.runtime)
         rec["audio"] = logs.audio_summary(ctx.certain, doubts, samples)
@@ -758,9 +737,27 @@ def faults(ctx):
         ctx.vcertain, doubts, ctx.vfields = ctx.vpre or checks.video_check(ctx.path, j=ctx.j, hp=hp)
         rec["video"] = checks.video_summary(ctx.vcertain, doubts, ctx.vfields)
         if "code" in ctx.vfields:
+            ctx.extra.append(ctx.vfields["code"])
             rec["reasons"] = rec["reasons"] + [ctx.vfields["code"]]
         if doubts:
             rest.append({"kind": "video", "doubts": doubts})
+
+
+def write_findings(ctx):
+    """The findings that the write can change, in their place in ctx.rest, see faults(): a subtitle whose text
+    contradicts its tag, by its place in the file the run leaves, and a header issue that stays."""
+    rec, hp, hr, found = ctx.rec, ctx.hp, ctx.rec.get("header_repair") or {}, []
+    if ctx.tags and ctx.tags["mismatch"]:
+        found.append({"kind": "sublang", "mismatch": ctx.tags["mismatch"], "muted": [n for n in ctx.d["notes"] if " loses its default and forced flags, " in n]})
+    code = None if ctx.ended or hr.get("edit") or hr.get("remux") else hr.get("code")   # the edit or subtitle finding names the failure
+    if code in ("header_repair_failed", "subtitle_file_may_be_cut"):
+        why = hr["result"].partition(": ")[2]
+        found.append({"kind": "header", "why": why[:200]} if code == "header_repair_failed" else {"kind": "cut", "why": why})
+    if code == "subtitle_overrun_unfixable" and hp.get("unfixable"):   # the alerts name the places before a removal, see report.track_langs()
+        rm = rec.get("subremux") or {}
+        gone = [*(rm.get("removed") or []), *(rm.get("stripped") or {} if rm.get("done") else [])]   # the remux took both out
+        found.append({"kind": "subtitle", "issue": hp["issue"], "tracks": [dict(x, track=place_before(x["track"], gone)) for x in hp["unfixable"]]})
+    ctx.rest[ctx.at:ctx.at] = found
 
 
 def place_before(p, gone):
@@ -774,7 +771,7 @@ def place_before(p, gone):
 
 
 def act(ctx):
-    """The exclusive lock, then the re-grab of a certain fault, or the flag edit, see regrab() and edit()."""
+    """The exclusive lock, then the re-grab of a certain fault, or the one write of the run, see regrab() and write()."""
     rec, d, certain, vcertain, job = ctx.rec, ctx.d, ctx.certain, ctx.vcertain, ctx.job
     if ctx.shared and not (certain or vcertain or "content" in config.CFG.regrab):   # the checks found nothing to re-grab
         ctx.shared.settle()
@@ -784,7 +781,7 @@ def act(ctx):
     ctx.sides, ctx.side_ends = sides, {n: v for n, v in ctx.flashy.items() if n in sides}   # at SUBTITLES check, sidecar_fix() only reports
     ctx.acts = [n for n in sides if (ctx.sync_all.get(n) or {}).get("verdict") == "mismatch" or ((ctx.sync_all.get(n) or {}).get("timing") or {}).get("fix")
                 or n in ctx.side_ends or n in ctx.side_moves or n in ctx.bad_sides]
-    if ctx.shared and ctx.apply and (certain or vcertain or (ctx.mkv and (d["edits"] or ctx.acts))):
+    if ctx.shared and ctx.apply and (certain or vcertain or (ctx.mkv and (d["edits"] or ctx.acts or ctx.subplan or ctx.head))):
         ctx.shared.exclusive(ctx.st)
     if certain:
         rec.update(outcome="broken_audio", result=f"broken audio: {certain}")
@@ -798,23 +795,166 @@ def act(ctx):
         if not ctx.unconverted:
             rec.update(outcome="not_mkv", result="skipped, not mkv")
     else:
-        # The deep analysis and a recheck keep the flags an earlier run set, and --sub-time keeps them on a file no app
-        # lists, as no item says the original language. Only a subtitle verdict changes a flag then: an unmatched track
-        # loses its default and forced flags. That holds after a remux of their own too.
-        keep = ctx.background or not ctx.app
-        edits = [[t["sel"], 0, 1] for t in d["tracks"] if t["pos"] in ctx.unmatched and t["default"]] + \
-            [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in d["tracks"] if t["pos"] in ctx.unmatched and t["forced_flag"]] if keep else d["edits"]
-        if keep and d["edits"] != edits:
+        if (ctx.background or not ctx.app) and d["edits"] != flag_edits(ctx, d, ctx.unmatched | set(ctx.strip)):
             set_by = "an earlier run set the flags" if ctx.recheck else "the import set the flags"
             rec["flags_kept"] = (set_by if ctx.app else "no app lists the file, so no original language is known") + \
                 ", and only a subtitle verdict changes a flag"
-        rec = ctx.rec = edit(rec, ctx.j, edits, ctx.apply, replan=lambda after: muted_plan(replan(after, plan_inputs(ctx)), ctx.muted), ts=d["tracks"])
+        if write(ctx):
+            return True
+        rec, d = ctx.rec, ctx.d
         # An abstained or dropped decision has no edits of its own, and its reason stays in "undecided" or "dropped". It
         # names the result only when nothing changed, so an edit of a subtitle verdict keeps "edited" and its Plex analyze.
         if d.get("undecided") and rec["outcome"] == "no_change":
             rec.update(outcome="undecided", result="undecided: " + d["undecided"])
         elif d.get("dropped") and rec["outcome"] == "no_change":
             rec.update(outcome="dropped", result="dropped: " + "; ".join(d["dropped"]))
+    write_findings(ctx)
+
+
+def flag_edits(ctx, d, unmatched):
+    """The flag edits of the decision d that the run makes. The deep analysis and a recheck keep the flags an earlier run
+    set, and --sub-time keeps them on a file no app lists, as no item says the original language. Only a subtitle
+    verdict changes a flag then: a track in unmatched loses its default and forced flags. That holds after a remux of
+    their own too."""
+    if ctx.app and not ctx.background:
+        return d["edits"]
+    return [[t["sel"], 0, 1] for t in d["tracks"] if t["pos"] in unmatched and t["default"]] + \
+        [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in d["tracks"] if t["pos"] in unmatched and t["forced_flag"]]
+
+
+def write(ctx):
+    """The one write of the run (docs/design.md, "Write stage"), under the exclusive lock act() holds. A planned remux
+    runs once and carries the flag edits of the tracks it keeps as mkvmerge options: resub() when subtitle work is
+    planned, with the header issue of ctx.head in the same remux, else repack() for ctx.head. A file that is not
+    writable gets no edits carried, so edit() gives it read_only, as before. After the remux the file is probed and
+    planned again, see replan(), and edit() makes what that plan still asks for: mkvmerge's statistics tags or a
+    removed track can change it. rec["replan_edits"] counts those edits. With no remux planned, or when the remux
+    fails or cannot run, edit() makes the edits of the decision without the garbled tracks the remux takes out, as
+    before the remux was planned, and a dry run records them. After a failed remux, edit() keeps the flags of a file
+    that a flag edit would enclose bytes in, see edit(). Returns True when the app replaced the file of a deep analysis
+    or a recheck during the remux, see deep_drop()."""
+    rec, j, path, sub, head = ctx.rec, ctx.j, ctx.path, ctx.subplan, ctx.head
+    replan_of = lambda after: muted_plan(replan(after, plan_inputs(ctx)), ctx.muted)
+    edits = flag_edits(ctx, ctx.d, ctx.unmatched | set(ctx.strip))
+    if not (sub or head):
+        return edited(ctx, edit(rec, j, edits, ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=ctx.stage))
+    if ctx.waits:   # a remux of a film takes minutes, so an import that waits goes first
+        runner.deep_waits()
+    gone, ids = {*sub["drop"], *sub.get("strip", ()), *sub.get("covers", ())} if sub else set(), remux.track_ids(j)
+    sel = {t["pos"]: t["sel"] for t in ctx.d["tracks"]}
+    off = {sel.get(p) for p, r in ctx.recode.items() if r["default_off"]}   # the repair turns these off itself, see subtitle_checks()
+    carried = [e for e in needed(j, edits) if ids.get(e[0]) not in gone and not (e[0] in off and decide.prop(e) == "flag-default" and not e[1])] \
+        if ctx.apply and os.access(path, os.W_OK) else []
+    if carried and subsync.INVARIANTS:
+        mute_rule(path, ctx.d["tracks"], carried)
+    # Either remux drops the bytes past the Segment end, so edit_blocked stops it, as another Matroska file there
+    hp = edit_probe(path, j, ctx.stage if ctx.stage is not None else checks.header_of(path, j) or {})
+    blocked = "; ".join(hp.get("edit_blocked") or [])
+    if sub:
+        code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {blocked}", {}) if blocked else \
+            remux.resub(path, j, ctx.st, ctx.apply, **sub, **({"edits": carried} if carried else {}), **({"hp": head} if head else {}))
+        done = code == "subtitles_remuxed"
+        fixes, ends, remove, moves, kept, recode, strip, covers = ctx.fixes, ctx.ends, ctx.remove, ctx.moves, ctx.kept, ctx.recode, ctx.strip, ctx.covers
+        timed = set(moves) - set(kept)
+        rec["subremux"] = {**rec.get("subremux", {}), **dict(
+            info, result=result, done=done, fixed=sorted(fixes), ended=sorted(ends), remove=remove, removed=remove if done else [],
+            codes=[c for c, x in (("subtitle_retimed", fixes), ("subtitle_blocks_retimed", timed), ("subtitle_ends_lengthened", ends),
+                                  ("subtitle_mismatch_removed", remove), ("subtitle_repaired", recode), ("subtitle_garbled_removed", strip),
+                                  ("cover_attached", covers)) if x] if done else [code],
+            **({"covers": sorted(e["place"] for e in covers.values())} if covers else {}),
+            **({"copies": c} if (c := sorted(e["place"] for e in covers.values() if e.get("copy"))) else {}),
+            **({"timed": sorted(timed)} if timed else {}), **({"recoded": sorted(recode)} if recode else {}),
+            **({"stripped": {p: (info.get("garbled_text") or {}).get(str(i)) for p, i in zip(strip, sub["strip"])}} if strip else {}),
+            **({"tracks_before": logs.track_log(ctx.d["tracks"])} if done else {}))}   # the places the check named, before a removal moves the tracks up
+        if head:   # the same remux repairs the header, see resub()
+            tail = head.get("tail") or head.get("edit_tail")
+            hcode, hresult = (("tail_removed", "tail removed") if tail else ("header_repaired", "header repaired")) if done else \
+                ({"would_remux_subtitles": "would_repair_header", "subtitle_remux_skipped": "header_repair_skipped"}.get(code, "header_repair_failed"), result)
+            rec["header_repair"] = dict(issue=head["issue"], result=hresult, code=hcode, remux="subtitles")
+    else:
+        code, result, info = ("header_repair_skipped", f"header repair skipped, {blocked}: {'; '.join(head['issue'])}", {}) if blocked else \
+            remux.repack(path, j, ctx.st, ctx.apply, head, **({"edits": carried} if carried else {}))
+        done = code in config.REPAIRED
+        rec["header_repair"] = dict(info, issue=head["issue"], result=result, code=code)
+    if not done:
+        if deep_drop(ctx):   # "the original changed", and the drop logs no stale edit
+            return True
+        if ctx.strip:   # the remux took no garbled track out, so the decision gives its flags as before the plan
+            ctx.d = decide.decide(j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched)
+            ctx.d = muted_plan(decide.with_tags(ctx.d, ctx.tags) if ctx.tags else ctx.d, ctx.muted)
+        # After a failed remux, edit() keeps the flags of a file it would enclose bytes in (held), and after a failed
+        # header repair it tries no second one (tried)
+        stage = dict(hp, **{{"subtitle_remux_failed": "held", "header_repair_failed": "tried"}[code]: result}) \
+            if code in ("subtitle_remux_failed", "header_repair_failed") else hp
+        return edited(ctx, edit(ctx.rec, j, flag_edits(ctx, ctx.d, ctx.unmatched), ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=stage))
+    # The original is kept a while, so its record is on disk before anything else runs. It names the undo of the edits it carried.
+    logs.log(dict(rec, outcome=code, result=result, **({"undo": ["mkvpropedit", path] + propedit_args(carried, 2)} if carried else {})))
+    checks.lid_carry(path, ctx.st)   # the proof shows the same audio, so the words the checks heard move to the new file
+    refresh(ctx, duration=bool(head))   # a subtitle remux alone keeps the record's duration
+    if sub:
+        gone = {*ctx.remove, *ctx.strip}   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
+        ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
+        ctx.checked = subtitles.renumber(ctx.checked, gone)
+        ctx.unmatched = set(subtitles.renumber(dict.fromkeys(ctx.unmatched), gone))
+        ctx.stay = [p for p in ctx.stay if p not in rec["subremux"]["removed"]]
+        if ctx.hp and ctx.hp["issue"] and not head:   # mkvmerge wrote a new header, and a retime can end a subtitle overrun
+            now = checks.header_of(path, ctx.j)
+            ctx.ended, ctx.hp = bool(now and not now["issue"]), now or ctx.hp   # its places are of the new file, see write_findings()
+    # The plan of the new file as it reads with no edit carried, as after a remux in 2.18.3. Its edits are the change
+    # from the original. mkvpropedit makes those the remux did not, and takes back a carried edit the plan no longer asks for.
+    probe = unedited(ctx.j, j, carried) if carried else ctx.j
+    ctx.tags = decide.retag(probe, ctx.got, ctx.known, checks.langs(), ctx.said, ctx.read, ctx.content_lang, ctx.checked)
+    ctx.d = muted_plan(decide.with_tags(decide.decide(probe, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, ctx.unmatched),
+                                        ctx.tags), ctx.muted)
+    want = flag_edits(ctx, ctx.d, ctx.unmatched)
+    asked = {(e[0], decide.prop(e)) for e in want}
+    left = [[e[0], e[2], e[1], *e[3:]] for e in carried if (e[0], decide.prop(e)) not in asked] + decide.unapplied(ctx.j, want)
+    out = edit(ctx.rec, ctx.j, left, True, replan=replan_of, ts=ctx.d["tracks"])
+    out["replan_edits"] = len(out.get("edits") or [])
+    if carried and not want and out["outcome"] == "edited":   # the replan took back every carried edit, so the flags are the original's
+        out = dict({k: v for k, v in out.items() if k not in ("before", "edits", "undo", "after", "recheck")}, outcome="no_change", result="no change")
+        with contextlib.suppress(sqlite3.Error):   # the edit of the take-back ended, see checks.hook_edit_failed()
+            store.drop("editing", path)
+    elif carried:   # the record names the change from the original, as for a flag edit
+        out.update(before=runner.flags(probe), edits=want, undo=["mkvpropedit", path] + propedit_args(want, 2))
+        if out["outcome"] == "no_change" and want:
+            out.update(outcome="edited", result="edited", after=runner.flags(ctx.j))
+            try:
+                out["recheck"] = rechecked(replan_of(ctx.j))
+            except Exception as ex:
+                out["recheck"] = {"error": config.mask(f"{type(ex).__name__}: {ex}")[:200]}
+    edited(ctx, out)
+
+
+def edited(ctx, rec):
+    """Hand on rec, the record of edit(), with the decision record, see decision_fields(). A repair in edit() replaces
+    the file, so ctx then takes its probe and stat, see refresh(). The content checks and the quick check read them. A
+    file the app removed or replaced keeps the old stat, so those checks skip it, as before."""
+    was, ctx.rec = ctx.rec.get("header_repair"), rec
+    if rec.get("header_repair") is not was and rec["header_repair"]["code"] in config.REPAIRED:   # a repair of edit()'s own
+        st, ctx.st = ctx.st, None   # edit() moved the mark of a burn-in job already, see runner.mute_mark()
+        try:
+            refresh(ctx)
+        except OSError:   # the app removed the file
+            ctx.st = st
+    decision_fields(ctx)
+
+
+def edit_probe(path, j, hp):
+    """hp, the header stage of the file j probes, with the stream ends and edit_blocked of header_of(edit=True) when it
+    holds bytes past the Segment end and was read without edit, see checks.header_probe()."""
+    return checks.header_of(path, j, edit=True) or hp if hp.get("edit_tail") and hp.get("edit_blocked") is None else hp
+
+
+def unedited(new, old, edits):
+    """new, the probe of the file a remux wrote with edits, as it reads with no edit carried. Each property an edit set
+    takes its value in old, the probe of the original, again, on the tracks the edits name, by UID."""
+    uids = {t["uid"] for t in decide.classify(old) if t["sel"] in {e[0] for e in edits}}
+    keys = {k for e in edits for k in (remux.EDIT_OPTS[decide.prop(e)][1], *(["language"] if decide.prop(e) in (decide.LANG_EDIT, decide.LANG_IETF) else []))}
+    was = {(t.get("properties") or {}).get("uid"): t.get("properties") or {} for t in old.get("tracks") or []}
+    back = lambda p: {**{k: v for k, v in p.items() if k not in keys}, **{k: was[p["uid"]][k] for k in keys if k in was[p["uid"]]}} \
+        if p.get("uid") in uids and p.get("uid") in was else p
+    return dict(new, tracks=[dict(t, properties=back(t.get("properties") or {})) for t in new.get("tracks") or []])
 
 
 def sub_outcome(rec):
@@ -851,18 +991,19 @@ def quiet_result(rec, apply, source):
 
 
 def after_edit(ctx):
-    """The rescans after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
+    """The rescan after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
     rec, d = ctx.rec, ctx.d
     # After the edit, so the app's disk scan never probes a header mkvpropedit is rewriting. A backfill sends one rescan
     # per item at the end of its run, because Sonarr's rescan of a large series is slow.
     rescan_now = lambda: "none, no app lists the file" if ctx.check == "outside" else \
         apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
-    if "repack" in rec and not ctx.unconverted and not rec["repack"].get("pending"):   # a pending one settles below, with no lock
-        rec["repack"]["rescan"] = rescan_now()
-    if rec.get("header_repair", {}).get("code") in config.REPAIRED:
-        rec["header_repair"]["rescan"] = rescan_now()
-    if (rec.get("subremux") or {}).get("done"):
-        rec["subremux"]["rescan"] = rescan_now()
+    # One rescan after the last write that replaced the file. Each part of the record that names a remux holds what it gave.
+    parts = [x for x, wrote in ((rec.get("repack"), "repack" in rec and not ctx.unconverted and not rec["repack"].get("pending")),   # a pending one settles below, with no lock
+                                (rec.get("header_repair"), (rec.get("header_repair") or {}).get("code") in config.REPAIRED),
+                                (rec.get("subremux"), (rec.get("subremux") or {}).get("done"))) if wrote]
+    said = rescan_now() if parts else None
+    for x in parts:
+        x["rescan"] = said
     if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain):   # the sidecars beside the file, under the lock of the edit
         rec["sidecars"] = subtitles.sidecar_fix({n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
                                                 **({"timed": ctx.side_moves} if ctx.side_moves else {}))
@@ -1041,7 +1182,9 @@ def alerts(ctx):
     rec["alert_kinds"] = [p["kind"] for p in rec["findings"]]
     if ctx.post:   # after the edit, so a failed post never blocks one
         ctx.held = [] if ctx.mode == "import" and runner.deep_wanted(rec) else None
-        rec["alert_result"] = logs.alert_findings(rec, ctx.size, ctx.held)
+        # The marker of each alert keys on the size of the file now, after any write, so a later run over it posts no alert twice
+        size = os.path.getsize(ctx.path) if os.path.exists(ctx.path) else ctx.size
+        rec["alert_result"] = logs.alert_findings(rec, size, ctx.held)
 
 
 STEPS = (start, conversion, header, languages, subtitle_checks, flag_hearing, deep_drop, decision_fields, faults, act, after_edit, content_checks,
@@ -1137,14 +1280,31 @@ def propedit_args(edits, i):
                                        else ("--edit", e[0], "--set", f"{decide.prop(e)}={e[i]}"))]
 
 
-def edit(rec, j, edits, apply, replan=None, ts=None):
-    """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result. When the
-    header layout of the edited file breaks the Matroska rules, layout says why, see checks.layout_fault(). The edit
-    stays, and the next header check of the file repairs the layout with a remux.
+def needed(j, edits):
+    """edits less the flag edits that j, the probe of the file, shows already, so a flag edit never runs as a no-op."""
+    return [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG) or decide.unapplied(j, [e])]
+
+
+def rechecked(p):
+    """rec["recheck"] of the plan p of an edited file: its edit count and the invariants of the new state."""
+    return {"edits": len(p["edits"]), "undecided": p.get("abstain"), "invariants": [c for c, _ in decide.invariants(p["tracks"], [], p["cls"], set(p["orig"]))]}
+
+
+def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
+    """mkvpropedit the planned flags and verify them with a second probe. Returns the record with the result.
     replan(after) plans the edited file again. Its edit count and the invariants of the new state go in "recheck",
-    which the audit reads instead of probing the file again. ts is the tracks of the plan, for mute_rule()."""
-    edits = [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG)
-             or decide.unapplied(j, [e])]   # never a no-op flag edit
+    which the audit reads instead of probing the file again. ts is the tracks of the plan, for mute_rule().
+
+    With HEADER_REPAIR on, two guards keep the Matroska layout whole (docs/design.md, "Write stage"). hp is the header
+    stage of the file as it is, see header(), else header_of() reads it. A file whose bytes past the Segment end
+    (edit_tail) or zero run in it (enclosed) a flag edit would put inside the Segment takes the edits in one repack()
+    in place of mkvpropedit. The probe with edit reads the stream ends and edit_blocked, and the video check looks for
+    real damage first, as before any header repair. When that remux must not run (edit_blocked, a block of the video
+    check), or another remux of the file failed in this run (hp["held"], hp["tried"]), nothing is written: the outcome
+    is edit_failed, and the flags stay. After mkvpropedit, a header layout that breaks the Matroska rules, as when
+    mkvpropedit moves Tracks past the Clusters, is repaired at once, see relayout(). That runs after no_stop() ends, so
+    SIGTERM removes the temp file of the remux and leaves the edited file. header_repair records either remux."""
+    edits = needed(j, edits)
     if not edits:
         return dict(rec, outcome="no_change", result="no change")
     path = rec["path"]
@@ -1158,13 +1318,31 @@ def edit(rec, j, edits, apply, replan=None, ts=None):
         return dict(rec, outcome="read_only", result="read-only, not edited")
     if subsync.INVARIANTS:
         mute_rule(path, ts or decide.classify(j), edits)
-    with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
-        config.DEADLINE.stop()
-        logs.log(dict(rec, result="editing"))   # the undo record exists before the file changes
-        e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
+    hp = (hp if hp is not None else checks.header_of(path, j) if config.CFG.header_repair else None) or {}
+    remuxed = config.CFG.header_repair and bool(hp.get("edit_tail") or hp.get("enclosed") is not None)
+    if remuxed:   # fix 2
+        why, room = hp.get("tried") or hp.get("held"), f'the {hp["edit_tail"]} bytes past its end' if hp.get("edit_tail") else "a run of zero bytes"
+        hp = hp if why else edit_probe(path, j, hp)   # the stream ends and the guards of the remux
+        if not why and "repairable" not in hp:   # the video check looks for real damage first, as for a header issue
+            issue = hp["issue"] or [f"a flag edit would put {room} inside the Matroska Segment"]
+            hp = checks.video_check(path, j=j, hp=dict(hp, issue=issue))[2].get("header") or dict(hp, issue=issue, repairable=False)
+        why = why or "; ".join(hp.get("edit_blocked") or []) or (None if hp.get("repairable") else "; ".join(hp.get("blocked") or ["the video check failed"]))
+        if not why:
+            code, result, info = remux.repack(path, j, before, True, hp, edits)
+            rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
+            why = None if code in config.REPAIRED else result
+        if why:   # one alert, the edit finding, names the repair that failed too, see write_findings()
+            return dict(rec, outcome="edit_failed", result=f"not edited, as a flag edit would put {room} inside the Matroska Segment: {why}",
+                        after=rec["before"], **({"header_repair": dict(rec["header_repair"], edit=True)} if "header_repair" in rec else {}))   # nothing changed
+        logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+    else:
+        with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
+            config.DEADLINE.stop()
+            logs.log(dict(rec, result="editing"))   # the undo record exists before the file changes
+            e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
     checks.lid_carry(path, before)
     runner.mute_mark(path, before)
-    if e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
+    if not remuxed and e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
             rec["after"] = runner.flags(checks.mkvmerge(path))
@@ -1172,17 +1350,42 @@ def edit(rec, j, edits, apply, replan=None, ts=None):
             rec["after_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:300]
         return rec
     after = checks.mkvmerge(path)
+    if config.CFG.header_repair and not remuxed and not hp.get("tried") and checks.layout_of(path):   # fix 1
+        after = relayout(rec, path, after)
     rec["after"] = runner.flags(after)
-    if layout := checks.layout_of(path):   # mkvpropedit can move Tracks past the Clusters. The next header check repairs it.
-        rec["layout"] = layout
     if decide.unapplied(after, edits):
         return dict(rec, outcome="verify_failed", result="VERIFY FAILED, flags did not change")
     rec = dict(rec, outcome="edited", result="edited")
     if replan:
         try:
-            p = replan(after)
-            rec["recheck"] = {"edits": len(p["edits"]), "undecided": p.get("abstain"),
-                              "invariants": [c for c, _ in decide.invariants(p["tracks"], [], p["cls"], set(p["orig"]))]}
+            rec["recheck"] = rechecked(replan(after))
         except Exception as ex:
             rec["recheck"] = {"error": config.mask(f"{type(ex).__name__}: {ex}")[:200]}
     return rec
+
+
+def relayout(rec, path, j):
+    """Repair at once the header layout that the flag edit of rec broke, with a remux, see repack(). j is the probe of
+    the edited file. The video check of the edited file looks for real damage first, as for any header repair, and a
+    subtitle that runs past the end leaves the repair to the next header check, which decides its cut. Sets
+    rec["header_repair"] and returns the probe of the file the run leaves."""
+    st, hp = os.stat(path), checks.header_of(path, j)
+    if not (hp and hp["issue"]):   # the probe failed
+        return j
+    h = {} if hp.get("trim") or hp.get("remove") else checks.video_check(path, j=j, hp=hp)[2].get("header") or {}
+    try:
+        code, result, info = remux.repack(path, j, st, True, h) if h.get("repairable") else (None, None, {})
+    except (SystemExit, KeyboardInterrupt):   # the temp file is gone and the edit stays, so the run ends with its line first
+        runner.pass_stop()
+        code, result, info = "header_not_repaired", "not repaired: the run was stopped. The issue: " + "; ".join(hp["issue"]), {}
+    if code is None:
+        code, result, info = "header_not_repaired", "not repaired: " + "; ".join(h.get("blocked") or [
+            "a subtitle runs past the end, so the next header check repairs it" if hp.get("trim") or hp.get("remove") else "the video check failed"]) + \
+            ". The issue: " + "; ".join(hp["issue"]), {}
+    rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
+    if code not in config.REPAIRED:
+        return j
+    logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+    checks.lid_carry(path, st)
+    runner.mute_mark(path, st)
+    return checks.mkvmerge(path)

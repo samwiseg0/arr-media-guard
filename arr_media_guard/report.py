@@ -737,6 +737,7 @@ def live_line(x, t):
 
 NO_MATCH = "don't match what's said in the audio"
 GARBLED = "show garbled characters"
+BROKEN_BYTES = "show broken characters, because some of their bytes aren't valid text"   # see subtitles.garbled_tracks(), "encoding"
 NO_LAYOUT = "don't line up with the speech in the audio, so they may be from another episode or version"
 
 
@@ -744,19 +745,22 @@ def garbled(x, t):
     """Subtitle tracks whose text is garbled and stays as it is, see subtitles.garbled_tracks(): a repair that a dry
     run plans, that failed, or that SUBTITLES check leaves out, or no repair the check could prove. With names, a
     track that cannot be repaired and that a dry run plans to take out, or whose removal failed. With kept_back, a
-    setting keeps such a track, see KEPT_BACK."""
+    setting keeps such a track, see KEPT_BACK. With encoding, the tracks hold bytes that are not UTF-8, so they show
+    broken characters and no repair is tried."""
     name = cap(subs_name(x["tracks"], x["langs"]))
-    unsure = f"{name} {GARBLED}, and the right text couldn't be worked out for sure."
+    shows = BROKEN_BYTES if x.get("encoding") else GARBLED
+    unsure = f"{name} {shows}." if x.get("encoding") else f"{name} {GARBLED}, and the right text couldn't be worked out for sure."
     if x.get("names") and t == "planned" and (x.get("block") or {}).get("code") == "remux":
         return f"{unsure} --apply would take them out of the file and keep their text beside the video as {and_list(x['names'])}."
     if x.get("kept_back"):
         return f"{unsure} They're still in the file, because {KEPT_BACK[x['kept_back']]}."
     if "result" in x:
-        return f"{name} {GARBLED}. {block(x['block'])}" if t == "planned" and x.get("block") else \
-            f"{name} {GARBLED}{fix_failed(x['result'])}. The original file was not changed."
+        return f"{name} {shows}. {block(x['block'])}" if t == "planned" and x.get("block") else \
+            f"{name} {shows}{fix_failed(x['result'])}. The original file was not changed."
     if x["repair"] and not x["flags_off"]:
         return f"{name} {GARBLED}. SUBTITLES is set to check, so they were left as they are."
-    return f"{name} {GARBLED}, but the right text couldn't be worked out for sure, so they were left as they are."
+    return f"{name} {shows}, so they were left as they are." if x.get("encoding") else \
+        f"{name} {GARBLED}, but the right text couldn't be worked out for sure, so they were left as they are."
 
 
 def no_match(x):

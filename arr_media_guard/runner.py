@@ -140,6 +140,18 @@ def job_term(signum, _):
         raise SystemExit(128 + signum)
 
 
+def pass_stop():
+    """Hand the stop that remux.stopped() recorded during the layout repair after a flag edit to the handler that the
+    process runs, see process.relayout(). A job process then runs its job to its end, see job_term(), and a backfill
+    ends after the file, see cli.backfill_files(). A process with no handler of its own keeps the stop for its next
+    write, see raise_term()."""
+    sig = STOP["term"]
+    handler = signal.getsignal(sig) if sig else None
+    if callable(handler) and handler is not signal.default_int_handler:
+        STOP["term"] = None
+        handler(sig, None)
+
+
 def raise_term():
     """Raise the stop that job_term() or stopped() recorded, see STOP. A SIGINT raises KeyboardInterrupt, as Ctrl+C does."""
     if STOP["term"] == signal.SIGINT:
@@ -867,7 +879,10 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
                 edits = [[t["sel"], 0, 1] for t in on if t["default"]] + [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in on if t["forced_flag"]]
                 if apply:   # first, so the safety rule of the edit sees it, see process.mute_rule(). edit() carries it.
                     mute_mark(path)
+                before = os.stat(path)
                 done = process.edit(rec, j, edits, apply, replan=lambda after: kept_off(after, got), ts=ts)
+                if (done.get("header_repair") or {}).get("code") in config.REPAIRED:   # a repair inside the edit replaced the file
+                    rekey(path, before)
                 rec = dict(done, outcome=rec["outcome"], edit_result=done["result"], result=f'{words}, {done["result"]}')
                 f["edit"] = done["outcome"]
                 if burn_changed(done, {t["sel"] for t in on}):   # mkvpropedit can fail and still write, see process.edit()
@@ -901,6 +916,22 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
     if post:
         rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(path) if os.path.exists(path) else 0)
     return rec
+
+
+def rekey(path, before):
+    """Give the queued deep analysis and whole-file check of path the key of the file now, when a repair inside a flag
+    edit of this job replaced the file that the stat before describes, see process.edit(). Else they would drop
+    themselves as for a file another import replaced, see deep_replaced(). A file the app removed meanwhile changes no
+    job."""
+    try:
+        now = os.stat(path)
+    except OSError:
+        return
+    for name in (deep_name(path), whole_name(path)) if now.st_ino != before.st_ino else ():
+        with contextlib.suppress(FileNotFoundError, ValueError, sqlite3.Error):
+            job = job_of(name)
+            if (job.get("key") or [None])[0] == before.st_ino:
+                put_job(name, dict(job, key=file_key(now)))
 
 
 def burn_changed(done, sels):
@@ -1028,9 +1059,9 @@ def deep_analysis(name, pending, claimed=False):
                 with locked(shared=True) as lock:
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: cli.upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: reshared(lock, path, st)))
-            except Replan as ex:
+            except Replan:
                 with locked() as lock:
-                    rec = subtitles.swept_before(run(lock, False), ex)
+                    rec = run(lock, False)
             rec["job"] = name
     except subtitles.Yielded as ex:
         logs.log(dict(rec, result="yielded", note=str(ex)))
