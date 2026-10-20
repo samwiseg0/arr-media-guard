@@ -311,7 +311,8 @@ def test_a_header_repair_reads_the_resync_of_mkvmerge_in_any_locale(zp, tmp_path
     monkeypatch.delenv("LC_ALL", raising=False)
     monkeypatch.delenv("LC_MESSAGES", raising=False)
     monkeypatch.delenv("LANGUAGE", raising=False)
-    said = REAL_RUN(["mkvmerge", "-q", "-o", str(tmp_path / "de.mkv"), path], capture_output=True, text=True).stdout
-    assert said.startswith("Warnung: "), said   # the locale works, so the test can fail
+    r = REAL_RUN(["mkvmerge", "-q", "-o", str(tmp_path / "de.mkv"), path], capture_output=True, text=True)
+    if not r.stdout.startswith("Warnung: "):   # the test can fail only where mkvmerge speaks German
+        pytest.skip(f"mkvmerge printed no German warning here, exit {r.returncode}: {(r.stdout + r.stderr)[-300:]!r}")
     code, result, info = hook.repack(path, j, os.stat(path), True, header(path, j, enclosed=at, enclosed_size=ZEROS))
     assert result == "header repaired" and "Warning: Resync failed" in info["warnings"] and "Warnung" not in info["warnings"], (result, info)

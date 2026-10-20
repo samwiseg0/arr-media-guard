@@ -161,6 +161,8 @@ def test_an_edit_blocked_tail_writes_nothing(env, monkeypatch):
 
 def test_a_read_only_file_gets_no_edits_in_the_remux(env, monkeypatch):
     """The remux still repairs the header, as before. The edits stay off the file, so its outcome stays read_only."""
+    if os.geteuid() == 0:
+        pytest.skip("root may write a file of mode 0444, so the file is not read only")
     calls = header_issue(env, monkeypatch)
     os.chmod(env["path"], 0o444)
     hook.main([])
