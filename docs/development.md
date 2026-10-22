@@ -22,6 +22,8 @@ The hunter imports the package, and the package never imports the hunter.
 | `convert.py`, `proof.py` | the conversion into Matroska, and its packet proof |
 | `regrab.py` | the re-grab, and the restore of the old file of an upgrade |
 | `vault.py` | the kept files and their prune |
+| `gate.py` | the write gate of a queued plan, and its guard, an audit hook that fails a write around the gate |
+| `ff.py` | every ffmpeg, ffprobe and PyAV call, the times each use may read, and the launch guard, an audit hook that refuses any other start |
 | `plex.py` | the Plex analyze and the folder scans |
 | `logs.py` | the decision log, the syslog line and the Discord posts |
 | `report.py` | the words of every decision output: the decision line, the syslog summary, the alerts and the CLI line |

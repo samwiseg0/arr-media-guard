@@ -244,7 +244,8 @@ def kept_pcm(cache, path, index):
 
 def extract(path, index, start, secs=SAMPLE_SECS):
     """secs of one audio stream from start, as mono 16 kHz signed 16-bit PCM. Read-only."""
-    r = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.1f}", "-i", path, "-t", f"{secs:.1f}",
+    from . import ff
+    r = ff.run("lid.extract", ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.1f}", "-i", path, "-t", f"{secs:.1f}",
                         "-map", f"0:a:{index}", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
                        capture_output=True, timeout=120)
     if r.returncode: raise RuntimeError(f"ffmpeg exited {r.returncode}: {r.stderr.decode(errors='replace').strip()[-300:]}")
@@ -473,10 +474,11 @@ def start_delay(path, audio_index):
     """Seconds ffmpeg audio stream audio_index of path starts after the file starts, or 0 when ffprobe gives none. A
     decode to raw audio starts at the stream's first packet, but the cues and the speech onsets run on the file's
     clock. Without the delay, the speech of a delayed stream reads early by it."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"a:{audio_index}", "-show_entries", "stream=start_time:format=start_time",
-                        "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=60)
+    from . import ff
+    r = ff.run("lid.start_delay", ["ffprobe", "-v", "error", "-select_streams", f"a:{audio_index}", "-show_entries", "stream=start_time:format=start_time",
+                                   "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=60)
     try:
-        j = json.loads(r.stdout)
+        j = ff.loads(r)
         return round(float(j["streams"][0]["start_time"]) - float(j["format"]["start_time"]), 3)
     except (ValueError, KeyError, IndexError, TypeError):
         return 0.0
@@ -492,7 +494,7 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None, job=None):
     when waits() names a job or a hearing at gate and queue: it stops the read and caches nothing. Returns {"spans":
     [[start, end]] in seconds, "cached", "took": wall seconds}, or {"yielded": True, "cached", "took"}. Raises when
     ffmpeg or ffprobe fails, and nothing is cached then."""
-    from . import subsync
+    from . import ff, subsync
     t0, how, st = time.time(), speech_how(), os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns, audio_index, how)
     with closing(_db(cache)) as db, db:
@@ -502,7 +504,7 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None, job=None):
     import numpy as np
     from faster_whisper.vad import get_vad_model
     model, probs = get_vad_model(), []
-    p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path,
+    p = ff.popen("lid.speech", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path,
                           "-map", f"0:a:{audio_index}", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
@@ -682,7 +684,7 @@ def job_arg(v):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Identify the spoken language of one audio stream. Prints one JSON line.")
-    ap.add_argument("path", nargs="?"); ap.add_argument("index", type=int, nargs="?"); ap.add_argument("duration", type=float, nargs="?")
+    ap.add_argument("path", nargs="?"); ap.add_argument("index", type=int, nargs="?"); ap.add_argument("runtime", type=float, nargs="?")
     ap.add_argument("--fetch", action="store_true", help="deploy time: download the pinned model and check its sha256")
     ap.add_argument("--expect", nargs="*", default=[], help="the track's tag and the app's original language, as 639-2 codes")
     ap.add_argument("--model", default=MODEL); ap.add_argument("--model-dir", default=MODEL_DIR)
@@ -704,7 +706,7 @@ def main(argv=None):
     if a.fetch:
         print(fetch(a.model_dir))
         return 0
-    if a.duration is None: ap.error("PATH, INDEX and DURATION are required")
+    if a.runtime is None: ap.error("PATH, INDEX and DURATION are required")
     global SLOT
     SLOT = a.slot
     try:
@@ -720,7 +722,7 @@ def main(argv=None):
                            more=more)
         else:
             threads = min(a.threads, WORD_THREADS) if a.then_words else a.threads   # the shared model runs the subtitle check's thread count
-            r = identify(a.path, a.index, a.duration, a.expect, a.model, a.model_dir, a.cache, threads, a.fresh, a.keep_pcm or bool(a.then_words))
+            r = identify(a.path, a.index, a.runtime, a.expect, a.model, a.model_dir, a.cache, threads, a.fresh, a.keep_pcm or bool(a.then_words))
             if a.then_words:
                 r["words"] = jobs(a.path, a.then_words, a.cache, a.model, a.model_dir)
     except Exception as e:   # the hook reads one JSON line either way

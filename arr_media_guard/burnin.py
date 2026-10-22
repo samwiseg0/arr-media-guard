@@ -153,10 +153,9 @@ class Sampler:
     time, as lid.speech() and an ffmpeg -ss give them. A TS recording or a remux that kept its times starts late."""
 
     def __init__(self, path, threads=THREADS):
-        import av
-        self.av = av
+        from . import decide, ff   # here, as the image fetches the models with burnin.py and lid.py alone
+        self.av = av = ff.pyav("burnin.Sampler")
         self.c = av.open(path)
-        from . import decide   # here, as the image fetches the models with burnin.py and lid.py alone
         vs = list(self.c.streams.video)
         v = decide.main_video([{"index": k, "codec_type": "video", "codec_name": getattr(x.codec_context, "name", None),   # None: no decoder
                                 "disposition": {"attached_pic": bool(x.disposition & av.stream.Disposition.attached_pic)}} for k, x in enumerate(vs)])
@@ -292,7 +291,8 @@ class Ocr:
     def read(self, rgb, box, model="ch"):
         """(text, mean character probability) of the line in box, read by the recognizer model. The crop grows the box
         by PaddleOCR's unclip distance, its area times unclip over its perimeter, so no letter loses an edge."""
-        import av   # PyAV's swscale resizes the line, so no image library is needed
+        from . import ff
+        av = ff.pyav("burnin.Ocr.read")   # PyAV's swscale resizes the line, so no image library is needed
         np = self.np
         x0, y0, x1, y1 = box[:4]
         pad = max(2, int(round(LIMITS["unclip"] * (x1 - x0) * (y1 - y0) / (2 * (x1 - x0 + y1 - y0)))))
@@ -739,7 +739,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Check one file for burned-in subtitles. Prints one JSON line.")
     ap.add_argument("path", nargs="?")
     ap.add_argument("index", type=int, nargs="?", help="the ffmpeg audio index, 0:a:INDEX")
-    ap.add_argument("duration", type=float, nargs="?")
+    ap.add_argument("runtime", type=float, nargs="?")
     ap.add_argument("--fetch", action="store_true", help="install time: download the pinned models and check each sha256")
     ap.add_argument("--quick", action="store_true", help="the import's sort, see quick()")
     ap.add_argument("--full", action="store_true", help="the check that decides, see full()")
@@ -754,14 +754,14 @@ def main(argv=None):
     if a.fetch:
         print(fetch(a.model_dir))
         return 0
-    if a.duration is None or a.quick == a.full:
+    if a.runtime is None or a.quick == a.full:
         ap.error("PATH, INDEX, DURATION and one of --quick and --full are required")
     lid.lower_priority(THREADS)
     try:
         if a.quick:
-            r = quick(a.path, a.index, a.duration)
+            r = quick(a.path, a.index, a.runtime)
         else:
-            r = full(a.path, a.index, a.duration, a.second, a.yield_gate, a.yield_queue, a.cache, a.model_dir, lid.job_arg(a.yield_job))
+            r = full(a.path, a.index, a.runtime, a.second, a.yield_gate, a.yield_queue, a.cache, a.model_dir, lid.job_arg(a.yield_job))
     except Exception as e:   # the hook reads one JSON line either way
         r = {"error": f"{type(e).__name__}: {e}"[:300]}
     print(json.dumps(r))

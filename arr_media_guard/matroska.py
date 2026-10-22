@@ -4,7 +4,7 @@
 reader (docs/design.md, "Frame times"). check() reads the EBML header, each level-1 element before the first Cluster,
 and each one a SeekHead lists. It never reads a Cluster. It holds each element to the schema of RFC 9559 section 5.1
 and to the EBML rules of RFC 8794. frames() reads the time of every frame from the blocks of the Clusters."""
-import array, collections, itertools, mmap, os, re, struct, threading, zlib
+import array, collections, contextlib, itertools, mmap, os, re, struct, threading, zlib
 
 from . import decide
 
@@ -618,10 +618,12 @@ def frames(path):
     """{"scale": the TimestampScale in ns, "tracks": [track_frames() of each TrackEntry the walk reads, one after damage
     too, in file order], "error": why the walk stopped, or None, "whole": True when every Cluster read whole, "resyncs": [(where the walk looked for a
     Cluster after damage, the Cluster it read on from)], "read_on": the tracks with the blocks read after each resync,
-    or None with no resync} of the Matroska file path, from one walk of every Cluster (docs/design.md, "Frame times").
+    or None with no resync, "end": the byte where the Segment ends, at most the size of the file} of the Matroska file
+    path, from one walk of every Cluster (docs/design.md, "Frame times").
     It reads element headers, block headers and the sizes of every lace through mmap. Where a frame with no
     DefaultDuration needs the codec's frame length, it reads the first bytes of the frame in the same pass, or after it
-    when Tracks comes after the Clusters. It also reads the first bytes of the first frame of each audio track, see
+    when Tracks comes after the Clusters. A second Info or Tracks does not count, as ffmpeg, mpv and mkvmerge read the
+    first. It also reads the first bytes of the first frame of each audio track, see
     codec_frame in track_frames(). It skips a run of zero bytes before the first Cluster or after the last one,
     as an edit by mkvpropedit leaves one before the Tracks it moves to the end. An element or lace sizes that do not
     read, as in a damaged or cut Cluster, set error, and error says where. So do a zero run between two Clusters and a
@@ -631,8 +633,9 @@ def frames(path):
     Cluster and the next Cluster that reads whole after its end. Else the last trusted Cluster sets it, and the blocks
     of the damaged Cluster leave read_on. The walk reads on from the first Cluster that reads whole, no earlier than
     the bound and no later than the next Cluster that reads whole after it. A damaged Cluster between the damage and
-    that Cluster keeps its blocks before its damage in read_on when its Timestamp lies between the two. So a Cluster id
-    inside damaged bytes gives no frame at a false time. A Segment that runs past the end of the file sets error after
+    that Cluster keeps its blocks before its damage in read_on when its Timestamp lies between the two. With no Cluster
+    that reads whole after it, the walk reads on from it only when the bytes after it read to the Segment end, see
+    ends(). So a Cluster id inside damaged bytes gives no frame at a false time. A Segment that runs past the end of the file sets error after
     the walk. The tracks hold the blocks read before the first error, so a caller never takes them for the whole file,
     unless whole is True. The error is then a Segment size past the end of the file, or
     a level-1 element after the last Cluster whose size does not read, when no Cluster id follows it in the file, as
@@ -648,6 +651,20 @@ def frames(path):
         while len(WALKS) > 4:
             del WALKS[next(iter(WALKS))]
     return got
+
+
+def carry(path, before):
+    """Move the walk that frames() keeps for path from its os.stat() before an in-place mkvpropedit edit to its stat
+    now. An edit of flags and languages changes no frame, and mkvpropedit moves no Cluster. Only a walk with no error
+    of a Segment that ends at the end of the file moves. mkvpropedit puts bytes past the Segment end inside it, so a
+    fresh walk can find damage there. It writes what it adds at the end of such a Segment, so the Segment still ends at
+    the end of the file. Any other change of the file gives another stat, and the walk reads again."""
+    with LOCK:
+        got = WALKS.pop((path, before.st_size, before.st_mtime_ns), None)
+    if got and got["error"] is None and got["end"] == before.st_size:
+        with contextlib.suppress(OSError), LOCK:
+            st = os.stat(path)
+            WALKS[(path, st.st_size, st.st_mtime_ns)] = dict(got, end=st.st_size)
 
 
 # ponytail: keyed by path, size and mtime, as subtitles.FULL is. A rewrite of the same size within one mtime tick (about
@@ -737,7 +754,7 @@ def walk(path, enough=None):
                 if s is None or d + s > end:   # every Cluster read whole when no Cluster id follows, in this file or one joined to it. head() skips the search.
                     whole = not enough and b.find(CLUSTER_ID, d) < 0
                     raise damage(f"the element at byte {p} has an unknown size or runs past the Segment end", d)
-                if i in (decide.INFO, decide.TRACKS):
+                if i in (decide.INFO, decide.TRACKS) and i not in seen:   # the first one counts, as ffmpeg and mkvmerge read it
                     top(i, d, s)
                 p = d + s
             except ValueError as ex:   # damage or a cut file: the walk reads on from the next Cluster id, as ffmpeg does
@@ -758,6 +775,8 @@ def walk(path, enough=None):
                 w = n if start == at and not fits else after(b, at, end, low, reads)   # n holds for a later last too
                 while w and (n := after(b, w[2], end, low, reads)) and w[1] > n[1]:   # a whole Cluster later than the next one
                     w = n
+                if w and not n and not ends(b, w[2], end):   # no later Cluster agrees, and damage follows it
+                    w = None
                 if not w:
                     whole = whole and not resyncs
                     break
@@ -778,7 +797,8 @@ def walk(path, enough=None):
         tracks = [track_frames(b, t, cut.get(t["number"], []) if cut is not None else blocks.get(t["number"], ()), scale)
                   for t in entries]
         read_on = [dict(track_frames(b, t, blocks.get(t["number"], ()), scale), resumed=len(c["time"])) for t, c in zip(entries, tracks)] if resyncs else None
-        return {"scale": scale, "tracks": tracks, "error": error, "whole": error is None or whole, "resyncs": resyncs, "read_on": read_on}
+        return {"scale": scale, "tracks": tracks, "error": error, "whole": error is None or whole, "resyncs": resyncs, "read_on": read_on,
+                "end": end}
 
 
 def first_time(b, d, end):
@@ -819,6 +839,24 @@ def after(b, q, end, last, reads):
             return q, f[0], f[3]
         q = b.find(CLUSTER_ID, q + 1, end)
     return None
+
+
+def ends(b, q, end):
+    """Whether the bytes b[q:end] read as level-1 elements up to end, as after the last Cluster of a file. A zero run
+    reads, and so does a last element that runs past end or has an unknown size, as in a cut file. Fewer than 12 bytes
+    left to the end of the file read as the header of an element cut there, as in decide.cluster_blocks()."""
+    while q < end:
+        e = decide.element(b, q)
+        if not e and not b[q]:
+            m = NONZERO.search(b, q, end)
+            q = m.start() if m else end
+            continue
+        if not e and len(b) - q < 12:   # an id and a size take at most 12 bytes
+            return True
+        if not e or e[0] not in decide.LEVEL1:
+            return False
+        q = end if e[2] is None else e[1] + e[2]
+    return True
 
 
 def damage(text, at):
@@ -937,7 +975,7 @@ def track_frames(b, t, blocks, scale):
             lens = None
             if fixed and not dd:   # the AAC config gives the length of every frame
                 lens = [length(b"")] * n
-            elif readable:   # cluster() kept the heads, unless Tracks came after the Clusters or a second Tracks changed the track
+            elif readable:   # cluster() kept the heads, unless Tracks came after the Clusters
                 lens = [length(h) for h in heads or lace_heads(b, *lace_sizes(b, head, end, lacing))]
                 lens = None if None in lens else lens
             at = 0.0

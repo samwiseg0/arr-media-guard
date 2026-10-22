@@ -3,7 +3,7 @@
 """The subtitle match check and the reads of the subtitle tracks."""
 import contextlib, fractions, json, math, os, re, resource, statistics, subprocess, tempfile, time
 
-from . import align, checks, config, content, decide, judge, logs, matroska, proof, remux, report, runner, store, subsync, vault
+from . import align, checks, config, content, decide, ff, judge, logs, matroska, proof, remux, report, runner, store, subsync, vault
 
 
 def subtitle_ends(path, j, timeout, limit=None, lines=None):
@@ -400,7 +400,7 @@ def lid_kept(path, index):
     return lid.kept_pcm(os.path.join(config.CFG.state_dir, "lid.sqlite"), path, index)
 
 
-SUB_SOURCES = ("hook", "deep_analysis", "recheck", "check", "backfill_job")   # an import, the jobs of the background queue and --check follow SUBTITLES
+SUB_SOURCES = ("hook", "deep_analysis", "recheck", "check", "backfill_job", "check_job")   # an import, the jobs of the background queue and --check follow SUBTITLES
 
 
 def sub_on(source, sub_check=False):
@@ -949,11 +949,11 @@ def onsets(path, j, idx, parts, facts=None):
         out += [o for p in parts if key(*p) in ONSETS for o in ONSETS[key(*p)]]
         parts = [p for p in parts if key(*p) not in ONSETS]
         channels = (audio[idx].get("properties") or {}).get("audio_channels") or 0
-        layout = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"a:{idx}", "-show_entries", "stream=channel_layout", "-of",
+        layout = ff.run("subtitles.onsets.layout", ["ffprobe", "-v", "error", "-select_streams", f"a:{idx}", "-show_entries", "stream=channel_layout", "-of",
                                  "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=60).stdout.strip() if channels > 2 and parts else ""
         centre = bool(layout) and "FC" in re.split(r"[+() ]", ffmpeg_layouts().get(layout, layout))
         for lo, hi in parts:
-            r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-ss", f"{lo:.3f}", "-t",
+            r = ff.run("subtitles.onsets", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-ss", f"{lo:.3f}", "-t",
                                 f"{hi - lo:.3f}", "-i", path, "-map", f"0:a:{idx}", "-vn", "-sn", "-dn", "-af",
                                 ("pan=mono|c0=FC," if centre else "aformat=channel_layouts=mono,") + "silencedetect=noise=-25dB:d=0.3",
                                 "-f", "null", "/dev/null"], capture_output=True, text=True, errors="replace", timeout=ONSET_TIMEOUT)
@@ -982,7 +982,7 @@ def ffmpeg_layouts():
     track's layout by these names. A process keeps the first read that gives them, and a failed read gives {}."""
     if not LAYOUTS:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
-            text = subprocess.run(["ffmpeg", "-hide_banner", "-layouts"], capture_output=True, text=True, errors="replace", timeout=30).stdout
+            text = ff.run("subtitles.ffmpeg_layouts", ["ffmpeg", "-hide_banner", "-layouts"], capture_output=True, text=True, errors="replace", timeout=30).stdout
             LAYOUTS.update(re.findall(r"(?m)^(\S+)\s+([A-Z][A-Z0-9]*(?:\+[A-Z][A-Z0-9]*)+)\s*$", text or ""))
     return LAYOUTS
 

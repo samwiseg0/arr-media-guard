@@ -3,7 +3,7 @@
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
 import contextlib, filecmp, fractions, hashlib, itertools, math, mmap, os, re, shutil, signal, subprocess, threading, time
 
-from . import align, checks, config, decide, logs, matroska, proof, runner, subsync, vault
+from . import align, checks, config, decide, ff, logs, matroska, proof, runner, subsync, vault
 
 
 # The track properties a remux must keep, with the Matroska default of each. uid too, except on a track a trim replaced.
@@ -1376,7 +1376,7 @@ def cover_images(path, indexes, images, folder, timeout):
     if indexes:
         out = os.path.join(folder, "first.md5")
         r = checks.run_bounded(["ffmpeg", "-nostdin", "-v", "error", "-i", path, *[a for i in indexes for a in ("-map", f"0:{i}")], "-c", "copy",
-                                "-copyinkf", "-frames:v", "1", "-f", "framemd5", out], timeout, capture_output=True, text=True, errors="replace")
+                                "-copyinkf", "-frames:v", "1", "-f", "framemd5", out], timeout, use="remux.cover_images", capture_output=True, text=True, errors="replace")
         if r.returncode:
             raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-150:]}")
         with open(out) as f:
@@ -1526,7 +1526,7 @@ def moved_tracks(moves):
         clamp = (f"setts=time_base=1/1000:pts=max({t('PTS')}\\,0):dts=max({t('DTS')}\\,0)"
                  f":duration=if(lt({t('PTS')}\\,0)\\,max(1\\,{t('PTS')}+DURATION*{k}*TB*1000)\\,DURATION*{k}*TB*1000)")
         argv += ["-map", f"{n}:{at}", "-c", "copy", "-bsf:0", clamp, "-f", "matroska", out]
-    r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+    r = ff.run("remux.moved_tracks", argv, capture_output=True, text=True, errors="replace")
     lines = levels(r.stderr)
     for level, line in lines:   # "[sost#2:0/copy @ 0x..] Non-monotonic DTS; ...": output file 2 is the third move
         if level == "warning" and (m := re.match(r"\[\w+#(\d+):\d+/\w+ @ 0x[0-9a-f]+\] Non-monotonic DTS", line)):
@@ -1691,7 +1691,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
                 x = covers[i]["index"]
                 argv += [*([] if covers[i].get("hashed") else ["-map", f"0:{x}", "-c", "copy", "-copyinkf", "-f", "framemd5", md5]),
                          "-map", f"0:{x}", "-c", "copy", "-copyinkf", "-frames:v", "1", "-f", "data", img]
-            r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
+            r = ff.run("remux.resub", argv, capture_output=True, text=True, errors="replace")
             if r.returncode or proof.bad_lines(r.stderr):
                 raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-300:]}")
         for i, (srt, md5) in texts.items():   # an ASS, SSA or WebVTT file holds its header too, which mkvextract writes

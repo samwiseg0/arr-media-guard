@@ -3,7 +3,7 @@
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
 import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
 
-from . import apps, checks, config, content, decide, logs, mp4, proof, regrab, remux, runner, store, subtitles, vault
+from . import apps, checks, config, content, decide, ff, logs, mp4, proof, regrab, remux, runner, store, subtitles, vault
 
 
 # The conversion of a file that is not Matroska into <base>.mkv (docs/design.md, "Conversion"). Every stream is proven at packet
@@ -29,7 +29,7 @@ def convert_captions(path, streams, folder, size, shift=0.0):
     for s in streams:
         f = os.path.join(folder, f"cc{s['index']}.srt")
         r = checks.run_bounded(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", "-i", path, "-map", f"0:{s['index']}",
-                         "-c:s", "srt", "-f", "srt", f], max(600, size / proof.PROOF_RATE), capture_output=True, text=True, errors="replace")
+                         "-c:s", "srt", "-f", "srt", f], max(600, size / proof.PROOF_RATE), use="convert.convert_captions", capture_output=True, text=True, errors="replace")
         raw, clean = "", lambda line: " ".join(re.sub(r"\{\\[^}]*\}|</?font[^>]*>", "", line).replace("\\h", " ").split())
         if r.returncode == 0:
             with contextlib.suppress(OSError), open(f, encoding="utf-8", errors="replace") as fh:
@@ -61,18 +61,19 @@ def avi_sync(path, j, streams):
     out = []
     for kind in ("video", "audio"):
         ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == kind]
-        ff = [s for s in proof.media_streams(streams) if s.get("codec_type") == kind]
-        for n, s in enumerate(ff):
+        kin = [s for s in proof.media_streams(streams) if s.get("codec_type") == kind]
+        for n, s in enumerate(kin):
             try:
                 r = checks.run_bounded(["ffprobe", "-v", "error", "-select_streams", str(s["index"]), "-show_entries", "packet=pts_time,dts_time",
-                                        "-read_intervals", "%+#1", "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
-                p = (json.loads(r.stdout or "{}").get("packets") or [{}])[0] if r.returncode == 0 else {}
+                                        "-read_intervals", "%+#1", "-of", "json", path], 120, use="convert.avi_sync", capture_output=True,
+                                       text=True, errors="replace")
+                p = (ff.loads(r, "{}").get("packets") or [{}])[0] if r.returncode == 0 else {}
                 t = float(p.get("pts_time") or p.get("dts_time") or 0)   # AVI video with B-frames has a decode time only
             except (subprocess.TimeoutExpired, ValueError):
                 continue
             if t > START_MAX:
                 return []
-            if t >= 0.001 and len(ids) == len(ff):
+            if t >= 0.001 and len(ids) == len(kin):
                 out.append({"stream": f"{kind} {s['index']}", "track": ids[n], "ms": round(t * 1000)})
     return out
 
@@ -225,7 +226,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
     return argv
 
 
-def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), broken=()):
+def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), broken=(), ready=None):
     """The subtitle match check of a conversion (docs/design.md, "Subtitle match"). It checks each sidecar in subs and
     each built-in text track, in a SUB_ROLES role and in the language of a main audio track, against the audio. A
     forced sidecar is never checked. Returns (the sidecars to mux, [(mkvmerge track id, ffprobe stream index)] of the
@@ -237,7 +238,7 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
     the remux. A built-in track whose times need a fix gets them after the conversion, from the check of the new
     Matroska file, which reads the same windows and the words carried over, see process(). known holds the item's
     original languages for sub_hold(). broken holds the ffprobe indexes of the tracks of broken_tracks(), which the
-    remux removes, so the check leaves them out."""
+    remux removes, so the check leaves them out. ready(verdicts) runs before the first move, see convert()."""
     if dur < config.SUB_MIN_SECONDS or not checks.lid_ready():
         return subs, []
     ts = decide.classify(j)
@@ -255,13 +256,15 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
         if x and x["index"] not in broken and x.get("codec_name") in ("subrip", "ass", "ssa", "webvtt", "mov_text") and t["role"] in config.SUB_ROLES \
                 and k in audio and subtitles.spaced(t["lang"]):
             r = checks.run_bounded(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{x['index']}", "-c:s", "srt", "-f", "srt", "-"],
-                            600, capture_output=True, text=True, errors="replace")
+                            600, use="convert.convert_subs", capture_output=True, text=True, errors="replace")
             items[t["pos"]] = (t["lang"], audio[k], [(a / 1000, b / 1000, c) for a, b, c in (proof.srt_cues(r.stdout) if r.returncode == 0 else [])])
     if not items:
         return subs, []
     c = j.get("container") or {}   # mkvmerge gives no duration for an MP4, and the hearing needs one, so ffprobe's goes in
     timed = j if decide.duration(j) else dict(j, container=dict(c, properties=dict(c.get("properties") or {}, duration=round(dur * 1e9))))
     got = info["subcheck"] = subtitles.sub_held(subtitles.sub_verdicts(path, timed, items), items, ts, known)
+    if ready:
+        ready(got)
     keep = []
     for s in subs:
         r = got.get(s["name"]) or {}
@@ -824,7 +827,7 @@ def held_name(path):
 
 
 def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False, source="backfill",
-            outside=False):
+            outside=False, compare=None):
     """Remux a file that is not Matroska, and its sidecar subtitles, into <base>.mkv, under the caller's file lock
     (docs/design.md, "Conversion"). j is its mkvmerge -J probe, st its stat, ids the app's ids of the item. Returns (code,
     result, info, the file's path now). result is "repacked", "would repack: ...", "repack failed: ..." or "skipped, not
@@ -873,10 +876,16 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     the undo leaves the new file in place. A dry run writes none, and its result names each one. info["broken"] names
     each track by its place in the original, with its sidecar.
 
-    A conversion of --check, source check, keeps the original too, see cli.check(). The sidecars it muxed go to the kept
+    A conversion of --check, source check, keeps the original too, see cli.check(), and so does its queued job, source
+    check_job, see cli.check_queue(). The sidecars it muxed go to the kept
     originals with it. outside is a file of --check that no app lists. Its conversion asks the app nothing. The new name
     goes beside the original, and the original and its sidecars stay in place. A file whose new name is its own keeps
-    the original as any conversion of --check does."""
+    the original as any conversion of --check does.
+
+    info["planned"] is a digest of what the conversion writes. It holds its result, the broken tracks, the verdicts and
+    fixes of its subtitle check, and each sidecar it muxes, by name, language, flags, size and mtime. A plan row holds
+    it, see process.conversion(). compare(digest) runs before the first write of the conversion, in a dry run too. The
+    write gate compares the digest with the row there, and raises gate.PlanRefused when they differ, see gate.opened()."""
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
@@ -908,7 +917,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     what = f"the container is {container}" + ((", a new .mkv beside it" if outside else ", renamed to .mkv") if new != path else "") \
         + (f", {len(subs)} sidecar subtitles" if subs else "") \
         + (f", {len(caps)} CEA-608 caption tracks as SubRip" if caps else "")
-    check = source == "check" and not (outside and new != path)   # it keeps the original, see the swap below
+    check = source in ("check", "check_job") and not (outside and new != path)   # it keeps the original, see the swap below
     why, old, items, cc, drop = why or convert_skip(app, path, new, st, ids, outside, check), {}, {}, {}, []
     said = lambda code, text: (code, text) if text else None
     if not why and new != path and not outside:   # read-only: the app's record of the original, which the ManualImport copies
@@ -930,13 +939,25 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         except BaseException:
             shutil.rmtree(folder, ignore_errors=True)
             raise
+
+    def ready(got):   # the conversion as a plan row holds it, before the first write of the run, see process.conversion()
+        info["planned"] = mine = runner.digest([what, sorted(broken), {k: [r.get("verdict"), (r.get("timing") or {}).get("fix")] for k, r in (got or {}).items()},
+                                                [[s["name"], s["lang"], s["flags"], *runner.file_key(os.stat(s["path"]))[1:]] for s in subs]])
+        if compare:
+            try:
+                compare(mine)
+            except BaseException:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
     if not why and sub and not unreadable:
         try:
             subs, drop = convert_subs(path, j, streams, subs, dur, apply, folder, info, known,
-                                      **({"broken": {e["stream"] for e in broken.values()}} if broken else {}))
+                                      **({"broken": {e["stream"] for e in broken.values()}} if broken else {}), ready=ready)
         except BaseException:
             shutil.rmtree(folder, ignore_errors=True)
             raise
+    if not why and "planned" not in info:   # no subtitle check heard the tracks
+        ready(None)
     skip = {e["stream"] for e in broken.values()} | {i for _, i in drop}   # the streams the remux leaves out
     if broken:   # the decision log names each track by its place in the original, and a dry run names each sidecar too
         shift = start_shift(path, streams, skip)
@@ -985,7 +1006,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         gone = [t for t, _ in drop] + [e["id"] for e in broken.values()]
         times, plans = remux.planned_args(path, j, [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in gone], folder) \
             if c.get("type") == "Matroska" else ([], {})   # a WebM, as convert_cmd() orders the tracks
-        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times),
+        r = ff.run("convert.convert", convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times),
                            capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so

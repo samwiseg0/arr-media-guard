@@ -3,7 +3,7 @@
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
 import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error, urllib.request
 
-from . import apps, checks, config, content, decide, health, report, runner, store
+from . import apps, checks, config, content, decide, ff, health, report, runner, store
 
 
 def log(rec):
@@ -82,7 +82,12 @@ def decision(rec, started):
     """Write one decision line for a file the hook, a backfill or an audit looked at, then its one-line summary to syslog,
     see report.render(). The summary says tmdb=not_asked when the run asked TMDB nothing, as in a conversion backfill.
     The store keeps the KEPT_KEYS of the line, under no app for a file no app lists, see cli.check(), so no audit of an
-    app counts it."""
+    app counts it. A time read that ff.py refused since started, in this process or a child, makes the line an error
+    that names it, as a caller may have caught the TimeRead (docs/design.md, "Time reads")."""
+    if refused := ff.faults(started):
+        # ponytail: a backfill with several worker threads errors each line written in the same span. A refusal is a
+        # fault of a code path, so it shows on every file anyway. A per-job token through threads and children if not.
+        rec = dict(rec, outcome="error", result=config.mask(f"error: TimeRead: {refused[0]}")[:300], ff_refused=refused[:5])
     rec = report.render(dict(rec, took=round(time.time() - started, 2)), "log")
     store.decided(log(rec), None if rec.get("outside") else rec.get("app"), rec.get("path"), config.mask(json.dumps({k: rec[k] for k in KEPT_KEYS if k in rec})))
     line = report.render(rec, "logfmt")

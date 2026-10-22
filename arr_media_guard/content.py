@@ -17,7 +17,7 @@ docs/design.md, "Metadata checks", has the rules and the reasons behind them.
 """
 import contextlib, difflib, fcntl, functools, http.client, json, math, re, select, sqlite3, subprocess, time, unicodedata, urllib.error, urllib.parse, urllib.request
 
-from . import decide
+from . import decide, ff
 
 TMDB = "https://api.themoviedb.org/3"
 CACHE_DAYS = 30
@@ -335,15 +335,15 @@ def last_packet(path, timeout=30, probe=None):
         if len(vs) == 1:
             film = "V:0"
         else:
-            r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", "V", "-show_entries", "stream=index,codec_type,codec_name",
+            r = ff.run("content.last_packet.film", ["ffprobe", "-v", "error", "-of", "json", "-select_streams", "V", "-show_entries", "stream=index,codec_type,codec_name",
                                 path], capture_output=True, text=True, errors="replace", timeout=DEADLINE.bound(timeout))
-            if not (film := decide.main_video((json.loads(r.stdout or "{}") or {}).get("streams") or [])):
+            if not (film := decide.main_video((ff.loads(r, "{}") or {}).get("streams") or [])):
                 return None
             film = str(film["index"])
-        r = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-select_streams", film, "-show_entries", "packet=pts_time:format=start_time",
+        r = ff.run("content.last_packet", ["ffprobe", "-v", "error", "-of", "json", "-select_streams", film, "-show_entries", "packet=pts_time:format=start_time",
                             "-read_intervals", "999999999%+999999999", path], capture_output=True, text=True, errors="replace",
                            timeout=DEADLINE.bound(timeout))
-        d = json.loads(r.stdout or "{}")
+        d = ff.loads(r, "{}")
         pts = [float(p["pts_time"]) for p in d.get("packets") or [] if p.get("pts_time") not in (None, "N/A")]
         return round(max(pts) - float((d.get("format") or {}).get("start_time") or 0), 3) if pts else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -351,16 +351,15 @@ def last_packet(path, timeout=30, probe=None):
         return None
 
 
-def trusted_duration(probe, size, last_packet=None, stored_end=None):
-    """The file's duration when two sources agree. probe is mkvmerge -J or ffprobe JSON, size in bytes, last_packet
-    from last_packet(), stored_end from checks.stored_end().
+def trusted_duration(probe, last_packet=None, stored_end=None):
+    """The file's duration when two sources agree. probe is mkvmerge -J or ffprobe JSON, last_packet from
+    last_packet(), stored_end from checks.stored_end().
 
     Sources: the container header, the stream durations, the stored end, and the last packet. The stream durations
     are mkvmerge's statistics tags, used only when the app that wrote the file wrote them, because ffmpeg copies
     stale tags from its source. The stored end is where the last video or audio frame the file stores ends. A
-    container with no reader of AMG (READERS), as AVI, takes two estimates instead: the size over the summed bitrate
-    tags, and an ffprobe probe's stream durations. A cover picture, see decide.cover(), leaves the bitrate sum, and its
-    bytes leave the size, as the attachments do.
+    container with no reader of AMG (READERS), as AVI, takes an ffprobe probe's stream durations instead, an estimate.
+    A cover picture, see decide.cover(), leaves the statistics tags.
     trust: "agree" (the header and another source agree), "bitrate" (the header is off, two other sources agree),
     "header" (the header alone) or "conflict" (no two sources agree, or two pairs disagree). seconds is None unless
     two sources agree.
@@ -369,8 +368,6 @@ def trusted_duration(probe, size, last_packet=None, stored_end=None):
     c = (probe.get("container") or {}).get("properties") or {}
     app = c.get("writing_application") or ""
     tracks = probe.get("tracks") or []
-    pics = [t.get("properties") or {} for t in tracks if decide.cover(t, tracks)]
-    props = [t.get("properties") or {} for t in tracks if not decide.cover(t, tracks)]
     av = [t.get("properties") or {} for t in tracks if t.get("type") in ("audio", "video") and not decide.cover(t, tracks)]
     fresh = lambda p: app.startswith("mkvmerge") and p.get("tag__statistics_writing_app", app) == app
     src = {"header": decide.duration(probe)}
@@ -379,11 +376,7 @@ def trusted_duration(probe, size, last_packet=None, stored_end=None):
     read = (probe.get("container") or {}).get("type") in READERS or ((probe.get("format") or {}).get("format_name") or "").startswith(FF_READERS)
     if read:
         src["stored"] = stored_end
-    else:   # no reader: the estimates stay
-        if av and all(fresh(p) and str(p.get("tag_bps", "")).isdigit() for p in av):   # subtitles count when tagged
-            bps = sum(int(p["tag_bps"]) for p in props if fresh(p) and str(p.get("tag_bps", "")).isdigit())
-            src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])
-                              - sum(int(n) for p in pics if fresh(p) and str(n := p.get("tag_number_of_bytes")).isdigit())) * 8 / bps if bps else 0
+    else:   # no reader: the estimate stays
         ff = [float(s["duration"]) for s in probe.get("streams") or [] if s.get("codec_type") in ("audio", "video") and s.get("duration")]
         if ff: src["streams"] = max(ff)
     src["last_packet"] = last_packet
@@ -735,6 +728,5 @@ def header_alert(trusted):
         return None
     if trusted.get("seconds"):
         return f'The file says it runs {hms(s["header"])}, but the video and audio stop at {hms(trusted["seconds"])}. Players may show the wrong length.'
-    k = next((k for k in ("last_packet", "stored", "streams", "bitrate") if s.get(k)), None)
-    real = "its size and bitrate point to" if k == "bitrate" else "the video and audio stop at"
-    return f'The file says it runs {hms(s["header"])}, but {real} {hms(s[k])}. The runtime check was skipped.' if k else None
+    k = next((k for k in ("last_packet", "stored", "streams") if s.get(k)), None)
+    return f'The file says it runs {hms(s["header"])}, but the video and audio stop at {hms(s[k])}. The runtime check was skipped.' if k else None

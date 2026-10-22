@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Unit tests for content.py, the metadata checks behind the wrong-content alerts.
 
-The cases follow Radarr alerts of a dry run. Titles, ids, years, runtimes, sizes and durations are made up, and
+The cases follow Radarr alerts of a dry run. Titles, ids, years, runtimes and durations are made up, and
 each case keeps the ratios its checks read. The probes have the shape of mkvmerge -J. No network: TMDB is a fake _get().
 
 Run: pytest tests/test_arr_meta.py
@@ -54,43 +54,42 @@ def state_dir(tmp_path, monkeypatch):
     return tmp_path / "state"
 
 
-def mkv(header, app, size, tracks=(), attachments=0):
+def mkv(header, app, tracks=()):
     """A cut-down mkvmerge -J probe. tracks: (type, tag_duration, tag_bps). The statistics app is the writing app."""
     stat = lambda d, b: {"tag_duration": d, "tag_bps": b, "tag__statistics_writing_app": app} if d else {}
     return {"container": {"type": "Matroska", "properties": {"duration": header, "writing_application": app}},
-            "tracks": [{"type": t, "properties": stat(d, b)} for t, d, b in tracks],
-            "attachments": [{"size": attachments}] if attachments else []}, size
+            "tracks": [{"type": t, "properties": stat(d, b)} for t, d, b in tracks]}
 
 
-# (probe, size, last video packet) for each case.
+# (probe, last video packet) for each case.
 PROBES = {
-    "Film A": (*mkv(5673794000000, "mkvmerge v4.1.0", 2917802658, [("video", None, None), ("audio", None, None)]), 3901.113),
-    "Film B": (*mkv(6179277000000, "mkvmerge v71.1.0", 3866505029, [("video", "01:42:59.231000000", "4175993"),
-                                                                    ("audio", "01:42:59.277000000", "821760")]), 6179.192),
-    "Film D": (*mkv(56593450000000, "mkvmerge v3.4.0", 4542708124, [("video", None, None), ("audio", None, None)], 1377312), 6943.192),
-    "Film E": (*mkv(9017443000000, "mkvmerge v8.9.0", 9241993462, [("video", "02:30:17.420000000", "7525141"),
-                                                                   ("audio", "02:30:17.443000000", "672000")]), 9017.381),
-    "Film F": (*mkv(7172972000000, "mkvmerge v20.0.0", 4328606025, [("audio", "01:59:32.960000000", "120790"),
-                                                                    ("video", "01:59:32.911000000", "4335770"),
-                                                                    ("audio", "01:59:32.972000000", "368640")]), 7172.911),
-    "Film G": (*mkv(1391069000000, "mkvmerge v10.1.0", 1605172434, [("video", "00:23:11.057000000", "8627710"),
-                                                                    ("audio", "00:23:11.069000000", "601600")]), 1391.011),
-    "Film H": (*mkv(2316476000000, "mkvmerge v3.4.0", 738365314, [("video", None, None), ("audio", None, None)]), 2316.444),
-    "Film J": (*mkv(8233109000000, "mkvmerge v12.0.0", 14686026208, [("video", "02:17:13.105000000", "13867198"),
-                                                                     ("audio", "02:17:13.109000000", "400325")], 522913), 8233.065),
-    "Film K": (*mkv(4097808000000, "mkvmerge v74.0.0", 5436783199, [("video", "01:08:17.776000000", "9933397"),
-                                                                    ("audio", "01:08:17.808000000", "678400")]), 4097.738),
-    "Film L": (*mkv(11108748000000, "mkvmerge v83.0", 9357035356, [("video", "02:03:26.147000000", "9482112"),
-                                                                   ("audio", "02:03:26.178000000", "620800")]), 7406.104),
-    "Film M": (*mkv(5542378000000, "mkvmerge v88.0", 5115555916, [("video", "01:32:22.337000000", "7148915"),
-                                                                  ("audio", "01:32:22.378000000", "232960")]), 5542.297),
-    "Film N": (*mkv(9529336000000, "mkvmerge v82.0", 7238074150, [("video", "01:40:49.899000000", "8973371"),
-                                                                  ("audio", "01:40:49.903000000", "595200")]), 6049.855),
-    "Film P": (*mkv(6656566000000, "mkvmerge v89.0", 5253829435, [("video", "01:50:56.434000000", "5614476"),
-                                                                  ("audio", "01:50:56.566000000", "697600")]), 6655.48),
-    "Film Q": (*mkv(3356638000000, "mkvmerge v58.0.0", 2076503520, [("video", "00:55:56.616000000", "4538985"),
-                                                                    ("audio", "00:55:56.601000000", "116656"),
-                                                                    ("audio", "00:55:56.582000000", "290950")]), 3356.6),
+    "Film A": (mkv(5673794000000, "mkvmerge v4.1.0", [("video", None, None), ("audio", None, None)]), 3901.113),
+    "Film B": (mkv(6179277000000, "mkvmerge v71.1.0", [("video", "01:42:59.231000000", "4175993"),
+                                                       ("audio", "01:42:59.277000000", "821760")]), 6179.192),
+    "Film D": (mkv(56593450000000, "mkvmerge v3.4.0", [("video", None, None), ("audio", None, None)]), 6943.192),
+    "Film E": (mkv(9017443000000, "mkvmerge v8.9.0", [("video", "02:30:17.420000000", "7525141"),
+                                                      ("audio", "02:30:17.443000000", "672000")]), 9017.381),
+    "Film F": (mkv(7172972000000, "mkvmerge v20.0.0", [("audio", "01:59:32.960000000", "120790"),
+                                                       ("video", "01:59:32.911000000", "4335770"),
+                                                       ("audio", "01:59:32.972000000", "368640")]), 7172.911),
+    "Film G": (mkv(1391069000000, "mkvmerge v10.1.0", [("video", "00:23:11.057000000", "8627710"),
+                                                       ("audio", "00:23:11.069000000", "601600")]), 1391.011),
+    "Film H": (mkv(2316476000000, "mkvmerge v3.4.0", [("video", None, None), ("audio", None, None)]), 2316.444),
+    "Film J": (mkv(8233109000000, "mkvmerge v12.0.0", [("video", "02:17:13.105000000", "13867198"),
+                                                       ("audio", "02:17:13.109000000", "400325")]), 8233.065),
+    "Film K": (mkv(4097808000000, "mkvmerge v74.0.0", [("video", "01:08:17.776000000", "9933397"),
+                                                       ("audio", "01:08:17.808000000", "678400")]), 4097.738),
+    "Film L": (mkv(11108748000000, "mkvmerge v83.0", [("video", "02:03:26.147000000", "9482112"),
+                                                      ("audio", "02:03:26.178000000", "620800")]), 7406.104),
+    "Film M": (mkv(5542378000000, "mkvmerge v88.0", [("video", "01:32:22.337000000", "7148915"),
+                                                     ("audio", "01:32:22.378000000", "232960")]), 5542.297),
+    "Film N": (mkv(9529336000000, "mkvmerge v82.0", [("video", "01:40:49.899000000", "8973371"),
+                                                     ("audio", "01:40:49.903000000", "595200")]), 6049.855),
+    "Film P": (mkv(6656566000000, "mkvmerge v89.0", [("video", "01:50:56.434000000", "5614476"),
+                                                     ("audio", "01:50:56.566000000", "697600")]), 6655.48),
+    "Film Q": (mkv(3356638000000, "mkvmerge v58.0.0", [("video", "00:55:56.616000000", "4538985"),
+                                                       ("audio", "00:55:56.601000000", "116656"),
+                                                       ("audio", "00:55:56.582000000", "290950")]), 3356.6),
 }
 
 
@@ -137,10 +136,10 @@ ALERT_ONLY = {"Film Q", "Film H"}
 
 def evidence(label):
     langs, original, exp, listed, release, year, years, oth = CASES[label]
-    probe, size, last = PROBES[label]
+    probe, last = PROBES[label]
     tracks = [{"kind": "a", "role": "main", "lang": x, "conf": 0.6} for x in langs]
     alts = [(label, year)] + [(None, y) for y in years]
-    return M.wrong_content_evidence(tracks, original, exp, M.trusted_duration(probe, size, last), listed, release,
+    return M.wrong_content_evidence(tracks, original, exp, M.trusted_duration(probe, last), listed, release,
                                     "special" if exp["special"] else "movie", year, alts, oth)
 
 
@@ -163,45 +162,41 @@ def test_real_alerts_signals():
 
 
 def test_trusted_duration_real_files():
-    t = lambda label: M.trusted_duration(*PROBES[label])
+    t = lambda label: M.trusted_duration(PROBES[label][0], PROBES[label][1])
     # a header with no second source that agrees: Film D says 15:43:13, Film A 1:34:33 on a 65-minute file
     assert t("Film D")["trust"] == "conflict" and t("Film D")["seconds"] is None
     assert t("Film A")["trust"] == "conflict"
-    # a stray subtitle event sets the header of Film L and Film N. Streams, bitrate and last packet agree.
+    # a stray subtitle event sets the header of Film L and Film N. Streams and last packet agree.
     stray = t("Film L")
     assert (stray["seconds"], stray["trust"], stray["header_ok"], stray["sources"]["header"]) == (7406.178, "bitrate", False, 11108.748)
     assert round(t("Film N")["seconds"]) == 6050
     assert t("Film E")["trust"] == "agree" and t("Film E")["seconds"] == 9017.443
     assert t("Film H")["trust"] == "agree"   # header and last packet, no statistics
     # without the last packet a header alone is never trusted
-    probe, size, _ = PROBES["Film D"]
-    assert M.trusted_duration(probe, size) == {"seconds": None, "trust": "header", "sources": {"header": 56593.45}, "header_ok": None}
+    probe = PROBES["Film D"][0]
+    assert M.trusted_duration(probe) == {"seconds": None, "trust": "header", "sources": {"header": 56593.45}, "header_ok": None}
 
 
 def test_trusted_duration_rules():
-    probe, size = mkv(7200 * 10**9, "mkvmerge v92.0", 7200 * 5_000_000 // 8, [("video", "02:00:00.000000000", "4600000"),
-                                                                               ("audio", "02:00:00.000000000", "400000")])
-    assert M.trusted_duration(probe, size)["trust"] == "agree"
+    probe = mkv(7200 * 10**9, "mkvmerge v92.0", [("video", "02:00:00.000000000", "4600000"),
+                                                  ("audio", "02:00:00.000000000", "400000")])
+    assert M.trusted_duration(probe)["trust"] == "agree"
     # statistics written by another app are stale: ffmpeg copies them
     stale = json.loads(json.dumps(probe))
     stale["container"]["properties"]["writing_application"] = "Lavf60.16.100"
-    assert M.trusted_duration(stale, size)["trust"] == "header"
+    assert M.trusted_duration(stale)["trust"] == "header"
     # two pairs that disagree: the header with the last packet against the statistics and the stored end
-    probe, size = mkv(10800 * 10**9, "mkvmerge v92.0", 7200 * 5_000_000 // 8, [("video", "02:00:00.000000000", "4600000"),
-                                                                                ("audio", "02:00:00.000000000", "400000")])
-    assert M.trusted_duration(probe, size, 10799.0, 7200.0)["trust"] == "conflict"
-    # a container AMG reads takes no length from a bitrate: the stored end stands in
-    assert set(M.trusted_duration(probe, size, None, 7200.0)["sources"]) == {"header", "streams", "stored"}
-    # a container with no reader keeps the bitrate. Attachments are not bitrate: 400 MB of fonts in a 1.6 GB file
-    probe, size = mkv(0, "mkvmerge v92.0", 2_000_000_000, [("video", "00:40:00.000000000", "5000000"),
-                                                           ("audio", "00:40:00.000000000", "333334")], attachments=400_000_000)
-    del probe["container"]["type"]
-    assert M.trusted_duration(probe, size)["trust"] == "bitrate"
-    probe["container"]["type"] = "Matroska"
-    assert M.trusted_duration(probe, size)["trust"] == "conflict" and M.trusted_duration(probe, size, None, 2400.0)["trust"] == "bitrate"
+    probe = mkv(10800 * 10**9, "mkvmerge v92.0", [("video", "02:00:00.000000000", "4600000"),
+                                                   ("audio", "02:00:00.000000000", "400000")])
+    assert M.trusted_duration(probe, 10799.0, 7200.0)["trust"] == "conflict"
+    # a container AMG reads takes the stored end
+    assert set(M.trusted_duration(probe, None, 7200.0)["sources"]) == {"header", "streams", "stored"}
+    # a header of 0 counts as none: the statistics alone are no trusted duration, and with the stored end they are
+    probe = mkv(0, "mkvmerge v92.0", [("video", "00:40:00.000000000", "5000000"), ("audio", "00:40:00.000000000", "333334")])
+    assert M.trusted_duration(probe)["trust"] == "conflict" and M.trusted_duration(probe, None, 2400.0)["trust"] == "bitrate"
     # ffprobe of an mp4: the index gives each stream a duration
     ff = {"format": {"duration": "5400.0"}, "streams": [{"codec_type": "video", "duration": "5399.9"}, {"codec_type": "audio", "duration": "5400.0"}]}
-    assert M.trusted_duration(ff, 1)["trust"] == "agree"
+    assert M.trusted_duration(ff)["trust"] == "agree"
 
 
 def test_runtime_verdict():
@@ -436,7 +431,7 @@ def test_iso_codes(code, want):
 def test_very_short_needs_tmdb():
     """Film G runs 23 of 121 minutes. Without TMDB's runtime to confirm the listing it scores one point, not two."""
     tracks = [{"kind": "a", "role": "main", "lang": "eng", "conf": 0.6}]
-    ev = M.wrong_content_evidence(tracks, "English", None, M.trusted_duration(*PROBES["Film G"]), 121,
+    ev = M.wrong_content_evidence(tracks, "English", None, M.trusted_duration(PROBES["Film G"][0], PROBES["Film G"][1]), 121,
                                   "Film.G.2015.1080p.NF.WEB-DL", "movie", 2016, [("Film G", 2016), (None, 2015)])
     assert ev["points"] == 1 and not ev["regrab"], ev
 
@@ -493,14 +488,14 @@ def test_special_never_scores_two_on_runtime():
 
 
 def test_header_alert():
-    t = lambda label: M.trusted_duration(*PROBES[label])
+    t = lambda label: M.trusted_duration(PROBES[label][0], PROBES[label][1])
     assert M.header_alert(t("Film D")) == \
         "The file says it runs 15:43:13, but the video and audio stop at 1:55:43. The runtime check was skipped."
     assert M.header_alert(t("Film L")) == "The file says it runs 3:05:08, but the video and audio stop at 2:03:26. Players may show the wrong length."
     assert M.header_alert(t("Film E")) is None
-    probe, size, _ = PROBES["Film D"]
-    assert M.header_alert(M.trusted_duration(probe, size)) is None   # a header alone says nothing
-    assert M.header_alert(M.trusted_duration(probe, size, None, 6943.192)) == \
+    probe = PROBES["Film D"][0]
+    assert M.header_alert(M.trusted_duration(probe)) is None   # a header alone says nothing
+    assert M.header_alert(M.trusted_duration(probe, None, 6943.192)) == \
         "The file says it runs 15:43:13, but the video and audio stop at 1:55:43. The runtime check was skipped."   # the stored end alone
 
 

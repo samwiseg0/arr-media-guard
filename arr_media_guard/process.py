@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks and the one write of one file, process(), with the metadata checks it runs."""
-import contextlib, dataclasses, fcntl, os, sqlite3, statistics, subprocess, time, uuid
+import contextlib, dataclasses, fcntl, json, os, sqlite3, statistics, subprocess, time, uuid
 
-from . import apps, checks, cli, config, content, convert, decide, logs, proof, regrab, remux, report, runner, store, subsync, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, gate, logs, matroska, proof, regrab, remux, report, runner, store, subsync, subtitles, vault
 
 
-def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=None, nfo=None):
+def metadata(app, path, j, d, original, release, item, fresh=False, asked=None, nfo=None):
     """The checks of content.py on one probed file against its item, item from movie_item() or episode_item(). Returns
     {"trusted", "expected", "other", "evidence", "tmdb"}. A TMDB failure reads as unknown. TMDB's status goes to
     status.json only after a live answer, because a cache hit says nothing about the key. fresh is a second check
     before a re-grab, see tmdb_ask(). asked is the tmdb_ask() the decision already made, so TMDB is asked once. nfo is
     the episode title of the release's NFO, see release_nfo_title(). It wins over the title in the release name."""
-    trusted = content.trusted_duration(j, size, content.last_packet(path, probe=j), checks.stored_end(path, j))
+    trusted = content.trusted_duration(j, content.last_packet(path, probe=j), checks.stored_end(path, j))
     token, ids = config.CFG.tmdb_token or None, item.get("ids") or {}
     cache = "tmdb-recheck" if fresh else "tmdb"
     expected, t0 = asked or checks.tmdb_ask(app, item, fresh)
@@ -186,7 +186,11 @@ class Ctx:
     flags. A deep analysis of --check runs in the foreground, see cli.check(), so it never yields to an import, and
     yields is False. A job a backfill queued has check and "backfill" in job, see runner.deep_analysis(). Its source
     is backfill_job, so its conversion keeps no original, as an import's does. waits is True for it, so it stops for an
-    import that waits before a conversion and before a remux, until a step replaced the file, see refresh()."""
+    import that waits before a conversion and before a remux, until a step replaced the file, see refresh(). A job
+    that applies a plan of a dry run has that run's file key in planned, see cli.planned_file(). start() refuses a file
+    with another key, and waits is True for it too. A job of --check --background has check and planned, and its
+    source is check_job. Its conversion keeps the original, as one of --check does. Its apply has the plan row in row,
+    and each write goes through the write gate, which compares it with the row first, see gate.allow()."""
     app: str; path: str; label: str; original: str; runtime: object   # the file, and its item's original language and runtime
     mode: str = "import"; job: dict = None   # job is the queued hook job of an import
     save: object = None   # stores job in the queue, see runner.run_job()
@@ -200,17 +204,20 @@ class Ctx:
     force: str = None   # the refusal a person accepts, see convert()
     recheck: str = None
     held: list = None   # the alerts an import holds for the deep analysis of its file, see alerts()
+    planned: list = None   # the file key of the dry run whose plan a queued job applies, see start() and cli.planned_file()
+    row: dict = None   # the plan row that the apply of a queued job follows, see gate.allow()
 
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f"no mode {self.mode}")
         self.check = (self.job or {}).get("check")
         queued = bool((self.job or {}).get("backfill"))   # a job a backfill queued, see runner.deep_analysis()
-        self.source = "recheck" if self.recheck else "backfill_job" if queued else "check" if self.check else \
+        self.source = "recheck" if self.recheck else ("check_job" if self.planned is not None else "backfill_job") if queued else \
+            "check" if self.check else \
             {"import": "hook", "deep": "deep_analysis"}.get(self.mode, "backfill")   # of the decision log
         self.background = self.mode == "deep" or bool(self.recheck)
         self.yields = self.background and not self.check   # it stops for an import that waits, see runner.deep_waits()
-        self.waits = self.yields or queued   # it stops for an import before a conversion and before a remux
+        self.waits = self.yields or queued or self.planned is not None   # it stops for an import before a conversion and before a remux
         self.depth = self.recheck or self.mode
 
     def rearm(self):
@@ -222,12 +229,17 @@ def process(ctx):
     """Probe one file and decide its flags, see Ctx. Hear the audio language when the decision needs it, check the
     subtitles, check the audio and the video (import only), then write the file once with the flag edits and any remux
     the checks planned, see write(), and verify. Then run the metadata checks and alert. A step that ends the run returns True. Returns the decision log record, which the
-    caller writes with decision(). Once a stop is asked, see runner.stop_asked(), no further step runs, see stop_line()."""
+    caller writes with decision(). Once a stop is asked, see runner.stop_asked(), no further step runs, see stop_line().
+    A write of a queued plan that differs from the row ends the run before the write, see refuse()."""
     for i, step in enumerate(STEPS):
         if i and runner.stop_asked():
             stop_line(ctx, STEPS[i:])
             break
-        if step(ctx):
+        try:
+            if step(ctx):
+                break
+        except gate.PlanRefused as ex:
+            refuse(ctx, ex.args[0])
             break
     return ctx.rec
 
@@ -236,7 +248,9 @@ def stop_line(ctx, left):
     """The record of a run that a stop ended before the steps left, so its decision line comes at once. "not_run" names
     those steps. A run that stopped before its decision gets the outcome stopped, with the reason codes of what it
     wrote, so the Plex analyze of a changed file still runs. A job goes back to the queue, see runner.job_process(),
-    and its next run makes the rest. A backfill ends after the file.
+    and its next run makes the rest. A backfill ends after the file. A job that applies a plan stores the key of the
+    file its own writes left, see own_writes(), so its next run tells them from a change by another program, see
+    cli.planned_file().
 
     No later run finds a re-grab that acted, or the subtitles a conversion took out. So the findings keep ctx.first and
     the unreadable notice, and they post, with the change posts of the writes that finished, see
@@ -247,18 +261,31 @@ def stop_line(ctx, left):
     if "outcome" not in rec:   # a conversion that failed or was skipped set one, so "repack" here is a conversion that ran
         wrote = (["repacked"] if "repack" in rec else []) + [c for c in [(rec.get("header_repair") or {}).get("code")] if c in config.REPAIRED]
         rec.update(outcome="stopped", result="not checked: the run was stopped", reasons=rec.get("reasons") or wrote)
+    held = False   # the job holds the rescan for its next run
     if after_edit in left and (parts := rescanned(ctx)):
         if ctx.mode == "import" and ctx.save:
-            ctx.job["rescan"] = True
-            with contextlib.suppress(sqlite3.Error):   # a busy store costs the rescan, and the app's own refresh reads the file later
-                ctx.save()
+            ctx.job["rescan"] = held = True
         elif not (ctx.mode == "import" or ctx.background):
             for x in parts:
                 x["rescan"] = "after the run"
+    own = own_writes(ctx) if ctx.planned is not None else []
+    if ctx.save and (held or own):
+        with contextlib.suppress(OSError, sqlite3.Error):   # a busy store costs the rescan, and the app's own refresh reads the file later
+            ctx.save(**({"own": own} if own else {}))
     found = [f for f in [*getattr(ctx, "first", ()), getattr(ctx, "unreadable", None)] if f]   # faults() and conversion() set them
     rec.update(findings=found, alert_kinds=[f["kind"] for f in found])
     if ctx.post:
         rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(ctx.path) if os.path.exists(ctx.path) else ctx.size)
+
+
+def own_writes(ctx):
+    """The reason codes of the writes of ctx's run that changed the file: a conversion, a header repair, a subtitle
+    remux and a flag edit."""
+    rec = ctx.rec
+    hr, rm = rec.get("header_repair") or {}, rec.get("subremux") or {}
+    return (["repacked"] if "repack" in rec and not ctx.unconverted and rec["repack"].get("new_size") else []) + \
+        ([hr["code"]] if hr.get("code") in config.REPAIRED else []) + (rm.get("codes") or [] if rm.get("done") else []) + \
+        (["edited"] if "edited" in (rec.get("outcome"), rec.get("edit_result")) else [])
 
 
 def rescanned(ctx):
@@ -312,6 +339,9 @@ def start(ctx):
     if ctx.apply and (ctx.mkv or ctx.conv):   # a SIGKILL during a repack leaves its temp file
         remux.sweep_repack_tmp(os.path.dirname(ctx.path), ctx.source)
     refresh(ctx)
+    if ctx.planned and list(runner.file_key(ctx.st)) != list(ctx.planned):   # under the file lock, so the run edits only the file the dry run planned
+        ctx.rec.update(outcome="plan_refused", result="refused, the file changed since the dry run")
+        return True
     ctx.muted = runner.muted(ctx.path, ctx.st)   # a burn-in job turned off the English subtitles, see decision_fields()
     ctx.extra = []   # the reason codes faults() adds to the decision's, which decision_fields() keeps
 
@@ -333,9 +363,10 @@ def conversion(ctx):
     if ctx.waits:   # a conversion of a film takes minutes, so an import that waits goes first
         runner.deep_waits()
     was = ctx.path
-    got, result, rec["repack"], ctx.path = convert.convert(ctx.app, ctx.path, j, st, ctx.apply, rec["ids"], ctx.lock, ctx.pool, ctx.force,
-                                                           ctx.subs_on and subtitles.sub_fixes(ctx.source), decide.codes(ctx.original),
-                                                           shared=bool(ctx.shared or ctx.pool), source=ctx.source, outside=ctx.check == "outside")
+    got, result, rec["repack"], ctx.path = gate.allow(ctx, "conversion", lambda: convert.convert(
+        ctx.app, ctx.path, j, st, ctx.apply, rec["ids"], ctx.lock, ctx.pool, ctx.force, ctx.subs_on and subtitles.sub_fixes(ctx.source),
+        decide.codes(ctx.original), shared=bool(ctx.shared or ctx.pool), source=ctx.source, outside=ctx.check == "outside",
+        compare=lambda mine: gate.opened(ctx, "conversion", convert_plan=mine)), late=True)   # the compare comes before the first write, see convert()
     path = ctx.path
     # A relink gives the file a new id: the new name, or the original that convert_undo() imported again. The new name
     # always replaces the old id. Its id is None when an undo found the new name listed but could not read the id, and
@@ -367,6 +398,11 @@ def conversion(ctx):
         if path != rec["path"]:   # the app lists the new name now, with the new file id above, unless it is outside the library
             rec["path"], ctx.mkv = path, True
         logs.log(dict(rec, outcome="repacked", result="repacked"))   # a repack cannot be undone, so its record is on disk before anything else runs
+        if ctx.row is not None:   # no dry run saw the new file, so the rest of the job runs as --check --apply runs it, see gate.differs()
+            ctx.row = None
+            if ctx.save:   # a run after a stop goes on from the new file, see cli.planned_file()
+                with contextlib.suppress(OSError, sqlite3.Error):
+                    ctx.save(converted=list(runner.file_key(os.stat(path))))
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
         if broken := rec["repack"].get("broken"):
             ctx.unreadable = report.unreadable_finding(broken, rec["repack"].get("kept"), container)
@@ -392,7 +428,8 @@ def conversion(ctx):
     rec.update(outcome=got, result=result, reasons=["not_matroska"], **{"class": f"would repack {kind}" if would else "not Matroska"})
     if ctx.keep_plan:   # outcome: --audit --plan-from groups the skipped files by it
         rec["plan"] = {"app": ctx.app, "label": ctx.label, "path": path, "class": rec["class"], "edits": [], "undecided": None, "dropped": [],
-                       "cls": None, "orig": [], "tracks": [], "repack": result, "outcome": got,
+                       "cls": None, "orig": [], "tracks": [], "repack": result, "outcome": got, "key": list(runner.file_key(ctx.st)),
+                       **({"convert_plan": rec["repack"]["planned"]} if rec["repack"].get("planned") else {}),
                        **({} if would else {"skipped": f"not Matroska: {container}"})}
     failed = None
     if got == "repack_failed":   # one embed, like a failed flag edit. A skip, a dry run or a changed original posts nothing.
@@ -426,6 +463,7 @@ def header(ctx):
     ctx.asked = checks.tmdb_ask(ctx.app, ctx.item)   # the forced-flag clear of an English original needs TMDB's spoken languages. metadata() reuses it.
     ctx.hp = ctx.vpre = ctx.head = None   # header_probe(), and the video check of a file with a header issue, which looks for real damage first
     ctx.ended = False   # a subtitle remux ended a header issue that stayed, see write()
+    ctx.header_plan = None   # what the header repair writes, see writes()
     if ctx.mkv and config.CFG.header_repair and ctx.video and not ctx.background:
         ctx.hp = checks.header_of(path, j)
     hp = ctx.stage = ctx.hp
@@ -443,6 +481,8 @@ def header(ctx):
     ctx.vpre = checks.video_check(path, j=j, hp=hp)
     h = ctx.vpre[2].get("header") or {}
     ctx.stage = h or dict(hp, repairable=False)
+    if h.get("repairable") and not cut:   # the issue and the subtitle trims and removals the repair writes
+        ctx.header_plan = runner.digest({k: h.get(k) for k in ("issue", "trim", "remove", "streams", "listed", "tail", "edit_tail")})
     if cut and h.get("repairable"):   # the subtitles of a cut file run to the full length and are good: keep the file
         code, result, info = "subtitle_file_may_be_cut", f"not repaired, the file may be cut: {cut}", {"listed": hp["listed"], "streams": h["streams"]}
     elif h.get("repairable") and not hp["first"]:   # the one write of the run repairs it, with the flag edits
@@ -451,7 +491,7 @@ def header(ctx):
     elif h.get("repairable"):
         if ctx.waits:   # as before a subtitle remux
             runner.deep_waits()
-        code, result, info = remux.repack(path, j, ctx.st, ctx.apply, h)
+        code, result, info = gate.allow(ctx, "header repair", lambda: remux.repack(path, j, ctx.st, ctx.apply, h), header_plan=ctx.header_plan)
         if "warnings" in info:
             ctx.rearm()   # repack() ran mkvmerge with the time limit off, whatever came of it
     elif hp.get("unfixable"):
@@ -754,11 +794,14 @@ def decision_fields(ctx):
     rec["reasons"] += ctx.extra
     rec["class"] = decide.plan_class(d)
     if ctx.keep_plan:
-        rec["plan"] = cli.plan_record(ctx.app, ctx.label, ctx.path, d)
+        was = rec.get("plan") if ctx.unconverted else None   # the conversion of an import, which its apply runs first, see conversion()
+        rec["plan"] = dict(cli.plan_record(ctx.app, ctx.label, ctx.path, d), key=list(runner.file_key(ctx.st)))   # see cli.plan_queue()
+        rec["plan"].update({k: was[k] for k in ("class", "repack", "outcome", "skipped", "convert_plan") if k in (was or {})})
         if "header_repair" in rec:
             rec["plan"]["header_repair"] = rec["header_repair"]["code"]
         if checks.padding_only(ctx.hp):   # --only-header leaves it, see docs/design.md, "RFC 9559 check"
             rec["plan"]["padding_only"] = True
+        planned_writes(ctx)
 
 
 def faults(ctx):
@@ -832,6 +875,7 @@ def act(ctx):
     ctx.sides, ctx.side_ends = sides, {n: v for n, v in ctx.flashy.items() if n in sides}   # at SUBTITLES check, sidecar_fix() only reports
     ctx.acts = [n for n in sides if (ctx.sync_all.get(n) or {}).get("verdict") == "mismatch" or ((ctx.sync_all.get(n) or {}).get("timing") or {}).get("fix")
                 or n in ctx.side_ends or n in ctx.side_moves or n in ctx.bad_sides]
+    ctx.wrote = writes(ctx)
     if ctx.shared and ctx.apply and (certain or vcertain or (ctx.mkv and (d["edits"] or ctx.acts or ctx.subplan or ctx.head))):
         ctx.shared.exclusive(ctx.st)
     if certain:
@@ -850,7 +894,8 @@ def act(ctx):
             set_by = "an earlier run set the flags" if ctx.recheck else "the import set the flags"
             rec["flags_kept"] = (set_by if ctx.app else "no app lists the file, so no original language is known") + \
                 ", and only a subtitle verdict changes a flag"
-        if write(ctx):
+        gate.compare(ctx, **ctx.wrote)   # first, so a plan that differs refuses before any write of the run
+        if write(ctx):   # the one write and the sidecar step of after_edit() go through the gate, see gate.allow()
             return True
         rec, d = ctx.rec, ctx.d
         # An abstained or dropped decision has no edits of its own, and its reason stays in "undecided" or "dropped". It
@@ -860,6 +905,47 @@ def act(ctx):
         elif d.get("dropped") and rec["outcome"] == "no_change":
             rec.update(outcome="dropped", result="dropped: " + "; ".join(d["dropped"]))
     write_findings(ctx)
+
+
+WRITES = ("edits", "header_plan", "subtitles")   # the fields of a plan row that the writes follow, see writes()
+
+
+def writes(ctx):
+    """What the one write of the run and the sidecar step will write, as a plan row holds it. That is the flag edits, a
+    digest of the header repair, see header(), and the subtitle plan. The subtitle plan names the tracks by place and the
+    sidecars by name. Its "times" is a digest of their new times, with the tracks by id, so a rename by the app keeps it.
+    act() builds it before the write, so the apply of a queued plan compares it first, see gate.compare()."""
+    sub, sync = ctx.subplan or {}, ctx.sync_all
+    sides = {n: [(sync.get(n) or {}).get("verdict"), ((sync.get(n) or {}).get("timing") or {}).get("fix"), ctx.side_ends.get(n), ctx.side_moves.get(n),
+                 ((ctx.sides.get(n) or {}).get("garbled") or {}).get("repair")] for n in ctx.acts}
+    subs = {k: v for k, v in dict(fixed=sorted(ctx.fixes), ended=sorted(ctx.ends), remove=ctx.remove, timed=sorted(set(ctx.moves) - set(ctx.kept)),
+                                  recoded=sorted(ctx.recode), stripped=sorted(ctx.strip), covers=sorted(e["place"] for e in ctx.covers.values()),
+                                  sidecars=sorted(ctx.acts)).items() if v}
+    if subs:
+        subs["times"] = runner.digest([[sub.get(k) for k in ("fixes", "ends", "timed")], sides])
+    return {"edits": flag_edits(ctx, ctx.d, ctx.unmatched | set(ctx.strip)), "header_plan": ctx.header_plan, "subtitles": subs or None}
+
+
+def planned_writes(ctx):
+    """The writes of the run in its plan row, once act() planned them, see writes(). Their flag edits take the place of
+    the decision's, as the write follows them and a dry remux plans the decision again, see write()."""
+    if ctx.keep_plan and getattr(ctx, "wrote", None) and "plan" in ctx.rec:
+        ctx.rec["plan"].update({k: v for k, v in ctx.wrote.items() if v is not None})
+
+
+def refuse(ctx, diff):
+    """End the run with the outcome plan_refused before a write of a queued plan, as cli.planned_file() refuses after
+    its dry pass, see gate.compare(). diff is plan_diff(). The record keeps the fields of the file and of the writes the
+    run made first, a header repair and a subtitle remux, with their rescan, see rescan(). It has no class, so the audit
+    never takes it as the file's result. It posts nothing."""
+    rec = ctx.rec
+    hr, rm = rec.get("header_repair") or {}, rec.get("subremux") or {}
+    ctx.rec = dict({k: rec[k] for k in ("id", "app", "source", "apply", "ids", "label", "path", "original", "kids", "release", "size", "mtime",
+                                        "file_duration", "header_repair", "subremux") if k in rec},
+                   reasons=([hr["code"]] if hr.get("code") in config.REPAIRED else []) + (rm.get("codes") or [] if rm.get("done") else []),
+                   outcome="plan_refused", plan_diff=diff, result=f"refused, the plan differs from the dry run's in {', '.join(diff)}")
+    rescan(ctx)
+    return True
 
 
 def flag_edits(ctx, d, unmatched):
@@ -888,7 +974,8 @@ def write(ctx):
     replan_of = lambda after: muted_plan(replan(after, plan_inputs(ctx)), ctx.muted)
     edits = flag_edits(ctx, ctx.d, ctx.unmatched | set(ctx.strip))
     if not (sub or head):
-        return edited(ctx, edit(rec, j, edits, ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=ctx.stage))
+        return edited(ctx, gate.allow(ctx, "flag edit", lambda: edit(rec, j, edits, ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=ctx.stage),
+                                      **ctx.wrote))   # the one write, so a remux the row plans and this run does not refuses
     if ctx.waits:   # a remux of a film takes minutes, so an import that waits goes first
         runner.deep_waits()
     gone, ids = {*sub["drop"], *sub.get("strip", ()), *sub.get("covers", ())} if sub else set(), remux.track_ids(j)
@@ -902,8 +989,9 @@ def write(ctx):
     hp = ctx.stage if ctx.stage is not None else checks.header_of(path, j) or {}
     blocked = "; ".join(hp.get("edit_blocked") or [])
     if sub:
-        code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {blocked}", {}) if blocked else \
-            remux.resub(path, j, ctx.st, ctx.apply, **sub, **({"edits": carried} if carried else {}), **({"hp": head} if head else {}))
+        code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {blocked}", {}) if blocked else gate.allow(
+            ctx, "subtitle remux", lambda: remux.resub(path, j, ctx.st, ctx.apply, **sub, **({"edits": carried} if carried else {}), **({"hp": head} if head else {})),
+            **ctx.wrote)
         done = code == "subtitles_remuxed"
         fixes, ends, remove, moves, kept, recode, strip, covers = ctx.fixes, ctx.ends, ctx.remove, ctx.moves, ctx.kept, ctx.recode, ctx.strip, ctx.covers
         timed = set(moves) - set(kept)
@@ -923,8 +1011,8 @@ def write(ctx):
                 ({"would_remux_subtitles": "would_repair_header", "subtitle_remux_skipped": "header_repair_skipped"}.get(code, "header_repair_failed"), result)
             rec["header_repair"] = dict(issue=head["issue"], result=hresult, code=hcode, remux="subtitles")
     else:
-        code, result, info = ("header_repair_skipped", f"header repair skipped, {blocked}: {'; '.join(head['issue'])}", {}) if blocked else \
-            remux.repack(path, j, ctx.st, ctx.apply, head, **({"edits": carried} if carried else {}))
+        code, result, info = ("header_repair_skipped", f"header repair skipped, {blocked}: {'; '.join(head['issue'])}", {}) if blocked else gate.allow(
+            ctx, "header repair", lambda: remux.repack(path, j, ctx.st, ctx.apply, head, **({"edits": carried} if carried else {})), **ctx.wrote)
         done = code in config.REPAIRED
         rec["header_repair"] = dict(info, issue=head["issue"], result=result, code=code)
     if not done:
@@ -936,8 +1024,9 @@ def write(ctx):
         # After a failed remux, edit() keeps the flags of a file it would enclose bytes in (held), and after a failed
         # header repair it tries no second one (tried). repack() gives header_not_repaired only to a stopped one.
         mark = {"subtitle_remux_failed": "held", "header_repair_failed": "tried", "header_not_repaired": "tried"}.get(code)
-        stage = dict(hp, **{mark: result}) if mark else hp
-        return edited(ctx, edit(ctx.rec, j, flag_edits(ctx, ctx.d, ctx.unmatched), ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=stage))
+        stage, edits = dict(hp, **{mark: result}) if mark else hp, flag_edits(ctx, ctx.d, ctx.unmatched)
+        return edited(ctx, gate.allow(ctx, "flag edit", lambda: edit(ctx.rec, j, edits, ctx.apply, replan=replan_of, ts=ctx.d["tracks"], hp=stage),
+                                      edits=edits))
     # The original is kept a while, so its record is on disk before anything else runs. It names the undo of the edits it carried.
     logs.log(dict(rec, outcome=code, result=result, **({"undo": ["mkvpropedit", path] + propedit_args(carried, 2)} if carried else {})))
     checks.lid_carry(path, ctx.st)   # the proof shows the same audio, so the words the checks heard move to the new file
@@ -960,7 +1049,7 @@ def write(ctx):
     want = flag_edits(ctx, ctx.d, ctx.unmatched)
     asked = {(e[0], decide.prop(e)) for e in want}
     left = [[e[0], e[2], e[1], *e[3:]] for e in carried if (e[0], decide.prop(e)) not in asked] + decide.unapplied(ctx.j, want)
-    out = edit(ctx.rec, ctx.j, left, True, replan=replan_of, ts=ctx.d["tracks"])
+    out = gate.allow(ctx, "replan edit", lambda: edit(ctx.rec, ctx.j, left, True, replan=replan_of, ts=ctx.d["tracks"]), **replanned(ctx, want))
     out["replan_edits"] = len(out.get("edits") or [])
     if carried and not want and out["outcome"] == "edited":   # the replan took back every carried edit, so the flags are the original's
         out = dict({k: v for k, v in out.items() if k not in ("before", "edits", "undo", "after", "recheck")}, outcome="no_change", result="no change")
@@ -975,6 +1064,17 @@ def write(ctx):
             except Exception as ex:
                 out["recheck"] = {"error": config.mask(f"{type(ex).__name__}: {ex}")[:200]}
     edited(ctx, out)
+
+
+def replanned(ctx, want):
+    """The compare of the replan edit after a remux of a queued plan, see gate.allow(). want is the replan's flag edits
+    of the new file. They must be the row's edits of the tracks the new file holds, by track UID. So the replan keeps
+    the row's edits, and an edit of its own refuses. With no row it compares nothing."""
+    if ctx.row is None:
+        return {}
+    now = {t["sel"] for t in decide.classify(ctx.j)}
+    by = lambda es: sorted(es, key=lambda e: json.dumps(e))
+    return {"against": {"edits": by(e for e in ctx.row.get("edits") or [] if e[0] in now)}, "edits": by(want)}
 
 
 def edited(ctx, rec):
@@ -1038,19 +1138,11 @@ def quiet_result(rec, apply, source):
 def after_edit(ctx):
     """The rescan after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
     rec, d = ctx.rec, ctx.d
-    # After the edit, so the app's disk scan never probes a header mkvpropedit is rewriting. A backfill sends one rescan
-    # per item at the end of its run, because Sonarr's rescan of a large series is slow.
-    rescan_now = lambda: "none, no app lists the file" if ctx.check == "outside" else \
-        apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
-    # One rescan after the last write that replaced the file. Each part of the record that names a remux holds what it gave.
-    # A job whose stopped run wrote asks for it too, see stop_line(). The record then holds it.
-    parts = rescanned(ctx) or ([rec] if (ctx.job or {}).get("rescan") else [])
-    said = rescan_now() if parts else None
-    for x in parts:
-        x["rescan"] = said
+    rescan(ctx)
     if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain):   # the sidecars beside the file, under the lock of the edit
-        rec["sidecars"] = subtitles.sidecar_fix({n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
-                                                **({"timed": ctx.side_moves} if ctx.side_moves else {}))
+        rec["sidecars"] = gate.allow(ctx, "sidecars", lambda: subtitles.sidecar_fix(
+            {n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
+            **({"timed": ctx.side_moves} if ctx.side_moves else {})), subtitles=ctx.wrote["subtitles"])
     if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
         rec.update(outcome=named[0], result=named[1])
     elif rec["outcome"] == "no_change" and (said := quiet_result(rec, ctx.apply, ctx.source)):   # the outcome stays, so every count stays
@@ -1102,11 +1194,26 @@ def after_edit(ctx):
     if ctx.lock is not None:   # the edit is done, and the checks below only read the file
         fcntl.flock(ctx.lock, fcntl.LOCK_UN)
     # A stopped run of the job left the extras of its conversion hidden, see stop_line(). This run settles them.
+    # The apply of a queued plan settles only the extras of its own conversion, as its row holds no others. The next
+    # import or --check --apply of the file settles those of another run, and so does convert.pending_recover().
     pending = (rec.get("repack") or {}).get("pending")
-    keys = [pending] if pending else convert.left_converted(ctx.app, ctx.path) if ctx.mode == "import" and ctx.apply else []
+    keys = [pending] if pending else convert.left_converted(ctx.app, ctx.path) if ctx.mode == "import" and ctx.apply and ctx.row is None else []
     if keys and (ctx.mode == "import" or ctx.background):   # two waited rescans, see settle()
         config.DEADLINE.stop()
-        (rec["repack"] if pending else rec)["settle"] = convert.settle_extras(ctx.app, (ctx.ids or {}).get("app_id"), keys)
+        (rec["repack"] if pending else rec)["settle"] = gate.allow(ctx, "extras", lambda: convert.settle_extras(ctx.app, (ctx.ids or {}).get("app_id"), keys))
+
+
+def rescan(ctx):
+    """The app rescan after the last write that replaced the file. Each part of the record that names a remux holds
+    what it gave. A job whose stopped run wrote asks for it too, see stop_line(). The record then holds it. It runs
+    after the edit, so the app's disk scan never probes a header mkvpropedit is rewriting. A backfill sends one rescan
+    per item at the end of its run, because Sonarr's rescan of a large series is slow."""
+    rescan_now = lambda: "none, no app lists the file" if ctx.check == "outside" else \
+        apps.ARR[ctx.app].rescan((ctx.ids or {}).get("app_id")) if ctx.mode == "import" or ctx.background else "after the run"
+    parts = rescanned(ctx) or ([ctx.rec] if (ctx.job or {}).get("rescan") else [])
+    said = rescan_now() if parts else None
+    for x in parts:
+        x["rescan"] = said
 
 
 def short_error(text, path, limit=150):
@@ -1131,7 +1238,7 @@ def content_checks(ctx):
                 return
             episode = ctx.app in apps.ARR and not apps.ARR[ctx.app].film   # metadata() reads an NFO title for an episode only
             nfo = (job or {}).get("nfo_title") or (library_nfo_title(ctx.path) if episode else None)
-            meta = ctx.meta = metadata(ctx.app, ctx.path, ctx.j, ctx.size, ctx.d, ctx.original, ctx.release, ctx.item, asked=ctx.asked, nfo=nfo)
+            meta = ctx.meta = metadata(ctx.app, ctx.path, ctx.j, ctx.d, ctx.original, ctx.release, ctx.item, asked=ctx.asked, nfo=nfo)
             rec.update(trusted=meta["trusted"], expected=meta["expected"], other_film=meta["other"], evidence=meta["evidence"],
                        tmdb=meta["tmdb"])
             ev = meta["evidence"]
@@ -1172,7 +1279,7 @@ def burn_audio(ts, edits=()):
 def quick_check(ctx):
     """The quick burned-in subtitle check of an import whose file has a video track, in any container (docs/design.md,
     "Burned-in subtitles"), see burnin.quick(). It runs after the import's own checks and edits, on the audio that plays
-    first. It only sorts the file and changes nothing. clean ends there. flagged and unsure queue the full check in the
+    first. A dry run takes the audio that its planned edit leaves playing first. It only sorts the file and changes nothing. clean ends there. flagged and unsure queue the full check in the
     background, see runner.queue_burn_in(). It gets the time the metadata checks left of their limit, see
     content_checks(), and the run of burnin.py ends at that limit. With under QUICK_SECS left, or when the check fails,
     the file is unsure. The decision line keeps the result in "burned_in". A file whose probe holds no track, as an ASF
@@ -1185,7 +1292,7 @@ def quick_check(ctx):
             return
     except OSError:
         return
-    edited = "edited" in (rec.get("outcome"), rec.get("edit_result"))
+    edited = {"edited", "dry_run"} & {rec.get("outcome"), rec.get("edit_result")}   # a dry --check plans the audio its edit leaves on
     audio, why = burn_audio(ctx.d["tracks"], ctx.d["edits"] if edited else ()) if tracks else {}, burn_ready()   # {}: ffprobe tells below
     if audio is None or why:
         rec["burned_in"] = {"result": "skipped", "why": why or "the file has no audio track"}
@@ -1405,6 +1512,8 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
     if own:   # a failed edit carries neither, so the next check hears the file again and the next write keeps it anew
         checks.lid_carry(path, before)
         vault.kept_carry(path, before)   # relayout() below reuses the keep
+        if not remuxed:   # the probe below takes the walk of the file before the edit
+            matroska.carry(path, before)
     after = checks.mkvmerge(path)
     if config.CFG.header_repair and not remuxed and not hp.get("tried") and checks.layout_of(path):   # fix 1
         after = relayout(rec, path, after)

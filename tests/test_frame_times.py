@@ -269,19 +269,22 @@ def chain(path, items):
     """A Matroska file at path of one AC-3 track and a Cluster of one block at ms for each (ms, kind) of items. Kind w
     reads whole. d adds a child after the block that no Cluster holds, so the Cluster is damaged there. p puts a
     PrevSize before the Timestamp. wi and di hold a whole Cluster at 260 ms inside the frame, and dd a damaged one. j
-    is two bytes of no level-1 element between Clusters."""
+    is two bytes of no level-1 element between Clusters, z 16 zero bytes, t a Tags whose size runs past the end, u
+    a Tags of unknown size, g a whole Tags, and c a Cluster id and 2 bytes of its size, as the end of a cut file."""
     junk = el(0x4D80, b"junk")
     inner = {k: el(0x1F43B675, uint(0xE7, 260) + simple(1, 0, [b"z"]) + (junk if k == "dd" else b"")) for k in ("wi", "di", "dd")}
+    other = {"j": b"\xe7\x80", "z": bytes(16), "t": b"\x12\x54\xc3\x67\x88", "u": b"\x12\x54\xc3\x67\x01" + b"\xff" * 7,   # no Cluster
+             "g": el(0x1254C367, el(0x7373, b"x")), "c": b"\x1f\x43\xb6\x75\x01\x00"}
     body = el(0x1549A966, uint(0x2AD7B1, NS)) + el(0x1654AE6B, entry(1, 2, "A_AC3", 32 * NS))
     for ms, kind in items:
         frame = b"x" + inner.get(kind, b"") + b"x"
-        body += b"\xe7\x80" if kind == "j" else el(0x1F43B675, (uint(0xAB, 0) if kind == "p" else b"") + uint(0xE7, ms) + simple(1, 0, [frame])
-                                                     + (junk if kind[0] == "d" else b""))
+        body += other[kind] if kind in other else el(0x1F43B675, (uint(0xAB, 0) if kind == "p" else b"") + uint(0xE7, ms) + simple(1, 0, [frame])
+                                                      + (junk if kind[0] == "d" else b""))
     path.write_bytes(bytes.fromhex("1a45dfa3" "84" "42860181") + el(0x18538067, body))
     return str(path)
 
 
-W0, W100, J = (0, "w"), (100, "w"), (None, "j")
+W0, W100, J, Z, T, U, G, C = (0, "w"), (100, "w"), (None, "j"), (None, "z"), (None, "t"), (None, "u"), (None, "g"), (None, "c")
 TRUST = {   # items, then the ms of the frames of read_on, or None when the walk read on from no Cluster
     "damaged Clusters in a row keep their blocks": ([W0, W100, (200, "d"), (250, "d"), (300, "w"), (400, "w")], [0, 100, 200, 250, 300, 400]),
     "a found Cluster earlier than the damaged one": ([W0, W100, (200, "d"), (199, "d"), (300, "w")], [0, 100, 200, 300]),
@@ -305,6 +308,18 @@ TRUST = {   # items, then the ms of the frames of read_on, or None when the walk
     "the next whole Cluster repeats the trusted one": ([W0, W100, J, (50, "d"), (100, "w"), (200, "w")], [0, 100, 100, 200]),
     "two whole Clusters at one time before the damage": ([W0, W100, W100, J, (50, "w"), (200, "w")], [0, 100, 100, 200]),
     "a Cluster whose first child is no Timestamp": ([W0, (50, "p"), W100], None),
+    "a late whole Cluster in damage at the end": ([W0, W100, J, (9000, "w"), J], None),
+    "a late whole Cluster after damaged ones in damage at the end": ([W0, W100, (200, "d"), (250, "d"), (9000, "w"), J], None),
+    "a whole Cluster that ends the file after damage": ([W0, W100, J, (9000, "w")], [0, 100, 9000]),
+    "a whole Cluster before zeros at the end": ([W0, W100, J, (300, "w"), Z], [0, 100, 300]),
+    "a whole Cluster before a cut Tags": ([W0, W100, J, (300, "w"), T], [0, 100, 300]),
+    "a whole Cluster before a Tags of unknown size": ([W0, W100, J, (300, "w"), U], [0, 100, 300]),
+    "a whole Cluster before a Cluster header cut by the end": ([W0, W100, J, (300, "w"), C], [0, 100, 300]),
+    "a late whole Cluster before a whole Tags and damage at the end": ([W0, W100, J, (9000, "w"), G, J], None),
+    "a late whole Cluster in damage at the end after a resync": ([W0, W100, J, (200, "w"), (300, "w"), J, (9000, "w"), J],
+                                                                 [0, 100, 200, 300]),
+    "a late whole Cluster before zeros and damage at the end": ([W0, W100, J, (9000, "w"), Z, J], None),
+    "a whole Cluster before a damaged last one": ([W0, W100, J, (300, "w"), (400, "d")], [0, 100, 300, 400]),
     "a damaged Cluster inside a kept one": ([W0, W100, (200, "d"), (250, "dd"), (300, "w")], [0, 100, 200, 250, 300]),
     "a whole Cluster inside a damaged one": ([W0, W100, (200, "d"), (250, "di"), (300, "w")], [0, 100, 200, 260, 300]),
 }
@@ -319,7 +334,9 @@ def test_the_walk_trusts_a_cluster_no_later_than_the_next_one_that_reads_whole(t
     Cluster that reads whole, no earlier than the bound and no later than the next Cluster that reads whole. Each
     damaged Cluster between the damage and that Cluster keeps its blocks before its damage when its Timestamp lies
     between the two, and the search goes on from its damage. A damage past that Cluster keeps none, so no block reads
-    twice. tracks keep the blocks before the first damage."""
+    twice. With no Cluster that reads whole after it, the walk reads on from it only when the bytes after it read as
+    level-1 elements to the end, or as a header cut by the end of the file. So a late whole Cluster inside damage at
+    the end of the file gives no frame. tracks keep the blocks before the first damage."""
     items, want = TRUST[name]
     got = matroska.frames(chain(tmp_path / "c.mkv", items))
     first = next((k for k, (_, kind) in enumerate(items) if kind[0] in "dj"), len(items))
@@ -400,16 +417,26 @@ def test_the_walk_keeps_the_first_bytes_of_each_lace_frame(tmp_path, monkeypatch
         assert tagged(t) == [(0, "stored"), (100 * NS, "stored")] + [(100 * NS + round(k * length), "bitstream") for k in (1, 2)], t
 
 
-@pytest.mark.parametrize("late", [True, False])
-def test_a_late_tracks_reads_the_lace_frames_after_the_walk(tmp_path, late):
-    """When Tracks comes after the Clusters, as mkvpropedit can write it, or a second Tracks changes a track, the walk
-    kept no bytes of its laces. The frame lengths then read from the file after the walk."""
+def test_a_late_tracks_reads_the_lace_frames_after_the_walk(tmp_path):
+    """When Tracks comes after the Clusters, as mkvpropedit can write it, the walk kept no bytes of its laces. The
+    frame lengths then read from the file after the walk."""
     cluster = el(0x1F43B675, uint(0xE7, 0) + simple(1, 0, [dts(), dts(), dts()], "xiph"))
-    first = b"" if late else el(0x1654AE6B, entry(1, 2, "A_DTS", 32 * NS))
-    body = el(0x1549A966, uint(0x2AD7B1, NS)) + first + cluster + el(0x1654AE6B, entry(1, 2, "A_DTS"))
+    body = el(0x1549A966, uint(0x2AD7B1, NS)) + cluster + el(0x1654AE6B, entry(1, 2, "A_DTS"))
     (tmp_path / "s.mkv").write_bytes(bytes.fromhex("1a45dfa3" "84" "42860181") + el(0x18538067, body))
     t = matroska.frames(str(tmp_path / "s.mkv"))["tracks"][0]
     assert tagged(t) == [(0, "stored")] + [(round(k * DTS_FRAME), "bitstream") for k in (1, 2)], t
+
+
+def test_the_walks_take_the_first_info_and_the_first_tracks(tmp_path):
+    """A second Info and a second Tracks after the Clusters do not count, as ffmpeg, mpv and mkvmerge read the first.
+    So the whole walk and the head walk take the first TimestampScale and the first DefaultDuration."""
+    cluster = el(0x1F43B675, uint(0xE7, 0) + simple(1, 0, [dts(), dts(), dts()], "xiph"))
+    path = headed(tmp_path / "two.mkv", el(0x1549A966, uint(0x2AD7B1, NS)) + el(0x1654AE6B, entry(1, 2, "A_DTS", 32 * NS)) + cluster
+                  + el(0x1549A966, uint(0x2AD7B1, 2 * NS)) + el(0x1654AE6B, entry(1, 2, "A_DTS")))
+    matroska.WALKS.clear()
+    head, whole = matroska.head(path, lambda *a: True), matroska.frames(path)
+    want = [(0, "stored"), (32 * NS, "default"), (64 * NS, "default")]
+    assert head["scale"] == whole["scale"] == NS and tagged(head["tracks"][0]) == tagged(whole["tracks"][0]) == want, (head, whole)
 
 
 def test_the_codec_gives_the_length_of_a_frame():

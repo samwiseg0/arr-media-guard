@@ -24,8 +24,8 @@ RUN python3 -m venv /opt/arr-media-guard-lid/venv \
 
 # The text models of the burned-in subtitle check, 24.6 MB (NOTICE). burnin.py --fetch downloads them at their pinned
 # revision and checks each sha256, so a wrong model fails the build. They sit in a layer of their own, so a change of
-# burnin.py keeps the venv layer above.
-COPY arr_media_guard/__init__.py arr_media_guard/burnin.py /opt/arr-media-guard/arr_media_guard/
+# burnin.py keeps the venv layer above. __init__.py imports ff.py, which installs the launch guard.
+COPY arr_media_guard/__init__.py arr_media_guard/burnin.py arr_media_guard/ff.py /opt/arr-media-guard/arr_media_guard/
 RUN /opt/arr-media-guard-lid/venv/bin/python -B /opt/arr-media-guard/arr_media_guard/burnin.py --fetch --model-dir /opt/arr-media-guard-lid/models
 
 # The bytecode is compiled here, because PYTHONDONTWRITEBYTECODE stops each run from writing it. merge_env.py writes the

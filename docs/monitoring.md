@@ -49,7 +49,7 @@ also goes to the container log. Loki reads these keys, so they stay as they are.
 | Key | Value |
 | --- | --- |
 | `arr` | the app |
-| `source` | what made the line: `hook` for an import, `check` for `--check`, `backfill` for the backfill and the other commands, `deep_analysis`, `audit`, `audio_scan`, `video_scan` or `subhunt` |
+| `source` | what made the line: `hook` for an import, `check` for `--check`, `backfill` for the backfill and the other commands, `backfill_job` for a job a backfill queued, `check_job` for a job of `--check --background`, `deep_analysis`, `audit`, `audio_scan`, `video_scan` or `subhunt` |
 | `outcome` | the outcome code |
 | `class` | the plan group, the [item class](policy.md#keys) and the rules of the plan, or a state such as `undecided`, `dropped`, `no change` or `repacked` |
 | `edits` | the number of flag edits |
@@ -62,7 +62,9 @@ also goes to the container log. Loki reads these keys, so they stay as they are.
 | `from` | the `job` of the import that queued a deep analysis. A deep analysis line has it, and so does the `source=hook` line that drops a deep analysis job after its third crash. Other lines have no `from` key. |
 | `error` | the result of an `error` line, cut to 150 characters. Other lines have no `error` key. |
 
-The nightly audit writes one more syslog line a day, with `source=audit outcome=summary` and its counts.
+The nightly audit writes one more syslog line a day, with `source=audit outcome=summary` and its counts. A `refused`
+key counts the time reads that `ff.py` refused in the window, in every process and for every app. The line has it only
+when that count is above 0. Each one is a fault of AMG's code, and `STATE_DIR/ff-faults.jsonl` names it.
 
 ## Undo an edit
 
@@ -97,10 +99,11 @@ A remux, a moved or rewritten `.srt` file, and some conversions keep the old fil
 The decision log grows with each file. On a host, rotate it weekly with logrotate. Leave out `copytruncate`, because AMG
 opens the log again for each line it writes.
 
-The Docker image rotates with these lines. On a host, put them in `/etc/logrotate.d/arr-media-guard`.
+The Docker image rotates with these lines. On a host, put them in `/etc/logrotate.d/arr-media-guard`. The second
+path is `ff-faults.jsonl` in `STATE_DIR`, where AMG writes each time read that `ff.py` refused.
 
 ```
-/var/log/arr-media-guard.jsonl {
+/var/log/arr-media-guard.jsonl /var/lib/arr-media-guard/ff-faults.jsonl {
     weekly
     rotate 52
     compress

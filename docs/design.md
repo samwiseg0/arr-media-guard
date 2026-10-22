@@ -272,7 +272,8 @@ fails still posts, with its title and its file, and the sentence `report.UNTOLD`
 
 **Check and step.** `report.stage_fields()` gives each issue alert two inline fields under its text and above the item
 field. Check names the check that found the problem, by the source of the record, see `report.CHECKS`. The sources are
-`hook`, `burn_in`, `whole_file`, `deep_analysis`, `recheck`, `check` and `backfill`, the flag backfill.
+`hook`, `burn_in`, `whole_file`, `deep_analysis`, `recheck`, `check`, `backfill` (the flag backfill), `backfill_job` (a
+job a backfill queued) and `check_job` (a job of `--check --background`).
 A conversion that a stopped run left has `worker` when the worker finds it as it starts, and `backfill` when a
 `--convert` run finds it, see `convert.pending_recover()`. Stopped at names the step where the fix stopped, one of
 `report.FIX_STEPS`, see `report.stopped_at()`. A finding with an action takes its step from `ACTION_STEPS`. A subtitle
@@ -1031,6 +1032,59 @@ planned again before its edit, so a changed file gets the current plan. `--canar
 each instance, one file of each class in turn. `--only-undecided` takes the undecided files, so hearing can decide them without a
 probe of the whole library.
 
+**Queued plans.** `--background` puts each file of a plan in the background queue with its plan line, see
+`cli.plan_queue()` and `cli.check_queue()`. A queued plan writes nothing the user did not audit. The worker plans the
+file again in a dry pass first, see `cli.planned_file()`, so most refusals come before any write. The language
+hearing, the time limits and TMDB can give the apply pass another answer than the dry pass, so the apply compares
+again at each write.
+
+One function owns every write of a queued job, the write gate `gate.allow()`. Each write of `process.py` and of the
+burn-in job runs through it: the conversion, a header repair, the subtitle remux, a flag edit with its repairs inside
+`process.edit()`, the edit that follows a remux, the sidecar changes, the burn-in mute and the move back of the extras
+that the job's own conversion hid. `allow()` compares what the
+write writes with the plan line, and runs the write only when they agree. A difference raises `gate.PlanRefused`
+before the write, and `process.process()` ends the run with `process.refuse()`. The line has the outcome `plan_refused`,
+`plan_diff` and no class, so the audit never takes it as the result of the file. It keeps the writes the run made
+first, with their rescan. `process.act()` compares all that the run will write, see `process.writes()`, before the
+first write of the one write. The conversion compares its digest inside `convert.convert()`, after its subtitle check
+and before its first sidecar move, through `gate.opened()`. The digest holds the result, the broken tracks, the
+verdicts and fixes of the subtitle check, and each sidecar it muxes, by name, language, flags, size and mtime. After a
+remux the run plans the new file again, see `process.write()`. Its edit must equal the edits of the plan line on the
+tracks the new file holds, by track UID, see `process.replanned()`. So the remux keeps the edits of the line, and an
+edit of the replan's own refuses.
+
+A guard proves that no write goes around the gate. `gate.armed()` installs one audit hook in the process, see
+`sys.addaudithook()`, and arms it on the job's file while the job runs: through both passes of `cli.planned_file()`,
+and through a deep analysis or a burn-in job that holds a plan. The guard watches the file and its sidecars: each
+name in its folder that is its stem, or its stem, a dot and more. It sees an open for write, a rename or replace, a
+remove, a link, a truncate, a shutil move or copy, and a start of mkvpropedit, mkvmerge with `-o`, mkvextract or
+ffmpeg that writes such a name. Outside a window of `allow()` it raises `gate.Escaped` before the write runs. The
+guard keeps the first one, and `armed()` raises it again at the end of the job, so a caller that catches it still
+fails the job. The job's line then has the outcome `error`. The dry pass writes nothing, so its `allow()` opens no
+window, and the guard fails each write of that pass. The hook does nothing while no job is armed. AMG's state
+folder, its temp files and the kept originals are outside the watched names. The launch guard of `ff.py` is a second
+audit hook, see "Time reads". A start of a tool must pass both. The launch guard judges the program, and this guard
+judges the files it writes. Python calls no later hook after one raises, so a refused start counts once.
+
+Two exceptions hold, and the gate knows them. No dry run sees the file that a conversion makes. So after the job's
+own conversion, `process.conversion()` sets `ctx.row` to None, and the rest of the job runs as `--check --apply` runs
+it. The gate then compares nothing, and each write still goes through it. The extras that another run's conversion
+hid stay hidden, as the plan line holds no move of them. The next import or `--check --apply` of the file moves them
+back, and so does a `--convert` apply, see `convert.pending_recover()`. The job stores the key of the new file as
+`converted`, and each save after a later write of its own moves it on, so a run after a stop goes on from the file the
+job left. The jobs that follow such a file run as after an import, with no plan and no guard. The other jobs that a
+job of `--check` queues follow the plan line. A dry `--check` with `--plan-out` keeps the plans of its deep analysis and
+its burned-in subtitle check in `deep` and `burn_in`, see `cli.check()`. The burned-in subtitle check of the dry run
+reads the flags that the import's planned edits leave, see `remux.planned_state()`: the audio that then plays first
+and the subtitles that are then on. The job runs it after those edits.
+`runner.queue_after()` gives each job its plan in `audited`. A field that a deep analysis leaves empty never refuses,
+as it writes nothing there. So a deep analysis that finds the import's fix made already ends with no change. The
+whole-file check of a job of `--check` only says what a re-grab would do, so it needs no plan.
+
+A stop after a write of the job's own leaves the key of the file in the job, with the reason codes of the writes, see
+`process.stop_line()`. The next run of a job that did not convert then refuses, and its line says that the job wrote
+the file before the stop. The rescan that the stop held goes out then.
+
 ## Audit
 
 `--audit` never edits. It prints one summary and, with `--post`, sends it as one embed when it found a problem. With
@@ -1070,8 +1124,9 @@ as in an alert. Its footer names TMDB only when TMDB had trouble that day. The t
 syslog summary line goes out every night. It counts each problem of each decision line of the day, also the problems
 the post leaves out. It also counts the files with each RFC 9559 fault kind, by the latest line of each file in the
 window that ran the header check, scans and dry runs included, as `rfc_version=3`. A repair in the run that found the
-faults clears them. The terminal prints the same counts. The audit also removes kept originals past their age and writes the policy status, see "Status
-file".
+faults clears them. A `refused` key counts the time reads that `ff.py` refused in the window, see "Time reads".
+The terminal prints the same counts. The audit also removes kept originals past their age and writes the policy
+status, see "Status file".
 
 `--check-audio` and `--check-video` scan every file of the app the way the worker checks an import.
 A scan never deletes, edits or re-grabs. It checks `SCAN_WORKERS` files at a time, and each worker
@@ -1488,7 +1543,8 @@ Where a lace needs the codec's frame length, the walk keeps the first 16 bytes o
 track the first byte of each unlaced block. The walk drops each page behind it, so a second read of a lace reads it
 from the disk again. A 7 GB episode has a DTS track that laces every block with no DefaultDuration. Its frame times
 after the walk took 11 to 15 s cold with that second read. They took 1.1 to 1.6 s with the kept bytes. A file whose
-Tracks comes after its Clusters reads those bytes after the walk. The frames of a text track that zlib packs read after
+Tracks comes after its Clusters reads those bytes after the walk. The walk takes the first Info and the first Tracks,
+as ffmpeg, mpv and mkvmerge read them. A second one after the Clusters does not count. The frames of a text track that zlib packs read after
 the walk too. A packed text frame that unpacks to no byte holds no data, as a frame of 0 bytes does. ffmpeg, mkvextract
 and the Cues read drop both, so the proof counts neither. A Cluster child or a block that does not read is damage, and
 the walk names where. A Cluster that runs past the end of the file is damage too, as in a file cut at a block boundary.
@@ -1499,7 +1555,11 @@ Cluster id and reads on from there, as ffmpeg does. A trusted Cluster reads whol
 the next Cluster that reads whole. The damaged Cluster the walk was in sets the lower bound of the search when its
 Timestamp lies between the last trusted Cluster and the next Cluster that reads whole after its end. Else the last
 trusted Cluster sets it, and the blocks of the damaged Cluster leave `read_on`. The walk reads on from the first
-Cluster that reads whole, no earlier than the bound and no later than the next Cluster that reads whole after it. A
+Cluster that reads whole, no earlier than the bound and no later than the next Cluster that reads whole after it. With
+no Cluster that reads whole after it, the walk reads on from it only when the bytes after it read as level-1 elements
+to the Segment end. So a late whole Cluster inside damage at the end of a file gives no frame. Fewer than 12 bytes at
+the end of the file read as a header cut there, as in a cut download. A zero run over the header of the element after
+that Cluster is a known limit. The bytes after the zeros do not read, so that Cluster leaves `read_on`. A
 damaged Cluster between the damage and that Cluster keeps its blocks before its damage when its Timestamp lies between
 the two. So a Cluster id inside the damaged bytes gives no frame at a wrong time, and a late Timestamp drops no good
 Cluster after it. Three damaged Clusters of 5 s in a row lose 1.5 s of video, where the search that took whole Clusters
@@ -1509,7 +1569,9 @@ plan take a walk with damage as no read. The whole-file subtitle read keeps the 
 track marked as cut short (`subtitles.Cut`). A film of 10.9 GB with 274,346 blocks took 3 s of CPU from the page cache
 and 23 s cold, against 29 to 44 s of CPU for ffprobe's packet read. The whole proof of that film and an mkvmerge copy
 took 86 s and 229 s of CPU, where 2.18.5 took 107 s and 284 s. The last 4 walks stay for the file at its size and
-mtime, so the proof and the header repair share one.
+mtime, so the proof and the header repair share one. A flag edit by mkvpropedit changes no frame, so the walk moves to
+the edited file (`matroska.carry()`). Only a walk with no error of a Segment that ends at the end of the file moves,
+because mkvpropedit puts bytes past the Segment end inside it.
 
 **The head walk.** `lace_guess()` needs only the first frames, so it takes `matroska.head()`. A whole walk that the
 cache holds serves. Else the walk stops after the first Cluster that gives each audio track 500 frames and the first
@@ -1704,14 +1766,62 @@ stream's first time, which a new file with a coarser TimestampScale than the ori
 takes half the difference of the two scales more, and the time check and the start check share that bound. A track
 that moves 2 ms refuses.
 
-**The guard.** `tests/test_time_reads.py` fails when code reads a time from ffmpeg or ffprobe output. Its words
-name the packet, frame, format and stream time fields, the framemd5, framecrc and framehash muxers, the packet and
-frame dumps, showinfo, `-progress` and `-debug_ts`. Its attributes name the times PyAV gives a packet, a frame, a
-stream or a container. Each function that may keep such a read is listed in `READS` with its reason, such as the md5s
-of the proof's packet data, the decoded frames of a picture window, the AVI read above, and a container duration that
-gates a check by length. A new read needs its reason in review. The guard reads names, so a key of a parsed probe
-(`x["pts"]`), a field after a comma, a call of a helper that reads, and a new read in a function that `READS` lists
-stay unseen.
+**The guard.** `ff.py` makes every ffmpeg, ffprobe and PyAV call. Each call names its use, and `ff.READS` names
+the times that use may read, with the reason, such as the md5s of the proof's packet data, the decoded frames of a
+picture window, the AVI read above, and a container duration that gates a check by length. A new read needs its
+reason in review. `ff.py` allows only what it knows. Anything else raises `TimeRead`, and the check errors.
+
+- **The argv.** `ff.check()` parses each call. Each option, log level, ffprobe section and field, output format,
+  filter, bitstream filter, muxer and protocol must be on an allow list of `ff.py`. Each one that gives a time must be
+  named by the use. These are an ffprobe time field, a muxer other than null, data and s16le, a filter that logs a
+  time, setts, `-progress`, `-debug_ts`, `-report` or `FFREPORT`. A filter and a bitstream filter take only the
+  arguments AMG gives them, because `print()` in an expression of asetpts or setts logs a time for each frame. `-ss`,
+  `-t` and a `-read_intervals` time need `seek`, because ffmpeg's own frame times place that cut. Each ffmpeg output
+  names its muxer with `-f`. A lavfi input is a filter graph. Only `ionice` and `nice` may come before ffmpeg or
+  ffprobe, and the argv is a list with no shell. A named ffprobe field that the call does not ask for raises too.
+- **The output.** Text that needs a filter must come back as captured text, or to an `ff.Log` for a `popen()`.
+  ffprobe JSON keeps the known keys of each section, nested ones too, so the DURATION tag goes, and `ff.loads()`
+  gives mappings that raise on any other key, with `[]`, `.get()` or `in`. At level info ffmpeg prints the input dump
+  (Duration, start, Chapter) and its stats line (`time=`). So a call at level info names each line's level with
+  `level+info`, and its stderr keeps only the lines of named channels and the lines below info. A use that names
+  `dump` keeps the stream lines. showinfo, silencedetect, volumedetect, `-progress` and framemd5 text keep only their
+  named time fields. `ff.run()` filters a framemd5 file when the call ends, and finds a relative path under `cwd=`.
+  The large reads (the packet reads of the proof and of the audio checks) name every field they ask for, so no filter
+  runs on them.
+- **PyAV.** `ff.pyav()` wraps every object PyAV gives, the classes and the submodules too. Each kind of object allows
+  its known attributes and the times the use names. So metadata, chapters, a subtitle set and a frame's sample count
+  raise. A filter graph, a resampler and an audio frame allow no attribute, because no use needs one. `repr()` shows
+  no time. A source scan checks that no module but `ff.py` reads the object behind a proxy (`_o`, `_unwrap()`).
+- **The launch guard.** `ff.py` installs an audit hook (`sys.addaudithook`) once per process, and the package's
+  `__init__.py` imports it. So the job processes, the scripts of the language-ID venv and any pool worker have it.
+  Package code may start ffmpeg and ffprobe only through `ff.run()` and `ff.popen()`. It may start a Python only to
+  run a script of the package. Else it may start only mkvmerge, mkvextract, mkvpropedit and logrotate (`ff.OTHERS`).
+  The hook reads the program at `argv[0]` or after `ionice` and `nice`, and the program of `executable=`. Any other
+  start raises, so a launcher such as `env`, `sh` or `timeout` raises. The hook sees `subprocess`, `os.system`,
+  `os.exec*`, `os.posix_spawn` and, on Python 3.14, the start of a multiprocessing child. A start whose callers are
+  all in the standard library counts as package code, as a thread or a pool that runs `subprocess.run()` itself. A
+  lookup of a C function through `ctypes` by package code raises, and so does an import of PyAV by a module other
+  than `ff.py`. Code outside the package, as a test or faster_whisper, passes. The source scan refuses an import of
+  `ctypes`, `_posixsubprocess` or `multiprocessing` in the package, and the name `ProcessPoolExecutor`, because
+  Python 3.13 raises no event for a multiprocessing child.
+
+Whisper's word times and the speech spans count the samples of raw PCM from the `-ss` start, and `lid.start_delay()`
+moves them by the stream start, a named read. volumedetect's `n_samples` counts decoded samples, and a use names it
+as a count. Error and warning lines, as "Non-monotonic DTS", are no channel.
+
+Each refusal writes one line to `STATE_DIR/ff-faults.jsonl`, because many callers catch every exception. `config.py`
+names the file at load, so each entry has it: the hook, the worker, the subtitle hunter and the listener. Every child
+inherits the name. `logs.decision()` reads the refusals of its run, in its process and its children, and makes the
+decision line an error that names the use and the field. The nightly audit counts it as an error. A dry run, a scan
+and a lid.py child of the subtitle hunter write a decision line that the audit leaves out, or none. So the audit's
+summary line also counts every fault line of its window as `refused`. logrotate rotates the file with the decision
+log.
+
+`tests/conftest.py` fails a test when a call, a read or the audit hook raised `TimeRead`, in the test's process or a
+child. The source scan of `tests/test_time_reads.py` is the second line, for the paths no test runs. Each time word
+or attribute in a function or class must be a name of a use that it calls, or reads for as a reader that
+`ff.READS` names, as `decide.FRAME` reads the window's showinfo text. Each name of an entry must show in the code of
+its use.
 
 ## Header repair
 
@@ -1977,8 +2087,7 @@ that reads the video takes the film: the windows, the burn-in samples, the packe
 packet and the DURATION tag of the video end, the frame count of a header repair, and the height of the length
 check's bitrate ceiling. The burn-in samples seek by the film's own index, and so does the last packet read. A film in MJPEG,
 as from an old camera, is a limit. With a short h264 track after it, the checks take the h264 track as the film. Its
-frames differ, so the MJPEG track stays. An MJPEG film with no other video track is the film, and it keeps its bitrate
-in the bitrate source of the trusted duration, see `decide.cover()`.
+frames differ, so the MJPEG track stays. An MJPEG film with no other video track is the film, see `decide.cover()`.
 
 The remux leaves the track out of its first input (`-d !<id>`), with no `--compression` option. The ffmpeg read of the
 original before the remux writes its first packet, and the md5 of each of its packets. A track that the check read
@@ -2125,9 +2234,9 @@ checks after the flag edit.
   the last packet of the film. The stored end is where the last video or audio frame ends: the last
   Clusters of a Matroska file, read up to any zero padding, the sample tables of an MP4
   (`checks.stored_end()`). A TS file has no
-  stored end, because its reader reads the whole file. A container with no reader, as AVI, takes the
-  size over the bitrate tags and ffprobe's stream durations instead, both estimates. A cover picture
-  leaves the bitrate and the size. A header that no other source confirms gets a duration alert only.
+  stored end, because its reader reads the whole file. A container with no reader, as AVI, takes
+  ffprobe's stream durations instead, an estimate. A cover picture, see `decide.cover()`, leaves the
+  statistics tags. A header that no other source confirms gets a duration alert only.
 - **Runtime.** A movie counts as short when it runs under 0.6 of its listed runtime, and long over
   1.4. An edition word such as Extended or Director's Cut widens that to 0.5 and 2.0. A TV movie or
   a stand-up special gets 0.5 and 1.8. A file with several cuts in it is never long. An episode is

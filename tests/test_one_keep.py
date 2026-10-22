@@ -3,7 +3,8 @@
 """One kept original per library file, see vault.keep_original() and docs/design.md, "Kept originals". A write of a
 file that holds the hook's own output, with its original still kept, keeps nothing new. It names that keep, and the
 keep's days start again. A new grab, a hand edit or an expired keep gives a new keep. The flag edit of process.edit()
-carries the keep, the cached words and the mark of a burn-in job only to the file it edited. The files are made up."""
+carries the keep, the cached words, the walk and the mark of a burn-in job only to the file it edited. The files are
+made up."""
 import contextlib
 import importlib
 import json
@@ -18,6 +19,7 @@ from test_arr_media_guard import (hook, REAL_MKVMERGE, REAL_RUN, convertible, ke
                                   state_dir_in_tmp, sync_mkv)
 
 VAULT = next(m for m in hook._mods if m.__name__.endswith(".vault"))
+MATROSKA = hook.matroska
 FIX = {2: {"rate": "1/1", "offset": 1.0}}   # the SubRip track of sync_mkv, 1 s later
 
 
@@ -427,3 +429,52 @@ def test_a_remux_inside_the_hook_s_flag_edit_carries_the_words_and_the_mark(sync
     now = os.stat(path)
     assert rec["outcome"] == "edited" and rec["header_repair"]["code"] == "header_repaired" and now.st_ino != imported.st_ino, rec
     assert keys() == [(now.st_size, now.st_mtime_ns)] and hook.muted(path)
+
+
+def test_an_import_with_a_flag_edit_walks_a_stale_tag_file_once(tmp_path, settings, monkeypatch):
+    """A file whose NUMBER_OF_FRAMES tags are stale takes a walk for its subtitle counts, see checks.walk_frames(). The
+    flag edit changes no frame, so process.edit() carries the walk to the edited file, and the probe after the edit
+    walks no second time. The carried walk is the walk of the edited file."""
+    lib, d = tmp_path / "lib" / "Film A (1979)", tmp_path / "src"
+    lib.mkdir(parents=True)
+    d.mkdir()
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:duration=60", "-f", "lavfi", "-i",
+                "sine=frequency=440:duration=60", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(d / "av.mkv")], check=True)
+    (d / "s.srt").write_text("\n\n".join(f"{k + 1}\n{stamp(5 + 5 * k)} --> {stamp(7 + 5 * k)}\nLine {k}" for k in range(10)) + "\n")
+    REAL_RUN(["mkvmerge", "-q", "-o", str(d / "mm.mkv"), "--language", "1:eng", str(d / "av.mkv"), "--language", "0:eng", "--default-track-flag",
+              "0:0", str(d / "s.srt"), "--language", "0:fre", "--default-track-flag", "0:1", str(d / "s.srt")], check=True)
+    path = str(lib / "Film A (1979).mkv")   # ffmpeg keeps the statistics tags of mkvmerge, so they are stale
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-i", str(d / "mm.mkv"), "-map", "0", "-c", "copy", "-default_mode", "passthrough", path], check=True)
+    settings(log=str(tmp_path / "log.jsonl"), header_repair=True)
+    monkeypatch.setattr(hook, "mount_top", lambda f: str(tmp_path / "lib"))
+    walks, real = [], MATROSKA.walk
+    monkeypatch.setattr(MATROSKA, "walk", lambda p, enough=None: (enough or walks.append(os.stat(p).st_mtime_ns), real(p, enough))[1])
+    hook.DEADLINE.start(hook.BUDGET)
+    try:
+        rec = hook.process(hook.Ctx("radarr", path, "Film A (1979)", "English", 1, mode="import", apply=True, post=False, job={"check": "outside"},
+                                    lock=open(tmp_path / "lock", "w"), shared=False))
+    finally:
+        hook.DEADLINE.stop()
+    j = hook.mkvmerge(path)
+    assert rec["outcome"] == "edited" and rec["edits"] and len(walks) == 1, json.dumps(rec, default=str)[:3000]
+    assert [t["properties"].get("walk_frames") for t in j["tracks"]] == [None, None, 10, 10] and MATROSKA.frames(path) == real(path), j
+
+
+def test_the_walk_moves_only_from_a_whole_segment_with_no_error(sync_mkv, tmp_path):
+    """matroska.carry() moves the walk of a Segment that ends at the end of the file, and whose walk has no error.
+    mkvpropedit puts bytes past the Segment end inside the Segment, so a file with such bytes walks again. A walk that
+    names damage walks again too, and so does a file that changed after the edit."""
+    path = str(tmp_path / "f.mkv")
+    for tail, error in ((bytes(4096), None), (b"", "damage"), (b"", None)):
+        with open(path, "wb") as f:
+            f.write((sync_mkv / "f.mkv").read_bytes() + tail)
+        MATROSKA.WALKS.clear()
+        got, before = MATROSKA.frames(path), os.stat(path)
+        got["error"] = error
+        REAL_RUN(["mkvpropedit", "-q", path, "--edit", "track:2", "--set", "flag-forced=1"], check=True)
+        MATROSKA.carry(path, before)
+        st = os.stat(path)
+        assert list(MATROSKA.WALKS) == ([(path, st.st_size, st.st_mtime_ns)] if not tail and not error else []), (len(tail), error)
+    carried = MATROSKA.WALKS[(path, st.st_size, st.st_mtime_ns)]
+    os.utime(path, ns=(1, 1))
+    assert MATROSKA.frames(path) is not carried and len(MATROSKA.WALKS) == 2

@@ -1423,6 +1423,22 @@ def test_under_the_listener_the_audit_writes_only_its_summary_line(app, monkeypa
     assert capsys.readouterr().out.startswith(f"Open problems: 0 files · Radarr {h.CFG.instance}\n0 files with an open problem since ")
 
 
+def test_the_audit_summary_counts_the_refused_time_reads(app, monkeypatch, capsys, tmp_path):
+    """A refusal of ff.py in a dry run, a scan or a lid.py child of the subtitle hunter reaches no decision line that
+    the audit counts. So the summary line also counts the lines of ff-faults.jsonl in its window, of every process."""
+    faults = tmp_path / "ff-faults.jsonl"
+    faults.write_text("".join(json.dumps({"at": at, "pid": 7, "ppid": 1, "what": "a use reads x"}) + "\n"
+                              for at in (time.time() - 3 * 86400, time.time() - 60, time.time() - 30)))
+    monkeypatch.setenv("AMG_FF_FAULTS", str(faults))
+    sent = []
+    monkeypatch.setattr(syslog, "syslog", lambda priority, line: sent.append(line))
+    monkeypatch.setattr(h.os, "nice", lambda n: None)
+    monkeypatch.setattr(h.subprocess, "run", lambda argv, **k: None)   # ionice
+    h.main(["--audit", "radarr", "--since", "24h"])
+    assert sent[-1].endswith(" refused=2"), sent
+    assert "0 files with an open problem since " in (out := capsys.readouterr().out) and " ff.py refused 2 time reads, see ff-faults.jsonl" in out
+
+
 def test_spawn_starts_a_new_program_in_its_own_session(monkeypatch):
     seen = []
     monkeypatch.setattr(arr_serve.subprocess, "Popen", lambda argv, **kw: seen.append((argv, kw)))
@@ -1482,7 +1498,7 @@ def test_the_daily_jobs_audit_each_app_with_a_key_then_rotate_the_log(app, monke
     assert [r[2:] for r in runs[:-1]] == [["--serve", "--audit", "radarr", "--since", "24h", "--post"]]   # its summary lines reach the container log
     state = os.path.join(h.CFG.state_dir, "logrotate.state")
     assert runs[-1][:3] == ["logrotate", "-s", state] and runs[-1][-1].endswith("logrotate.conf")   # the state stays in /config
-    assert open(runs[-1][-1]).read().startswith(h.CFG.log + " {\n    weekly\n")
+    assert open(runs[-1][-1]).read().startswith(f"{h.CFG.log} {os.environ['AMG_FF_FAULTS']} {{\n    weekly\n")   # the fault file of ff.py too
 
 
 def test_the_daily_jobs_go_on_without_logrotate(app, monkeypatch, settings, capsys):

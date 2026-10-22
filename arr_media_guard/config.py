@@ -347,6 +347,9 @@ def settings(path, environ=os.environ):
 
 
 CFG = settings(ENV_FILE)
+# ff.refuse() writes each refusal to this file, and every child inherits the name. logs.decision() and the nightly
+# audit read it back. Each entry loads config, so the hook, the subtitle hunter and the listener all name it.
+os.environ.setdefault("AMG_FF_FAULTS", os.path.join(CFG.state_dir, "ff-faults.jsonl"))
 
 
 def slots():

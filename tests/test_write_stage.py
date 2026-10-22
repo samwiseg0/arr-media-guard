@@ -489,9 +489,10 @@ def test_zeros_an_older_edit_enclosed_take_the_repair_with_the_edit(layouts, tmp
     j = hook.mkvmerge(path)
     assert hook.header_of(path, j)["enclosed"] == os.path.getsize(layouts["ffmpeg"])
     no_damage(monkeypatch)
-    seen = runs(monkeypatch)
+    seen, walked = runs(monkeypatch), hook.matroska.frames(path)
     rec = hook.edit({"path": path}, j, edit_of(j), True)
     assert (rec["outcome"], rec["header_repair"]["code"], writes(seen)) == ("edited", "header_repaired", (0, 1)), rec
+    assert walked["error"] is None and hook.matroska.frames(path) == hook.matroska.walk(path)   # the remux carries no walk
     hp = hook.header_of(path)
     assert (hp["issue"], hp["enclosed"]) == ([], None) and D.unapplied(hook.mkvmerge(path), edit_of(j) + edit_of(j, 4)) == []
 

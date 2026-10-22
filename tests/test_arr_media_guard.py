@@ -128,6 +128,7 @@ def env(tmp_path, monkeypatch, settings):
     start = calls["clock"][0]
 
     def fake_run(argv, **kw):   # ffmpeg, ffprobe, mkvpropedit and a repack reach subprocess.run, mkvmerge -J is patched below
+        sys.audit("subprocess.Popen", argv[0], argv, None, None)   # as a real start of the tool, so the write gate's guard sees it
         if "mkvmerge" in argv:   # a repack, ionice -c3 nice -n 19 mkvmerge -q -o <temp> <file>. MKV! marks the Matroska copy.
             calls["repacks"].append(argv); calls["events"].append("repack")
             with open(argv[-1], "rb") as f, open(argv[argv.index("-o") + 1], "wb") as g:
@@ -3938,7 +3939,7 @@ def test_a_file_of_another_series_stays_out_of_the_unit(env, monkeypatch, tmp_pa
 def test_the_probe_of_another_file_judges_its_own_episodes(env, monkeypatch):
     """Another file of the unit gets the listing and the season of its own episodes, never the job's."""
     seen = []
-    monkeypatch.setattr(hook, "metadata", lambda app, path, j, size, d, original, release, item, **k:
+    monkeypatch.setattr(hook, "metadata", lambda app, path, j, d, original, release, item, **k:
                         seen.append(item) or {"evidence": {"regrab": False}, "trusted": {}})
     probe = hook.content_probe("sonarr", "5", "English", False, "", {"listed": [22], "season": 1}, None)
     probe(env["path"], {"eps": [{"seriesId": 5, "seasonNumber": 0, "runtime": 45}]})
@@ -4361,7 +4362,8 @@ def test_tool_output_with_a_latin1_byte_never_breaks_a_check(tmp_path, monkeypat
     """A tool may print byte 0xc4, and a strict decode fails on UnicodeDecodeError. Every tool call replaces it."""
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     scripts = {"mkvmerge": """printf '{"container": {"type": "Matroska"}, "tracks": [{"type": "audio", "properties": {"track_name": "Espa\\304ol"}}]}'""",
-               "ffmpeg": """printf '[x] [info] title: Espa\\304ol\\n[x] [info] n_samples: 20\\n[x] [info] max_volume: -4.0 dB\\n' >&2""",
+               "ffmpeg": """printf '[x] [info] title: Espa\\304ol\\n[Parsed_volumedetect_0 @ 0x1] [info] n_samples: 20\\n'"""
+                             """'[Parsed_volumedetect_0 @ 0x1] [info] max_volume: -4.0 dB\\n' >&2""",   # volumedetect logs by its filter
                "ffprobe": """printf 'Espa\\304ol\\n' >&2
 case "$*" in *packet=pts_time*) printf '{"packets": [{"pts_time": "5.0"}], "format": {"tags": {"title": "Espa\\304ol"}}}' ;;
   *format=duration*) echo 600.0 ;; *) echo 0 ;; esac"""}
@@ -5071,36 +5073,28 @@ def test_a_hardlinked_import_with_a_cover_track_posts_only_the_cover(env, cover_
                                        "link, such as the download client's copy.\nThe original file was not changed.")], posts
 
 
-def test_a_film_in_mjpeg_keeps_its_bitrate_in_the_trusted_duration():
-    """An MJPEG film with no other video track is the film, see decide.cover(). Its bitrate and bytes stay in the
-    bitrate source of the trusted duration, which only a container with no reader takes, as AVI. A cover track with no
-    statistics tags leaves the stream sources, so the tags of the film and the audio still count."""
+def test_a_cover_track_with_no_tags_leaves_the_stream_durations():
+    """A cover track with no statistics tags leaves the stream durations of the trusted duration, see decide.cover(),
+    so the tags of the film and the audio still count."""
     app = "mkvmerge v102.0 ('Little Houses') 64-bit"
     tags = lambda codec, bps, n: {"codec_id": codec, "tag_bps": str(bps), "tag_duration": "00:02:00.000000000", "tag_number_of_bytes": str(n),
                                   "tag__statistics_writing_app": app}
     probe = lambda *tracks: {"container": {"type": "Matroska", "properties": {"duration": 120_000_000_000, "writing_application": app}},
                              "tracks": [{"type": t, "properties": p} for t, p in tracks]}
     audio = ("audio", tags("A_AAC", 64_000, 960_000))
-    j, size = probe(("video", tags("V_MJPEG", 8_000_000, 120_000_000)), audio), 122_000_000
-    assert "bitrate" not in hook.arr_meta.trusted_duration(j, size)["sources"]   # Matroska has a reader
-    avi = dict(j, container=dict(j["container"], type="AVI"))
-    assert abs(hook.arr_meta.trusted_duration(avi, size)["sources"]["bitrate"] - 121.0) < 0.1, hook.arr_meta.trusted_duration(avi, size)
     j = probe(("video", tags("V_MPEG4/ISO/AVC", 8_000_000, 120_000_000)), audio, ("video", {"codec_id": "V_MJPEG"}))
-    assert hook.arr_meta.trusted_duration(j, 121_000_000)["sources"]["streams"] == 120, hook.arr_meta.trusted_duration(j, 121_000_000)
+    assert hook.arr_meta.trusted_duration(j)["sources"]["streams"] == 120, hook.arr_meta.trusted_duration(j)
 
 
 @pytest.mark.parametrize("name", ["one-first.mkv", "same-second.mkv", "gif-second.mkv"])
 def test_a_cover_track_never_counts_in_the_length_of_the_file(cover_mkvs, name):
-    """A still image is no part of the film's bitrate. Its tag leaves the sum, and its bytes leave the size, so the
-    bitrate source of the trusted duration reads 2 minutes. Matroska takes the stored end instead of the bitrate, and
-    the cover leaves that too. The length check reads the same stored end."""
+    """A still image is no part of the film's length. The stored end of the trusted duration leaves the cover, and
+    reads 2 minutes. The length check reads the same stored end."""
     path = str(cover_mkvs / name)
     j, size = REAL_MKVMERGE(path), os.path.getsize(path)
     assert hook.arr_decide.checks(j, size, 0, stored_end=hook.stored_end(path, j)) == []
-    got = hook.arr_meta.trusted_duration(j, size, None, hook.stored_end(path, j))
-    assert abs(got["sources"]["stored"] - 120) < 0.5 and "bitrate" not in got["sources"], got
-    avi = dict(j, container=dict(j["container"], type="AVI"))   # the bitrate source of a container with no reader
-    assert abs(hook.arr_meta.trusted_duration(avi, size)["sources"]["bitrate"] - 120) < 1.5, hook.arr_meta.trusted_duration(avi, size)
+    got = hook.arr_meta.trusted_duration(j, None, hook.stored_end(path, j))
+    assert abs(got["sources"]["stored"] - 120) < 0.5, got
 
 
 @pytest.mark.parametrize("name", ["one-first.mkv", "same-first.mkv", "same-second.mkv"])
@@ -15295,7 +15289,7 @@ def test_the_conversion_checks_subtitles_only_where_it_may_fix(env, monkeypatch,
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     seen = []
     monkeypatch.setattr(hook, "convert", lambda app, path, j, st, apply, ids=None, lock=None, pool=None, force=None, sub=False, known=(), shared=False,
-                        source=None, outside=False: seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
+                        source=None, outside=False, compare=None: seen.append(sub) or ("not_matroska", "skipped, not matroska, test", {}, path))
     hook.main([])
     assert seen == [sub]
 
@@ -15747,7 +15741,7 @@ def test_a_conversion_that_leaves_a_track_out_keeps_the_original(env, monkeypatc
     settings(keep_days=7)
     monkeypatch.setattr(hook, "originals_root", lambda p: root)
 
-    def left_out(path, j, streams, subs, dur, apply, folder, info, known=()):
+    def left_out(path, j, streams, subs, dur, apply, folder, info, known=(), ready=None):
         info.update(subcheck={"s1": {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best"}}, tracks_unmatched=["s1"])
         return subs, [(2, 2)]
     monkeypatch.setattr(hook, "convert_subs", left_out)
@@ -15786,7 +15780,7 @@ def test_a_conversion_asks_with_the_original_language(env, monkeypatch):
     mp4_import(env, monkeypatch, sidecars=())
     env["movies"]["movie/7"]["originalLanguage"] = {"name": "Japanese"}
     seen = []
-    monkeypatch.setattr(hook, "convert_subs", lambda *a: seen.append(set(a[8])) or (a[3], []))
+    monkeypatch.setattr(hook, "convert_subs", lambda *a, ready=None: seen.append(set(a[8])) or (a[3], []))
     monkeypatch.setattr(hook, "sub_on", lambda source, sub_check=False: True)
     hook.main([])
     assert seen == [hook.arr_decide.codes("Japanese")], seen
@@ -15853,11 +15847,13 @@ def test_a_cue_moved_before_0_starts_at_0_and_no_stream_moves(sync_mkv, tmp_path
     path = str(tmp_path / "f.mkv")
     shutil.copy(sync_mkv / "f.mkv", path)
     j = REAL_MKVMERGE(path)
-    starts = {x["index"]: float(x.get("start_time") or 0) for x in hook.ff_streams(path)[1]}
+    starts = lambda: {x["index"]: float(x.get("start_time") or 0) for x in json.loads(REAL_RUN(   # ffprobe's start of each stream
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", path], capture_output=True, text=True, check=True).stdout)["streams"]
+        if x["codec_type"] != "subtitle"}
+    before = starts()
     _, result, info = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": offset}})
     assert result == "subtitles remuxed", (result, info)
-    assert {x["index"]: float(x.get("start_time") or 0) for x in hook.ff_streams(path)[1] if x["codec_type"] != "subtitle"} == \
-        {i: t for i, t in starts.items() if i != 2}
+    assert starts() == before
     rows = REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "2", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", path],
                     capture_output=True, text=True, check=True).stdout.split()
     got = [(round(float(a), 3), round(float(a) + float(d), 3)) for a, d in (r.split(",") for r in rows[:3])]
@@ -25578,7 +25574,7 @@ def test_check_apply_conversion_keeps_the_original_of_a_listed_file(env, monkeyp
     real_relink = hook.relink   # the app takes a minute, so the sidecars are kept a minute after the original
     monkeypatch.setattr(hook, "relink", lambda *a: env["clock"].__setitem__(0, env["clock"][0] + 60) or real_relink(*a))
 
-    def retimed(path, j, streams, subs, dur, apply, folder, info, known=()):   # the .en.srt gets new times, see convert_subs()
+    def retimed(path, j, streams, subs, dur, apply, folder, info, known=(), ready=None):   # the .en.srt gets new times, see convert_subs()
         info["sidecars_kept"] = [hook.keep_original(sides[0])]
         return [dict(s, mux=s["path"]) if s["path"] == sides[0] else s for s in subs], []
     monkeypatch.setattr(hook, "convert_subs", retimed)

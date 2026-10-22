@@ -18,10 +18,16 @@ for each packet that fails to decode or demux, "corrupt decoded frame" for each 
 for each frame with its time from START. So decide.parse_window() reads both, with the same rules. Exit 1 means the
 file did not open, has no decoder for the stream, or the decoder did not open. Each libav line goes out as libav logs
 it, from any thread, so a window that checks.watch() kills keeps the lines up to the kill, as ffmpeg's does. The lines leave out ffmpeg's stream list, so an encv FourCC never
-shows. checks.video_stages() then reads the bytes for encryption, see checks.encrypted_video().
+shows. checks.video_stages() then reads the bytes for encryption, see checks.encrypted_video(). PyAV comes from
+ff.pyav(), so each time it reads is one that ff.READS names for avwindow.main.
 """
 import logging
 import sys
+
+try:
+    from . import ff
+except ImportError:   # run by path, so the folder of this file comes first on sys.path
+    import ff
 
 LEVELS = {50: "fatal", 40: "error", 30: "warning", 20: "info"}   # PyAV's Python levels of libav's lines, as ffmpeg's -loglevel level+ names them
 
@@ -39,8 +45,7 @@ class Libav(logging.Handler):
 
 def main(path, index, start, secs):
     """Decode the window and write each line to stderr. Returns the exit code."""
-    import av
-    import av.logging
+    av = ff.pyav("avwindow.main")
     av.logging.set_level(av.logging.INFO)
     logging.getLogger("libav").addHandler(Libav())
     with av.open(path) as c:   # a file that does not open raises, and exits 1

@@ -74,7 +74,7 @@ def content_probe(app, owner, original, kids, release, ctx, heard=None):
             again = checks.hear(path, j, d, original, fresh=True)[0]
             if again:
                 d = decide.decide(j, original, kids, release, again)
-        m = process.metadata(app, path, j, os.path.getsize(path), d, original, release, c, fresh=fresh or f is None)
+        m = process.metadata(app, path, j, d, original, release, c, fresh=fresh or f is None)
         ev = m["evidence"]
         if f is None and any(pos not in again for pos in heard):
             ev = without_language(ev, "not heard again on the second check")

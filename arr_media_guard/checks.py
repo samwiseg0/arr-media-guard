@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks of one file: the probes, the header check, broken audio, corrupt video and the spoken language."""
-import bisect, collections, contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
+import bisect, collections, contextlib, fcntl, json, os, re, select, signal, subprocess, threading, time
 
-from . import config, content, decide, matroska, mp4, proof, store, subsync, subtitles, ts
+from . import config, content, decide, ff, matroska, mp4, proof, store, subsync, subtitles, ts
 
 
-def run_bounded(argv, timeout, **kw):
-    """subprocess.run() with timeout cut to the job's time left. A cut raises OutOfTime. A caller takes a TimeoutExpired
-    for a slow read and goes on."""
+def run_bounded(argv, timeout, use=None, **kw):
+    """ff.run() of argv for use with timeout cut to the job's time left. A cut raises OutOfTime. A caller takes a
+    TimeoutExpired for a slow read and goes on. An ffmpeg or ffprobe argv needs its use, see ff.READS."""
     try:
-        return subprocess.run(argv, timeout=config.DEADLINE.bound(timeout), **kw)
+        return ff.run(use, argv, timeout=config.DEADLINE.bound(timeout), **kw)
     except subprocess.TimeoutExpired:
         config.DEADLINE.check()
         raise
@@ -52,7 +52,7 @@ def sample(path, start, index, window=decide.SAMPLE_SECS):
     try:
         r = run_bounded(["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-ss", f"{start:.1f}", "-i", path,
                          "-t", f"{window:.1f}", "-map", f"0:a:{index}", "-vn", "-sn", "-dn", "-af", "volumedetect", "-f", "null", "-"],
-                        120, capture_output=True, text=True, errors="replace")
+                        120, use="checks.sample", capture_output=True, text=True, errors="replace")
         got = decide.parse_sample(r.stderr, r.returncode)
     except subprocess.TimeoutExpired:
         got = dict(decide.parse_sample("", 1))
@@ -62,7 +62,7 @@ def sample(path, start, index, window=decide.SAMPLE_SECS):
 def ffprobe_audio(path):
     """The audio stream indexes ffprobe sees, or None when ffprobe fails."""
     r = run_bounded(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
-                    120, capture_output=True, text=True, errors="replace")
+                    120, use="checks.ffprobe_audio", capture_output=True, text=True, errors="replace")
     return r.stdout.split() if r.returncode == 0 else None
 
 
@@ -167,7 +167,7 @@ def full_decode(path, index):
     if skipped:
         return {"kind": "full", "ran": False, "error": skipped}
     try:
-        r = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-progress", "pipe:1", "-i", path,
+        r = ff.run("checks.full_decode", ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-progress", "pipe:1", "-i", path,
                             "-map", f"0:a:{index}", "-vn", "-sn", "-dn", "-af",
                             "aformat=sample_rates=48000:channel_layouts=mono,asetpts=PTS-STARTPTS,volumedetect", "-f", "null", "-"],
                            capture_output=True, text=True, errors="replace", timeout=timeout)
@@ -234,9 +234,9 @@ def packet_read(path, index):
     if skipped:
         return {"error": skipped}
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=format_name,start_time:stream=index,id,codec_type,codec_name,profile:"
+        r = ff.run("checks.packet_read", ["ffprobe", "-v", "error", "-show_entries", "format=format_name,start_time:stream=index,id,codec_type,codec_name,profile:"
                             "stream_disposition=attached_pic", "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=min(120, timeout))
-        info = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+        info = ff.loads(r, "{}") if r.returncode == 0 else {}
         streams = info.get("streams") or []
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as ex:
         return {"error": f"ffprobe did not run: {type(ex).__name__}"}
@@ -291,7 +291,7 @@ def packet_read(path, index):
 def ffprobe_packets(path, timeout, add):
     """ffprobe's exit code after it read every packet of path, with add(stream index, time, duration) of each in
     seconds. The read of a format with no reader of AMG, see packet_read(). Raises OSError when ffprobe does not start."""
-    p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0", path],
+    p = ff.popen("checks.ffprobe_packets", ["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0", path],
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
     timer, rc = threading.Timer(timeout, p.kill), None
     timer.start()
@@ -961,8 +961,8 @@ def stream_probe(path):
     has none in the read pass either."""
     try:
         r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,id,codec_type,sample_rate,codec_name:format=format_name",
-                         "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
-        return json.loads(r.stdout) if r.returncode == 0 else None
+                         "-of", "json", path], 120, use="checks.stream_probe", capture_output=True, text=True, errors="replace")
+        return ff.loads(r) if r.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
 
@@ -1012,7 +1012,7 @@ def whole_check(path, stop=lambda: None):
     pcm, bare = pcm_audio(path, info), [s["index"] for s in truehd_cores(info.get("streams") or []) if not int(s.get("sample_rate") or 0)]
     bound = max(WHOLE_MIN, size / WHOLE_RATE)
     took = lambda t: round(time.monotonic() - t, 1)
-    p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error", "-i", path,
+    p = ff.popen("checks.whole_check", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error", "-i", path,
                           "-ignore_unknown", "-map", "0", *(a for i in bare for a in ("-map", f"-0:{i}")), "-c", "copy", "-f", "null", "-"],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
     got = {"kept": [], "lines": 0, "noise": 0}
@@ -1025,7 +1025,7 @@ def whole_check(path, stop=lambda: None):
             zeros["when"] = play_times(path, [a for a, _ in runs])
         if len(runs) >= 2 and not pcm:
             p.kill(); p.wait()
-            ff, out = {"skipped": "the zero scan was certain"}, None
+            read_pass, out = {"skipped": "the zero scan was certain"}, None
         else:
             stopped = watch(p, lambda: stop() or config.DEADLINE.check() or (f"ran over {bound:.0f} s" if time.monotonic() - t0 > bound else None))
             p.wait(); reader.join()
@@ -1037,14 +1037,14 @@ def whole_check(path, stop=lambda: None):
                 out["when"] = play_times(path, out["pos"])
             if out and out["lines"] and (short := segment_short(path) or 0) < 0:   # bytes past the Segment end, see decide.whole_verdict()
                 out.update(tail=-short, tail_errors=tail_errors(path))
-            ff = dict(out or {"skipped": stopped}, took=took(t0), code=p.returncode)
+            read_pass = dict(out or {"skipped": stopped}, took=took(t0), code=p.returncode)
     finally:
         if p.poll() is None:   # a stop or an error: no ffmpeg outlives the check
             p.kill(); p.wait()
         reader.join(10)
         p.stderr.close()
     certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
-    return certain, zero, more, {"zeros": zeros, "ffmpeg": ff, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
+    return certain, zero, more, {"zeros": zeros, "ffmpeg": read_pass, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
 
 
 def tail_errors(path):
@@ -1130,9 +1130,9 @@ def main_stream(path):
     True when a still-image track comes before it. An ffmpeg -ss then seeks by that track's index, and the film decodes
     from a frame that is no keyframe. So window() decodes such a film through PyAV."""
     r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,duration:stream_disposition=attached_pic",
-                     "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
+                     "-of", "json", path], 120, use="checks.main_stream", capture_output=True, text=True, errors="replace")
     try:
-        streams = json.loads(r.stdout).get("streams") or []
+        streams = ff.loads(r).get("streams") or []
         v = decide.main_video(streams)
     except (ValueError, AttributeError):
         return None
@@ -1166,9 +1166,9 @@ def window(path, start, secs, stream=None):
         [os.path.join(config.CFG.lid_dir, "venv", "bin", "python"), os.path.join(os.path.dirname(__file__), "avwindow.py"), path, str(stream),
          f"{start:.2f}", f"{secs:.2f}"]
     t0, stopped = time.monotonic(), None
-    with tempfile.TemporaryFile("w+", errors="replace", dir=config.CFG.state_dir) as err:   # a file, so a long stderr never blocks ffmpeg
+    with ff.Log("checks.window", config.CFG.state_dir) as err:   # a file, so a long stderr never blocks ffmpeg
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+            p = ff.popen("checks.window", cmd, stdout=subprocess.DEVNULL, stderr=err)
         except OSError as ex:   # the venv's Python is gone, as after an upgrade of the host's Python: the window did not run
             return dict(decide.parse_window(f"[fatal] {ex}", 1), at=round(start), stopped=None, took=round(time.monotonic() - t0, 2), read=0,
                         error=config.mask(str(ex))[:200], **({} if stream is None else {"via": "pyav"}))
@@ -1181,7 +1181,6 @@ def window(path, start, secs, stream=None):
         finally:
             if p.poll() is None:   # the job's time limit or an interrupt: no decoder outlives the check
                 p.kill(); p.wait()
-        err.seek(0)
         return dict(decide.parse_window(err.read(), 1 if stopped else p.returncode), at=round(start), stopped=stopped,
                     took=round(time.monotonic() - t0, 2), read=read, **({} if stream is None else {"via": "pyav"}))
 
@@ -1602,7 +1601,7 @@ def ffprobe_duration(path):
     loses its stage to it (CI has no ffprobe)."""
     try:
         r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                        120, capture_output=True, text=True, errors="replace")
+                        120, use="checks.ffprobe_duration", capture_output=True, text=True, errors="replace")
         return float(r.stdout.strip())
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None

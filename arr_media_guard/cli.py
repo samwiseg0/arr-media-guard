@@ -3,7 +3,7 @@
 """The command line: main(), the backfill, --sub-time, --check, the audit and the scans."""
 import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, traceback, types, uuid
 
-from . import apps, checks, config, content, convert, decide, logs, plex, process, regrab, report, runner, store, subsync, subtitles, vault
+from . import apps, checks, config, content, convert, decide, ff, gate, logs, plex, process, regrab, report, runner, store, subsync, subtitles, vault
 
 
 def plan_record(app, label, path, d):
@@ -47,7 +47,7 @@ def upgrade(lock, path, st):
     runner.same_file(path, st)
 
 
-def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
+def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, planned=None, row=None):
     """One file of a backfill, as (the seconds it took, the decision record), or None when its own tracks leave it out.
     The selection probe and the checks hold the file lock shared, so the workers of a dry run read side by side and an
     import never waits for a file's language detection. An edit takes the lock exclusive, see upgrade(). A file that
@@ -63,7 +63,8 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
     the deep analysis after it when job holds deep. An apply posts its alerts when an app names the file. The caller
     ends the time limit. job["run"] keeps the process.Ctx of the run, as runner.run_job() reads its own. save stores job
     in the queue after a conversion, see process.Ctx. A job a backfill queued yields to an import, see
-    runner.deep_analysis(), so subtitles.Yielded passes through."""
+    runner.deep_analysis(), so subtitles.Yielded passes through. planned is the file key of the dry run whose plan a
+    queued job applies, and row is the plan row its apply follows, see planned_file()."""
     label, original, runtime, want, kids, ctx = info
     started, path, ids = time.time(), f["path"], file_ids(f, want, ctx)
     mode = ("deep" if job.get("deep") else "import") if job else "convert" if a.convert else "sub_time" if a.sub_time else "sub_check" if a.sub_check else "backfill"
@@ -72,7 +73,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None):
             config.DEADLINE.start(config.BUDGET)
         c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=a.apply and bool(app) and mode in ("import", "deep", "backfill"),
                         kids=kids, release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
-                        force=a.force.get(path), job=job, save=save)
+                        force=a.force.get(path), job=job, save=save, planned=planned, row=row)
         if job:
             job["run"] = c
         return process.process(c)
@@ -142,7 +143,8 @@ def backfill_args(argv):
     ap = argparse.ArgumentParser(prog="arr-media-guard --backfill", description="Run the hook's checks and decision over the "
                                  "library of one instance, or of every instance in turn, at nice 19 and idle I/O priority. With no "
                                  "pass flag and no plan option, --apply puts one job per file in the background queue. The worker runs "
-                                 "each as --check --apply runs a file, after the imports. A plan option with --apply posts the alerts as "
+                                 "each as --check --apply runs a file, after the imports. --background with --apply and --plan-from queues the files "
+                                 "of the plan, and the worker applies the plan. A plan option with --apply posts the alerts as "
                                  "those jobs do. --convert and --sub-check print the alerts of each file and post none. --convert --apply posts "
                                  "an alert for each conversion that a stopped run left.")
     ap.add_argument("app", nargs="?", choices=sorted(config.CFG.apps), help="the instance. With none the run takes every instance in turn")
@@ -173,6 +175,9 @@ def backfill_args(argv):
     ap.add_argument("--recheck", action="store_true", help="with --sub-check, check each file again, whatever its saved result says")
     ap.add_argument("--drop-queued", action="store_true", help="drop the jobs that a backfill queued and that wait or run, of the "
                     "instance or of every instance, and do nothing else")
+    ap.add_argument("--background", action="store_true", help="with --apply and --plan-from, put each file of the plan in the "
+                    "background queue with its plan. The worker applies the plan after the imports. It refuses a file that changed "
+                    "since the dry run, and a file whose new plan differs")
     a = ap.parse_args(argv)
     a.sub_time = False   # see sub_time()
     a.queue = not (a.convert or a.sub_check or a.check_audio or a.check_video or a.plan_out or a.plan_from)   # see backfill_queue()
@@ -198,6 +203,10 @@ def backfill_args(argv):
         ap.error("--only-undecided needs --plan-from, the dry run's plan file")
     if a.only_header and not a.plan_from:
         ap.error("--only-header needs --plan-from, the dry run's plan file")
+    if a.background and not (a.apply and a.plan_from):
+        ap.error("--background needs --apply and --plan-from, the dry run's plan file")
+    if a.background and (a.convert or a.sub_check or a.check_audio or a.check_video or a.only_undecided or a.plan_out):
+        ap.error("--background takes no --convert, --sub-check, scan, --only-undecided or --plan-out")
     if a.workers is not None and (a.workers < 1 or (a.workers > 1 and a.apply and not a.convert)):
         ap.error("--workers takes 1 or more, and more than 1 only in a dry run, a scan or --convert --apply")
     return a
@@ -262,6 +271,11 @@ def backfill_app(app, a, out):
                  and (r["undecided"] if a.only_undecided else r.get("header_repair") == "would_repair_header" and not r.get("padding_only")
                       if a.only_header
                       else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
+        if a.background:   # before the canary, so a second run takes the next files. An applied file changed, so it never queues again.
+            why = {r["path"]: changed_since(r) for r in plans}
+            for text, n in collections.Counter(w for w in why.values() if w).items():
+                print(f"{app}: {n} file{'s' if n != 1 else ''} of the plan not queued, {text}", flush=True)
+            plans = [r for r in plans if not why[r["path"]]]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
         work = [w for w in work if w[0]["path"] in keep]
     for given in filter(None, (a.paths, a.force_convert)):   # the run takes only the listed files
@@ -271,6 +285,8 @@ def backfill_app(app, a, out):
         work = [w for w in work if w[0]["path"] in listed]
     if a.queue:
         return backfill_queue(app, a, work)
+    if a.background:
+        return plan_queue(app, a, work)
     a.force = logged_refusals({w[0]["path"] for w in work}) if a.force_convert else {}   # path: the refusal a person checked, docs/design.md, "Conversion"
     for p in sorted(p for p, why in a.force.items() if not why):
         print(f"no proof refusal in the decision log, so {'it is not' if apps.ARR[app].film else 'only its name check is'} forced: {p}",
@@ -390,6 +406,100 @@ def backfill_queue(app, a, work):
     print(f"{app}: {n} file{'s' if n != 1 else ''} {'queued' if a.apply else 'to queue, dry run'}, {minutes / 60:.1f} hours of video, "
           f"{len(set(order) - set(state['done']))} of {len(work)} files left in this pass. They wait in the background queue behind the "
           f"imports and run {config.CFG.background_workers} at a time.", flush=True)
+
+
+def plan_queue(app, a, work):
+    """--backfill --plan-from --apply --background: one job per file of work in the background queue, with the plan
+    row of the dry run, see runner.queue_listed(). The worker applies the row as this backfill's apply would, see
+    planned_file(). A file with a job of its path that waits or runs keeps that job. --limit N queues N files."""
+    rows, n, kept, minutes = {r["path"]: r for r in a.plans[app]}, 0, 0, 0
+    for f, info in work:
+        if a.limit and n >= a.limit:
+            break
+        with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away
+            got = runner.queue_listed(app, f, info, backfill=True, flag_backfill=True, plan=rows[f["path"]])
+            n, kept, minutes = n + got, kept + (not got), minutes + got * info[2]
+    print(f"{app}: {n} file{'s' if n != 1 else ''} queued with the plan of the dry run, {minutes / 60:.1f} hours of video"
+          + (f", {kept} kept the job of its path that waits or runs" if kept else "")
+          + f". They wait in the background queue behind the imports and run {config.CFG.background_workers} at a time.", flush=True)
+
+
+def changed_since(row):
+    """Why the file of the plan row is not the file its dry run planned, or None. The row holds the dry run's
+    runner.file_key(), see process.decision_fields(). A row of a version before 2.18.7 holds none."""
+    if "key" not in row:
+        return "the plan holds no file key, so run the dry run again with this version"
+    try:
+        st = os.stat(row["path"])
+    except OSError:
+        return "the file is gone"
+    return None if list(runner.file_key(st)) == row["key"] else "the file changed since the dry run"
+
+
+def own_refusal(app, dry, own, job):
+    """The fields that name the job's own writes in dry, the refusal of process.start() of a file whose key is the one
+    own holds, see planned_file(). The rescan that a stop held goes out now. {} for another refusal."""
+    try:
+        mine = dry.get("outcome") == "plan_refused" and own and list(runner.file_key(os.stat(dry["path"]))) == own["key"]
+    except OSError:
+        mine = False
+    if not mine:
+        return {}
+    out = {"result": f"refused, this job wrote the file before a stop ({', '.join(own['codes'])}), so a new dry run plans the rest"}
+    if (job or {}).get("rescan"):
+        out["rescan"] = apps.ARR[app].rescan((dry.get("ids") or {}).get("app_id"))
+    return out
+
+
+LATER = ("deep", "burn_in")   # the plans of the jobs that a queued --check queues after it, see check()
+
+
+def plan_diff(row, fresh):
+    """{field: [the value in row, the value in fresh]} for each field where fresh, the plan of a new dry run, differs from
+    row, the plan of the dry run a job applies. The label, the path and the key are left out: process.start() checks
+    the key first, and a file the app moved keeps its key."""
+    old, new = (json.loads(json.dumps({k: v for k, v in (p or {}).items() if k not in ("label", "path", "key")})) for p in (row, fresh))
+    return {k: [old.get(k), new.get(k)] for k in sorted(old.keys() | new.keys()) if old.get(k) != new.get(k)}
+
+
+def planned_file(app, f, info, a, row, job=None, save=None, converted=None, own=None):
+    """(seconds, decision record) of a queued job that applies row, the plan of a dry run, see plan_queue() and
+    check_queue(). A dry run of the file plans it again first, as the dry run that wrote row did: the flag backfill, or
+    --check when job is given. Only when that plan equals row, see plan_diff(), does the file run again with a, the
+    apply. Both runs refuse a file whose file key is not the row's, under the file lock, see process.start(). Each write
+    of the apply goes through the write gate, which compares it with the row first, see gate.allow(), as the hearing
+    and the time limits can decide otherwise. A refusal edits nothing more and posts nothing. Its outcome is
+    plan_refused, and its result says why. A flag backfill sends its rescan at the end of the file, as no run end
+    follows, see rescan_item(). The guard of the gate runs through both passes, see gate.armed(), so a write that no
+    allow() let through fails the job.
+
+    converted is the file key after a conversion of this job's own, which save() stores, see process.conversion(). A run
+    after a stop then goes on from the new file with no dry pass, as the run that converted it would have, under the
+    file key of the new file. Its line says so in "note". The follow-up jobs of that file get no plan, see
+    runner.queue_after(), as no dry run saw the new file.
+
+    own is what the job's own writes before a stop left, see process.stop_line(): their reason codes and the file key.
+    A refusal of a file that has that key says the change is the job's own. A rescan that the stop held is sent then."""
+    started = time.time()
+    with gate.armed(f["path"]):
+        if converted:
+            _, rec = backfill_file(app, f, info, a, False, job=job, save=save, planned=converted)
+            rec["note"] = "this job converted the file before a stop"
+        else:
+            _, dry = backfill_file(app, f, info, types.SimpleNamespace(**dict(vars(a), apply=False)), True, job=dict(job) if job else None, planned=row["key"])
+            config.DEADLINE.stop()   # an import's time limit starts again for the apply
+            fresh = dry.pop("plan", None)
+            if fresh is None or runner.STOP["skipped"]:   # a refusal of process.start(), an error, or a stop
+                return time.time() - started, dict(dry, apply=a.apply, **own_refusal(app, dry, own, job))
+            if diff := plan_diff({k: v for k, v in row.items() if k not in LATER}, fresh):
+                keep = ("id", "app", "source", "ids", "label", "path", "original", "kids", "release", "size", "mtime", "file_duration")
+                return time.time() - started, dict({k: dry[k] for k in keep if k in dry}, apply=a.apply, outcome="plan_refused", plan_diff=diff,
+                                                   result=f"refused, the plan differs from the dry run's in {', '.join(diff)}")
+            _, rec = backfill_file(app, f, info, a, False, job=job, save=save, planned=row["key"], row=row)
+    if job is None and "after the run" in ((rec.get("repack") or {}).get("rescan"), (rec.get("header_repair") or {}).get("rescan"),
+                                           (rec.get("subremux") or {}).get("rescan")):
+        rescan_item(app, (rec.get("ids") or {}).get("app_id"), [p] if (p := (rec.get("repack") or {}).get("pending")) else None)
+    return time.time() - started, rec
 
 
 def sub_count(c, rec, took):
@@ -540,9 +650,20 @@ def check(argv):
                        "A film is movie/ID, as movie/603. An episode is tv/ID/SEASON/EPISODE, as tv/1396/1/3 for season 1, episode 3")
     ap.add_argument("--apply", action="store_true", help="edit the files as an import does, keep the original of a conversion, post the "
                     "alerts and ask Plex to analyze. Without it the run is dry and changes nothing")
+    ap.add_argument("--plan-out", metavar="FILE", help="write each file's plan as a JSON line, for --background")
+    ap.add_argument("--plan-from", dest="plan_file", metavar="FILE", help="with --background, the plan file of a dry run with --plan-out")
+    ap.add_argument("--background", action="store_true", help="with --apply and --plan-from, put each file in the background queue with "
+                    "its plan. The worker applies the plan after the imports. It refuses a file that changed since the dry run, and a "
+                    "file whose new plan differs")
     a = ap.parse_args(argv)
     if a.id is not None and not a.app:
         ap.error("--id needs --app")
+    if a.background and not (a.apply and a.plan_file):
+        ap.error("--background needs --apply and --plan-from, the dry run's plan file")
+    if a.plan_file and not a.background:
+        ap.error("--plan-from needs --background")
+    if a.plan_out and a.background:
+        ap.error("--plan-out writes no plan with --background, which runs no file")
     if a.tmdb and not re.fullmatch(r"movie/\d+|tv/\d+/\d+/\d+", a.tmdb):
         ap.error("--tmdb takes movie/ID or tv/ID/SEASON/EPISODE, as movie/603 or tv/1396/1/3")
     vars(a).update(CHECK_ARGS)
@@ -595,7 +716,12 @@ def check(argv):
     for p in left:
         print(f"{said}, so it runs {'as ' + info[0] if app else 'with no item'}: {p}", flush=True)
         work.append((app, dict(fields, path=p), (info[0] or os.path.basename(p), *info[1:]), out))
+    if a.background:
+        return check_queue(a, work, failed)
     skipped, burst = set(), {}   # plex_analyze()'s, as for --sub-time
+    if a.plan_out:   # as /config/plans/, which the docs name
+        os.makedirs(os.path.dirname(os.path.abspath(a.plan_out)), exist_ok=True)
+    plans = open(a.plan_out, "w") if a.plan_out else None   # one line per file, see process.decision_fields()
 
     def done(app, info, out, took, rec, what=""):
         """The Plex analyze after a change, the decision line and the printed report of one run of a file."""
@@ -609,17 +735,53 @@ def check(argv):
             failed.append(f'{rec["path"]}: {what}{rec["result"]}')
     for app, f, info, out in work:
         job = check_job(f, info, out is not None)
-        took, rec = backfill_file(app, f, info, a, False, job=job)
+        took, rec = backfill_file(app, f, info, a, bool(plans), job=job)
         config.DEADLINE.stop()
+        row = rec.pop("plan", None)
         run = job.pop("run", None)
         rec["not_checked"] = (out or []) + check_left(rec)
         done(app, info, out, took, rec)
         if run and "tracks" in rec:   # the decision ran, so an import would queue these, see runner.run_job()
             for what, later in (("burned-in subtitle check, ", burn_later), ("whole-file check, ", whole_later), ("deep analysis, ", deep_later)):
                 if got := later(app, f, info, a, job, rec, run):
+                    p = got[1].pop("plan", None) or {}   # what the job of the worker may write, see runner.queue_after()
+                    if row is not None and later is deep_later:
+                        row["deep"] = {k: p[k] for k in process.WRITES if p.get(k) is not None}
+                    elif row is not None and later is burn_later:   # its mute is a flag edit
+                        row["burn_in"] = {"edits": got[1].get("edits") or []}
                     done(app, info, out, *got, what=what)
+        if row is not None:
+            plans.write(json.dumps(row) + "\n")
+    if plans:
+        plans.close()
     if failed:
         sys.exit("--check did not check every file:\n  " + "\n  ".join(failed))
+
+
+def check_queue(a, work, failed):
+    """--check --apply --background: one job per file of work in the background queue, with its plan row from
+    --plan-from, see runner.queue_listed(). The worker applies the row as --check --apply would, see planned_file(). A
+    file no app lists, a file the plan file holds no row of, a file whose key is not the row's, see changed_since(),
+    and a file with a job of its path that waits or runs are not queued. Each gets one line, and the exit code is 1."""
+    rows, n = {}, 0
+    for app, f, info, out in work:
+        row = None if out is not None else rows.setdefault(app, {r["path"]: r for r in plan_rows(a.plan_file, app)}).get(f["path"])
+        why = "no app lists it, so the background queue cannot take it" if out is not None else \
+            "the plan file holds no plan of it" if row is None else changed_since(row)
+        if not why:
+            try:
+                got = runner.queue_listed(app, f, info, backfill=True, plan=row)
+            except OSError as ex:
+                got, why = 0, config.mask(f"{type(ex).__name__}: {ex}")[:200]
+            n += got
+            why = why or (None if got else "a job of its path waits or runs, so it keeps that job")
+        if why:
+            failed.append(f"not queued, {why}: {f['path']}")
+            print(failed[-1], flush=True)
+    print(f"{n} file{'s' if n != 1 else ''} queued with the plan of the dry run. They wait in the background queue behind the imports "
+          f"and run {config.CFG.background_workers} at a time.", flush=True)
+    if failed:
+        sys.exit("--check did not queue every file:\n  " + "\n  ".join(failed))
 
 
 CHECK_ARGS = dict(sub_check=False, sub_time=False, recheck=False, plan_from=None, convert=False, force={})   # what backfill_file() reads of a run of check()
@@ -635,7 +797,8 @@ def check_job(f, info, outside=False):
 def burn_later(app, f, info, a, job, rec, run):
     """(seconds, decision record) of the full burned-in subtitle check that an import queues after its quick check, run
     now as the burn-in job runs it, see runner.burn_act(), or None when the quick check of rec asks for none. run is the
-    process.Ctx of the check, so the job decides with its inputs. It runs dry and never re-grabs, as the check does."""
+    process.Ctx of the check, so the job decides with its inputs. It never re-grabs, as the check does. A dry run plans
+    the mute on the flags that the check's edits leave, as the job of a queued --check runs after those edits."""
     b = rec.get("burned_in") or {}
     if b.get("result") not in ("flagged", "unsure"):
         return None
@@ -643,7 +806,8 @@ def burn_later(app, f, info, a, job, rec, run):
     r = dict(id=uuid.uuid4().hex[:12], app=app, source="check", path=rec["path"], apply=a.apply, ids=rec.get("ids") or {}, label=rec.get("label"))
     inputs = dict(label=info[0], original=info[1], kids=info[4], release=f.get("sceneName") or "", plan=process.plan_inputs(run))
     try:
-        r = runner.burn_act(None, dict(app=app, path=rec["path"], inputs=inputs, quick=b["result"], grab=job), r, [], post=run.post)
+        r = runner.burn_act(None, dict(app=app, path=rec["path"], inputs=inputs, quick=b["result"], grab=job,
+                                       **({} if a.apply else {"planned": rec.get("edits") or []})), r, [], post=run.post)
     except Exception as ex:
         if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
             raise
@@ -670,11 +834,12 @@ def whole_later(app, f, info, a, job, rec, run):
 def deep_later(app, f, info, a, job, rec, run):
     """(seconds, decision record) of the deep analysis that an import queues for its file, see runner.deep_wanted(),
     run now with the inputs of the check, as runner.deep_analysis() runs it, or None. It has no time limit. The alerts
-    that the check held for it post when it does not find them again, see runner.held_after()."""
+    that the check held for it post when it does not find them again, see runner.held_after(). With --plan-out its
+    record holds its plan, which the row of the file keeps, see check()."""
     if not runner.deep_wanted(rec):
         return None
     deep = dict(job, deep=True, path=rec["path"])
-    took, r = backfill_file(app, dict(f, path=rec["path"], id=(rec.get("ids") or {}).get("file_id")), info, a, False, job=deep)
+    took, r = backfill_file(app, dict(f, path=rec["path"], id=(rec.get("ids") or {}).get("file_id")), info, a, bool(getattr(a, "plan_out", None)), job=deep)
     r["deep"] = True   # its line keeps source check, so the audit tells it apart by this, see a_result()
     if r["outcome"] == "error" and getattr(deep.get("run"), "rec", None):   # what the run changed before the error, as runner.deep_analysis() keeps it
         r.update({k: deep["run"].rec[k] for k in ("subremux", "sidecars") if k in deep["run"].rec})
@@ -898,7 +1063,7 @@ def lines_field(name, groups):
     return fields + ([(name if not fields else f"{name}, more", cur)] if cur else [])
 
 
-RESULTS = ("hook", "check", "backfill", "backfill_job")   # the runs that decide the flags. A deep analysis and a recheck keep them.
+RESULTS = ("hook", "check", "backfill", "backfill_job", "check_job")   # the runs that decide the flags. A deep analysis and a recheck keep them.
 
 
 def a_result(r):
@@ -942,7 +1107,8 @@ def audit(argv):
     g.add_argument("--plan-from", metavar="FILE", help="group the plans of a dry run by policy path and rule, and check the "
                    "invariants again")
     g.add_argument("--since", metavar="24h|DATE", help="read the decision log from this time on, 24h or an ISO date")
-    ap.add_argument("--source", choices=["hook", "backfill", "check"], help="only the results of the hook, of a backfill or of --check")
+    ap.add_argument("--source", choices=["hook", "backfill", "check"], help="only the results of the hook, of a backfill or of --check. "
+                    "backfill and check take the jobs they queued too")
     ap.add_argument("--post", action="store_true", help="post the summary to DISCORD_WEBHOOK, when there is anything to report")
     a = ap.parse_args(argv); app = a.app
     os.nice(19)
@@ -983,7 +1149,7 @@ def audit(argv):
             day.append(r)   # every source, for the TMDB status
             if "rfc" in r:   # the faults the run found, which a repair of the same run ended
                 rfc[r.get("path")] = {} if (r.get("header_repair") or {}).get("code") in config.REPAIRED else r["rfc"]
-            if (a.source and r.get("source") != a.source) or not (r.get("apply") or r.get("source") == "hook"):
+            if (a.source and r.get("source") not in (a.source, f"{a.source}_job")) or not (r.get("apply") or r.get("source") == "hook"):
                 continue   # from the hook or an apply only. Dry runs change nothing.
             latest[r.get("path"), r.get("source")] = r
             if a_result(r):
@@ -1038,13 +1204,15 @@ def audit(argv):
         runner.queue_rechecks()   # on a host the first nightly audit of a new version queues its rechecks
         # one summary line a night, so Loki sees each host even on a day without imports. It counts a file once per decision line.
         k = collections.Counter(what.partition(":")[0] for what, _ in seen)
+        refused = len(ff.logged(start.timestamp()))   # the time reads ff.py refused in every process. A fault line names no app.
         kinds = collections.Counter(kind for path, found in rfc.items() if os.path.exists(path or "") for kind in found)   # files per kind
         logs.to_syslog(report.logfmt([("arr", app), ("source", "audit"), ("outcome", "summary"), ("edited", len(last)),
                           ("further", k["further"] + k["reprobe"]), ("undecided", k["undecided"]), ("dropped", k["dropped"]),
-                          ("broken", k["broken"]), ("errors", k["error"]), ("tmdb", tmdb)] + [(f"rfc_{x}", n) for x, n in sorted(kinds.items())]))
+                          ("broken", k["broken"]), ("errors", k["error"]), ("tmdb", tmdb)] + ([("refused", refused)] if refused else []) + [(f"rfc_{x}", n) for x, n in sorted(kinds.items())]))
         files = logs.audit_files([(what, r) for what, r in seen if open_problem(what, r, result, edited_at, latest)])
         title = f"Open problems: {len(files)} file{'' if len(files) == 1 else 's'} · {logs.app_name(app)}"
         text = f"{len(files)} file{'' if len(files) == 1 else 's'} with an open problem since {start.isoformat(timespec='minutes')}." + \
+            (f" ff.py refused {refused} time read{'' if refused == 1 else 's'}, see ff-faults.jsonl in the state folder." if refused else "") + \
             "".join(f"\n{label}: {problems}" for label, problems, _ in files)
         fields = [("TMDB", tmdb)]   # the day's metadata checks: ok, unavailable n times, key broken, or no checks
         if kinds:   # files with each RFC 9559 fault kind, by their latest header check in the window
@@ -1217,6 +1385,7 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --backfill [<instance>] --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]
   arr-media-guard --backfill <instance> --sub-check [--apply] [--ids ID ...] [--paths PATH ...]
   arr-media-guard --backfill [<instance>] --apply --plan-from FILE [--canary N]
+  arr-media-guard --backfill [<instance>] --apply --plan-from FILE --background [--canary N] [--limit N]   queue the files of the plan
   arr-media-guard --backfill [<instance>] --plan-from FILE --only-undecided [--apply] [--plan-out FILE]
   arr-media-guard --backfill <instance> --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]
   arr-media-guard --backfill <instance> --convert --apply --force-convert PATH [PATH ...] [--ids ID ...]
@@ -1226,7 +1395,8 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --backfill <instance> --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]
   arr-media-guard --audit <instance> (--plan-from FILE | --since 24h|DATE) [--source hook|backfill|check] [--post]
   arr-media-guard --sub-time PATH [PATH ...] [--apply]
-  arr-media-guard --check PATH [PATH ...] [--app <instance>] [--id ID | --tmdb KIND/ID] [--apply]
+  arr-media-guard --check PATH [PATH ...] [--app <instance>] [--id ID | --tmdb KIND/ID] [--apply] [--plan-out FILE]
+  arr-media-guard --check PATH [PATH ...] --apply --plan-from FILE --background   queue the files of the plan
   arr-media-guard --burn-in [PATH ...] [--app <instance> --ids ID ...]   the burned-in subtitle check, report only
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
@@ -1237,6 +1407,8 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
 <instance> is radarr, sonarr or a name in APP_INSTANCES, as sonarr-4k. A backfill or a scan with no instance runs every
 instance. With no pass flag (--convert, --sub-check, --check-audio, --check-video) and no plan option (--plan-out,
 --plan-from), --apply queues each file the app lists. The worker runs each one as --check --apply, after the imports.
+--background queues the files of a dry run's plan. The worker applies the plan only to a file that is unchanged and
+that it plans the same way again.
 --backfill, --audit, --sub-time, --check and --burn-in print their options with --help, as in arr-media-guard --backfill --help.
 README.md says how to install and connect it. docs/commands.md explains each mode, and docs/design.md how it works."""
 
@@ -1356,7 +1528,7 @@ def queue():
         try:
             job = json.loads(raw)
             kind = "burn_in" if name.startswith(runner.BURN_PREFIX) else "whole_file" if name.startswith(runner.WHOLE_PREFIX) else \
-                "hook" if not name.startswith("deep-analysis-") else "recheck" if job.get("recheck") else "backfill_job" if job.get("backfill") \
+                "hook" if not name.startswith("deep-analysis-") else "recheck" if job.get("recheck") else runner.queued_source(job) if job.get("backfill") \
                 else "deep_analysis"   # as runner.background() and deep_analysis() name the source
             jobs.append((kind, pid, job_proc(pid) if pid else None, job.get("path")))
         except (TypeError, ValueError, AttributeError):   # a job that does not read, as store.carry() counts one

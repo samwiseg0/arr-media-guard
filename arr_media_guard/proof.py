@@ -3,7 +3,7 @@
 """The packet proof of a conversion and the damage checks of its original."""
 import array, collections, concurrent.futures, contextlib, fractions, hashlib, heapq, itertools, json, os, re, shutil, subprocess, threading, uuid
 
-from . import checks, cli, config, content, convert, decide, matroska, mp4, runner, subsync, ts
+from . import checks, cli, config, content, convert, decide, ff, matroska, mp4, runner, subsync, ts
 
 
 PROOF_RATE = 10e6         # bytes a second a proof read must reach at least, else it times out
@@ -177,9 +177,9 @@ def cue_fault(what, a, b, last_end=True):
 
 def ff_streams(path):
     """(ffprobe's format name, its streams, the format duration in seconds) of path. Raises when ffprobe reads no stream."""
-    r = checks.run_bounded(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path], 120, capture_output=True, text=True,
-                    errors="replace")
-    d = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+    r = checks.run_bounded(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path], 120, use="proof.ff_streams",
+                           capture_output=True, text=True, errors="replace")
+    d = ff.loads(r, "{}") if r.returncode == 0 else {}
     if not d.get("streams"):
         raise RuntimeError(f"ffprobe read no stream: {config.mask(r.stderr.strip())[-200:]}")
     f = d.get("format") or {}
@@ -268,7 +268,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
         argv += ["-map", f"0:{i}", "-c", "copy", "-copyinkf", "-f", "data", f]
     for i, f in srt.items():
         argv += ["-map", f"0:{i}", "-c:s", "copy" if raw is True or i in (raw or ()) else "srt", "-f", "srt", f]
-    r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+    r = ff.run("proof.packet_hashes", argv, capture_output=True, text=True, errors="replace", timeout=timeout)
     bad = bad_lines(r.stderr)
     real = [line for line in bad if not SUB_DECODER.match(line)]
     if bad and not real:   # only the text of a subtitle failed to decode, which shows no damage, see DAMAGE
@@ -488,7 +488,7 @@ def packet_places(path, folder, timeout, clean=False):
             "packet=stream_index,pts_time,dts_time,duration_time,size,pos", "-of", "csv=p=0", path]
     out, nan, late = {}, float("nan"), []
     with open(os.path.join(folder, f"{uuid.uuid4().hex}.err"), "w+") as err, \
-            subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err, text=True, errors="replace") as r:
+            ff.popen("proof.packet_places", argv, stdout=subprocess.PIPE, stderr=err, text=True, errors="replace") as r:
         timer = threading.Timer(timeout, lambda: late.append(r.kill()))
         timer.start()
         try:
@@ -1079,7 +1079,7 @@ def source_read(damage, path, j):
     try:
         fam, streams, _ = ff_streams(path)
         if read == "mkvmerge":
-            r = subprocess.run(convert.convert_cmd(path, os.devnull, j, [], sync=convert.avi_sync(path, j, streams)), capture_output=True, text=True,
+            r = ff.run("convert.convert", convert.convert_cmd(path, os.devnull, j, [], sync=convert.avi_sync(path, j, streams)), capture_output=True, text=True,
                                errors="replace")
             dur = decide.duration(j) or checks.ffprobe_duration(path) or 0
             line = invalid_audio(r.stdout + r.stderr, j, streams, dur).get(damage["stream"])
@@ -1246,7 +1246,7 @@ def edit_list_sample(src, index, bsf, y, folder, timeout):
 def packet_data(path, index, bsf, n, timeout):
     """The data of the first n packets of stream index of path, read with -c copy through bsf, joined. The caller splits
     it by the sizes of its own read. It reads only the start of the file. A timeout or an ffmpeg error raises."""
-    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
+    r = ff.run("proof.packet_data", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
                         "-copyinkf", *(["-bsf:0", bsf] if bsf else []), "-frames:0", str(n), "-f", "data", "pipe:1"], capture_output=True,
                        timeout=timeout)
     if r.returncode:
@@ -1322,9 +1322,9 @@ def annexb_units(data):
 
 def extradata(path, index, timeout):
     """The codec header of stream index of path, from ffprobe's dump of it, or b"" when ffprobe gives none."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries", "stream=extradata", "-show_data", "-of", "json",
+    r = ff.run("proof.extradata", ["ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries", "stream=extradata", "-show_data", "-of", "json",
                         path], capture_output=True, text=True, errors="replace", timeout=timeout)
-    dump = ((json.loads(r.stdout or "{}").get("streams") or [{}])[0].get("extradata") or "") if r.returncode == 0 else ""
+    dump = ((ff.loads(r, "{}").get("streams") or [{}])[0].get("extradata") or "") if r.returncode == 0 else ""
     return bytes.fromhex("".join("".join(line[10:49].split()) for line in dump.splitlines() if line.strip()))
 
 
@@ -1356,11 +1356,11 @@ def hevc_packets(path, index, timeout):
     if len(head) < 23 or head[0] != 1:
         raise RuntimeError(f"stream {index} of {os.path.basename(path)} has no HEVC codec header")
     n = (head[21] & 3) + 1
-    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
+    r = ff.run("proof.hevc_packets", ["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", str(index), "-show_entries",
                         "packet=pts,dts,size,flags", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=timeout)
     if r.returncode:
         raise RuntimeError(f"ffprobe did not read the packets of {os.path.basename(path)}: {config.mask(r.stderr.strip())[-200:]}")
-    p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
+    p = ff.popen("proof.hevc_packets.data", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{index}", "-c", "copy",
                           "-copyinkf", "-f", "data", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     timer = threading.Timer(timeout, p.kill)
     timer.start()

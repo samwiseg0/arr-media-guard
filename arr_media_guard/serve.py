@@ -49,7 +49,7 @@ BANNER = r"""
 \__,_|_| |_|       |_|_|_|\___|\__,_||_|\__,_|     \__, |\_,_|\__,_|_|  \__,_|
                                                    |___/
 """[1:-1]   # the listener prints it once at its start, above the listening line
-ROTATE = """{log} {{
+ROTATE = """{log} {faults} {{
     weekly
     rotate 52
     compress
@@ -57,7 +57,7 @@ ROTATE = """{log} {{
     missingok
     notifempty
 }}
-"""   # the decision log's rotation, as docs/monitoring.md asks of a host install
+"""   # the rotation of the decision log and of the fault file of ff.py, as docs/monitoring.md asks of a host install
 
 
 def download(app, body):
@@ -339,7 +339,7 @@ def daily():
         subprocess.run([sys.executable, config.SCRIPT, "--serve", "--audit", app, "--since", "24h", "--post"], check=False)
     conf = os.path.join(config.CFG.state_dir, "logrotate.conf")
     with open(conf, "w") as f:
-        f.write(ROTATE.format(log=config.CFG.log))
+        f.write(ROTATE.format(log=config.CFG.log, faults=os.environ["AMG_FF_FAULTS"]))
     try:
         subprocess.run(["logrotate", "-s", os.path.join(config.CFG.state_dir, "logrotate.state"), conf], check=False)
     except FileNotFoundError:

@@ -84,6 +84,68 @@ arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl
 
 With no instance, one plan file holds the plans of every instance, and `--canary N` takes N files of each.
 
+### Apply a plan in the background queue
+
+`--background` puts each file of an audited plan in the background queue, with its plan. The worker applies the plan
+after the imports, in the places of `BACKGROUND_WORKERS`. Without it, `--apply --plan-from` and `--check --apply` edit
+the files in their own process, beside the imports.
+
+```
+arr-media-guard --backfill radarr --plan-out /config/plans/radarr.jsonl                                     # dry run
+arr-media-guard --audit radarr --plan-from /config/plans/radarr.jsonl                                       # the plans, by plan group
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --background --canary 20   # queue 20 files
+arr-media-guard --backfill radarr --apply --plan-from /config/plans/radarr.jsonl --background               # queue the rest
+arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --plan-out /config/plans/film-a.jsonl                 # dry run
+arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --apply --plan-from /config/plans/film-a.jsonl --background
+```
+
+- `--background` needs `--apply` and `--plan-from`. A backfill with it takes no `--convert`, `--sub-check`, scan,
+  `--only-undecided` or `--plan-out`. `--check --plan-out FILE` writes the plan file of a check, and `--check` takes
+  `--plan-from` only with `--background`.
+- Each plan line holds the file key of the file that the dry run read: its inode, its size and its modification time. A
+  file whose key differs does not queue. An apply changes the file, so a second run queues only the files left. A plan
+  file of 2.18.6 or older holds no key. Run the dry run again.
+- `--canary N` takes N of the files left, across the plan groups. `--limit N` queues N files.
+- The worker runs each job as its dry run ran: a backfill's job as the flag backfill, and a job of `--check` as `--check
+  --apply`. It plans the file again in a dry run first. It refuses the file when the file key differs, or when that
+  plan differs from the plan line. The compare leaves out the label, the path and the file key, which the key check
+  covers. Each write of the apply goes through one write gate, which compares it with the plan line first: the
+  conversion, the header repair, the flag edits, the edits after a remux, the subtitle remux, the sidecar changes and
+  the move back of the extras that the job's own conversion hid.
+  The language hearing and the time limits can give the apply another answer. A guard in the worker fails any write on
+  the file or its sidecars that skips the gate, and the job's line is then an error. A refusal writes nothing more and
+  posts nothing. Its decision line has the outcome `plan_refused`, a result that says
+  why, and `plan_diff`, both values of each field that differs. A new dry run plans the file again.
+- The plan line holds the flag edits, a digest of the header repair with its subtitle trims and removals, and a digest
+  of a conversion with the verdicts of its subtitle check and the name, language, flags, size and time of each sidecar
+  it muxes. The plan of `--check` also holds the
+  subtitle remux and the sidecar changes, by track and by sidecar, with a digest of their new times. So a job whose fit
+  finds 4 s refuses a plan that retimes by 2 s.
+- No dry run sees the file that a conversion makes. So after the job's own conversion, the rest of the job runs as
+  `--check --apply` runs it, and the new file gets the flag edits, the header repair and the subtitle fixes it needs. A
+  stop after the conversion, or after a later write of the job, leaves the key of the file in the job. Its next run goes
+  on from that file, and its decision line says "this job converted the file before a stop" in `note`. A stop after
+  another write of the job's own, as a header repair, ends with a refusal on the next run. Its result says "this job
+  wrote the file before a stop" and names the writes.
+- The jobs run `BACKGROUND_WORKERS` at a time, behind the imports, as the jobs of a bare backfill do. They count as jobs
+  from a backfill, and `--backfill --drop-queued` drops them. The decision lines of a backfill's job have source
+  `backfill_job`, and those of a job of `--check` have source `check_job`. `--queue` shows a running job by that source.
+- A file that has a job waiting or running keeps that job. `--check` names such a file, and a path that no app lists,
+  and then exits 1.
+- A job gives way to an import that waits, before a conversion and before a remux. A job of `--check` keeps the
+  original of a conversion for `KEEP_ORIGINALS_DAYS`, as `--check --apply` does. A backfill's job queues no other job,
+  and asks the app to rescan the item after a header repair.
+- A job of `--check` queues the burned-in subtitle check, the whole-file check and the deep analysis, as a job of a
+  bare backfill does. At `BURNED_IN=fix` the burned-in subtitle check can turn subtitles off, and at `SUBTITLES=deep`
+  the deep analysis can remux the file. So the plan line of `--check` holds the plans that its dry run made for both,
+  and each job follows its plan. It compares before its write and refuses on any difference, as the job of the plan
+  does. A plan of none refuses every write. The dry run plans the burned-in subtitle check on the flags that its own
+  edits leave, as the job runs after them. The whole-file check of such a job writes nothing, because its re-grab only
+  says what an import would do. After the job's own conversion these jobs run by their own settings, as after an
+  import.
+- A subtitle remux of the job of `--check` can change what its deep analysis finds. A deep analysis that then writes
+  nothing ends with no change. One that writes otherwise refuses, and a new dry run of `--check` plans the rest.
+
 Other useful commands:
 
 ```
@@ -326,7 +388,8 @@ link stays right. This needs no logged refusal.
 `--audit` reviews changes. With `--plan-from` it groups the plans of a dry run by the rule that made them. With
 `--since` it lists the files that imports, backfills and `--check` with `--apply` left with a problem in that time. A
 file that no app lists counts in no audit. AMG keeps the decision lines for 14 days. `--source hook` takes only the
-imports, `--source backfill` only the backfills, and `--source check` only `--check`. `--post` sends the list to
+imports, `--source backfill` only the backfills and the jobs they queued, and `--source check` only `--check` and
+its jobs of `--background`. `--post` sends the list to
 Discord, titled "Open problems: 2 files", when a file has an open problem.
 
 The list has one line per file, with its problems in plain words. Each file counts once, by its latest import, check or
@@ -415,10 +478,11 @@ where the worker runs, with `docker exec` in Docker. A one-off container sees no
 that an older AMG wrote gets its upgrade first, as with every command.
 
 A flag backfill, a backfill with `--plan-out` or `--plan-from`, runs in its own process and puts no job in the
-background queue, so `--queue` never lists it. So do `--convert` and `--sub-check`.
+background queue, so `--queue` never lists it. So do `--convert` and `--sub-check`. With `--background` the files of a
+plan go to the background queue, see [Apply a plan in the background queue](#apply-a-plan-in-the-background-queue).
 Such a run prints its lines in its own terminal. Its decision lines have source `backfill` in the decision log, see
 [monitoring.md](monitoring.md), and `--audit <instance> --since 24h --source backfill` lists the files its `--apply`
-left with an open problem.
+left with an open problem. The jobs of `--background` have source `backfill_job`, which `--source backfill` takes too.
 
 ```
 docker exec -it arr-media-guard arr-media-guard --queue
@@ -456,7 +520,7 @@ process gone: 1
   worker started before the setting changed.
 - Each busy place has one line with the kind of its job, the time its process started, how long it has run, and its
   file. The kind is the `source` of the job's lines in the decision log. An import is `hook`. A job of the background
-  queue is `burn_in`, `whole_file`, `deep_analysis`, `recheck` or `backfill_job`. A job the worker took and has not
+  queue is `burn_in`, `whole_file`, `deep_analysis`, `recheck`, `backfill_job` or `check_job`. A job the worker took and has not
   started yet says `starting`.
 - A job whose process is gone stays marked as running, so no process runs it. The next worker puts it back in the
   queue. With no worker, each such job counts as gone. `claimed jobs that do not read` counts the ones whose record
@@ -529,6 +593,7 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --backfill sonarr --plan-out FILE [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--workers N]` | `$RUN --backfill sonarr --plan-out /config/plans/FILE ...` | `$EXEC --backfill sonarr --plan-out /config/plans/FILE ...` | API, Media, LID, Plex, Discord |
 | `arr-media-guard --backfill sonarr --sub-check [--apply] [--recheck] [--ids ID ...] [--paths PATH ...]` | `$RUN --backfill sonarr --sub-check ...` | `$EXEC --backfill sonarr --sub-check ...` | API, Media, LID, Plex |
 | `arr-media-guard --backfill sonarr --apply --plan-from FILE [--canary N]` | `$RUN --backfill sonarr --apply --plan-from /config/plans/FILE ...` | `$EXEC --backfill sonarr --apply --plan-from /config/plans/FILE ...` | API, Media, LID, Plex, Discord |
+| `arr-media-guard --backfill sonarr --apply --plan-from FILE --background [--canary N] [--limit N]` | `$RUN --backfill sonarr --apply --plan-from /config/plans/FILE --background ...` | `$EXEC --backfill sonarr --apply --plan-from /config/plans/FILE --background ...` | API. The jobs need what the service needs. |
 | `arr-media-guard --backfill sonarr --plan-from FILE --only-undecided [--apply] [--plan-out FILE]` | `$RUN --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | `$EXEC --backfill sonarr --plan-from /config/plans/FILE --only-undecided ...` | API, Media, LID, Plex, Discord |
 | `arr-media-guard --backfill sonarr --convert [--apply] [--plan-from FILE] [--canary N] [--workers N] [--plex-later]` | `$RUN --backfill sonarr --convert ...` | `$EXEC --backfill sonarr --convert ...` | API, Media, Plex |
 | `arr-media-guard --backfill sonarr --convert --apply --force-convert PATH ...` | `$RUN --backfill sonarr --convert --apply --force-convert PATH ...` | `$EXEC --backfill sonarr --convert --apply --force-convert PATH ...` | API, Media, Plex |
@@ -536,7 +601,8 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --backfill sonarr --check-audio [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-audio ...` | `$EXEC --backfill sonarr --check-audio ...` | API, Media, Discord |
 | `arr-media-guard --backfill sonarr --check-video [--ids ID ...] [--limit N] [--restart] [--workers N]` | `$RUN --backfill sonarr --check-video ...` | `$EXEC --backfill sonarr --check-video ...` | API, Media, Discord |
 | `arr-media-guard --sub-time PATH ... [--apply]` | `$RUN --sub-time /data/PATH ...` | `$EXEC --sub-time /data/PATH ...` | Media, LID. The API names the original language, and Plex gets the request after a change. It exits 0, 1 (with `--apply` an app lookup failed and nothing changed, or the policy file did not load), 2 (a wrong option), 3 (with `--apply` a planned change did not happen) or 4 (a path holds no file). |
-| `arr-media-guard --check PATH ... [--app sonarr] [--id ID \| --tmdb KIND/ID] [--apply]` | `$RUN --check /data/PATH ...` | `$EXEC --check /data/PATH ...` | Media, LID. The API names the item, and Plex and Discord get the requests of an apply. It exits 0, 1 (a path holds no file, another instance than `--app` lists it, a lookup failed, an item did not read, a check ended in an error, or the policy file did not load) or 2 (a wrong option, or `--id` or `--tmdb` with more than one path that no app lists). |
+| `arr-media-guard --check PATH ... --apply --plan-from FILE --background` | `$RUN --check /data/PATH ... --apply --plan-from /config/plans/FILE --background` | `$EXEC --check /data/PATH ... --apply --plan-from /config/plans/FILE --background` | API. The jobs need what the service needs. It exits 0, 1 (a file did not queue) or 2 (a wrong option). |
+| `arr-media-guard --check PATH ... [--app sonarr] [--id ID \| --tmdb KIND/ID] [--apply] [--plan-out FILE]` | `$RUN --check /data/PATH ...` | `$EXEC --check /data/PATH ...` | Media, LID. The API names the item, and Plex and Discord get the requests of an apply. It exits 0, 1 (a path holds no file, another instance than `--app` lists it, a lookup failed, an item did not read, a check ended in an error, or the policy file did not load) or 2 (a wrong option, or `--id` or `--tmdb` with more than one path that no app lists). |
 | `arr-media-guard --burn-in (PATH ... \| --app sonarr --ids ID ...)` | `$RUN --burn-in /data/PATH ...` | `$EXEC --burn-in /data/PATH ...` | Media, LID. With `--app`: API. |
 | `arr-media-guard --audit sonarr (--plan-from FILE \| --since 24h) [--source hook\|backfill\|check] [--post]` | `$RUN --audit sonarr --since 24h ...` | `$EXEC --audit sonarr --since 24h ...` | With `--since`: API, Media, Discord. With `--plan-from`: none. |
 | `arr-media-guard-subhunt radarr --ids ID ... [--apply] [--force]` | `$RUN arr-media-guard-subhunt radarr --ids ID ...` | `docker exec -it arr-media-guard arr-media-guard-subhunt radarr --ids ID ...` | API, Media, LID, Discord, `SABNZBD_API_KEY` and `NEWZNAB_API_KEY`, and SABnzbd and NZBHydra2 at the addresses Radarr has saved, or at `SABNZBD_URL` and `NEWZNAB_URL`. The download folder at SABnzbd's path, or in a pair of Radarr's path map. |

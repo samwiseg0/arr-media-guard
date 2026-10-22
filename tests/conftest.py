@@ -20,6 +20,7 @@ import os
 import shlex
 import signal
 import socket
+import sys
 import urllib.request
 import urllib.response
 
@@ -56,6 +57,25 @@ def no_stop_left():
     yield
     for s in amg.stops():
         s.update(held=False, asked=False, term=None, skipped=False)
+
+
+@pytest.fixture(autouse=True)
+def one_door(monkeypatch, tmp_path_factory):
+    """ff.py is the one door to ffmpeg, ffprobe and PyAV (docs/design.md, "Time reads"). Its audit hook refuses a start
+    of ffmpeg or ffprobe, or an import of PyAV, from any other module of the package. A test fails when a call, a read
+    or the hook refused, in this process or in a process it started, as AMG_FF_FAULTS collects them. Many callers
+    catch every exception. Each test starts with no refusal of an earlier test in ff.FAULTS."""
+    faults = tmp_path_factory.getbasetemp() / f"ff-faults-{os.getpid()}.txt"
+    faults.touch()
+    seen = faults.stat().st_size
+    for m in [m for k, m in list(sys.modules.items()) if k == "ff" or k.endswith(".ff")]:
+        getattr(m, "FAULTS", []).clear()
+    monkeypatch.setenv("AMG_FF_FAULTS", str(faults))
+    yield
+    with open(faults) as f:
+        f.seek(seen)
+        new = f.read()
+    assert not new, f"ff refused a time read: {new}"
 
 
 LOCAL = ("127.0.0.1", "localhost", "::1")
