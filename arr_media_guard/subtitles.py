@@ -1,35 +1,34 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The subtitle match check and the reads of the subtitle tracks."""
-import contextlib, fractions, json, math, os, re, resource, select, statistics, subprocess, tempfile, time, zlib
+import contextlib, fractions, json, math, os, re, resource, statistics, subprocess, tempfile, time
 
-from . import align, checks, config, content, decide, judge, logs, proof, remux, report, runner, store, subsync, vault
+from . import align, checks, config, content, decide, judge, logs, matroska, proof, remux, report, runner, store, subsync, vault
 
 
 def subtitle_ends(path, j, timeout, limit=None, lines=None):
-    """{mkvmerge track id: where its last subtitle packet ends, the pts plus the duration} from ffprobe's demux of the
-    whole file, or None when ffprobe fails or the timeout ends it. lines gets {track id: [its packets, the packets that
-    start at or after limit]}, one packet a SubRip line. ffprobe's k-th subtitle stream is mkvmerge's k-th
+    """{mkvmerge track id: where its last subtitle block ends} from one walk of the blocks of the Matroska file path, see
+    matroska.frames(), or None when the walk stops before it reads every Cluster, or less than 10 s of timeout is left.
+    A block ends at its time plus its BlockDuration or the DefaultDuration, else where the next block of its track
+    starts, as RFC 9559 defines it, see matroska.rfc_ends(). The last block with no duration ends at its time. A block
+    whose frame holds no data counts for nothing, as ffmpeg, mkvextract and mkvmerge drop it. lines gets {track id:
+    [its blocks, the blocks that start at or after limit]}, one block a SubRip line. The k-th subtitle TrackEntry is mkvmerge's k-th
     subtitle track. A subtitle event with a bogus duration sets the Segment duration, and a remux keeps it."""
     ids = [t["id"] for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
     if timeout < 10 or not ids:
         return None
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries", "stream=index:packet=stream_index,pts_time,duration_time",
-                            "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=timeout)
-        d = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
-    except (subprocess.TimeoutExpired, ValueError):
+        r = matroska.frames(path)
+    except (OSError, ValueError):
         return None
-    order = [x.get("index") for x in d.get("streams") or []]
-    if len(order) != len(ids):
+    subs = [t for t in r["tracks"] if t["type"] == 17]
+    if r["error"] and not r["whole"] or len(subs) != len(ids):   # a walk that read every Cluster whole counts, see matroska.frames()
         return None
-    ends, count = dict.fromkeys(ids, 0.0), {i: [0, 0] for i in ids}
-    for pk in d.get("packets") or []:
-        with contextlib.suppress(KeyError, ValueError, TypeError):
-            i, pts = ids[order.index(pk["stream_index"])], float(pk["pts_time"])
-            ends[i] = max(ends[i], pts + float(pk.get("duration_time") or 0))
-            count[i][0] += 1
-            count[i][1] += limit is not None and pts >= limit
+    ends, count = {}, {}
+    for i, t in zip(ids, subs):
+        blocks = [(s, None if d == matroska.NONE else d) for s, d, full in zip(t["time"], t["dur"], t["full"]) if s != matroska.NONE and full]
+        ends[i] = max((s if e is None else e for (s, _), e in zip(blocks, matroska.rfc_ends(blocks))), default=0) / 1e9
+        count[i] = [len(blocks), sum(limit is not None and s / 1e9 >= limit for s, _ in blocks)]
     if lines is not None:
         lines.update(count)
     return {i: round(e, 3) for i, e in ends.items()}
@@ -40,14 +39,19 @@ def subtitle_read(path, j, want):
     want (docs/design.md, "Subtitle text"). j is its mkvmerge -J probe. It stops at text_language()'s verdict or after
     TEXT_CUES blocks, see subtitle_blocks(). A track the read cannot take gets no entry, or a reason. A failure keeps
     what was read. The job's time limit passes."""
-    return subtitle_blocks(path, j, want, config.TEXT_CODECS, config.TEXT_CUES, lambda blocks: decide.text_language(t for _, _, t in blocks),
+    return subtitle_blocks(path, j, want, config.TEXT_CODECS, config.TEXT_CUES, lambda blocks: decide.text_language(t for _, _, t in blocks if t is not None),
                            lambda why: (None, 0.0, why))
 
 
 def timed(blocks):
-    """[(start, end, text)] of subtitle_blocks(). A cue with no BlockDuration ends at the next cue, 5 seconds at most."""
-    got = [b for b in blocks if b[0] is not None]
-    return [(s, s + d if d is not None else min(s + 5, got[k + 1][0] if k + 1 < len(got) else s + 5), text) for k, (s, d, text) in enumerate(got)]
+    """[(start, end, text)] of subtitle_blocks() in their order. A cue with no duration ends at the start of the next block
+    in time order, as RFC 9559 defines the duration of a block with no BlockDuration. The last such cue has no known
+    end, so it ends at its start here, and the list is a remux.Unended. A block with no start gives no cue, and nor
+    does an empty frame, whose text is None, see cue_text(). An empty frame still ends the cue before it, see
+    matroska.rfc_cues()."""
+    cues = matroska.rfc_cues([b for b in blocks if b[0] is not None])
+    out = [(s, s if e is None else round(e, 9), text) for s, e, text in cues]   # to the ns, as the file stores it
+    return remux.Unended(out) if any(e is None for _, e, _ in cues) else out
 
 
 class Cut(list):
@@ -71,15 +75,16 @@ def before_cut(heard, cues):
     return heard if end is None else [w for w in heard if w["at"] + w.get("secs", subsync.WINDOW) <= end]
 
 
-def subtitle_cues(path, j, want, full=False, bad=None):
+def subtitle_cues(path, j, want, full=False, bad=None, empty=None):
     """{track position: [(start, end, text)] in seconds, see timed()} of every cue of the text subtitle tracks at the
     positions in want, for the subtitle match check (docs/design.md, "Subtitle match"). SubRip, ASS, SSA and WebVTT
     tracks. A track whose Cues list CUE_MAX blocks or more gives a Cut, as the read stopped there, and so does a read
     that took READ_WALL seconds. A block that gives no cue still counts. With full, a track the Cues do not index comes
     from full_read(). A track the read cannot take gets no entry. The set bad gets the position of each SubRip track
-    with a cue read that is not UTF-8."""
+    with a cue read that is not UTF-8. The dict empty gets the count of empty frames of each track the Cues index, see
+    subtitle_blocks()."""
     capped = set()
-    got = subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None, capped, bad)
+    got = subtitle_blocks(path, j, want, config.SUB_CODECS, config.CUE_MAX, timed, lambda why: None, capped, bad, empty)
     got = {p: Cut(c) if p in capped else c for p, c in got.items() if c}
     if full and (lost := set(want) - set(got)):
         whole = full_read(path, j)
@@ -128,8 +133,6 @@ def cue_lengths(path, j, want, full=False):
 
 
 FULL = {}   # (path, size, mtime_ns) -> full_read() of that file, so a run reads a file whole at most once
-FULL_OUT = {"subrip": ("-c", "copy", "srt"), "ass": ("-c", "copy", "ass"), "ssa": ("-c", "copy", "ass"), "webvtt": ("-c:s", "srt", "srt"),
-            "hdmv_pgs_subtitle": ("-c", "copy", "sup"), "dvd_subtitle": ("-c", "copy", "framecrc")}   # ffmpeg codec: its codec option and format
 
 
 def cue_less(path, j):
@@ -145,134 +148,87 @@ def cue_less(path, j):
 
 
 def full_read(path, j):
-    """{"cues": {track position: [(start, end, text)] in seconds}, "tracks", "not_utf8", "took", "cpu", "why"} of the subtitle tracks
-    of path that no cue entry indexes, from one ffmpeg read of the whole file at nice 19 and idle I/O (docs/design.md,
-    "Subtitle match"). A film takes minutes, so only --sub-check and --sub-time ask for it, and an import never does.
-    SubRip and ASS keep their text, WebVTT becomes SubRip, a PGS track gives its display sets, see pgs_shows(), and a
-    VobSub track its packets with their durations. ffmpeg writes each track into its own pipe, and the read keeps only
-    the cue times and text as they arrive. A PGS track keeps only its PCS segments, see sup_pcs(). So the read writes
-    no file and needs no free space. The result is kept for the file as it is, so a run reads a file whole once. A
-    failure gives no cues and why. A track keeps CUE_MAX cues at most, PICTURE_MAX for pictures, and a read stops after
+    """{"cues": {track position: [(start, end, text)] in seconds}, "tracks", "not_utf8", "took", "cpu", "why"} of the
+    subtitle tracks of path that no cue entry indexes, from one walk of every Cluster, see matroska.frames()
+    (docs/design.md, "Subtitle match"). A film takes about a minute, so only --sub-check and --sub-time ask for it, and
+    an import never does. Each block of those tracks is read at its byte as subtitle_blocks() reads a block the Cues
+    index, see read_block(). Its start and its duration come from the walk, and a cue with no duration ends as timed()
+    ends it. An empty frame gives no cue, see cue_text(). A walk that stops at damage keeps the cues before it, each track a Cut, and why says where. A PGS track gives its display sets, see pgs_shows(), and a VobSub track its packets, each ending at its
+    stop command. The result is kept for the file as it is, so a run reads a file whole once. A failure gives no cues
+    and why. A track keeps CUE_MAX cues at most, PICTURE_MAX for pictures, and the reads of the blocks stop after
     FULL_WALL seconds. A track cut short either way gives a Cut, and a stop gives why too. not_utf8 lists the SubRip
     tracks whose bytes are not all UTF-8."""
     st = os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns)
     if key in FULL:
         return FULL[key]
-    out = {"cues": {}, "tracks": [], "not_utf8": [], "took": 0.0, "cpu": 0.0, "why": None}
-    lost, ends, proc = cue_less(path, j), {}, None
+    out, lost = {"cues": {}, "tracks": [], "not_utf8": [], "took": 0.0, "cpu": 0.0, "why": None}, cue_less(path, j)
+    take = {}
+    for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1):
+        p = t.get("properties") or {}
+        if f"s{n}" in lost and p.get("codec_id") in config.SUB_CODECS + config.PICTURE_CODECS and p.get("content_encoding_algorithms") in (None, "0") \
+                and p.get("number"):
+            take[f"s{n}"] = (p["number"], p["codec_id"], p.get("content_encoding_algorithms") == "0")
+    if not take:
+        return out
+    t0, c0 = time.monotonic(), time.process_time()
     try:
-        streams = [x for x in proof.ff_streams(path)[1] if x.get("codec_type") == "subtitle"] if lost else []   # the k-th is mkvmerge's k-th subtitle track
-        take = {f"s{k}": x["codec_name"] for k, x in enumerate(streams, 1) if f"s{k}" in lost and x.get("codec_name") in FULL_OUT}
-        if take:
-            argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", "-i", path]
-            for p, codec in take.items():
-                ends[p] = list(os.pipe())   # [read end, write end or None once closed]
-                opt, value, fmt = FULL_OUT[codec]
-                argv += ["-map", f"0:s:{int(p[1:]) - 1}", opt, value, "-f", fmt, f"pipe:{ends[p][1]}"]
-            t0, c0 = time.monotonic(), resource.getrusage(resource.RUSAGE_CHILDREN)
-            try:
-                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                        pass_fds=[w for _, w in ends.values()])
-            finally:   # only ffmpeg holds the write ends, so each pipe ends when ffmpeg closes its output
-                for e in ends.values():
-                    os.close(e[1]); e[1] = None
-            keep, part, err = {p: bytearray() for p in take}, {p: bytearray() for p in take}, b""
-            fds, poll = {r: p for p, (r, _) in ends.items()} | {proc.stderr.fileno(): None}, select.poll()
-            for fd in fds:
-                poll.register(fd, select.POLLIN)
-            until, late = time.monotonic() + config.FULL_WALL, False
-            while fds:   # read every pipe as it fills, so ffmpeg never waits on a full one
-                if (left := until - time.monotonic()) <= 0:   # a slow share: the read stops here, see Cut
-                    late = True
-                    proc.kill()
-                    break
-                for fd, _ in poll.poll(left * 1000):
-                    chunk, p = os.read(fd, 1 << 16), fds[fd]
-                    if not chunk:
-                        poll.unregister(fd); del fds[fd]
-                    elif p is None:
-                        err = (err + chunk)[-4096:]
-                    elif FULL_OUT[take[p]][2] != "sup":
-                        keep[p] += chunk
-                    else:
-                        part[p] += chunk
-                        keep[p] += sup_pcs(part[p])
-            proc.wait()
-            c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-            out.update(tracks=sorted(take), took=round(time.monotonic() - t0, 1), cpu=round(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, 1))
-            if proc.returncode and not late:
-                raise RuntimeError(f"ffmpeg exited {proc.returncode}: {config.mask(err.decode('utf-8', 'replace').strip())[-200:]}")
-            for p, codec in take.items():
-                fmt = FULL_OUT[codec][2]
-                data = bytes(keep[p]) if fmt == "sup" or not late else bytes(keep[p][:keep[p].rfind(b"\n") + 1])   # whole lines only
-                c, cap = full_cues(data, fmt), config.PICTURE_MAX if fmt in ("sup", "framecrc") else config.CUE_MAX
-                out["cues"][p] = Cut(c[:cap]) if late or len(c) >= cap else c
-                out["not_utf8"] += [p] if codec == "subrip" and not proof.utf8(data) else []   # SubRip copies its packets, see FULL_OUT
-            if late:
-                out["why"] = f"the read stopped after {config.FULL_WALL} s, so each track holds only the cues read"
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as ex:
+        r = matroska.frames(path)
+        walked = {t["number"]: t for t in r["tracks"]}
+        until, late = t0 + config.FULL_WALL, False
+        with open(path, "rb", buffering=0) as f:
+            for p, (number, codec, packed) in take.items():
+                t, blocks, bad, done = walked.get(number) or {"time": ()}, [], False, 0
+                cap = config.PICTURE_MAX if codec in config.PICTURE_CODECS else config.CUE_MAX
+                for k in range(len(t["time"])):   # a block that gives no cue still counts
+                    config.DEADLINE.check()
+                    if k >= cap or (late := late or time.monotonic() > until):
+                        break
+                    data, done = read_block(f, t["place"][k], number, codec, packed)[0], k + 1
+                    if data is not None:
+                        bad = bad or (codec == "S_TEXT/UTF8" and not proof.utf8(data))
+                        blocks.append((t["time"][k] / 1e9, None if t["dur"][k] == matroska.NONE else t["dur"][k] / 1e9, cue_text(data, codec)))
+                cues = pgs_shows(sorted(blocks, key=lambda x: x[0])) if codec == "S_HDMV/PGS" else \
+                    ended(timed((a, spu_stop(x) or d, "") for a, d, x in blocks)) if codec == "S_VOBSUB" else timed(blocks)
+                out["cues"][p] = Cut(cues) if done < len(t["time"]) or r["error"] else cues
+                out["not_utf8"] += [p] if bad else []
+        out.update(tracks=sorted(take), took=round(time.monotonic() - t0, 1), cpu=round(time.process_time() - c0, 1))
+        if late or r["error"]:
+            out["why"] = f"the read stopped after {config.FULL_WALL} s" if late else config.mask(f"the walk stopped: {r['error']}")[:200]
+            out["why"] += ", so each track holds only the cues read"
+    except (OSError, ValueError) as ex:
         out.update(cues={}, why=config.mask(f"the whole-file read failed: {type(ex).__name__}: {ex}")[:200])
-    finally:
-        if proc and proc.poll() is None:   # the job's time limit or an interrupt: no ffmpeg outlives the read
-            proc.kill(); proc.wait()
-        if proc:
-            proc.stderr.close()
-        for fd in (fd for e in ends.values() for fd in e if fd is not None):
-            os.close(fd)
     while len(FULL) >= 8:   # the files a backfill's workers read now, never the whole library
         FULL.pop(next(iter(FULL)))
     FULL[key] = out
     return out
 
 
-def sup_pcs(buf):
-    """The PCS segments among the whole segments at the start of buf, a bytearray of ffmpeg's sup stream. The whole
-    segments leave buf, and the part segment at its end stays for the next bytes. A segment is "PG", PTS and DTS, type,
-    size and data. pgs_shows() reads only the PCS, and the pictures of a film can take GBs. A lost sync raises
-    ValueError, so buf never grows without end."""
-    k, pcs = 0, bytearray()
-    while buf[k:k + 2] == b"PG" and k + 13 + int.from_bytes(buf[k + 11:k + 13], "big") <= len(buf):
-        end = k + 13 + int.from_bytes(buf[k + 11:k + 13], "big")
-        pcs += buf[k:end] if buf[k + 10] == 0x16 else b""
-        k = end
-    del buf[:k]
-    if not b"PG".startswith(buf[:2]):
-        raise ValueError("a PGS track's sup stream lost its sync")
-    return bytes(pcs)
+def read_block(f, at, number, codec, packed):
+    """matroska.block_data() of the block of track number of codec at byte at of the open file f, with packed as
+    there. A PGS block gives its first bytes, as they say whether it shows or clears."""
+    return matroska.block_data(f, at, number, codec == "S_HDMV/PGS", packed, config.TEXT_BLOCK)
 
 
-def full_cues(data, fmt):
-    """[(start, end, text)] in seconds of one subtitle track that ffmpeg wrote as fmt for full_read()."""
-    if fmt == "srt":
-        return [(a / 1000, b / 1000, t) for a, b, t in proof.srt_blocks(data.decode("utf-8", "replace"))]
-    if fmt == "ass":
-        clock = lambda t: sum(float(x) * m for x, m in zip(t.split(":"), (3600, 60, 1)))
-        return sorted((clock(m[1]), clock(m[2]), m[3]) for m in re.finditer(r"(?m)^Dialogue:\s*[^,]*,([^,]*),([^,]*),(?:[^,]*,){6}(.*?)\r?$",
-                                                                             data.decode("utf-8", "replace")))
-    if fmt == "sup":   # segments: "PG", PTS and DTS at 90 kHz, type, size, data. pgs_shows() takes the PCS of each display set.
-        sets, k = [], 0
-        while data[k:k + 2] == b"PG" and k + 13 <= len(data):
-            size = int.from_bytes(data[k + 11:k + 13], "big")
-            sets.append((int.from_bytes(data[k + 2:k + 6], "big") / 90000, None, data[k + 10:k + 13 + size]))
-            k += 13 + size
-        return pgs_shows(sets)
-    tb, got = 0.001, []   # framecrc: "#tb 0: 1/1000", then stream, dts, pts, duration, size, crc
-    for line in data.decode("ascii", "replace").splitlines():
-        if line.startswith("#tb "):
-            a, b = line.split(":")[1].strip().split("/")
-            tb = int(a) / int(b)
-        elif line[:1].isdigit():
-            f = [x.strip() for x in line.split(",")]
-            got.append((int(f[2]) * tb, int(f[3]) * tb or None, ""))
-    return timed(got)
+def cue_text(data, codec):
+    """The text of a cue of codec from its frame data: the bytes of a picture, the text of a SubRip or WebVTT cue, and
+    the text of an ASS or SSA event. An ASS event holds 8 fields before its text. HandBrake ends each event with a NUL
+    byte, and mkvextract drops it. So the text leaves it out, and a plan pairs with the extracted text, see
+    remux.set_ends(). An empty frame of a text codec gives None. ffmpeg, mkvextract and mkvmerge drop it, so it gives
+    no cue, see timed()."""
+    if codec in config.PICTURE_CODECS:
+        return data
+    if not data:
+        return None
+    text = data.decode("utf-8", "replace")
+    return text.split(",", 8)[-1].removesuffix("\0") if codec in ("S_TEXT/ASS", "S_TEXT/SSA") else text
 
 
 def flash_check(path, j, sides, full=False, stop=None):
     """{subtitle position or sidecar name: flash_plan()} of the text tracks and .srt sidecars whose cues flash
     (docs/design.md, "Subtitle match"). Any language and any role, forced too. The Cues give the duration of each
     block, so only a track whose median entry lasts under subsync.FLASH is read in full, and only when the read
-    gets every cue. A track whose read was cut short gets no plan, see Cut. A track with an entry that has no
+    gets a cue or an empty frame for each entry. A track whose read was cut short gets no plan, see Cut. A track with an entry that has no
     CueDuration is read too. With full, a track the Cues do not
     index comes from full_read(). stop() true before a read leaves that track and the rest unread. SubRip, ASS, SSA
     and WebVTT tracks. sides are sidecar_subs() entries, read in their file order."""
@@ -281,8 +237,10 @@ def flash_check(path, j, sides, full=False, stop=None):
     for p in sorted((p for p, ds in lens.items() if ds and (None in ds or statistics.median(ds) < subsync.FLASH)), key=lambda p: int(p[1:])):
         if stop and stop():
             break
-        cues = subtitle_cues(path, j, {p}, full).get(p) or []
-        plan = remux.flash_plan(cues, codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")) if len(cues) == len(lens[p]) and not isinstance(cues, Cut) else None
+        empty = {}
+        cues = subtitle_cues(path, j, {p}, full, empty=empty).get(p) or []
+        whole = len(cues) + empty.get(p, 0) == len(lens[p]) and not isinstance(cues, Cut)   # an empty frame has an entry and no cue
+        plan = remux.flash_plan(cues, codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")) if whole else None
         out.update({p: plan} if plan else {})
     for s in sides:
         plan = remux.flash_plan(side_cues(s))
@@ -307,7 +265,7 @@ def same_cues(a, b):
     return sorted(round(c[0], 3) for c in a) == sorted(round(c[0], 3) for c in b)
 
 
-def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=None):
+def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=None, empty=None):
     """{track position: use(its blocks)} for the tracks of codecs at the positions in want. mkvmerge and ffmpeg index
     every subtitle block in the Cues, so the read takes the Cues and then each block by its index entry, one small read
     each. It never reads a Cluster in full, so the cost does not grow with the file size. use gets an iterator of
@@ -316,7 +274,8 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=No
     track with a content encoding other than zlib, and a track the Cues do not index get no entry, or failed(why). A
     failure keeps what was read. The job's time limit passes. A track's read stops after READ_WALL seconds. The set
     capped gets the position of each track whose read stopped there, or whose Cues list cap blocks or more. The set bad
-    gets the position of each SubRip track with a block read that is not UTF-8."""
+    gets the position of each SubRip track with a block read that is not UTF-8. The dict empty gets the count of empty
+    frames read of each text track, which give no cue, see cue_text()."""
     tracks, n, out = {}, 0, {}
     for t in j.get("tracks") or []:
         p = t.get("properties") or {}
@@ -324,7 +283,7 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=No
             continue
         n += 1
         if f"s{n}" in want and p.get("codec_id") in codecs and p.get("content_encoding_algorithms") in (None, "0") and p.get("number"):
-            tracks[p["number"]] = (f"s{n}", p["codec_id"], p.get("content_encoding_algorithms") == "0")
+            tracks[p["number"]] = (f"s{n}", p["codec_id"], p.get("content_encoding_algorithms") == "0", p.get("default_duration"))
     if not tracks:
         return out
     scale = ((j.get("container") or {}).get("properties") or {}).get("timestamp_scale") or 1000000   # ns a tick
@@ -335,8 +294,7 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=No
             if ds is None:
                 return out
 
-            def blocks(number, codec, packed):   # the cues of one track, read one block at a time while use() asks
-                head = codec == "S_HDMV/PGS"   # a PGS block can hold a large picture, and its first bytes say all
+            def blocks(number, codec, packed, dd):   # the cues of one track, read one block at a time while use() asks
                 until = time.monotonic() + config.READ_WALL
                 for i, (cp, rp, _) in enumerate(cues[number]):
                     config.DEADLINE.check()   # up to cap small reads, each a wait on a cold NFS file
@@ -354,35 +312,30 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=No
                         clusters[cp] = (e[1], ts) if e and e[0] == decide.CLUSTER else None
                     if clusters[cp] is None:
                         continue
-                    f.seek(ds + cp + clusters[cp][0] + rp); blk = f.read(1024); e = decide.element(blk, 0)
-                    if not head and e and e[2] is not None and len(blk) < e[1] + e[2] <= config.TEXT_BLOCK:
-                        blk += f.read(e[1] + e[2] - len(blk))
-                    frame, times = decide.block_head(blk, number) if head else (decide.block_frame(blk, number), decide.block_times(blk))
-                    if frame is not None:
-                        data = zlib.decompressobj().decompress(frame) if packed else frame   # a cut PGS block gives its first bytes
+                    data, times = read_block(f, ds + cp + clusters[cp][0] + rp, number, codec, packed)
+                    if data is not None:
                         start = (clusters[cp][1] + times[0]) * scale / 1e9 if times and clusters[cp][1] is not None else None
-                        text = data if codec in config.PICTURE_CODECS else data.decode("utf-8", "replace")
                         if bad is not None and codec == "S_TEXT/UTF8" and not proof.utf8(data):
                             bad.add(tracks[number][0])
-                        # An ASS event holds 8 fields before its text. HandBrake ends each event with a NUL byte, and mkvextract
-                        # drops it. So the text of a cue leaves it out, and a plan pairs with the extracted text, see remux.set_ends().
-                        yield start, times[1] * scale / 1e9 if times and times[1] is not None else None, \
-                            text.split(",", 8)[-1].removesuffix("\0") if codec in ("S_TEXT/ASS", "S_TEXT/SSA") else text
-            for number, (pos, codec, packed) in tracks.items():
-                out[pos] = use(blocks(number, codec, packed)) if number in cues else failed("the Cues index none of its blocks")
+                        if (text := cue_text(data, codec)) is None and empty is not None:
+                            empty[tracks[number][0]] = empty.get(tracks[number][0], 0) + 1
+                        # a block with no BlockDuration lasts the DefaultDuration, else timed() ends it (RFC 9559)
+                        yield start, times[1] * scale / 1e9 if times and times[1] is not None else dd / 1e9 if dd else None, text
+            for number, (pos, codec, packed, dd) in tracks.items():
+                out[pos] = use(blocks(number, codec, packed, dd)) if number in cues else failed("the Cues index none of its blocks")
                 if capped is not None and (number in late or len(cues.get(number) or ()) >= cap):
                     capped.add(pos)
     except content.OutOfTime:
         raise
     except Exception as ex:   # the text is one signal among others, so a failed read never stops a job
-        out.update({p: failed(config.mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, _, _ in tracks.values() if p not in out})
+        out.update({p: failed(config.mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, *_ in tracks.values() if p not in out})
     return out
 
 
 def pgs_shows(sets):
     """[(start, end, "")] of PGS display sets [(start, None, PCS bytes)] in time order. A set whose composition holds an
     object shows a cue, and the next set that is not a palette update ends it. A palette update only changes colours,
-    as in a fade. The last cue ends 5 seconds after it starts."""
+    as in a fade. A cue that no set ends has no known end, so it gives no cue, see ended()."""
     out, since = [], None
     for s, _, pcs in sets:   # a PCS: type 0x16, its size, then width, height, rate, number, state, palette update, palette, objects
         if s is None or len(pcs) < 14 or pcs[0] != 0x16 or (pcs[11] and pcs[13] and since is not None):
@@ -390,19 +343,29 @@ def pgs_shows(sets):
         if since is not None:
             out.append((since, s, ""))
         since = s if pcs[13] else None
-    return out + ([(since, since + 5, "")] if since is not None else [])
+    return out
+
+
+def ended(cues):
+    """The picture cues of timed() less the last one when its end is not known, see remux.Unended. A picture cue gives
+    only its times, so a cue with no end gives nothing to fit. The block stays in the file, and a fix of the whole track
+    moves it with every other block."""
+    if not isinstance(cues, remux.Unended):
+        return cues
+    last = max(range(len(cues)), key=lambda k: (cues[k][0], k))   # the cue rfc_ends() leaves with no end
+    return cues[:last] + cues[last + 1:]
 
 
 def picture_cues(path, j, want, full=False):
     """{track position: [(start, end, "")] in seconds} of the PGS and VobSub tracks at the positions in want, for the
     reference timing of --sub-time (docs/design.md, "Subtitle match"). A PGS cue comes from its display sets, see
     pgs_shows(). A VobSub packet is one cue that ends at its stop command, see spu_stop(), else at its
-    BlockDuration, else as a text cue ends, see timed(). With full, a track the Cues do not index comes from
-    full_read(). No picture cue lasts over subsync.SPAN seconds. A track the read cannot take gets no entry. A read cut
-    short gives a Cut, as in subtitle_cues()."""
+    BlockDuration, else as a text cue ends, see timed(). A last cue with no known end gives no cue, see ended(). With
+    full, a track the Cues do not index comes from full_read(). No picture cue lasts over subsync.SPAN seconds. A track
+    the read cannot take gets no entry. A read cut short gives a Cut, as in subtitle_cues()."""
     vob, capped = {t for t, c in sub_codecs(j).items() if c == "S_VOBSUB"}, set()
     got = subtitle_blocks(path, j, want & vob, ("S_VOBSUB",), config.PICTURE_MAX,
-                          lambda b: timed((s, spu_stop(spu) or d, "") for s, d, spu in b), lambda why: None, capped)
+                          lambda b: ended(timed((s, spu_stop(spu) or d, "") for s, d, spu in b)), lambda why: None, capped)
     got.update(subtitle_blocks(path, j, want - vob, ("S_HDMV/PGS",), config.PICTURE_MAX, lambda b: pgs_shows(sorted(b, key=lambda x: x[0] or 0)),
                                lambda why: None, capped))
     got = {p: Cut(c) if p in capped else c for p, c in got.items() if c}
@@ -1056,17 +1019,23 @@ SUB_CHECKS = {
     "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
-    "garbled_repair": {"version": 3, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
+    "garbled_repair": {"version": 4, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
                                                        # SSA or WebVTT track, and repairs or renames a garbled .srt sidecar.
                                                        # Version 1 checked no sidecar and no ASS, SSA or WebVTT track. A
                                                        # result names no codec, so each older result gets one recheck.
                                                        # Version 3 takes out a SubRip track with bytes that are not UTF-8.
                                                        # It adds no entry, because a recheck reads each checked file whole
                                                        # again. A file checked before is found when it or its sidecars
-                                                       # change, a run names it, or its result is pending.
-    "flash": {"version": 2, "fixes": {2: ["fix"]}},    # lines that flash by too fast to read. Version 2 writes the new
-                                                       # ends of a HandBrake ASS track, whose events end in a NUL byte.
-                                                       # Version 1 failed there, and its result says fix.
+                                                       # change, a run names it, or its result is pending. Version 4 judges
+                                                       # each cue and keeps right CJK text. It only drops false verdicts, and
+                                                       # a recheck cannot bring back a track taken out, so it adds no entry.
+    "flash": {"version": 3, "fixes": {2: ["fix"], 3: ["fix"]}},    # lines that flash by too fast to read. Version 2
+                                                       # writes the new ends of a HandBrake ASS track, whose events end in a
+                                                       # NUL byte. Version 1 failed there, and its result says fix. Version 3
+                                                       # reads the cues from the blocks, drops empty frames and repeated Cue
+                                                       # entries, and ends a cue with no duration at the next block. Version 2
+                                                       # made a plan of such a track that its remux could not write, and that
+                                                       # result says fix too.
     "block_timing": {"version": 5, "fixes": {3: ["fix"], 4: ["live", "off"], 5: None}},   # the timing of the lines of
                                                        # --sub-time and the deep analysis. Version 3 writes the plan of a
                                                        # HandBrake ASS track, as flash 2, so a result with fix gets a
@@ -1248,6 +1217,8 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                 remux.own_like(tmp, st)
             e["kept"] = vault.keep_original(s["path"], e)
             os.remove(s["path"]) if move else os.replace(tmp, s["path"])
+            if not move:
+                vault.kept_write(s["path"], e["kept"])
             e["result"] = "moved" if move else "repaired" if g else "retimed"
             logs.log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", kept=e["kept"], why=e["why"]))
         except OSError as ex:

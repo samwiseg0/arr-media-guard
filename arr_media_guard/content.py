@@ -50,6 +50,8 @@ TV_MOVIE, STANDUP = 10770, "stand-up comedy"   # TMDB genre id and keyword that 
 # Two duration sources agree when they differ by at most the larger of these.
 DURATION_SLACK = 30         # seconds
 DURATION_TOLERANCE = 0.02   # share of the longer one
+READERS = ("Matroska", "MP4/QuickTime", "MPEG transport stream")   # mkvmerge's names of the containers AMG reads itself,
+FF_READERS = ("matroska", "mov", "mpegts")                           # and ffprobe's, see docs/design.md, "Time reads"
 # Runtime bands: the file's trusted minutes over the listed minutes.
 MIN_LISTED = 10                          # a listed runtime under this says nothing
 SHORT, LONG = 0.6, 1.4                   # a movie, the band the hook alerted on before
@@ -349,14 +351,16 @@ def last_packet(path, timeout=30, probe=None):
         return None
 
 
-def trusted_duration(probe, size, last_packet=None):
+def trusted_duration(probe, size, last_packet=None, stored_end=None):
     """The file's duration when two sources agree. probe is mkvmerge -J or ffprobe JSON, size in bytes, last_packet
-    from last_packet().
+    from last_packet(), stored_end from checks.stored_end().
 
-    Sources: the container header, the stream durations, the size over the summed bitrate, and the last packet. The
-    stream durations and bitrates are mkvmerge's statistics tags, used only when the app that wrote the file wrote
-    them, because ffmpeg copies stale tags from its source. An ffprobe probe gives stream durations instead. A cover
-    picture, see decide.cover(), leaves the sums, and its bytes leave the size, as the attachments do.
+    Sources: the container header, the stream durations, the stored end, and the last packet. The stream durations
+    are mkvmerge's statistics tags, used only when the app that wrote the file wrote them, because ffmpeg copies
+    stale tags from its source. The stored end is where the last video or audio frame the file stores ends. A
+    container with no reader of AMG (READERS), as AVI, takes two estimates instead: the size over the summed bitrate
+    tags, and an ffprobe probe's stream durations. A cover picture, see decide.cover(), leaves the bitrate sum, and its
+    bytes leave the size, as the attachments do.
     trust: "agree" (the header and another source agree), "bitrate" (the header is off, two other sources agree),
     "header" (the header alone) or "conflict" (no two sources agree, or two pairs disagree). seconds is None unless
     two sources agree.
@@ -372,12 +376,16 @@ def trusted_duration(probe, size, last_packet=None):
     src = {"header": decide.duration(probe)}
     if av and all(fresh(p) and p.get("tag_duration") for p in av):
         src["streams"] = max(decide.tag_seconds(p["tag_duration"]) for p in av)
-    if av and all(fresh(p) and str(p.get("tag_bps", "")).isdigit() for p in av):   # subtitles count when tagged
-        bps = sum(int(p["tag_bps"]) for p in props if fresh(p) and str(p.get("tag_bps", "")).isdigit())
-        src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])
-                          - sum(int(n) for p in pics if fresh(p) and str(n := p.get("tag_number_of_bytes")).isdigit())) * 8 / bps if bps else 0
-    ff = [float(s["duration"]) for s in probe.get("streams") or [] if s.get("codec_type") in ("audio", "video") and s.get("duration")]
-    if ff: src["streams"] = max(ff)
+    read = (probe.get("container") or {}).get("type") in READERS or ((probe.get("format") or {}).get("format_name") or "").startswith(FF_READERS)
+    if read:
+        src["stored"] = stored_end
+    else:   # no reader: the estimates stay
+        if av and all(fresh(p) and str(p.get("tag_bps", "")).isdigit() for p in av):   # subtitles count when tagged
+            bps = sum(int(p["tag_bps"]) for p in props if fresh(p) and str(p.get("tag_bps", "")).isdigit())
+            src["bitrate"] = (size - sum(a.get("size") or 0 for a in probe.get("attachments") or [])
+                              - sum(int(n) for p in pics if fresh(p) and str(n := p.get("tag_number_of_bytes")).isdigit())) * 8 / bps if bps else 0
+        ff = [float(s["duration"]) for s in probe.get("streams") or [] if s.get("codec_type") in ("audio", "video") and s.get("duration")]
+        if ff: src["streams"] = max(ff)
     src["last_packet"] = last_packet
     src = {k: round(v, 3) for k, v in src.items() if v}
     agree = lambda a, b: abs(a - b) <= max(DURATION_SLACK, DURATION_TOLERANCE * max(a, b))
@@ -727,6 +735,6 @@ def header_alert(trusted):
         return None
     if trusted.get("seconds"):
         return f'The file says it runs {hms(s["header"])}, but the video and audio stop at {hms(trusted["seconds"])}. Players may show the wrong length.'
-    k = next((k for k in ("last_packet", "streams", "bitrate") if s.get(k)), None)
+    k = next((k for k in ("last_packet", "stored", "streams", "bitrate") if s.get(k)), None)
     real = "its size and bitrate point to" if k == "bitrate" else "the video and audio stop at"
     return f'The file says it runs {hms(s["header"])}, but {real} {hms(s[k])}. The runtime check was skipped.' if k else None

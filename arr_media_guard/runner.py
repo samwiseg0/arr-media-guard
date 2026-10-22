@@ -1082,12 +1082,13 @@ def deep_analysis(name, pending, claimed=False):
                 ctx = check.pop("run", None)
         else:
             st, read = os.stat(path), store.get("deep-read", name) or {}   # the whole-file read of a run that yielded
-            if read.get("key") == [st.st_size, st.st_mtime_ns] and "cut" in read:   # JSON keeps no Cut, so "cut" names those tracks
+            key = [st.st_size, st.st_mtime_ns, config.VERSION]   # another version reads again, as its read can differ
+            if read.get("key") == key and "cut" in read:   # JSON keeps no Cut, so "cut" names those tracks
                 subtitles.FULL[(path, st.st_size, st.st_mtime_ns)] = dict(read["read"], cues={p: (subtitles.Cut if p in read["cut"] else list)(map(tuple, c))
                                                                                              for p, c in read["read"]["cues"].items()})
             if (path, st.st_size, st.st_mtime_ns) not in subtitles.FULL and job.get("recheck") != "import":   # outside the file lock, and kept for a yield
                 whole = subtitles.full_read(path, checks.mkvmerge(path))
-                store.put("deep-read", name, {"key": [st.st_size, st.st_mtime_ns], "read": whole,
+                store.put("deep-read", name, {"key": key, "read": whole,
                                               "cut": [p for p, c in whole["cues"].items() if isinstance(c, subtitles.Cut)]})
             deep_waits()
             want = got.get("want")

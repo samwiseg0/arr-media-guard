@@ -57,7 +57,7 @@ def state_dir(tmp_path, monkeypatch):
 def mkv(header, app, size, tracks=(), attachments=0):
     """A cut-down mkvmerge -J probe. tracks: (type, tag_duration, tag_bps). The statistics app is the writing app."""
     stat = lambda d, b: {"tag_duration": d, "tag_bps": b, "tag__statistics_writing_app": app} if d else {}
-    return {"container": {"properties": {"duration": header, "writing_application": app}},
+    return {"container": {"type": "Matroska", "properties": {"duration": header, "writing_application": app}},
             "tracks": [{"type": t, "properties": stat(d, b)} for t, d, b in tracks],
             "attachments": [{"size": attachments}] if attachments else []}, size
 
@@ -186,14 +186,19 @@ def test_trusted_duration_rules():
     stale = json.loads(json.dumps(probe))
     stale["container"]["properties"]["writing_application"] = "Lavf60.16.100"
     assert M.trusted_duration(stale, size)["trust"] == "header"
-    # two pairs that disagree: the header with the last packet against the statistics
+    # two pairs that disagree: the header with the last packet against the statistics and the stored end
     probe, size = mkv(10800 * 10**9, "mkvmerge v92.0", 7200 * 5_000_000 // 8, [("video", "02:00:00.000000000", "4600000"),
                                                                                 ("audio", "02:00:00.000000000", "400000")])
-    assert M.trusted_duration(probe, size, 10799.0)["trust"] == "conflict"
-    # attachments are not bitrate: 400 MB of fonts in a 1.6 GB file
+    assert M.trusted_duration(probe, size, 10799.0, 7200.0)["trust"] == "conflict"
+    # a container AMG reads takes no length from a bitrate: the stored end stands in
+    assert set(M.trusted_duration(probe, size, None, 7200.0)["sources"]) == {"header", "streams", "stored"}
+    # a container with no reader keeps the bitrate. Attachments are not bitrate: 400 MB of fonts in a 1.6 GB file
     probe, size = mkv(0, "mkvmerge v92.0", 2_000_000_000, [("video", "00:40:00.000000000", "5000000"),
                                                            ("audio", "00:40:00.000000000", "333334")], attachments=400_000_000)
+    del probe["container"]["type"]
     assert M.trusted_duration(probe, size)["trust"] == "bitrate"
+    probe["container"]["type"] = "Matroska"
+    assert M.trusted_duration(probe, size)["trust"] == "conflict" and M.trusted_duration(probe, size, None, 2400.0)["trust"] == "bitrate"
     # ffprobe of an mp4: the index gives each stream a duration
     ff = {"format": {"duration": "5400.0"}, "streams": [{"codec_type": "video", "duration": "5399.9"}, {"codec_type": "audio", "duration": "5400.0"}]}
     assert M.trusted_duration(ff, 1)["trust"] == "agree"
@@ -495,6 +500,8 @@ def test_header_alert():
     assert M.header_alert(t("Film E")) is None
     probe, size, _ = PROBES["Film D"]
     assert M.header_alert(M.trusted_duration(probe, size)) is None   # a header alone says nothing
+    assert M.header_alert(M.trusted_duration(probe, size, None, 6943.192)) == \
+        "The file says it runs 15:43:13, but the video and audio stop at 1:55:43. The runtime check was skipped."   # the stored end alone
 
 
 class Urlopen:

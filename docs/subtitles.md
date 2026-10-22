@@ -425,7 +425,8 @@ No app names the file, so the run keeps every flag. Only a subtitle whose words 
 and forced flags. With `--apply`, a remux that AMG checks writes the new times, the new end times or the removal.
 
 The file as it was before the change stays as a hard link at `.arr-media-guard-originals/<UTC time>/Episode.mkv` in the
-mounted folder. The output names that path.
+mounted folder. The output names that path. A later `--apply` that changes the file again keeps nothing new while
+that kept original is still kept. It names the same path, so that file stays the one from before the first change.
 
 - `PUID:PGID` must be able to write in the mounted folder. When the dry run plans a remux and that folder is not
   writable, it names the folder, the uid and the gid.

@@ -96,6 +96,11 @@ nothing, because AMG checks every stream of the new file before the old one goes
 
 AMG keeps each one for `KEEP_ORIGINALS_DAYS` days, 7 by default.
 
+Each file has one kept original, the file as it was before AMG first changed it. A later change of the same file, in
+the same run or a later one, keeps nothing new while that kept original is still kept. Its output names the same
+kept original, and the days of that kept original start again. A file that changed after AMG wrote it, as a new
+grab or an edit by hand, gets a new kept original.
+
 | Folder | What it holds |
 | --- | --- |
 | `.<NAME>-originals` | The kept originals, at `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. |
@@ -143,11 +148,17 @@ The nightly audit and the worker's daily clean-up remove the kept originals and 
 - `0` keeps nothing new.
 - At `0` a clean-up removes every `KEEP_REPLACED` copy, and leaves the originals already kept.
 - Move a kept original out of its folder to keep it longer.
+- A later change of the file starts the days again. Its time folder then holds a `.renewed` file, whose time is that of
+  the latest change.
 
 ### Undo a change
 
 1. Move the kept original back over the file with `mv`.
 2. Rescan the item in the app.
+
+The kept original undoes every change AMG made to the file since it kept it. Before 2.18.6, AMG kept a file at each
+change, so a file can have several kept originals in different time folders. Look in the oldest time folder after
+the file's last import, while it is still there. It holds the file as it was before AMG first changed it.
 
 ```
 mv "/media/TV/.arr-media-guard-originals/<UTC time>/Show A/Season 1/Show A - S01E02.mkv" \

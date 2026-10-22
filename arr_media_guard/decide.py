@@ -168,11 +168,17 @@ def language(tag, named, heard=None):
 
 
 def events_per_minute(j, props):
-    """Subtitle events a minute from mkvmerge's statistics tags, or None when mkvmerge did not write them.
-    A PGS image subtitle stores about two frames per subtitle, one to show it and one to clear it, so its count is halved."""
+    """Subtitle events a minute from the track's frame count, or None when it has none. The count is the
+    NUMBER_OF_FRAMES tag when the app that wrote the file wrote it: its _STATISTICS_WRITING_APP is the file's writing
+    app, whatever that app is. A tag that another app or an earlier write left is stale, and the count of the track's
+    blocks from the walk stands in, walk_frames, which checks.walk_frames() adds. A PGS image subtitle stores about
+    two frames per subtitle, one to show it and one to clear it, so its count is halved."""
     c = (j.get("container") or {}).get("properties") or {}
-    minutes = (c.get("duration") or 0) / 6e10; frames = str(props.get("tag_number_of_frames") or "")
-    if not (c.get("writing_application") or "").startswith("mkvmerge") or not frames.isdigit() or minutes < POLICY["density_min_minutes"]:
+    app = c.get("writing_application") or ""
+    minutes, frames = (c.get("duration") or 0) / 6e10, str(props.get("tag_number_of_frames") or "")
+    if frames and props.get("tag__statistics_writing_app", app) != app:
+        frames = str(props.get("walk_frames", ""))
+    if not frames.isdigit() or minutes < POLICY["density_min_minutes"]:
         return None
     return int(frames) / (2 if props.get("codec_id") == "S_HDMV/PGS" else 1) / minutes
 
@@ -891,6 +897,11 @@ REPAIR_CUT = 0.02   # the share of a track's cues a read-back may find cut short
 # The share of the letters a read-back must change to show garbled text, see recode(). In its right codepage, text
 # changes only in a few borrowed words, such as an Italian "perchè" in Romanian dialogue.
 GARBLE_SHARE = 0.01
+# The CJK letters a cue must read back to in a codepage of Chinese, Japanese or Korean to count as garbled, see
+# recode(). The cp1252 bytes of "——" or of curly quotes read back as one kanji each, and "“——”" as two. In 1,027 CJK
+# tracks of a library, no right cue without a CJK letter read back to more than one (2026-10-21).
+GARBLE_CJK = 3
+CJK_SCRIPTS = ("CJK", "HIRAGANA", "KATAKANA", "HANGUL")   # script_of() of the letters of those codepages
 
 
 def writes(cp):
@@ -943,13 +954,21 @@ def read_back(text, cp):
     return "".join(out), cut
 
 
+def right_cue(text):
+    """Whether the cue text holds a letter that cp1252 does not write. Garbled text holds only the letters cp1252
+    writes, so such a cue is right text, see recode()."""
+    return any(c.isalpha() and c not in CP1252_TEXT for c in text)
+
+
 def recode(texts, readable=False):
     """[(codepage, the language the texts read as, the texts read back, the count of texts cut short)] of each codepage
     of UTF-8 and CODEPAGES that reads cue texts back, in that order (docs/design.md, "Garbled subtitle repair"). An old
     muxer that took a sidecar's bytes for cp1252 wrote each byte as the character cp1252 gives it. So the cp1252 bytes
     of the text are the sidecar's bytes, and read_back() reads them as the codepage they were in. A codepage counts
-    when every text decodes, the read-back changes GARBLE_SHARE of the letters at least, and the texts read as a
-    language it writes, see reads_as(). UTF-8 counts with no language too, as when the muxer cut most cues. Text in
+    when every cue it reads decodes, the read-back changes GARBLE_SHARE of the letters at least, and the texts read as a
+    language it writes, see reads_as(). A right cue, see right_cue(), stays as it is. In a codepage of Chinese,
+    Japanese or Korean, a cue changes only when it reads back to GARBLE_CJK CJK letters at least. cp932 reads the "——"
+    of right Japanese text as one kanji. UTF-8 counts with no language too, as when the muxer cut most cues. Text in
     another codepage does not decode as UTF-8, because that needs pairs such as "Ã©" that real text does not hold. The language is
     None then. In a codepage of more than one byte, each character outside ASCII that cp1252 writes counts as changed. The muxer
     cut a cue at a byte cp1252 leaves undefined. A cue cut inside a character, as UTF-8 always cuts it, gets U+FFFD
@@ -963,19 +982,21 @@ def recode(texts, readable=False):
     if not any(not t.isascii() for t in texts):
         return []
     letters, out = sum(c.isalpha() for t in texts for c in t), []
+    right = [right_cue(t) for t in texts]
     for cp in ("utf-8", *CODEPAGES):
         if cp == "cp1252":
             continue
         try:
-            got = [read_back(t, cp) for t in texts]
+            got = [(t, False) if r else read_back(t, cp) for t, r in zip(texts, right)]
         except UnicodeError:
             continue
         back = [t for t, _ in got]
         if cp == "utf-8" and (readable or any(cut and any(c.isalpha() for c in u) for u, cut in got)) and \
                 not any(c != "\N{REPLACEMENT CHARACTER}" and c not in t for t, u in zip(texts, back) for c in u):
             continue   # each cue only ends cut, as right text whose only letters outside ASCII end its cues
+        floor = GARBLE_CJK if CODEPAGES.get(cp) in ("chi", "jpn", "kor") else 0
         changed = sum(sum(a != b for a, b in zip(t, u)) if len(t) == len(u) else sum(not c.isascii() and c in CP1252_TEXT for c in t)
-                      for t, u in zip(texts, back))
+                      for t, u in zip(texts, back) if not floor or sum(c.isalpha() and script_of(c) in CJK_SCRIPTS for c in u) >= floor)
         if changed >= GARBLE_SHARE * letters and ((lang := reads_as(back, cp)) or cp == "utf-8"):
             out.append((cp, lang, back, sum(c for _, c in got)))
     return out
@@ -1021,14 +1042,13 @@ def duration(j):
     return float((j.get("format") or {}).get("duration") or 0)
 
 
-def checks(j, size, runtime, shorter_only=False):
+def checks(j, size, runtime, shorter_only=False, stored_end=None):
     """Alerts for one probed file: [(kind, facts)]. size is in bytes, runtime is the listed runtime in minutes (0 = unknown).
 
-    duration: the container duration disagrees with the size. The BPS statistics tags give the expected length, but
-    only when mkvmerge wrote the file and every audio and video track carries one. ffmpeg copies stale tags from its
-    source. A cover picture, see cover(), leaves the sum, and its bytes leave the size.
-    Otherwise a bitrate ceiling for the film's height decides: 50 Mbit/s up to 1080p (the Blu-ray mux rate is 48), 150
-    above.
+    duration: the container duration is more than 40 percent off stored_end, the end of the last video or audio frame
+    the file stores, from checks.stored_end(). A length from the size and a bitrate is an estimate, so no check takes it.
+    With no stored end, a bitrate ceiling for the film's height decides: 50 Mbit/s up to 1080p (the Blu-ray mux rate is
+    48), 150 above. It reads only the header and the size.
     runtime:  the file runs more than 40 percent off the listed runtime. Listed runtimes under 10 minutes are skipped.
     shorter_only (Sonarr) alerts only under 0.6 x the listed runtime, because double episodes and premieres run long.
     A long episode needs content.runtime_verdict(), which knows the season, the episode count and a trusted duration.
@@ -1037,16 +1057,11 @@ def checks(j, size, runtime, shorter_only=False):
     dur, out = duration(j), []
     if not dur: return out
     items = j.get("tracks") or j.get("streams") or []
-    av = [(t.get("properties") or {}) for t in items if t.get("type") in ("video", "audio") and not cover(t, items)]
-    app = ((j.get("container") or {}).get("properties") or {}).get("writing_application") or ""
-    bps = sum(int(p["tag_bps"]) for p in av) if app.startswith("mkvmerge") and av and all(str(p.get("tag_bps", "")).isdigit() for p in av) else 0
-    pics = sum(int(n) for t in items if cover(t, items) and str(n := (t.get("properties") or {}).get("tag_number_of_bytes")).isdigit())
     mmss = f"{int(dur // 3600)}:{int(dur % 3600 // 60):02d}:{int(dur % 60):02d}" if dur >= 3600 else f"{int(dur // 60)}:{int(dur % 60):02d}"
-    if bps:
-        est = (size - pics) * 8 / bps
-        if abs(dur - est) > 0.4 * est:
-            out.append(("duration", {"why": f"The file says it runs {mmss}, but at its own bitrate {size / 1e9:.1f} GB lasts about {est / 60:.0f} "
-                                            "minutes."}))
+    if stored_end:
+        if abs(dur - stored_end) > 0.4 * stored_end:
+            out.append(("duration", {"why": f"The file says it runs {mmss}, but the video and audio stop at {clock(stored_end)}. Players may "
+                                            "show the wrong length."}))
     else:
         v = main_video(items) or {}
         height = int(((v.get("properties") or {}).get("pixel_dimensions") or f'0x{v.get("height", 0)}').partition("x")[2] or 0)
@@ -1557,13 +1572,16 @@ def frame_steps(times):
     return dict(collections.Counter(round((b - a) * 1000, 1) for a, b in zip(t, t[1:]) if b > a))
 
 
-def off_rate(steps, tick=0.001):
+def off_rate(steps, tick=0.001, skips=False):
     """The share of steps, frame_steps() of a video track or a window of it, that are not the track's usual frame
     length, the median step. A step may differ from it by VFR_STEP of it, or by tick, the timestamp scale, when that is
     larger. Matroska rounds each time to the tick. A share of VFR_SHARE or more is a variable frame rate. Mixed rates
     make one, and so do repeated frames that an encoder dropped all through the track. A lost cluster and each frame an
-    encoder left out make one step each, so a constant rate that lost frames in a few places stays under it. The
-    DefaultDuration plays no part, as some files store the length of one field there. None when steps holds no step."""
+    encoder left out make one step each, so a constant rate that lost frames in a few places stays under it. With
+    skips, a step of a whole number of usual frames, within the same bound, is on the rate. It holds frames left out.
+    A web stream that left a frame out at each of its joins then stays under VFR_SHARE. Mixed rates still make one. A
+    median step of 0 ms holds no frame length, so each step then counts as one frame. The DefaultDuration plays no
+    part, as some files store the length of one field there. None when steps holds no step."""
     n, k = sum(steps.values()), 0
     if not n:
         return None
@@ -1571,7 +1589,8 @@ def off_rate(steps, tick=0.001):
         k += steps[mid]
         if 2 * k >= n:
             break
-    return sum(c for x, c in steps.items() if abs(x - mid) > max(tick * 1000, VFR_STEP * mid) + 0.06) / n   # in ms, 0.06 for the rounding
+    frames = lambda x: max(1, round(x / mid)) if skips and mid else 1   # the usual frames the step x holds
+    return sum(c for x, c in steps.items() if abs(x - frames(x) * mid) > max(tick * 1000, VFR_STEP * mid) + 0.06) / n   # in ms, 0.06 for the rounding
 
 
 def element(b, p):
@@ -1665,18 +1684,21 @@ def cue_blocks(b, tracks, cap):
     thousands of cue points, and a walk over each one in Python is slow. So this search finds the CueTrackPositions of
     the wanted tracks by their bytes: a one-byte CueTrack, then the CueClusterPosition and the CueRelativePosition, in
     the order mkvmerge and ffmpeg write them, and a CueDuration after them when there is one. mkvmerge and ffmpeg write
-    one for each subtitle block. An entry in another shape is left out."""
+    one for each subtitle block. An entry in another shape is left out. So is a second entry of one track for one
+    block, at the same Cluster position and position inside it. A track's entries so never depend on the entries of
+    another track, or on the tracks a call asks for."""
     # ponytail: a byte search. A muxer that writes the elements in another order or size gives no entries, so no answer.
-    out = {n: [] for n in tracks if 0 < n < 128}
+    out, seen = {n: [] for n in tracks if 0 < n < 128}, set()
     if not out:
         return {}
     for m in re.finditer(rb"\xf7\x81([" + re.escape(bytes(sorted(out))) + rb"])\xf1([\x81-\x88])", b):
         n, p = m[1][0], m.end() + (m[2][0] & 0x7F)
         r = len(out[n]) < cap and b[p:p + 1] == b"\xf0" and element(b, p)
-        if r and r[2] and r[1] + r[2] <= len(b):
+        at = r and r[2] and r[1] + r[2] <= len(b) and (int.from_bytes(b[m.end():p], "big"), int.from_bytes(b[r[1]:r[1] + r[2]], "big"))
+        if at and (n, *at) not in seen:   # a second entry of one block would read it twice
+            seen.add((n, *at))
             d = b[r[1] + r[2]:r[1] + r[2] + 1] == b"\xb2" and element(b, r[1] + r[2])
-            out[n].append((int.from_bytes(b[m.end():p], "big"), int.from_bytes(b[r[1]:r[1] + r[2]], "big"),
-                           int.from_bytes(b[d[1]:d[1] + d[2]], "big") if d and d[2] and d[1] + d[2] <= len(b) else None))
+            out[n].append((*at, int.from_bytes(b[d[1]:d[1] + d[2]], "big") if d and d[2] and d[1] + d[2] <= len(b) else None))
             if all(len(v) >= cap for v in out.values()):
                 break
     return {n: v for n, v in out.items() if v}

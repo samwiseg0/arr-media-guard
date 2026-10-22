@@ -3,13 +3,20 @@
 """The packet proof of a conversion and the damage checks of its original."""
 import array, collections, concurrent.futures, contextlib, fractions, hashlib, heapq, itertools, json, os, re, shutil, subprocess, threading, uuid
 
-from . import checks, cli, config, content, convert, decide, runner, subsync
+from . import checks, cli, config, content, convert, decide, matroska, mp4, runner, subsync, ts
 
 
 PROOF_RATE = 10e6         # bytes a second a proof read must reach at least, else it times out
 SYNC = 0.05               # seconds a stream's start may move against the first video stream's
-TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start: Matroska keeps milliseconds
-STORED_SLACK = 0.0005     # seconds a subtitle's stored time may move between two Matroska files: the rounding to ms
+TS_WRAP = (1 << 33) / 90000   # seconds a TS PTS counts before it wraps
+OVERLAP_MOVE = 0.2        # seconds an audio frame may move later where the original's blocks overlap, see times_fault().
+                          # The player measurement of such a remux covered moves up to 150 ms.
+CLOSE_MOVE = OVERLAP_MOVE  # seconds a remux moves audio frames later, at most, to close such an overlap, see remux.planned_times().
+                          # The owner picked this on 2026-10-21. With OVERLAP_MOVE 0, every frame keeps its time. With
+                          # float("inf") here, every overlap closes, as mkvmerge closes it on its own, and the proof refuses a
+                          # move past OVERLAP_MOVE.
+TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start when ffmpeg reads the original, see
+                          # mkv_slack() for two Matroska files
 LAG_SLACK = 1.0           # seconds a stream may sit further behind the other streams in the new file than in the original, see lags().
                           # A header repair, remux.header_fault(), takes it as an absolute bound.
 END_LOSS = 3              # video packets the new file may lack at its end, a loss of up to 3 frames that is accepted
@@ -415,37 +422,34 @@ def event_text(path, md5, raw, codec):
     return None if sorted(want) == sorted(have) else "the extracted text does not hold the bytes of each packet"
 
 
-def timed_packets(path, indexes, folder, timeout):
-    """{stream index: [(start, end in seconds, the bytes of its text)]} of the MP4 timed-text streams indexes of path,
-    read with -c copy and -copyts, so no text is decoded. Each packet holds a 2-byte length, the text in that many
-    bytes, then style boxes, which go, as mkvmerge drops them. A packet with no text gives no entry. A timeout raises,
-    and so does a failed read, see bad_lines(), or a packet shorter than its length."""
-    files = {i: (os.path.join(folder, f"{uuid.uuid4().hex}.md5"), os.path.join(folder, f"{uuid.uuid4().hex}.bin")) for i in indexes}
-    argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", "-i", path]
-    for i, (md5, data) in files.items():
-        argv += ["-map", f"0:{i}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{i}", "-c", "copy", "-f", "data", data]
-    r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
-    if r.returncode or bad_lines(r.stderr):
-        raise RuntimeError(f"ffmpeg did not read the timed text of {os.path.basename(path)}: {config.mask(r.stderr.strip())[-200:]}")
-    out = {}
-    for i, (md5, data) in files.items():
-        with open(data, "rb") as f:
-            raw = f.read()
-        out[i], pos, tb = [], 0, 1
-        with open(md5) as f:
-            for line in f:
-                if line.startswith("#tb "):
-                    num, den = line.split(":")[1].split("/")
-                    tb = int(num) / int(den)
-                elif line[:1].isdigit():
-                    p = [x.strip() for x in line.split(",")]
-                    pts, dur, size = int(p[2]), int(p[3]), int(p[4])
-                    b, pos = raw[pos:pos + size], pos + size
-                    n = int.from_bytes(b[:2], "big")
-                    if size < 2 + n:
-                        raise RuntimeError(f"a timed-text packet of stream {i} at {pts * tb:.3f} s holds {size} bytes, less than its text")
-                    if n:
-                        out[i].append((pts * tb, (pts + dur) * tb, b[2:2 + n]))
+def timed_packets(path, indexes, streams=None):
+    """{stream index: [(start, end in seconds, the bytes of its text)]} of the MP4 timed-text streams indexes of path.
+    streams is ff_streams()' list, read here when it is None. Its id names each stream's track_ID. The times are the sample tables' as the edit
+    list presents them, see mp4.track(), and a sample the edit list cuts gives no entry. Each sample's bytes are read
+    at its byte in the file, so no text is decoded. Each sample holds a 2-byte length, the text in that many bytes,
+    then style boxes, which go, as mkvmerge drops them. A sample with no text gives no entry. A read that fails raises
+    RuntimeError, and so does a sample shorter than its length."""
+    name = os.path.basename(path)
+    r = mp4.samples(path)
+    if r["error"]:
+        raise RuntimeError(f"the sample tables of {name} do not read: {r['error']}")
+    streams = ff_streams(path)[1] if streams is None else streams
+    tracks, ids, out = {t["id"]: t for t in r["tracks"]}, {s["index"]: int(s.get("id") or "0", 16) for s in streams}, {}
+    with open(path, "rb") as f:
+        for i in indexes:
+            if (t := tracks.get(ids.get(i))) is None:
+                raise RuntimeError(f"ffprobe names no track of the moov of {name} for stream {i}")
+            out[i] = []
+            for k in range(len(t["time"])):
+                if t["tag"][k] == mp4.CUT or not t["size"][k]:
+                    continue
+                f.seek(t["place"][k])
+                b = f.read(t["size"][k])
+                n = int.from_bytes(b[:2], "big")
+                if len(b) < 2 + n:
+                    raise RuntimeError(f"a timed-text sample of stream {i} at {t['time'][k] / 1e9:.3f} s holds {len(b)} bytes, less than its text")
+                if n:
+                    out[i].append((t["time"][k] / 1e9, (t["time"][k] + t["dur"][k]) / 1e9, b[2:2 + n]))
     return out
 
 
@@ -468,9 +472,9 @@ def utf8(b):
 
 def packet_places(path, folder, timeout, clean=False):
     """{stream index: (times, places, durations)} of path from one ffprobe read, each an array per packet with data,
-    in file order: the time and the duration in seconds (NaN for none) and the file position (-1 for none). Every
-    frame of a Matroska block of several frames (a lace) reads at that block's position, see lace_times(). Matroska
-    stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the frames it
+    in file order: the time and the duration in seconds (NaN for none) and the file position (-1 for none). prove()
+    reads a Matroska file with stored_places() instead, because ffmpeg estimates the times of the frames of a lace.
+    Matroska stores no decode times, so ffmpeg guesses them from the display times. A frame stored far ahead of the frames it
     displays after breaks that guess. ffmpeg's muxer then logs "Non-monotonic DTS", which -v error hides, and moves a
     few packet times of packet_hashes(). The same muxer moves a time that a file stores lower than the time before it
     in the file. ffprobe only demuxes, so it reads the times the file stores. A packet with no display time takes its
@@ -509,38 +513,129 @@ def packet_places(path, folder, timeout, clean=False):
     return out
 
 
-def lace_times(times, places, durations, tick=0.001):
-    """The times of one stream of a Matroska file as its blocks store them, a list with None for no time. times holds
-    the read time of each packet, places its position and durations its read duration, see packet_places(). A lace
-    stores one time, its block's. ffmpeg times its other frames from frame durations floored to the tick, the stream's
-    time base: up to 2 ms early for AAC and 5 ms for DTS with no default duration. So the frames of a lace at time T
-    share the span to the next block's time T' by their lengths. When the read durations of a lace differ by one tick
-    at most, as for AAC, AC-3 and DTS, every frame gets an equal share. Else, as for the short and long blocks of
-    Vorbis, each gets a share by its read duration plus half a tick, the middle of what a floored duration allows. A
-    packet with no read duration takes the stream's median one. A lace before a gap of more than its longest frame,
-    before a time that goes back, or at the end takes the stream's median span per share instead. With no duration at
-    all, every frame counts as one."""
-    out = [None if t is None or t != t else t for t in times]
-    starts = [i for i in range(len(out)) if not i or places[i] < 0 or places[i] != places[i - 1]] + [len(out)]
-    if len(starts) - 1 == len(out) or None in out:   # no lace, or a packet with no time: the read times stay
-        return out
-    known = lambda d: d is not None and d == d and d > 0   # None, NaN and 0 are no duration
-    good = sorted(filter(known, durations))
-    fill = good[len(good) // 2] if good else None
-    raw, blocks = [d if known(d) else fill for d in durations] if fill else None, list(zip(starts, starts[1:]))
-    w = list(raw or [1] * len(out))
-    for i, j in blocks:   # one length, or mixed lengths, see above
-        w[i:j] = [sum(w[i:j]) / (j - i)] * (j - i) if max(w[i:j]) - min(w[i:j]) <= tick * 1.5 else [d + tick / 2 for d in w[i:j]]
-    scales = sorted((out[j] - out[i]) / sum(w[i:j]) for i, j in blocks if j < len(out))
-    scale = scales[len(scales) // 2] if scales else 0
-    for i, j in blocks:
-        lace, span = sum(w[i:j]), out[j] - out[i] if j < len(out) else None
-        # a gap: the next block starts more than a frame after the most the floored durations allow
-        room = sum(raw[i:j]) + (j - i) * tick + max(raw[i:j]) if raw else (lace + max(w[i:j])) * scale
-        f = span / lace if span is not None and 0 < span <= room else scale
-        for n in range(i + 1, j if f > 0 else i):   # a lone lace with no span keeps its read times
-            out[n] = out[n - 1] + w[n - 1] * f
+STORED = ("matroska", "mov", "mpegts")   # the ffprobe formats whose times a reader of AMG gives, see stored_places()
+
+
+def stored_places(path, streams, fam="matroska", folder=None, timeout=600, whole_ok=False):
+    """{stream index: (times, places, durations, info)} of path from the reader of its container, in the shape of
+    packet_places(): the time and the duration in seconds of each frame with data (NaN when it is not known) and its
+    byte, in file order (docs/design.md, "Time reads"). fam is ffprobe's format name: Matroska reads with
+    matroska.frames(), MP4 and QuickTime ("mov") with mp4.samples(), MPEG-TS and M2TS with ts.frames(). info holds the
+    tick of the file's times in ns (scale), the seconds of one frame or None (frame), [count, worst s, first s] of the
+    blocks that start before the block before them ends (overlaps), or None, the stored time in seconds of each such
+    block (lapped), the count of frames whose time is not known (unknown), whether the last frame in time order has no
+    duration (unended), and exact, True when the container stores exact times that a Matroska copy rounds, see
+    mkv_slack(). An MP4 also gives shift, see start_plan(). An empty Matroska frame is a block too, so a frame with data
+    before it has an end. PCM has no frames. Both files cut it again into packets of
+    4096 samples (PROOF_BSF), and ffmpeg's pcm_rechunk times each one at the stored time of its block plus its sample
+    offset. So prove() keeps those times for PCM, and only the info counts. Raises RuntimeError when the read fails,
+    or when it finds other tracks than ffprobe. With whole_ok, a Matroska walk that stopped after it read every
+    Cluster whole counts, see matroska.frames()."""
+    if fam.startswith("mov"):
+        return mp4_places(path, streams, folder, timeout)
+    if fam.startswith("mpegts"):
+        return ts_places(path, streams)
+    try:
+        r = matroska.frames(path)
+        if r["error"] and not (whole_ok and r.get("whole")):
+            raise ValueError(r["error"])
+    except (OSError, ValueError) as ex:
+        raise RuntimeError(f"the block walk of {os.path.basename(path)} failed: {ex}") from ex
+    kinds = {1: "video", 2: "audio", 17: "subtitle"}
+    tracks = [t for t in r["tracks"] if t["type"] in kinds and t["codec"]]
+    media = sorted(media_streams(streams), key=lambda s: s["index"])
+    if [kinds[t["type"]] for t in tracks] != [s["codec_type"] for s in media]:
+        raise RuntimeError(f"the block walk of {os.path.basename(path)} finds the tracks {[kinds[t['type']] for t in tracks]}, "
+                           f"and ffprobe the streams {[s['codec_type'] for s in media]}")
+    sec = lambda v: float("nan") if v == matroska.NONE else v / 1e9
+    out = {}
+    for s, t in zip(media, tracks):
+        keep = [k for k, f in enumerate(t["full"]) if f]
+        o = t["overlaps"]
+        out[s["index"]] = (array.array("d", (sec(t["time"][k]) for k in keep)), array.array("q", (t["place"][k] for k in keep)),
+                           array.array("d", (sec(t["dur"][k]) for k in keep)),
+                           {"scale": r["scale"], "frame": t["frame"] and t["frame"] / 1e9, "overlaps": [o[0], o[1] / 1e9, o[2] / 1e9] if o[0] else None,
+                            "lapped": [sec(v) for v in t["lapped"]],
+                            "unknown": sum(t["tag"][k] == matroska.UNKNOWN for k in keep),
+                            "unended": t["type"] == 17 and bool(keep) and (last := max(range(len(t["time"])), key=lambda k: (t["time"][k], k))) in keep
+                            and t["dur"][last] == matroska.NONE})
     return out
+
+
+def mp4_places(path, streams, folder, timeout):
+    """stored_places() of the MP4 or QuickTime file path. ffprobe names each stream's track_ID in its id. Each packet
+    of ffprobe's read pairs with the sample that starts at its byte, so ffmpeg's own edit-list choices (the samples
+    it keeps before an edit, the one it cuts at the end) never move the pairing. A time is the sample's presentation
+    time, see mp4.track(). A sample the edit list cuts keeps its time on the edit's line, and info counts it in cut."""
+    name = os.path.basename(path)
+    try:
+        r = mp4.samples(path)
+    except Exception as ex:   # a reader that fails, as on a cut box header
+        r = {"error": str(ex)}
+    if r["error"]:
+        raise RuntimeError(f"the sample tables of {name} do not read: {r['error']}")
+    tracks = {t["id"]: t for t in r["tracks"]}
+    pos, out = packet_places(path, folder, timeout), {}
+    for s in media_streams(streams):
+        t = tracks.get(int(s.get("id") or "0", 16))
+        if t is None:
+            raise RuntimeError(f"ffprobe names track {s.get('id')} for stream {s['index']} of {name}, and the moov holds no such track")
+        at = {p: k for k, p in enumerate(t["place"]) if t["full"][k]}
+        places = (pos.get(s["index"]) or ((), array.array("q"), ()))[1] if not (s.get("codec_name") or "").startswith("pcm_") else ()   # see PCM above
+        ks = [at.get(p) for p in places]
+        if None in ks:
+            raise RuntimeError(f"ffprobe reads a packet of stream {s['index']} of {name} at byte {places[ks.index(None)]}, where no sample starts")
+        out[s["index"]] = (array.array("d", (t["time"][k] / 1e9 for k in ks)), array.array("q", places), array.array("d", (t["dur"][k] / 1e9 for k in ks)),
+                           {"scale": 1e9 / t["timescale"], "frame": t["frame"] and t["frame"] / 1e9, "overlaps": None, "unknown": 0,
+                            "unended": False, "exact": True, "cut": sum(t["tag"][k] == mp4.CUT for k in ks), "shift": t["shift"]})
+    return out
+
+
+def ts_places(path, streams):
+    """stored_places() of the MPEG-TS or M2TS file path. ffprobe names each stream's PID in its id. The k-th frame with
+    data of a PID pairs with the k-th packet of its stream, see ts.frames(). Every audio codec of the reader splits its
+    PES into frames, TrueHD and LATM AAC too. PCM gets its entry, see PCM in stored_places(). A PID the reader names no
+    codec gives no frames, and the proof refuses its count. The AC-3 stream of a Blu-ray TrueHD PID takes the frames of
+    its core, see ts.CORE."""
+    name = os.path.basename(path)
+    try:
+        r = ts.frames(path)
+    except (OSError, ValueError) as ex:
+        raise RuntimeError(f"the PES walk of {name} failed: {ex}") from ex
+    if r["error"]:
+        raise RuntimeError(f"the PES walk of {name} failed: {r['error']}")
+    tracks, out = {t["pid"]: t for t in r["tracks"]}, {}
+    sec = lambda v: float("nan") if v == matroska.NONE else v / 1e9
+    for s in media_streams(streams):
+        t = tracks.get(int(s.get("id") or "0", 16))
+        if t is None:
+            raise RuntimeError(f"ffprobe names PID {s.get('id')} for stream {s['index']} of {name}, and the PMT lists no such PID")
+        t = t["core"] if s.get("codec_name") == "ac3" and t.get("core") else t
+        keep = [k for k, f in enumerate(t["full"]) if f]
+        out[s["index"]] = (array.array("d", (sec(t["time"][k]) for k in keep)), array.array("q", (t["place"][k] for k in keep)),
+                           array.array("d", (sec(t["dur"][k]) for k in keep)),
+                           {"scale": 1e9 / 90000, "frame": t["frame"] and t["frame"] / 1e9, "overlaps": None,
+                            "unknown": sum(t["tag"][k] == matroska.UNKNOWN for k in keep), "unended": False, "exact": True})
+    return out
+
+
+def mkv_slack(scale_a, scale_b, kind, exact=False):
+    """The seconds a frame time of a Matroska file may move in a Matroska copy, the one bound of the time check for two
+    Matroska files (docs/design.md, "Frame times"). scale_a and scale_b are their TimestampScales in ns. A subtitle
+    keeps its stored time, and only the new file rounds it: scale_b / 2. An audio or a video block of the original
+    rounds its time to a tick, so the frames of a lace and the block after it can sit up to scale_a apart from the
+    DefaultDuration spacing. A copy that laces in other places times a frame from another block of the original, and
+    rounds again: scale_a + scale_b / 2. A time counts from the time of the stream's first frame or the video's, and a
+    new file with a coarser scale rounds that time too. So both bounds get max(0, scale_b - scale_a) / 2 more, and the
+    start check of prove() takes the same bound. All bounds get 1 us more for the grid of us().
+
+    exact is True for an original of another container that stores exact times (MP4 ticks of its timescale, TS ticks
+    of 90 kHz). mkvmerge moves such a file by its earliest time, which is not on the new file's grid, and rounds each
+    moved time to a tick. A time and the time it counts from (the stream's first, or the video's) each round, so a
+    move between them reaches scale_b. The check of a stream's start uses the same bound, see prove()."""
+    if exact:
+        return (scale_b + 1000) / 1e9
+    return ((scale_b / 2 if kind == "subtitle" else scale_a + scale_b / 2) + max(0, scale_b - scale_a) / 2 + 1000) / 1e9
 
 
 def lags(places):
@@ -548,7 +643,7 @@ def lags(places):
     trails the latest time of the packets before it in the file. A player reads the file in order, so a packet that
     sits minutes late never plays at its time. B-frames give the video a lag of a few frames in any file. Each stream
     is in file order already, so the streams merge by position one packet at a time."""
-    runs = [filter(lambda r: r[0] >= 0 and r[2] == r[2], zip(ps, itertools.repeat(i), times)) for i, (times, ps, _) in places.items()]
+    runs = [filter(lambda r: r[0] >= 0 and r[2] == r[2], zip(ps, itertools.repeat(i), times)) for i, (times, ps, *_) in places.items()]
     worst, top = {}, float("-inf")
     for _, i, t in heapq.merge(*runs):
         top = max(top, t)
@@ -556,7 +651,25 @@ def lags(places):
     return worst
 
 
-def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None, recoded=None):
+def start_plan(shift):
+    """The ms of mkvmerge's --sync that gives a track ffmpeg's MP4 start rule back, for a rule that moves it shift ns
+    earlier, see mp4.ffmpeg_lead(). mkvmerge takes whole ms and drops a frame it would time before 0, so the move
+    rounds toward 0, and the track lands up to 1 ms later than ffmpeg plays it, under one tick of the new file."""
+    return -(shift // 1000000)
+
+
+def lone_cores(j, streams):
+    """The ffprobe indexes of the streams of checks.truehd_cores() that mkvmerge does not read. mkvmerge 102 writes the
+    core as an AC-3 track of that PID only when it finds core frames. j is the mkvmerge -J probe of the file, which
+    numbers each track of a TS by its PID."""
+    if (j.get("container") or {}).get("type") != "MPEG transport stream":
+        return set()
+    read = {(t.get("properties") or {}).get("number") for t in j.get("tracks") or [] if t.get("codec") == "AC-3"}
+    return {s["index"] for s in checks.truehd_cores(media_streams(streams)) if int(s["id"], 16) not in read}
+
+
+def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absolute=False, ended=None, timed=None, recoded=None, synced=None,
+          cores=()):
     """(the refusal, or None; the proof per stream). The refusal is (stream, why): why the new file tmp is not a lossless
     copy of src with the sidecars subs, and the ffprobe index of the stream of src it refuses for its packet count or
     its packet data, else None. No stream is ever decoded.
@@ -580,16 +693,18 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     0 is the tail of the old one after zeros or a stray header, see junk_head(). The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
     edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. When src and
-    tmp are both Matroska, the times and ends of every stream are the ones its blocks store, see
-    packet_places(). ffmpeg's read moves a time that a file stores lower than the time before it in the file. So a
-    track stored out of time order reads the same in a copy whose muxer moved those times too. The stored times of a
-    subtitle stream may then move only STORED_SLACK, the rounding to milliseconds, against the video's start, or
-    against 0 with absolute. ffmpeg moves a time that goes back 2 ms or less with no warning, see
-    remux.moved_tracks(), and such a move refuses here. Audio and video keep TIME_SLACK: mkvmerge times the TrueHD
-    frames of a copy again, 0.83 ms each, up to 1 ms off the times of the source. Both times are right. Each file
-    rounds the same 1/1200 s frame grid to whole ms from its own start phase. So each stays within 0.5 ms of the true
-    frame time, and the two can differ by 1 ms. When the time check fails on a Matroska tmp of another container, the
-    times of that stream as ffprobe read them decide. The entry names it in times.reread.
+    tmp are both Matroska, the times and ends of every stream are the ones its blocks store or RFC 9559 defines, see
+    stored_places() (docs/design.md, "Frame times"). ffmpeg's read moves a time that a file stores lower than the
+    time before it in the file, and it estimates the times of the frames of a lace. A walk of the blocks reads
+    neither. The frames pair in file order, and each time may move mkv_slack(), the rounding of the two files. A
+    subtitle's stored time is measured against the video's start, or against 0 with absolute. ffmpeg moves a time
+    that goes back 2 ms or less with no warning, see remux.moved_tracks(), and such a move refuses here. mkvmerge times
+    the TrueHD frames of a copy again, 0.83 ms each, up to 1 ms off the times of the source. Both times are right. Each
+    file rounds the same 1/1200 s frame grid to whole ms from its own start phase, so the two can differ by 1 ms, the
+    bound mkv_slack() gives. A frame whose time the file does not define drops out of that check, and the entry counts
+    it. When the walk and ffmpeg count other frames of a stream, the proof refuses. When the time check fails on a
+    Matroska tmp of another container, the times of that stream as its blocks store them decide. The entry names it in
+    times.reread.
 
     A few more packets may go at the ends when every other packet matches in order, see ends_lost(): up to END_LOSS
     video packets at the end, junk and cut frames at the ends of an audio stream, and an audio lead of at most
@@ -600,9 +715,10 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     ones, and its text must match.
 
     dropped holds the stream indexes of src that the remux left out on purpose, a subtitle that does not match the
-    audio. retimed maps the k-th subtitle stream of src, from 0, to the fix of subsync.timing() that the remux
-    applied: its packets must match, and its times are compared as the fix moves them, a time before 0 at 0. Each
-    cue with a duration must keep its length as the fix moves its start and its end, within TIME_SLACK. A cue the fix
+    audio. cores holds the stream indexes of src of lone_cores(), which mkvmerge does not write. They pair with no
+    stream of tmp, and the proof refuses one that holds a frame. retimed maps the k-th subtitle stream of src, from 0,
+    to the fix of subsync.timing() that the remux applied: its packets must match, and its times are compared as the
+    fix moves them, a time before 0 at 0. Each cue with a duration must keep its length as the fix moves its start and its end, within TIME_SLACK. A cue the fix
     moves before 0 runs from 0 to its moved end, and 1 ms when that end lies before 0, see remux.moved_tracks(). absolute
     holds each stream to its own start time too, within SYNC, for a remux that must move no stream. The other checks
     compare each start with the video's, so a remux that moved every stream would pass them. ended maps the k-th
@@ -633,7 +749,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     fb, sb, _ = ff_streams(tmp)
     if fb.startswith("matroska") and (layout := checks.layout_of(tmp)):   # a player may not find the tracks, see checks.layout_fault()
         return (None, f"the header layout of the new file breaks the Matroska rules: {layout}"), []
-    a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped], media_streams(sb), fa.split(",")[0]
+    a, b, fam = [s for s in media_streams(sa) if s["index"] not in dropped and s["index"] not in cores], media_streams(sb), fa.split(",")[0]
     if unknown := next((s for s in (*a, *b) if not s.get("codec_name")), None):   # as ffprobe 7.1 reads a WebVTT track in Matroska
         side = "original" if unknown in a else "new file"
         return (None, f"ffprobe names no codec for stream {unknown['index']} of the {side}, so the proof cannot read it"), []
@@ -663,7 +779,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     timeout = max(600, os.path.getsize(src) / PROOF_RATE)
     pool = concurrent.futures.ThreadPoolExecutor(4)   # every read at once: the proof then takes about as long as the remux
     try:
-        pa_, pb_ = (pool.submit(packet_places, p, folder, timeout) for p in (src, tmp))
+        read = lambda p, f, ss: pool.submit(stored_places, p, ss) if f.startswith("matroska") else \
+            pool.submit(stored_places, p, ss, f, folder, timeout) if f.startswith(STORED) else pool.submit(packet_places, p, folder, timeout)
+        pa_, pb_ = read(src, fa, sa), read(tmp, fb, sb)
         a_ = pool.submit(packet_hashes, src, [s["index"] for s, _ in packets], {i: f[0] for i, f in bsf.items() if f[0]},
                          [s["index"] for s, _ in text], folder, timeout, raw=set(recoded), **({"nul": nul} if nul else {}),
                          **({"end_nul": end_nul} if end_nul else {}), **({"spu": spu} if spu else {}),
@@ -679,15 +797,42 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    tick = lambda streams, i: float(fractions.Fraction(next((x.get("time_base") for x in streams if x["index"] == i), None) or "1/1000"))
-    both_mkv = fa.startswith("matroska") and fb.startswith("matroska")   # each time as the blocks store it, see packet_places()
-    for h, places, f, ss in ((ha, pa, fa, sa), (hb, pb, fb, sb)):   # a lace stores one time, see lace_times()
+    for i in sorted(cores):   # see lone_cores()
+        if n := len((pa.get(i) or ((),))[0]):
+            pid = next(s.get("id") for s in sa if s["index"] == i)
+            main = next(s["index"] for s in sa if s.get("codec_name") == "truehd" and s.get("id") == pid)
+            return (i, f"stream {i} holds {n} frames of the AC-3 core of TrueHD stream {main}, and mkvmerge left it out"), proof
+    stored = fa.startswith(STORED) and fb.startswith(STORED)   # each time as the file stores or its spec defines it, see stored_places()
+    codecs = ({s["index"]: s.get("codec_name") or "" for s in sa}, {s["index"]: s.get("codec_name") or "" for s in sb})
+    for h, places, codec, f in ((ha, pa, codecs[0], fa), (hb, pb, codecs[1], fb)) if stored else ():
+        lift, kept = 0.0, []   # seconds from ffmpeg's clock of a TS to the reader's, which take a PTS wrap apart
         for i, x in h.items():
-            if f.startswith("matroska") and (got := places.get(i)) and len(got[1]) == len(x.get("times") or []):
-                x["times"] = lace_times(got[0] if both_mkv else x["times"], got[1], got[2], tick(ss, i))
-                if both_mkv:   # a block with no duration ends at its time, as packet_hashes() reads it
-                    x["ends"] = [None if t is None else t + (d if d == d else 0) for t, d in zip(x["times"], got[2])]
-                    x["stored"] = True
+            if (got := places.get(i)) is None or codec.get(i, "").startswith("pcm_"):   # see PCM in stored_places()
+                kept.append(x)
+                x["stored"], x["info"] = (True, got[3] if len(got) > 3 else {}) if got else (False, {})
+                continue
+            if len(got[0]) != len(x.get("times") or []):   # the reader and ffmpeg count other frames
+                x["walked"] = len(got[0])
+                kept.append(x)
+                continue
+            if f.startswith("mpegts") and (pair := next(((a, b) for a, b in zip(got[0], x["times"]) if a == a and b is not None), None)):
+                lift = round((pair[0] - pair[1]) / TS_WRAP) * TS_WRAP
+            x["times"] = [None if t != t else t for t in got[0]]
+            x["ends"] = [None if t is None else t + (d if d == d else 0) for t, d in zip(x["times"], got[2])]   # no duration: at its time
+            x["stored"], x["info"] = True, got[3] if len(got) > 3 else {}
+            shift = x["info"].get("shift", 0) if h is ha else 0
+            if h is ha and (shift or i in (synced or {})):   # ffmpeg's MP4 start rule, see start_plan()
+                if (synced or {}).get(i, 0) != start_plan(shift):
+                    x["sync_fault"] = ((synced or {}).get(i, 0), start_plan(shift))
+                else:   # the exact move the conversion asked of mkvmerge
+                    r = (shift + start_plan(shift) * 1000000) / 1e9
+                    x["times"], x["ends"] = [None if t is None else t + r for t in x["times"]], [None if e is None else e + r for e in x["ends"]]
+            known = [(t, e) for t, e in zip(x["times"], x["ends"]) if t is not None]   # start and end as the reader gives them
+            if known:
+                x["start"], x["end"] = min(t for t, _ in known), max(e for _, e in known)
+        for x in kept if lift else ():   # a PCM stream keeps ffmpeg's times, and they move to the reader's clock
+            x["times"], x["ends"] = [None if t is None else t + lift for t in x["times"]], [None if e is None else e + lift for e in x["ends"]]
+            x["start"], x["end"] = x["start"] + lift, x["end"] + lift
     none = {"count": 0, "empty": 0, "digest": "", "start": 0, "end": 0}
     video = lambda h, side: min(((h.get(p[side]["index"]) or none)["start"] for p in packets if p[0]["codec_type"] == "video"), default=0)
     va, vb, fault, stream = video(ha, 0), video(hb, 1), None, None
@@ -703,16 +848,20 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             proof[-1]["crlf"] = n   # packets whose line breaks changed between LF and CRLF, and nothing else
         xt, yt, xs, why, ycut, bad = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None), None   # bad: refused for its packets
         lead = None   # what the new file lost at the start, a cut first frame or a short lead, see ends_lost()
+        both = x.get("stored") and y.get("stored")   # stored times in both files: one bound for every time and the start
+        ia, ib = (x["info"], y["info"]) if both else ({}, {})
+        slack = mkv_slack(ia.get("scale", 1e6), ib.get("scale", 1e6), s["codec_type"], ia.get("exact")) if both else None
+        sync = slack if both else SYNC   # a start counts from the video's start, which the slack holds, see mkv_slack()
         if s["index"] in moved:   # the times the fix gives, see remux.moved_tracks()
             fx = moved[s["index"]]
-            to = lambda t: max(0.0, (t - float(fx["offset"])) / float(fractions.Fraction(fx["rate"])))   # unrounded, see STORED_SLACK
+            to = lambda t: max(0.0, (t - float(fx["offset"])) / float(fractions.Fraction(fx["rate"])))   # unrounded, see mkv_slack()
             xt, xs = [None if t is None else to(t) for t in xt], to(xs)
             proof[-1].update(retimed=fx, start=[round(xs - va, 3), proof[-1]["start"][1]])
         if s["index"] in planned:   # the times of the plan
             xt = [a for a, _ in planned[s["index"]]]
             xs = min(xt, default=xs)
             proof[-1]["start"][0] = round(xs - va, 3)
-        if x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame, and that passes
+        if s["codec_type"] != "subtitle" and x["count"] == y["count"] + 1 and x.get("but_last") == y["digest"]:   # mkvmerge drops a cut last frame
             proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[:-1]
         elif s["codec_type"] == "audio" and x["count"] - y["count"] in (1, 2) and \
@@ -758,21 +907,32 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             # later packet, and the first packets still start together, so the second packet must keep its time.
             if None in (xt[1:2] or [None]) + (yt[1:2] or [None]):
                 why = f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet has no time"
-            elif abs((xt[1] - va) - (yt[1] - vb)) > SYNC:
+            elif abs((xt[1] - va) - (yt[1] - vb)) > sync:
                 why = (f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet moved "
                        f"{((yt[1] - vb) - (xt[1] - va)) * 1000:+.0f} ms")
         elif x["count"] != y["count"]:
             why, bad = f"stream {name} ({s['codec_name']}) holds {y['count']} packets in the new file, {x['count']} in the original", s["index"]
         elif x["digest"] != y["digest"]:
             why, bad = f"the packet data of stream {name} ({s['codec_name']}) differ", s["index"]
-        if not why and abs((xs - va) - (y["start"] - vb)) > SYNC:   # every stream, the exceptions included
+        if not why and (walked := next((f"the {side}" for side, z in (("original", x), ("new file", y)) if "walked" in z), None)):
+            z, f = (x, fa) if walked == "the original" else (y, fb)
+            how = "block walk" if f.startswith("matroska") else "sample table" if f.startswith("mov") else "PES walk"
+            why = f"the {how} of {walked} finds {z['walked']} frames of stream {name} ({s['codec_name']}), and ffmpeg {z['count']}"
+        if not why and x.get("sync_fault"):
+            why = (f"stream {name} moves {x['sync_fault'][0]:+d} ms in the conversion, and ffmpeg's start rule of the MP4 needs "
+                   f"{x['sync_fault'][1]:+d} ms")
+        moved_by = abs(us((xs - va) - (y["start"] - vb)))   # the start of every stream, the exceptions included
+        if not why and (moved_by > us(SYNC) or not lead and moved_by > us(sync)):
             why = f"stream {name} starts {y['start'] - vb:+.3f} s from the video in the new file, {xs - va:+.3f} s in the original"
-        if not why and lead and abs(us((xs - va) - (y["start"] - vb))) > us(TIME_SLACK):   # mkvmerge can time the rest of an AVI's VBR MP3 early
+        if not why and lead and moved_by > us(slack or TIME_SLACK):   # mkvmerge can time the rest of an AVI's VBR MP3 early
             why = f"stream {name} lost {lead}, and its first kept packet moved {((y['start'] - vb) - (xs - va)) * 1000:+.0f} ms"
-        if not why and absolute and abs(xs - y["start"]) > SYNC:
+        if not why and absolute and abs(us(xs - y["start"])) > us(sync):
             why = f"stream {name} starts at {y['start']:.3f} s in the new file, {xs:.3f} s in the original"
-        if not why and (s["index"] in lengthened or s["index"] in planned) and \
-                (n := sum(t is not None and e == t for t, e in zip(x.get("times") or [], x.get("ends") or []))):   # no BlockDuration
+        if not why and (s["index"] in lengthened or s["index"] in planned) and x.get("stored"):   # RFC 9559: a cue ends at the next block
+            if x["info"].get("unended"):
+                why = f"the last cue of stream {name} has no duration in the original and no block after it, so its end is not known"
+        elif not why and (s["index"] in lengthened or s["index"] in planned) and \
+                (n := sum(t is not None and e == t for t, e in zip(x.get("times") or [], x.get("ends") or []))):   # ffmpeg reads no BlockDuration so
             why = f"stream {name} holds {n} cue{'s' if n > 1 else ''} with no duration in the original, so {'their ends are' if n > 1 else 'its end is'} not known"
         if not why and s["index"] in lengthened:   # the flash fix: only the ends change, as planned
             fx = moved.get(s["index"])
@@ -812,13 +972,15 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:
             video = (va, vb) if s["codec_type"] == "audio" else None   # packets that share a time, see times_fault()
-            if x.get("stored") and y.get("stored") and s["codec_type"] == "subtitle":   # a muxer that moved one by 1 ms refuses
-                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, slack=STORED_SLACK, zero=(0, 0) if absolute else (va, vb))
+            if both:   # stored times in both files: a muxer that moved a time past the rounding refuses
+                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video, sync if s["codec_type"] == "subtitle" and not absolute else slack,
+                                                      ((0, 0) if absolute else (va, vb)) if s["codec_type"] == "subtitle" else None, paired=True,
+                                                      length=ia.get("frame"), overlaps=ia.get("overlaps"), lapped=ia.get("lapped") or ())
             else:
                 why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video)
-            if why and fb.startswith("matroska") and not both_mkv:   # ffmpeg's muxer may move a few times of its read, see packet_places()
-                stored = pb.get(t["index"]) or ([], [], [])
-                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, lace_times(*stored, tick(sb, t["index"]))[ycut], video)
+            if why and fb.startswith("matroska") and not stored:   # ffmpeg's muxer may move a few times of its read, see packet_places()
+                got = [None if v != v else v for v in (pb.get(t["index"]) or [[]])[0]]
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, got[ycut], video)
         proof[-1]["match"] = not why
         if why and not fault:
             fault, stream = why, bad
@@ -886,10 +1048,10 @@ def damage_of(read, text):
 def invalid_audio(text, j, streams, dur):
     """{ffprobe index of an audio stream: the warning} for each mkvmerge warning in text that skipped invalid data in
     that audio track more than SKIP_EDGE seconds from either end of the file, dur seconds long. mkvmerge names the
-    track by its id in j. The k-th audio track of j is the k-th audio stream of streams, as prove() pairs them. An
-    unknown dur counts nothing."""
-    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "audio"]
-    ff = [s["index"] for s in media_streams(streams) if s.get("codec_type") == "audio"]
+    track by its id in j. The k-th audio track of j is the k-th audio stream of streams but lone_cores(), as prove()
+    pairs them. An unknown dur counts nothing."""
+    ids, lone = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "audio"], lone_cores(j, streams)
+    ff = [s["index"] for s in media_streams(streams) if s.get("codec_type") == "audio" and s["index"] not in lone]
     out = {}
     for m in re.finditer(rf"track (\d+): ({DAMAGE['mkvmerge'][0]} before timestamp (\d+):(\d+):(\d+(?:\.\d+)?)[^\n]*)", text or ""):
         at, k = int(m[3]) * 3600 + int(m[4]) * 60 + float(m[5]), ids.index(int(m[1])) if int(m[1]) in ids else len(ff)
@@ -955,53 +1117,97 @@ def us(t):
     return round(t * 1e6)
 
 
-def times_fault(name, codec, xt, yt, video=None, slack=TIME_SLACK, zero=None):
+def times_fault(name, codec, xt, yt, video=None, slack=TIME_SLACK, zero=None, paired=False, length=None, overlaps=None, lapped=()):
     """(why the packet times of a stream moved in the new file, or None; the check for the proof entry). xt and yt are
-    the times of the packets with data in file order, the one packet an exception left out already gone. Each list is
-    sorted and taken against its own first time, and each pair may differ by slack, TIME_SLACK by default, in whole
+    the times of the packets with data, in file order. The one packet an exception left out is already gone. Each list
+    is sorted and taken against its own first time. Each pair may differ by slack, TIME_SLACK by default, in whole
     microseconds, see us(). zero, (a time of the original, one of the new file), takes the place of the first times.
-    Sorted, because an AVI video
-    stream has decode times only and mkvmerge writes presentation times: with B-frames the order changes, never the
-    set. mkvmerge makes three changes on purpose, and all pass: it starts the file at 0, it rounds each time to the
-    millisecond of Matroska's timestamp scale, and it writes presentation times for decode times. A lace stores one
-    time for several audio frames, so prove() times the other frames from the stored times first, see lace_times(). An AVI
-    keeps no audio times at all: ffmpeg counts them from the bytes and the header's byte rate, mkvmerge from the samples,
-    and the two drift apart over the length of a file. A player plays the audio on, as mkvmerge
-    counts it, so prove() leaves AVI audio out of this check and keeps its start and its data. A TS
-    whose audio times go back 0.3 s at 2 minutes plays 0.3 s late in the new file from there, because mkvmerge makes
-    the audio continuous. That fails here.
+    The lists are sorted because an AVI video stream has decode times only, and mkvmerge writes presentation times.
+    With B-frames the order changes, and the set stays. mkvmerge makes three changes on purpose, and all pass. It
+    starts the file at 0. It rounds each time to the millisecond of Matroska's timestamp scale. It writes presentation
+    times for decode times. An AVI keeps no audio times at all. ffmpeg counts them from the bytes and the header's byte
+    rate. mkvmerge counts them from the samples. The two drift apart over the length of a file. A player plays the
+    audio on, as mkvmerge counts it. So prove() leaves AVI audio out of this check and keeps its start and its data.
+    In a TS whose audio times go back 0.3 s at 2 minutes, mkvmerge makes the audio continuous. The new file then plays
+    0.3 s late from there, and that fails here.
 
-    video is (the original's video start, the new file's) for an audio stream. When the check fails and packets of the
-    original share a time with a neighbour, a second check measures every time against the video's start, as the start
-    check does. A packet that shares a time may move one frame, the median step of the original, and TIME_SLACK more
-    for the rounding. Every other packet may move TIME_SLACK. An MP4 can give its first two AAC packets one time, and mkvmerge spaces them one frame apart.
-    The check then names the shared packets in shared. The refusal says where the new file plays out of sync, from the
-    moves of the check that refused, see out_of_sync()."""
-    if len(xt) != len(yt) or None in xt or None in yt:
-        return (f"stream {name} ({codec}) has packets with no time", {"checked": False}) if None in xt + yt else \
+    paired is True for two Matroska files, whose times come from stored_places(). Their packets matched in order, so
+    each pair is the same frame, in file order. No list is sorted then. A pair with a time that is not known (None)
+    drops out of the check. The entry counts it in unknown. slack is then mkv_slack().
+
+    video is (the original's video start, the new file's) for an audio stream. A second check runs when the check
+    fails and packets of the original share a time with a neighbour. It measures every time against the video's start,
+    as the start check does. A packet that shares a time may move one frame, and slack more for the rounding. Every
+    other packet may move slack. For paired files one frame is length, the seconds of a frame the original defines.
+    When the original defines none, a packet that shares a time may move slack only. For other files one frame is the
+    median step of the original. An MP4 can give its first two AAC packets one time, and mkvmerge spaces them one
+    frame apart. The check then names the shared packets in shared.
+
+    An audio frame of paired files may also move later than its defined time. That passes when the new file plays on
+    in whole frames from the last frame that kept its time. Its new time is then that frame's new time plus one frame
+    (length) for each frame between, within slack. Where the original's blocks overlap, mkvmerge makes the
+    audio contiguous so. A player then plays it closer to the picture. So the chain must hold a block of the original
+    after the frame that kept its time. That block starts before the block before it ends. lapped holds the stored
+    times of those blocks. The move may reach OVERLAP_MOVE at most. An earlier move refuses, so a gap of the original
+    never closes. A later move that is not contiguous refuses, and so does a chain with no such block. So a slow drift
+    never passes. A frame that shares a time with a neighbour and moves more than slack may go on with the chain by the
+    same rule. When it does not, it counts as a frame that kept its time. The check counts such frames in contiguous, with the worst move and the first time. The refusal says
+    where the new file plays out of sync, see out_of_sync(). It takes the moves of the check that refused. For paired
+    files it also names the count of moved frames. It names overlaps too, see stored_places(). That is [count, worst s,
+    first s] of the original's blocks that start before the block before them ends."""
+    if len(xt) != len(yt) or (not paired and (None in xt or None in yt)):
+        return (f"stream {name} ({codec}) has packets with no time", {"checked": False}) if len(xt) == len(yt) else \
             (f"stream {name} ({codec}) holds {len(yt)} timed packets in the new file, {len(xt)} in the original", {"checked": False})
-    a, b, slack = sorted(map(us, xt)), sorted(map(us, yt)), us(slack)
-    za, zb = (us(zero[0]), us(zero[1])) if zero else (a[0], b[0]) if a else (0, 0)
+    known = [k for k, (p, q) in enumerate(zip(xt, yt)) if p is not None and q is not None]
+    a, b, slack = [us(xt[k]) for k in known], [us(yt[k]) for k in known], us(slack)
+    if not paired:
+        a, b = sorted(a), sorted(b)
+    za, zb = (us(zero[0]), us(zero[1])) if zero else (min(a), min(b)) if a else (0, 0)
     worst, at = 0, None
     for p, q in zip(a, b):
         d = abs((p - za) - (q - zb))
         if d > worst:
             worst, at = d, p - za
-    check = {"worst_ms": round(worst / 1000, 1), **({"at": round(at / 1e6, 3)} if at is not None and worst > slack else {})}
+    check = {"worst_ms": round(worst / 1000, 1), **({"at": round(at / 1e6, 3)} if at is not None and worst > slack else {}),
+             **({"unknown": len(xt) - len(known)} if len(known) < len(xt) else {})}
     same = {j for i in range(1, len(a)) if a[i] == a[i - 1] for j in (i - 1, i)} if worst > slack and video else set()
     if same and len(set(a)) > 1:
-        steps = sorted(q - p for p, q in zip(a, a[1:]) if q > p)
+        steps = sorted(q - p for p, q in zip(a, a[1:]) if q > p) if not paired else []
         zero = (us(video[0]), us(video[1]))
-        frame, moves = steps[len(steps) // 2], [abs((q - zero[1]) - (p - zero[0])) for p, q in zip(a, b)]
+        frame, moves = us(length or 0) if paired else steps[len(steps) // 2], [abs((q - zero[1]) - (p - zero[0])) for p, q in zip(a, b)]
         check["shared"] = {"packets": len(same), "frame_ms": round(frame / 1000, 1), "worst_ms": round(max(moves) / 1000, 1)}
         if all(d <= (frame if i in same else 0) + slack for i, d in enumerate(moves)):
             return None, check
     if worst > slack:
         if "shared" not in check:   # the moves of the first check, each against its stream's first time
             moves, frame, same, zero = [abs((q - zb) - (p - za)) for p, q in zip(a, b)], 0, set(), (za, zb)
+        # Each frame may move slack, a frame that shares a time one frame more. An audio frame of paired files may also
+        # move later when the new file plays on in whole frames from the last frame that kept its time (the anchor),
+        # after an overlap of the original's blocks, see "Overlapping blocks".
         out = [i for i, d in enumerate(moves) if d > (frame if i in same else 0) + slack]
+        step, anchor, closed, moved = (length or 0) * 1e6 if paired and video else 0, None, [], set(out)   # us, kept as a float
+        lap, cap, seen = {us(t) for t in lapped}, us(OVERLAP_MOVE), False   # seen: an overlapping block since the anchor
+        for i in range(len(a)) if step and out else ():
+            seen = (i in moved or i in same and moves[i] > slack) and (seen or a[i] in lap)   # a shared frame may go on with the chain
+            if anchor is not None and seen and moves[i] <= cap and b[i] - zero[1] > a[i] - zero[0] and \
+                    abs(b[i] - b[anchor] - (i - anchor) * step) <= slack:
+                closed.append(i)
+            elif i not in moved:
+                anchor, seen = i, False
+        if closed:
+            check["contiguous"] = {"frames": len(closed), "worst_ms": round(max(moves[i] for i in closed) / 1000, 1),
+                                   "first": round(a[closed[0]] / 1e6 - zero[0] / 1e6 + zero[1] / 1e6, 3)}
+            out = sorted(moved - set(closed))
+        if not out:
+            return None, check
         sec = lambda v: [x / 1e6 for x in v]
-        return out_of_sync(name, codec, sec(a), sec(b), out, sec(moves), same, sec(zero)), check
+        why = out_of_sync(name, codec, sec(a), sec(b), out, sec(moves), same, sec(zero))
+        if paired:
+            why += f". {len(out)} of {len(a)} frames moved"
+            one = overlaps and overlaps[0] == 1
+            why += (f". The original stores {overlaps[0]} block{'' if one else 's'} that start{'s' if one else ''} before the block before "
+                    f"{'it' if one else 'them'} ends, up to {overlaps[1] * 1000:.0f} ms, the first at {overlaps[2]:.3f} s") if overlaps else ""
+        return why, check
     return None, check
 
 

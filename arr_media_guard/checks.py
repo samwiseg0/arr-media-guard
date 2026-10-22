@@ -3,7 +3,7 @@
 """The checks of one file: the probes, the header check, broken audio, corrupt video and the spoken language."""
 import bisect, collections, contextlib, fcntl, json, os, re, select, signal, subprocess, tempfile, threading, time
 
-from . import config, content, decide, matroska, store, subsync, subtitles
+from . import config, content, decide, matroska, mp4, proof, store, subsync, subtitles, ts
 
 
 def run_bounded(argv, timeout, **kw):
@@ -17,11 +17,34 @@ def run_bounded(argv, timeout, **kw):
 
 
 def mkvmerge(path):
+    """mkvmerge -J of path, with walk_frames() added."""
     r = run_bounded(["mkvmerge", "-J", path], 120, capture_output=True, text=True, errors="replace")
     if r.returncode not in (0, 1):   # 1 means warnings, and the JSON is still complete. A signal gives a negative code.
         text = (r.stdout + r.stderr).strip()[-300:]
         raise RuntimeError(f"mkvmerge exited {r.returncode}" + (f": {text}" if text else ""))
-    return json.loads(r.stdout)
+    return walk_frames(path, json.loads(r.stdout))
+
+
+def walk_frames(path, j):
+    """j, mkvmerge -J of the Matroska file path, with walk_frames added to each subtitle track whose NUMBER_OF_FRAMES
+    tag is stale: the count of its blocks from the walk, see decide.events_per_minute(). A tag is stale when its
+    _STATISTICS_WRITING_APP is not the file's writing app. The walk counts only when it read every Cluster, and it
+    runs only when read_time() allows a whole read. Otherwise the track gets no count."""
+    c = (j.get("container") or {}).get("properties") or {}
+    app = c.get("writing_application") or ""
+    stale = [p for t in j.get("tracks") or [] if t.get("type") == "subtitles" and str((p := t.get("properties") or {}).get("tag_number_of_frames") or "").isdigit()
+             and p.get("tag__statistics_writing_app", app) != app]
+    if not stale or (j.get("container") or {}).get("type") != "Matroska" or read_time(path, "the subtitle count")[1]:
+        return j
+    try:
+        r = matroska.frames(path)
+    except (OSError, ValueError):
+        return j
+    count = {t["number"]: len(t["time"]) for t in r["tracks"]} if r["whole"] else {}
+    for p in stale:
+        if p.get("number") in count:
+            p["walk_frames"] = count[p["number"]]
+    return j
 
 
 def sample(path, start, index, window=decide.SAMPLE_SECS):
@@ -115,7 +138,7 @@ def audio_span(path, j, index):
     return max(ends) if ends else decide.duration(j) or ffprobe_duration(path) or 0
 
 
-AUDIO_MORE = ("kind", "decoded", "end", "audio", "video", "video_gap", "held", "hole", "credits", "took", "error")   # log fields of audio_more()
+AUDIO_MORE = ("kind", "decoded", "end", "audio", "video", "video_gap", "held", "hole", "resyncs", "credits", "took", "error")   # log fields of audio_more()
 AUDIO_RESERVE = config.VIDEO_RESERVE + 3 * decide.VIDEO_TIMEOUT + config.ZERO_SECS   # seconds of the job's time limit an extra audio
                       # read leaves: the zero probe, then three video windows of up to VIDEO_TIMEOUT each, then VIDEO_RESERVE
 AUDIO_MAX = 1800      # seconds an extra audio read may take with no time limit, as in a scan. A large remux may need most of it.
@@ -156,20 +179,62 @@ def full_decode(path, index):
             "end": round(int(end[-1]) / 1e6, 1) if end else None, "took": round(time.monotonic() - t, 1)}
 
 
+def stored_frames(path, streams, fam, meta):
+    """Yields (ffprobe stream index, time, duration) of each frame with data and a known time of each media stream of
+    path, in ns, stream by stream in file order, from the reader of its container (docs/design.md, "Time reads"). fam
+    is ffprobe's format name, one of proof.STORED. A duration that is not known is 0, as ffprobe's N/A counts. The
+    streams pair as proof.stored_places() pairs them. A Matroska walk reads on past damage, see matroska.frames(), and
+    meta gets the count of its resyncs. An MP4 sample that no edit presents, or whose bytes run past the end of the
+    file, is left out, because ffmpeg's read stops at such a sample. A TS read that stops before the last packet
+    raises, and so does a read that fails or tracks that do not pair."""
+    name, media = os.path.basename(path), sorted(proof.media_streams(streams), key=lambda s: s["index"])
+    shown = lambda t, k: True
+    if fam.startswith("mov"):
+        r, size = mp4.samples(path), os.path.getsize(path)
+        if r["error"]:
+            raise RuntimeError(f"the sample tables of {name} do not read: {r['error']}")
+        by = {t["id"]: t for t in r["tracks"]}
+        shown = lambda t, k: t["tag"][k] != mp4.CUT and t["place"][k] + t["size"][k] <= size
+    elif fam.startswith("mpegts"):
+        r = ts.frames(path)
+        if r["error"] and not r["error"].startswith("the file ends inside the packet"):   # a cut file, where ffmpeg's read stops too
+            raise RuntimeError(f"the PES read of {name} stopped: {r['error']}")
+        by = {t["pid"]: t for t in r["tracks"]}
+    else:
+        r, kinds = matroska.frames(path), {1: "video", 2: "audio", 17: "subtitle"}
+        tracks = [t for t in r["read_on"] or r["tracks"] if t["type"] in kinds and t["codec"]]
+        if [kinds[t["type"]] for t in tracks] != [s["codec_type"] for s in media]:
+            raise RuntimeError(f"the block walk of {name} finds the tracks {[kinds[t['type']] for t in tracks]}, "
+                               f"and ffprobe the streams {[s['codec_type'] for s in media]}")
+        meta["resyncs"] = len(r["resyncs"])
+    pairs = [(s["index"], t) for s, t in zip(media, tracks)] if fam.startswith("matroska") else \
+        [(s["index"], by.get(int(s.get("id") or "0", 16))) for s in media]
+    if any(t is None for _, t in pairs):
+        raise RuntimeError(f"ffprobe names a track of {name} that its reader does not find")
+    for i, t in pairs:
+        time_, dur, full = t["time"], t["dur"], t["full"]
+        for k in range(len(time_)):
+            if full[k] and time_[k] != matroska.NONE and shown(t, k):
+                yield i, time_[k], max(dur[k], 0)   # NONE is negative
+
+
 def packet_read(path, index):
     """One demux of the whole file, no decode. Every time counts from the file start, as ffmpeg's -ss does: audio and
     video, where each stream ends, held, the seconds from the first audio packet to the audio end less every gap over
     decide.HOLE_GAP, hole, the longest gap between two audio packets, video_gap, the longest gap between two video
     packets or the longest video packet duration, as a broken MP4 stts entry gives one frame 20,000 s, subs,
-    [end, events, text] of each subtitle track, and the codec. The video is the film's, see decide.main_video(). held
-    reads no bit rate and no rounded packet duration.
-    Only running sums are kept, so a TrueHD track of 8 million packets needs no memory. A skip, a missing ffprobe, a
-    failure or a timeout returns {"error": why}, never a verdict."""
+    [end, events, text] of each subtitle track, the codec, and resyncs, the count of damages a Matroska walk read on
+    past. The video is the film's, see decide.main_video(). held reads no bit rate and no rounded packet duration.
+    Matroska, MP4 and TS files read the times the file stores, see stored_frames(). ffprobe gives the start, the
+    origin of the -ss of each sample. AVI times each frame by its index, so ffmpeg's times are the container's own
+    definition, and ffprobe reads its packets, as it reads a format with no reader of AMG.
+    The ffprobe read keeps only running sums, so a TrueHD track of 8 million packets needs no memory. A skip, a
+    missing ffprobe, a failure or a timeout returns {"error": why}, never a verdict."""
     t, (timeout, skipped) = time.monotonic(), read_time(path, "the packet read")
     if skipped:
         return {"error": skipped}
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=start_time:stream=index,codec_type,codec_name,profile:"
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=format_name,start_time:stream=index,id,codec_type,codec_name,profile:"
                             "stream_disposition=attached_pic", "-of", "json", path], capture_output=True, text=True, errors="replace", timeout=min(120, timeout))
         info = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
         streams = info.get("streams") or []
@@ -178,15 +243,57 @@ def packet_read(path, index):
     au = [x for x in streams if x.get("codec_type") == "audio"]
     if index >= len(au):
         return {"error": "ffprobe lists no such audio stream" if streams else "ffprobe failed"}
-    try:
-        p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0", path],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
-    except OSError as ex:
-        return {"error": f"ffprobe did not run: {type(ex).__name__}"}
     a, v = au[index]["index"], (decide.main_video(streams) or {}).get("index")
     subs = {x["index"]: [0.0, 0, x.get("codec_name") not in decide.BITMAP_SUBS] for x in streams if x.get("codec_type") == "subtitle"}
     out = dict(codec=au[index].get("codec_name"), profile=au[index].get("profile"), audio=None, hole=None, video=None, video_gap=0.0)
-    timer, rc, first, afirst, gaps = threading.Timer(timeout, p.kill), None, None, None, 0.0
+    first, afirst, gaps, meta = None, None, 0.0, {"resyncs": 0}
+
+    def add(i, pts, dur):   # one packet, in file order within its stream
+        nonlocal first, afirst, gaps
+        first = pts if first is None else min(first, pts)
+        if i == a:
+            gap = pts - out["audio"] if out["audio"] is not None else 0.0
+            if gap > (out["hole"][1] - out["hole"][0] if out["hole"] else 0):
+                out["hole"] = [out["audio"], pts]
+            gaps += gap if gap > decide.HOLE_GAP else 0
+            afirst = pts if afirst is None else afirst
+            out["audio"] = max(pts + dur, out["audio"] or pts)
+        elif i == v:
+            out["video_gap"] = max(out["video_gap"], dur, pts - out["video"] if out["video"] is not None else 0.0)   # a frame of 20,000 s too
+            out["video"] = max(pts + dur, out["video"] or pts)
+        elif i in subs:
+            subs[i][:2] = [max(subs[i][0], pts + dur), subs[i][1] + 1]
+
+    fam = (info.get("format") or {}).get("format_name") or ""
+    if fam.startswith(proof.STORED):
+        try:   # ponytail: the read_time() gate bounds the walk, which no timer stops. A thread with a deadline if a walk ever hangs.
+            for i, x, d in stored_frames(path, streams, fam, meta):
+                add(i, x / 1e9, d / 1e9)
+        except Exception as ex:   # any reader that fails, as on a cut box header
+            return {"error": config.mask(f"the frame read failed: {ex}")[:200]}
+    else:
+        try:
+            rc = ffprobe_packets(path, timeout, add)
+        except OSError as ex:
+            return {"error": f"ffprobe did not run: {type(ex).__name__}"}
+        if rc != 0:
+            return {"error": f"ffprobe exited {rc}" + (f", killed after {timeout:.0f} s" if rc == -signal.SIGKILL else "")}
+    try:   # an MPEG-TS file may start at any PTS
+        zero = float(info["format"]["start_time"])
+    except (KeyError, TypeError, ValueError):
+        zero = first or 0.0
+    at = lambda x: None if x is None else round(x - zero, 3)
+    return dict(out, audio=at(out["audio"]), video=at(out["video"]), hole=out["hole"] and [at(x) for x in out["hole"]],
+                held=None if afirst is None else round(out["audio"] - afirst - gaps, 1), video_gap=round(out["video_gap"], 1),
+                subs=[[at(e), n, text] for e, n, text in subs.values()], resyncs=meta["resyncs"], took=round(time.monotonic() - t, 1))
+
+
+def ffprobe_packets(path, timeout, add):
+    """ffprobe's exit code after it read every packet of path, with add(stream index, time, duration) of each in
+    seconds. The read of a format with no reader of AMG, see packet_read(). Raises OSError when ffprobe does not start."""
+    p = subprocess.Popen(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0", path],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    timer, rc = threading.Timer(timeout, p.kill), None
     timer.start()
     try:
         for line in p.stdout:
@@ -196,19 +303,7 @@ def packet_read(path, index):
                 dur = float(f[2]) if f[2][:1].isdigit() else 0.0
             except (ValueError, IndexError):
                 continue
-            first = pts if first is None else min(first, pts)
-            if i == a:
-                gap = pts - out["audio"] if out["audio"] is not None else 0.0
-                if gap > (out["hole"][1] - out["hole"][0] if out["hole"] else 0):
-                    out["hole"] = [out["audio"], pts]
-                gaps += gap if gap > decide.HOLE_GAP else 0
-                afirst = pts if afirst is None else afirst
-                out["audio"] = max(pts + dur, out["audio"] or pts)
-            elif i == v:
-                out["video_gap"] = max(out["video_gap"], dur, pts - out["video"] if out["video"] is not None else 0.0)   # a frame of 20,000 s too
-                out["video"] = max(pts + dur, out["video"] or pts)
-            elif i in subs:
-                subs[i][:2] = [max(subs[i][0], pts + dur), subs[i][1] + 1]
+            add(i, pts, dur)
         rc = p.wait()
     finally:   # the job's time limit may end the loop: ffprobe must not run on
         timer.cancel()
@@ -216,16 +311,7 @@ def packet_read(path, index):
             p.kill()
             p.wait()
         p.stdout.close()
-    if rc != 0:
-        return {"error": f"ffprobe exited {rc}" + (f", killed after {timeout:.0f} s" if rc == -signal.SIGKILL else "")}
-    try:   # an MPEG-TS file may start at any PTS
-        zero = float(info["format"]["start_time"])
-    except (KeyError, TypeError, ValueError):
-        zero = first or 0.0
-    at = lambda x: None if x is None else round(x - zero, 3)
-    return dict(out, audio=at(out["audio"]), video=at(out["video"]), hole=out["hole"] and [at(x) for x in out["hole"]],
-                held=None if afirst is None else round(out["audio"] - afirst - gaps, 1), video_gap=round(out["video_gap"], 1),
-                subs=[[at(e), n, text] for e, n, text in subs.values()], took=round(time.monotonic() - t, 1))
+    return rc
 
 
 def audio_more(path, j, index, samples, certain, doubts, span):
@@ -255,7 +341,7 @@ def audio_more(path, j, index, samples, certain, doubts, span):
     if "error" in pk:
         samples.append({"kind": "packets", "ran": False, "error": pk["error"]})
         return certain, doubts, samples
-    samples.append(dict({k: pk[k] for k in ("audio", "video", "video_gap", "held", "hole", "took")}, kind="packets", ran=True))
+    samples.append(dict({k: pk[k] for k in ("audio", "video", "video_gap", "held", "hole", "resyncs", "took")}, kind="packets", ran=True))
     certain = decide.stops_early(three, pk)
     doubt = None if certain else decide.held(pk)
     if doubt and pk["hole"] and pk["hole"][1] - pk["hole"][0] >= decide.HOLE_MIN:
@@ -459,14 +545,11 @@ def header_probe(path, j):
         if cues is True and cue_end is not None and not off(dur, cue_end) and not little and not rfc:
             out["took"] = round(time.monotonic() - t0, 3)
             return out   # the common case, read in a few small parts
-        kinds, ends = [k for k in ("video", "audio") if k in tracks.values()], None
+        kinds = [k for k in ("video", "audio") if k in tracks.values()]
         # The Segment end. The bytes past it may hold the Clusters of an older copy. stream_ends() cannot walk enclosed zeros.
         stop = gap[0] if gap else size + min(0, short or 0)
-        for n in config.HEADER_TAIL:   # the larger read also when a stream has no block in the smaller one
-            f.seek(max(0, stop - n)); t = f.read(stop - max(0, stop - n)); out["read"] += len(t)
-            ends = decide.stream_ends(t, durations)
-            if (ends is not None and {tracks.get(i) for i in ends} >= set(kinds)) or n >= stop:
-                break
+        ends, t, more = tail_ends(f, stop, durations, tracks)
+        out["read"] += more
         if edit_tail:   # two files joined with cat: ffmpeg plays the second one too, and a remux would drop it
             f.seek(size - edit_tail)
             if f.read(4) == decide.EBML_ID.to_bytes(4, "big"):
@@ -516,7 +599,7 @@ def header_probe(path, j):
         lines = {}
         per = subtitles.subtitle_ends(path, j, (left - config.SUB_RESERVE) if left else config.SUB_MAX, streams, lines) if config.CFG.header_repair and size <= config.CFG.repack_max else None
         if per is None:
-            out["blocked"].append("the subtitle events were not read: no time, no remux can follow, or ffprobe failed")
+            out["blocked"].append("the subtitle events were not read: no time, no remux can follow, or the block walk failed")
         else:
             out["subtitles"], out["sublines"], out["end"] = per, lines, max([out["end"]] + list(per.values()))
     out["expect"] = out["end"]   # the duration a remux writes
@@ -543,6 +626,56 @@ def header_probe(path, j):
     if edit_tail and cut and not off(out["end"], streams):   # a subtitle event far past the streams sets the stated length
         out["edit_blocked"].append(cut)
     return out
+
+
+def tail_ends(f, stop, durations, tracks):
+    """(decide.stream_ends() of the last bytes before byte stop of the open Matroska file f, those bytes, the bytes read
+    in all). It reads each size of config.HEADER_TAIL in turn, the larger one also when a stream has no block in the
+    smaller one. tracks maps a track number to its mkvmerge type, durations to its default duration in ticks."""
+    kinds, read = {k for k in ("video", "audio") if k in tracks.values()}, 0
+    for n in config.HEADER_TAIL:
+        f.seek(max(0, stop - n)); t = f.read(stop - max(0, stop - n)); read += len(t)
+        ends = decide.stream_ends(t, durations)
+        if (ends is not None and {tracks.get(i) for i in ends} >= kinds) or n >= stop:
+            break
+    return ends, t, read
+
+
+def stored_end(path, j):
+    """Seconds to the end of the last video or audio frame that path stores, for content.trusted_duration(), or None
+    when no reader of AMG takes j's container type cheaply. j is mkvmerge -J of path. Matroska reads the last Clusters
+    by tail_ends(), as header_probe() does: a block ends at its BlockDuration or its frames times the DefaultDuration.
+    The read stops before zero padding, as stream_ends() reads no zero run: the padding after the Cues, see zero_pad(),
+    or a run up to decide.ZERO_RUN that ends the Segment, as mkvpropedit leaves when it grows the Segment over a zero
+    tail. MP4 and MOV read the sample tables of the moov box, and a sample counts only when an edit presents it and its bytes
+    are in the file. A TS file has no cheap read, because ts.frames() reads the whole file. 0 when the read finds no
+    end or fails. Only content.OutOfTime, the job's time limit, raises."""
+    kind, props = (j.get("container") or {}).get("type"), (j.get("container") or {}).get("properties") or {}
+    try:
+        if kind == "Matroska":
+            scale = props.get("timestamp_scale") or 1000000
+            tracks = {(t.get("properties") or {}).get("number"): t.get("type") for t in j.get("tracks") or []}
+            durations = {(t.get("properties") or {}).get("number"): ((t.get("properties") or {}).get("default_duration") or 0) / scale
+                         for t in j.get("tracks") or []}
+            with open(path, "rb") as f:
+                size = f.seek(0, 2); f.seek(0); seg = decide.segment_start(f.read(config.HEADER_READ))
+                if not seg:
+                    return 0
+                stop = size if seg[1] is None else min(size, seg[0] + seg[1])
+                f.seek(stop - 1)
+                if f.read(1) == b"\0":   # zero padding ends the Segment
+                    stop -= zero_run(f, stop - 1, seg[0], stop)[0]
+                ends = tail_ends(f, zero_pad(path) or stop, durations, tracks)[0] or {}
+            return max((e for n, e in ends.items() if tracks.get(n) in ("video", "audio")), default=0) * scale / 1e9
+        if kind == "MP4/QuickTime":
+            r, size = mp4.samples(path), os.path.getsize(path)
+            return max((t["time"][k] + t["dur"][k] for t in r["tracks"] if t["kind"] in ("video", "audio") for k in range(len(t["time"]))
+                        if t["tag"][k] != mp4.CUT and t["place"][k] + t["size"][k] <= size), default=0) / 1e9
+    except content.OutOfTime:
+        raise
+    except Exception:   # a reader that fails, as on a cut box header, gives no end, so the metadata checks still run
+        return 0
+    return None
 
 
 RFC_ISSUE = "the header breaks RFC 9559: "   # the start of the issue of matroska.check()'s faults
@@ -822,17 +955,33 @@ def copy_lines(stream, got):
 PCM_FORMATS = ("matroska", "mov", "mp4")   # ffprobe's format names where the PCM rule holds, see pcm_audio()
 
 
-def pcm_audio(path):
+def stream_probe(path):
+    """ffprobe's format name of path and its streams with index, PID, codec and sample rate, as a dict, or None when
+    ffprobe cannot read the file. ffprobe opens the file as ffmpeg -i does, so a stream it names with no sample rate
+    has none in the read pass either."""
+    try:
+        r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,id,codec_type,sample_rate,codec_name:format=format_name",
+                         "-of", "json", path], 120, capture_output=True, text=True, errors="replace")
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def truehd_cores(streams):
+    """The ffprobe streams of streams that hold the AC-3 core of a Blu-ray TrueHD PID. ffmpeg names such a core as an
+    ac3 stream of its own on the PID of the TrueHD stream, see ts.CORE. It does so even when the PID holds no PES of
+    the core. ffprobe names a PID only in a TS."""
+    truehd = {s["id"] for s in streams if s.get("codec_name") == "truehd" and s.get("id")}
+    return [s for s in streams if s.get("codec_name") == "ac3" and s.get("id") in truehd]
+
+
+def pcm_audio(path, got=None):
     """Whether path is Matroska, MP4 or MOV with a PCM audio track, by ffprobe's format and codec names (pcm_s24le,
     pcm_f32le, pcm_s16be), or None when ffprobe cannot read the file. Silent PCM is zero bytes, so only the zero runs
     the read pass confirms count in such a file, see decide.whole_verdict(). In other containers the read pass named no
-    byte inside a real gap, and silent PCM left no zero run, so there every run counts and this is False."""
-    try:
-        r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name:format=format_name", "-of", "json", path],
-                        120, capture_output=True, text=True, errors="replace")
-        got = json.loads(r.stdout) if r.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
+    byte inside a real gap, and silent PCM left no zero run, so there every run counts and this is False. got is
+    stream_probe() of path when the caller holds it."""
+    got = stream_probe(path) if got is None else got
     if not got:
         return None
     if not set(((got.get("format") or {}).get("format_name") or "").split(",")) & set(PCM_FORMATS):
@@ -853,13 +1002,19 @@ def whole_check(path, stop=lambda: None):
     that count. fault is zero-filled for a certain verdict. A byte of the read pass that starts the file's zero_pad()
     moves from pos to padding, because no player reads it. when holds the play_times() of the other bytes, and in the
     zeros field those of the first byte of each run. When the pass printed a line, tail holds the count of bytes past
-    the Segment end, and tail_errors says whether they make ffmpeg read the last element again, see tail_errors()."""
-    size, t0, pcm = os.path.getsize(path), time.monotonic(), pcm_audio(path)
+    the Segment end, and tail_errors says whether they make ffmpeg read the last element again, see tail_errors().
+
+    The read pass leaves out each stream of truehd_cores() that has no sample rate when ffmpeg opens the file. The
+    null muxer cannot write a header with such a stream. The pass then printed one error and read nothing. A PID with no
+    core PES gives such a core, and so does one whose core PES start after ffmpeg's probe. The TrueHD stream of the PID
+    stays in the read, so the demuxer still reads every PES of the PID."""
+    size, t0, info = os.path.getsize(path), time.monotonic(), stream_probe(path) or {}
+    pcm, bare = pcm_audio(path, info), [s["index"] for s in truehd_cores(info.get("streams") or []) if not int(s.get("sample_rate") or 0)]
     bound = max(WHOLE_MIN, size / WHOLE_RATE)
     took = lambda t: round(time.monotonic() - t, 1)
     p = subprocess.Popen(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error", "-i", path,
-                          "-ignore_unknown", "-map", "0", "-c", "copy", "-f", "null", "-"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.PIPE, text=True, errors="replace")
+                          "-ignore_unknown", "-map", "0", *(a for i in bare for a in ("-map", f"-0:{i}")), "-c", "copy", "-f", "null", "-"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
     got = {"kept": [], "lines": 0, "noise": 0}
     reader = threading.Thread(target=copy_lines, args=(p.stderr, got), daemon=True)
     reader.start()
@@ -1061,14 +1216,15 @@ def check_video(path, dur, again=False, hp=None, pcm=None, by=None):
     by is the stream option of window(), see window_stream(). None reads it from the file.
 
     frame_rate holds the share of the windows' frame steps that are off the film's usual frame length, and whether that
-    makes the rate variable, see decide.off_rate(). It is logged only.
+    makes the rate variable, see decide.off_rate(). A step of a whole number of frames counts as on the rate, see
+    skips there. It is logged only.
     """
     pcm = pcm_audio(path) if pcm is None else pcm
     certain, doubts, fields = video_stages(path, dur, again, hp, pcm, by)
     steps = collections.Counter()
     for w in (fields.get("windows") or {}).get("list") or []:
         steps.update(w.get("steps") or {})
-    if (off := decide.off_rate(steps)) is not None:
+    if (off := decide.off_rate(steps, skips=True)) is not None:
         fields["frame_rate"] = {"off": round(off, 4), "variable": off >= decide.VFR_SHARE}
     h = fields["header"]
     if hp and hp["issue"]:

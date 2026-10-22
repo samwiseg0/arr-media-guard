@@ -125,22 +125,22 @@ def test_the_decision_rules(monkeypatch):
     # English only as commentary (flag or title): the wrong language, nothing changes
     d = decide.decide(ff(("audio", "por", "", 6, 1, 0, 0), ("audio", "eng", "", 2, 0, 0, 1)), "English")
     assert d["edits"] == [] and d["wrong_language"], d
-    # checks. A header of 10:05 on a file whose bitrate says 62 minutes.
+    # checks. A header of 10:05 on a file whose video and audio stop at 1:02:00.
     size = 4.6e9
     hdr = {"container": {"properties": {"duration": 605 * 10**9, "writing_application": "mkvmerge v92.0"}},
             "tracks": [{"type": "video", "properties": {"pixel_dimensions": "1920x1080", "tag_bps": "9400000"}},
                        {"type": "audio", "properties": {"tag_bps": "448000"}}]}
-    assert [k for k, _ in decide.checks(hdr, size, 62)] == ["duration"] and "about 62 minutes" in decide.checks(hdr, size, 62)[0][1]["why"]
-    # stale BPS tags from ffmpeg are ignored, and so is a partial set. The 50 Mbit/s ceiling decides.
-    remux_tag = {"container": {"properties": {"duration": 7200 * 10**9, "writing_application": "Lavf60.16.100"}},
-                 "tracks": [{"type": "video", "properties": {"pixel_dimensions": "1920x1080", "tag_bps": "30000000"}}]}
-    assert decide.checks(remux_tag, 8e9, 120) == []
-    remux_tag["container"]["properties"]["writing_application"] = "mkvmerge v92.0"
-    remux_tag["tracks"].append({"type": "audio", "properties": {}})
-    assert decide.checks(remux_tag, 8e9, 120) == []
-    del hdr["tracks"][0]["properties"]["tag_bps"]
-    assert [k for k, _ in decide.checks(hdr, size, 62)] == ["duration"]
-    assert decide.checks({"container": {"properties": {"duration": 7200 * 10**9}}, "tracks": []}, 7200 * 45e6 / 8, 120) == []
+    assert decide.checks(hdr, size, 62, stored_end=3720) == [("duration", {"why": "The file says it runs 10:05, but the video and audio stop at "
+                                                                                 "1:02:00. Players may show the wrong length."})]
+    # The stored end decides alone, at 40 percent of it. The BPS tags make no length, and the ceiling no longer counts
+    # (61 Mbit/s here).
+    alerts = lambda end: [k for k, _ in decide.checks(hdr, size, 0, stored_end=end)]
+    assert (alerts(1000), alerts(1010), alerts(440), alerts(430), alerts(605)) == ([], ["duration"], [], ["duration"], [])
+    assert decide.checks({"container": {"properties": {"duration": 700 * 10**9}}, "tracks": []}, size, 0, stored_end=500) == []   # 40 percent exactly
+    # With no stored end, or a read that found none, the 50 Mbit/s ceiling decides.
+    assert [k for k, _ in decide.checks(hdr, size, 62)] == ["duration"] == alerts(0) and "61 Mbit/s" in decide.checks(hdr, size, 0)[0][1]["why"]
+    film = {"container": {"properties": {"duration": 7200 * 10**9}}, "tracks": []}
+    assert decide.checks(film, 7200 * 45e6 / 8, 120) == [] == decide.checks(film, 7200 * 45e6 / 8, 120, stored_end=0)
     # runtime. Sonarr alerts only on a short file.
     short = {"container": {"properties": {"duration": 605 * 10**9}}, "tracks": [{"type": "video", "properties": {"pixel_dimensions": "1920x1080"}}]}
     assert decide.checks(short, 0.5e9, 62) == [("runtime", {"runs": "10:05", "listed": 62})]
@@ -479,9 +479,8 @@ def flags(j, heard=None, read=None, original="jpn", checked=None, notes=False):
 
 def test_a_cover_picture_track_is_no_part_of_the_film():
     """A still image is a cover picture, see decide.still(). mkvmerge names ffmpeg's GIF a QuickTime track of the FourCC
-    "gif ". The length check leaves a cover's BPS tag out of the sum and its bytes out of the size. A one-frame cover has
-    a high tag, and a cover shown for the whole film has many bytes. The film's height picks the bitrate ceiling, and
-    the film's DURATION tag is the video end of the audio check."""
+    "gif ". The film's height picks the bitrate ceiling of a file with no stored end, and the film's DURATION tag is the
+    video end of the audio check."""
     film = {"type": "video", "codec": "AVC/H.264/MPEG-4p10", "properties": {"codec_id": "V_MPEG4/ISO/AVC", "pixel_dimensions": "1920x1080",
                                                                            "tag_bps": "9400000", "tag_duration": "01:30:00.000000000"}}
     gif = {"type": "video", "codec": "QuickTime", "properties": {"codec_id": "V_QUICKTIME", "codec_private_data": "0000005a67696620" + "00" * 82}}
@@ -490,9 +489,6 @@ def test_a_cover_picture_track_is_no_part_of_the_film():
     mkv = lambda *tracks: {"container": {"properties": {"duration": 3720 * 10**9, "writing_application": "mkvmerge v102.0"}}, "tracks": list(tracks)}
     one = {"type": "video", "codec": "MJPEG", "properties": {"codec_id": "V_MJPEG", "pixel_dimensions": "1000x2000", "tag_bps": "40000000",
                                                              "tag_number_of_bytes": "200000", "tag_duration": "00:00:00.040000000"}}
-    whole = dict(one, properties=dict(one["properties"], tag_bps="8000000", tag_number_of_bytes=str(3720 * 10**6)))
-    size = 3720 * 9848000 / 8   # 62 minutes of film and audio
-    assert decide.checks(mkv(one, film, audio), size + 200000, 62) == [] and decide.checks(mkv(film, whole, audio), size + 3720 * 10**6, 62) == []
     lavf = {"container": {"properties": {"duration": 3600 * 10**9, "writing_application": "Lavf61.7.100"}}, "tracks": [one, film]}
     assert [k for k, _ in decide.checks(lavf, 3600 * 100e6 / 8, 0)] == ["duration"]   # 100 Mbit/s is over the ceiling of a 1080p film
     ok = {"n": 1922128, "max": -4.0, "errors": 0, "window": 20, "ran": True, "cut": False, "rate": 48000, "ch": 2}

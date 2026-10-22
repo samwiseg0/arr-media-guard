@@ -58,7 +58,7 @@ PICTURE_MAX = 100000                  # blocks picture_cues() reads at most per 
                                       # can hold tens of thousands.
 READ_WALL = 120                       # seconds the read of one subtitle track by its Cues may take. A slow share stops it
                                       # there, as a cap does, see subtitles.Cut.
-FULL_WALL = 1800                      # seconds full_read() may take. It reads the whole file, which takes minutes for a film.
+FULL_WALL = 1800                      # seconds the block reads of full_read() may take after its walk of the whole file
 SUB_MAX = 1800                        # seconds subtitle_ends() may take with no time limit, as in a scan or a backfill
 SUB_RESERVE = 150                     # seconds of the job's time limit it leaves for the zero probe and the windows
 LID_WHEN = {"original_missing_bare_tag", "untagged_may_be_original", "wrong_language", "audio_untagged_or_missing"}   # reason codes

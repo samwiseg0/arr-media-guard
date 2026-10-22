@@ -197,7 +197,9 @@ def test_the_repair_refuses_a_new_file_with_an_rfc_fault_its_original_lacks(tmp_
     tmp.write_bytes(bytes(1000))
     fault = {"schema": ["Info: no MuxingApp, which is mandatory (RFC 9559 5.1)"]}
     monkeypatch.setattr(hook, "header_probe", lambda path, j: {"cues": True, "rfc": fault, "issue": [hook.rfc_issue(fault)]})
-    monkeypatch.setattr(hook, "packet_places", lambda path, *a, **k: {})   # the zero bytes hold no packet to read
+    monkeypatch.setattr(hook, "stored_places", lambda path, streams: {})   # the zero bytes hold no frame to read
+    monkeypatch.setattr(hook, "ff_streams", lambda path: ("matroska,webm", [], 30.0))
+    monkeypatch.setattr(hook, "tail_ends", lambda f, stop, durations, tracks: ({1: 30000}, b"", 0))   # the streams end at 30 s
     new, hp, info = {"container": {"properties": {"duration": 30 * 10**9}}, "tracks": []}, {"expect": 30.0, "video": 30.0, "rfc": {}}, {}
     assert hook.header_checks(str(tmp), new, 10**9, hp, info, str(tmp_path)) == "the new file still has a header issue: " + hook.rfc_issue(fault)
     assert "rfc_left" not in info

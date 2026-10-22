@@ -3,7 +3,7 @@
 """The files the hook keeps: the original of a remux, the grab links, and their prune."""
 import calendar, contextlib, errno, hashlib, os, shutil, sqlite3, time
 
-from . import apps, config, logs, regrab, store
+from . import apps, config, logs, regrab, runner, store
 
 
 def kept_read():
@@ -268,10 +268,73 @@ def keepable(path, st):
     return None if os.access(where, os.W_OK) else f"{where} is not writable"
 
 
+KEPT_BEFORE = "kept at an earlier write"   # note["kept_how"] of a keep that keep_original() reused, see Swap.unkeep()
+RENEWED = ".renewed"   # the file in a stamp folder whose mtime is the latest write that reused a keep there, see stamp_time()
+
+
+def stamp_time(folder):
+    """The time a stamp folder of keep_dir or recycle_dir ages from: its name, a UTC stamp, or the mtime of its RENEWED
+    file when that is later. Raises ValueError for a name that is no stamp."""
+    t = calendar.timegm(time.strptime(os.path.basename(folder), "%Y%m%dT%H%M%SZ"))
+    with contextlib.suppress(OSError):
+        t = max(t, os.stat(os.path.join(folder, RENEWED)).st_mtime)
+    return t
+
+
+def kept_of(path):
+    """(the keep of the original of path, its stamp folder), or None. The file at path must be the one the hook last
+    wrote there, see kept_write(). Its inode, size and mtime must all be those the hook wrote. A new grab, a hand edit
+    and a restore from the keep each change one of them, so the file is a new original. The keep must still exist, with
+    more than regrab.KEEP_MARGIN of keep_days left. A prune can remove a keep in its last hour during the write. That
+    prune decided before the renewal, or it ran on the other host, whose NFS cache can show an old RENEWED for about a
+    minute. It reads only."""
+    try:
+        r = store.get("wrote", path)
+        if not r or list(runner.file_key(os.stat(path))) != r["file"] or not os.path.isfile(r["keep"]):
+            return None
+        root = originals_root(path)
+        top = os.path.relpath(r["keep"], root).split(os.sep)[0]
+        if top == os.pardir or time.time() - stamp_time(os.path.join(root, top)) > config.CFG.keep_days * 86400 - regrab.KEEP_MARGIN:
+            return None
+        return r["keep"], os.path.join(root, top)
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+
+
+def kept_write(path, keep):
+    """Record keep as the kept original of the file the hook just wrote at path, see kept_of(). Each write that keeps
+    calls it after its rename, so the next write of that file reuses the keep. Rows older than keep_days go. It raises
+    only OutOfTime. An error logs a line, and the next write of path keeps a new original."""
+    try:
+        st, now = os.stat(path), time.time()
+        with store.tx():
+            store.put("wrote", path, dict(keep=keep, file=runner.file_key(st)), at=now)
+            store.drop("wrote", older=now - config.CFG.keep_days * 86400)
+    except (sqlite3.Error, OSError) as ex:
+        with contextlib.suppress(OSError):
+            logs.log(dict(source="hook", path=path, result="warning", note=config.mask(f"the hook could not record its write: {type(ex).__name__}: {ex}")[:300]))
+
+
+def kept_carry(path, before):
+    """Move the row of kept_write() for path to the file now, when the row describes before, the stat of path before an
+    in-place edit of the hook's own. So a write after a flag edit still reuses the keep. A row of another file stays.
+    process.edit() calls it only after a successful mkvpropedit, and only when the file still has the inode of before.
+    An import that replaced the file during the edit has another inode, and its next write keeps a new original."""
+    with contextlib.suppress(OSError, sqlite3.Error):
+        r = store.get("wrote", path)
+        if r and r["file"] == list(runner.file_key(before)):
+            kept_write(path, r["keep"])
+
+
 def keep_original(path, note=None, stamp_of=None):
     """Keep path at <originals_root>/<UTC stamp>/<path from the mount> and return that path. The rename of the new file
     over path follows, so path is never missing. The keep holds the original for keep_days, see prune_originals().
     stamp_of is a kept path whose stamp folder the keep takes, so a sidecar kept later stays with its original.
+
+    A file has one kept original, its bytes before the hook's first write. When path holds the hook's own output and
+    its original is still kept, see kept_of(), the call keeps nothing new. It returns that keep, and note["kept_how"]
+    is KEPT_BEFORE. The mtime of RENEWED in the keep's stamp folder becomes now, so the latest write can be undone for
+    keep_days, see stamp_time(). A keep in its last hour is not reused, see kept_of().
 
     The keep is a hard link, which needs no space. Where the file system refuses one (LINK_REFUSED: another file
     system, too many links, or a mount or a container that allows no link), it is a copy with the mode and times of
@@ -280,6 +343,13 @@ def keep_original(path, note=None, stamp_of=None):
     then renamed to the kept name. So a crash leaves no file that looks kept, and the swap waits for a whole copy.
     Every fix that replaces or moves a library file keeps it here first, so the links of path from a grab go stale."""
     kept_replaced(path)
+    if got := kept_of(path):
+        renewed, now = os.path.join(got[1], RENEWED), time.time()
+        open(renewed, "a").close()
+        os.utime(renewed, (now, now))   # the host's clock, as the stamp names use it
+        if note is not None:
+            note["kept_how"] = KEPT_BEFORE
+        return got[0]
     root = originals_root(path)
     stamp = os.path.relpath(stamp_of, root).split(os.sep)[0] if stamp_of else time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time()))
     keep = os.path.join(root, stamp, os.path.relpath(path, os.path.dirname(root)))
@@ -327,7 +397,8 @@ def keep_original(path, note=None, stamp_of=None):
 
 
 def prune_originals(root):
-    """Remove the stamp folders under root older than keep_days. Returns their names. An error keeps the folder."""
+    """Remove the stamp folders under root older than keep_days, by stamp_time(). Returns their names. An error keeps
+    the folder."""
     gone = []
     try:
         names = sorted(os.listdir(root))
@@ -335,7 +406,7 @@ def prune_originals(root):
         return gone
     for n in names:
         with contextlib.suppress(ValueError, OSError):   # a folder the other host's audit removes at the same time
-            if time.time() - calendar.timegm(time.strptime(n, "%Y%m%dT%H%M%SZ")) > config.CFG.keep_days * 86400:
+            if time.time() - stamp_time(os.path.join(root, n)) > config.CFG.keep_days * 86400:
                 shutil.rmtree(os.path.join(root, n))
                 gone.append(n)
     return gone

@@ -18,7 +18,8 @@ and [design.md](design.md) the rules behind it. These words come up often.
 - The *decision log* is the file `LOG` names. It gets a line for each file AMG checks.
 - A *remux* writes a file again with the same video and audio. AMG never re-encodes.
 - A *re-grab* deletes a broken file through the app and marks the grab as failed, so the app searches again.
-- A *kept original* is the old file that a remux replaced. AMG keeps it for `KEEP_ORIGINALS_DAYS`.
+- A *kept original* is the file as it was before AMG's first remux of it. AMG keeps it for `KEEP_ORIGINALS_DAYS` after
+  its latest remux.
 
 ## The path of one file
 

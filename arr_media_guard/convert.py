@@ -3,7 +3,7 @@
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
 import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
 
-from . import apps, checks, config, content, decide, logs, proof, regrab, remux, runner, store, subtitles, vault
+from . import apps, checks, config, content, decide, logs, mp4, proof, regrab, remux, runner, store, subtitles, vault
 
 
 # The conversion of a file that is not Matroska into <base>.mkv (docs/design.md, "Conversion"). Every stream is proven at packet
@@ -16,20 +16,24 @@ START_MAX = 10            # seconds an AVI stream may start late and get --sync.
 LAST_GOP = ("HEVC/H.265/MPEG-H", "MPEG-1/2")   # mkvmerge's video codecs that lose frames at the end when another MP4 track ends first, see split_sync()
 
 
-def convert_captions(path, streams, folder, size):
+def convert_captions(path, streams, folder, size, shift=0.0):
     """({ffprobe stream index: {path, name, charset, cues}} of the SubRip file each CEA-608 caption stream becomes, why
     none can, or None). ffmpeg reads the c608 track and writes SubRip, one read of the file and no video decode. The
-    text keeps its line breaks and loses the markup SubRip players show as text: ASS override tags such as {\\an7}, the
-    hard spaces \\h and the Monospace font. A stream that gives no cue, or a read that fails, keeps the original."""
+    608 decoder gives each cue its start and end. -copyts keeps the times the file presents. Each time then moves by
+    shift seconds, start_shift() of the tracks the remux keeps, so each cue sits where mkvmerge puts the video.
+    Without -copyts, ffmpeg moved the cues by its own start of the file. That start counts a caption track that starts
+    less than 1 s before the video. The text keeps its line breaks and loses the markup SubRip players show as text: ASS
+    override tags such as {\\an7}, the hard spaces \\h and the Monospace font. A stream that gives no cue, or a read
+    that fails, keeps the original."""
     out = {}
     for s in streams:
         f = os.path.join(folder, f"cc{s['index']}.srt")
-        r = checks.run_bounded(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", f"0:{s['index']}",
+        r = checks.run_bounded(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", "-i", path, "-map", f"0:{s['index']}",
                          "-c:s", "srt", "-f", "srt", f], max(600, size / proof.PROOF_RATE), capture_output=True, text=True, errors="replace")
         raw, clean = "", lambda line: " ".join(re.sub(r"\{\\[^}]*\}|</?font[^>]*>", "", line).replace("\\h", " ").split())
         if r.returncode == 0:
             with contextlib.suppress(OSError), open(f, encoding="utf-8", errors="replace") as fh:
-                raw = fh.read()
+                raw = remux.srt_moved(fh.read(), {"rate": "1/1", "offset": -shift})
         text = "\n".join(clean(line) for line in raw.split("\n") if not line.strip() or clean(line))   # a markup-only line never splits a cue
         cues = proof.srt_cues(text)
         if not cues:
@@ -73,6 +77,29 @@ def avi_sync(path, j, streams):
     return out
 
 
+def mp4_sync(path, j, streams):
+    """[{stream, track, ms}] of each video track of the MP4 path that ffmpeg's start rule moves earlier, see
+    mp4.ffmpeg_lead(). AMG's reference for an MP4 is the timeline of ffmpeg-based players, and mkvmerge 102 presents
+    the edit list as written. So convert_cmd() gives mkvmerge the rule's move with --sync, in whole ms, see
+    proof.start_plan(), and prove() expects that exact move. stream names the ffprobe stream as prove() does, track is the mkvmerge track id
+    and ms the move, below 0. The k-th video track of j is the k-th video stream of streams, and ffprobe names each
+    stream's track_ID in its id. A count that differs, or a read that fails, gives none, and prove() decides."""
+    if (j.get("container") or {}).get("type") != "MP4/QuickTime":
+        return []
+    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "video"]
+    ff = [s for s in proof.media_streams(streams) if s.get("codec_type") == "video"]
+    try:
+        r = mp4.samples(path)
+    except OSError:
+        return []
+    tracks = {t["id"]: t for t in r["tracks"]}
+    if r["error"] or len(ids) != len(ff):
+        return []
+    got = [(n, tracks.get(int(s.get("id") or "0", 16))) for n, s in enumerate(ff)]
+    return [{"stream": f"video {ff[n]['index']}", "track": ids[n], "ms": proof.start_plan(t["shift"]), "rule": "ffmpeg's MP4 start"}
+            for n, t in got if t and proof.start_plan(t["shift"])]
+
+
 def split_sync(path, j, streams, skip):
     """({mkvmerge track id: --sync ms} of each video track, the --sync ms of the other tracks) when the MP4 path holds a
     video track of a LAST_GOP codec, else None (docs/design.md, "Conversion"). convert_cmd() then reads each video track
@@ -112,7 +139,7 @@ def broken_tracks(path, j, streams, folder, size):
     tracks = [t for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
     if not tt or len(subs) != len(tracks):   # the k-th ffprobe subtitle is mkvmerge's k-th
         return {}
-    read, out = proof.timed_packets(path, [s["index"] for s in tt], folder, max(600, size / proof.PROOF_RATE)), {}
+    read, out = proof.timed_packets(path, [s["index"] for s in tt], streams), {}
     for s in tt:
         if not all(proof.utf8(t) for _, _, t in read[s["index"]]):
             t = tracks[subs.index(s)]
@@ -122,32 +149,37 @@ def broken_tracks(path, j, streams, folder, size):
 
 
 def start_shift(path, streams, skip, split=False):
-    """The seconds mkvmerge moves each track of the MP4 path by: it starts the file at the earliest packet of the tracks
-    it keeps, before 0 or after it, as an AAC priming edit puts the first audio packets before 0. Those are the media
-    streams but the caption tracks and the ffprobe indexes in skip, the tracks the remux leaves out. A
-    timed-text track counts with its first packet, which may hold no text. ffprobe reads the first 500 packets. A read
-    that fails moves nothing, and the proof decides. With split, as split_sync() asks, a start it cannot tell gives
-    None. That is a read that fails, no packet of those tracks in the 500, or a packet that ffprobe flags D (discard).
-    An edit list cuts a D packet, and mkvmerge keeps or times it by its own rules. Audio packets that end at 0 s or
-    before, and start less than 1 s before 0, are the exception, as an AAC priming edit gives. mkvmerge and ffmpeg time
-    those the same (docs/design.md, "Conversion")."""
-    keep = {s["index"] for s in proof.media_streams(streams) if s.get("codec_name") not in proof.CAPTIONS and s["index"] not in skip}
+    """The seconds mkvmerge moves each track of the MP4 path by: it starts the file at the earliest sample of the tracks
+    it keeps, before 0 or after it, as an AAC priming edit puts the first audio samples before 0. Those are the media
+    streams but the caption tracks and the ffprobe indexes in skip, the tracks the remux leaves out. A timed-text track
+    counts with its first sample, which may hold no text. The times are the presentation times of the sample tables
+    and the edit list as mkvmerge reads them, without ffmpeg's start rule, see mp4.track(). ffprobe names each stream's track_ID in its id. A read that fails moves
+    nothing, and the proof decides. With split, as split_sync() asks, a start it cannot tell gives None. That is a
+    read that fails, no sample of those tracks, or a sample before 0 that the edit list cuts and that is not AAC
+    priming (docs/design.md, "Conversion")."""
+    keep = [s for s in proof.media_streams(streams) if s.get("codec_name") not in proof.CAPTIONS and s["index"] not in skip]
     try:
-        r = checks.run_bounded(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,duration_time,flags", "-read_intervals",
-                                "%+#500", "-of", "csv=p=0", path], 120, capture_output=True, text=True, errors="replace")
-    except subprocess.TimeoutExpired:
+        r = mp4.samples(path)
+    except OSError:
+        r = {"error": "no read"}
+    tracks = {t["id"]: t for t in r.get("tracks") or []}
+    got = [tracks.get(int(s.get("id") or "0", 16)) for s in keep] if not r["error"] else [None]
+    if None in got:
         return None if split else 0
-    rows = [p for p in (line.split(",") for line in r.stdout.splitlines()) if len(p) > 3 and p[0].isdigit() and int(p[0]) in keep]
-    times = [float(p[1]) for p in rows if p[1] not in ("", "N/A")]
-    audio = {s["index"] for s in streams if s.get("codec_type") == "audio"}
-    num = lambda x: float(x) if x not in ("", "N/A") else float("nan")   # nan fails each test below
-    priming = lambda p: int(p[0]) in audio and -1 < num(p[1]) and num(p[1]) + num(p[2]) < 0.001
-    if split and keep and (not times or any("D" in p[3] and not priming(p) for p in rows)):
+    # An AAC priming edit cuts audio samples that end at 0 s or before and start less than 1 s before it. mkvmerge and
+    # ffmpeg time those on the edit's line. Any other sample an edit cuts before its start, mkvmerge keeps or times by
+    # its own rules, so with split the start is not known. An empty edit moves a priming sample past 0, and mkvmerge
+    # then drops it.
+    priming = lambda t, k: t["kind"] == "audio" and -1e9 < t["time"][k] and t["time"][k] + t["dur"][k] < 1e6
+    first = lambda t: min((x for x, g in zip(t["time"], t["tag"]) if g != mp4.CUT), default=0)   # where the edit starts
+    lead = lambda t: [k for k in range(len(t["time"])) if t["tag"][k] == mp4.CUT and t["time"][k] < first(t)]
+    times = [t["time"][k] + t["shift"] for t in got for k in range(len(t["time"])) if t["full"][k]]   # as mkvmerge times them
+    if split and keep and (not times or any(not priming(t, k) for t in got for k in lead(t))):
         return None
-    return -min(times, default=0)
+    return -min(times, default=0) / 1e9
 
 
-def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), split=None):
+def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), split=None, times=()):
     """The remux of src, its captions and its sidecars subs into tmp. mkvmerge keeps the track order and every track it
     reads but the subtitle track ids in drop, then adds each caption SubRip of convert_captions() as "English (CC)",
     then the sidecars. With drop, -s names the subtitle tracks that stay, or -S keeps none. A sidecar with new times
@@ -158,7 +190,8 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
     -copyinkf instead, with streams, its ffprobe streams, and never a new encode. -copyinkf keeps the frames before the
     first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption. split holds the --sync of
     split_sync(). Each video track of src then comes from its own input of src, and the other tracks of src from one
-    more, which alone gives the chapters, the tags and the attachments."""
+    more, which alone gives the chapters, the tags and the attachments. times holds the --timestamps options of
+    remux.planned_args() for the audio tracks of a Matroska src."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in proof.media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
@@ -174,7 +207,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
              for a in ("--track-name", f"{t['id']}:{(t.get('properties') or {}).get('track_name') or ''}")]
     kept = [str(t["id"]) for t in j.get("tracks") or [] if t.get("type") == "subtitles" and t.get("id") not in (None, *drop)]
     skip = (["-s", ",".join(kept)] if kept else ["-S"]) if drop else []   # mkvmerge 92 and 102 warn of each id of -s !N in an MP4
-    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order]   # each frame its own block, see proof.lace_times()
+    argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order]   # each frame its own block, with its own stored time
     if own:
         pick = lambda keep: [a for p in zip(names[::2], names[1::2]) if int(p[1].partition(":")[0]) in keep for a in p]   # their --track-name
         for v, ms in own.items():
@@ -182,7 +215,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
         rest = [i for i in ids if i not in own]
         argv += [*pick(set(rest)), *[a for i in rest if rest_ms for a in ("--sync", f"{i}:{rest_ms}")], *skip, "-D", src]
     else:
-        argv += [*names, *skip, *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], src]
+        argv += [*names, *skip, *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], *times, src]
     for c in captions:
         argv += ["--language", "0:en", "--track-name", f"0:{proof.CC_NAME}", "--sub-charset", "0:UTF-8", "--default-track-flag", "0:0",
                  "--forced-display-flag", "0:0", c["path"]]
@@ -799,7 +832,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
 
     A CEA-608 caption track, which mkvmerge drops, becomes a SubRip track first, see convert_captions(). The remux goes
     to repack_tmp() with no time limit and no new encode. An error fails it, and an mkvmerge warning alone does not.
-    prove() then checks every stream at packet level, and the captions and the sidecars by their text. On a name change
+    prove() then checks every stream at packet level, and the captions and the sidecars by their text. A Blu-ray TrueHD
+    core that mkvmerge does not read pairs with no stream of the new file, see proof.lone_cores(). On a name change
     the new file goes in place, and the original holds held_name() while relink() makes the app list the new file. Only
     then the original and the sidecars go. The extras the app tracks for the original's record wait in hide_dir from the
     swap until settle() runs, see Radarr.extras(). A pending entry holds the swap from its start, see pending_edit(). When anything fails
@@ -915,7 +949,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         what += "".join(f", take out subtitle track {p[1:]}, its bytes to {os.path.basename(e['sidecar'])}" for p, e in broken.items() if e.get("sidecar"))
     if not why and caps:   # a read of the whole file, in a dry run too, so the dry run lists a caption track with no text
         try:
-            cc, why = convert_captions(path, caps, folder, st.st_size)
+            cc, why = convert_captions(path, caps, folder, st.st_size, start_shift(path, streams, skip))
         except BaseException:
             shutil.rmtree(folder, ignore_errors=True)
             raise
@@ -943,12 +977,15 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     try:
         sw.start()
         remux.new_tmp(tmp, st)
-        if sync := [] if unreadable else avi_sync(path, j, streams):   # the decision log shows why a stream starts late
+        if sync := [] if unreadable else avi_sync(path, j, streams) or mp4_sync(path, j, streams):   # the decision log shows each move
             info["start_sync"] = sync
         if split := None if unreadable else split_sync(path, j, streams, skip):
+            split[0].update({x["track"]: split[0][x["track"]] + x["ms"] for x in sync if x["track"] in split[0]})   # ffmpeg's MP4 start rule too
             info["split_sync"] = {"video": split[0], "other": split[1]}   # each video track from its own input
-        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()),
-                                       [t for t, _ in drop] + [e["id"] for e in broken.values()], sync, split),
+        gone = [t for t, _ in drop] + [e["id"] for e in broken.values()]
+        times, plans = remux.planned_args(path, j, [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in gone], folder) \
+            if c.get("type") == "Matroska" else ([], {})   # a WebM, as convert_cmd() orders the tracks
+        r = subprocess.run(convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times),
                            capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so
@@ -956,11 +993,17 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if r.returncode not in (0, 1) or (unreadable and (r.returncode or info["warnings"])):
             raise RuntimeError(f"{'ffmpeg' if unreadable else 'mkvmerge'} exited {r.returncode}: {info['warnings']}")
         out = "" if unreadable else r.stdout + r.stderr   # a warning of invalid audio data, see audio_damage()
+        if fault := remux.plan_fault(tmp, plans):
+            raise RuntimeError(fault)
         sw.sync()
         new_j = checks.mkvmerge(tmp)
         if (new_j.get("container") or {}).get("type") != "Matroska":
             raise RuntimeError(f"the new file reads as {(new_j.get('container') or {}).get('type')}")
-        refused, info["proof"] = proof.prove(path, tmp, subs, folder, cc, **({"dropped": skip} if skip else {}))
+        moved = {int(x["stream"].split()[1]): x["ms"] for x in sync} if (j.get("container") or {}).get("type") == "MP4/QuickTime" else {}
+        if cores := proof.lone_cores(j, streams):   # each must hold no frame, see prove()
+            info["cores_left_out"] = sorted(cores)
+        refused, info["proof"] = proof.prove(path, tmp, subs, folder, cc, **({"dropped": skip} if skip else {}), **({"synced": moved} if moved else {}),
+                                             **({"cores": cores} if cores else {}))
         fault = refused and refused[1]
         seen = fault and config.mask(f"repack failed: {fault}")[:500]   # the refusal as the decision log holds it
         if fault and force and seen != force:
@@ -1084,6 +1127,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if sw.stop(ex):
             return "repack_failed", "repack failed: the run was stopped", info, path
         if undo == "completed":
+            if info.get("kept"):
+                vault.kept_write(new, info["kept"])
             info.update(new_size=size, new_tracks=checks.track_list(new_j))
             return "repacked", "repacked", info, new
         stranded = ", the original and the new file both stay for a person" if undo == "stranded" else ""
@@ -1092,6 +1137,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     finally:
         sw.close(folder)   # the temp file last, after the extras are back. A temp file hidden with them came back too.
     if info.get("kept"):
+        vault.kept_write(new, info["kept"])
         vault.prune_originals(vault.originals_root(path))
     info.update(new_size=size, new_tracks=checks.track_list(new_j))
     return "repacked", "repacked", info, new

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The remuxes that replace a Matroska file, the header repair and the subtitle remux, and the swap they share."""
-import contextlib, filecmp, fractions, hashlib, math, os, re, shutil, signal, subprocess, threading, time
+import contextlib, filecmp, fractions, hashlib, itertools, math, mmap, os, re, shutil, signal, subprocess, threading, time
 
-from . import align, checks, config, decide, logs, proof, runner, subsync, vault
+from . import align, checks, config, decide, logs, matroska, proof, runner, subsync, vault
 
 
 # The track properties a remux must keep, with the Matroska default of each. uid too, except on a track a trim replaced.
@@ -39,12 +39,19 @@ LACE_GUESS = (0.0015, 0.010)
 # percent of the steps. True times with one jump of a few milliseconds, or a slow wander of about 1 ms, have 0 to 0.2
 # percent (measured 2026-10-18).
 LACE_STEPS = 0.03
+REFERENCE_BLOCK = 0xFB   # the child of a BlockGroup that names the frame it refers to, so no keyframe (RFC 9559)
+KEY_BLOCKS = 300   # the video blocks lace_guess() reads for the first keyframe
 
 
 # The mkvmerge hacks of resub() and ended_track() (mkvmerge --engage list). By default mkvmerge trims the spaces and
 # tabs at the ends of each line of a text subtitle packet, and puts the codec header units in front of each HEVC
 # keyframe. Both change packets that resub() copies or ended_track() writes again, and the proof refuses them.
 KEEP_PACKETS = ("--engage", "keep_whitespaces_in_text_subtitles", "--engage", "dont_normalize_parameter_sets")
+MUX_TICK = 1000000        # ns of mkvmerge's TimestampScale for a file with video, its coarsest. A file of audio alone gets a finer one, see mux_tick().
+REFRAMED = ("A_PCM/",)    # audio codecs whose frames mkvmerge cuts again, so a list of frame times cannot time them
+RETIMED = ("A_VORBIS",)   # audio codecs whose frame times mkvmerge 102 changes on its own: Vorbis from ffmpeg by up to 2 ms
+LACE_RETIMED = ("A_MPEG/L",)   # codecs whose lace frames mkvmerge 102 times wrong with no DefaultDuration, MP2 and MP3 by up to 144 ms.
+# It keeps the lace times of AC-3, E-AC-3, DTS and Opus (measured 2026-10-21).
 
 
 def prop_changed(pa, pb, k, d):
@@ -113,19 +120,32 @@ def header_checks(tmp, new, old_size, hp, info, folder, src=None):
     the new Cues, the frame count, the windows and the worst lag of each stream. With a still image before the film and
     no PyAV, no window runs, and info["windows_skipped"] says why.
 
-    The new video track must hold as many frames as its end over its default duration, less FRAME_SLACK. mkvmerge drops
-    a damaged cluster with no warning. A track with no default duration passes only when every window of the check
-    decoded clean. info["frame_rate"] gets the share of the steps between the new file's frames that are not its usual
-    frame length, see decide.off_rate(), and whether that makes the rate variable. A variable rate holds fewer frames
-    than its end over its default duration. Such a track passes when it holds every frame time of the original src,
-    see same_frames(). No packet may trail the packets before it in the new file by more than LAG_SLACK, see proof.lags().
+    The streams of the new file must end where the original's end, hp["expect"], within REPAIR_END. Both ends come
+    from decide.stream_ends() of the last bytes of each file, see checks.tail_ends(). mkvmerge writes the Segment
+    duration from the first block, so the header can differ from the stream end by that time.
+
+    mkvmerge drops a damaged cluster with no warning. So the new video track must hold every video frame the original
+    src stores, each at its time, see original_frames() and frames_fault(). Up to FRAME_SLACK frames may go at the end.
+    The block walk reads every Cluster of src by its bytes, so a cluster that a demuxer skips still counts, and a frame
+    that an encoder left out is no loss. When the walk of src stops before its end, the count of the original is not
+    known, and the repair refuses with the walk's reason. info["frame_rate"] gets the share of the steps between the
+    new file's frames that are not its usual frame length, see decide.off_rate(), and whether that makes the rate
+    variable. The decision line names it, and no check takes it. The times of the new file come
+    from proof.stored_places(). No packet may trail the packets before it in the new file by more than LAG_SLACK, see proof.lags().
     The bound holds whatever the original's lag, so a repair must put late packets in place. The size may differ by
     REPACK_SIZE from old_size less the bytes past the Segment end (hp["tail"], hp["edit_tail"]) and less the zero run
     that mkvpropedit enclosed (hp["enclosed_size"]). mkvmerge reads the elements after that run through the SeekHead
     and keeps them, see resynced(). An RFC 9559 fault of the new file that the original holds too fails no repair,
     because mkvmerge wrote it again. info["rfc_left"] then names it, see checks.rfc_again()."""
-    info["new_duration"] = d1 = round(decide.duration(new), 3)
-    if abs(d1 - hp["expect"]) > decide.REPAIR_END: return f"the new header says {d1} seconds, but the streams end at {hp['expect']}"
+    info["new_duration"] = round(decide.duration(new), 3)
+    scale = (((new.get("container") or {}).get("properties") or {}).get("timestamp_scale") or 1000000)
+    entries = {(t.get("properties") or {}).get("number"): t for t in new.get("tracks") or []}
+    with open(tmp, "rb") as f:   # the new file holds no bytes past its Segment
+        ends = checks.tail_ends(f, os.path.getsize(tmp), {n: ((t.get("properties") or {}).get("default_duration") or 0) / scale for n, t in entries.items()},
+                                {n: t.get("type") for n, t in entries.items()})[0]
+    info["new_end"] = end = round(max(ends.values()) * scale / 1e9, 3) if ends else None
+    if end is None or abs(end - hp["expect"]) > decide.REPAIR_END:
+        return f"the streams of the new file end at {end} seconds, but the streams of the original end at {hp['expect']}"
     now = checks.header_probe(tmp, new)
     info["new_cues"] = (now or {}).get("cues")
     if again := checks.rfc_again(now, hp):
@@ -134,23 +154,24 @@ def header_checks(tmp, new, old_size, hp, info, folder, src=None):
     if not now or now["cues"] is not True or issue:
         return "the new file still has a header issue: " + "; ".join(issue or [f"no usable Cues, {info['new_cues']}"])
     size = os.path.getsize(tmp)
-    places, v = proof.packet_places(tmp, folder, max(600, size / proof.PROOF_RATE)), checks.main_stream(tmp)   # each packet's time and place
+    try:
+        places, v = proof.stored_places(tmp, proof.ff_streams(tmp)[1]), checks.main_stream(tmp)   # each frame's time and place
+    except RuntimeError as ex:
+        return str(ex)
     times = [None if t != t else t for t in places[v["index"]][0]] if v and v["index"] in places else []   # the film's frames
     p = decide.main_video(new["tracks"])   # the film, never a cover picture
     p = None if p is None else p.get("properties") or {}
     if p is not None:
-        info["frames"] = n = int(p.get("tag_number_of_frames") or 0)
-        if p.get("default_duration"):
-            want = round(hp["video"] * 1e9 / p["default_duration"])
-            tick = (((new.get("container") or {}).get("properties") or {}).get("timestamp_scale") or 1000000) / 1e9
-            off = decide.off_rate(decide.frame_steps(times), tick)
-            info["frame_rate"] = rate = {"off": None if off is None else round(off, 4), "variable": off is not None and off >= decide.VFR_SHARE}
-            if n < want - decide.FRAME_SLACK:
-                short = f"the new file holds {n} video frames, but the video end at {hp['video']} s needs {want:.0f}"
-                if not (rate["variable"] and src): return short
-                if fault := same_frames(src, times, folder, rate): return f"the video has a variable frame rate, and {fault}"
-        elif not hp.get("windows_clean"):
-            return "the video track has no default duration, so lost frames cannot be counted, and not every window of the check decoded clean"
+        info["frames"] = int(p.get("tag_number_of_frames") or 0)
+        if p.get("default_duration"):   # the decision line names it, and no check takes it
+            off = decide.off_rate(decide.frame_steps(times), scale / 1e9)
+            info["frame_rate"] = {"off": None if off is None else round(off, 4), "variable": off is not None and off >= decide.VFR_SHARE}
+        old = original_frames(src) if src else "no original to count them in"
+        if isinstance(old, str):
+            return f"the video frames of the original are not all known, so lost frames cannot be counted: {old}"
+        info["original_frames"] = len(old[0])
+        if fault := frames_fault(old, times, scale, v.get("codec_name") if v else None):
+            return fault
     # The bytes past the Segment end go, once when both counts hold them, and so does the enclosed zero run
     old_size = old_size - max(hp.get("tail") or 0, hp.get("edit_tail") or 0) - (hp.get("enclosed_size") or 0)
     if abs(size - old_size) > config.REPACK_SIZE * old_size: return f"the size changed from {old_size} to {size} bytes"
@@ -168,18 +189,38 @@ def header_checks(tmp, new, old_size, hp, info, folder, src=None):
     return None
 
 
-def same_frames(src, times, folder, rate):
-    """Why the video frame times of a new file, times, are not the frame times of its original src, or None. A track
-    with a variable frame rate holds no frame for each default duration, so the original's frames are the count.
-    ffprobe reads every packet of src, and a line that names damage refuses, see proof.packet_places(). mkvmerge drops
-    a damaged cluster with no warning, and the frames of that cluster then miss in the new file. The times compare as
-    proof.times_fault() compares them. rate gets the original's frame count."""
-    v = checks.main_stream(src)
-    if not v:
-        return "ffprobe found no video stream in the original"
-    got = proof.packet_places(src, folder, max(600, os.path.getsize(src) / proof.PROOF_RATE), clean=True).get(v["index"], [[]])[0]
-    rate["original_frames"] = len(got)
-    return proof.times_fault(f"video {v['index']}", v.get("codec_name"), [None if t != t else t for t in got], times)[0]
+def original_frames(src):
+    """(the stored times in seconds of the main video frames of the Matroska file src, in file order, its
+    TimestampScale in ns), or why they are not all known, see proof.stored_places(). The walk must read every Cluster
+    whole. A Segment size past the end of the file, or a level-1 element after the last Cluster whose size does not
+    read, still gives them all: a failed edit leaves such a fault, and the header repair exists to fix it."""
+    try:
+        streams = proof.ff_streams(src)[1]
+        v = checks.main_stream(src)
+        got = proof.stored_places(src, streams, whole_ok=True).get(v["index"]) if v else None
+    except RuntimeError as ex:
+        return str(ex)
+    return ([None if t != t else t for t in got[0]], got[3]["scale"]) if got else "the walk finds no video track"
+
+
+def frames_fault(old, times, scale, codec):
+    """Why the video frame times of a new file, times, are not the stored ones of its original, old of
+    original_frames(), or None. scale is the TimestampScale of the new file in ns, codec the video's. The new file
+    holds every frame of the original in file order, up to FRAME_SLACK frames at the end, and each one at its own
+    time, as mkvmerge keeps the times of a Matroska file, see proof.times_fault(). So a frame lost at the start
+    refuses too. When the new file holds fewer frames, the reason names a loss only when each frame from the first one
+    that differs is a frame of the original some places on, and it names the first lost frame. Else it names the move."""
+    if not len(old[0]) - decide.FRAME_SLACK <= len(times) <= len(old[0]):
+        return f"the new file holds {len(times)} video frames, and the original stores {len(old[0])}"
+    xt, slack = old[0][:len(times)], proof.us(proof.mkv_slack(old[1], scale, "video"))
+    why = proof.times_fault("video", codec, xt, times, slack=slack / 1e6, zero=(0, 0), paired=True)[0]
+    same = lambda a, b: all(None in (p, q) or abs(proof.us(p) - proof.us(q)) <= slack for p, q in zip(a, b))
+    if why and len(times) < len(old[0]):   # the first frame that differs, then how many places on the rest sits
+        k = next(i for i, (p, q) in enumerate(zip(xt, times)) if not same([p], [q]))
+        n = next((m for m in range(1, len(old[0]) - len(times) + 1) if same(old[0][k + m:], times[k:])), None)
+        if n:
+            return f"the new file lacks {n} video frame{'s' if n > 1 else ''} the original stores, the first at {old[0][k]:.3f} s"
+    return why
 
 
 def track_args(p):
@@ -265,7 +306,8 @@ def merge_argv(path, j, tmp, ids, copied=(), own=None, edits=(), lace=False, hea
     track of own gets no such option. An edit of a track that ids leave out raises RuntimeError.
     Each track that the source holds uncompressed stays so, see compression_args(). KEEP_PACKETS keeps the packets of
     text subtitles and HEVC byte for byte. Without lace, each audio frame goes in its own block, as convert_cmd() does.
-    The Segment UID stays, as an ordered chapter of another file may point at it. head goes before the inputs.
+    The Segment UID stays, as an ordered chapter of another file may point at it. head goes before the inputs, so a
+    track option there, as the --timestamps of planned_args(), applies to input 0.
     mkvmerge prints its messages in English in any locale, so resynced() reads them. --ui-language en_US needs no
     locale file, and it leaves the charset of the paths to the locale."""
     own, tracks = own or {}, {t.get("id"): t for t in j.get("tracks") or []}
@@ -295,6 +337,126 @@ def merge_argv(path, j, tmp, ids, copied=(), own=None, edits=(), lace=False, hea
     return argv
 
 
+def planned_times(t, scale):
+    """The time in ns of each frame of the audio track t of matroska.frames(), in file order, as a remux writes it, or
+    None (docs/design.md, "Planned audio times"). scale is the TimestampScale of t's file in ns.
+
+    Each frame keeps its stored, default or bitstream time. Where a block starts before the block before it ends
+    (t["lapped"]), the frames from that block on play on. Each one then starts one frame (t["frame"]) after the frame
+    before it. The run goes on while that moves a frame later by more than the rounding of the two files. The move is
+    proof.CLOSE_MOVE less half a MUX_TICK at most, so the new file's rounding of a time off its grid keeps the move
+    within CLOSE_MOVE. A frame whose own time comes later ends the run, so a gap of the original stays. The rounding is
+    mkv_slack() plus half a MUX_TICK. The proof takes a smaller move for no move, and a frame after it would then follow
+    no overlap. A frame that shares its time with the frame before it goes on with the run as any frame does. The walk
+    finds its block in t["lapped"], so it starts a run too. A frame past the cap keeps its time. So the plan steps back
+    in time only where it keeps an overlap of the original that a move of CLOSE_MOVE does not close. None when a time
+    lies before 0, as matroska.NONE marks a time that is not known, when a frame holds no data, or when the codec is in
+    REFRAMED."""
+    if t["codec"].startswith(REFRAMED) or 0 in t["full"]:
+        return None
+    least, most, step = proof.mkv_slack(scale, MUX_TICK, "audio") * 1e9 + MUX_TICK / 2, proof.CLOSE_MOVE * 1e9 - MUX_TICK / 2, t["frame"]
+    lapped, out, run = set(t["lapped"]), [], False
+    for x in t["time"]:
+        if out and step and (run or x in lapped):   # the proof finds an overlapping block by its time too
+            run = least < out[-1] + step - x <= most
+        out.append(out[-1] + step if run else x)
+    out = [round(x) for x in out]
+    return out if min(out, default=0) >= 0 else None
+
+
+def mux_tick(j, ids):
+    """The TimestampScale in ns of a new file that mkvmerge 102 writes from the tracks ids of j, the mkvmerge -J probe of
+    its input, or None where a video track stays. mkvmerge then takes MUX_TICK. For a file with audio and no video,
+    mkvmerge takes one sample of the highest audio rate, less 1 ns, cut to whole ns: 20832 ns at 48 kHz. It reads the
+    rate of some codecs, such as AAC and FLAC, from the bitstream, and j shows the rate that the file stores. So
+    planned_args() gives mkvmerge this tick as --timestamp-scale. A file with no audio rate in j gets MUX_TICK.
+    mkvmerge takes a TimestampScale from 1000 to 10000000 ns."""
+    out = [t for t in j.get("tracks") or [] if t.get("id") in ids]
+    if any(t.get("type") == "video" for t in out):
+        return None
+    rate = max(((t.get("properties") or {}).get("audio_sampling_frequency") or 0 for t in out if t.get("type") == "audio"), default=0)
+    return min(max(int(1e9 / rate - 1), 1000), 10000000) if rate else MUX_TICK
+
+
+def planned_args(path, j, ids, folder, lag=None):
+    """(the mkvmerge options of the input path that give its audio tracks their planned_times(), {the place of each
+    such track in the new file, from 1: (its DefaultDuration in ns or None, its planned times)}). j is the mkvmerge -J
+    probe of path, and ids holds the track ids of j in their order in the new file. mkvmerge 102 times an audio frame
+    on its own where its time is not later than the time before it, as at an overlap of the blocks, and for a codec in
+    RETIMED. It writes wrong times for the frames of a lace with no DefaultDuration of a codec in LACE_RETIMED. So a
+    track gets a plan when the walk finds an overlapping block, a bitstream time of such a codec or a codec in RETIMED.
+    mkvmerge keeps the times of every other track, an Opus lace too, and the remux then needs no mkvpropedit.
+    The walk finds overlaps and bitstream times on audio tracks only. Each plan goes to a v4 timestamps file in folder, one line per frame in file order, which mkvmerge keeps in
+    that order. A walk of path that fails gives no plan.
+
+    proof.times_fault() checks each plan against the walk, as prove() pairs the new file with the original. The check
+    rounds each planned time half up to the tick of the new file, as mkvmerge rounds it. That tick is MUX_TICK where a
+    video track stays. Otherwise it is mux_tick(), which the options give mkvmerge. A track whose plan the proof would
+    refuse keeps the time of each frame instead. So no writer writes a plan that its own proof refuses, and the header
+    repair, which runs no proof, writes none either. lag is a time in seconds or None. Where a plan keeps an overlap of
+    the original's blocks, a frame may drop at most lag below the latest planned time before it. The track would sit
+    that far behind the other streams in the new file, and header_checks() refuses a lag over LAG_SLACK. A larger drop
+    raises RuntimeError, which names the original's overlap."""
+    try:
+        r = matroska.frames(path)
+    except (OSError, ValueError):
+        return [], {}
+    tracks = {t["number"]: t for t in r["tracks"]} if not r["error"] else {}
+    args, plans, tick = [], {}, mux_tick(j, ids)
+    step = tick or MUX_TICK
+    for x in j.get("tracks") or []:
+        t = tracks.get((x.get("properties") or {}).get("number"))
+        if x.get("id") not in ids or not t or not (t["lapped"] or t["codec"].startswith(LACE_RETIMED) and matroska.BITSTREAM in t["tag"]
+                                                    or t["codec"] in RETIMED):   # audio only
+            continue
+        if (plan := planned_times(t, r["scale"])) is None:
+            continue
+        if plan != (kept := list(t["time"])) and proof.times_fault(
+                "audio", t["codec"], [v / 1e9 for v in kept], [(v + step // 2) // step * step / 1e9 for v in plan], (0.0, 0.0),
+                proof.mkv_slack(r["scale"], step, "audio"), paired=True, length=t["frame"] and t["frame"] / 1e9, lapped=[v / 1e9 for v in t["lapped"]])[0]:
+            plan = kept
+        n, worst, first = t["overlaps"]
+        if lag is not None and n and (drop := max(top - v for top, v in zip(itertools.accumulate(plan, max), plan))) > lag * 1e9:
+            raise RuntimeError(f"audio track {x['id']} of the original stores {n} block{'s' if n > 1 else ''} that start{'' if n > 1 else 's'} before "
+                               f"the block before {'them' if n > 1 else 'it'} ends, up to {worst / 1e6:.0f} ms, the first at {first / 1e9:.3f} s. "
+                               f"The new file would keep that overlap, and the audio would sit up to {drop / 1e9:.1f} s behind the other streams")
+        f = os.path.join(folder, f"times-{x['id']}.txt")
+        with open(f, "w") as fh:
+            fh.write("# timestamp format v4\n" + "".join(f"{v // 1000000}.{v % 1000000:06d}\n" for v in plan))   # ms, exact to the ns
+        args += ["--timestamps", f"{x['id']}:{f}"]
+        plans[ids.index(x["id"]) + 1] = (t["dd"], plan)
+    return [*(["--timestamp-scale", str(tick)] if args and tick else []), *args], plans
+
+
+def plan_fault(tmp, plans):
+    """Why the remux tmp does not hold each audio track of plans, see planned_args(), at its planned times and with the
+    original's DefaultDuration, or None. mkvmerge sets the DefaultDuration of a track from the steps of its timestamps
+    file, 43 ms for frames of 42.667 ms whose blocks store whole ms. So mkvpropedit first gives each track whose
+    DefaultDuration changed the original's again, or removes it where the original holds none. That edit changes a few
+    bytes of Tracks in place, and the layout check of the writer reads tmp after it. The block walk of tmp then reads
+    each planned time back, within half a tick of tmp's TimestampScale, as mkvmerge rounds it, and 1 ns for the read of
+    the file's lines. A walk that stops early holds fewer frames, and a walk that raises fails the remux."""
+    if not plans:
+        return None
+    have = dict(enumerate(((t.get("properties") or {}).get("default_duration") for t in checks.mkvmerge(tmp).get("tracks") or []), 1))
+    edits = [a for n, (dd, _) in plans.items() if have.get(n) != dd
+             for a in ("--edit", f"track:{n}", *(("--set", f"default-duration={dd}") if dd else ("--delete", "default-duration")))]
+    e = subprocess.run(["mkvpropedit", tmp, *edits], capture_output=True, text=True, errors="replace") if edits else None
+    if e and e.returncode not in (0, 1):   # a signal gives a negative code
+        return f"mkvpropedit exited {e.returncode}: {config.mask((e.stdout + e.stderr).strip())[-300:]}"
+    r = matroska.frames(tmp)
+    for n, (dd, plan) in plans.items():
+        t = r["tracks"][n - 1]   # mkvpropedit found it
+        if t["type"] != 2 or t["dd"] != dd:
+            return f"track {n} of the new file is not the planned audio track, or its DefaultDuration is not the original's"
+        got, half = list(t["time"]), r["scale"] // 2 + 1
+        if len(got) != len(plan) or any(abs(a - b) > half for a, b in zip(plan, got)):
+            k = next((k for k, (a, b) in enumerate(zip(plan, got)) if abs(a - b) > half), min(len(plan), len(got)))
+            at = f", at {plan[k] / 1e9:.3f} s," if k < len(plan) else ""
+            return f"audio track {n} of the new file holds {len(got)} frames, the plan {len(plan)}, and frame {k + 1}{at} is the first at another time"
+    return None
+
+
 def resynced(text, hp):
     """Whether text, all that mkvmerge printed in a remux of a file, is only its resync at the zero run that mkvpropedit
     encloses in a Segment (docs/design.md, "Header repair"). That needs hp["enclosed"], where hp found the run, and
@@ -311,51 +473,81 @@ def resynced(text, hp):
 
 
 def lace_guess(path, j, n=500):
-    """(the ffprobe indexes of the audio streams of path whose block times hold ffmpeg's estimates of laced frame
-    times, why mkvmerge must not lace them again or None). ffmpeg copies a lace frame by frame, each frame in its own
-    block at the time it estimated from floored durations. ffprobe reads the first n packets of each audio track of j.
-    The frames of one block share its position, so each block counts once, at the number of frames before it. Two
-    signs together mark the estimates. The block times spread around a least-squares frame clock within LACE_GUESS.
-    At least LACE_STEPS of the steps from block to block fall outside floor..ceil of the clock's frame length times
-    the frames between the blocks, as ffmpeg's estimates catch up once per lace. When any audio track starts before the
-    first video keyframe, a lace there would cost audio at a seek to 0, so the estimates stay. A read that fails finds
-    none, and a video keyframe that does not read keeps the estimates."""
-    tracks, video = (sum(t.get("type") == kind for t in j.get("tracks") or []) for kind in ("audio", "video"))
-    read = lambda which, entries, count: subprocess.run(
-        ["ionice", "-c3", "nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", which, "-show_entries", f"packet={entries}",
-         "-read_intervals", f"%+#{count}", "-of", "csv=p=0", path], capture_output=True, text=True, errors="replace", timeout=120)
-    lines = lambda r: [p.split(",") for p in (r.stdout if r and not r.returncode else "").splitlines()]
+    """(the mkvmerge ids of the audio tracks of path whose block times hold ffmpeg's estimates of laced frame times,
+    why mkvmerge must not lace them again or None). ffmpeg copies a lace frame by frame, each frame in its own block at
+    the time it estimated from floored durations. The walk of the first Clusters gives the stored time of each block
+    among the first n frames of each audio track, see matroska.head() and lace_read(). The whole walk serves when the
+    file has no SeekHead entry for a Tracks after the first Cluster. The frames of one block share its byte, so each
+    block counts once, at the number of frames before it. For AAC, AC-3, E-AC-3, DTS and MPEG audio, the frame clock is
+    the length the codec defines. mkvmerge 102 writes that length in the DefaultDuration of a relace. Another codec
+    takes the track's DefaultDuration, else its codec length. Two signs together mark the estimates. The block times
+    spread around the clock within LACE_GUESS. At least LACE_STEPS of the steps from block to block fall outside
+    floor..ceil of the frame length times the frames between the blocks. The bound counts in ticks of the
+    TimestampScale. ffmpeg's estimates catch up once per lace, so they make such steps. A track with no defined frame length marks nothing. When any audio track starts before the first
+    video keyframe, a lace there would cost audio at a seek to 0, so the estimates stay. The keyframe flag is the one
+    each video block stores. A track plays each block at its time less the track's CodecDelay (RFC 9559), so the
+    start of each track counts that way. A walk that fails finds none, and a video keyframe that does not read keeps
+    the estimates. The k-th audio or video TrackEntry is mkvmerge's k-th track of that type."""
+    kinds = {2: "audio", 1: "video"}
+    own = {k: [t for t in j.get("tracks") or [] if t.get("type") == kind] for k, kind in kinds.items()}
+    delay = lambda t: (t.get("properties") or {}).get("codec_delay") or 0   # ns
+    ids = [t.get("id") for t in own[2]]
     try:
-        r = read("a", "stream_index,pts_time,pos", n * tracks) if tracks else None
-    except subprocess.TimeoutExpired:
+        r = matroska.head(path, lambda b, entries, blocks: lace_read(b, entries, blocks, n)) or matroska.frames(path)
+    except (OSError, ValueError):
         return [], None
-    rows, out = {}, []
-    for p in lines(r):
-        if len(p) >= 3 and p[0].isdigit() and "N/A" not in p[1:3]:
-            rows.setdefault(int(p[0]), []).append((float(p[1]), p[2]))
-    for i, pk in rows.items():
-        b = [(k, t) for k, (t, pos) in enumerate(pk) if not k or pos != pk[k - 1][1]]
-        if len(b) < 20:
+    audio, scale, out = [t for t in r["tracks"] if t["type"] == 2], r["scale"], []
+    for i, t in zip(ids, audio):
+        size = t["codec_frame"] or t["frame"]
+        b = [(k, t["time"][k]) for k in range(min(n, len(t["time"]))) if (not k or t["place"][k] != t["place"][k - 1]) and t["time"][k] != matroska.NONE]
+        if not size or len(b) < 20:
             continue
-        mx, my = sum(k for k, _ in b) / len(b), sum(t for _, t in b) / len(b)
-        slope = sum((k - mx) * (t - my) for k, t in b) / sum((k - mx) ** 2 for k, _ in b)
-        res = [t - my - slope * (k - mx) for k, t in b]
-        odd = sum(not math.floor(slope * (k2 - k1) * 1000) <= round((t2 - t1) * 1000) <= math.ceil(slope * (k2 - k1) * 1000)
-                  for (k1, t1), (k2, t2) in zip(b, b[1:]))
-        if LACE_GUESS[0] < max(res) - min(res) <= LACE_GUESS[1] and odd >= LACE_STEPS * (len(b) - 1):
+        res = [x - k * size for k, x in b]
+        odd = sum(not math.floor(size * (k2 - k1) / scale) <= (t2 - t1) // scale <= math.ceil(size * (k2 - k1) / scale) for (k1, t1), (k2, t2) in zip(b, b[1:]))
+        if LACE_GUESS[0] * 1e9 < max(res) - min(res) <= LACE_GUESS[1] * 1e9 and odd >= LACE_STEPS * (len(b) - 1):
             out.append(i)
+    video = next((t for t in r["tracks"] if t["type"] == 1), None)
     if not out or not video:
         return out, None
-    try:
-        v = read("v:0", "pts_time,flags", 300)
-    except subprocess.TimeoutExpired:
-        v = None
-    key = next((float(p[0]) for p in lines(v) if len(p) >= 2 and "K" in p[1] and p[0] != "N/A"), None)
     held = f"audio stream {', '.join(map(str, out))} keeps ffmpeg's estimated times"
+    key = keyframe(path, video, KEY_BLOCKS)
     if key is None:
         return out, f"{held}, as the first video keyframe did not read"
-    lead = round(key - min(pk[0][0] for pk in rows.values()), 3)
+    starts = [t["time"][0] - delay(x) for x, t in zip(own[2], audio) if len(t["time"]) and t["time"][0] != matroska.NONE]
+    lead = round((key - delay((own[1] or [{}])[0]) - min(starts)) / 1e9, 3)
     return out, f"{held}, as audio starts {lead * 1000:.0f} ms before the first video keyframe" if lead > 0 else None
+
+
+def lace_read(b, entries, blocks, n):
+    """Whether blocks, the blocks of a walk so far in the bytes b of a file, see matroska.head(), hold all that
+    lace_guess() reads: n frames of each audio track of entries, and of the first video track a keyframe or KEY_BLOCKS
+    blocks, see keyblock()."""
+    video = next((t["number"] for t in entries if t["type"] == 1), None)
+    got = blocks.get(video, ())
+    return all(sum(x[1] for x in blocks.get(t["number"], ())) >= n for t in entries if t["type"] == 2) and (
+        video is None or len(got) >= KEY_BLOCKS or any(keyblock(b, x[2]) for x in got))
+
+
+def keyframe(path, t, n):
+    """The stored time in ns of the first keyframe among the first n blocks of the track t of matroska.frames(), or
+    None, see keyblock()."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as b:
+            return next((t["time"][k] for k in [k for k in range(len(t["place"])) if not k or t["place"][k] != t["place"][k - 1]][:n]
+                         if keyblock(b, t["place"][k])), None)
+    except (OSError, ValueError):
+        return None
+
+
+def keyblock(b, q):
+    """Whether the block at byte q of b holds a keyframe. A SimpleBlock stores the keyframe flag (0x80) in its flags,
+    and a BlockGroup is a keyframe when it holds no ReferenceBlock (RFC 9559 10.2)."""
+    e = decide.element(b, q)
+    if not e or e[2] is None:
+        return False
+    tn = 9 - b[e[1]].bit_length() if e[1] < len(b) else 9   # the bytes of the track number, then 2 of time and the flags
+    return bool(e[0] == decide.SIMPLEBLOCK and tn <= 8 and e[2] > tn + 2 and b[e[1] + tn + 2] & 0x80 or
+                e[0] == decide.BLOCKGROUP and all(i != REFERENCE_BLOCK for i, _, _ in decide.children(b, e[1], e[1] + e[2])))
 
 
 def repack_block(path, st, keep=True):
@@ -509,10 +701,12 @@ class Swap:
                 raise RuntimeError(f"the original could not be kept, so it stays: {ex}") from None
 
     def unkeep(self, *paths):
-        """Remove the kept link after a failure when one of paths still holds the original. The rename then never ran."""
+        """Drop info["kept"] after a failure when one of paths still holds the original. The rename then never ran. The
+        keep goes only when this write made it. A keep that an earlier write made stays, see vault.keep_original()."""
         with contextlib.suppress(OSError):
             if self.info.get("kept") and self.st.st_ino in {os.stat(p).st_ino for p in paths if os.path.lexists(p)}:
-                os.remove(self.info["kept"])
+                if self.info.get("kept_how") != vault.KEPT_BEFORE:
+                    os.remove(self.info["kept"])
                 del self.info["kept"]
 
     def release(self):
@@ -632,11 +826,13 @@ def repack(path, j, st, apply, hp, edits=()):
         if trim or remove:
             own, info["trimmed"], info["removed"] = trim_inputs(path, j, hp, folder)
         copied = [i for i in ids if i not in own and tracks[i].get("type") == "subtitles"]   # input 1, see above
-        r = subprocess.run(merge_argv(path, j, tmp, ids, copied, own, edits, lace=bool(relace)), capture_output=True, text=True, errors="replace")
+        times, plans = ([], {}) if relace else planned_args(path, j, ids, folder, proof.LAG_SLACK)   # a lace keeps the time of its first frame only
+        r = subprocess.run(merge_argv(path, j, tmp, ids, copied, own, edits, lace=bool(relace), head=times), capture_output=True, text=True, errors="replace")
         text = (r.stdout + r.stderr).strip()
         info["warnings"] = config.mask(text)[-500:] or None
         if (r.returncode or text) and not (r.returncode == 1 and resynced(text, hp)):
             raise RuntimeError(f"mkvmerge exited {r.returncode}: {info['warnings']}")
+        if fault := plan_fault(tmp, plans): raise RuntimeError(fault)
         sw.sync()
         new = checks.mkvmerge(tmp)
         fault = header_fault(j, tmp, new, st.st_size, hp, info, folder, edits, path)
@@ -652,6 +848,7 @@ def repack(path, j, st, apply, hp, edits=()):
     finally:
         sw.close(folder)
     if info.get("kept"):
+        vault.kept_write(path, info["kept"])
         vault.prune_originals(vault.originals_root(path))
     info.update(new_size=size, new_tracks=checks.track_list(new))
     return *done, info
@@ -742,9 +939,20 @@ def srt_moved(text, fix):
     return "".join(x if k % 2 else decide.SRT_TIME.sub(line, x) for k, x in enumerate(re.split(r"(\r\n|\r|\n)", text)))
 
 
+class Unended(list):
+    """The cues [(start, end, text)] of a track whose last block has no BlockDuration and no block after it, so its end
+    is not known (RFC 9559, BlockDuration). That cue ends at its start here, see subtitles.timed(). A plan of new ends
+    or new times would make one up, so flash_plan() and time_plan() give none for such a track."""
+
+
+UNENDED = "its last cue has no duration and no block after it, so its end is not known, and no plan changes its times"
+
+
 def flash_plan(cues, ass=False):
     """[(start, text, old end, new end)] of subsync.flash() for cues [(start, end, text)], or None when the cues do
-    not flash. ASS keeps centiseconds, so an ASS end rounds to them."""
+    not flash or are Unended. ASS keeps centiseconds, so an ASS end rounds to them."""
+    if isinstance(cues, Unended):
+        return None
     ends = subsync.flash(cues)
     return [(s, t, e, round(n, 2) if ass else n) for (s, e, t), n in zip(cues, ends)] if ends else None
 
@@ -768,7 +976,9 @@ def time_plan(cues, fix, blocks, ends=None, ass=False, starts=None):
 
     A start stays at 0 or later. An end stays 1 ms after its start, as in srt_moved(). ASS keeps centiseconds, so an
     ASS time rounds to them, and an ASS end stays 1 cs after its start. With subsync.INVARIANTS, subsync.ordered()
-    checks the order of the new starts."""
+    checks the order of the new starts. Unended cues get no plan."""
+    if isinstance(cues, Unended):
+        return None
     step = 10 if ass else 1   # ms
     at = lambda t: round((subsync.moved(t * 1000, fix) if fix else t * 1000) / step) * step
     new_starts, new_ends = {}, {}
@@ -820,10 +1030,10 @@ def set_ends(text, ass, plan):
     write the events in another order. A cue must also have the plan's old end, within 2 ms. mkvextract cuts an ASS time to centiseconds, so an ASS end must be the
     old end cut the same way. A start that does not move keeps its text. Raises when a cue finds no pair.
 
-    A block with no BlockDuration has no known end, and timed() makes one up for the plan. mkvextract then writes an
-    ASS event that ends at its start, and a SubRip cue that ends at the next cue's start. It leaves out such a SubRip
-    cue when it is the last one. Those cues find no pair, so no made-up end goes into the file. prove() refuses
-    the rest, see its timed and ended checks."""
+    A block with no BlockDuration ends at the next block's start, see subtitles.timed(), and mkvextract writes a SubRip
+    cue so. It writes an ASS event that ends at its start, and it leaves out such a SubRip cue when it is the last
+    one. Those cues find no pair, so no other end goes into the file. A track whose last cue has no end gets no plan,
+    see Unended, and prove() refuses it too, see its timed and ended checks."""
     plan = [p if len(p) == 5 else (*p[:3], p[0], p[3]) for p in plan]   # a flash_plan() keeps each start
     lines, fmt = text.split("\n"), lambda x: (lambda v: f"{v // 3600000:02d}:{v // 60000 % 60:02d}:{v // 1000 % 60:02d},{v % 1000:03d}")(round(x * 1000))
     if ass:
@@ -865,24 +1075,38 @@ def set_ends(text, ass, plan):
     return "\n".join(lines)
 
 
+def srt_packets(path, j, tid):
+    """[(start, end in seconds, the bytes)] of each packet of SubRip track tid of the Matroska file path, in file order.
+    The walk of the blocks gives the time and the duration of each packet, see matroska.frames(), and a read at its
+    byte its bytes. An empty frame is no packet, as in subtitles.timed(). A packet with no duration ends at the next
+    block, an empty frame too, see matroska.rfc_cues(), and the last such packet at its time. Raises RuntimeError when
+    the walk fails or a packet does not read."""
+    p = next((t.get("properties") or {} for t in j.get("tracks") or [] if t.get("id") == tid), {})
+    if p.get("content_encoding_algorithms") not in (None, "0"):
+        raise RuntimeError(f"its content encoding {p.get('content_encoding_algorithms')} is not zlib")
+    try:
+        walked = matroska.frames(path)
+        if walked["error"]:
+            raise ValueError(walked["error"])
+    except ValueError as ex:
+        raise RuntimeError(f"the block walk failed: {ex}") from ex
+    t = next((t for t in walked["tracks"] if t["number"] == p.get("number")), None) or {"time": ()}
+    with open(path, "rb", buffering=0) as f:
+        data = [matroska.block_data(f, t["place"][k], p["number"], packed=p.get("content_encoding_algorithms") == "0")[0] for k in range(len(t["time"]))]
+    if None in data:
+        raise RuntimeError(f"packet {data.index(None) + 1} does not read")
+    blocks = [(t["time"][k], None if t["dur"][k] == matroska.NONE else t["dur"][k], data[k] or None) for k in range(len(t["time"]))]   # in ns
+    return [(s / 1e9, (s if e is None else e) / 1e9, b) for s, e, b in matroska.rfc_cues(blocks)]
+
+
 def srt_track(path, j, tid, plan, raw):
     """Write raw, a Matroska file of SubRip track tid of path alone, each packet as it is at the new times of plan, a
-    time_plan() or a flash_plan(). One ffmpeg read gives the bytes, time and duration of each packet. A packet pairs
+    time_plan() or a flash_plan(). srt_packets() gives the time, the end and the bytes of each packet. A packet pairs
     with the plan by its place, and it must have the plan's old start and end, as in set_ends(). Raises when a packet
     finds no pair, or when a new start lies before the one of the packet before it. mkvmerge's SubRip reader drops the
     blank lines at the start of a cue, and mkvmerge 8 stored them as line breaks, so such a packet cannot go back
     through a SubRip text."""
-    k = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"].index(tid)   # ffmpeg's k-th subtitle stream, see resub()
-    md5, data = raw + ".md5", raw + ".bin"
-    r = subprocess.run(["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-copyts", "-i", path,
-                        *(a for fmt, f in (("framemd5", md5), ("data", data)) for a in ("-map", f"0:s:{k}", "-c", "copy", "-f", fmt, f))],
-                       capture_output=True, text=True, errors="replace")
-    if r.returncode or proof.bad_lines(r.stderr):
-        raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-300:]}")
-    with open(md5) as f, open(data, "rb") as g:
-        lines = f.read().splitlines()
-        tb = fractions.Fraction(next(x.split(":")[1] for x in lines if x.startswith("#tb ")).strip())   # the time base of each time
-        packets = [(float(int(p[2]) * tb), float((int(p[2]) + int(p[3])) * tb), g.read(int(p[4]))) for p in (x.split(",") for x in lines if x[:1].isdigit())]
+    packets = srt_packets(path, j, tid)
     plan = [p if len(p) == 5 else (*p[:3], p[0], p[3]) for p in plan]   # a flash_plan() keeps each start
     if len(packets) != len(plan):
         raise RuntimeError(f"the track holds {len(packets)} cues, and the plan {len(plan)}")
@@ -959,12 +1183,13 @@ def repaired(texts, cp, side=None):
     the cue texts of a sidecar in the same order, may fill the cues the old muxer cut: there the read-back is the start
     of the sidecar's text, and the next character holds a byte cp1252 leaves undefined. Every other cue of side must
     equal the read-back, as srt_cues() compares text. Else the result is None, because the sidecar is not the source of
-    the track: a garbled copy, the track extracted again or an SDH version."""
+    the track: a garbled copy, the track extracted again or an SDH version. A right cue stays as it is, see
+    decide.right_cue()."""
     if side is not None and len(side) != len(texts):
         return None
     out, filled, left = [], [], 0
     for k, t in enumerate(texts):
-        back, cut = decide.read_back(t, cp)
+        back, cut = (t, False) if decide.right_cue(t) else decide.read_back(t, cp)
         if side is not None:
             mine, theirs = proof.clean_text(back.removesuffix("\N{REPLACEMENT CHARACTER}")), proof.clean_text(side[k])
             if theirs != mine or cut:
@@ -1289,7 +1514,7 @@ def moved_tracks(moves):
     ffmpeg's muxer changes a decode time that is lower than the one before it to that one, and logs "Non-monotonic
     DTS". A source that stores a track out of time order would then get its cues seconds late. So the call reads the
     warnings, see levels(), and such a warning refuses the move before mkvmerge writes a merge. ffmpeg 7.1 logs a step
-    back of 2 ms or less at debug level only, and prove() refuses that move, see proof.STORED_SLACK. Every other
+    back of 2 ms or less at debug level only, and prove() refuses that move, see proof.mkv_slack(). Every other
     warning is left out, and the rest goes to proof.bad_lines(), as a read with -v error gives it."""
     srcs = list(dict.fromkeys(src for src, *_ in moves))
     argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "level+warning", "-y", "-copyts", *[a for src in srcs for a in ("-i", src)]]
@@ -1359,7 +1584,8 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     input in file order and holds back only about 20 MB of it. A track that --sync moved earlier than 20 MB of the
     other tracks stayed late in the new file, where no player shows it, and mkvmerge drops a cue that --sync moves
     before 0. A track from its own file gets the language, name and flags of its planned properties with track_args(),
-    and mkvpropedit gives that file the original's UID first. mkvpropedit never edits the new file. A copied subtitle track
+    and mkvpropedit gives that file the original's UID first. mkvpropedit edits the new file only to give a planned
+    audio track its DefaultDuration back, see plan_fault(). A copied subtitle track
     that the source stores late would stay late too. So the subtitle tracks it copies come from a second input of the
     same file, which mkvmerge reads on its own and writes by time. The chapters, tags and attachments come from the first input only. Each track that the
     source holds uncompressed stays so, see compression_args(). Any line mkvmerge prints fails the remux, and
@@ -1452,14 +1678,15 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         if moved:
             own.update(zip(moved, moved_tracks([(own.get(i, path), 0 if i in own else index[i], fixes[i], os.path.join(folder, f"{i}.moved.mkv"), i)
                                                 for i in moved])))
-        # The packets of a track in strip, from a read of their own: as SubRip, or as they are for mkvextract's file, see below
+        # The packets of a track in strip, from a read of their own: their md5s, and their bytes as they are for
+        # mkvextract's file, see below. A SubRip track's file is written from the walk, with the times the file stores.
         texts = {i: (os.path.join(folder, f"{i}.garbled.{'srt' if codec[i] == 'S_TEXT/UTF8' else 'bin'}"), os.path.join(folder, f"{i}.md5")) for i in strip}
         pics = {i: (os.path.join(folder, f"cover-track-{i}"), os.path.join(folder, f"cover-track-{i}.md5")) for i in covers}   # its first packet, its md5s
         if texts or pics:
             argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
             for i, (srt, md5) in texts.items():
-                argv += ["-map", f"0:{index[i]}", "-c", "copy", "-f", "framemd5", md5, "-map", f"0:{index[i]}", "-c", "copy",
-                         "-f", "srt" if srt.endswith(".srt") else "data", srt]
+                argv += ["-map", f"0:{index[i]}", "-c", "copy", "-f", "framemd5", md5,
+                         *([] if srt.endswith(".srt") else ["-map", f"0:{index[i]}", "-c", "copy", "-f", "data", srt])]
             for i, (img, md5) in pics.items():   # a GIF frame is no keyframe, and a copy drops it without -copyinkf
                 x = covers[i]["index"]
                 argv += [*([] if covers[i].get("hashed") else ["-map", f"0:{x}", "-c", "copy", "-copyinkf", "-f", "framemd5", md5]),
@@ -1468,6 +1695,9 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
             if r.returncode or proof.bad_lines(r.stderr):
                 raise RuntimeError(f"ffmpeg exited {r.returncode}: {config.mask(r.stderr.strip())[-300:]}")
         for i, (srt, md5) in texts.items():   # an ASS, SSA or WebVTT file holds its header too, which mkvextract writes
+            if srt.endswith(".srt"):
+                with open(srt, "wb") as f:
+                    f.write(proof.timed_srt(srt_packets(path, j, i)))
             out = srt if srt.endswith(".srt") else events_file(path, i, codec[i], folder)
             if why := (proof.packet_text(srt, md5) if out == srt else proof.event_text(out, md5, srt, codec[i])):
                 raise RuntimeError(f"the bytes of track {i} were not written whole: {why}")
@@ -1496,15 +1726,17 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         copied = [i for i in ids if i in index and i not in own]   # the subtitle tracks of input 1, see above
         # Each frame its own block, as in convert_cmd(). A player that seeks to 0 skips a whole lace that starts before the
         # first video keyframe, up to 170 ms of AAC audio (docs/design.md, "Subtitle match").
-        argv = merge_argv(path, j, tmp, ids, copied, own, edits, head=[
+        times, plans = planned_args(path, j, ids, folder)
+        argv = merge_argv(path, j, tmp, ids, copied, own, edits, head=[*times, *(
             a for name, (i, img) in added.items() for a in ("--attachment-name", name, "--attachment-mime-type", covers[i]["mime"],
                                                              *(["--attachment-description", covers[i]["title"]] if covers[i].get("title") else []),
-                                                             "--attach-file", img)])
+                                                             "--attach-file", img))])
         new_tmp(tmp, st)
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         if r.returncode or info["warnings"]:   # a warning may say mkvmerge left data out, as in repack()
             raise RuntimeError(f"mkvmerge exited {r.returncode}: {info['warnings']}")
+        if fault := plan_fault(tmp, plans): raise RuntimeError(fault)
         sw.sync()
         new = checks.mkvmerge(tmp)
         fault = props_fault(dict(j, attachments=[*(j.get("attachments") or []), *({"file_name": n} for n in added)]), new, [*drop, *covers],
@@ -1555,6 +1787,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     finally:
         sw.close(folder)
     if info.get("kept"):
+        vault.kept_write(path, info["kept"])
         vault.prune_originals(vault.originals_root(path))
     info["new_size"] = size
     return "subtitles_remuxed", "subtitles remuxed" if fixes or drop or ends or timed or recode or not covers else \

@@ -12,7 +12,7 @@ def metadata(app, path, j, size, d, original, release, item, fresh=False, asked=
     status.json only after a live answer, because a cache hit says nothing about the key. fresh is a second check
     before a re-grab, see tmdb_ask(). asked is the tmdb_ask() the decision already made, so TMDB is asked once. nfo is
     the episode title of the release's NFO, see release_nfo_title(). It wins over the title in the release name."""
-    trusted = content.trusted_duration(j, size, content.last_packet(path, probe=j))
+    trusted = content.trusted_duration(j, size, content.last_packet(path, probe=j), checks.stored_end(path, j))
     token, ids = config.CFG.tmdb_token or None, item.get("ids") or {}
     cache = "tmdb-recheck" if fresh else "tmdb"
     expected, t0 = asked or checks.tmdb_ask(app, item, fresh)
@@ -633,6 +633,8 @@ def subtitle_checks(ctx):
         rec["flash"] = {k: {"cues": len(v), "median": round(statistics.median(o - a for a, _, o, _ in v), 3), "lengthened": sum(n != o for _, _, o, n in v),
                             "first": [[a, o, n] for a, _, o, n in v[:3]], **({"report_only": "WebVTT"} if k in vtt else {})} for k, v in flashy.items()}
     later |= set(recode) & set(flashy)
+    if unended := sorted(p for p, x in items.items() if isinstance(x[2], remux.Unended)):   # no plan makes up an end, see remux.Unended
+        rec["unended"] = {p: remux.UNENDED for p in unended}
     for p in later:
         rec["garbled"][p]["later"] = True
     ends = {p: v for p, v in flashy.items() if p.startswith("s") and p[1:].isdigit() and p not in remove and p not in vtt and p not in recode
@@ -738,7 +740,8 @@ def decision_fields(ctx):
     if ctx.muted and (kept := muted_plan(d))["edits"] != d["edits"]:   # a run that keeps the flags plans none of these
         d = ctx.d = kept
         rec["flags_kept"] = "a burned-in subtitle check turned off the English subtitles, so they stay off"
-    ctx.file_checks = decide.checks(ctx.j, ctx.size, ctx.runtime, shorter_only=config.program(ctx.app) == "sonarr")
+    ctx.file_checks = decide.checks(ctx.j, ctx.size, ctx.runtime, shorter_only=config.program(ctx.app) == "sonarr",
+                                    stored_end=checks.stored_end(ctx.path, ctx.j))
     rec.update(notes=d["notes"], reasons=d.get("reasons", []), item_class=d.get("cls"), tracks=logs.track_log(d["tracks"]),
                undecided=d.get("undecided"), abstain=d.get("abstain"), dropped=d.get("dropped", []), invariants=d.get("invariants", []),
                edit_rules=d.get("edit_rules", []), policy_path=d.get("path"))
@@ -1387,8 +1390,11 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
                 e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
         except runner.Stopped as ex:   # a stop came before the edit, so nothing changed
             return dict(rec, outcome="edit_failed", result=f"not edited: {ex}", after=rec["before"])
-    checks.lid_carry(path, before)
-    runner.mute_mark(path, before)
+    own = remuxed   # the carries below move the hook's state to the file now. mkvpropedit edits in place, so the inode stays.
+    with contextlib.suppress(OSError):
+        own = own or os.stat(path).st_ino == before.st_ino   # an import during the edit gives another inode, and it gets nothing
+    if own:   # before the exit code. A failed mkvpropedit can still turn the subtitles off, and the mark follows the flags.
+        runner.mute_mark(path, before)
     if not remuxed and e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
@@ -1396,6 +1402,9 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
         except Exception as ex:
             rec["after_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:300]
         return rec
+    if own:   # a failed edit carries neither, so the next check hears the file again and the next write keeps it anew
+        checks.lid_carry(path, before)
+        vault.kept_carry(path, before)   # relayout() below reuses the keep
     after = checks.mkvmerge(path)
     if config.CFG.header_repair and not remuxed and not hp.get("tried") and checks.layout_of(path):   # fix 1
         after = relayout(rec, path, after)
