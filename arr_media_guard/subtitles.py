@@ -250,12 +250,12 @@ def flash_check(path, j, sides, full=False, stop=None):
 
 def side_cues(s):
     """[(start, end, text)] in seconds of the cues of a sidecar_subs() entry s in file order, see proof.srt_blocks(). A
-    plan of new times pairs with the cues of the file in this order, see remux.set_ends(). A file that does not read
-    gives []."""
+    plan of new times pairs with the cues of the file in this order, see remux.set_ends(). A file that does not read,
+    or does not decode as its charset now, gives []."""
     try:
         with open(s["path"], "rb") as f:
-            return [(a / 1000, b / 1000, t) for a, b, t in proof.srt_blocks(f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace"))]
-    except OSError:
+            return [(a / 1000, b / 1000, t) for a, b, t in proof.srt_blocks(f.read().decode(proof.PY_CHARSET[s["charset"]]))]
+    except (OSError, UnicodeDecodeError):
         return []
 
 
@@ -1145,7 +1145,8 @@ def raw_srt(raw):
     """(BOM, codec, text) of the bytes raw of a SubRip sidecar, so a rewrite of its time lines keeps every other byte
     as it was. A file with a UTF-16 BOM decodes as UTF-16 in its byte order. Every other file decodes as latin-1, which
     reads each byte as one character and writes it back the same. The time lines are ASCII, so the charset of the text
-    never matters, and a charset the detection misses keeps its text. Raises OSError when UTF-16 text does not decode."""
+    never matters, and a charset the detection reads wrong keeps its text. A sidecar whose charset is unknown never
+    gets here, see proof.sidecar_subs(). Raises OSError when UTF-16 text does not decode."""
     for bom, code in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"), (b"\xef\xbb\xbf", "latin-1"), (b"", "latin-1")):
         if raw.startswith(bom):
             try:
@@ -1161,13 +1162,15 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     lines move, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
     holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
     KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. A rewrite changes only the time lines and keeps every other byte,
-    see raw_srt(). Each move and rewrite gets a log line. Returns one entry per sidecar with an action: {name, action:
-    "move", "retime", "lengthen" or "repair", why, result: "moved", "retimed", "repaired", "left" or "dry run", kept or
-    left}. A rewrite whose new times do not fit the text adds error, the error of remux.set_ends(), and left says so in
-    plain words for the alert. A garbled sidecar, one that holds "garbled", gets the action repair when its verdict
-    holds a repair, see side_repair(), else rename, see broken_side(). A repair takes the place of every other change
-    but a move, as for a track, see process.subtitle_checks(). Its original is kept as for a rewrite. A repair that
-    fails its proof renames the sidecar instead."""
+    see raw_srt(). A sidecar with a timing line that a player shows as a cue of its own and AMG reads as text, see
+    proof.glued_cue(), gets no rewrite, in a dry run too. The rewrite would keep the old time of that cue. Each move and
+    rewrite gets a log line. Returns one entry per sidecar with an action: {name, action: "move", "retime", "lengthen"
+    or "repair", why, result: "moved", "retimed", "repaired", "left" or "dry run", kept or left}. A rewrite whose new
+    times do not fit the text adds error, the error of remux.set_ends(), and left says so in plain words for the alert.
+    A garbled sidecar, one that holds "garbled", gets the action repair when its verdict holds a repair, see
+    side_repair(), else rename, see broken_side(). A repair takes the place of every other change but a move, as for a
+    track, see process.subtitle_checks(). Its original is kept as for a rewrite. A repair that fails its proof renames
+    the sidecar instead."""
     out, ends, timed = [], ends or {}, timed or {}
     for n, s in sorted(sides.items()):
         r, plan, times = sync.get(n) or {}, ends.get(n), timed.get(n)
@@ -1183,6 +1186,9 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                                                                                 times and remux.blocks_moved(times, fix)) if x),
              **({"garbled": {k: g[k] for k in ("codepage", "lang", "read", "cut", "cues")}} if g else {}), **({"later": True} if g and g.get("later") else {})}
         out.append(e)
+        if not g and not move and s["glued"] is not None:   # a rewrite keeps the time of the cue a player shows there
+            e.update(result="left", left=f"AMG reads the subtitle at line {s['glued'] + 1} as part of the one before, so it would keep its old time")
+            continue
         if not apply or not sub_fixes(source):
             e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is set to check")
             continue
@@ -1242,10 +1248,7 @@ def side_repair(s):
     bom = raw[:3] if raw.startswith(b"\xef\xbb\xbf") else b""
     text = raw[len(bom):].decode("utf-8")
     new_text, new_cues = remux.repair_text({"codepage": s["garbled"]["codepage"], "lang": s["garbled"]["tag"]}, 0)
-    lines, ends = new_text(text).split("\n"), re.findall(r"\r?\n", text)   # srt_rewrite() reads a CRLF line break as LF
-    if len(lines) != len(ends) + 1:
-        raise RuntimeError("the new file does not keep the lines of the old one")
-    new = "".join(x + end for x, end in zip(lines, [*ends, ""]))
+    new = new_text(text)   # srt_rewrite() keeps the line end of each line
     if proof.srt_blocks(new, "\n") != [list(c) for c in new_cues(proof.srt_blocks(text, "\n"))]:
         raise RuntimeError("the new file does not hold each cue at its times with its repaired text")
     return bom + new.encode()

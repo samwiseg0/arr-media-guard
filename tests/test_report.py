@@ -204,6 +204,34 @@ FINDINGS = [
     ({"kind": "frame_rate", "off": 0.365}, "Variable frame rate", "amber",
      "The video has a variable frame rate. 36% of the frames checked stay on the screen longer or shorter than most frames. A player that "
      "follows the frame times plays it right. Nothing was changed."),
+    ({"kind": "unreadable", "container": "MP4/QuickTime", "tracks": {"Film A (1979).srt": {"unread": True}}}, "Unreadable subtitles", "amber",
+     "Converted the MP4/QuickTime file to MKV. The subtitles in Film A (1979).srt can't be read as text, because AMG can't tell their "
+     "character set. The conversion to MKV left them out, and the file was left beside the video as it is."),
+    ({"kind": "unreadable", "container": "AVI", "tracks": {"Film A (1979).es.srt": {"unread": "mkvmerge drops 2 of its cues"}}},
+     "Subtitles left out of the MKV", "amber", "Converted the AVI file to MKV. The subtitles in Film A (1979).es.srt can't go into the MKV as they "
+     "are, because the MKV would lose some of their lines or show them wrong. The conversion to MKV left them out, and the file was left beside "
+     "the video as it is."),
+    # Several sidecars left beside the file share the two sentences, and a sentence per reason names them. The decision
+    # line keeps why mkvmerge misreads each one.
+    ({"kind": "unreadable", "container": "AVI", "tracks": {"Film A (1979).1.srt": {"unread": "mkvmerge drops 2 of its cues"},
+                                                         "Film A (1979).2.srt": {"unread": "mkvmerge reads the timing line at line 5 as text"}}},
+     "Subtitles left out of the MKV", "amber", "Converted the AVI file to MKV. The subtitles in 2 files can't go into the MKV as they are. The "
+     "conversion to MKV left them out, and the files were left beside the video as they are. The MKV would lose some of the lines of "
+     "Film A (1979).1.srt and Film A (1979).2.srt or show them wrong."),
+    ({"kind": "unreadable", "container": "AVI", "tracks": {"Film A (1979).es.srt": {"unread": "mkvmerge drops 2 of its cues"}, "Film A (1979).hr.srt": {"unread": True}}},
+     "Unreadable subtitles", "amber", "Converted the AVI file to MKV. The subtitles in 2 files can't go into the MKV as they are. The conversion "
+     "to MKV left them out, and the files were left beside the video as they are. The MKV would lose some of the lines of Film A (1979).es.srt "
+     "or show them wrong. AMG can't tell the character set of Film A (1979).hr.srt."),
+    ({"kind": "unreadable", "container": "AVI", "tracks": {"Film A (1979).hr.srt": {"unread": True}, "Film A (1979).sr.srt": {"unread": True}}},
+     "Unreadable subtitles", "amber", "Converted the AVI file to MKV. The subtitles in 2 files can't go into the MKV as they are. The conversion "
+     "to MKV left them out, and the files were left beside the video as they are. AMG can't tell the character set of Film A (1979).hr.srt and "
+     "Film A (1979).sr.srt."),
+    ({"kind": "unreadable", "container": "AVI", "tracks": {"Film A (1979).es.srt": {"unread": "mkvmerge drops 2 of its cues"}},
+      "remux": {"kind": "unreadable", "tracks": {"s2": {"lang": "per", "sidecar": "Film A (1979).per.broken-encoding.srt.txt"}}}},
+     "Unreadable subtitles", "amber", "Converted the AVI file to MKV. The subtitles in Film A (1979).es.srt can't go into the MKV as they are, "
+     "because the MKV would lose some of their lines or show them wrong. The conversion to MKV left them out, and the file was left beside the "
+     "video as it is. The Persian subtitles (track 2 of the converted file) can't be read as text, so they were removed and saved beside the "
+     "file as Film A (1979).per.broken-encoding.srt.txt."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().

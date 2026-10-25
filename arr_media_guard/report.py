@@ -267,26 +267,42 @@ def failed_repack(f, t):
 def unreadable_finding(tracks, kept=None, container=None, mark=None, remux=None):
     """The one notice of subtitle bytes AMG took out and kept beside the video, see remux.broken_plan(): tracks,
     {place or sidecar name: its entry, with "sidecar" and the facts of track_name()}, the kept original, and the
-    container of a conversion. The run of a conversion posts one notice: remux holds the notice of its subtitle remux
-    and its sidecars, see process.after_edit(). mark keys the marker, see logs.alert_findings()."""
+    container of a conversion. The entry of a sidecar that a conversion left out holds "unread" in place of "sidecar":
+    True when its charset is unknown, else why mkvmerge misreads it, see proof.misread(). The run of a conversion posts
+    one notice: remux holds the notice of its subtitle remux and its sidecars, see process.after_edit(). mark keys the
+    marker, see logs.alert_findings()."""
     return {"kind": "unreadable", "tracks": tracks, **({"kept": kept} if kept else {}), **({"container": container} if container else {}),
             **({"mark": mark} if mark else {}), **({"remux": remux} if remux else {})}
 
 
 def unreadable(f, t, of="original"):
-    """The subtitle tracks a conversion to MKV removed because their text is not UTF-8, see convert.broken_tracks(), or a
-    subtitle remux removed because their text is garbled, see subtitles.garbled_tracks(), and the file beside the video
-    that holds the bytes of each. A track goes by its number in the original file. A garbled sidecar goes by its name
-    and the name it was renamed to, see subtitles.broken_side(). The repairs of the same run follow, see
-    subtitles.sub_findings(). Only a conversion has a container. The remux of a conversion's notice follows it. It
-    names a track by its number in the original file, from places, see process.conversion(), else in the converted
-    file, as a sidecar the conversion added."""
+    """The subtitle tracks a conversion to MKV removed because their text is not UTF-8, see convert.broken_tracks(), or
+    a subtitle remux removed because their text is garbled, see subtitles.garbled_tracks(), and the file beside the
+    video that holds the bytes of each. A track goes by its number in the original file. A garbled sidecar goes by its
+    name and the name it was renamed to, see subtitles.broken_side(). A sidecar with "unread" goes by its name, and it
+    stayed beside the file as it is, see convert.convert(). The decision line names why mkvmerge misreads it. Several
+    such sidecars share their two sentences, and then a sentence per reason names them. The repairs of the same run
+    follow, see subtitles.sub_findings(). Only a conversion has a container. The remux of a conversion's notice follows
+    it. It names a track by its number in the original file, from places, see process.conversion(), else in the
+    converted file, as a sidecar the conversion added."""
     tracks, places = sorted((p for p in f["tracks"] if re.fullmatch(r"s\d+", p)), key=lambda p: int(p[1:])), f.get("places") or {}
     num = lambda p: f"{places[p][1:]} of the original file" if p in places else f"{p[1:]} of the {of} file"
     told = [f'{cap(track_name(p, f["tracks"][p]["lang"], num(p), f["tracks"][p]))} can\'t be read as text, so they were '
             f'removed and saved beside the file as {bold(os.path.basename(f["tracks"][p]["sidecar"]))}.' for p in tracks]
-    told += [f'{cap(sub_name(n, {}))} can\'t be read as text, so the file was renamed to {bold(x["sidecar"])}.'
-             for n, x in sorted(f["tracks"].items()) if n not in tracks]
+    left = lambda why: ("can't be read as text, because AMG can't tell their character set." if why is True else
+                        "can't go into the MKV as they are, because the MKV would lose some of their lines or show them wrong.") \
+        + " The conversion to MKV left them out, and the file was left beside the video as it is."
+    rest = [(n, x) for n, x in sorted(f["tracks"].items()) if n not in tracks]
+    unread = [(n, x["unread"]) for n, x in rest if x.get("unread")]
+    if len(unread) > 1:
+        told += [f"The subtitles in {len(unread)} files can't go into the MKV as they are. The conversion to MKV left them out, and the files were "
+                 "left beside the video as they are."]
+        lost, unknown = [bold(n) for n, why in unread if why is not True], [bold(n) for n, why in unread if why is True]
+        told += [f"The MKV would lose some of the lines of {and_list(lost)} or show them wrong."] if lost else []
+        told += [f"AMG can't tell the character set of {and_list(unknown)}."] if unknown else []
+    else:
+        told += [f'{cap(sub_name(n, {}))} {left(why)}' for n, why in unread]
+    told += [f'{cap(sub_name(n, {}))} can\'t be read as text, so the file was renamed to {bold(x["sidecar"])}.' for n, x in rest if not x.get("unread")]
     told += [sub_line(dict(x, kept=None) if x.get("kept") == f.get("kept") else x, t, f.get("langs")) for x in f.get("repaired") or []]
     head = [f'Converted the {f["container"]} file to MKV.'] if f.get("container") else []
     after = [unreadable(dict(f["remux"], langs=f.get("langs")), t, "converted")] if f.get("remux") else []
@@ -378,6 +394,7 @@ FINDINGS = {
     "burned_in": ("Burned-in subtitles", lambda f, t: burned(f, t)),
     "cover": ("Cover picture not moved", lambda f, t: cover_line(f)),
 }
+LEFT_OUT = "Subtitles left out of the MKV"   # the title of an unreadable notice whose sidecars AMG reads well, see title()
 # The title of a certain fault the hook acted on. Its action code adds the end, see ACTIONS. Red, or amber when unconfirmed.
 FAULT_TITLES = {"audio": "Broken audio", "content": "Wrong content", "video": "Broken video", "damage": "Damaged file", "burned_in": "Burned-in subtitles"}
 # Per fault kind: the result of a faulty file, of a clean one, and the words for the files a re-grab deleted.
@@ -458,12 +475,15 @@ def action_code(a):
 
 
 def title(f):
-    """(title, color) of the alert of finding f."""
+    """(title, color) of the alert of finding f. An unreadable notice of sidecars that AMG reads well and mkvmerge
+    misreads alone gets LEFT_OUT, see unreadable()."""
     a = f.get("action")
     if f["kind"] in FAULT_TITLES and a:
         return FAULT_TITLES[f["kind"]] + ACTIONS[action_code(a)][0], "amber" if a["code"] in ("unconfirmed", "disagreed", "unsure", "once") else "red"
     if f["kind"] == "repack" and f.get("note"):   # a conversion that a stopped run left
         return "Stopped conversion", "amber"
+    if f["kind"] == "unreadable" and not f.get("remux") and all(isinstance(x.get("unread"), str) for x in f["tracks"].values()):
+        return LEFT_OUT, "amber"
     return FINDINGS[f["kind"]][0], "amber"
 
 

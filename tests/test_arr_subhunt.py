@@ -567,18 +567,47 @@ def test_a_safety_pause_is_never_resumed(env, monkeypatch):
 
 
 def test_sigterm_deletes_every_job_and_folder(env, monkeypatch):
+    """ff.on_stop() records the SIGTERM, and the next check raises SystemExit(143). The cleanup then deletes every job
+    and folder, though each call to SABnzbd checks the stop as apps.http() does."""
     env["releases"] = [{"title": SUBS, "probe": ENGLISH}, {"title": NF, "probe": ENGLISH}]
     def killed(*a):
-        raise SystemExit(143)   # what the SIGTERM handler raises
+        hook.STOP["term"] = signal.SIGTERM   # what ff.on_stop() records
+        hook.DEADLINE.check()   # the next check raises it
     monkeypatch.setattr(sh, "verdict", killed)
     fakes = []
-    with pytest.raises(SystemExit):
-        run(env, monkeypatch, "--apply", wrap=lambda fake: fakes.append(fake) or fake)
-    assert fakes[0].jobs == {} and fakes[0].deleted() == {"nzo1", "nzo2"}   # the finished job and the paused one
-    assert not (env["tmp"] / "downloads" / SUBS).exists() and env["signals"][0][0] == signal.SIGTERM
+    def checked(fake):
+        fakes.append(fake)
+        return lambda cred, **q: hook.DEADLINE.check() or fake(cred, **q)
     with pytest.raises(SystemExit) as ex:
-        env["signals"][0][1](signal.SIGTERM, None)
-    assert ex.value.code == 143
+        run(env, monkeypatch, "--apply", wrap=checked)
+    assert ex.value.code == 143 and fakes[0].jobs == {} and fakes[0].deleted() == {"nzo1", "nzo2"}   # the finished job and the paused one
+    assert not (env["tmp"] / "downloads" / SUBS).exists() and env["signals"][0] == (signal.SIGTERM, hook.ff.on_stop)
+
+
+def test_a_sigterm_after_the_last_check_of_a_hunt_stops_the_run(env, monkeypatch):
+    """SIGTERM lands in the syslog write of the first movie's decision line, after the last check of its hunt. The
+    cleanup holds the stop off and puts it back, so the next check raises it, and the run queues no second download."""
+    env["releases"] = [{"title": SUBS, "probe": ENGLISH}]
+    fired = []
+    def syslog(line):
+        if not fired and "imported" in line:
+            fired.append(env["signals"][0][1](signal.SIGTERM, None))   # the handler main() set, as the kernel runs it here
+    monkeypatch.setattr(hook, "to_syslog", syslog)
+    monkeypatch.setattr(hook, "arr", lambda app, p, real=hook.arr: hook.DEADLINE.check() or real(app, p))   # as apps.http() checks
+    with pytest.raises(SystemExit) as ex:
+        run(env, monkeypatch, "5017", "--apply", wrap=lambda fake: lambda cred, **q: hook.DEADLINE.check() or fake(cred, **q))
+    assert (ex.value.code, fired, len(env["hydra"]), len(env["imports"])) == (143, [None], 1, 1), env["hydra"]
+
+
+def test_a_sigterm_during_the_poll_of_a_download_raises_after_one_second(env, monkeypatch):
+    """The hunter reads SABnzbd every POLL seconds. It sleeps 1 s at a time and checks the stop after each sleep, so
+    a SIGTERM in the poll ends the run after 1 s. The cleanup then deletes the job."""
+    env["releases"] = [{"title": SUBS, "plan": "stall"}]
+    sleeps, fakes = [], []
+    monkeypatch.setattr(sh.time, "sleep", lambda s: sleeps.append(s) or env["signals"][0][1](signal.SIGTERM, None))
+    with pytest.raises(SystemExit) as ex:
+        run(env, monkeypatch, "--apply", wrap=lambda fake: fakes.append(fake) or fake)
+    assert (ex.value.code, sleeps, fakes[0].deleted(), env["imports"]) == (143, [1], {"nzo1"}, [])
 
 
 @pytest.mark.parametrize("stop", [False, True])

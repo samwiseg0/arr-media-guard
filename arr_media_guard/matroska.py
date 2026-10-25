@@ -6,7 +6,7 @@ and each one a SeekHead lists. It never reads a Cluster. It holds each element t
 and to the EBML rules of RFC 8794. frames() reads the time of every frame from the blocks of the Clusters."""
 import array, collections, contextlib, itertools, mmap, os, re, struct, threading, zlib
 
-from . import decide
+from . import decide, ff
 
 # The elements of RFC 9559 section 5.1 outside the Clusters, one a line: the id, the path below the Segment, the type
 # (m master, u uinteger, i integer, f float, s string, 8 utf-8, b binary, d date), the least and the most occurrences in
@@ -640,7 +640,8 @@ def frames(path):
     unless whole is True. The error is then a Segment size past the end of the file, or
     a level-1 element after the last Cluster whose size does not read, when no Cluster id follows it in the file, as
     one in a second file joined by cat. Each track of read_on holds resumed, the index of its first frame read after a
-    resync. Raises ValueError when the file holds no Segment, and OSError when the file does not open."""
+    resync. Raises ValueError when the file holds no Segment or a time past the range of track_frames(), and OSError
+    when the file does not open."""
     st = os.stat(path)
     key = (path, st.st_size, st.st_mtime_ns)
     with LOCK:
@@ -715,6 +716,7 @@ def walk(path, enough=None):
                 reads = {t["number"]: t["codec"] == "A_VORBIS" for t in entries if heads_read(t)}
             seen.add(i)
         while p < end:
+            ff.check_stop()   # a walk of a large file on a slow NAS reads for minutes
             try:
                 e = decide.element(b, p)
                 if not e and not b[p]:   # a zero run that an edit left between level-1 elements, see checks.zero_gap()
@@ -934,7 +936,8 @@ def track_frames(b, t, blocks, scale):
     plus k DefaultDurations (RFC 9559 10.3.5), else bitstream at the block time plus the lengths of the frames before
     it, from the codec, see frame_length() and aac_length(), else unknown. A frame's duration is its BlockDuration, else
     the DefaultDuration, else for a lace frame its codec length, else NONE. RFC 9559 then ends an unlaced block at the
-    next block in time order, see subtitles.timed()."""
+    next block in time order, see subtitles.timed(). Raises ValueError when a time or a duration in ns does not fit a
+    signed 64-bit integer. libmkv 0.6.5 wrote a Cluster Timestamp of -16 ms as 2^64 ns less 16 ms, in ticks."""
     dd, codec = t["dd"], t["codec"]
     fixed = aac_length(t["private"]) if codec.startswith("A_AAC") and not t["packed"] else None
     readable = t["type"] == 2 and not t["packed"] and not dd
@@ -963,36 +966,41 @@ def track_frames(b, t, blocks, scale):
                     and codec.startswith(("A_AC3", "A_EAC3", "A_DTS", "A_MPEG/L")) else None)
     time, tag, place, dur, full = array.array("q"), bytearray(), array.array("q"), array.array("q"), bytearray()
     over, gap, last, lapped = [0, 0, None], [0, 0, None], None, array.array("q")
-    for tk, n, pos, head, end, lacing, bdur, empty, heads in blocks:
-        t0 = tk * scale
-        if n == 1:
-            d = bdur * scale if bdur is not None else dd or NONE
-            time.append(t0); tag.append(STORED); place.append(pos); dur.append(d); full.append(holds(head, end))
-            span = d if d != NONE else frame
-            if vorbis:   # the next packet's length takes this one's block size
-                length(heads if heads is not None else b[head:min(head + 1, end)])
-        else:
-            lens = None
-            if fixed and not dd:   # the AAC config gives the length of every frame
-                lens = [length(b"")] * n
-            elif readable:   # cluster() kept the heads, unless Tracks came after the Clusters
-                lens = [length(h) for h in heads or lace_heads(b, *lace_sizes(b, head, end, lacing))]
-                lens = None if None in lens else lens
-            at = 0.0
-            for k in range(n):
-                time.append(t0 if not k else t0 + k * dd if dd else t0 + round(at) if lens else NONE)
-                tag.append(STORED if not k else DEFAULT if dd else BITSTREAM if lens else UNKNOWN)
-                dur.append(dd or (round(lens[k]) if lens else NONE))
-                place.append(pos); full.append(not empty >> k & 1)
-                at += lens[k] if lens else 0
-            span = n * dd if dd else round(at) if lens else (bdur * scale if bdur is not None else None)
-        if t["type"] == 2 and last is not None:   # audio blocks against the end of the block before
-            for x, off in ((over, last - t0), (gap, t0 - last)):
-                if off > scale:
-                    x[0], x[1], x[2] = x[0] + 1, max(x[1], off), x[2] if x[2] is not None else t0
-                    if x is over:
-                        lapped.append(t0)
-        last = t0 + span if span else None
+    try:
+        for i, (tk, n, pos, head, end, lacing, bdur, empty, heads) in enumerate(blocks):
+            if not i & 0xffff:   # a TrueHD track of a film holds millions of blocks
+                ff.check_stop()
+            t0 = tk * scale
+            if n == 1:
+                d = bdur * scale if bdur is not None else dd or NONE
+                time.append(t0); tag.append(STORED); place.append(pos); dur.append(d); full.append(holds(head, end))
+                span = d if d != NONE else frame
+                if vorbis:   # the next packet's length takes this one's block size
+                    length(heads if heads is not None else b[head:min(head + 1, end)])
+            else:
+                lens = None
+                if fixed and not dd:   # the AAC config gives the length of every frame
+                    lens = [length(b"")] * n
+                elif readable:   # cluster() kept the heads, unless Tracks came after the Clusters
+                    lens = [length(h) for h in heads or lace_heads(b, *lace_sizes(b, head, end, lacing))]
+                    lens = None if None in lens else lens
+                at = 0.0
+                for k in range(n):
+                    time.append(t0 if not k else t0 + k * dd if dd else t0 + round(at) if lens else NONE)
+                    tag.append(STORED if not k else DEFAULT if dd else BITSTREAM if lens else UNKNOWN)
+                    dur.append(dd or (round(lens[k]) if lens else NONE))
+                    place.append(pos); full.append(not empty >> k & 1)
+                    at += lens[k] if lens else 0
+                span = n * dd if dd else round(at) if lens else (bdur * scale if bdur is not None else None)
+            if t["type"] == 2 and last is not None:   # audio blocks against the end of the block before
+                for x, off in ((over, last - t0), (gap, t0 - last)):
+                    if off > scale:
+                        x[0], x[1], x[2] = x[0] + 1, max(x[1], off), x[2] if x[2] is not None else t0
+                        if x is over:
+                            lapped.append(t0)
+            last = t0 + span if span else None
+    except OverflowError:   # the arrays hold signed 64-bit ns, as libmatroska and ffmpeg hold times
+        raise ValueError(f"the block at byte {pos} of track {t['number']} stores a time or a duration of 2^63 ns or more") from None
     return dict(t, time=time, tag=tag, place=place, dur=dur, full=full, frame=frame, codec_frame=own and own[0] * 1e9 / own[1], overlaps=over,
                 gaps=gap, lapped=lapped)
 

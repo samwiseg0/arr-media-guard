@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The checks and the one write of one file, process(), with the metadata checks it runs."""
-import contextlib, dataclasses, fcntl, json, os, sqlite3, statistics, subprocess, time, uuid
+import contextlib, dataclasses, fcntl, json, os, signal, sqlite3, statistics, subprocess, time, uuid
 
 from . import apps, checks, cli, config, content, convert, decide, gate, logs, matroska, proof, regrab, remux, report, runner, store, subsync, subtitles, vault
 
@@ -404,8 +404,10 @@ def conversion(ctx):
                 with contextlib.suppress(OSError, sqlite3.Error):
                     ctx.save(converted=list(runner.file_key(os.stat(path))))
         checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
-        if broken := rec["repack"].get("broken"):
-            ctx.unreadable = report.unreadable_finding(broken, rec["repack"].get("kept"), container)
+        broken = rec["repack"].get("broken")
+        unread = {n: {"unread": why} for n, why in (rec["repack"].get("sidecars_unread") or {}).items()}   # the sidecars it left out, see convert()
+        if broken or unread:
+            ctx.unreadable = report.unreadable_finding({**(broken or {}), **unread}, rec["repack"].get("kept"), container)
         # The place in the original of each subtitle track of the new file that came from one of the original's, for
         # the notice of a remux that takes it out, see after_edit(). The conversion keeps their order, and its own
         # tracks come after them, see convert.convert_cmd().
@@ -502,6 +504,7 @@ def header(ctx):
     rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
     if code in config.REPAIRED:
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
+        checks.lid_carry(path, ctx.st)   # the repair keeps the audio, so the hearing of a dry run moves to the new file, as in write()
         refresh(ctx)
         ctx.stage = None   # the stage was of the original
     elif code == "header_repair_failed" or info.get("stopped"):   # edit() tries no second remux of the file in this run
@@ -576,6 +579,8 @@ def subtitle_checks(ctx):
     if unindexed:
         rec["unindexed"] = {"tracks": sorted(unindexed), "why": "the Cues index none of their blocks, and an import never reads the whole file, "
                                                                "so the subtitle checks skip them"}
+    if mkv and subs_on and (skipped := [s["name"] for s in proof.sidecar_subs(path, unknown=True) if not s["charset"]]):   # no check reads its text
+        rec["sidecars_skipped"] = [f"{n}: its charset is unknown, so the subtitle checks leave it out" for n in skipped]
     # A garbled .srt sidecar is repaired or renamed, see subtitles.sidecar_fix(). Only a run that reads whole files
     # checks it, as for a garbled track below. One to rename leaves every other check. One to repair stays in them, as a
     # garbled track does, and what they find waits for its readable text, see later below.
@@ -689,8 +694,9 @@ def subtitle_checks(ctx):
         cs = subtitles.side_cues({**others, **sides}[k]) if k in others or k in sides else cues_of(k)
         if not cs or not subsync.keep_ordered(cs, timed_by[k]["timing"]):
             blocks.pop(k, None), kept.pop(k), fixes.pop(k, None)
+            but = "its cues do not read now" if not cs else "a line with no text would pass a line that keeps its time"
             timed_by[k] = dict(timed_by[k], timing={"fix": None, "unfixed": timed_by[k]["timing"]["fix"]["offset"],
-                                                    "why": f'{timed_by[k]["timing"]["why"]}, but a line with no text would pass a line that keeps its time, so the times stay'})
+                                                    "why": f'{timed_by[k]["timing"]["why"]}, but {but}, so the times stay'})
     moves = {p: x for p in {*blocks, *starts} if p not in sides and p not in others and p not in recode and p not in strip and codecs.get(p) in config.TEXT_CODECS
              and (x := plan(p, cues_of(p), fixes.get(p), codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")))}
     timing_of = lambda n: ({**sync, **timed_by}.get(n) or {}).get("timing") or {}
@@ -1540,7 +1546,9 @@ def relayout(rec, path, j):
     h = {} if hp.get("trim") or hp.get("remove") else checks.video_check(path, j=j, hp=hp)[2].get("header") or {}
     try:   # a stop removes the temp file and keeps the edit, see Swap.stop(). The run then writes the line of the edit.
         code, result, info = remux.repack(path, j, st, True, h) if h.get("repairable") else (None, None, {})
-    except (SystemExit, KeyboardInterrupt):   # no handler of the process's own, as in --check. It keeps the stop for its next write.
+    except (SystemExit, KeyboardInterrupt) as ex:   # no handler of the process's own, as in --check and the one-file worker
+        runner.STOP["kept"] = runner.STOP["term"] or (signal.SIGINT if isinstance(ex, KeyboardInterrupt) else None)   # Python's own handler records nothing
+        runner.STOP["term"] = None   # the next write raises it, see runner.raise_term()
         code, result, info = "header_not_repaired", "not repaired: the run was stopped. The issue: " + "; ".join(hp["issue"]), {}
     if code is None:
         code, result, info = "header_not_repaired", "not repaired: " + "; ".join(h.get("blocked") or [

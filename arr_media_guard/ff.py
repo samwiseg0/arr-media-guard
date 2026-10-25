@@ -14,7 +14,7 @@ lines below info. pyav() gives PyAV objects that allow their known attributes an
 hook refuses a start of ffmpeg or ffprobe, or an import of PyAV, from any other module of the package, and a start of
 a program that ff.py does not allow. This module needs only the standard library, so the scripts of the language-ID
 venv import it too."""
-import collections, enum, fractions, json, os, re, subprocess, sys, tempfile, time, types
+import collections, contextlib, enum, fractions, json, os, re, signal, subprocess, sys, tempfile, time, types
 
 # A use: names, the times it may read: "section.field" of ffprobe (packet.pts_time), a channel (a muxer, a filter, a
 # bitstream filter or an option that gives a time, such as framemd5, showinfo, setts, progress or seek),
@@ -594,15 +594,87 @@ def tidy(use, o, r, cwd=None):
                 f.write(kept)
 
 
+# --- the stop ---------------------------------------------------------------------------------------------------------
+
+STOP = {"held": False, "asked": False, "term": None, "skipped": False, "cut": 0, "kept": None}
+# held: in a job process, a write has started, and in a backfill, cli.stops() runs. asked: on_stop() took a stop while
+# held. No write and no further step start after it, see runner.stop_asked(). skipped: a stop refused or cut a write
+# or left a step out, so a finding the stop caused posts nothing, see logs.alert_findings(), and a job process puts its
+# job back, see runner.job_process(). term: the SIGTERM or SIGINT of a stop that cuts the step in flight, see
+# check_stop(). cut: the count of remux.Swap blocks of the main thread. kept: the stop of a layout repair in a process
+# with no handler of its own, which only its next write raises, see runner.raise_term(). runner.STOP is this dict.
+
+
+def on_stop(signum, _):
+    """The SIGTERM and SIGINT handler of a job process, a remux.Swap and a backfill. It only records the stop and kills
+    the children of the process, so it never leaves a lock held. CPython runs a handler between any two bytecodes of
+    the main thread, also inside a with block of the standard library, and a raise there skips its release. While held
+    and outside a Swap the stop only asks, and the step in flight ends. Else it records term, kills each child with
+    SIGKILL, and the next check_stop() raises."""
+    if STOP["held"] and not STOP["cut"]:
+        STOP["asked"] = True
+        return
+    STOP["term"] = signum
+    kill_children()
+
+
+def check_stop():
+    """Raise the stop that on_stop() recorded in STOP["term"], at a point where the job holds no lock. A SIGINT raises
+    KeyboardInterrupt, as Ctrl+C does, and a SIGTERM SystemExit(143). The record stays, so each later check raises
+    too."""
+    if STOP["term"] == signal.SIGINT:
+        raise KeyboardInterrupt
+    if STOP["term"]:
+        raise SystemExit(128 + STOP["term"])
+
+
+@contextlib.contextmanager
+def held_off():
+    """Hold a recorded stop off while a cleanup that must run after the stop runs, so its checks let it go on. The stop
+    comes back after the block, also when a new stop lands inside it, and the next check raises it."""
+    term, STOP["term"] = STOP["term"], None
+    try:
+        yield
+    finally:
+        STOP["term"] = STOP["term"] or term
+
+
+def kill(pid):
+    """SIGKILL the child pid, and its whole process group when it leads one, as a child of its own session does."""
+    for f in (os.killpg, os.kill):
+        try:
+            return f(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def kill_children():
+    """SIGKILL every child of this process, of each of its threads. It reads them from /proc with os calls only, so a
+    signal handler may call it."""
+    for t in os.listdir("/proc/self/task"):
+        try:
+            fd = os.open(f"/proc/self/task/{t}/children", os.O_RDONLY)
+        except OSError:   # a thread that ended meanwhile
+            continue
+        try:
+            pids = os.read(fd, 1 << 16).split()
+        finally:
+            os.close(fd)
+        for pid in pids:
+            kill(int(pid))
+
+
 def run(use, argv, **kw):
     """subprocess.run(argv, **kw) for use, see check(). A stream that ff.py must filter comes back as text, else the
-    call raises. The output then keeps only what the use may read, and the result holds ff_use for loads()."""
+    call raises. The output then keeps only what the use may read, and the result holds ff_use for loads(). A stop
+    that cut the step raises once the child is reaped, see check_stop()."""
     door(argv, kw)
     o = check(use, argv, kw.get("env"))
     for s in sorted(need(use, o) if o else ()):
         if not as_text(kw, s):
             refuse(f"{use} gets its {s} back as bytes, in a file or in a pipe ff.py does not read, so ff.py cannot filter it")
     r = subprocess.run(argv, **kw)
+    check_stop()
     if use is not None:   # another tool, as mkvmerge through checks.run_bounded()
         tidy(use, o, r, kw.get("cwd"))
         try:
@@ -636,7 +708,8 @@ class Log:
 
 def popen(use, argv, **kw):
     """subprocess.Popen(argv, **kw) for use, see check(). A stream that ff.py must filter goes to DEVNULL, or stderr to
-    an ff.Log of the use, else the call raises."""
+    an ff.Log of the use, else the call raises. The caller calls check_stop() once it reaped the child, because a stop
+    that cuts the step kills the child, and its output then counts for nothing."""
     door(argv, kw)
     o = check(use, argv, kw.get("env"))
     for s in sorted(need(use, o) if o else ()):
@@ -718,6 +791,9 @@ def audit(event, args):
         return
     if event not in LAUNCH:
         return
+    # ponytail: a stop that lands between this check and the fork lets that one child run to its end, and the check
+    # after its reap raises. A thread that kills each child a stop finds would close that window.
+    check_stop()   # no child starts once a stop cut the step, see on_stop()
     if event == "os.system":
         exe, argv = None, ["sh", "-c", os.fsdecode(args[0])]
     else:

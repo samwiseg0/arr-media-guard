@@ -25,18 +25,57 @@ def spread(plans, n):
     return out
 
 
-def selected(path):
-    """A backfill reads a file with two or more audio tracks, any subtitle track, a main audio track whose tag the heard
-    language may change (und among them), a tag form to fix, or a container other than Matroska, which a repack
-    fixes. One audio track and no subtitle plays that track whatever its flag says, and the hook still sets a missing
-    default flag on import. The probe runs at the backfill's priority. A file whose probe fails is taken, so process()
-    logs why. A file mkvmerge does not recognize is left out."""
+def original_flag(f):
+    """The trigger of the Original language flag, see TRIGGERS. A track that the run would hear or read for the flag
+    counts, and so does one that retag() is sure of with no hearing, see decide.flag_checks(). A track to hear counts
+    only when the run can hear the file, f.hears. The content language is TMDB's when the app names none, see
+    decide.content_language(), so then any flag may change."""
+    langs = decide.codes(f.original)
+    if not langs:
+        return bool(f.ts)
+    sure = lambda c: any(decide.prop(e) == decide.ORIGINAL_FLAG for e in decide.retag(f.j, table=checks.langs(), original=c)["edits"])
+    for c in sorted(langs):
+        hear, read = decide.flag_checks(f.j, c)
+        if read or (hear and f.hears) or sure(c):
+            return True
+    return False
+
+
+# The checks of a backfill run that can write a file, each with its trigger, see selected(). A trigger says the check
+# may have work for the file f. It may fire for a file that the check then leaves as it is. The file still gets its
+# whole plan, which costs a TMDB ask, the header read, the last-packet read and often a hearing of about 20 s.
+# A new check that can write adds its trigger here. f holds path, the probe j, the audio and subtitle tracks ts, the
+# audio tracks au, the decision d, the tag plan r, the item's original language, and sub_check for a --sub-check run.
+# hears is True when language detection is installed and the file is LID_MIN_SECONDS long or more, as
+# process.languages() and process.flag_hearing() hear.
+TRIGGERS = {
+    "tracks": lambda f: len(f.au) > 1 or len(f.ts) > len(f.au),   # the hearing and the subtitle checks choose between tracks
+    "container": lambda f: (f.j.get("container") or {}).get("type") not in (None, "Matroska"),   # a repack, see process.conversion()
+    "flags": lambda f: bool(f.d["edits"]),   # a default or forced flag, as a missing default flag
+    "hearing": lambda f: f.hears and bool(f.au and (config.LID_WHEN & set(f.d["reasons"]) or f.r["ask"])),   # as process.languages() hears. It may change a tag.
+    "tags": lambda f: bool(f.r["edits"]),   # a tag form to fix
+    "original flag": original_flag,
+    "sidecars": lambda f: f.sub_check and bool(subtitles.side_stats(f.path)),   # --sub-check checks the .srt files beside the file
+    "covers": lambda f: f.sub_check and sum(t.get("type") == "video" for t in f.j.get("tracks") or []) > 1,   # see remux.cover_tracks()
+    "header": lambda f: config.CFG.header_repair and bool((checks.header_of(f.path, f.j) or {}).get("issue")),   # last, as it reads the file
+}
+
+
+def selected(path, original=None, kids=False, release="", sub_check=False):
+    """Whether a backfill reads the file at path: a trigger of TRIGGERS fires for it. So a file is left out only when no
+    check that can write has work for it, as a file with one audio track, its flags and tag right, no subtitle and a
+    whole header. original, kids and release are the item's, as process() decides with them. sub_check is a
+    --sub-check run. The probe runs at the backfill's priority. A file whose probe fails is taken, so process() logs
+    why. A file mkvmerge does not recognize is left out. A new check that can write adds its trigger to TRIGGERS."""
     try:
         j = checks.mkvmerge(path)
     except Exception:
         return True
-    ts = decide.classify(j); au = [t for t in ts if t["kind"] == "a"]; r = decide.retag(j, table=checks.langs())
-    return len(au) > 1 or len(ts) > len(au) or bool(r["edits"] or r["ask"]) or (j.get("container") or {}).get("type") not in (None, "Matroska")
+    ts = decide.classify(j)
+    f = types.SimpleNamespace(path=path, j=j, ts=ts, au=[t for t in ts if t["kind"] == "a"], d=decide.decide(j, original, kids, release),
+                              r=decide.retag(j, table=checks.langs()), original=original, sub_check=sub_check,
+                              hears=checks.lid_ready() and decide.duration(j) >= config.LID_MIN_SECONDS)
+    return any(fires(f) for fires in TRIGGERS.values())
 
 
 def upgrade(lock, path, st):
@@ -48,7 +87,7 @@ def upgrade(lock, path, st):
 
 
 def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, planned=None, row=None):
-    """One file of a backfill, as (the seconds it took, the decision record), or None when its own tracks leave it out.
+    """One file of a backfill, as (the seconds it took, the decision record), or None when selected() leaves it out.
     The selection probe and the checks hold the file lock shared, so the workers of a dry run read side by side and an
     import never waits for a file's language detection. An edit takes the lock exclusive, see upgrade(). A file that
     changed meanwhile, or needs a repack, runs again with the lock exclusive from the start, as a job process does.
@@ -83,7 +122,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, pl
                 with runner.locked(shared=True) as lock:
                     if a.sub_check and not a.recheck and subtitles.sub_cached(path):   # --sub-time takes each file it names
                         return "checked"
-                    if not (job or a.sub_time or a.plan_from or a.convert or selected(path) or (a.sub_check and subtitles.side_stats(path))):
+                    if not (job or a.sub_time or a.plan_from or a.convert or selected(path, original, kids, f.get("sceneName") or "", a.sub_check)):
                         return None
                     rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: runner.reshared(lock, path, st)), pool)
@@ -227,6 +266,12 @@ def backfill(a):
     if a.plan_out:   # as /config/plans/, which the docs name
         os.makedirs(os.path.dirname(os.path.abspath(a.plan_out)), exist_ok=True)
     failed, out = [], open(a.plan_out, "w") if a.plan_out else None   # one plan file for every instance
+    # A dry run only records Ctrl+C, and its next check raises it, see ff.on_stop(). Python's own handler raised it
+    # anywhere, also inside the code of the pool, and the exit of the process could then hang. Only the main thread
+    # sets a handler.
+    dry = not a.apply and threading.current_thread() is threading.main_thread() and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    if dry:
+        signal.signal(signal.SIGINT, ff.on_stop)
     try:
         for app in todo:
             if HALT.is_set():
@@ -236,8 +281,16 @@ def backfill(a):
                 continue
             if not a.app:
                 print(f"== {app}", flush=True)
+            stopped = False
             try:
                 backfill_app(app, a, out)
+                ff.check_stop()   # a stop that landed after the last check of the instance
+            except KeyboardInterrupt:
+                # Ctrl+C in a dry run, raised at a check of the main thread. Its traceback holds the frame of
+                # backfill_app() and the generator of its results, so the pool would run each queued file before the
+                # process ends. The raise below comes once that traceback is gone, and the generator then cancels each
+                # file left.
+                stopped = True
             except (Exception, SystemExit) as ex:   # app_list() exits for an instance set up in part
                 if a.app or isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
                     raise
@@ -245,8 +298,12 @@ def backfill(a):
                 print(f"{app}: the backfill stopped: {why}", flush=True)
                 logs.log(dict(app=app, source="backfill", result="error", note=why))
                 failed.append(app)
+            if stopped:
+                raise KeyboardInterrupt
     finally:
         if out: out.close()
+        if dry:   # a second Ctrl+C ends the exit at once
+            signal.signal(signal.SIGINT, signal.default_int_handler)
     if failed:
         sys.exit(f"the backfill failed for {', '.join(failed)}")
 
@@ -273,7 +330,8 @@ def backfill_app(app, a, out):
                       else r["edits"] or r.get("outcome") == "would_repack" or r.get("header_repair") == "would_repair_header")]
         if a.background:   # before the canary, so a second run takes the next files. An applied file changed, so it never queues again.
             why = {r["path"]: changed_since(r) for r in plans}
-            for text, n in collections.Counter(w for w in why.values() if w).items():
+            refused = collections.Counter(w for w in why.values() if w)
+            for text, n in refused.items():
                 print(f"{app}: {n} file{'s' if n != 1 else ''} of the plan not queued, {text}", flush=True)
             plans = [r for r in plans if not why[r["path"]]]
         keep = {r["path"] for r in (spread(plans, a.canary) if a.canary else plans)}
@@ -286,7 +344,7 @@ def backfill_app(app, a, out):
     if a.queue:
         return backfill_queue(app, a, work)
     if a.background:
-        return plan_queue(app, a, work)
+        return plan_queue(app, a, work, refused)
     a.force = logged_refusals({w[0]["path"] for w in work}) if a.force_convert else {}   # path: the refusal a person checked, docs/design.md, "Conversion"
     for p in sorted(p for p, why in a.force.items() if not why):
         print(f"no proof refusal in the decision log, so {'it is not' if apps.ARR[app].film else 'only its name check is'} forced: {p}",
@@ -298,9 +356,12 @@ def backfill_app(app, a, out):
         workers = (a.workers or config.CFG.convert_workers) if a.convert else 1
     else:
         workers = a.workers or config.CFG.scan_workers
-    print(f"{len(work)} {'files that are not .mkv' if a.convert else 'mkv files, each read for its own tracks'}, "
-          f"{('APPLY' + (f', {workers} at a time' if workers > 1 else '')) if a.apply else f'dry run, {workers} at a time'}", flush=True)
-    counts, skipped, needed = {}, set(), 0   # skipped: plex_analyze()'s sections
+    n, left = len(work), 0 if a.convert or a.plan_from or a.paths else len(unconverted)   # --paths names each path it skips
+    kind = "files that are not .mkv" if a.convert else f"file{'s' if n != 1 else ''} named .mkv, each read for its own tracks"
+    print(f"{n} {kind}, "
+          f"{('APPLY' + (f', {workers} at a time' if workers > 1 else '')) if a.apply else f'dry run, {workers} at a time'}"
+          + (f". {left} file{'s' if left != 1 else ''} not named .mkv left out, --convert takes them" if left else ""), flush=True)
+    counts, also, skipped, needed = {}, {}, set(), 0   # also: the codes counted on top of an outcome. skipped: plex_analyze()'s sections
     burst = {}   # plex_analyze()'s rows of idle checks, see plex_step()
     scans, rescans, settles, stop = {}, set(), {}, threading.Event()   # scans: folder -> plex_folder_job(), rescans and settles: per item, at the end
     if a.apply and a.convert:   # a stopped run left these
@@ -311,9 +372,10 @@ def backfill_app(app, a, out):
     one = lambda w: backfill_file(app, w[0], w[1], a, bool(out), pool)
     ex = concurrent.futures.ThreadPoolExecutor(workers) if workers > 1 and not pool else None
     # An apply goes through backfill_files(): a pool yields its files in the order they end, and SIGTERM lets the files in
-    # flight end first and write their decision lines. A dry run keeps the file order.
+    # flight end first and write their decision lines. A dry run keeps the file order. A stop cancels the files of a dry
+    # run that did not start, and each file that started still gets its count, its decision line and its plan row.
     results = backfill_files(work, lambda *w: one(w), 2 * workers if pool else 1, stop, converted) if a.apply else \
-        zip(work, ex.map(one, work) if ex else map(one, work))
+        in_order(collections.deque((w, ex.submit(one, w)) for w in work)) if ex else zip(work, map(one, work))
     subs = collections.Counter()   # the --sub-check summary
     for (f, (label, original, runtime, want, kids, ctx)), got in results:
         if got is None or got == "checked":
@@ -324,8 +386,8 @@ def backfill_app(app, a, out):
         if out and "plan" in rec:
             out.write(json.dumps(rec.pop("plan")) + "\n")
         counts[rec["outcome"]] = counts.get(rec["outcome"], 0) + 1
-        for code in {"repacked", *config.REPAIRED, "would_repair_header"} & set(rec.get("reasons", [])) - {rec["outcome"]}:   # each file once
-            counts[code] = counts.get(code, 0) + 1
+        for code in {"repacked", *config.REPAIRED, "would_repair_header", "would_remux_subtitles"} & set(rec.get("reasons", [])) - {rec["outcome"]}:   # counts holds the file once
+            also[code] = also.get(code, 0) + 1
         if rec.get("edits") or rec.get("findings") or rec.get("heard") or "repack" in rec or "header_repair" in rec or rec.get("subcheck") \
                 or rec.get("flash") or rec.get("garbled") or rec["outcome"] in ("undecided", "dropped", "error", "verify_failed", "edit_failed", "read_only",
                                                                                  "hardlinked"):
@@ -359,7 +421,9 @@ def backfill_app(app, a, out):
             stop.set()
         needed += process.wrote(rec)
         if a.limit and needed >= a.limit: stop.set()
-        if stop.is_set() and not pool: break   # a pool lets its files in flight end, see backfill_files()
+        if stop.is_set() and ex:   # no file starts after the stop, and the loop takes each file in flight
+            ex.shutdown(wait=False, cancel_futures=True)
+        elif stop.is_set() and not pool: break   # a pool lets its files in flight end, see backfill_files()
     if ex: ex.shutdown(cancel_futures=True)
     for owner in sorted(rescans):   # the size and media info follow the edits, and the record of a converted original goes
         rescan_item(app, owner, settles.get(owner))
@@ -371,6 +435,8 @@ def backfill_app(app, a, out):
         logs.log(dict(app=app, source="backfill", label=p["label"], path=p["path"], result="plex", plex=done, plex_reason=code, decision_id=p["decision_id"]))
         time.sleep(config.PLEX_PACE)
     print("summary:", json.dumps(counts))
+    if also:
+        print("of the files in the summary:", json.dumps(also))
     if a.sub_check:
         print(sub_summary(subs, library), flush=True)
 
@@ -388,37 +454,63 @@ def backfill_queue(app, a, work):
     state, todo, order = pass_left(name, work, lambda w: w[0]["id"], a.restart, sorted(a.ids) + sorted(a.paths))
     if not todo:
         print(f"{app}: the pass is done, so nothing was queued. --restart starts a new pass.", flush=True)
+        if a.apply:
+            log_queued(app, "backfill", a, 0, 0)
         return
-    n = minutes = 0
-    for f, info in todo:
-        if a.limit and n >= a.limit:
-            break
-        with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away, stays in the pass
-            got = runner.queue_listed(app, f, info, backfill=True) if a.apply else not runner.still_queued(runner.deep_name(f["path"]))
-            if got:
-                n, minutes = n + 1, minutes + info[2]
-                if not a.apply:
-                    print(f"would queue: {f['path']}", flush=True)
-            # The job of the path, queued now or before, takes the file. A recheck repeats only the subtitle check, so it does not.
-            if a.apply and store.read(f"SELECT 1 FROM jobs WHERE name = ? AND {runner.RECHECK} = 0", runner.deep_name(f["path"])):
-                advance(state, order, f["id"])
-                store.put("scan", name, state)
+    n = minutes = kept = 0
+    try:
+        for f, info in todo:
+            ff.check_stop()   # a dry run only records Ctrl+C, see backfill(), so the loop stops at the next file
+            if a.limit and n >= a.limit:
+                break
+            with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away, stays in the pass
+                got = runner.queue_listed(app, f, info, backfill=True) if a.apply else not runner.still_queued(runner.deep_name(f["path"]))
+                kept += not got
+                if got:
+                    n, minutes = n + 1, minutes + info[2]
+                    if not a.apply:
+                        print(f"would queue: {f['path']}", flush=True)
+                # The job of the path, queued now or before, takes the file. A recheck repeats only the subtitle check, so it does not.
+                if a.apply and store.read(f"SELECT 1 FROM jobs WHERE name = ? AND {runner.RECHECK} = 0", runner.deep_name(f["path"])):
+                    advance(state, order, f["id"])
+                    store.put("scan", name, state)
+    finally:   # a failure part way, as a locked store or Ctrl+C, still counts the jobs it queued
+        if a.apply:
+            log_queued(app, "backfill", a, n, kept)
     print(f"{app}: {n} file{'s' if n != 1 else ''} {'queued' if a.apply else 'to queue, dry run'}, {minutes / 60:.1f} hours of video, "
           f"{len(set(order) - set(state['done']))} of {len(work)} files left in this pass. They wait in the background queue behind the "
           f"imports and run {config.CFG.background_workers} at a time.", flush=True)
 
 
-def plan_queue(app, a, work):
+def log_queued(app, source, a, queued, kept, refused=None):
+    """One line in the decision log for the apply of a queue command, as runner.queue_rechecks() writes for its rechecks.
+    It counts the jobs the command queued, the files that kept the job of their path that waits or runs, and the files
+    it refused, with the count of each reason in refused_why. options holds the options of the command that select its
+    files. Each job's own decision line names the time of its queue in "queued", see runner.deep_analysis(). The audits
+    read only the decision lines that the store keeps, see logs.decision(), so they never count this line. A command
+    that fails part way writes the line too, with the counts so far."""
+    refused = refused or {}
+    options = {k: getattr(a, k, None) for k in ("limit", "ids", "paths", "restart", "canary")}
+    options["plan_from"] = getattr(a, "plan_file", None) or a.plan_from   # --check keeps its --plan-from in plan_file
+    logs.log(dict(app=app, source=source, result="queued", queued=queued, kept=kept, refused=sum(refused.values()), refused_why=dict(refused),
+                  options={k: v for k, v in options.items() if v}))
+
+
+def plan_queue(app, a, work, refused):
     """--backfill --plan-from --apply --background: one job per file of work in the background queue, with the plan
     row of the dry run, see runner.queue_listed(). The worker applies the row as this backfill's apply would, see
-    planned_file(). A file with a job of its path that waits or runs keeps that job. --limit N queues N files."""
+    planned_file(). A file with a job of its path that waits or runs keeps that job. --limit N queues N files. refused
+    counts the files of the plan that backfill_app() refused, by reason, see changed_since()."""
     rows, n, kept, minutes = {r["path"]: r for r in a.plans[app]}, 0, 0, 0
-    for f, info in work:
-        if a.limit and n >= a.limit:
-            break
-        with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away
-            got = runner.queue_listed(app, f, info, backfill=True, flag_backfill=True, plan=rows[f["path"]])
-            n, kept, minutes = n + got, kept + (not got), minutes + got * info[2]
+    try:
+        for f, info in work:
+            if a.limit and n >= a.limit:
+                break
+            with contextlib.suppress(OSError):   # a file that went since the app listed it, or whose mount is away
+                got = runner.queue_listed(app, f, info, backfill=True, flag_backfill=True, plan=rows[f["path"]])
+                n, kept, minutes = n + got, kept + (not got), minutes + got * info[2]
+    finally:   # a failure part way, as a locked store or Ctrl+C, still counts the jobs it queued
+        log_queued(app, "backfill", a, n, kept, refused)
     print(f"{app}: {n} file{'s' if n != 1 else ''} queued with the plan of the dry run, {minutes / 60:.1f} hours of video"
           + (f", {kept} kept the job of its path that waits or runs" if kept else "")
           + f". They wait in the background queue behind the imports and run {config.CFG.background_workers} at a time.", flush=True)
@@ -576,7 +668,7 @@ def sub_time(argv):
     skipped, burst, missed, absent, stop = set(), {}, [], [], threading.Event()
     with stops(stop) if a.apply else contextlib.nullcontext():   # an apply ends after the file in flight, as a backfill does
         for app, f, info in work:
-            if stop.is_set():   # the run names each path it never started, and exits SUB_TIME_MISSED
+            if halted(stop):   # the run names each path it never started, and exits SUB_TIME_MISSED
                 missed.append(f'{f["path"]}: not run, the run was stopped')
                 continue
             if not os.path.isfile(f["path"]):
@@ -762,22 +854,28 @@ def check_queue(a, work, failed):
     """--check --apply --background: one job per file of work in the background queue, with its plan row from
     --plan-from, see runner.queue_listed(). The worker applies the row as --check --apply would, see planned_file(). A
     file no app lists, a file the plan file holds no row of, a file whose key is not the row's, see changed_since(),
-    and a file with a job of its path that waits or runs are not queued. Each gets one line, and the exit code is 1."""
-    rows, n = {}, 0
-    for app, f, info, out in work:
-        row = None if out is not None else rows.setdefault(app, {r["path"]: r for r in plan_rows(a.plan_file, app)}).get(f["path"])
-        why = "no app lists it, so the background queue cannot take it" if out is not None else \
-            "the plan file holds no plan of it" if row is None else changed_since(row)
-        if not why:
-            try:
-                got = runner.queue_listed(app, f, info, backfill=True, plan=row)
-            except OSError as ex:
-                got, why = 0, config.mask(f"{type(ex).__name__}: {ex}")[:200]
-            n += got
-            why = why or (None if got else "a job of its path waits or runs, so it keeps that job")
-        if why:
-            failed.append(f"not queued, {why}: {f['path']}")
-            print(failed[-1], flush=True)
+    and a file with a job of its path that waits or runs are not queued. Each gets one line, and the exit code is 1. One
+    line in the decision log counts them, see log_queued(). Its app is the instance of the files, or the instances
+    joined by a comma."""
+    rows, n, refused, keeps = {}, 0, collections.Counter(), "a job of its path waits or runs, so it keeps that job"
+    try:
+        for app, f, info, out in work:
+            row = None if out is not None else rows.setdefault(app, {r["path"]: r for r in plan_rows(a.plan_file, app)}).get(f["path"])
+            why = "no app lists it, so the background queue cannot take it" if out is not None else \
+                "the plan file holds no plan of it" if row is None else changed_since(row)
+            if not why:
+                try:
+                    got = runner.queue_listed(app, f, info, backfill=True, plan=row)
+                except OSError as ex:
+                    got, why = 0, config.mask(f"{type(ex).__name__}: {ex}")[:200]
+                n += got
+                why = why or (None if got else keeps)
+            if why:
+                refused[why] += 1
+                failed.append(f"not queued, {why}: {f['path']}")
+                print(failed[-1], flush=True)
+    finally:   # a failure part way, as a locked store or Ctrl+C, still counts the jobs it queued
+        log_queued(",".join(sorted({w[0] for w in work if w[0]})) or None, "check", a, n, refused.pop(keeps, 0), refused)
     print(f"{n} file{'s' if n != 1 else ''} queued with the plan of the dry run. They wait in the background queue behind the imports "
           f"and run {config.CFG.background_workers} at a time.", flush=True)
     if failed:
@@ -983,14 +1081,14 @@ def backfill_files(work, one, workers, stop, converted):
     with stops(stop):
         if workers == 1:   # the file ends and writes its decision line. A stop during a remux reaches stop through remux.Swap.stop().
             for w in work:
-                if stop.is_set():
+                if halted(stop):
                     return
                 yield w, one(*w)
             return
         with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             left, running = iter(work), {}
             while True:
-                while not stop.is_set() and len(running) < workers and converted[0] + len(running) < config.CFG.convert_max and (w := next(left, None)):
+                while not halted(stop) and len(running) < workers and converted[0] + len(running) < config.CFG.convert_max and (w := next(left, None)):
                     running[pool.submit(one, *w)] = w
                 if not running:
                     return
@@ -998,20 +1096,47 @@ def backfill_files(work, one, workers, stop, converted):
                     yield running.pop(fut), fut.result()
 
 
+def in_order(futures):
+    """(work item, result) for each (work item, future) of the deque futures, in its order. It pops each one, as
+    Executor.map() does, so a long dry run keeps no record it already counted. A future that a stop cancelled is a
+    file that never started, and it gives nothing, see backfill_app(). When the generator ends early, as at Ctrl+C in
+    fut.result(), it cancels each future left, as Executor.map() does. Otherwise the exit of the process joins the pool,
+    and the pool runs each queued file first."""
+    try:
+        while futures:
+            w, fut = futures.popleft()
+            if not fut.cancelled():
+                yield w, fut.result()
+    finally:
+        for _, fut in futures:
+            fut.cancel()
+
+
 @contextlib.contextmanager
 def stops(stop):
-    """SIGTERM and Ctrl+C set stop and HALT inside the block, and the caller starts no new file. The file in flight ends
-    with its decision line. A stop during its remux removes the temp file, and remux.Swap.stop() hands the stop to this
-    handler. The handler sets runner.STOP["asked"] too, so the file in flight starts no write after the stop, see
-    runner.refuse(). A backfill apply and --sub-time --apply run their files in it. A process that ignores SIGINT keeps
-    it ignored, as remux.Swap does."""
-    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set(), runner.STOP.update(asked=True))) for s in (signal.SIGTERM, signal.SIGINT)
-                if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN}
+    """SIGTERM and Ctrl+C go to ff.on_stop() inside the block, and with runner.STOP["held"] set they only ask. So the
+    file in flight starts no write after the stop, see runner.refuse(), and ends with its decision line. A stop during
+    its remux removes the temp file, and remux.Swap.stop() hands the stop to this handler. halted() turns the stop into
+    stop and HALT, and the caller starts no new file. A backfill apply and --sub-time --apply run their files in it. A
+    process that ignores SIGINT keeps it ignored, as remux.Swap does."""
+    handlers = {s: signal.signal(s, ff.on_stop) for s in (signal.SIGTERM, signal.SIGINT) if s == signal.SIGTERM or signal.getsignal(s) != signal.SIG_IGN}
+    held, runner.STOP["held"] = runner.STOP["held"], True
     try:
         yield
     finally:
         for s, h in handlers.items():
             signal.signal(s, h)
+        runner.STOP["held"] = held
+        halted(stop)
+
+
+def halted(stop):
+    """Whether stop is set. A stop that ff.on_stop() asked for sets stop and HALT first. The handler never sets them
+    itself, because Event.set() takes a lock that the main thread may hold."""
+    if runner.STOP["asked"]:
+        stop.set()
+        HALT.set()
+    return stop.is_set()
 
 
 def read_jsonl(*paths):
@@ -1328,8 +1453,9 @@ def scan(app, a, kind):
         store.drop(name)
     print(f"{kind} scan of {app}: {len(todo)} of {len(work)} files left in this pass, {a.workers} workers", flush=True)
     checked = found = gone = 0
-    stop, left, running = threading.Event(), iter(todo[:a.limit] if a.limit else todo), {}
-    handlers = {s: signal.signal(s, lambda *_: (stop.set(), HALT.set())) for s in (signal.SIGTERM, signal.SIGINT)}
+    asked, left, running = [], iter(todo[:a.limit] if a.limit else todo), {}
+    stop = types.SimpleNamespace(is_set=lambda: bool(asked))   # the handler only appends, so it takes no lock
+    handlers = {s: signal.signal(s, lambda *_: asked.append(True)) for s in (signal.SIGTERM, signal.SIGINT)}
     try:
         with concurrent.futures.ThreadPoolExecutor(a.workers) as pool:
             while True:
@@ -1368,6 +1494,8 @@ def scan(app, a, kind):
     finally:
         for s, h in handlers.items():
             signal.signal(s, h)
+    if asked:   # a backfill of several instances scans no next one
+        HALT.set()
     rows = sorted(store.items(name).values(), key=lambda r: r["file_id"])
     with open(base + ".txt", "w") as f:
         f.writelines(f'{scan_class(r)}\t{r["label"]}\t{scan_text(r)}\t{r["path"]}\n' for r in rows)

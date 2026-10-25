@@ -265,7 +265,7 @@ def alert(app, kind, path, size, emb):
         sent = post(app, emb)
     finally:
         if sent != "sent" and mark:   # a later run tries again, also after a stop during the post
-            with contextlib.suppress(sqlite3.Error, OSError):
+            with ff.held_off(), contextlib.suppress(sqlite3.Error, OSError):   # the store's checks would raise the stop again
                 store.drop("alert", mark)
     return sent
 

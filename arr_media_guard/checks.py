@@ -267,7 +267,9 @@ def packet_read(path, index):
     fam = (info.get("format") or {}).get("format_name") or ""
     if fam.startswith(proof.STORED):
         try:   # ponytail: the read_time() gate bounds the walk, which no timer stops. A thread with a deadline if a walk ever hangs.
-            for i, x, d in stored_frames(path, streams, fam, meta):
+            for k, (i, x, d) in enumerate(stored_frames(path, streams, fam, meta)):
+                if not k & 0xffff:   # a film holds millions of frames
+                    ff.check_stop()
                 add(i, x / 1e9, d / 1e9)
         except Exception as ex:   # any reader that fails, as on a cut box header
             return {"error": config.mask(f"the frame read failed: {ex}")[:200]}
@@ -311,6 +313,7 @@ def ffprobe_packets(path, timeout, add):
             p.kill()
             p.wait()
         p.stdout.close()
+    ff.check_stop()   # a stop killed ffprobe, so rc counts for nothing
     return rc
 
 
@@ -1043,6 +1046,7 @@ def whole_check(path, stop=lambda: None):
             p.kill(); p.wait()
         reader.join(10)
         p.stderr.close()
+    ff.check_stop()   # a stop killed the read pass, so it found nothing
     certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
     return certain, zero, more, {"zeros": zeros, "ffmpeg": read_pass, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
 
@@ -1181,6 +1185,7 @@ def window(path, start, secs, stream=None):
         finally:
             if p.poll() is None:   # the job's time limit or an interrupt: no decoder outlives the check
                 p.kill(); p.wait()
+        ff.check_stop()   # a stop killed the decoder, so the window read nothing
         return dict(decide.parse_window(err.read(), 1 if stopped else p.returncode), at=round(start), stopped=stopped,
                     took=round(time.monotonic() - t0, 2), read=read, **({} if stream is None else {"via": "pyav"}))
 
@@ -1393,6 +1398,7 @@ def lid_turn(deadline, background=False):
                 if time.monotonic() >= deadline:
                     return None
                 select.select([], [], [], 0.2)
+                ff.check_stop()
         return turns[got], got
     finally:
         gate.close()
@@ -1507,6 +1513,7 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
             log_file = ORT_LOG.format(p.pid)
             if os.stat(log_file).st_size == 0 and os.stat(log_file).st_mtime >= t0 - 1:
                 os.remove(log_file)
+        ff.check_stop()   # a stop killed the helper, so its answer counts for nothing
 
 
 ORT_LOG = "/tmp/mat-debug-{}.log"   # onnxruntime in the Whisper venv creates this empty file on import, always in /tmp

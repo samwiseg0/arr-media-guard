@@ -5,13 +5,16 @@ plan in the background queue with its plan row. The worker plans the file again 
 that plan equals the row and the file has the row's key. The apply compares again before each write, see
 gate.allow(). The flow tests fake the tools, see the env fixture."""
 import copy
+import datetime
 import json
 import os
+import sqlite3
 
 import pytest
 
 from test_arr_media_guard import (HEADER_HP, NOT_MATROSKA, QUICK, burn, check_listed, decided, enqueue, env, header_issue, hearing, hook,  # noqa: F401
-                                  japanese_film, late_english_film, log_lines, mk, mp4_import, one_alert_film, posted, sub_probe, talk, verdict)
+                                  japanese_film, late_english_film, log_lines, mk, mp4_import, one_alert_film, posted, queue_lines, sub_probe, talk,
+                                  verdict)
 
 ENGLISH_FIRST = {"container": {"properties": {"duration": 7200 * 10**9}},   # English plays first, so no flag edit
                  "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6), mk("subtitles", "eng", 3, False)]}
@@ -69,7 +72,8 @@ def test_a_file_that_changed_since_the_dry_run_never_queues_and_the_worker_refus
     os.utime(path, ns=(1, 1))
     queue(plans)
     assert "radarr: 1 file of the plan not queued, the file changed since the dry run\n" in capsys.readouterr().out
-    assert hook.deep_analysis_queued() == []
+    assert hook.deep_analysis_queued() == [] and queue_lines(env) == [("radarr", "backfill", 0, 0, 1, {"plan_from": str(plans)})]
+    assert log_lines(env)[-1]["refused_why"] == {"the file changed since the dry run": 1}
     plans, _ = dry_run(tmp_path)
     queue(plans)
     with open(path, "ab") as f:
@@ -111,6 +115,72 @@ def test_a_second_queue_run_queues_no_double_limit_counts_and_drop_queued_drops(
     assert sorted(hook.job_of(n)["path"] for n in hook.deep_analysis_queued()) == sorted(paths)
     hook.main(["--backfill", "radarr", "--drop-queued"])
     assert "dropped 2 jobs that a backfill queued" in capsys.readouterr().out and hook.deep_analysis_queued() == []
+
+
+def fail_queue(monkeypatch, at, error):
+    """runner.queue_listed() raises error at its call number at."""
+    real, calls = hook.queue_listed, [0]
+    def queue_listed(*a, **k):
+        calls[0] += 1
+        if calls[0] == at:
+            raise error()
+        return real(*a, **k)
+    monkeypatch.setattr(hook, "queue_listed", queue_listed)
+
+
+@pytest.mark.parametrize("error", [sqlite3.OperationalError, KeyboardInterrupt])
+@pytest.mark.parametrize("plan", [True, False])
+def test_a_queue_run_that_fails_part_way_writes_its_line(env, monkeypatch, tmp_path, error, plan):
+    """Reviewer 2026-10-24: a plan queue run whose second file raised "database is locked" wrote no queue line, and the
+    job of its first file waited in the queue. A plan queue and a bare backfill now write the line with the counts so
+    far, as runner.queue_rechecks() writes its line after a failure. Ctrl+C gives the same line."""
+    other = os.path.join(os.path.dirname(env["path"]), "Other.mkv")
+    with open(other, "wb") as f:
+        f.write(b"z" * 10)
+    listed(env, monkeypatch, other)
+    plans, _ = dry_run(tmp_path)
+    fail_queue(monkeypatch, 2, error)
+    with pytest.raises(error):
+        queue(plans) if plan else hook.main(["--backfill", "radarr", "--apply"])
+    options = {"plan_from": str(plans)} if plan else {}
+    assert len(hook.deep_analysis_queued()) == 1 and queue_lines(env) == [("radarr", "backfill", 1, 0, 0, options)]
+
+
+@pytest.mark.parametrize("error", [sqlite3.OperationalError, KeyboardInterrupt])
+def test_a_check_queue_that_fails_writes_its_line(env, monkeypatch, tmp_path, error):
+    """--check --apply --background writes its queue line when runner.queue_listed() raises, as the backfill queues do."""
+    check_listed(env, monkeypatch)
+    plans = tmp_path / "check.jsonl"
+    hook.main(["--check", env["path"], "--plan-out", str(plans)])
+    fail_queue(monkeypatch, 1, error)
+    with pytest.raises(error):
+        hook.main(["--check", env["path"], "--apply", "--plan-from", str(plans), "--background"])
+    assert queue_lines(env) == [("radarr", "check", 0, 0, 0, {"paths": [env["path"]], "plan_from": str(plans)})]
+
+
+def test_each_queue_run_writes_a_line_and_each_job_line_names_its_queue_time(env, monkeypatch, tmp_path):
+    """Tester 2026-10-22: the edit of two files failed, so neither file changed, and each plan queue run queued both
+    again. Each apply of a queue command writes one line with its counts and its options. The line of each job names
+    the time of its queue in "queued", so two runs of one job name show two queue times."""
+    other = os.path.join(os.path.dirname(env["path"]), "Other.mkv")
+    with open(other, "wb") as f:
+        f.write(b"z" * 10)
+    paths = listed(env, monkeypatch, other)
+    plans, rows = dry_run(tmp_path)
+    real = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: type("R", (), {"returncode": 2, "stdout": "", "stderr": "bad"})()
+                        if argv[0] == "mkvpropedit" else real(argv, **kw))
+    times = []
+    for _ in range(2):
+        env["clock"][0] += 3600
+        times.append(datetime.datetime.fromtimestamp(env["clock"][0]).astimezone().isoformat(timespec="seconds"))
+        queue(plans)
+        for p in paths:
+            hook.background(hook.deep_name(p), [])
+    assert queue_lines(env) == [("radarr", "backfill", 2, 0, 0, {"plan_from": str(plans)})] * 2
+    assert sorted((r["path"], r["queued"], r["outcome"]) for r in lines(env)) == sorted((p, t, "edit_failed") for p in paths for t in times)
+    assert [list(hook.file_key(os.stat(p))) for p in paths] == [r["key"] for r in rows] and times[0] != times[1]
+    assert "queued" not in {json.loads(r).get("result") for (r,) in hook.store.read("SELECT rec FROM decisions")}   # the audits read these rows
 
 
 def test_imports_go_first_and_background_workers_caps_the_queued_plans(env, monkeypatch, settings, tmp_path):
@@ -160,6 +230,10 @@ def test_check_queues_its_audited_plan_and_refuses_what_it_cannot_queue(env, mon
     hook.main(["--check", env["path"], "--apply", "--plan-from", str(plans), "--background"])
     name = hook.deep_name(env["path"])
     assert "flag_backfill" not in hook.job_of(name) and env["mkvpropedit"] == [] and "1 file queued with the plan" in capsys.readouterr().out
+    with pytest.raises(SystemExit):   # the job of the path waits, so the file keeps it
+        hook.main(["--check", env["path"], "--apply", "--plan-from", str(plans), "--background"])
+    options = {"paths": [env["path"]], "plan_from": str(plans)}
+    assert queue_lines(env) == [("radarr", "check", 1, 0, 0, options), ("radarr", "check", 0, 1, 0, options)]
     assert hook.claim(name)   # --queue names a claimed job by the source of its lines
     hook.main(["--queue"])
     assert f"  {'check_job':<14}{'process gone':<27}{env['path']}" in capsys.readouterr().out.splitlines()
@@ -176,6 +250,12 @@ def test_check_queues_its_audited_plan_and_refuses_what_it_cannot_queue(env, mon
     assert f"not queued, the plan holds no file key, so run the dry run again with this version: {env['path']}" in out, out
     assert f"not queued, no app lists it, so the background queue cannot take it: {outside}" in out and "0 files queued" in out
     assert ex.value.code.startswith("--check did not queue every file") and hook.deep_analysis_queued() == []
+    assert queue_lines(env)[-1][2:5] == (0, 0, 2) and log_lines(env)[-1]["refused_why"] == {
+        "the plan holds no file key, so run the dry run again with this version": 1, "no app lists it, so the background queue cannot take it": 1}
+    (tmp_path / "outside2.mkv").write_bytes(b"x")
+    with pytest.raises(SystemExit):   # no app lists the two files, so the line names no app
+        hook.main(["--check", str(outside), str(tmp_path / "outside2.mkv"), "--apply", "--plan-from", str(plans), "--background"])
+    assert queue_lines(env)[-1][:5] == (None, "check", 0, 0, 2)
 
 
 def test_a_queued_check_keeps_the_original_of_a_conversion(env, monkeypatch, settings, tmp_path):

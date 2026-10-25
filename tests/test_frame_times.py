@@ -2,6 +2,7 @@
 # Copyright (C) 2026 samwiseg0
 """The frame reader, matroska.frames(), and the time check of two Matroska files that reads it (docs/design.md, "Frame
 times"). Every file is made up, byte by byte."""
+import itertools
 import random
 import zlib
 
@@ -934,9 +935,9 @@ def test_the_new_files_rounding_keeps_a_planned_move_within_close_move(tmp_path)
     assert plan(1995)[0][-3:] == [3006, 3206, 3406]   # 199.5 ms plays on
 
 
-def args_of(path, lag=None):
+def args_of(path):
     """The plan of planned_args() for the one audio track of the made-up file path, as mkvmerge -J would list it."""
-    return hook.planned_args(str(path), {"tracks": [{"id": 0, "properties": {"number": 1}}]}, [0], str(path.parent), lag)[1][1][1]
+    return hook.planned_args(str(path), {"tracks": [{"id": 0, "properties": {"number": 1}}]}, [0], str(path.parent))[1][1][1]
 
 
 def clustered(ticks):
@@ -1034,21 +1035,54 @@ def test_mux_tick_takes_the_timestamp_scale_of_mkvmerge(tracks, ids, tick):
     assert hook.mux_tick(j, ids) == tick
 
 
-def test_a_header_repair_refuses_a_plan_that_keeps_an_overlap_over_lag_slack(tmp_path):
-    """The block at 200 ms starts 1020 ms before the block before it ends, past CLOSE_MOVE, so every frame keeps its
-    time. It then sits 1000 ms behind the frame before it, which LAG_SLACK allows. One at 199 ms sits 1001 ms behind,
-    and the plan refuses with the original's overlap. A Vorbis block with no BlockDuration has no known end, so the walk
-    finds no overlap there. Its drop of 1100 ms raises nothing, and header_checks() decides after mkvmerge."""
+def test_a_plan_that_makes_an_overlap_over_lag_slack_worse_keeps_each_time(tmp_path):
+    """The block at 199 ms starts 1021 ms before the block before it ends, past CLOSE_MOVE, so every frame keeps its
+    time. It sits 1001 ms behind the frame before it, as in the stored times, and proof.lag_over() passes that. With a
+    70 ms overlap at 1050 ms first, the plan moves each frame after it 70 ms later. The block at 199 ms then sits
+    1061 ms behind, 991 ms in the stored times. So every frame keeps its time, as for a plan that the proof refuses. A
+    Vorbis block with no BlockDuration has no known end, so the walk finds no overlap there. Its plan keeps the stored
+    times, with their drop of 1100 ms."""
     path = tmp_path / "v.mkv"
     mkv(path, [entry(1, 2, "A_VORBIS")], [(0, [simple(1, x, [b"a"]) for x in [*range(0, 1201, 20), 100]])])
-    assert args_of(path, hook.LAG_SLACK)[-1] == 100 * NS
-    for at in (200, 199):
-        path = tmp_path / f"l{at}.mkv"
-        mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], [(0, [simple(1, x, [b"a"]) for x in [*range(0, 1201, 20), at, at + 20]])])
-        if at == 200:
-            assert args_of(path, hook.LAG_SLACK)[-2:] == [200 * NS, 220 * NS]
-            continue
-        with pytest.raises(RuntimeError) as ex:
-            args_of(path, hook.LAG_SLACK)
-        assert str(ex.value) == ("audio track 0 of the original stores 1 block that starts before the block before it ends, up to 1021 ms, the first "
-                                 "at 0.199 s. The new file would keep that overlap, and the audio would sit up to 1.0 s behind the other streams")
+    assert args_of(path)[-1] == 100 * NS
+    for name, ticks in (("same", [*range(0, 1201, 20), 199, 219]), ("worse", [*range(0, 1101, 20), *range(1050, 1191, 20), 199, 219])):
+        path = tmp_path / f"{name}.mkv"
+        t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], [(0, [simple(1, x, [b"a"]) for x in ticks])]))["tracks"][0]
+        plan = hook.planned_times(t, NS)
+        assert args_of(path) == (plan if name == "same" else list(t["time"])) and (plan == list(t["time"])) == (name == "same")
+        assert plan[-3:-1] == [(1200 if name == "same" else 1260) * NS, 199 * NS]   # a drop of 1001 or 1061 ms
+
+
+def test_a_plan_whose_drop_fails_the_lag_rule_after_rounding_keeps_each_time(tmp_path):
+    """Reviewer 2026-10-24: planned_args() took the lag rule on the raw plan, and the new file stores it rounded half up
+    to 1 ms. The original stores 100 us ticks. A 0.5 ms gap puts a frame at 1100.5 ms. The plan plays on the five frames
+    of the 70 ms overlap after it, up to 1200.5 ms. Then a block at 200.2 ms steps back 1000.3 ms, which rounds to 1000
+    ms and passes proof.lag_over(). The new file stores 1201 and 200 ms, a step back of 1001 ms, which prove() refuses.
+    The stored times step back 929.8 ms. So every frame keeps its time."""
+    path = tmp_path / "r.mkv"
+    t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], clustered([*range(0, 10801, 200), 11005, *range(10500, 11301, 200), 2002, 2202]),
+                            scale=100000))["tracks"][0]
+    plan = hook.planned_times(t, 100000)
+    drop = lambda ts: max(top - v for top, v in zip(itertools.accumulate(ts, max), ts)) / 1e9
+    rounded = [(v + NS // 2) // NS * NS for v in plan]
+    assert (drop(plan), drop(rounded), drop(t["time"])) == (1.0003, 1.001, 0.9298), plan
+    assert not hook.lag_over(drop(plan), drop(t["time"])) and hook.lag_over(drop(rounded), drop(t["time"]))
+    assert args_of(path) == list(t["time"]) != plan
+
+
+@pytest.mark.parametrize("cluster", [[(((1 << 64) - 16551616) // NS, [group(1, 0, b"a", 34)])], [(0, [group(1, 0, b"a", 1 << 60)])]],
+                         ids=["a Timestamp of 2^64 ns less 16 ms", "a duration of 2^60 ticks"])
+def test_a_time_past_64_bits_fails_the_walk_and_each_caller_refuses(tmp_path, cluster):
+    """libmkv 0.6.5 wrote a Cluster Timestamp of -16 ms as 2^64 ns less 16 ms, in ticks. That time in ns does not fit
+    the signed 64-bit arrays of the walk, and neither does a BlockDuration that large. The walk raises ValueError and
+    names the block. Each caller of the walk then reads nothing or refuses with that reason, and none raises."""
+    path = mkv(tmp_path / "w.mkv", [entry(1, 17, "S_TEXT/UTF8")], [(0, [group(1, 0, b"x", 10)])] + cluster)
+    why = r"the block at byte \d+ of track 1 stores a time or a duration of 2\^63 ns or more"
+    with pytest.raises(ValueError, match=why):
+        matroska.frames(path)
+    j = {"container": {"type": "Matroska"}, "tracks": [{"id": 0, "type": "subtitles", "properties": {"number": 1, "codec_id": "S_TEXT/UTF8"}}]}
+    assert hook.lace_guess(path, j) == ([], None) and hook.planned_args(path, j, [0], str(tmp_path)) == ([], {})
+    with pytest.raises(RuntimeError, match=why):
+        hook.srt_packets(path, j, 0)
+    with pytest.raises(RuntimeError, match=why):
+        hook.stored_places(path, [])

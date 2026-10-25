@@ -286,7 +286,11 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
             try:
                 if why: raise OSError(why)
                 with open(s["path"], "rb") as f:
-                    text_now = f.read().decode(proof.PY_CHARSET[s["charset"]], errors="replace")
+                    raw = f.read()
+                try:
+                    text_now = raw.decode(proof.PY_CHARSET[s["charset"]])
+                except UnicodeDecodeError:   # the file changed since its charset was read
+                    raise OSError(f"it does not decode as {s['charset']} now") from None
                 mux = os.path.join(folder, f"retimed-{len(keep)}.srt")
                 with open(mux, "w", encoding="utf-8") as f:
                     f.write(remux.srt_moved(text_now, fix))
@@ -654,6 +658,7 @@ def busy_tmp(lock, tmp):
     end = time.monotonic() + SWAP_POLL
     while os.path.lexists(tmp) and time.monotonic() < end:
         select.select([], [], [], 0.5)   # a real wait. The tests fake time.sleep.
+        ff.check_stop()
     raise runner.Replan("another conversion of the file wrote its temp file")
 
 
@@ -670,6 +675,7 @@ def swap_lock(lock):
             return
         except BlockingIOError:
             select.select([], [], [], 0.5)
+            ff.check_stop()
     runner.gated(lock, fcntl.LOCK_EX)
 
 
@@ -835,7 +841,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
 
     A CEA-608 caption track, which mkvmerge drops, becomes a SubRip track first, see convert_captions(). The remux goes
     to repack_tmp() with no time limit and no new encode. An error fails it, and an mkvmerge warning alone does not.
-    prove() then checks every stream at packet level, and the captions and the sidecars by their text. A Blu-ray TrueHD
+    prove() then checks every stream at packet level, and the captions and the sidecars by their text. A sidecar whose
+    charset is unknown, see proof.sidecar_text(), that mkvmerge reads otherwise than a player shows it, see
+    proof.misread(), or whose cues are timed for another cut, stays beside the file as it is. info names it in
+    sidecars_left. sidecars_unread maps the name of one with an unknown charset to True, and of one that mkvmerge misreads
+    to why. A sidecar timed for another cut gives that reason first, and it gets no notice. A Blu-ray TrueHD
     core that mkvmerge does not read pairs with no stream of the new file, see proof.lone_cores(). On a name change
     the new file goes in place, and the original holds held_name() while relink() makes the app list the new file. Only
     then the original and the sidecars go. The extras the app tracks for the original's record wait in hide_dir from the
@@ -889,9 +899,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     c = j.get("container") or {}
     unreadable = c.get("recognized") is False or c.get("supported") is False   # mkvmerge cannot read ASF or WMV
     container = c.get("type") or ("a container mkvmerge cannot read" if unreadable else "unknown")
-    new, subs = os.path.splitext(path)[0] + ".mkv", [] if unreadable else proof.sidecar_subs(path)
+    new, subs = os.path.splitext(path)[0] + ".mkv", [] if unreadable else proof.sidecar_subs(path, unknown=True)
     dur = decide.duration(j) or checks.ffprobe_duration(path) or 0
-    late = [s for s in subs if s["end"] > dur + max(decide.HEADER_OFF, decide.HEADER_SHARE * dur) or not s["ordered"]]
+    over = lambda s: s["end"] > dur + max(decide.HEADER_OFF, decide.HEADER_SHARE * dur)
+    cut = lambda s: over(s) or not s["ordered"]   # timed for another cut
+    late = [s for s in subs if not s["charset"] or cut(s) or s["misread"]]
     subs = [s for s in subs if s not in late]
     audio = {t["lang"] for t in decide.classify(j) if t["kind"] == "a" and t["role"] == "main"}
     for s in subs:   # a sidecar whose text reads as another language than its name is muxed with the text's language
@@ -903,8 +915,11 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             "sidecars": [{**{k: s[k] for k in ("name", "lang", "flags")}, "read": s["read"][0], **({"mismatch": s["mismatch"]} if "mismatch" in s else {})}
                          for s in subs], **({"old_path": path, "new_path": new} if new != path else {})}
     if late:   # it stays beside the file, where it keeps the base name the player looks for
-        info["sidecars_left"] = [f"{s['name']}: its cues are out of order" if not s["ordered"] else
-                                 f"{s['name']}: its last cue ends at {content.hms(s['end'])}, the file at {content.hms(dur)}" for s in late]
+        info["sidecars_left"] = [f"{s['name']}: " + ("its charset is unknown" if not s["charset"] else "its cues are out of order" if not s["ordered"]
+                                 else f"its last cue ends at {content.hms(s['end'])}, the file at {content.hms(dur)}" if over(s) else s["misread"])
+                                 for s in late]
+    if unread := {s["name"]: s["misread"] or True for s in late if not s["charset"] or not cut(s)}:   # the unreadable notice names them, see process.conversion()
+        info["sidecars_unread"] = unread
     try:
         streams = proof.ff_streams(path)[1]
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as ex:   # why: the (code, text) of a skip

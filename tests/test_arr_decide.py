@@ -418,6 +418,69 @@ def test_the_decision_rules(monkeypatch):
         pass
 
 
+def test_srt_read_finds_the_cues_mkvmerge_writes():
+    """decide.srt_read() of hostile SubRip shapes against the cues mkvmerge 102 wrote of each (2026-10-24). A cue that
+    mkvmerge drops (no text, or an end at or before its start) is left out of both sides, as clean_cues() leaves it
+    out. mkvmerge strips the spaces and tabs of each line of a cue and sorts the cues by start. stop is the line where
+    mkvmerge stops."""
+    t = lambda a, b: f"00:00:{a:02d},000 --> 00:00:{b:02d},000"
+    tail, abc = f"\n\n2\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", [(1000, 2000, "a"), (3000, 4000, "b"), (5000, 6000, "c")]
+    shapes = [
+        (f"1\n{t(1, 2)}\n" + tail, abc[1:], None),   # no text, then three line breaks
+        (f"1\n{t(1, 2)}\n   \t" + tail, abc[1:], None),   # spaces only
+        (f"1\n{t(1, 2)}\na\n" + tail, abc, None),   # three line breaks after a text
+        (f"1\n{t(1, 2)}\na\n\n2\n{t(3, 4)}\n\n\n3\n{t(5, 6)}\n\n", abc[:1], None),   # two cues with no text at the end
+        (f"1\n{t(1, 2)}\na\n\n  more" + tail, [(1000, 2000, "a\n\nmore"), *abc[1:]], None),   # a text after a blank line
+        (f"1\n{t(1, 2)}\na\n2\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", [(1000, 2000, f"a\n2\n{t(3, 4)}\nb"), abc[2]], None),   # no blank line
+        (f"1\n{t(1, 2)}\na\n\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", [(1000, 2000, f"a\n\n{t(3, 4)}\nb"), abc[2]], None),   # no number
+        (f"1\n{t(1, 2)}\na\n\n 2 \n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", [(1000, 2000, f"a\n\n2\n{t(3, 4)}\nb"), abc[2]], None),   # " 2 "
+        (f"1\n{t(1, 2)}\na\n\n2\n\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", abc, None),   # a blank line after the number
+        (f"1\n{t(1, 2)}\na\n\u00a0\n2\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", [(1000, 2000, f"a\n\u00a0\n2\n{t(3, 4)}\nb"), abc[2]], None),   # a no-break space is text
+        (f"1\n{t(1, 2)}\na\n\n2\nnot a time\nb\n\n3\n{t(5, 6)}\nc\n", abc[:1], 5),
+        (f"x\n{t(1, 2)}\na" + tail, [], 0),
+        ("\ufeff" + (f"1\n{t(1, 2)}\na" + tail).replace("\n", "\r\n"), abc, None),
+        ((f"1\n{t(1, 2)}\na" + tail).replace("\n", "\r"), abc, None),   # CR line ends
+        ((f"1\n{t(1, 2)}\na" + tail).replace("\n", "\r\r\n"), abc, None),   # CR CR LF is one line end
+        (f"1\r\n{t(1, 2)}\r\na\r\n\r\n2\n{t(3, 4)}\nb\r\r3\r{t(5, 6)}\rc\n", [abc[0], (3000, 4000, f"b\n3\n{t(5, 6)}\nc")], None),
+        (f"1\n00:00:01:000 -> 00:00:02.000 X1:1 X2:2 Y1:1 Y2:2\na" + tail, abc, None),
+        (f"1\n0:0:1 - - > 0:00:02,25\na" + tail, [(1000, 2250, "a"), *abc[1:]], None),
+        (f"1\n 00: 00: 01, 0006-->00:00:02,0004\na\n\n2\n00:00:03,0005 --> 00:00:04,0015\nb" + tail[tail.index("\n\n3"):],
+         [(1001, 2000, "a"), (3001, 4002, "b"), abc[2]], None),   # ms round half up
+        (f"1\n-00:00:01,000 --> 00:00:02,000\na" + tail, [(0, 3000, "a"), *abc[1:]], None),
+        (f"1\n100:00:01,000 --> 100:00:02,000\na" + tail, [*abc[1:], (360001000, 360002000, "a")], None),
+        (f"1\n{t(1, 1)}\na\n\n2\n{t(4, 3)}\nb\n\n3\n{t(5, 6)}\nc\n", abc[2:], None),   # length 0, ends before it starts
+        (f"1\n{t(1, 2)}\n{t(3, 4)}\n42\na" + tail, [(1000, 2000, f"{t(3, 4)}\n42\na"), *abc[1:]], None),
+        (f"1\n{t(1, 2)}\na\n\n2\0\n{t(3, 4)}\nb\n\n3\n{t(5, 6)}\nc\n", abc, None),   # a NUL at a line end
+        (f"1\n-00:00:01,000 --> -00:00:03,000\na" + tail, [(0, 2000, "a"), *abc[1:]], None),   # the end moves, and it keeps no sign
+        (f"1\n-00:-00:01,000 --> 00:00:02,000\na" + tail, abc, None),   # two minus signs cancel
+        (f"1\n{t(1, 2)}\na\n\n2\n００:00:03,000 --> 00:00:04,000\nb\n\n3\n{t(5, 6)}\nc\n", abc[:1], 5),   # digits are ASCII
+        (f"1\n00:00:01,0004 --> 00:00:02,1234567891\na" + tail, [(1000, 2123, "a"), *abc[1:]], None),   # 9 digits of the fraction
+        # mkvmerge cannot identify these as SubRip, see srt_probe()
+        (f"1234567890\n{t(1, 2)}\na" + tail, [], 0),   # a first number of 10 characters
+        (f"1          \n{t(1, 2)}\na" + tail, [], 0),
+        (f"1\n\n{t(1, 2)}\na" + tail, [], 0),   # a blank line before the first timing line
+        ("\n\n\n", [], 0),
+        ((f"1\n{t(1, 2)}\na" + tail).encode("utf-16-le").decode(), [], 0),   # UTF-16 with no BOM read as UTF-8
+        (f"1\n{t(1, 2)}", [], 0),   # the file ends at the first timing line
+        (f"1\r{t(1, 2)}\r", [], 0),
+        (f"1\n{t(1, 2)}" + "x" * 80, [], None),   # a read of 100 characters ends inside the line
+        (f"1\n{t(1, 2)}" + "x" * 71, [], None),   # a read of 100 characters ends at the file end
+        (f"1\n{t(1, 2)}" + "x" * 70, [], 0),   # a read of 99 characters reaches the file end
+        (f"1\n{t(1, 2)}\n", [], None),
+        (f"1\0\n{t(1, 2)}\na" + tail, abc, None),   # the probe strips a NUL too
+        (f"\0\n1\n{t(1, 2)}\na" + tail, abc, None),   # a line of NULs before the first number
+        ("1\n00:00:01,000" + " " * 60 + "--> 00:00:02,000\na" + tail, abc, None),
+        ("1\n00:00:01,000" + " " * 90 + "--> 00:00:02,000\na" + tail, [], 0),   # the timing line runs past 100 characters
+        ("", [], None),
+        ("\n", [], None),   # mkvmerge takes a file of 1 byte by its extension
+    ]
+    for text, want, stop in shapes:
+        lines, ends, cues, end = decide.srt_read(text)
+        got = sorted((a, b, "\n".join(x.strip(" \t") for x in decide.srt_text(lines, c).split("\n"))) for c in cues for a, b in [c[:2]]
+                     if c[3] and b > a)
+        assert (got, end, "".join(map(str.__add__, lines, ends))) == (sorted(want), stop, text), (text, got, end)
+
+
 def songs_probe(*subs):
     """A mkvmerge -J probe of 100 minutes: one English audio track titled English, then English subtitles (title,
     default, forced flag, frames). UIDs count from 1. frames None leaves out mkvmerge's statistics tag."""

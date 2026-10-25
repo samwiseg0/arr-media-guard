@@ -221,7 +221,7 @@ def test_the_header_repair_counts_the_frames_of_a_walk_that_read_every_cluster(t
     monkeypatch.setattr(hook, "ff_streams", lambda p: ("matroska,webm", [{"index": 0, "codec_type": "video", "codec_name": "h264"}], 1.0))
     monkeypatch.setattr(hook, "main_stream", lambda p: {"index": 0, "codec_name": "h264"})
     got = hook.original_frames(str(tmp_path / "cut.mkv"))
-    assert (got.startswith(want) if isinstance(want, str) else got == ([x / 1000 for x in want], NS)), got
+    assert (got.startswith(want) if isinstance(want, str) else got == ([x / 1000 for x in want], NS, {"video": [0.0], "audio": [], "subtitle": []})), got
 
 
 @pytest.mark.parametrize("place, whole", [("after the last Cluster", True), ("between two Clusters", False)])
@@ -240,7 +240,7 @@ def test_a_level1_element_whose_size_does_not_read_ends_the_count_only_after_the
     monkeypatch.setattr(hook, "ff_streams", lambda p: ("matroska,webm", [{"index": 0, "codec_type": "video", "codec_name": "h264"}], 1.0))
     monkeypatch.setattr(hook, "main_stream", lambda p: {"index": 0, "codec_name": "h264"})
     frames = hook.original_frames(str(tmp_path / "e.mkv"))
-    assert frames == ([0.0, 0.04, 0.1, 0.14], NS) if whole else frames.startswith("the block walk of e.mkv failed: the element at byte"), frames
+    assert frames[:2] == ([0.0, 0.04, 0.1, 0.14], NS) if whole else frames.startswith("the block walk of e.mkv failed: the element at byte"), frames
 
 
 

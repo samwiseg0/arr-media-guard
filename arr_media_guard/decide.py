@@ -707,7 +707,13 @@ def unapplied(after, edits):
 
 # Subtitle text language (docs/design.md, "Subtitle text"). A count of common words names the language of a subtitle
 # text, with no model and no dependency. Each list holds frequent dialogue words of one language. A word in one list
-# only is a telling word. A word in several lists counts only for the cover of each.
+# only is a telling word. A word in several lists counts only for the cover of each. A word of one list that is among the
+# 100 most common words of another listed language of its codepage joins that list for text_language() too, see
+# TEXT_SHARED, so it tells neither language. The word joins only when it is less than 4 times as common in its own
+# language as in the other. The OpenSubtitles 2018 word frequency lists gave these words (2026-10-24): "od", "po" and
+# "za" of Polish in Czech and Slovak, and "daar" and "haar" of Afrikaans in Dutch. "y" and "los" of Spanish, "of" of
+# English and "jou" of Afrikaans are 4.1 to 6.9 times as common in their own language, so they stay telling words. The
+# Ukrainian frequency list holds much Russian text, so it gave no word.
 TEXT_STEP = 300      # letters between two counts. A text with fewer letters is short and gets no answer.
 TEXT_STOP = 3000     # letters after which the count stops, about 600 words
 TEXT_TELL = 25       # telling words the top language needs for an answer
@@ -774,7 +780,6 @@ STOPWORDS = {k: frozenset(v.split()) for k, v in {
            "із йому тепер коли ну якщо вже або бути був нього вас знову вам там потім себе нічого їй може вони тут де є треба ній для "
            "ми тебе їх чим була сам без теж собі під буде тоді хто цей добре чому",
 }.items()}
-TELLING = {k: s - frozenset().union(*(o for j, o in STOPWORDS.items() if j != k)) for k, s in STOPWORDS.items()}
 # A script that names one language. Latin and Cyrillic go to the word lists. Han with kana is Japanese. Arabic script
 # with Persian letters is Persian. Another script names no language.
 SCRIPTS = {"GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara", "THAI": "tha", "HANGUL": "kor", "HIRAGANA": "jpn", "KATAKANA": "jpn",
@@ -794,8 +799,23 @@ HAN_SHARE = 0.2   # the share of the Han characters that HAN_COMMON must hold fo
 # lost the space after their ς weigh much at the first counts, so the count reads on to TEXT_STOP.
 GREEK_INNER_SIGMA = 0.01
 TEXT_NOISE = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # SubRip tags, ASS override blocks and ASS line breaks
-TEXT_FOLD = str.maketrans("şţё", "șțе")   # Romanian cedillas to commas below, and Russian ё to е, as the lists spell them
+# Cedillas to commas below, as Romanian lists spell them, Russian ё to е, and Turkish ı to i. lower() makes the Turkish
+# capital I an i, so "HAYIR" and "hayır" both fold to "hayir".
+TEXT_FOLD = str.maketrans("şţёı", "șțеi")
 WORD = re.compile(r"[^\W\d_]+")
+
+
+def text_fold(text):
+    """text in lower case with the letters of TEXT_FOLD folded. text_language() folds the text and the word lists with
+    it, so a Turkish ş in a list matches the ş of a text."""
+    return text.replace("İ", "i").lower().translate(TEXT_FOLD)
+
+
+# The shared words that join a list for text_language() only. The timing checks drop the STOPWORDS of a track's language
+# from the words they match, so these words stay anchors there, as in 2.18.7.
+TEXT_SHARED = {"cze": "od po za", "slo": "od po za", "dut": "daar haar"}
+TEXT_WORDS = {k: frozenset(map(text_fold, s | set(TEXT_SHARED.get(k, "").split()))) for k, s in STOPWORDS.items()}   # the lists as text_fold() folds them
+TELLING = {k: s - frozenset().union(*(o for j, o in TEXT_WORDS.items() if j != k)) for k, s in TEXT_WORDS.items()}
 
 
 def script_of(c):
@@ -831,7 +851,7 @@ def text_judge(words, scripts, letters):
         return None, 0.0, f"Serbian or Macedonian letters rule out {lang}", True
     if tell[lang] < TEXT_TELL:
         return None, 0.0, f"{tell[lang]} telling words", False
-    share, cover = tell[lang] / sum(tell.values()), sum(words.get(w, 0) for w in STOPWORDS[lang]) / sum(words.values())
+    share, cover = tell[lang] / sum(tell.values()), sum(words.get(w, 0) for w in TEXT_WORDS[lang]) / sum(words.values())
     if cover < TEXT_COVER:
         return None, round(share, 2), f"no list fits, {lang} words are {cover:.0%} of the text", True
     if share < TEXT_SHARE:
@@ -850,7 +870,7 @@ def text_language(cues):
     TEXT_MIXED is mixed at once, and a share just under TEXT_SHARE reads on, because a few early words weigh most."""
     words, scripts, letters, check = {}, {}, 0, TEXT_STEP
     for text in cues:
-        text = TEXT_NOISE.sub(" ", text).replace("İ", "i").lower().translate(TEXT_FOLD)
+        text = text_fold(TEXT_NOISE.sub(" ", text))
         for c in text:
             if c.isalpha():
                 s = script_of(c); scripts[s] = scripts.get(s, 0) + 1; letters += 1
@@ -1562,7 +1582,99 @@ REMOVE_MIN = 2                        # and at least this many late lines, so on
 CUT_END = 0.95     # the video and the audio of a complete file end at this share of the listed runtime or later
 REMOVE_END = 1.2   # a removed track ends past this share of the listed runtime
 TEXT_SUBS = ("S_TEXT/UTF8",)          # the subtitle codecs a trim can cut: SubRip
-SRT_TIME = re.compile(r"^\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})(.*)$")
+# A SubRip timing line as mkvmerge 102 reads it (srt_parser_c::parse). Each part may hold spaces and a minus sign, the
+# fraction may have any count of digits or be left out, and the arrow is a run of dashes and spaces before ">". Text
+# after the end time is left out. Group 1 is the start time as written, then a sign and digits for each part.
+SRT_STAMP = r"\s*(-?)\s*(\d+):\s*(-?)\s*(\d+):\s*(-?)\s*(\d+)(?:[,.:]\s*(-?)\s*(\d+))?"
+SRT_TIME = re.compile(rf"({SRT_STAMP})\s*[-\s]+>{SRT_STAMP}", re.ASCII)
+SRT_NUMBER = re.compile(r"\d+", re.ASCII)
+
+
+def srt_lines(text):
+    """(the lines of text, the line end after each one) as mkvmerge splits a text file (mm_text_io_c::getline), so
+    "".join(map(str.__add__, *srt_lines(text))) is text. LF, CR LF and a lone CR end a line. In a file whose first line
+    end holds an LF, CRs in a row before an LF or a letter make one line end. In a file of CR line ends, each CR ends a
+    line. The last line has the end ""."""
+    first = re.search(r"[\r\n]+", text)
+    parts = re.split(r"(\r*\n|\r+)" if first is None or "\n" in first.group() else r"(\r\n|\r|\n)", text)
+    return parts[0::2], parts[1::2] + [""]
+
+
+def srt_ms(g):
+    """The time in ms of the 8 groups of one stamp of SRT_TIME, a sign and digits per part. mkvmerge reads the fraction
+    to the nanosecond, and its Matroska time rounds to the ms. One minus sign makes the time negative, two cancel."""
+    ns = ((int(g[1]) * 3600 + int(g[3]) * 60 + int(g[5])) * 10 ** 9 + int((g[7] or "").ljust(9, "0")[:9]))
+    return -ns if g[0::2].count("-") % 2 else ns
+
+
+def srt_probe(lines, ends):
+    """Whether mkvmerge 102 takes a text, srt_lines() lines and ends, as SubRip (srt_parser_c::probe). Else it cannot
+    identify the file, and the remux fails. The probe reads in pieces. The first piece of 10 characters that holds more
+    than spaces, tabs and NULs must be a number. The next piece of up to 100 characters, the rest of that line or the
+    next line, must start with a timing line. The read of that piece must not reach the end of the file. A read of 100
+    characters stops at the 100th, so it never reaches the end. A text of at most 1 character passes, because mkvmerge
+    then goes by the file's extension (measured on mkvmerge 102). mkvmerge counts the bytes after the BOM there, so it
+    refuses a UTF-16 text of 1 character. srt_probe() takes that text too."""
+    lines = [lines[0][1:] if lines[0][:1] == "\ufeff" else lines[0], *lines[1:]]
+    if sum(map(len, lines + ends)) <= 1:
+        return True
+    end = lambda i: i == len(lines) - 1 or ("\n" not in ends[i] and i == len(lines) - 2 and not lines[-1])   # the read of line i reaches the file end
+    i = next((i for i, s in enumerate(lines) if s.strip(" \t\0")), None)
+    if i is None:
+        return False
+    k = next(k for k in range(0, len(lines[i]), 10) if lines[i][k:k + 10].strip(" \t\0"))
+    if not re.fullmatch(r"[-+]?\d+", lines[i][k:k + 10].strip(" \t\0"), re.ASCII):
+        return False
+    if len(lines[i]) - k < 10:   # the piece took the line end, so the next piece is the next line
+        if end(i):
+            return False
+        i, k = i + 1, -10
+    t = lines[i][k + 10:]
+    return bool(SRT_TIME.match(t[:100])) and (len(t) >= 100 or not end(i))
+
+
+def srt_read(text):
+    """(lines, ends, cues, stop) of a SubRip text as mkvmerge 102 reads it (srt_parser_c::parse). lines and ends are
+    srt_lines(). cues holds each timing line it reads, in file order, as [start ms, end ms, the index of the timing
+    line, range of the indexes of its text lines]. stop is the index of the line where mkvmerge stops reading the
+    file, else None. It is 0 with no cues for a text that srt_probe() refuses. Each line loses its spaces, tabs and NULs
+    at the end for the reading. The rules:
+    - A number line (digits alone) and then a timing line start a cue. Blank lines between the two do not count.
+    - The lines after the timing line are its text, blank lines among them too, up to the next number line that comes
+      after a blank line. A number or timing line in the text is text, as is a timing line with no number before it.
+    - A number line that a timing line does not follow, or a first line that is no number, stops the reading.
+    - A start before 0 becomes 0, and the end moves by as much.
+    mkvmerge writes no cue with empty text, and none that ends at or before its start. Such cues are in cues too."""
+    lines, ends = srt_lines(text)
+    if not srt_probe(lines, ends):
+        return lines, ends, [], 0
+    cues, state, stop = [], "first", None
+    for i, line in enumerate(lines):
+        s = (line[1:] if i == 0 and line[:1] == "\ufeff" else line).rstrip(" \t\0")
+        if not s:
+            state = state if state in ("first", "time") else "number"
+        elif state == "time":
+            if not (m := SRT_TIME.match(s)):
+                stop = i
+                break
+            a, b = srt_ms(m.groups()[1:9]), srt_ms(m.groups()[9:17])
+            a, b = (a, b) if a >= 0 else (0, abs(b - a))
+            cues.append([(a + 500000) // 10 ** 6, (b + 500000) // 10 ** 6, i, range(i + 1, i + 1)])
+            state = "text"
+        elif state != "text" and SRT_NUMBER.fullmatch(s):
+            state = "time"
+        elif state == "first":
+            stop = i
+            break
+        else:
+            r = cues[-1][3]
+            cues[-1][3] = range(r.start if r else i, i + 1)
+    return lines, ends, cues, stop
+
+
+def srt_text(lines, cue, sep="\n"):
+    """The text of a cue of srt_read() with its lines joined by sep."""
+    return sep.join(lines[n] for n in cue[3])
 
 
 def frame_steps(times):
@@ -1848,23 +1960,15 @@ def subtitle_plan(trim, remove, ends, streams, listed):
 
 def trim_srt(text, limit):
     """(the SubRip text with every event cut at limit seconds, {"events", "cut", "dropped"}). An event that starts at or
-    after limit goes, one that ends after it ends at it, and the events are numbered again. A block with no timing line
-    is more text of the event before it, after a blank line, as mkvmerge reads it.
-    Raises ValueError when the first block has no timing line, so a trim never drops text it could not read."""
-    sec = lambda h, m, s, f: int(h) * 3600 + int(m) * 60 + int(s) + int(f.ljust(3, "0")) / 1000
+    after limit goes, one that ends after it ends at it, and the events are numbered again. The events are the cues of
+    srt_read(). Raises ValueError when mkvmerge stops reading the text, so a trim never drops text it could not read."""
     stamp = lambda t: f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{int(t % 60):02d},{round(t % 1 * 1000) % 1000:03d}"
-    events, out, n = [], [], {"events": 0, "cut": 0, "dropped": 0}
-    for block in re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n").strip("\n\ufeff")):
-        lines = block.split("\n")
-        k = next((i for i, line in enumerate(lines[:2]) if SRT_TIME.match(line)), None)
-        if k is None:
-            if not events:
-                raise ValueError(f"a SubRip block with no timing line: {block[:60]!r}")
-            events[-1][1] += ["", *lines]
-            continue
-        events.append([SRT_TIME.match(lines[k]).groups(), lines[k + 1:]])
-    for g, text_lines in events:
-        start, end = sec(*g[:4]), sec(*g[4:8])
+    lines, _, cues, stop = srt_read(text)
+    if stop is not None:
+        raise ValueError(f"mkvmerge stops reading the SubRip text at line {stop + 1}: {lines[stop][:60]!r}")
+    out, n = [], {"events": 0, "cut": 0, "dropped": 0}
+    for c in cues:
+        start, end = c[0] / 1000, c[1] / 1000
         n["events"] += 1
         if start >= limit:
             n["dropped"] += 1
@@ -1872,7 +1976,8 @@ def trim_srt(text, limit):
         if end > limit:
             n["cut"] += 1
             end = limit
-        out.append("\n".join([str(len(out) + 1), f"{stamp(start)} --> {stamp(end)}{g[8]}"] + text_lines))
+        rest = lines[c[2]][SRT_TIME.match(lines[c[2]]).end():]
+        out.append("\n".join([str(len(out) + 1), f"{stamp(start)} --> {stamp(end)}{rest}", srt_text(lines, c)]))
     return "\n\n".join(out) + "\n", n
 
 

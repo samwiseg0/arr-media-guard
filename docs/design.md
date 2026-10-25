@@ -191,8 +191,8 @@ TMDB gives none or one with no 639-2 code, no flag changes.
   flag edits.
 - An undecided or dropped plan gets none, as for the tags. The deep analysis, a recheck and `--sub-time` on a file
   no app lists keep the flags, see `process.act()`. No recheck entry exists, so old files change only in a backfill.
-  `cli.selected()` leaves out a file with one audio track, no subtitles and no tag to fix, so a backfill never sets
-  its flag.
+  `cli.selected()` takes a file with one audio track, no subtitles and no tag to fix when its Original language flag
+  may change, see `cli.TRIGGERS`. So a backfill sets its flag as an import does.
 - An edit of this flag alone queues no Plex analyze, see `process.changed()`. Plex does not read the flag, and most
   imports get one. Any other edit queues the analyze as before.
 - The decision line's `tracks` shows each track's flag as `orig`, 1, 0 or `null`, as the run found it.
@@ -843,12 +843,21 @@ stopped one. Its job goes back to the queue, and its next run reads the file as 
 rest. That next run queues the jobs that follow an import, see `runner.queue_after()`. It settles the extras that a
 converted import left hidden, see `convert.left_converted()`, and sends the app rescan of a write of the stopped run.
 A backfill sends that rescan at its end. A deep analysis that a stop cut keeps its held alerts for its next run.
-When mkvmerge fails after `remux.stopped()` recorded a stop, the failure counts as the stop, because the same Ctrl+C
-or SIGTERM killed mkvmerge. A run with no handler of its own, as `--check`, has Python's Ctrl+C handler and SIGTERM at
-its default. It keeps a stop during the layout repair, and its next write raises it. A stop during any other remux ends
-such a run at once. Pending Plex analyzes go into the state store for the next worker. With `KillMode=process` on the
-app's unit, a stop of the
-app never signals the worker. A decision log line is one `O_APPEND` write, so lines never
+A job process, a remux and a backfill apply send SIGTERM and Ctrl+C to one handler, `ff.on_stop()`. A dry backfill
+sends Ctrl+C to it. It only records the stop, so it never leaves a lock held. CPython runs a handler between any two
+bytecodes of the main thread, also inside a `with` block of the standard library, and a raise there skips the release.
+After a write, and in a backfill apply, the stop only asks. Before a write, during a remux and in a dry backfill, the
+stop cuts the step. The handler then kills each child of the
+process with SIGKILL. The job raises the stop at its next check, see `ff.check_stop()`. A check comes before each
+child starts, after each child of `ff.run()` and `ff.popen()`, at each check of a time limit and at each try of a file
+lock. The Matroska walk and its frame pass, the packet read's frame loop, the TS read, the proof's wait for its reads,
+and the waits for another job's turn, temp file or swap check too. A sleep runs 10 seconds at most before the next check. An HTTP call in flight runs to its timeout, 60 seconds for
+an app. When mkvmerge fails after such a stop, the failure counts as the stop, because the stop killed mkvmerge, see
+`remux.Swap.stop()`. A run with no handler of its own, as `--check` and the worker with `HOOK_WORKERS=1` and
+`BACKGROUND_WORKERS=1`, has Python's Ctrl+C handler and SIGTERM at its default. It keeps a stop during the layout repair
+in `STOP["kept"]`, and only its next write raises it, see `runner.raise_term()`. The checks before that write let the
+run go on, so the decision line of the edit gets its store row. A stop during any other remux ends such a run at once. Pending Plex analyzes go into the state store for the next worker. With `KillMode=process` on the app's unit, a stop of the app
+never signals the worker. A decision log line is one `O_APPEND` write, so lines never
 interleave. When the app renamed a file before its job ran, the worker asks the app for the new path
 by the file's id. A 404 or another item drops the job as `file_gone`. When the file is at its path, each run of the
 job asks the app by the file's id too. The run asks under the file lock before the checks, and a re-run after a re-plan
@@ -1236,8 +1245,17 @@ that holds another container converts under its own name, so its original goes t
 **The remux.** A `.srt` beside the video that starts with its base name is muxed in, with its
 language, forced and hearing-impaired flags from the name. Its text can overrule the name's language,
 and a name with no language takes the text's. A sidecar in a legacy codepage goes in decoded right.
-One that no codepage reads decodes as cp1252 and goes in as before 2.4.0, see "Subtitle text". A sidecar that ends past the video, or
-has cues out of order, is timed for another cut and stays beside the file. `mkvmerge
+A sidecar whose charset is unknown stays beside the file as it is, see "Subtitle text". AMG reads the cues of a
+sidecar as mkvmerge 102 reads them, see `decide.srt_read()`. mkvmerge writes no cue with empty text, and the proof leaves
+such a cue out too. mkvmerge reads some sidecars otherwise than a player shows them, see `proof.misread()`. It may not
+identify the file as SubRip, see `decide.srt_probe()`, and then the remux fails. It stops reading at a number line that
+no timing line follows. It reads a number and a timing line after a text line with no blank line as text of the cue
+before, where a player shows a cue of its own. It drops a cue with text of length 0 and a cue that ends before it
+starts. Such a sidecar stays beside the new file byte for byte. `repack.sidecars_left` says why, as "Movie.es.srt:
+mkvmerge drops 2 of its cues", and the "Subtitles left out of the MKV" notice names it, see "Unreadable subtitles".
+The proof still refuses a stop and a dropped cue, as a guard. A sidecar that ends past the video, or
+has cues out of order, is timed for another cut and stays beside the file. `repack.sidecars_left` names each sidecar
+that stays and why. `mkvmerge
 --disable-lacing --track-order` writes the temp file into `.<NAME>-convert` beside the video. The apps' disk
 scan and Plex skip a hidden folder, so they never import a partial file. A hidden file beside the
 video is not enough. The app's scan takes it as an extra of the item and can rename it or send it to
@@ -1344,10 +1362,18 @@ Matroska source, such as a WebM, gives an audio track that mkvmerge would time o
 plays at its time. The ffmpeg subtitle remux read each rewritten track from its own input, and with a sparse copied
 track ffmpeg held that input back and wrote its packets in bursts minutes late. The proof reads the file position of
 each packet from the reader of its container, see "Time reads", and from an ffprobe read of a file with no reader. A packet's lag is how far its time trails the latest time of the packets
-before it in the file. Each stream's worst lag in the new file may exceed its paired stream's worst lag in the
-original by 1 second at most (`LAG_SLACK`). A sidecar has no original stream and may lag 1 second. B-frames give
-video a lag of a few frames in any file. The refusal names the stream and both lags, and each proof entry keeps them
-in `lag`. A new Matroska file must also pass the layout check of "Header repair" before any packet is read.
+before it in the file. A stream fails when its worst lag in the new file is over 1 second (`LAG_SLACK`) and over the
+worst lag of its paired stream in the original by more than 1 ms, both in whole ms (`proof.lag_over()`). A new file
+with video stores whole ms. A TS or MP4 original stores 90 kHz ticks, so the copy of its step back of 1.0004 s steps
+back 1.001 s. So a stream may sit up to 1 second behind, or 1 ms further behind than in the original. A sidecar has no
+original stream, so 1 second alone bounds it. The proof, the header repair and the planned audio times all take this rule. A PGS track
+can store a display set right after its own display set of a later time. A Blu-ray file measured on 2026-10-24 holds
+three such tracks. Each stores a display set at 4303.383 s right after its display set at 4304.384 s, a step back of
+1.001 s in the track's own order. mkvmerge keeps the packet order of each track, so 1.001 s is the lowest lag any
+writer can give them. The original holds 1.044 s, because an audio packet at 4304.427 s sits before them. B-frames
+give video a lag of a few frames in any file. The refusal names the
+stream and both lags, and each proof entry keeps them in `lag`, [original, new file]. A new Matroska file must also
+pass the layout check of "Header repair" before any packet is read.
 
 **Laced audio.** A Matroska block can hold several audio frames, a lace, and it stores one time for all of them.
 ffmpeg times the other frames from durations floored to the millisecond. So when both files are Matroska, the proof
@@ -1680,8 +1706,10 @@ gives a file of audio alone one sample of its highest audio rate, less 1 ns and 
 frames, which can differ from the rate the file stores. So the remux of a file of audio alone gives mkvmerge the tick
 of the stored rate (`--timestamp-scale`), and the check and the new file use one tick. Where the two rates agree, the
 new file holds the same bytes as without the option. When the proof would refuse the plan, every frame of that
-track keeps its time. So no writer writes a plan that its own proof refuses. The header repair runs no proof, and it
-writes no such plan either. The proof counts the frame length of a run in fractions of a microsecond, so a run of
+track keeps its time. A plan that keeps an overlap has a worst drop, how far a frame falls below the latest planned
+time before it. The drop comes from the planned times rounded to the tick, as the new file stores them. When that drop fails the rule of "Where a packet sits" against the same drop in the stored times,
+every frame keeps its time too. So no writer writes a plan that its own proof refuses. The header repair runs no
+proof, and it writes no such plan either. The proof counts the frame length of a run in fractions of a microsecond, so a run of
 any length passes. It refuses a plan that moves the earliest frame of the track. In an original finer than 1 ms, a
 frame and the first time it counts from each round in the new file. The slack holds both, see "The slack" under
 "Frame times". On a film of 10.9 GB the check took 1.4 s, and it kept the plan.
@@ -1869,7 +1897,8 @@ keeps the name and the original, and it keeps the track order and every UID. The
 these checks:
 
 - mkvmerge exits 0 with no warning.
-- The same tracks, in the same order, with the same properties and UIDs.
+- The same tracks, in the same order, with the same properties and UIDs. A property changes only as a row of
+  "mkvmerge rewrites" says.
 - The streams end within 1 second of where the original's streams end, usable Cues, and no issue left. Both ends
   come from the last blocks of each file, read the same way. mkvmerge writes the Segment duration from the first
   block, so a file whose blocks start at 2.5 s has a header 2.5 s shorter than its stream end.
@@ -1883,10 +1912,15 @@ these checks:
   Segment size past the end of the file, or a level-1 element after the last Cluster whose size does not read, with no
   Cluster id after it in the file. A failed edit leaves such a file, and the repair exists to fix it. A second file
   that cat joined after it holds a Cluster id, so the count is not known.
+- As many streams of each type as ffprobe reads in the original, less the tracks the repair removes. mkvmerge 102
+  -J lists no Opus, S_KATE, S_DVBSUB or HDMV TextST track with no CodecPrivate, and its remux drops that track with
+  exit 0. The tracks check compares two mkvmerge probes, so it misses that loss. The ffprobe read of the original
+  comes with the walk for the frame count, so a new file with no main video gets no such check.
 - A size within 3 percent of the original Segment, and 3 clean decoded windows.
-- No packet over 1 second (`LAG_SLACK`) behind the packets before it in the file. A packet's lag is how
-  far its time trails the latest time of the packets before it. The original's lag does not count, so a
-  repair must put late packets in place. The walk of the new file gives the positions.
+- Each stream's lag passes the rule of "Where a packet sits" against its stream in the original. The walk of the
+  new file gives the positions, and the walk of the original for the frame count gives its lags. The k-th stream of
+  a type pairs with the k-th track of that type in the original, less the tracks the repair removes. A new file with
+  no main video walks no original, and 1 second alone bounds it. `header_repair.lag` keeps both lags per stream.
 
 **A variable frame rate.** Some files hold frames of more than one length in one video track. They still store one
 DefaultDuration. HandBrake mixes film parts at 23.976 fps and video parts at 29.97 fps from a telecined source. A
@@ -1916,7 +1950,9 @@ rewritten tracks up to an hour late in the file. mkvmerge reads one input in fil
 about 20 MB of packets while it waits for a late one, and past that it writes the late packet where it
 finds it. So the remux names the file twice. The first input gives every track but the subtitles, with
 the chapters, the tags and the attachments. The second gives only the subtitle tracks. mkvmerge reads
-each input on its own and writes every packet by its time. The second input reads the whole file again.
+each input on its own and writes the packets of all tracks by their times. It keeps the packet order of each track,
+so a packet stored after a later packet of its own track stays behind it, see "Where a packet sits". The second
+input reads the whole file again.
 A file with no subtitle track has one input. mkvmerge compresses PGS and VobSub tracks with zlib by
 default, and some hardware players read none. So a track that the source holds uncompressed stays
 uncompressed, as in the subtitle remux, see `remux.compression_args()`.
@@ -1924,10 +1960,8 @@ uncompressed, as in the subtitle remux, see `remux.compression_args()`.
 **Each audio frame in its own block.** The remux passes `--disable-lacing`, as a conversion does.
 mkvmerge would lace the audio of an unlaced source. A player that seeks to 0 skips each block before the
 first video keyframe, and a lace there holds up to 170 ms of audio. An audio track that mkvmerge would time on its own
-gets its planned times, see "Planned audio times", and `plan_fault()` reads each one back. The repair holds every
-stream within `LAG_SLACK` of the others. A plan that keeps an overlap of more than 1 s would leave its audio that far
-behind. So the repair refuses before mkvmerge runs, and the header issue stays. The reason names the count of the
-original's overlapping blocks, the worst overlap and the first time.
+gets its planned times, see "Planned audio times", and `plan_fault()` reads each one back. A plan that would put
+its audio further behind the other streams than the rule of "Where a packet sits" allows keeps the stored times.
 
 **Audio that holds ffmpeg's estimates is laced again.** ffmpeg copies a lace frame by frame. It puts each
 frame in its own block, at a time it estimated from floored durations, up to 2 ms early for AAC. mkvmerge
@@ -1963,7 +1997,8 @@ the video and the audio. It cuts the late SubRip lines at the end. A track with 
 `REMOVE_MIN` (2) lines, and `REMOVE_SHARE` (10 percent) of its lines, after the real end is timed
 for another cut. The hook removes that track when it also ends past `REMOVE_END` (1.2) of the listed
 runtime, because a wrong track is worse than none. It trims the other late tracks. A PGS or VobSub track would need a new encode, so it
-stays.
+stays. A trimmed track goes into the remux as a Matroska file that holds its UID, see `remux.uid_files()`, so it keeps
+its UID as every other track does.
 
 **A cut file keeps its subtitles.** A cut file's subtitles run to the full length and would meet the
 removal rule. So nothing changes when the video and the audio end under `CUT_END` (0.95) of the
@@ -1985,6 +2020,46 @@ The app rescans the item once. A backfill dry run reports
 doubt or a fault that blocks the repair gives `header_not_repaired`. Its result names the block, then the issue, as
 `not repaired: the video ends at 1:54:58 and the audio at 1:50:12. The issue: the header says 13:23:33, but the streams
 end at 1:54:58`. The line of a backfill shows the first 300 characters of a header result.
+
+## mkvmerge rewrites
+
+mkvmerge 102 writes a few track properties again in a remux. `remux.REWRITES` holds one row for each change that AMG
+accepts. A row names the codecs it takes, the mkvmerge -J properties it may change, the change, and one function that
+accepts that change and nothing else. `remux.tracks_fault()`, `remux.props_fault()` and `remux.header_kept()` read the
+table, so the header repair and the subtitle remux take the same rows. Any other change of a kept property refuses the
+remux. The rows:
+
+- BCP 47 tag added. A track with a legacy tag and no BCP 47 tag gets the tag that mkvmerge's language table gives it.
+- Legacy tag added. A track with only a BCP 47 tag reads as eng, and mkvmerge writes the legacy tag of its language.
+- A legacy 639-3 code. mkvmerge writes a code its 639-2 table lacks, such as yue, as the BCP 47 tag, and the closest
+  639-2 code, such as chi, as the legacy tag. That code must be und or name the same language, see
+  `decide.lang_key()`, so zsm to may refuses. The code any keeps its refusal. HandBrake writes any for Any, and BCP 47
+  reads it as the Anyin language.
+- AVC header. Bytes 1 to 3, the profile, the compatibility flags and the level, take those of the first SPS.
+  mkvmerge 4.9.1 wrote them as 0.
+- VC-1 header. biSize of a BITMAPINFOHEADER of FourCC WVC1 becomes the header's length, and biXPelsPerMeter and
+  biYPelsPerMeter become 1 where they are 0. ffmpeg writes a byte of padding past biSize and both as 0.
+- Vorbis comments. mkvmerge empties the comment list and keeps the vendor. The identification and setup headers stay
+  byte for byte. It makes a METADATA_BLOCK_PICTURE comment an attachment, so a header that holds one refuses.
+- VP9 header. mkvmerge adds Codec Feature Metadata where the track has no header. Each record holds 3 bytes, an ID
+  from 1 to 4, a length of 1 and the value. The IDs come in ascending order, and IDs 1 and 3 always come.
+- ASS header. The text round trip of the subtitle remux writes the header's lines in order, less a NUL at its end and
+  the blank lines at its end, each followed by CRLF, then one blank line. A header with no `[Events]` section, in any
+  case, gets a blank line, `[Events]` and the Format line of its codec before that blank line. Only a track that the
+  round trip wrote takes the row.
+
+Every AMG remux keeps every track UID, and `remux.tracks_fault()` refuses any UID change.
+A track with no UID, or a UID that another track holds too, takes a new UID from mkvmerge, so its remux refuses.
+MakeMKV track UIDs keep their refusal. mkvmerge gives every track of a file whose writing app holds makemkv in its
+first word a new random UID. A selector names a track by its UID. A queued plan line, an audited follow-up and the
+undo line of an earlier edit name the tracks of the original, so a new UID breaks them. In the census of 2026-10-24,
+41 files that MakeMKV wrote took new UIDs, and none of them had a header issue to repair.
+
+To add a row, take a census with the new mkvmerge. Remux a few files of each kind in the library (codec, muxing app
+and writing app) with the header repair's own command, and compare every track property of each pair. A change that
+no row accepts refuses the remux. Read the source of mkvmerge for that change, then add one row and its function. Give
+the row a test of the change it accepts and one test of each near change, in `tests/test_rewrites.py`. Take the census
+again at each mkvmerge bump.
 
 ## RFC 9559 check
 
@@ -2370,6 +2445,9 @@ touch /opt/arr-media-guard-lid/ready        # last
 dependency. Each of 18 languages has a list of common dialogue words: English, Spanish, Portuguese,
 French, German, Italian, Romanian, Dutch, Afrikaans, Swedish, Danish, Norwegian, Polish, Czech,
 Slovak, Turkish, Russian and Ukrainian. A word in one list only is a *telling* word. Its answer is the *read* language.
+A word common in two listed languages of one codepage counts in both lists and tells neither, see the comment above
+`STOPWORDS` in `decide.py`. It joins the other list only for this read, see `TEXT_SHARED`. The timing checks keep it as
+a word to match.
 
 - The letters give the script first. Greek, Hebrew, Arabic, Persian, Thai, Korean, Japanese, Chinese,
   Hindi, Tamil, Telugu, Georgian and Armenian text gets the language of its script. Latin and Cyrillic
@@ -2409,8 +2487,13 @@ The read language is a signal, never an authority.
   letters, but with ς inside words, which Greek writes only at a word's end, so that decode reads as no Greek. When no
   decode reads as a language, the first codepage of the name's language whose decode gives the letters of one script
   wins, in Latin letters mostly ASCII ones. So a Serbian name takes cp1250 for Latin letters and cp1251 for Cyrillic.
-  Else the bytes decode as cp1252, as they did before 2.4.0, and the sidecar keeps its name's language or `und`. The
-  same decode reads a sidecar beside a Matroska file for the subtitle check. mkvmerge gets the codepage with `--sub-charset`.
+  Else the charset is unknown. Each charset decodes the bytes strictly, UTF-16 too. Each later read of the sidecar, by
+  the proof, the retime of a conversion and the flash check, decodes it strictly with that charset too. A sidecar that
+  does not decode as its charset now fails the proof and gets no new times. A conversion never muxes a sidecar
+  whose charset is unknown. It stays beside the new file byte for byte. `repack.sidecars_left` and `repack.sidecars_unread`
+  name it, and the "Unreadable subtitles" notice says why. The same decode reads a sidecar beside a Matroska file for the
+  subtitle checks, and they leave out a sidecar whose charset is unknown. So no check reads its text, and no fix moves or
+  writes it. The decision line names it in `sidecars_skipped`. mkvmerge gets the codepage with `--sub-charset`.
 - **Subs folders.** The hook reads the sidecars beside the video only. The apps import the sidecars of
   a download's Subs folder beside the video, under the video's name, so no Subs folder reaches the hook.
 - **Tracks in a Matroska file.** The read language is one signal of the rule in "Language tags". Only
@@ -2592,7 +2675,12 @@ keeps them. A subtitle remux names each file in `subremux.garbled_text`, and a f
 in `subremux.garbled_text_removed`.
 
 **The notice.** `report.unreadable_finding()` builds the one alert, "Unreadable subtitles". It names each track as
-track N of the original file and each sidecar by its name, with the file that holds its bytes. A conversion's alert
+track N of the original file and each sidecar by its name, with the file that holds its bytes. A sidecar that a
+conversion left beside the video as it is goes by its name alone, see "Conversion". Its charset is unknown, or mkvmerge
+reads it otherwise than a player shows it, and its own file still holds its bytes. Several such sidecars share one
+pair of sentences, and then a sentence per reason names them. When AMG reads each sidecar of the alert well, and
+mkvmerge misreads it, the title is "Subtitles left out of the MKV". The alert marker keys on the kind
+`unreadable`, see `logs.alert()`. A conversion's alert
 starts with the conversion. A run posts one such alert, and it also says each repair of the run, see
 `subtitles.sub_findings()`. When a run converts the file and then takes out garbled tracks or renames sidecars, the
 alert names the conversion first, then the tracks taken out after it, see `process.after_edit()`. Such a track goes
@@ -2855,11 +2943,9 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   the type, codec and language of each kept track in order, its UID and its BCP 47 tag. It must also keep the
   properties in `KEEP_PROPS` (its name, flags and codec private data), the count of attachments and the chapter
   entries of each edition. mkvmerge
-  keeps the codec private data byte for byte, the HEVC hvcC record too, but for two headers it writes again in place.
-  It writes the profile, compatibility and level bytes of an AVC header from its first SPS, where mkvmerge 4.9.1 wrote
-  0. It writes biSize of a VC-1 header (FourCC WVC1) that ffmpeg wrote as the header's length, and its
-  pixels-per-meter fields as 1 where they are 0. Only those exact bytes pass, see `remux.header_kept()`, and the
-  changes of the text round trip below. Any other change refuses the remux. mkvmerge also writes the Channels element
+  keeps the codec private data byte for byte, the HEVC hvcC record too, but for the headers it writes again. Only the
+  rows of "mkvmerge rewrites" pass, see `remux.header_kept()`, and any other change refuses the remux. mkvmerge also
+  writes the Channels element
   of an old E-AC-3 7.1 or AAC 7.1 track as 8, and a DefaultDuration for AC-3 that ffmpeg wrote. Those match the
   streams, and `KEEP_PROPS` holds no audio field. The proof of "Conversion" must pass with the retimed tracks' times
   as the fix moves them. It also holds each stream to its own start time, so a remux that moved every stream fails.
@@ -2872,7 +2958,9 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 - A sidecar beside a Matroska file that does not match moves into `.<NAME>-originals` as a kept original, with a log line and
   the alert. A sidecar whose times need a fix is written again with new times, and its original is kept the same way.
   Only its time lines change. Every other byte stays, so its text keeps its character set, even one the detection
-  misses (`subtitles.raw_srt()`). With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. The program
+  misses (`subtitles.raw_srt()`). With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. A sidecar with
+  a timing line that AMG reads as text of the cue before, with text of its own after it, stays as it is and alerts, see
+  `proof.glued_cue()`. A player shows that text as a cue of its own, and a rewrite would keep its old time. The program
   that wrote it, such as Bazarr, can download the same wrong file again, and the hook does not tell it. A later check
   moves it again.
 - In a conversion, a sidecar that does not match is not muxed. It moves into `.<NAME>-originals`, and with
@@ -2931,8 +3019,8 @@ text. For an ASS or SSA track, mkvextract writes its text, the ends go in, and m
 each packet and the ASS header byte for byte, with the changes below.
 HandBrake ends each ASS event and the ASS header with a NUL byte, and writes no `[Events]` section into the header. The
 round trip drops those NUL bytes and adds the section. The proof compares each packet that ended in a NUL without that
-one byte, and names their count in `nul_cut`. The header must be the old one less its NUL, then the `[Events]` section
-and its Format line. Each ASS packet starts with its ReadOrder, the event's place in the script. mkvmerge numbers the
+one byte, and names their count in `nul_cut`. The header must be the one that the ASS row of "mkvmerge rewrites" gives.
+Each ASS packet starts with its ReadOrder, the event's place in the script. mkvmerge numbers the
 events from 0 in that order. HandBrake may skip a ReadOrder. So the proof gives each packet of the original the rank
 of its ReadOrder. The rank applies only when every ReadOrder of the track is a whole number written in digits alone,
 and no two are equal. Otherwise each packet must keep its ReadOrder. The proof names the count of packets that changed

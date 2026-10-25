@@ -53,6 +53,8 @@ On a host, leave out `docker exec -it arr-media-guard`.
   next files it would queue.
 - A file that has a job waiting or running keeps that job, so a second `--apply` queues it once. A file with a waiting
   recheck, or one missing on disk, stays for the next run.
+- Each apply that queues, here or with `--background`, writes one decision log line with result `queued`, its counts
+  and its options. An apply that stops part way, as at Ctrl+C, writes the line with the counts so far.
 - A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to four
   times: from its job, its burned-in subtitle check, its whole-file check and its deep analysis. With
   `DISCORD_POSTS=all`, each file whose default tracks change also posts "Default tracks changed".
@@ -66,7 +68,9 @@ A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. 
 language tags of the Matroska files the app lists, at the lowest CPU and disk priority. Its `--apply` posts as a job
 above does. It posts each problem not posted yet, once per file and kind. With `DISCORD_POSTS=all` it posts each
 change too. A dry run posts nothing. It shares a lock with the imports, so the two never change one file at the same
-time. It skips a file with one audio track, no subtitle and a right language tag, which plays that track anyway.
+time. It skips a file only when no check that can write has work for it, as a file with one audio track, its flags
+and language tag right, no subtitle and a header with no issue. Each such check has one trigger in `cli.TRIGGERS`.
+A new check that can write adds its trigger there.
 
 Run a large flag backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one
 file. A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them.
@@ -170,7 +174,8 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
 - `--paths` limits the backfill, `--convert` and `--sub-check` to the listed files. It needs an instance. A scan
   refuses it.
 - `--limit N` stops after N files that need a change. A scan checks N files, and a queue takes the next N files of
-  each instance.
+  each instance. A dry run with more than one worker starts no file after the stop. The files it already reads end, and
+  the summary and the plan count them. So they can hold more than N files that need a change.
 - The flag backfill and `--sub-check` print one line for each file with something to show. The line starts with the
   result. `dry run` says that `--apply` would write the file or a sidecar, with a flag edit, a header repair, a subtitle
   remux or a sidecar fix. `no change` says that it would write nothing. An apply names its change, as `edited`,
@@ -179,6 +184,16 @@ arr-media-guard --audit radarr --since 24h --post             # the open problem
   past the Matroska Segment end and each fault of the RFC 9559 check are a header issue, so `--apply` repairs them, see
   [RFC 9559 check](design.md#rfc-9559-check). When that remux must not run and the file has bytes past its Segment
   end, the line starts `not edited, as a flag edit would put`, and the flags stay.
+- The first line counts the files the run reads, as `1488 files named .mkv`. When the run leaves out files not named
+  `.mkv`, the line counts them too, and `--convert` takes them. A run with `--convert`, `--plan-from` or `--paths` gives
+  no such count. The last line, `summary:`, counts each file of the run once, by one of these keys:
+  - the outcome of its decision line, as `no_change`, `dry_run`, `edited`, `undecided` or `would_repack`
+  - `not_selected`, a file the backfill leaves out, see above
+  - `subtitles_cached`, a file whose saved subtitle check still holds, with `--sub-check`
+
+  The line `of the files in the summary:` follows when some of those files also got a remux, or a dry run plans one.
+  It counts `would_repair_header`, `header_repaired`, `repacked` and the codes of a subtitle remux, as `subtitle_retimed`
+  or `would_remux_subtitles`.
 - `--only-undecided` with `--plan-from` takes only the files the plan left undecided, for language detection.
 - `--only-header` with `--plan-from` takes only the files the plan gives a header repair. It leaves a file whose only
   fault is padding, up to 1 MiB of bytes past the Segment end (`"padding_only": true` in the plan). This is the

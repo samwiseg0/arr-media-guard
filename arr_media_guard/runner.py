@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
-import collections, contextlib, dataclasses, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request, uuid
+import collections, contextlib, dataclasses, datetime, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request, uuid
 
-from . import apps, checks, cli, config, content, convert, decide, gate, judge, logs, plex, process, regrab, remux, report, store, subsync, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, ff, gate, judge, logs, plex, process, regrab, remux, report, store, subsync, subtitles, vault
 
 
 def gated(f, op, wait=config.DEADLINE):
@@ -112,6 +112,7 @@ def wait_turn(name, job):
         if not older:
             return
         select.select([], [], [], 0.5)   # a real wait. The tests fake time.sleep.
+        ff.check_stop()
 
 
 def job_alive(name):
@@ -129,13 +130,7 @@ def settle(name, on=True):
         store.write("UPDATE jobs SET settled = ? WHERE name = ? AND claimed = 1", int(on), name)
 
 
-STOP = {"held": False, "asked": False, "term": None, "skipped": False}
-# held: in a job process, a write has started. asked: a handler of the process's own took a stop, job_term() after a
-# write or the backfill's, see cli.stops(). No write and no further step start after it, see stop_asked(). skipped: a
-# stop refused or cut a write or left a step out, so a finding the stop caused posts nothing, see logs.alert_findings(),
-# and a job process puts its job back, see job_process().
-# term: the SIGTERM or SIGINT that job_term() or stopped() raised on. CPython drops an exception that a handler raises
-# while a finalizer such as Popen.__del__ runs, so a later step that must not run past a stop raises it again.
+STOP = ff.STOP   # the stop of this process, see ff.on_stop()
 
 
 class Stopped(BaseException):
@@ -161,39 +156,27 @@ def refuse():
         raise Stopped("the run was stopped")
 
 
-def job_term(signum, _):
-    """SIGTERM in a job process. Before any write the job stops at once and goes back to the queue. Once no_stop()
-    started an edit or a re-grab, the job ends the step in flight and starts no write and no further step, see
-    stop_asked(). Its decision line and its Plex analyze are written, job_process() exits, and a job that the stop cut
-    goes back to the queue too."""
-    if STOP["held"]:
-        STOP["asked"] = True
-    else:
-        STOP["term"] = signum
-        raise SystemExit(128 + signum)
-
-
 def pass_stop():
-    """Hand the stop that remux.stopped() recorded during a remux to the handler that the process runs, see
-    remux.Swap.stop(). Returns True when that handler took it. A job process then ends its run with its decision line,
-    see job_term(), and a backfill ends after the file, see cli.backfill_files(). A process with no handler of its own
-    keeps the stop for its next write, see raise_term(). --check has none. It keeps Python's Ctrl+C handler and SIGTERM
-    at its default."""
+    """Hand the stop that a remux.Swap recorded to the handler that the process runs after the Swap, see
+    remux.Swap.stop(). Returns True when that handler only asks. A job process that has written then ends its run with
+    its decision line, and a backfill ends after the file, see cli.backfill_files(). A job process that has not
+    written keeps the stop, and raise_term() raises it. So does a process with no handler of its own, as --check, which
+    keeps Python's Ctrl+C handler and SIGTERM at its default."""
     sig = STOP["term"]
     handler = signal.getsignal(sig) if sig else None
     if callable(handler) and handler is not signal.default_int_handler:
         STOP["term"] = None
         handler(sig, None)
-        return True
+        return not STOP["term"]
     return False
 
 
 def raise_term():
-    """Raise the stop that job_term() or stopped() recorded, see STOP. A SIGINT raises KeyboardInterrupt, as Ctrl+C does."""
-    if STOP["term"] == signal.SIGINT:
-        raise KeyboardInterrupt
-    if STOP["term"]:
-        raise SystemExit(128 + STOP["term"])
+    """Raise a stop that cuts the step, see ff.on_stop(), before a write. A stop that a process with no handler of its
+    own kept from its layout repair raises here too, see process.relayout()."""
+    if STOP["kept"]:
+        STOP["term"], STOP["kept"] = STOP["kept"], None
+    ff.check_stop()
 
 
 @contextlib.contextmanager
@@ -202,14 +185,14 @@ def no_stop():
     signals, so a stop that signals every process never cuts mkvpropedit mid-write. Ctrl+C in a terminal signals the
     whole foreground process group. The one-file worker then stops once the block ends: CPython runs the SIGINT
     handler inside pthread_sigmask(), so a Ctrl+C raises right after the write. A job process ends the write first on
-    SIGTERM, see job_term(). A stop whose raise a finalizer dropped stops it here, before the write. A stop that a
-    handler of the process's own took raises Stopped here, see refuse(), also one whose handler ran inside
-    pthread_sigmask()."""
+    SIGTERM, see ff.on_stop(). A stop that cut the step before the block raises here, before the write. A stop that
+    only asked raises Stopped here, see refuse(), also one whose handler ran inside pthread_sigmask()."""
     raise_term()
     old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     try:
         refuse()
-        STOP["held"] = True   # a SIGTERM in a job process now ends the write first, see job_term()
+        STOP["held"] = True   # a SIGTERM in a job process now ends the write first, see ff.on_stop()
+        raise_term()   # a stop that another thread of the job took before held
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
@@ -683,6 +666,8 @@ def follow_up(name, pending, claimed, source, act):
             rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500], trace=traceback.format_exc(limit=3)[-800:])
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
         rec["from"] = job["from"]
+    if job.get("time"):   # the time of its queue, as on a deep analysis line
+        rec["queued"] = datetime.datetime.fromtimestamp(job["time"]).astimezone().isoformat(timespec="seconds")   # as logs.log() writes "time"
     rec = logs.decision(rec, started)
     want = (job.get("inputs") or {}).get("want")
     if want and os.path.exists(rec.get("path") or "") and process.changed(rec):
@@ -1173,6 +1158,8 @@ def deep_analysis(name, pending, claimed=False):
                 rec.update({k: ctx.rec[k] for k in ("subremux", "sidecars") if k in ctx.rec})
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
         rec["from"] = job["from"]
+    if job.get("time"):   # the time of its queue, so two runs of one job name show two queues, see cli.log_queued()
+        rec["queued"] = datetime.datetime.fromtimestamp(job["time"]).astimezone().isoformat(timespec="seconds")   # as logs.log() writes "time"
     if job.get("held") and not STOP["skipped"]:   # a job that a stop cut goes back with its held alerts, see drop_job()
         rec["held_result"] = held_after(job, rec)
     rec = logs.decision(rec, started)
@@ -1876,7 +1863,7 @@ def coordinate(lock, pending):
     A job process that died leaves its job claimed, and requeue() puts it back. A job whose processes crash CRASH_TRIES
     times in one run is not claimed again in that run, also when the store lost the count of requeue(). SIGTERM starts no new job and passes
     SIGTERM on. A job process that has not written stops at once and its job goes back to the queue. One that has
-    edited or re-grabbed ends that write first and writes its line, see job_term(). This process then keeps the pending
+    edited or re-grabbed ends that write first and writes its line, see ff.on_stop(). This process then keeps the pending
     analyze requests for the next worker, see save_plex(), and exits."""
     stop, crashes = [], collections.Counter()   # crashes: job name -> the crashes of its job processes in this run
     signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
@@ -1995,17 +1982,17 @@ def still_queued(name):
 
 def job_process(name, w, sigmask):
     """A job process of coordinate(): run_job() on one claimed job with its own time limit, then its Plex analyze and
-    the TMDB pause as JSON to the pipe w. It never returns. SIGTERM before a write raises SystemExit, see job_term().
-    subprocess.run() and the other callers kill their child on the way out, so no ffmpeg or mkvmerge outlives the job.
+    the TMDB pause as JSON to the pipe w. It never returns. SIGTERM before a write kills the job's children and raises
+    SystemExit at the next check, see ff.on_stop(). So no ffmpeg or mkvmerge outlives the job.
     The stopped job stays claimed, and coordinate() puts it back in the queue. After a write the job ends the step in
     flight and writes its line. When the stop left a step out or cut a write, the job stays claimed too, see drop_job(),
     and the exit code is that of SIGTERM. The next run of the job reads the file as the stopped run left it and makes
     the rest."""
     code, started = 1, time.time()
     try:
-        STOP.update(held=False, asked=False, term=None, skipped=False)   # a fresh job, whatever the parent process had done
+        STOP.update(held=False, asked=False, term=None, skipped=False, cut=0, kept=None)   # a fresh job, whatever the parent process had done
         config.JOB = name
-        signal.signal(signal.SIGTERM, job_term)
+        signal.signal(signal.SIGTERM, ff.on_stop)
         signal.pthread_sigmask(signal.SIG_SETMASK, sigmask)
         pending = []
         run_job(name, pending, shared=True, claimed=True)

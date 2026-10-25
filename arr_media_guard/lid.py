@@ -520,6 +520,7 @@ def speech(path, audio_index, cache=CACHE, gate=None, queue=None, job=None):
     finally:
         p.stdout.close()
         p.wait()
+    ff.check_stop()   # a stop killed ffmpeg, so the read is cut short
     if p.returncode:
         raise RuntimeError(f"ffmpeg exited {p.returncode} reading audio stream {audio_index}")
     late = start_delay(path, audio_index)

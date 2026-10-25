@@ -3,8 +3,10 @@
 """A remux that carries the flag and language edits of a plan as mkvmerge track options, see remux.merge_argv(), and
 its proof against the planned state, see remux.tracks_fault(). Also the resync that repack() accepts at the zero run
 mkvpropedit encloses in a Segment, see remux.resynced(). Every file is made up."""
+import json
 import os
 import shutil
+import types
 
 import pytest
 
@@ -98,6 +100,18 @@ def test_a_subtitle_remux_carries_the_edits_and_repairs_the_header_in_one_write(
     new = REAL_MKVMERGE(path)
     assert decide.unapplied(new, edits) == [] and hook.segment_short(path) == 0 and info["new_cues"] is True
     assert "repair the header: a made-up issue" in hook.resub(path, new, os.stat(path), False, {2: {"rate": "1/1", "offset": 0.5}}, hp=hp)[1]
+
+
+def test_a_subtitle_remux_that_repairs_a_header_pairs_each_lag_less_the_dropped_track(zp, tmp_path, settings, monkeypatch):
+    """The remux drops subtitle track 2 and repairs the header. The new file's subtitle stream 2 is track 3, so the
+    header checks take the lag of track 3 in the original, see remux.paired_lags(). The lags of the original are made
+    up, one per track."""
+    settings(keep_days=0)
+    path, j = copy(zp, tmp_path, "ff_zp.mkv")
+    real = hook.original_frames
+    monkeypatch.setattr(hook, "original_frames", lambda src: (*real(src)[:2], dict(real(src)[2], subtitle=[7.0, 0.25])))
+    code, result, info = hook.resub(path, j, os.stat(path), True, {3: {"rate": "1/1", "offset": 0.5}}, drop=[2], hp=header(path, j, edit_tail=ZEROS))
+    assert code == "subtitles_remuxed" and info["lag"][2][0] == 0.25 and sorted(info["lag"]) == [0, 1, 2], (result, info.get("lag"))
 
 
 def test_a_track_from_its_own_file_takes_its_edits_from_track_args(zp, tmp_path, settings, monkeypatch):
@@ -208,11 +222,15 @@ def test_the_planned_state_and_the_options_of_each_edit():
 
 def test_a_removed_track_whose_uid_stays_fails_the_track_check():
     """A remux that drops subtitle track 1 and writes its UID on the track that takes its place fails, though the
-    types, codecs and languages match."""
-    t = lambda i, uid, kind="subtitles": {"id": i, "type": kind, "codec": "SubRip/SRT", "properties": {"uid": uid, "language": "eng"}}
+    types, codecs and languages match. An edit of track 2, which takes the place of track 1, shows by its selector. A
+    track with no UID has a selector by its place, and the edit maps to its new place."""
+    t = lambda i, uid, kind="subtitles", **kw: {"id": i, "type": kind, "codec": "SubRip/SRT", "properties": {"uid": uid, "language": "eng", **kw}}
     j = {"tracks": [t(0, 1, "video"), t(1, 2), t(2, 3)]}
     assert hook.tracks_fault(j, {"tracks": [t(0, 1, "video"), t(1, 2)]}, drop=(1,)) == "a removed track is still in the file"
     assert hook.tracks_fault(j, {"tracks": [t(0, 1, "video"), t(1, 3)]}, drop=(1,)) is None
+    assert hook.tracks_fault(j, {"tracks": [t(0, 1, "video"), t(1, 3, default_track=True)]}, [["track:=3", 1, 0]], drop=(1,)) is None
+    j = {"tracks": [t(0, None, "video"), t(1, None), t(2, None)]}
+    assert hook.tracks_fault(j, {"tracks": [t(0, None, "video"), t(1, None, default_track=True)]}, [["track:s2", 1, 0]], drop=(1,)) is None
 
 
 def test_a_subtitle_remux_that_repairs_a_header_never_laces_again(lace_mkvs, tmp_path, settings):
@@ -250,19 +268,21 @@ def test_a_tail_that_is_also_an_edit_tail_counts_once(zp, tmp_path, settings):
 
 def test_the_track_check_holds_the_bcp47_tag_and_the_trimmed_events():
     """A remux that changes only the BCP 47 tag of a track fails, though its legacy tag reads the same. A trimmed track
-    must hold its events less the dropped ones. Its UID may change."""
+    must hold its events less the dropped ones, and its UID."""
     t = lambda i, uid, kind="subtitles", **p: {"id": i, "type": kind, "codec": "SubRip/SRT", "properties": {"uid": uid, "language": "spa", **p}}
     j = {"container": {"type": "Matroska"}, "tracks": [t(0, 1, "video"), t(1, 2, language_ietf="es-419")]}
     new = {"container": {"type": "Matroska"}, "tracks": [t(0, 1, "video"), t(1, 2, language_ietf="es-ES")]}
     assert hook.tracks_fault(j, new) == "track 1 changed its language_ietf"
-    new["tracks"][1] = t(1, 9, language_ietf="es-419", tag_number_of_frames="5")
+    new["tracks"][1] = t(1, 2, language_ietf="es-419", tag_number_of_frames="5")
     info = {"trimmed": {1: {"events": 7, "dropped": 1}}}
     assert hook.header_fault(j, "", new, 0, {"trim": [1]}, info, "") == "the trimmed track 1 holds 5 events, not 6"
+    new["tracks"][1]["properties"]["uid"] = 9
+    assert hook.header_fault(j, "", new, 0, {"trim": [1]}, info, "") == "track 1 changed its uid"
 
 
 def test_a_header_repair_carries_the_edits_of_a_trimmed_track(mkvs, tmp_path, settings):
-    """A trim writes the SubRip track again from its own file, with a new UID. Its language and default flag edits reach
-    it through track_args(), and the proof finds the track by its place in the new file."""
+    """A trim writes the SubRip track again from its own Matroska file, which holds the track's UID, see uid_files().
+    The track keeps its UID, and its language and default flag edits reach it through track_args()."""
     settings(keep_days=0)
     path = str(tmp_path / "subtitle.mkv")
     shutil.copy(mkvs / "subtitle.mkv", path)
@@ -273,9 +293,36 @@ def test_a_header_repair_carries_the_edits_of_a_trimmed_track(mkvs, tmp_path, se
     code, result, info = hook.repack(path, j, os.stat(path), True, h, edits)
     assert result == "subtitles trimmed" and list(info["trimmed"]) == [2], (result, info)
     new = REAL_MKVMERGE(path)
-    sel = decide.classify(new)[1]["sel"]   # the trimmed track by its new UID
-    assert new["tracks"][2]["properties"]["uid"] != j["tracks"][2]["properties"]["uid"] and decide.unapplied(new, [[sel, *e[1:]] for e in edits]) == []
+    assert new["tracks"][2]["properties"]["uid"] == j["tracks"][2]["properties"]["uid"] and decide.unapplied(new, edits) == []
     assert (new["tracks"][2]["properties"]["language_ietf"], new["tracks"][2]["properties"]["default_track"]) == ("fr-CA", bool(1 - s1["default"]))
+
+
+def test_a_trim_keeps_the_spaces_at_the_ends_of_subtitle_lines(mkvs, tmp_path, settings):
+    """A trimmed track goes into the remux through a Matroska file of its own, see uid_files(). Both mkvmerge runs keep
+    the spaces and tabs at the ends of its lines, see KEEP_PACKETS."""
+    settings(keep_days=0)
+    (tmp_path / "ws.srt").write_text("1\n00:00:10,000 --> 00:59:00,000\nHello   \n\n2\n00:00:20,000 --> 00:00:21,000\nAgain\t\n")
+    path = str(tmp_path / "ws.mkv")
+    REAL_RUN(["mkvmerge", "-q", *hook.KEEP_PACKETS, "-o", path, str(mkvs / "good.mkv"), str(tmp_path / "ws.srt")], check=True)
+    j = REAL_MKVMERGE(path)
+    code, result, info = hook.repack(path, j, os.stat(path), True, hook.video_check(path)[2]["header"])
+    assert result == "subtitles trimmed" and REAL_MKVMERGE(path)["tracks"][2]["properties"]["uid"] == j["tracks"][2]["properties"]["uid"], (result, info)
+    REAL_RUN(["mkvextract", path, "tracks", f"2:{tmp_path / 'out.srt'}"], check=True, capture_output=True)
+    text = (tmp_path / "out.srt").read_bytes().removeprefix(b"\xef\xbb\xbf")   # mkvextract writes a BOM
+    assert text == b"1\n00:00:10,000 --> 00:02:00,023\nHello   \n\n2\n00:00:20,000 --> 00:00:21,000\nAgain\t\n\n", text
+
+
+def test_a_warning_of_the_mux_of_a_trimmed_track_refuses_the_repair(mkvs, tmp_path, settings, monkeypatch):
+    """mkvmerge stops its read of a SubRip file at a number line with no timing line after it, and warns. uid_files()
+    refuses that warning, as the remux refuses its own, so no cue of the trimmed track goes. The original stays."""
+    settings(keep_days=0)
+    path = str(tmp_path / "subtitle.mkv")
+    shutil.copy(mkvs / "subtitle.mkv", path)
+    j, before, real = REAL_MKVMERGE(path), open(path, "rb").read(), decide.trim_srt
+    monkeypatch.setattr(decide, "trim_srt", lambda text, limit: (lambda t, n: (t + "\n3\nno timing line\n", n))(*real(text, limit)))
+    code, result, info = hook.repack(path, j, os.stat(path), True, hook.video_check(path)[2]["header"])
+    assert code == "header_repair_failed" and result.startswith("header repair failed: mkvmerge exited 1: ") and "timestamp line" in result, result
+    assert open(path, "rb").read() == before
 
 
 def test_a_header_repair_keeps_the_spaces_at_the_ends_of_subtitle_lines(zp, tmp_path, settings):
@@ -316,3 +363,58 @@ def test_a_header_repair_reads_the_resync_of_mkvmerge_in_any_locale(zp, tmp_path
         pytest.skip(f"mkvmerge printed no German warning here, exit {r.returncode}: {(r.stdout + r.stderr)[-300:]!r}")
     code, result, info = hook.repack(path, j, os.stat(path), True, header(path, j, enclosed=at, enclosed_size=ZEROS))
     assert result == "header repaired" and "Warning: Resync failed" in info["warnings"] and "Warnung" not in info["warnings"], (result, info)
+
+
+def test_a_trim_after_a_removed_track_keeps_the_uid_of_the_trimmed_track(mkvs, tmp_path, settings):
+    """The removed track before the trimmed one moves it up one place. A selector names a track by its UID, and the
+    trimmed track keeps its UID. So the edits show by the selectors of the original, and the undo by them brings the
+    original's default flags and tags back. unedited() takes the edits back by UID, and replanned() takes the row's
+    edits as they are, see process.write()."""
+    settings(keep_days=0)
+    path = str(tmp_path / "m.mkv")
+    REAL_RUN(["mkvmerge", "-q", "-o", path, str(mkvs / "good.mkv"), "--language", "0:ita", str(mkvs / "ita.srt"), "--language", "0:spa",
+              str(mkvs / "late.srt")], check=True)
+    j = REAL_MKVMERGE(path)
+    hp = hook.video_check(path)[2]["header"]
+    assert (hp["remove"], hp["trim"]) == ([2], [3]), hp
+    s = decide.classify(j)[2]
+    edits = [[s["sel"], "fr-CA", s["tag"], decide.LANG_EDIT], [s["sel"], 1 - s["default"], s["default"]]]
+    code, result, info = hook.repack(path, j, os.stat(path), True, hp, edits)
+    assert result == "subtitles removed" and list(info["trimmed"]) == [3], (result, info)
+    new = REAL_MKVMERGE(path)
+    assert decide.classify(new)[1]["sel"] == s["sel"] and decide.unapplied(new, edits) == [], decide.classify(new)
+    kept = lambda x: [t for t in x["tracks"] if t["properties"].get("language") != "ita"]
+    flags = lambda x: [t["default"] for t in hook.flags(dict(x, tracks=kept(x)))]   # the trim changes the role, see the stats tags
+    langs = lambda x: [(t["properties"].get("language"), t["properties"].get("language_ietf")) for t in kept(x)]
+    back = hook.unedited(new, j, edits)   # the new file as it reads with no edit carried
+    assert flags(back) == flags(j) and langs(back) == langs(j)
+    undo = str(tmp_path / "undo.mkv")
+    shutil.copy(path, undo)
+    REAL_RUN(["mkvpropedit", "-q", undo, *hook.propedit_args(edits, 2)], check=True)   # the undo line of write()
+    assert flags(REAL_MKVMERGE(undo)) == flags(j) and langs(REAL_MKVMERGE(undo)) == langs(j)
+    ctx = types.SimpleNamespace(row={"edits": edits}, j=new)
+    assert hook.replanned(ctx, edits)["against"]["edits"] == sorted(edits, key=json.dumps)
+
+
+def test_a_walk_past_64_bits_refuses_the_repair_with_its_reason(zp, tmp_path, settings, monkeypatch):
+    """The walk of a file whose subtitle block lies 2^64 ns less 16 ms in, as a HandBrake file of libmkv 0.6.5 stores
+    one, raises ValueError, see matroska.track_frames(). lace_guess() runs outside the try of repack() and resub(),
+    and it finds no lace. The dry run plans, and each remux refuses with the walk's reason. The original stays."""
+    settings(keep_days=0)
+    path, j = copy(zp, tmp_path, "src.mkv")
+    hp, before, real = header(path, j), open(path, "rb").read(), hook.matroska.cluster
+
+    def far(b, start, end, open_, blocks, reads):   # the first block of the original's first subtitle, at the time of libmkv's Cluster
+        got = real(b, start, end, open_, blocks, reads)
+        if blocks.get(3) and len(b) == len(before):
+            blocks[3][0] = (((1 << 64) - 16551616) // 1000000, *blocks[3][0][1:])
+        return got
+    monkeypatch.setattr(hook.matroska, "cluster", far)
+    hook.matroska.WALKS.clear()
+    with pytest.raises(ValueError, match="track 3 stores a time or a duration of 2"):
+        hook.matroska.frames(path)
+    assert hook.lace_guess(path, j) == ([], None) and hook.repack(path, j, os.stat(path), False, hp)[0] == "would_repair_header"
+    code, result, _ = hook.repack(path, j, os.stat(path), True, hp)
+    assert code == "header_repair_failed" and "the video frames of the original are not all known" in result and "2^63 ns" in result, result
+    code, result, _ = hook.resub(path, j, os.stat(path), True, {2: {"rate": "1/1", "offset": 0.5}}, hp=hp)
+    assert code == "subtitle_remux_failed" and "2^63 ns" in result and open(path, "rb").read() == before, result

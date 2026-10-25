@@ -6,7 +6,7 @@ reads it from the blocks of a Matroska file. A PES header stores the PTS of the 
 PES (13818-1 2.4.3.7). An audio PES can hold several frames, and the codec gives the length of each."""
 import array, bisect, mmap, os, re, threading
 
-from . import matroska
+from . import ff, matroska
 from .matroska import BITSTREAM, NONE, STORED, UNKNOWN
 
 WRAP = 1 << 33   # a PTS or a DTS counts 90 kHz ticks in 33 bits
@@ -70,6 +70,7 @@ def frames(path):
         tracks, error, at, ahead, spare = None, None, None, None, bytearray(CHUNK * size)
         try:
             for p0 in range(first, first + count * size, CHUNK * size):   # strided slices of the mmap, so no chunk copy
+                ff.check_stop()   # a stop waits for one chunk at most
                 p1 = min(p0 + CHUNK * size, first + count * size)
                 if ahead:
                     ahead.join()

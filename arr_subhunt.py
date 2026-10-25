@@ -28,7 +28,7 @@ It handles Radarr only. An episode needs its own search.
 """
 import argparse, datetime, email.utils, os, re, shutil, signal, sys, time, urllib.parse, uuid
 
-from arr_media_guard import apps, checks, config, decide, logs, report, runner, store
+from arr_media_guard import apps, checks, config, decide, ff, logs, report, runner, store
 
 CAP = 3                      # rejected candidates per movie. Then the movie is no_subbed_release until --force.
 GRAB_WAIT = 120              # seconds SABnzbd may take to fetch the NZBs. It retries a dead link without pause.
@@ -238,7 +238,9 @@ def wait_download(cred, nzo):
             if unsafe:
                 return None, "SABnzbd paused the job as " + ", ".join(unsafe), True
             sab(cred, mode="queue", name="resume", value=nzo)
-        time.sleep(POLL)
+        for _ in range(POLL):   # 1 s at a time, so a stop ends the wait within 1 s
+            time.sleep(1)
+            ff.check_stop()
     return None, f"the download did not finish in {DOWNLOAD_WAIT // 3600} hours", False
 
 
@@ -517,13 +519,14 @@ def hunt(app, mid, a, cred, ctx):
                                    [("Title", shown), ("Tried", tried), ("App", logs.app_name(app))]))
         return note("no_subbed_release", f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])
     finally:   # the paused jobs a pass never reached, and every job of a run that broke off, SIGTERM included
-        for c, nzo in jobs:
-            if nzo not in done:
-                try:
-                    storage = apps.mapped((job_state(cred, nzo)[1] or {}).get("storage"), app)
-                except Exception:
-                    storage = None
-                print("  " + cleanup(cred, nzo, storage, c["title"], ctx["roots"]), flush=True)
+        with ff.held_off():   # the calls to SABnzbd below run after a stop, and the next check raises it
+            for c, nzo in jobs:
+                if nzo not in done:
+                    try:
+                        storage = apps.mapped((job_state(cred, nzo)[1] or {}).get("storage"), app)
+                    except Exception:
+                        storage = None
+                    print("  " + cleanup(cred, nzo, storage, c["title"], ctx["roots"]), flush=True)
 
 
 def main(argv):
@@ -539,7 +542,7 @@ def main(argv):
     logs.status("policy", "failed" if decide.POLICY is None else "ok", config.POLICY_ERROR or "")   # as each mode of the core records it
     if decide.POLICY is None:
         sys.exit(config.policy_help())
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a kill runs the finally cleanup, as Ctrl-C does
+    signal.signal(signal.SIGTERM, ff.on_stop)   # a kill raises SystemExit(143) at the next check and runs the finally cleanup, as Ctrl-C does
     run_lock = runner.try_lock("subhunt.lock") if a.apply else None   # held until main returns
     if a.apply and not run_lock:   # two runs would overwrite each other's state and download at once
         sys.exit("another subtitle hunter run is active")

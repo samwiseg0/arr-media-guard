@@ -40,9 +40,9 @@ and subtitle track in the original language. It takes the flag off a track in an
 - The edit is one more flag in the same `mkvpropedit` call, with the same undo line. The decision log shows it with the
   other flag edits. With `DISCORD_POSTS=all` a change post says, for example, "Marked the **Japanese audio (track 2)**
   as the original language." It never posts an alert.
-- Imports set it. A backfill or `--sub-check` with `--apply` sets it on the files it checks. A backfill skips a file
-  with one audio track, no subtitles and no tag to fix, so such a file keeps its flag. The deep analysis and a recheck
-  keep the flags the import set, so files imported before 2.7.0 change only in a backfill.
+- Imports set it. A backfill or `--sub-check` with `--apply` sets it on the files it checks. A backfill also reads a
+  file with one audio track and no subtitle when its flag may change. The deep analysis and a recheck keep the flags
+  the import set, so files imported before 2.7.0 change only in a backfill.
 
 ## Language detection
 
@@ -144,8 +144,13 @@ subtitle. It gets no fix from the speech and no fix of single lines, and no chec
 
 Old sidecars are often saved in an old character set, such as Big5 for Chinese or Windows-1250 for Central Europe. AMG
 tries each set and keeps the first one whose text reads as a language that set writes. Else it takes the set of the
-language in the file name, when the text looks right in it, or Windows-1252. The subtitle check reads the sidecar that
-way, and a conversion puts it into the new file with the right characters. The sidecar file itself stays as it is.
+language in the file name, when the text looks right in it. Else the character set is unknown. The subtitle check
+reads the sidecar in the set AMG found, and a conversion puts it into the new file with the right characters. A
+conversion leaves a sidecar with an unknown set beside the new file as it is, and the alert says so. The subtitle check
+skips it. A conversion also leaves a sidecar beside the new file as it is when mkvmerge would lose some of its lines or
+show them wrong. One such sidecar has a line with no blank line before the next line's number. AMG gives such a
+sidecar beside an MKV no new times either, when a player shows that next line at its own time, and the alert says
+why.
 
 ## Garbled subtitle repair
 

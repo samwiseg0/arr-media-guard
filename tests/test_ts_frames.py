@@ -7,6 +7,7 @@ byte by byte."""
 import json
 import pathlib
 import shutil
+import signal
 import subprocess
 
 import pytest
@@ -68,6 +69,15 @@ def test_each_audio_frame_pairs_with_ffprobes_packet(tmp_path, audio, codec):
     assert sound["tag"][0] == matroska.STORED and sound["tag"].count(matroska.BITSTREAM) >= len(sound["tag"]) // 2, codec
     assert sound["frame"] == pytest.approx({"aac": 1024, "mp2": 1152, "mp3": 1152, "dts": 512}.get(codec, 1536) * 1e9 / 48000)
     assert set(sound["dur"]) == {round(sound["frame"])} and sound["pes_no_pts"] == 0
+
+
+def test_a_stop_ends_the_read_before_its_next_chunk(tmp_path, monkeypatch):
+    """The reader parses CHUNK packets at a time in Python, at page cache speed through the whole file. It checks the
+    stop before each chunk."""
+    path = clip(tmp_path, "stop.ts", ["aac"])
+    monkeypatch.setitem(ts.ff.STOP, "term", signal.SIGTERM)
+    with pytest.raises(SystemExit):
+        ts.frames(path)
 
 
 def test_an_m2ts_file_has_192_byte_packets(tmp_path):

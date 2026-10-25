@@ -17,8 +17,7 @@ CLOSE_MOVE = OVERLAP_MOVE  # seconds a remux moves audio frames later, at most, 
                           # move past OVERLAP_MOVE.
 TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start when ffmpeg reads the original, see
                           # mkv_slack() for two Matroska files
-LAG_SLACK = 1.0           # seconds a stream may sit further behind the other streams in the new file than in the original, see lags().
-                          # A header repair, remux.header_fault(), takes it as an absolute bound.
+LAG_SLACK = 1.0           # seconds a stream may sit behind the other streams of a new file, or 1 ms further than in the original, see lag_over()
 END_LOSS = 3              # video packets the new file may lack at its end, a loss of up to 3 frames that is accepted
 JUNK_MAX = 16             # audio packets the ends of a stream may lose as junk and cut frames, see ends_lost()
 LEAD_LOSS = 0.1           # seconds of the original an audio stream may lose at its start, whatever the packets hold
@@ -52,10 +51,13 @@ def sidecar_text(raw, named=None):
     whose decode reads as a language it writes wins, see decide.reads_as(). The codepages that write named, the
     language code of the sidecar's name, go first. When no decode reads, the first of those codepages whose decode is
     plausible wins, see decide.plausible(), as for a short text or a language with no word list. Serbian in Latin
-    letters then takes cp1250, and in Cyrillic cp1251. Else the bytes decode as cp1252, as they did before any codepage
-    was read."""
+    letters then takes cp1250, and in Cyrillic cp1251. Else the charset is unknown, and the result is (None, None).
+    Each charset decodes the bytes strictly."""
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return "UTF-16", raw.decode("utf-16", errors="replace")
+        try:
+            return "UTF-16", raw.decode("utf-16")
+        except UnicodeDecodeError:
+            return None, None
     try:
         return "UTF-8", raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -76,16 +78,18 @@ def sidecar_text(raw, named=None):
             continue
         if decide.plausible(" ".join(c[2] for c in srt_cues(text))):
             return cp, text
-    return "cp1252", raw.decode("cp1252", errors="replace")
+    return None, None
 
 
-def sidecar_subs(path):
+def sidecar_subs(path, unknown=False):
     """The .srt files beside path whose name starts with its base name, as {path, name, named, lang, flags, charset,
     end, ordered, read}. The first part after the base name is the language when it reads as a code (Movie.en.srt,
     Movie.eng.srt), and named holds it, else None. Else the language is the one its text reads as, and und when it reads as none, as for Movie.srt
     and Movie.1.srt. forced, hi, sdh and cc set a flag (Movie.en.forced.srt, Movie.en.hi.srt). The charset is that of
     sidecar_text(). end is where its last cue ends, in seconds. ordered says each cue starts no earlier than the one
-    before, else mkvmerge warns. read is text_language() of its first cues, and cues is srt_cues() of its text."""
+    before, else mkvmerge warns. read is text_language() of its first cues, and cues is srt_cues() of its text.
+    misread is misread() of its text, and glued is glued_cue() of it. A sidecar whose charset is unknown comes only with
+    unknown, with the charset None and no cues. So no check reads its text, and no fix writes it."""
     folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
     try:
         names = sorted(n for n in os.listdir(folder) if n.startswith(base + ".") and n.lower().endswith(".srt"))
@@ -97,29 +101,55 @@ def sidecar_subs(path):
         named = tags[0] if tags and tags[0] not in SIDECAR_FLAGS and re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", tags[0]) else None
         with open(os.path.join(folder, n), "rb") as f:
             charset, text = sidecar_text(f.read(), named)
-        cues, starts = srt_cues(text), [m.groups()[:4] for m in map(decide.SRT_TIME.match, text.splitlines()) if m]
-        starts = [(int(h), int(m), int(s), int(f.ljust(3, "0")[:3])) for h, m, s, f in starts]
+        if charset is None and not unknown:
+            continue
+        got = decide.srt_read(text or "")
+        blocks = [[c[0], c[1], decide.srt_text(got[0], c, " ")] for c in got[2]]   # srt_blocks()
+        cues, starts = clean_cues(blocks), [c[0] for c in blocks]
         read = decide.text_language(c[2] for c in cues)
         out.append(dict(path=os.path.join(folder, n), name=n, named=named, lang=named or read[0] or "und", flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
-                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts), read=read, cues=cues))
+                        charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts), read=read, cues=cues,
+                        misread=misread(*got), glued=glued_cue(got[0], got[2])))
     return out
 
 
+def glued_cue(lines, cues):
+    """The index of the first timing line of decide.srt_read() lines and cues that mkvmerge reads as text of a cue, with
+    text of its own after it, else None. A player shows that text as a cue of its own at the times of that line. Its
+    text ends at the next timing line of that cue. A number line before that next timing line, with only empty lines
+    between, is the number of the next cue, so it is no text. ffmpeg reads the number as strtol() does. So " 3", "+3"
+    and "-0" are numbers, and "3 " and "-3" are text. A timing line with no text gives a player no cue (measured on
+    ffmpeg 7.1.5)."""
+    for c in cues:
+        timed = [i for i in c[3] if decide.SRT_TIME.match(lines[i])]
+        for i, j in zip(timed, timed[1:] + [None]):
+            text = [s for s in lines[i + 1:c[3].stop if j is None else j] if s]
+            if j is not None and text and re.fullmatch(r"\s*(\+?\d+|-0+)", text[-1], re.ASCII):
+                text.pop()
+            if clean_text(" ".join(text)):
+                return i
+    return None
+
+
+def misread(lines, ends, cues, stop):
+    """Why mkvmerge 102 reads a SubRip text, decide.srt_read() of it, otherwise than a player shows it, or None
+    (docs/design.md, "Conversion"). mkvmerge cannot identify the text, or it stops reading it. It reads a timing line
+    as text of the cue before, where a player shows a cue of its own. Or it drops cues with text, see clean_text(),
+    that end at or before their start. A conversion leaves such a sidecar beside the new file as it is."""
+    if stop is not None:
+        return f"mkvmerge stops reading it at line {stop + 1}" if stop or decide.srt_probe(lines, ends) else "mkvmerge cannot identify it as SubRip"
+    timed = next((i for c in cues for i in c[3] if decide.SRT_TIME.match(lines[i])), None)
+    if timed is not None:
+        return f"mkvmerge reads the timing line at line {timed + 1} as text"
+    dropped = sum(c[1] <= c[0] for c in cues if clean_text(decide.srt_text(lines, c)))
+    return f"mkvmerge drops {dropped} of its cues" if dropped else None
+
+
 def srt_blocks(text, sep=" "):
-    """[[start ms, end ms, text]] of the cues of a SubRip text in file order, each with its lines joined by sep. A
-    block with no timing line is more text of the cue before it, as mkvmerge reads it."""
-    ms = lambda h, m, s, f: int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(f.ljust(3, "0")[:3])
-    cues = []
-    for block in re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip("\n\ufeff")):
-        lines = block.split("\n")
-        k = next((i for i, line in enumerate(lines[:2]) if decide.SRT_TIME.match(line)), None)
-        if k is None:
-            if cues:
-                cues[-1][2] += sep + sep.join(lines)
-            continue
-        g = decide.SRT_TIME.match(lines[k]).groups()
-        cues.append([ms(*g[:4]), ms(*g[4:8]), sep.join(lines[k + 1:])])
-    return cues
+    """[[start ms, end ms, text]] of the cues of a SubRip text in file order, as mkvmerge reads them, see
+    decide.srt_read(). The lines of each text are joined by sep. A cue with no text gives the text ""."""
+    lines, _, cues, _ = decide.srt_read(text)
+    return [[c[0], c[1], decide.srt_text(lines, c, sep)] for c in cues]
 
 
 def srt_cues(text, shift=0):
@@ -503,6 +533,7 @@ def packet_places(path, folder, timeout, clean=False):
             code = r.wait()
         finally:
             timer.cancel()
+        ff.check_stop()   # a stop killed ffprobe, so the read is cut short
         if late:
             raise subprocess.TimeoutExpired(argv, timeout)
         err.seek(0)
@@ -651,6 +682,17 @@ def lags(places):
     return worst
 
 
+def lag_over(new, old=0.0):
+    """Whether a stream sits too far behind the other streams of a new file. new and old are its worst lag in seconds,
+    see lags(), in the new file and in the original. Both round to the ms, as the records keep them. The stream fails
+    when new is over LAG_SLACK and over old by more than 1 ms. A new file with video stores whole ms. A TS or MP4
+    original stores 90 kHz ticks, so the copy of its step back of 1.0004 s steps back 1.001 s. So a stream may sit up
+    to LAG_SLACK behind, or 1 ms further behind than in the original. A sidecar has no original stream, so old is 0 and
+    LAG_SLACK alone bounds it. prove(), remux.header_checks() and remux.planned_args() take this rule."""
+    ms = lambda x: round(x * 1000)
+    return ms(new) > max(ms(LAG_SLACK), ms(old) + 1)
+
+
 def start_plan(shift):
     """The ms of mkvmerge's --sync that gives a track ffmpeg's MP4 start rule back, for a rule that moves it shift ns
     earlier, see mp4.ffmpeg_lead(). mkvmerge takes whole ms and drops a frame it would time before 0, so the move
@@ -791,6 +833,12 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                          [t["index"] for _, t in text] + [t["index"] for s, t, sc in pairs if sc], folder, timeout, raw=True,
                          **({"crlf": [t["index"] for s, t in packets if s["index"] in crlf]} if crlf else {}),
                          **({"spu": [t["index"] for s, t in packets if s["index"] in spu]} if spu else {}))
+        left = {a_, b_, pa_, pb_}
+        while left:   # 0.5 s at a time, so a stop raises between two waits, and a failed read at once
+            done, left = concurrent.futures.wait(left, 0.5, concurrent.futures.FIRST_EXCEPTION)
+            for f in done:
+                f.result()
+            ff.check_stop()
         (ha, ta), (hb, tb), pa, pb = a_.result(), b_.result(), pa_.result(), pb_.result()
     except BaseException:   # a stop or a failed read: no ffmpeg of the proof reads on
         cli.kill_children()
@@ -1000,19 +1048,24 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         fault = fault or why
     for s, t, sc in pairs:
         if sc:
-            with open(sc.get("mux") or sc["path"], "rb") as f:
-                ca = srt_cues(f.read().decode(PY_CHARSET[sc["charset"]], errors="replace"))
             what = f"the captions of stream {s['index']}" if s else f"the sidecar {sc['name']}"
-            why = cue_fault(what, ca, srt_cues(tb[t["index"]]))
+            with open(sc.get("mux") or sc["path"], "rb") as f:
+                raw = f.read()
+            try:
+                side, why = raw.decode(PY_CHARSET[sc["charset"]]), None
+            except UnicodeDecodeError:   # the file changed since its charset was read
+                side, why = "", f"{what} does not decode as {sc['charset']} now"
+            ca, stop = srt_cues(side), decide.srt_read(side)[3]
+            why = why or (stop is not None and f"mkvmerge stops reading {what} at line {stop + 1}") or cue_fault(what, ca, srt_cues(tb[t["index"]]))
             proof.append(dict(stream=f"{s['codec_type']} {s['index']}" if s else sc["name"], codec=s["codec_name"] if s else "subrip",
                               method="caption text" if s else "sidecar text", count=len(ca), match=not why))
             fault = fault or why
     la, lb = lags(pa), lags(pb)   # each stream sits in the file near its time, as in the original, see lags()
     for (s, t), row in zip(packets + text + [(s, t) for s, t, sc in pairs if sc], proof):   # the rows in the order they were added
         row["lag"] = [round(la.get(s["index"], 0.0), 3) if s else 0.0, round(lb.get(t["index"], 0.0), 3)]
-        if row["lag"][1] > row["lag"][0] + LAG_SLACK:
+        if lag_over(row["lag"][1], row["lag"][0]):
             row["match"] = False
-            fault = fault or f"stream {row['stream']} sits up to {row['lag'][1]:.1f} s behind the other streams in the new file, {row['lag'][0]:.1f} s in the original"
+            fault = fault or f"stream {row['stream']} sits up to {row['lag'][1]:.3f} s behind the other streams in the new file, {row['lag'][0]:.3f} s in the original"
     # The video and the audio must end where they ended. A subtitle may run on, so the container duration does not count.
     end = lambda h, side, v0: max(((h.get(p[side]["index"]) or none)["end"] - v0 for p in packets if p[0]["codec_type"] in ("video", "audio")),
                                   default=0)
@@ -1386,6 +1439,7 @@ def hevc_packets(path, index, timeout):
         timer.cancel()
         p.kill()
         p.wait()
+        ff.check_stop()   # a stop killed ffmpeg, so the read is cut short
 
 
 def rpu_fault(a, b):

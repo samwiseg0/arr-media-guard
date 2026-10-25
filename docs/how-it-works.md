@@ -247,8 +247,8 @@ and the audit with `--post` post a summary, and `--test-discord` posts a test me
 - `--backfill --apply` puts one job per file of every instance in the background queue. The worker runs each one as
   `--check --apply`, after the imports. `--backfill <instance>` takes one instance.
 - `--backfill <instance> --plan-out FILE` runs the flag backfill. It fixes the default tracks and language tags of the
-  Matroska files the app lists. It skips a file with one audio track and no subtitle, which plays that track anyway. It
-  runs at the lowest CPU and disk priority. FILE is a new plan file outside `STATE_DIR`, as
+  Matroska files the app lists. It skips a file only when no check that can write has work for it. It runs at the
+  lowest CPU and disk priority. FILE is a new plan file outside `STATE_DIR`, as
   `/config/plans/radarr.jsonl`. The run empties it first and writes each file's plan there as a JSON line.
 - `--backfill <instance> --convert` converts the files that are not `.mkv`. `--sub-check` adds the subtitle check, and
   `--sub-time PATH` runs the full subtitle check of the deep analysis on single files. `--sub-check` skips a file whose

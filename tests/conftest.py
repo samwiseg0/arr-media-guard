@@ -52,11 +52,11 @@ def no_time_limit():
 
 @pytest.fixture(autouse=True)
 def no_stop_left():
-    """runner.STOP is module state too. A stop that reaches a backfill's handler or job_term() sets it, and a later
-    remux would then refuse to start. So each test ends with no stop, in each copy of the package."""
+    """runner.STOP is module state too. A stop that reaches ff.on_stop() sets it, and a later remux would then refuse
+    to start. So each test ends with no stop, in each copy of the package."""
     yield
     for s in amg.stops():
-        s.update(held=False, asked=False, term=None, skipped=False)
+        s.update(held=False, asked=False, term=None, skipped=False, cut=0, kept=None)
 
 
 @pytest.fixture(autouse=True)

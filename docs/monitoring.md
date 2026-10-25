@@ -36,6 +36,8 @@ A decision line holds:
   its entry starts `no text:`. A run that changed nothing has an empty list.
 - `deep`, true on the deep analysis line that `--check` writes after its own checks. The nightly audit never takes
   that line as the file's latest result.
+- `queued`, on the line of a job of the background queue, the time the job was queued. Two runs of one job show two
+  times.
 
 Search the codes, never the sentences, because the words of a sentence may change. [design.md](design.md#alerts) lists
 the kinds and the codes. A dry run words its alerts as what `--apply` would do. [design.md](design.md#logs) has more on

@@ -103,7 +103,9 @@ class Deadline:
         self.end = None
 
     def left(self):
-        """The seconds left, None with no limit."""
+        """The seconds left, None with no limit. A stop that cut the step raises first, see ff.check_stop(), so each
+        check of a time limit is a point where the job stops."""
+        ff.check_stop()
         if self.end is None:
             return None
         left = self.end - time.monotonic()
@@ -138,10 +140,9 @@ class Deadline:
                 self.end = time.monotonic() + left
 
     def lock(self, f, op):
-        """fcntl.flock(f, op). While a limit runs it tries with LOCK_NB every LOCK_POLL seconds, else it blocks. A limit
-        that ran out before the first try raises, as after a wait_turn() that waited it all."""
-        if self.end is None:
-            return fcntl.flock(f, op)
+        """fcntl.flock(f, op). It tries with LOCK_NB every LOCK_POLL seconds and checks the limit and the stop between
+        two tries. A blocking flock would wait on after a stop, because CPython retries it once the handler returns. A
+        limit that ran out before the first try raises, as after a wait_turn() that waited it all."""
         self.check()
         while True:
             try:
