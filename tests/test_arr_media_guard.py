@@ -4605,11 +4605,18 @@ def test_a_stop_kills_each_child_of_the_process_and_the_group_of_a_session_of_it
     try:
         hook.ff.on_stop(signal.SIGTERM, None)   # the thread still runs, so its child is listed under it
         assert group.wait(5) == -signal.SIGKILL and threaded[0].wait(5) == -signal.SIGKILL
+
+        def dead(pid):   # a PID 1 that reaps nothing, as in a CI container, leaves the killed grandchild a zombie
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+            except FileNotFoundError:
+                return True
         for _ in range(100):   # init reaps the grandchild
-            if not os.path.exists(f"/proc/{grandchild}"):
+            if dead(grandchild):
                 break
             time.sleep(0.05)
-        assert not os.path.exists(f"/proc/{grandchild}")
+        assert dead(grandchild)
     finally:
         hook.STOP["term"] = None
         go.set(); t.join()
