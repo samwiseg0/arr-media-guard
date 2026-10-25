@@ -4610,7 +4610,7 @@ def test_a_stop_kills_each_child_of_the_process_and_the_group_of_a_session_of_it
             try:
                 with open(f"/proc/{pid}/stat") as f:
                     return f.read().rsplit(")", 1)[1].split()[0] == "Z"
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):   # init reaped it before the open, or between the open and the read
                 return True
         for _ in range(100):   # init reaps the grandchild
             if dead(grandchild):
