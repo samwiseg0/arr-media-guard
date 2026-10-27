@@ -28,7 +28,7 @@ import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, ROOT)
-from arr_media_guard import health as S  # noqa: E402
+from arr_media_guard import content, health as S  # noqa: E402
 
 T0 = 1_790_000_000   # a fixed epoch, 800 seconds into its hour
 
@@ -106,11 +106,7 @@ def test_an_unknown_check_writes_nothing(tmp_path):
     assert not written and "plex" in note and not os.listdir(tmp_path)
 
 
-class OutOfTime(Exception):
-    """Stands in for arr_meta.OutOfTime, which record() knows by name only."""
-
-
-@pytest.mark.parametrize("exc", [TimeoutError, OutOfTime])
+@pytest.mark.parametrize("exc", [TimeoutError, content.OutOfTime])
 def test_the_time_limit_is_never_swallowed(tmp_path, monkeypatch, exc):
     def late(*a, **k):
         raise exc("time is up")

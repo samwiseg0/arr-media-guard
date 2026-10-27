@@ -3,7 +3,7 @@
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
 import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error, urllib.request
 
-from . import apps, checks, config, content, decide, ff, health, report, runner, store
+from . import apps, checks, config, decide, ff, health, report, runner, store
 
 
 def log(rec):
@@ -49,7 +49,7 @@ def status(key, code, detail="", touch=True):
         return
     try:
         _, note = health.record(config.CFG.state_dir, key, code, config.mask(detail or ""), touch=touch, flock=config.DEADLINE.lock)
-    except (content.OutOfTime, TimeoutError):
+    except TimeoutError:
         raise
     except Exception as ex:
         note = f"status.json: {type(ex).__name__}: {ex}"[:200]
@@ -149,7 +149,8 @@ QUIET_UNTIL = 0.0   # the time.monotonic() until which Discord asked this proces
 def post(app, emb):
     """One embed to DISCORD_WEBHOOK, as the app ("Radarr <INSTANCE>"). A 429 waits retry_after and tries again, up to
     POST_TRIES tries in all. A retry_after over POST_WAIT, or the last try, gives up. Every later post of this process
-    then skips until the time Discord named, and its result says so."""
+    then skips until the time Discord named, and its result says so. A wait ends at the job's time limit, which
+    passes."""
     global QUIET_UNTIL
     hook_url = config.CFG.discord_webhook
     if not hook_url: return "no webhook configured"
@@ -185,7 +186,8 @@ def alert_findings(rec, size, held=None):
 
     held is a list when the deep analysis of the file follows this import, see process.alerts(). A finding of
     DEEP_KINDS that would post then goes into held as its kind, size and embed, the subtitles it names as "keys", see
-    report.named(), with the places its timing outcome left off as "spans", see report.named_spans(), and gives
+    report.named(), with the places its timing outcome left off as "spans", see report.named_spans(), and the places
+    after the run of the tracks whose flags it says were turned off as "flags", see report.tells(). It gives
     HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
     nothing judged those subtitles again, see runner.held_after(). With DISCORD_POSTS all, a held finding keeps the
     change posts of what it says itself in "changes", see report.held_posts(): a removed track, a flag it says was
@@ -198,7 +200,8 @@ def alert_findings(rec, size, held=None):
 
     With DISCORD_POSTS all, each change the run made to the file posts too, see report.render() "changes". They skip the
     marker of alert(), because a second run finds nothing left to change. rec["change_result"] says what each post gave.
-    A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line."""
+    A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line.
+    The job's time limit passes."""
     out = []
     for f, e in zip(rec["findings"], report.render(rec, "embed")):
         if not report.posts(f, rec):
@@ -208,8 +211,9 @@ def alert_findings(rec, size, held=None):
         elif held is not None and f["kind"] in DEEP_KINDS:
             changes = report.held_posts(rec, f, report.tense_of(rec)) if config.CFG.discord_posts == "all" else []
             spans = report.named_spans(rec, f) if f["kind"] == "subtiming" else {}   # the places the deep analysis must hear again
+            flags = sorted(report.tells(f, report.track_langs(rec, after=True))["flags"])   # the deep analysis says them again, see process.subtitle_checks()
             held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {}),
-                         **({"spans": spans} if spans else {})})
+                         **({"spans": spans} if spans else {}), **({"flags": flags} if flags else {})})
             out.append(HOLD_RESULT)
         else:
             out.append(alert(rec["app"], f.get("mark", f["kind"]), rec["path"], size, e))

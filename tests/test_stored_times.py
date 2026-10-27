@@ -447,6 +447,151 @@ def test_ffmpegs_chunk_rule_takes_one_stts_entry(tmp_path, change):
         assert len(t["time"]) == n and t["frame"] == 20833
 
 
+def table(path, handler, kind):
+    """(the bytes of path, (data start, data end) of the box kind in the trak whose hdlr names handler)."""
+    b = path.read_bytes()
+
+    def find(s, e, want):
+        for k, d, x in mp4.boxes(b, s, e):
+            if k == want:
+                return d, x
+            if k in mp4.CONTAINERS and (got := find(d, x, want)):
+                return got
+    for k, d, e in mp4.boxes(b, *find(0, len(b), b"moov")):
+        if k == b"trak" and b[find(d, e, b"hdlr")[0] + 8:][:4] == handler:
+            return b, find(d, e, kind)
+
+
+def full_box(kind, runs, fmt):
+    body = b"".join(struct.pack(fmt, *r) for r in runs)
+    return struct.pack(">I4s4sI", 16 + len(body), kind, bytes(4), len(runs)) + body
+
+
+def aac_mp4(path, rate, head=((1, 1024),), stts=()):
+    """An MP4 in the shape of a measured release, its moov last: no edit lists, a video of 96000 ticks a second whose
+    first frame plays 3 frames late, and AAC at rate. head holds the ctts runs of the first AAC samples, and the rest
+    play at their decode time. stts holds the stts runs of the first AAC samples, and each other sample lasts 1024
+    ticks. By default the first AAC sample has a composition offset of one frame, so the first two samples play at
+    one time. A first stts run of two deltas of 0 gives the first three samples one time, as an iTunes file stores
+    its priming."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24000/1001:duration=4", "-f", "lavfi",
+                    "-i", f"sine=frequency=440:sample_rate={rate}:duration=4", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "3",
+                    "-c:a", "aac", "-video_track_timescale", "96000", "-use_editlist", "0", "-f", "mp4", str(path)], check=True)
+    b, (d, e) = table(path, b"vide", b"ctts")   # one frame more of delay
+    regrow(path, d - 8, e - d + 8, full_box(b"ctts", [(c, o + 4004) for c, o in struct.iter_unpack(">Ii", b[d + 8:e])], ">Ii"))
+    b, (d, e) = table(path, b"soun", b"stts")
+    n = sum(c for c, _ in struct.iter_unpack(">II", b[d + 8:e]))
+    ctts = [*head, (n - sum(c for c, _ in head), 0)]
+    regrow(path, d - 8, e - d + 8, full_box(b"stts", [*stts, (n - sum(c for c, _ in stts), 1024)], ">II") + full_box(b"ctts", ctts, ">Ii"))
+    return path
+
+
+def shared_first_pts(src, dst, pid=0x101):
+    """Write the TS src to dst with the PTS of the first PES of pid set to the PTS of the second one. ffmpeg gives
+    the audio PID 0x101."""
+    b, at = bytearray(src.read_bytes()), []
+    for p in range(0, len(b), 188):
+        if ((b[p + 1] & 0x1F) << 8 | b[p + 2]) == pid and b[p + 1] & 0x40:   # a packet that starts a PES
+            at.append(p + 4 + (1 + b[p + 4] if b[p + 3] & 0x20 else 0) + 9)   # its PTS, after the adaptation field
+        if len(at) == 2:
+            break
+    b[at[0]:at[0] + 5] = b[at[1]:at[1] + 5]
+    dst.write_bytes(b)
+
+
+def converted(path, new):
+    """(the refusal, the proof) of the conversion of path into new, by convert_cmd() with the --sync of mp4_sync() and
+    the options of kept_times()."""
+    j, streams = hook.mkvmerge(str(path)), hook.ff_streams(str(path))[1]
+    sync = hook.mp4_sync(str(path), j, streams)
+    times = hook.kept_times(str(path), j, streams, set(), str(new.parent))
+    subprocess.run(hook.convert_cmd(str(path), str(new), j, [], sync=sync, times=times), check=True)
+    return hook.prove(str(path), str(new), [], str(new.parent), **({"synced": {int(x["stream"].split()[1]): x["ms"] for x in sync}} if sync else {}))
+
+
+@pytest.mark.parametrize("rate, head, stts", [(48000, ((1, 1024),), ()), (44100, ((1, 1024),), ()), (32000, ((1, 1024),), ()),
+                                              (8000, ((1, 1024),), ()), (48000, ((100, 7200),), ()), (48000, (), ((2, 0),))],
+                         ids=["48k shared", "44.1k shared", "32k shared", "8k shared", "150 ms back", "zero deltas"])
+def test_an_mp4_track_mkvmerge_would_play_on_keeps_its_stored_times(tmp_path, rate, head, stts):
+    """mkvmerge 102 times a frame that is not later than the frame before it one frame after that frame, and plays the
+    rest of the track on. So kept_times() gives such a track the reader's times, and every frame keeps its time in the
+    new file: two samples of one time, a ctts that steps 150 ms back at sample 100, and the three samples of one time
+    of an iTunes priming run."""
+    path = aac_mp4(tmp_path / "a.mp4", rate, head, stts)
+    a = mp4.samples(str(path))["tracks"][1]
+    assert hook.plays_on(a["time"]), list(a["time"][:4])
+    refused, rows = converted(path, tmp_path / "b.mkv")
+    assert refused is None and rows[1]["match"] and rows[1]["times"]["worst_ms"] <= 1.0 and "shared" not in rows[1]["times"], (refused, rows)
+
+
+@pytest.mark.parametrize("rate", [48000, 32000])
+def test_a_ts_whose_first_two_aac_pes_share_a_pts_keeps_its_stored_times(tmp_path, rate):
+    """The MP4 shape as a TS of one AAC frame a PES: the first PES takes the PTS of the second. kept_times() gives
+    the track the PES times, and every frame keeps its time in the new file."""
+    mp4_path, plain, path = aac_mp4(tmp_path / "a.mp4", rate, ()), tmp_path / "plain.ts", tmp_path / "a.ts"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(mp4_path), "-c", "copy", "-pes_payload_size", "0", "-f", "mpegts", str(plain)], check=True)
+    shared_first_pts(plain, path)
+    a = next(t for t in ts.frames(str(path))["tracks"] if t["kind"] == "audio")
+    assert a["time"][0] == a["time"][1] and hook.plays_on(a["time"])
+    refused, rows = converted(path, tmp_path / "b.mkv")
+    assert refused is None and rows[1]["match"] and rows[1]["times"]["worst_ms"] <= 1.0 and "shared" not in rows[1]["times"], (refused, rows)
+
+
+@pytest.mark.parametrize("case", ["kept", "empty frame", "pcm", "cut after an empty edit", "cut at the end kept", "cut priming kept", "unknown time",
+                                  "ts kept"])
+def test_kept_times_writes_only_lines_that_pair_with_mkvmerges_frames(tmp_path, monkeypatch, case):
+    """A made-up read of an MP4 or a TS whose audio frames 0 and 1 share a time, so plays_on() marks the track. Its
+    file holds one line per frame, less the file start of 10 ms, the video's first time. A frame with no data, a
+    PCM track, a cut sample before the first shown one after an empty edit, which mkvmerge drops, and a time that is
+    not known give no file. mkvmerge keeps a cut sample at the end, and a cut priming sample with no empty edit, so
+    those tracks get their file. The priming sample then sets the file start, 21.333 ms before 0."""
+    import sys
+    mod = sys.modules[hook.kept_times.__module__]
+    ts_case = case in ("unknown time", "ts kept")
+    audio = {"id": 2, "pid": 0x101, "kind": "audio", "time": hook.array.array("q", [10000000, 10000000, 31333333]), "full": bytearray([1, 1, 1]),
+             "tag": bytearray([matroska.STORED] * 3), "dur": hook.array.array("q", [21333333] * 3), "shift": 0, "edits": None}
+    video = {"id": 1, "pid": 0x100, "kind": "video", "time": hook.array.array("q", [10000000, 51708333]), "full": bytearray([1, 1]),
+             "tag": bytearray([matroska.STORED] * 2), "dur": hook.array.array("q", [41708333] * 2), "shift": 0, "edits": None}
+    if case == "empty frame":
+        audio["full"][2] = 0
+    elif case == "cut after an empty edit":   # a priming sample that ends at 0 s, before the first shown one
+        audio["time"].insert(0, -21333333), audio["full"].insert(0, 1), audio["tag"].insert(0, mp4.CUT), audio["dur"].insert(0, 21333333)
+        audio["edits"] = [(1000, -1, 0x10000), (0, 1024, 0x10000)]
+    elif case == "cut priming kept":   # the edit list cuts the first sample, with no empty edit
+        audio["time"].insert(0, -21333333), audio["full"].insert(0, 1), audio["tag"].insert(0, mp4.CUT), audio["dur"].insert(0, 21333333)
+        audio["edits"] = [(1000, 1024, 0x10000)]
+    elif case == "cut at the end kept":
+        audio["time"].append(52666667), audio["full"].append(1), audio["tag"].append(mp4.CUT), audio["dur"].append(21333333)
+        audio["edits"] = [(1000, -1, 0x10000), (0, 0, 0x10000)]
+    elif case == "unknown time":
+        audio["time"][2] = matroska.NONE
+    read = {"error": None, "tracks": [video, audio]}
+    monkeypatch.setattr(mod.ts if ts_case else mod.mp4, "frames" if ts_case else "samples", lambda path: read)
+    j = {"container": {"type": "MPEG transport stream" if ts_case else "MP4/QuickTime"},
+         "tracks": [{"id": 0, "type": "video", "properties": {"number": 0x100 if ts_case else 1}},
+                    {"id": 1, "type": "audio", "codec": "PCM" if case == "pcm" else "AAC", "properties": {"number": 0x101 if ts_case else 2}}]}
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264", "id": "0x100" if ts_case else "0x1"},
+               {"index": 1, "codec_type": "audio", "codec_name": "aac", "id": "0x101" if ts_case else "0x2"}]
+    got = hook.kept_times(str(tmp_path / "a.src"), j, streams, set(), str(tmp_path))
+    if not case.endswith("kept"):
+        assert got == [], got
+        return
+    assert got == ["--timestamps", f"1:{tmp_path / 'kept-1.txt'}"], got
+    want = {"cut at the end kept": "0.000000\n0.000000\n21.333333\n42.666667\n", "cut priming kept": "0.000000\n31.333333\n31.333333\n52.666666\n"}
+    assert (tmp_path / "kept-1.txt").read_text() == "# timestamp format v4\n" + want.get(case, "0.000000\n0.000000\n21.333333\n")
+
+
+def test_a_track_mkvmerge_times_as_stored_gets_no_kept_times(tmp_path):
+    """An MP4 track and a TS track whose frames each come later than the frame before get no kept-times file, so
+    mkvmerge times them as before. So does a Matroska file, whose plans come from remux.planned_args()."""
+    src = make(tmp_path / "a.mp4")
+    ts_path = tmp_path / "a.ts"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-c", "copy", "-f", "mpegts", str(ts_path)], check=True)
+    for path in (src, ts_path, remux(src, tmp_path / "a.mkv")):
+        j, streams = hook.mkvmerge(str(path)), hook.ff_streams(str(path))[1]
+        assert hook.kept_times(str(path), j, streams, set(), str(tmp_path)) == [], path
+
+
 def test_a_cut_top_level_box_header_names_its_byte(tmp_path):
     """A file that ends inside its last top-level box header, after a size of 1 and before the 64-bit size, gives the
     reader's error. A raw struct.error passed start_shift() and mp4_sync(), which catch OSError, and failed the

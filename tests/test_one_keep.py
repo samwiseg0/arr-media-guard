@@ -15,8 +15,8 @@ import time
 import types
 
 import amg
-from test_arr_media_guard import (hook, REAL_MKVMERGE, REAL_RUN, convertible, kept_files, real_convert, refused_link, stamp,  # noqa: F401
-                                  state_dir_in_tmp, sync_mkv)
+from test_arr_media_guard import (hook, REAL_MKVMERGE, REAL_RUN, convertible, decided, env, kept_files, real_convert, refused_link,  # noqa: F401
+                                  sidecar_film, stamp, state_dir_in_tmp, sync_mkv, talk)
 
 VAULT = next(m for m in hook._mods if m.__name__.endswith(".vault"))
 MATROSKA = hook.matroska
@@ -207,6 +207,25 @@ def test_a_kept_sidecar_is_reused_by_a_later_retime(tmp_path, settings, monkeypa
     twice = "1\n00:00:08,000 --> 00:00:09,000\na\n\n2\n00:00:10,000 --> 00:00:11,000\nb\n"   # each retime moved it 1 s
     assert open(e["kept"]).read() == text and side.read_text() == twice
     assert [f for f in kept_files(tmp_path) if f.endswith(".srt")] == [os.path.relpath(e["kept"], tmp_path / ".kept")]
+
+
+def test_a_time_limit_in_the_mark_of_the_grab_links_ends_the_job(env, monkeypatch, settings, tmp_path):
+    """The time limit ends the job. An import retimes its late .en.srt sidecar and keeps its original, with
+    KEEP_REPLACED on. The limit runs out as kept_replaced() starts, so its store transaction meets it, and the job ends
+    with an error."""
+    settings(keep_replaced=True)
+    sidecar_film(env, monkeypatch, tmp_path, _en_srt=talk.cues(talk.RIGHT, offset=2.0))
+    real, ends = hook.kept_replaced, []
+    def kept_replaced(*a, **k):
+        ends.append(hook.DEADLINE.end)
+        if hook.DEADLINE.end is not None:
+            env["clock"][0] = hook.DEADLINE.end
+        return real(*a, **k)
+    monkeypatch.setattr(hook, "kept_replaced", kept_replaced)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["result"]) == ("error", f"error: OutOfTime: stopped after {hook.BUDGET} seconds"), rec
+    assert ends and ends[0] is not None, ends
 
 
 def test_a_write_after_a_kept_conversion_reuses_the_kept_original(convertible, tmp_path, monkeypatch, settings):

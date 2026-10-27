@@ -41,6 +41,11 @@ On a host, leave out `docker exec -it arr-media-guard`.
   gives way to an import that waits before a conversion and before a remux, until it changed the file. The jobs stay
   in the queue across a restart. `--backfill --drop-queued` drops them, and `--backfill <instance> --drop-queued`
   drops those of one instance. A job that runs then ends first.
+- `--drop-queued` drops only the per-file jobs that a backfill queued. The checks that those jobs queued stay, see the
+  next item. In the background queue line, `files still to check` counts the jobs it drops. A backfill counts a file
+  done when it queues it, so a later `--apply` of the same pass never runs a dropped file. A run with `--ids` or
+  `--paths` keeps a pass of its own, so it can queue the file again. `--restart` queues every file again. To hold the
+  jobs for a time, see [Pause the background queue](#pause-the-background-queue).
 - A job queues the burned-in subtitle check, the whole-file check and the deep analysis as an import does. The
   whole-file check reads each file whole, so a full backfill reads the library once more, and it only alerts. The deep
   analysis waits behind every job a backfill queued. At `SUBTITLES=deep` it takes about 16 minutes per hour of video
@@ -257,7 +262,8 @@ arr-media-guard --check "/data/movies/Film A (2000)/Film A (2000).mkv" --apply  
   app then takes the new name. The sidecar subtitles that the new file holds go to the kept originals too, beside the
   original. An import deletes the original and those sidecars.
 - A conversion that cannot keep its original is skipped before the remux. The dry run says so too.
-- A sidecar subtitle that does not match the audio moves to the kept originals, as on an import.
+- A sidecar subtitle that does not match the audio gets a name players skip beside the video, as
+  `Film.en.mismatch.srt.txt`, as on an import. With every such name taken it moves to the kept originals.
 - The nightly audit removes the kept originals after `KEEP_ORIGINALS_DAYS`. At `0` AMG keeps nothing. A remux of the
   subtitles then keeps every track. A conversion of a file that an app lists deletes the original and those sidecars,
   as an import does.
@@ -271,7 +277,7 @@ A file that no app lists runs too, such as a copy in a scratch folder. `--apply`
 rescan, no monitor and no import of a new name. Plex gets an analyze only for a file it lists.
 
 - A conversion writes the new `.mkv` beside the original, and the original stays where it is. A sidecar subtitle that
-  does not match the audio moves to the kept originals. The other sidecars stay beside the original, and the new file
+  does not match the audio gets a name players skip, as on an import. The other sidecars stay beside the original, and the new file
   holds them too. So a player that finds them beside the `.mkv` may list each one twice.
 - An `.mkv` file that holds another container converts under its own name. Its original goes to the kept originals.
   At `KEEP_ORIGINALS_DAYS=0` AMG keeps nothing, so the original is gone.
@@ -501,9 +507,11 @@ left with an open problem. The jobs of `--background` have source `backfill_job`
 
 ```
 docker exec -it arr-media-guard arr-media-guard --queue
+watch -n 5 docker exec arr-media-guard arr-media-guard --queue   # a new look every 5 seconds
 ```
 
-On a host, leave out `docker exec -it arr-media-guard`.
+On a host, leave out `docker exec -it arr-media-guard`. Leave out `-it` under `watch`. With `-t` the terminal ends each
+line with a carriage return, so `watch` leaves one character of a longer line it showed before.
 
 ```
 2026-10-18 09:30:00 EDT
@@ -547,6 +555,46 @@ process gone: 1
   which. `--queue` then says so under the worker line, `one place:`.
 - With no state store yet, it says `background queue: 0 jobs`. When the store does not read, it prints the time and
   `the store did not read:` with the error, and exits 1.
+- While the background queue is paused, a line under the background queue line says so, see
+  [Pause the background queue](#pause-the-background-queue).
+
+### Pause the background queue
+
+`--queue --pause` holds the background queue, as before a restart of the host. No new job of the background queue
+starts. The jobs that run end as they would, and the imports run as before. The deep analysis that an import queues
+waits too, so the alerts it holds post after the resume. The pause stays across a restart of AMG until
+`--queue --resume`. `--queue` and `--selftest` show it:
+
+```
+background queue: 12 jobs, 9 of them from a backfill (1 file still to check)
+background queue: paused, its jobs wait for --queue --resume
+```
+
+`--wait` waits until no job of the background queue runs, then exits 0. So a script can restart the host after it:
+
+```
+docker exec arr-media-guard arr-media-guard --queue --pause --wait && reboot
+docker exec arr-media-guard arr-media-guard --queue --resume   # after the restart
+```
+
+On a host, leave out `docker exec arr-media-guard`. The wait prints `waiting for 2 background jobs to end` once, and
+`no background job runs` at its end.
+
+- `--wait` looks every 5 seconds and has no time limit of its own. A deep analysis can run for an hour. To give it a
+  limit, run it under `timeout` in the container, as
+  `docker exec arr-media-guard timeout 3600 arr-media-guard --queue --wait`. On a host, run
+  `timeout 3600 arr-media-guard --queue --wait`. `timeout` exits 124 when the time passes. A `timeout` around
+  `docker exec` stops only the client, and the wait in the container goes on.
+- `--wait` needs a paused queue, because a job can start right after the wait of a queue that runs. On a queue that
+  runs it exits 2. It also exits 2 when the pause ends during the wait, as by `--queue --resume` in another shell.
+- With `HOOK_WORKERS` and `BACKGROUND_WORKERS` at 1, the store does not record which job the worker runs. `--wait` then
+  waits until no worker runs, so it waits for an import too. When the open files of another user's worker do not
+  read, it says `worker: unknown` and exits 1.
+- `--resume` starts no worker. On a host the next import starts one. In Docker the listener starts one within a minute.
+- Each pause and each resume writes one line to the decision log, with source `backfill` and result `paused` or
+  `resumed`.
+- The pause is a record in the state store. A broken store that moves aside takes the pause with it, so the new store
+  starts with the queue running.
 
 ## Test the Discord webhook
 
@@ -602,6 +650,9 @@ Each command needs `/config`. The last column of the table names what else it ne
 | `arr-media-guard --serve` | the service itself | none | API, Media, LID, Plex, Discord |
 | `arr-media-guard --selftest` | `$RUN --selftest` | `$EXEC --selftest` | |
 | `arr-media-guard --queue` | none, it sees no process of the service | `$EXEC --queue` | |
+| `arr-media-guard --queue --pause` | `$RUN --queue --pause` | `$EXEC --queue --pause` | |
+| `arr-media-guard --queue --resume` | `$RUN --queue --resume` | `$EXEC --queue --resume` | |
+| `arr-media-guard --queue [--pause] --wait` | none, it sees no process of the service | `$EXEC --queue [--pause] --wait` | It exits 0, 1 (the store or the worker's open files do not read) or 2 (the queue is not paused, or the pause ended during the wait). |
 | `arr-media-guard --test-discord` | `$RUN --test-discord` | `$EXEC --test-discord` | Discord |
 | `arr-media-guard --backfill [sonarr] [--apply] [--ids ID ...] [--paths PATH ...] [--limit N] [--restart]` | `$RUN --backfill ...` | `$EXEC --backfill ...` | API. The jobs need what the service needs. |
 | `arr-media-guard --backfill [sonarr] --drop-queued` | `$RUN --backfill --drop-queued` | `$EXEC --backfill --drop-queued` | |

@@ -86,7 +86,9 @@ not yet in view. The worker then tries again, after a minute at first and at mos
 
 One worker runs at a time. On a host the Custom Script starts it, so it runs inside the app's service, see
 [design.md](design.md#memory). In Docker the listener starts it after it puts a job in the background queue, and every
-60 seconds while a job waits. The worker exits when no job waits.
+60 seconds while a job waits. The worker exits when no job waits. While `--queue --pause` holds the background queue,
+the worker starts none of its jobs, and a job that waits there starts no worker. The jobs that run end first, see
+[commands.md](commands.md#pause-the-background-queue).
 
 At its start the worker checks the state store. A broken store moves aside as `state.sqlite.corrupt-<time>`, and a new
 one starts with the jobs it could read. Once a day the worker also removes kept originals older than
@@ -135,7 +137,8 @@ A sure audio or video fault replaces every other change with a re-grab. Otherwis
   checks before it takes the old name. The old file stays as a kept original. A kept original is a hard link in
   `.<NAME>-originals`, at the top of the mount or in the highest folder AMG can write. Where links are refused, it is a
   copy. With `KEEP_ORIGINALS_DAYS=0`, nothing is kept, and AMG then removes no subtitle and changes no sidecar.
-- **Sidecars.** A `.srt` file beside the video whose words do not match moves to the kept originals. One whose times are
+- **Sidecars.** A `.srt` file beside the video whose words do not match gets a name players skip, as
+  `Film.en.mismatch.srt.txt`. One whose times are
   off, or whose lines flash, is written again with new times. Only its time lines change.
 - **Wrong content.** After the edit, AMG checks the audio language, the runtime, and the year and title in the release
   name against TMDB and the app. Two points of evidence mark the content as wrong. It re-grabs only when `REGRAB` lists

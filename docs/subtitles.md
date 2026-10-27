@@ -8,7 +8,14 @@ the video is a *sidecar*, and AMG checks it too. [design.md](design.md#subtitle-
 
 The check skips commentary tracks. A track of production notes, trivia or pop-up facts counts as commentary, because its
 text is not what people say. AMG never removes one for not matching the speech.
-An audio track with such a title counts as commentary too.
+An audio track with such a title counts as commentary too. A subtitle with no such title can still follow a
+commentary or a second audio track in its language. So before it counts as wrong, AMG also hears that track, and a
+subtitle that matches it stays as it is.
+
+A track that does not match leaves the file only when its text reads as its language, see
+[design.md](design.md#subtitle-match). A track in a language AMG has no word list for, such as Finnish, leaves unless
+its text reads as another language. Else it stays and loses its default and forced flags. AMG saves the text of a
+removed track beside the video, as `Episode.eng.mismatch.srt.txt`.
 
 ## Levels
 
@@ -385,7 +392,7 @@ after 30 minutes when AMG reads the whole file. A track whose read stopped is re
 
 With `--apply`, one remux writes every change of a subtitle in the file. That is new times, new end times, a moved
 stretch, a repaired text or a removal. AMG checks every line of the new file before it takes the old name. A sidecar is
-written again, or moved aside. AMG keeps the old file or sidecar for `KEEP_ORIGINALS_DAYS` (7) days in
+written again, or renamed to a name players skip when it does not match. AMG keeps the old file or sidecar for `KEEP_ORIGINALS_DAYS` (7) days in
 `.<NAME>-originals`. With `KEEP_ORIGINALS_DAYS` at 0, AMG still retimes a subtitle in the file, but takes no subtitle
 out and changes no sidecar. [regrabs.md](regrabs.md#kept-originals) says where that folder goes and how to undo a
 change.

@@ -930,7 +930,9 @@ def track_frames(b, t, blocks, scale):
     the ns of one frame as the codec defines it for AAC, AC-3, E-AC-3, DTS and MPEG audio, else None. It comes from the
     AAC config or the header of the first frame, whatever the DefaultDuration says. overlaps and gaps are [count, the
     worst ns, the first time in ns] of the audio blocks that start more than a tick before the end of the block before,
-    or after it. lapped holds the time in ns of each such block that starts before that end.
+    or after it. lapped holds the time in ns of each such block that starts before that end where the block before is
+    a lace. The times of a lace's frames come from its block time and their lengths, so they can run past the next
+    block, see remux.planned_times().
 
     A frame's time is stored for an unlaced block and frame 0 of a lace. Frame k of a lace is default at the block time
     plus k DefaultDurations (RFC 9559 10.3.5), else bitstream at the block time plus the lengths of the frames before
@@ -965,7 +967,7 @@ def track_frames(b, t, blocks, scale):
     own = fixed or (frame_length(codec, t["strip"] + bytes(b[first():first() + 16])) if blocks and t["type"] == 2 and not t["packed"]
                     and codec.startswith(("A_AC3", "A_EAC3", "A_DTS", "A_MPEG/L")) else None)
     time, tag, place, dur, full = array.array("q"), bytearray(), array.array("q"), array.array("q"), bytearray()
-    over, gap, last, lapped = [0, 0, None], [0, 0, None], None, array.array("q")
+    over, gap, last, laced, lapped = [0, 0, None], [0, 0, None], None, False, array.array("q")
     try:
         for i, (tk, n, pos, head, end, lacing, bdur, empty, heads) in enumerate(blocks):
             if not i & 0xffff:   # a TrueHD track of a film holds millions of blocks
@@ -996,9 +998,9 @@ def track_frames(b, t, blocks, scale):
                 for x, off in ((over, last - t0), (gap, t0 - last)):
                     if off > scale:
                         x[0], x[1], x[2] = x[0] + 1, max(x[1], off), x[2] if x[2] is not None else t0
-                        if x is over:
+                        if x is over and laced:
                             lapped.append(t0)
-            last = t0 + span if span else None
+            last, laced = t0 + span if span else None, n > 1
     except OverflowError:   # the arrays hold signed 64-bit ns, as libmatroska and ffmpeg hold times
         raise ValueError(f"the block at byte {pos} of track {t['number']} stores a time or a duration of 2^63 ns or more") from None
     return dict(t, time=time, tag=tag, place=place, dur=dur, full=full, frame=frame, codec_frame=own and own[0] * 1e9 / own[1], overlaps=over,

@@ -32,10 +32,10 @@ def metadata(app, path, j, d, original, release, item, fresh=False, asked=None, 
 
 
 def episode_title(app, item, nfo, release, path):
-    """content.episode_title_verdict() of an episode file, or None when neither the NFO, the release name nor the
-    file name gives a title. Only then does it read the series' episodes, unless item holds them, as in a backfill. A
-    failed read is verdict "unknown", so the other checks still run. A file with no scene name has Sonarr's own name,
-    and the alert says so, because Sonarr wrote that name in the order it had at the import."""
+    """content.episode_title_verdict() of an episode file, or None when neither the NFO, the release name nor the file
+    name gives a title. Only then does it read the series' episodes, unless item holds them, as in a backfill. A failed
+    read is verdict "unknown", so the other checks still run. The job's time limit passes. A file with no scene name has
+    Sonarr's own name, and the alert says so, because Sonarr wrote that name in the order it had at the import."""
     name = release or os.path.basename(path)
     said, title = ("the release's NFO", nfo) if nfo else \
         ("the release name" if release else "the file name", content.release_episode_title(name))
@@ -203,7 +203,7 @@ class Ctx:
     pool: object = None   # the conversion pool of a backfill with several workers, see backfill_files(). It converts under the shared lock.
     force: str = None   # the refusal a person accepts, see convert()
     recheck: str = None
-    held: list = None   # the alerts an import holds for the deep analysis of its file, see alerts()
+    held: list = None   # the alerts an import holds for the deep analysis of its file, see alerts(). The deep analysis gets them from its job.
     planned: list = None   # the file key of the dry run whose plan a queued job applies, see start() and cli.planned_file()
     row: dict = None   # the plan row that the apply of a queued job follows, see gate.allow()
 
@@ -256,6 +256,7 @@ def stop_line(ctx, left):
     the unreadable notice, and they post, with the change posts of the writes that finished, see
     logs.alert_findings(). A finding that the stop caused posts nothing. The app rescan of a write waits. A job's next
     run sends it, see after_edit(), and a backfill sends it at its end. A deep analysis or a recheck sends none."""
+    config.DEADLINE.stop()   # the checks are over, so the posts of the line run with no limit
     rec = ctx.rec
     rec["not_run"] = [s.__name__ for s in left]
     if "outcome" not in rec:   # a conversion that failed or was skipped set one, so "repack" here is a conversion that ran
@@ -286,6 +287,15 @@ def own_writes(ctx):
     return (["repacked"] if "repack" in rec and not ctx.unconverted and rec["repack"].get("new_size") else []) + \
         ([hr["code"]] if hr.get("code") in config.REPAIRED else []) + (rm.get("codes") or [] if rm.get("done") else []) + \
         (["edited"] if "edited" in (rec.get("outcome"), rec.get("edit_result")) else [])
+
+
+def step_video_check(ctx, *a, **k):
+    """checks.video_check() in a step of ctx. A time limit that ended the check is no verdict, and the run gets a new
+    limit, as the checks after a header repair get one, so each later read of the import stays bounded."""
+    got = checks.video_check(*a, **k)
+    if (got[2].get("error") or "").startswith("OutOfTime:"):
+        ctx.rearm()
+    return got
 
 
 def rescanned(ctx):
@@ -389,7 +399,7 @@ def conversion(ctx):
                 convert.convert_list(ctx.app, dict(rec, outcome=got, result=result))
             ctx.shared.exclusive(st)
         ctx.shared = False
-    elif ctx.lock is not None and not ctx.pool and got in ("repacked", "repack_failed", "repack_source_changed"):   # convert() let the lock go, see there
+    elif ctx.lock is not None and not ctx.pool and ctx.apply and got in ("repacked", "repack_failed", "repack_source_changed"):   # the remux or the swap may have let the lock go
         runner.gated(ctx.lock, fcntl.LOCK_EX)
     if "warnings" in rec["repack"]:
         ctx.rearm()   # convert() ran the remux with the time limit off, whatever came of it
@@ -480,7 +490,7 @@ def header(ctx):
         hp = ctx.hp = dict(hp, trim=trim, remove=remove, listed=listed)
     if hp["first"] and ctx.shared and ctx.apply and not hp["blocked"] and not cut and not remux.repack_skip(path, ctx.st):
         raise runner.Replan("the file needs a header repair")
-    ctx.vpre = checks.video_check(path, j=j, hp=hp)
+    ctx.vpre = step_video_check(ctx, path, j=j, hp=hp)
     h = ctx.vpre[2].get("header") or {}
     ctx.stage = h or dict(hp, repairable=False)
     if h.get("repairable") and not cut:   # the issue and the subtitle trims and removals the repair writes
@@ -655,13 +665,29 @@ def subtitle_checks(ctx):
         if subtitles.sub_fixes(ctx.source) and config.CFG.keep_days else {}
     # A track whose every name for its bytes holds a file stays this run, so the remux still makes the other fixes.
     # Before the remux no bytes say whether one of those files holds them already, see remux.broken_plan().
-    names = {p: {"lang": tag, "data": None, "ext": remux.TEXT_EXT[subtitles.sub_codecs(j)[p]]} for p, tag in strip.items()}
+    names = {p: remux.text_entry(tag, subtitles.sub_codecs(j)[p]) for p, tag in strip.items()}
     remux.broken_plan(path, names)
     for p in [p for p, e in names.items() if e["reused"]]:   # with no bytes, a name that holds a file is taken
         del strip[p]
         for g in (garbled[p], rec["garbled"][p]):
             g.update(held=True, why=f'{g["why"]}, but the names for its bytes beside the video are taken')
-    remove = sorted(unmatched - set(strip)) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
+    # A mismatch leaves the file only when its text lets it, see subtitles.tag_read(). Else it stays with its
+    # flags off, as with KEEP_ORIGINALS_DAYS 0. The read takes the cues of the word check, or those sub_layout() read.
+    # A removed text track's bytes go beside the video, see remux.resub(), so a track whose names there are all taken
+    # stays too.
+    kept_for, codecs, tag = {}, subtitles.sub_codecs(j), {t["pos"]: t["lang"] for t in d["tracks"]}
+    for p in sorted(p for p, r in {**sync, **timed_by}.items() if p not in sides and p not in others and r["verdict"] == "mismatch"):
+        ok, read = subtitles.tag_read(items[p][2] if p in items else subtitles.layout_cues(path, p), tag.get(p))
+        at = sync if p in sync else timed_by
+        at[p] = dict(at[p], text=read)
+        if not ok and p in unmatched:
+            kept_for[p] = "text"
+    tagged = {f"s{n}": decide.track_tag(t.get("properties") or {}) for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
+    texts = {p: remux.text_entry(tagged[p], codecs[p], True)
+             for p in unmatched - set(strip) - set(kept_for) if codecs.get(p) in remux.TEXT_EXT} if config.CFG.keep_days else {}
+    remux.broken_plan(path, texts)
+    kept_for.update({p: "names" for p, e in texts.items() if e["reused"]})
+    remove = sorted(unmatched - set(strip) - set(kept_for)) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
     # A repair takes the track's place in the remux and keeps its times, so the track gets no other change in this run.
     # Its default flag goes when the decision turns it off, in a run whose flag edit acts on the decision, see act().
     keep = ctx.background or not ctx.app   # the runs that keep the flags, as act() does
@@ -672,7 +698,6 @@ def subtitle_checks(ctx):
     later = {p for p in recode if p in fixes or p in blocks or p in starts or p in waits}   # judged again after the repair, see after_edit()
     fixes = {p: f for p, f in fixes.items() if p not in recode and p not in strip}
     flashy = subtitles.flash_check(path, j, [s for s in proof.sidecar_subs(path) if s["name"] not in gone_sides], full, stop) if mkv and subs_on else {}   # ends too short to read, any text track or sidecar
-    codecs = subtitles.sub_codecs(j)
     vtt = {p for p, c in codecs.items() if c == "S_TEXT/WEBVTT"} & set(flashy)   # the fix never rewrites WebVTT: report only
     if flashy:
         rec["flash"] = {k: {"cues": len(v), "median": round(statistics.median(o - a for a, _, o, _ in v), 3), "lengthened": sum(n != o for _, _, o, n in v),
@@ -730,10 +755,16 @@ def subtitle_checks(ctx):
         rec.setdefault("subremux", {}).update(kept_back="check")
     elif stay and not config.CFG.keep_days:
         rec.setdefault("subremux", {}).update(kept_back="keep_days")
+    if kept_for:   # why each of these stays, see report.KEPT_BACK
+        rec.setdefault("subremux", {}).update(kept_for=kept_for)
     if unmatched or strip:   # the remux takes out the tracks in strip too, so the decision gives them no flag either
         d = decide.decide(ctx.j, ctx.original, ctx.kids, ctx.release, ctx.heard, ctx.spoken, ctx.wrong, unmatched | set(strip))
         if ctx.tags:
             d = decide.with_tags(d, ctx.tags)
+    # The tracks whose default or forced flag the run turns off, by their place before any remux, so an alert says it only of them.
+    # A deep analysis adds those its import turned off, as its alert takes the place of the import's held one, see logs.alert_findings().
+    off = {e[0] for e in flag_edits(ctx, d, unmatched | set(strip)) if decide.prop(e) in ("flag-default", decide.FORCED_FLAG)}
+    ctx.cut = {t["pos"] for t in d["tracks"] if t["sel"] in off} | {p for h in ctx.held or () for p in h.get("flags") or ()}
     ctx.d, ctx.sync, ctx.timed_by, ctx.sides, ctx.others, ctx.unmatched, ctx.stay = d, sync, timed_by, sides, others, unmatched, stay
     ctx.fixes, ctx.remove, ctx.ends, ctx.flashy, ctx.moves, ctx.side_moves, ctx.recode = fixes, remove, ends, flashy, moves, side_moves, recode
     ctx.strip, ctx.later, ctx.bad_sides, ctx.covers, ctx.kept = strip, later | side_later, bad_sides, covers, kept
@@ -831,7 +862,7 @@ def faults(ctx):
         if doubts:   # uncertain: one alert per file, because the alerts of one kind share a marker
             rest.append({"kind": "audio", "doubts": doubts})
     if ctx.mode == "import" and ctx.video and not ctx.certain:   # before the edit, under the job's time limit, see check_video()
-        ctx.vcertain, doubts, ctx.vfields = ctx.vpre or checks.video_check(ctx.path, j=ctx.j, hp=hp)
+        ctx.vcertain, doubts, ctx.vfields = ctx.vpre or step_video_check(ctx, ctx.path, j=ctx.j, hp=hp)
         rec["video"] = checks.video_summary(ctx.vcertain, doubts, ctx.vfields)
         if "code" in ctx.vfields:
             ctx.extra.append(ctx.vfields["code"])
@@ -1010,6 +1041,8 @@ def write(ctx):
             **({"copies": c} if (c := sorted(e["place"] for e in covers.values() if e.get("copy"))) else {}),
             **({"timed": sorted(timed)} if timed else {}), **({"recoded": sorted(recode)} if recode else {}),
             **({"stripped": {p: (info.get("garbled_text") or {}).get(str(i)) for p, i in zip(strip, sub["strip"])}} if strip else {}),
+            **({"saved": saved} if (done or not ctx.apply)   # a failed or skipped remux of an apply wrote none, or removed it again
+               and (saved := {p: n for p, i in zip(remove, sub["drop"]) if (n := (info.get("mismatch_text") or {}).get(str(i)))}) else {}),
             **({"tracks_before": logs.track_log(ctx.d["tracks"])} if done else {}))}   # the places the check named, before a removal moves the tracks up
         if head:   # the same remux repairs the header, see resub()
             tail = head.get("tail") or head.get("edit_tail")
@@ -1146,14 +1179,15 @@ def after_edit(ctx):
     rec, d = ctx.rec, ctx.d
     rescan(ctx)
     if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain):   # the sidecars beside the file, under the lock of the edit
+        planned = [os.path.join(os.path.dirname(ctx.path), n) for n in ((rec.get("subremux") or {}).get("saved") or {}).values()]   # a dry run's, once
         rec["sidecars"] = gate.allow(ctx, "sidecars", lambda: subtitles.sidecar_fix(
             {n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
-            **({"timed": ctx.side_moves} if ctx.side_moves else {})), subtitles=ctx.wrote["subtitles"])
+            **({"timed": ctx.side_moves} if ctx.side_moves else {}), video=ctx.path, taken=planned), subtitles=ctx.wrote["subtitles"])
     if rec["outcome"] == "no_change" and (named := sub_outcome(rec)):   # the subtitle step was the change, so the outcome names it
         rec.update(outcome=named[0], result=named[1])
     elif rec["outcome"] == "no_change" and (said := quiet_result(rec, ctx.apply, ctx.source)):   # the outcome stays, so every count stays
         rec["result"] = said
-    found = subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts)
+    found = subtitles.sub_findings(rec, ctx.sync_all, ctx.stay, ctx.starts, ctx.cut)
     rm = rec.get("subremux") or {}
     # A cover move that failed or could not run. With subtitle fixes, the alert that says why the rewrite failed takes
     # one more sentence for it, so the run posts once. Only a sentence of a subtitle fix in this remux holds its result.
@@ -1265,7 +1299,7 @@ def content_checks(ctx):
                 ctx.first.append(dict(content_finding(ev), action=action))
             elif ev["regrab"]:
                 ctx.first.append(content_finding(ev))
-        except Exception as ex:   # the edit is done, so a failure or the time limit costs only the checks
+        except (Exception, content.OutOfTime) as ex:   # the edit is done, so a failure or the time limit costs only the checks
             rec["meta_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:200]
         finally:
             ctx.until = config.DEADLINE.end
@@ -1316,7 +1350,7 @@ def quick_check(ctx):
             rec["burned_in"] = {"result": "skipped", "why": f'the file has no {"audio" if video else "video"} track'}
             return
         rec["burned_in"] = dict(burn_run(ctx.path, audio["index"], duration, ["--quick"], config.DEADLINE.left()), audio=audio)
-    except Exception as ex:
+    except (Exception, content.OutOfTime) as ex:
         rec["burned_in"] = dict(result="unsure", why=config.mask(f"the quick check failed: {type(ex).__name__}: {ex}")[:200],
                                 **({"audio": audio} if audio else {}))
     finally:
@@ -1329,9 +1363,10 @@ def alerts(ctx):
     them, see report.unreadable_finding(). An import whose file gets the deep
     analysis holds the subtitle alerts in held, because that analysis checks them again and posts what it still finds,
     see logs.alert_findings() and runner.queue_deep_analysis()."""
+    config.DEADLINE.stop()   # the checks are over, as after a file the app removed, so the posts run with no limit
     rec = ctx.rec
     try:
-        found = file_alerts(ctx.d, ctx.file_checks, ctx.meta, ctx.original, ctx.item)
+        found = file_alerts(ctx.d, ctx.file_checks, ctx.meta, ctx.original, ctx.item, ctx.app)
         if ctx.check and not ctx.app:   # with no original language, audio in another language than English proves nothing
             found = [f for f in found if f["kind"] != "language"]
         problems = ctx.first + found + ctx.rest
@@ -1358,16 +1393,23 @@ def content_finding(ev):
     return {"kind": "content", "signals": [s["why"] for s in scored], "scored": [s["kind"] for s in scored], "points": ev["points"]}
 
 
-def file_alerts(d, file_checks, meta, original, item):
+def file_alerts(d, file_checks, meta, original, item, app=None):
     """The language, duration and runtime findings of one file. The metadata checks decide them when they ran. The
-    language alert fires on a wrong verdict, or on the decision's wrong_language when TMDB cannot tell. The runtime
-    alert needs a trusted duration. Without the checks, decide.checks() decides as before them."""
+    language alert fires on a wrong verdict, or on the decision's wrong_language when TMDB cannot tell. Its "has" names
+    the main audio. "aside" lists [language, role] of each other audio track in a wanted language, such as an English
+    commentary. "listed" is [source, language] of the original language: TMDB when its original agrees, else the app.
+    The runtime alert needs a trusted duration. Without the checks, decide.checks() decides as before them."""
     ev = (meta or {}).get("evidence")
     verdict = {s["kind"]: s["verdict"] for s in (ev or {}).get("signals", [])}
     out = []
     if verdict.get("language") == "wrong" or (verdict.get("language", "unknown") == "unknown" and d["wrong_language"]):
         want = "English" if "eng" in decide.codes(original) else f"English or {original or 'the original language'}"
-        out.append({"kind": "language", "want": want, "has": [t["lang"] for t in d["tracks"] if t["kind"] == "a"]})
+        audio, wanted = [t for t in d["tracks"] if t["kind"] == "a"], decide.codes(original) | {"eng"}
+        tmdb = ((meta or {}).get("expected") or {}).get("original")
+        by = "TMDB" if tmdb and tmdb in decide.codes(original) else (config.program(app) or "").capitalize()
+        out.append({"kind": "language", "want": want, "has": [t["lang"] for t in audio if t["role"] == "main"],
+                    "aside": [[t["lang"], t["role"]] for t in audio if t["role"] != "main" and t["lang"] in wanted],
+                    **({"listed": [by, original]} if original and by else {})})
     duration = [dict(f, kind=k) for k, f in file_checks if k == "duration"]
     header = content.header_alert(meta["trusted"]) if meta else None
     out += duration or ([{"kind": "duration", "why": header}] if header else [])
@@ -1433,8 +1475,8 @@ def mute_rule(path, ts, edits):
 
 
 def propedit_args(edits, i):
-    """mkvpropedit arguments that set the property of each edit (flag-default, flag-forced, flag-original, language or
-    language-ietf) to its new (i=1) or old (i=2) value. None deletes the property: a track that had no BCP 47 tag or no
+    """mkvpropedit arguments that set the property of each edit (flag-default, flag-forced, flag-original,
+    flag-commentary, language or language-ietf) to its new (i=1) or old (i=2) value. None deletes the property: a track that had no BCP 47 tag or no
     Original language flag gets none back on undo."""
     return [a for e in edits for a in (("--edit", e[0], "--delete", decide.prop(e)) if e[i] is None
                                        else ("--edit", e[0], "--set", f"{decide.prop(e)}={e[i]}"))]
@@ -1442,7 +1484,8 @@ def propedit_args(edits, i):
 
 def needed(j, edits):
     """edits less the flag edits that j, the probe of the file, shows already, so a flag edit never runs as a no-op."""
-    return [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG) or decide.unapplied(j, [e])]
+    return [e for e in edits if decide.prop(e) not in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG, decide.COMMENTARY_FLAG)
+            or decide.unapplied(j, [e])]
 
 
 def rechecked(p):

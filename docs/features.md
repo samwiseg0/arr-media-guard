@@ -44,6 +44,14 @@ and subtitle track in the original language. It takes the flag off a track in an
   file with one audio track and no subtitle when its flag may change. The deep analysis and a recheck keep the flags
   the import set, so files imported before 2.7.0 change only in a backfill.
 
+## Commentary flag
+
+Matroska has a *Commentary* flag, so a player can name a commentary track. Many releases title the track
+"Commentary" and leave the flag out. At import, AMG sets the flag on each audio and subtitle track whose title reads as
+commentary. A title of notes, such as "Production Notes" or "Trivia", gets no flag, and a flag set already stays. A
+title such as "No Commentary" or "Commentary-free" marks the dialogue, so that track gets no flag. The edit is one more
+flag in the same `mkvpropedit` call, with the same undo line.
+
 ## Language detection
 
 A track can have no language tag, or a wrong one. *Language detection* is a speech model, Whisper, that hears an audio
@@ -61,9 +69,16 @@ audio, one early and one late, and more when needed. It compares the words with 
 the audio. That covers subtitles in the file and `.srt` files beside it, called *sidecars*. This compare is the *word
 check*. It needs language detection.
 
-- AMG takes a subtitle track whose words do not match out of the file, in a remux. A sidecar that does not match moves
-  into `.<NAME>-originals`, the folder of [kept originals](regrabs.md#kept-originals). When AMG cannot remove a track,
-  it stops the track playing by default and alerts.
+- AMG takes a subtitle track whose words do not match out of the file, in a remux. A sidecar that does not match gets a
+  name players skip, as `Film.en.mismatch.srt.txt`. When that name and its numbered forms are all taken, it moves into
+  `.<NAME>-originals`, the folder of [kept originals](regrabs.md#kept-originals). When AMG cannot remove a track, it
+  stops the track playing by default and alerts.
+- Before a subtitle counts as wrong, AMG also listens to the other audio tracks in its language, such as a commentary.
+  A subtitle that matches one of them stays as it is, with no alert.
+- A track leaves the file only when its text reads as its language. An English track that holds Dutch text stays, stops
+  playing by default, and the alert says why. AMG has no word list for some languages, such as Finnish. A track in
+  such a language leaves unless its text reads as another language. AMG saves the text of a removed track beside the video, as
+  `Film.eng.mismatch.srt.txt`. Players skip a `.txt` file, and Radarr and Sonarr list it as an extra.
 - A subtitle early or late by one amount gets new times. So does one made for another frame rate, which drifts.
   When the word check finds a subtitle off and no new times pass the checks, an alert says it seems off. An alert
   posts only where AMG heard lines three quarters of a second or more off after its moves, see
@@ -150,7 +165,7 @@ conversion leaves a sidecar with an unknown set beside the new file as it is, an
 skips it. A conversion also leaves a sidecar beside the new file as it is when mkvmerge would lose some of its lines or
 show them wrong. One such sidecar has a line with no blank line before the next line's number. AMG gives such a
 sidecar beside an MKV no new times either, when a player shows that next line at its own time, and the alert says
-why.
+why. A sidecar named .srt that holds ASS or SSA text stays beside the new file too, and the alert says so.
 
 ## Garbled subtitle repair
 
@@ -181,7 +196,10 @@ so. See [regrabs.md](regrabs.md#re-grabs).
 After the import, a *whole-file check* reads each file whole in the background queue. It looks for gaps of zero bytes,
 as a torrent piece that never downloaded leaves, and ffmpeg reads every packet beside it. Gaps at two or more places
 re-grab the file when `REGRAB` lists `video`. One gap, or an error of the full read, only alerts. That alert names the
-play time of the gap or of each error, as the import's alert of one gap does. Silent PCM audio is zero bytes too, so in
+play time of the gap or of each error, as the import's alert of one gap does. An error of an audio decoder alerts as
+"Audio may be broken". Up to 10 such errors of one decoder go to the decision log only, when a 20 s sample of each
+audio track finds at most 10 more. A player plays past one bad frame at the start. The sample finds a track whose every
+frame is bad. Silent PCM audio is zero bytes too, so in
 an MKV, MP4 or MOV file with PCM audio a gap counts only where the full read breaks. The check takes about the time the
 NAS needs to send the file once. See [design.md](design.md#whole-file-check).
 
@@ -272,7 +290,10 @@ and the sidecars go into the new file. A subtitle whose words do not match the a
 of the new file, packet by packet, before it removes the source file. Every packet must also sit in the file near its
 time, as in the source. In an MP4 with HEVC, MPEG-1 or MPEG-2 video,
 mkvmerge would drop the last frames when a subtitle or audio track ends first. AMG reads such a video on its own, so it keeps
-every frame. An MP4 subtitle track must hold its text in UTF-8.
+every frame. An MP4 VobSub track with no picture size (a width or a height of 0) stops the conversion before the
+remux, because ffmpeg
+cannot read such a track in an MKV. The alert says so, and the source file stays. An MP4 subtitle track must hold its
+text in UTF-8.
 A track with any line in an older character set, such as Windows-1256, shows as garbage in every player. AMG removes
 it from the MKV and saves its bytes as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`.
 Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as a subtitle file, and Radarr may rename it

@@ -10,7 +10,9 @@ def gated(f, op, wait=config.DEADLINE):
     """flock f with op, after the gate (lock.gate). A taker holds the gate only while it waits for f. So an edit that
     waits holds the gate, no new scan file starts, and the edit waits only for the files in flight. Linux flock gives
     a waiting LOCK_EX no preference, so without the gate a stream of shared scan locks could keep an edit out. wait is
-    the content.Deadline of both waits, the job's by default."""
+    the content.Deadline of both waits, the job's by default. The lock of f goes first, because a taker that waited at
+    the gate with f locked would deadlock with an edit that holds the gate and waits for f."""
+    fcntl.flock(f, fcntl.LOCK_UN)   # an unlock of a file with no lock does nothing
     with open(os.path.join(config.CFG.state_dir, "lock.gate"), "w") as gate:
         wait.lock(gate, fcntl.LOCK_EX)
         wait.lock(f, op)
@@ -51,12 +53,11 @@ def same_file(path, st, step="the checks", during="since"):
 
 def exclusive(lock, path, st, name, job, unit):
     """Trade the shared file lock of a job process for the exclusive one, before an edit or a re-grab. flock cannot
-    upgrade a lock in one step, so the shared lock goes first. A process that waited at the gate while it held the
-    lock shared would deadlock with the edit that holds the gate. wait_turn() first lets the older jobs of the same
-    download finish. Then the file must still be the one st describes, the stat the checks started from, and the
-    download's re-grab unit must still be unit, the one the job read before its checks. Raises Replan when
-    either changed, so no edit or re-grab rests on a stale read. The wait has LOCK_WAIT of its own, and the job keeps
-    the time it had left."""
+    upgrade a lock in one step, so the shared lock goes first. It goes before wait_turn(), so an older job that waits
+    for the exclusive lock can take it. wait_turn() first lets the older jobs of the same download finish. Then the
+    file must still be the one st describes, the stat the checks started from, and the download's re-grab unit must
+    still be unit, the one the job read before its checks. Raises Replan when either changed, so no edit or re-grab
+    rests on a stale read. The wait has LOCK_WAIT of its own, and the job keeps the time it had left."""
     fcntl.flock(lock, fcntl.LOCK_UN)
     with config.DEADLINE.paused() as left:
         wait = content.Deadline(config.LOCK_WAIT, f"gave up after waiting {config.LOCK_WAIT} seconds for the exclusive lock")
@@ -285,8 +286,32 @@ def job_of(name, claimed=False):
 def claim(name):
     """Claim the queued job name for a job process, see coordinate(). One change of the store does it, so of two
     workers one alone gets the job. The claim clears a yielding mark that an older AMG left on the row. False when it is
-    gone or claimed."""
-    return store.write("UPDATE OR IGNORE jobs SET claimed = 1, yielding = 0 WHERE name = ? AND claimed = 0", name).rowcount == 1
+    gone or claimed, or when it is a job of the background queue and the queue is paused. The claim reads the pause in
+    the same change, so no job of the background queue starts after pause() ends, see cli.wait_background()."""
+    return store.write("UPDATE OR IGNORE jobs SET claimed = 1, yielding = 0 WHERE name = ? AND claimed = 0 AND NOT (name LIKE 'deep-analysis-%' "
+                       "AND EXISTS (SELECT 1 FROM kv WHERE ns = 'mark' AND key = ?))", name, PAUSED).rowcount == 1
+
+
+PAUSED = "queue-paused"   # the key in the store's ns "mark" while --queue --pause holds the background queue
+
+
+def paused():
+    """Whether --queue --pause holds the background queue. A store with no such row, as one of an older AMG, is not
+    paused."""
+    return store.get("mark", PAUSED) is not None
+
+
+def pause(on):
+    """Hold the background queue, or with on False start it again. The row stays in the store, so the pause stays
+    across a restart. A job that runs ends as it would, and the imports run. Returns whether the state changed."""
+    with store.tx():
+        if paused() == on:
+            return False
+        if on:
+            store.put("mark", PAUSED, True)
+        else:
+            store.drop("mark", PAUSED)
+    return True
 
 
 def put_job(name, job, claimed=False):
@@ -507,8 +532,8 @@ def queue_rechecks():
     job takes the inputs of its item from the app now, as --sub-check does. A job of the path that waits or runs
     already stays. The mark of the version goes in only after every app answered. So after a stop or a failure part
     way, the next start or nightly audit queues the rest. One line on stdout and in the decision log gives the count,
-    or the failure. With nothing queued and nothing failed it writes none. It never raises. Returns the count, or None
-    when nothing ran."""
+    or the failure. With nothing queued and nothing failed it writes none. It raises only OutOfTime, the job's time
+    limit. Returns the count, or None when nothing ran."""
     if not config.CFG.recheck_on_update or config.CFG.subtitles == "off":
         return None
     n, failed = 0, []
@@ -690,8 +715,10 @@ def whole_act(name, job, rec, pending, post=True):
     an import's re-grab would, with the cap, the kept copies and the restore of regrab.regrab(). Every other file of the
     download has a job of its own. The lock is exclusive for the re-grab, and the second check measures the runs that
     count again then, see regrab.whole_probe(). A doubt only alerts. The one blank gap that the import's alert named
-    logs only. A file that changed during the scan gets no verdict, see same_file(). The zero runs of a file with PCM
-    audio that the read pass did not confirm are logged in the note only, see decide.whole_verdict().
+    logs only. The audio doubt of decide.whole_verdict() and decide.audio_sampled() alerts as kind audio when no video
+    doubt posts beside it, and logs only when it does not post. A file that changed during the scan gets no verdict,
+    see same_file(). The zero runs of a file with PCM audio that the read pass did not confirm are logged in the note
+    only, see decide.whole_verdict().
 
     --check runs it with no name and check in grab, see cli.whole_later(). It then never yields, and its re-grab
     only says what an import would do, so it takes no lock. A job a backfill queued gives check in grab too. post False
@@ -709,8 +736,10 @@ def whole_act(name, job, rec, pending, post=True):
         return dict(rec, outcome="file_changed", result=f"dropped, {ex}")
     count, size = fields["zeros"]["count"], fields["size"]
     said = job.get("gap") is not None and len(count) == 1 and count[0][0] / size - decide.NEAR <= job["gap"] <= count[0][1] / size + decide.NEAR
-    posts = more if said else zero + more
-    rec["whole"].update(certain=certain, doubts=zero + more)
+    shown = more if said else zero + more   # the video doubts that post
+    heard = fields["audio"]["doubts"] if fields.get("audio") else []   # the audio doubts, see decide.whole_verdict()
+    posts = shown + (heard if heard and fields["audio"]["posts"] else [])
+    rec["whole"].update(certain=certain, doubts=zero + more + heard)
     notes, left = [], len(fields["zeros"]["runs"]) - len(count)   # the runs of a file with PCM audio that the read pass did not confirm
     if left:
         notes.append(f"{left} zero run{'s' if left != 1 else ''} in a file with PCM audio, where the read pass found no error, logged only")
@@ -731,13 +760,17 @@ def whole_act(name, job, rec, pending, post=True):
             f["action"] = dict(regrab.regrab(app, grab, "zero-filled", regrab.whole_probe(path, count, rec["whole"]), "video", alone=True), kind="video")
         code = f["action"]["code"]
         rec = regrab.restore_log(dict(rec, outcome="corrupt_video", regrab=code, result=f"corrupt video: {certain}, re-grab {code}"), grab, pending, app)
-    elif zero + more:
-        rec.update(outcome="video_doubt", result=f"video may be broken: {'; '.join(zero + more)}" + ("" if posts else ", logged only, the import's alert named it"))
-        f = posts and {"kind": "video", "doubts": posts, "mark": "whole"}
+    elif zero + more + heard:
+        kind = "video" if zero + more else "audio"
+        anywhere = any(c in decide.ANYWHERE for c, _ in fields["ffmpeg"].get("audio") or [])   # lines with no place, see decide.whole_verdict()
+        bound = f"at most {decide.AUDIO_BAD} " + ("audio errors" if anywhere else "errors at the start of each audio track")
+        why = (["the import's alert named it"] if zero + more else []) + ([bound] if heard else [])
+        rec.update(outcome=f"{kind}_doubt", result=f"{kind} may be broken: {'; '.join(zero + more + heard)}" + ("" if posts else f", logged only, {' and '.join(why)}"))
+        f = posts and {"kind": "video" if shown else "audio", "doubts": posts, "mark": "whole"}
     else:
         rec.update(outcome="video_checked", result=report.FAULTS["video"][1])
     if f:
-        rec.update(findings=[f], alert_kinds=["video"])
+        rec.update(findings=[f], alert_kinds=[f["kind"]])
         if post:
             rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(job["path"]) if os.path.exists(job["path"]) else 0)
     return rec
@@ -1127,7 +1160,7 @@ def deep_analysis(name, pending, claimed=False):
                 ctx = process.Ctx(app, path, got.get("label") or os.path.basename(path), got.get("original"), got.get("runtime") or 0,
                                   mode={"import": "sub_check"}.get(job.get("recheck"), job.get("recheck") or "deep"), recheck=job.get("recheck"),
                                   kids=bool(got.get("kids")), release=got.get("release") or "", ids=job.get("ids"), item=got.get("ctx"),
-                                  lock=lock, shared=shared, row=job.get("audited"))
+                                  lock=lock, shared=shared, row=job.get("audited"), held=job.get("held"))
                 with gate.armed(path) if "audited" in job else contextlib.nullcontext():   # a follow-up of a queued plan, see queue_after()
                     return process.process(ctx)
             try:
@@ -1590,13 +1623,15 @@ def newznab_check(url, until):
 def waiting():
     """Whether work waits for a worker: a queued import or deep analysis job, a job a dead worker left claimed, the Plex
     analyzes a stopped worker kept, or a job file in queue_dir() that a busy store left there. A worker exits once no
-    import waits, so a deep analysis job left by a stopped container waits for this check."""
+    import waits, so a deep analysis job left by a stopped container waits for this check. A job of the background
+    queue counts only while the queue is not paused, see pause()."""
     files = os.listdir(queue_dir()) if os.path.isdir(queue_dir()) else []   # read only, so the hook and the listener never wait here
     if any(not n.startswith(".") for n in files):
         return True
     try:
-        return bool(store.read("SELECT 1 FROM jobs WHERE claimed = 1 OR name LIKE 'deep-analysis-%' OR due <= ? LIMIT 1", time.time_ns())
-                    or store.get("plex", "pending"))
+        background = "" if paused() else " OR name LIKE 'deep-analysis-%'"
+        return bool(store.read(f"SELECT 1 FROM jobs WHERE claimed = 1 OR due <= ? AND name NOT LIKE 'deep-analysis-%'{background} LIMIT 1",
+                               time.time_ns()) or store.get("plex", "pending"))
     except sqlite3.DatabaseError:   # a worker looks at a store that does not read, see check_store()
         return True
 
@@ -1823,10 +1858,10 @@ def worker(lock):
     while True:
         jobs = queued()
         warned = backlog(jobs, warned)
-        deep = deep_analysis_queued()
+        deep = [] if paused() else deep_analysis_queued()
         if jobs:
             run_job(jobs[0], pending)
-        elif deep:   # a job of the background queue only when no import waits
+        elif deep:   # a job of the background queue only when no import waits and the queue is not paused
             background(deep[0], pending)
         plex.plex_pass(pending)
         if jobs or deep:
@@ -1875,7 +1910,7 @@ def coordinate(lock, pending):
         jobs = next_jobs(jobs, [x[1] for x in running.values()], live)
         while jobs and not stop:
             name = jobs.pop(0)
-            if not claim(name):   # gone since the listing
+            if not claim(name):   # gone since the listing, or a job of the background queue that a pause holds
                 continue
             old, pipe = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}), ()   # blocked until the child has its own handler
             try:
@@ -1945,11 +1980,13 @@ def next_jobs(imports, names, live):
     queued, which yields only before a conversion and a remux. With no import waiting, the jobs of the background queue
     while fewer than BACKGROUND_WORKERS of them run and a slot is free, never two jobs of one file at once, see
     file_tag(). A burn-in mute or a remux of a file would make a whole-file check of it drop with no verdict. live drops
-    the jobs that crashed too often."""
+    the jobs that crashed too often. A paused queue starts no job of the background queue, see pause()."""
     background, free = [x for x in names if x.startswith("deep-analysis-")], config.slots() - len(names)
     if imports:
         room = config.CFG.hook_workers - (len(names) - len(background))   # the import places left
         return imports[:max(0, room if free < room and not frees_slot() else min(room, free))]
+    if paused():
+        return []
     busy, out = {file_tag(x) for x in background}, []
     for x in live(deep_analysis_queued()):
         if len(out) + len(background) >= config.CFG.background_workers or len(out) >= free:
@@ -2234,11 +2271,17 @@ def run_job(name, pending, shared=False, claimed=False):
         again = ex.args[0] if ex.args else str(ex)
     except Unchecked as ex:
         rec.update(outcome="error", result=f"error: {ex}"[:500])
-    except Exception as ex:   # the time limit, a timeout, a bad probe: record it and go on with the next job
+    except (Exception, content.OutOfTime) as ex:   # the time limit, a timeout, a bad probe: record it and go on with the next job
         if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
             raise
         rec.update(outcome="error", result=f"error: {type(ex).__name__}: {ex}"[:500])
         rec["trace"] = traceback.format_exc(limit=3)[-800:]
+        if getattr(run, "rec", None):   # what the run wrote before the error, so the line names it and Plex reads the file again
+            rec.update({k: run.rec[k] for k in ("label", "path", "header_repair", "repack", "subremux", "sidecars") if k in run.rec})
+            if wrote := [r for r in process.own_writes(run) if r != "edited"]:   # from the write fields, so they hold before decision_fields() too
+                rec["reasons"] = wrote
+            if "edited" in (run.rec.get("result"), run.rec.get("edit_result")):   # the flag edit, see process.changed()
+                rec.update({k: run.rec[k] for k in ("edits", "before", "after", "undo") if k in run.rec}, edit_result="edited")
     finally:
         config.DEADLINE.stop()
     if again:

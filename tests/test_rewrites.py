@@ -171,7 +171,7 @@ def test_the_legacy_row_refuses_each_near_change(why, pair):
 
 
 def test_the_legacy_row_refuses_with_no_language_table(monkeypatch):
-    monkeypatch.setattr(hook, "langs", lambda: ({}, {}))
+    monkeypatch.setattr(hook, "langs", lambda: ({}, {}, {}))
     assert hook.props_fault(*legacy_pair("yue", "chi", "yue")) is not None
 
 

@@ -81,7 +81,6 @@ def selected(path, original=None, kids=False, release="", sub_check=False):
 def upgrade(lock, path, st):
     """exclusive() for a backfill file, which has no time limit and no download. It trades the shared file lock for the
     exclusive one before an edit, and raises Replan when the file changed since the checks started from st."""
-    fcntl.flock(lock, fcntl.LOCK_UN)
     runner.gated(lock, fcntl.LOCK_EX)
     runner.same_file(path, st)
 
@@ -112,7 +111,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, pl
             config.DEADLINE.start(config.BUDGET)
         c = process.Ctx(app, path, label, original, runtime, mode=mode, apply=a.apply, post=a.apply and bool(app) and mode in ("import", "deep", "backfill"),
                         kids=kids, release=f.get("sceneName") or "", keep_plan=keep_plan, ids=ids, item=ctx, lock=lock, shared=shared, pool=pool,
-                        force=a.force.get(path), job=job, save=save, planned=planned, row=row)
+                        force=a.force.get(path), job=job, save=save, planned=planned, row=row, held=(job or {}).get("held"))
         if job:
             job["run"] = c
         return process.process(c)
@@ -129,7 +128,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, pl
             except runner.Replan:
                 with runner.locked() as lock:
                     rec = run(lock, False, None)
-    except Exception as ex:
+    except (Exception, content.OutOfTime) as ex:
         if isinstance(ex, (subsync.Broken, subtitles.Yielded)):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
             raise
         rec = dict(id=uuid.uuid4().hex[:12], app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path,
@@ -936,7 +935,7 @@ def deep_later(app, f, info, a, job, rec, run):
     record holds its plan, which the row of the file keeps, see check()."""
     if not runner.deep_wanted(rec):
         return None
-    deep = dict(job, deep=True, path=rec["path"])
+    deep = dict(job, deep=True, path=rec["path"], held=run.held)   # the deep analysis says the flags the import turned off, see process.subtitle_checks()
     took, r = backfill_file(app, dict(f, path=rec["path"], id=(rec.get("ids") or {}).get("file_id")), info, a, bool(getattr(a, "plan_out", None)), job=deep)
     r["deep"] = True   # its line keeps source check, so the audit tells it apart by this, see a_result()
     if r["outcome"] == "error" and getattr(deep.get("run"), "rec", None):   # what the run changed before the error, as runner.deep_analysis() keeps it
@@ -1529,6 +1528,9 @@ HELP = """arr-media-guard: set the default audio and subtitle tracks of an impor
   arr-media-guard --serve             the Webhook listener for Sonarr and Radarr in Docker
   arr-media-guard --selftest
   arr-media-guard --queue             the worker, the queue counts and the jobs that run now
+  arr-media-guard --queue --pause [--wait]   start no new job of the background queue, with --wait wait until none runs
+  arr-media-guard --queue --resume    start the jobs of the background queue again
+  arr-media-guard --queue --wait      wait until no job of the paused background queue runs
   arr-media-guard --test-discord      post a test message to DISCORD_WEBHOOK and print Discord's answer
   arr-media-guard-subhunt <radarr instance> --ids ID [ID ...] [--apply] [--force]   the subtitle hunter, a command of its own
 
@@ -1570,12 +1572,18 @@ def worker_lines():
     return out
 
 
+PAUSED_LINE = "background queue: paused, its jobs wait for --queue --resume"
+WORKER_UNKNOWN = "worker: unknown, run this as root or as the worker's user"
+
+
 def queue_line():
-    """The background queue line of --selftest and --queue, see runner.backfill_jobs(). Both only look, so the close of
-    the connection skips its checkpoint, which would write the -wal file into the store."""
+    """The background queue line of --selftest and --queue, see runner.backfill_jobs(), and PAUSED_LINE under it while
+    the queue is paused, see runner.pause(). Both only look, so the close of the connection skips its checkpoint, which
+    would write the -wal file into the store."""
     store.db().setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
     jobs, ours, left = runner.backfill_jobs()
-    return f"background queue: {jobs} jobs, {ours} of them from a backfill ({left} file{'s' if left != 1 else ''} still to check)"
+    return f"background queue: {jobs} jobs, {ours} of them from a backfill ({left} file{'s' if left != 1 else ''} still to check)" + \
+        (f"\n{PAUSED_LINE}" if runner.paused() else "")
 
 
 def job_proc(pid):
@@ -1599,7 +1607,9 @@ def worker_held():
     runner.ensure_worker(). /proc/locks lists the worker's flock() by its inode. In a PID namespace of its own, as in a
     container, it leaves the lock out once the process that took it is gone, as the hook that forks a host worker is.
     So an arr-media-guard process with the file open counts too. The scan reads only the names of the open files, as
-    store.fork() does. A stat() of a file on a network share can hang."""
+    store.fork() does. A stat() of a file on a network share can hang. A process that exits during the scan loses its
+    memory first, and the kernel then gives its open files to root, so they do not read. Its command line is gone then
+    too, so it counts as ended, and only a live process whose open files do not read gives None."""
     lock = os.path.join(config.CFG.state_dir, "worker.lock")
     try:
         st = os.stat(lock)
@@ -1616,8 +1626,8 @@ def worker_held():
                     with contextlib.suppress(OSError):   # a descriptor that closed
                         if os.readlink(f"/proc/{pid}/fd/{fd}") == lock:
                             return True
-            except PermissionError:   # a process of another user, read only by root or that user
-                held = None
+            except PermissionError:   # a process of another user, read only by root or that user, or one that exits now
+                held = None if job_proc(pid) is not None else held
             except OSError:   # a process that ended
                 pass
     return held
@@ -1636,7 +1646,7 @@ def queue():
     print(time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now)))
     folder = runner.queue_dir()   # the job files of a busy store, read only as runner.waiting() reads them
     filed = sum(not n.startswith(".") for n in os.listdir(folder)) if os.path.isdir(folder) else 0
-    said = {True: "worker: running", None: "worker: unknown, run this as root or as the worker's user",
+    said = {True: "worker: running", None: WORKER_UNKNOWN,
             False: f"worker: none, {'the listener starts one within a minute when a job waits' if config.IMAGE else 'the next import starts one'}"}
     if not os.path.exists(store.path()):
         print(said[worker_held()], "background queue: 0 jobs", f"imports waiting: {filed}", sep="\n")
@@ -1689,6 +1699,74 @@ def queue():
     if bad:
         lines.append(f"claimed jobs that do not read: {bad}")
     print(*lines, sep="\n")
+
+
+def queue_change(argv):
+    """--queue with --pause, --resume or --wait, see runner.pause() and wait_background(). A change of the pause writes
+    one line to the decision log. --resume on a host with no store changes nothing. A store that does not read exits
+    1, as in queue()."""
+    try:
+        if "--resume" in argv:
+            if os.path.exists(store.path()) and runner.pause(False):
+                logs.log(dict(source="backfill", result="resumed", note="the background queue resumed"))
+            print("background queue: resumed")
+            return
+        if "--pause" in argv:
+            if runner.pause(True):
+                logs.log(dict(source="backfill", result="paused", note="the background queue is paused, its jobs wait for --queue --resume"))
+            print(PAUSED_LINE, flush=True)
+        if "--wait" in argv:
+            wait_background()
+    except sqlite3.Error as ex:
+        sys.exit(f"the store did not read: {ex}")
+
+
+def background_busy():
+    """The jobs of the background queue that run now, as queue() counts them busy: each claimed one whose job process
+    lives, see job_proc(), and each one the worker claimed and has not started yet while a worker may run. With
+    HOOK_WORKERS and BACKGROUND_WORKERS at 1 the worker runs each job in itself and claims none, so a running worker
+    counts as one job, also while it runs an import. None when worker_held() cannot tell."""
+    if config.slots() == 1:
+        held = worker_held()
+        return None if held is None else int(held)
+    pids = [pid for pid, in store.read("SELECT pid FROM jobs WHERE claimed = 1 AND name LIKE 'deep-analysis-%'")]
+    starting = sum(not pid for pid in pids)
+    return sum(job_proc(pid) is not None for pid in pids if pid) + (starting if starting and worker_held() is not False else 0)
+
+
+def wait_background():
+    """--queue --wait: return once no job of the background queue runs, see background_busy(). It looks every POLL
+    seconds and has no time limit of its own. Only a paused queue waits, because a job can start right after the wait
+    of a queue that runs. A paused queue starts no job, see runner.claim(), so a restart after the wait cuts none. Each
+    look reads the pause after the count, so a pause that ended during the wait, by --queue --resume or by a broken
+    store that moved aside, exits 2 at the next look, the last one too. The wait only looks, as queue() does, so Ctrl+C
+    leaves nothing behind. It then dies by SIGINT with no traceback, as Python does at Ctrl+C. So a shell that runs the
+    wait in a script stops the script too, and the next command, as a restart, never runs. A shell gives exit 130."""
+    if not (os.path.exists(store.path()) and runner.paused()):
+        print("arr-media-guard: --wait needs a paused background queue, as a job can start after the wait. Run --queue --pause --wait.",
+              file=sys.stderr)
+        sys.exit(2)
+    store.db().setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+    told = False
+    try:
+        while True:
+            n = background_busy()
+            if not runner.paused():
+                print("arr-media-guard: the background queue is no longer paused, so a job can start after the wait.", file=sys.stderr)
+                sys.exit(2)
+            if n == 0:
+                break
+            if n is None:
+                sys.exit(WORKER_UNKNOWN)
+            if not told:
+                print(f"waiting for {n} background job{'s' if n != 1 else ''} to end", flush=True)
+                told = True
+            time.sleep(config.POLL)
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        sys.exit(130)   # only when SIGINT is blocked, so the kill did not end the process
+    print("no background job runs")
 
 
 def cores(proc="/proc/self/cgroup", root="/sys/fs/cgroup"):
@@ -1749,6 +1827,8 @@ def main(argv):
         print("selftest ok")
     elif argv == ["--queue"]:
         queue()
+    elif mode == ["--queue"] and sorted(argv[1:]) in (["--pause"], ["--resume"], ["--wait"], ["--pause", "--wait"]):
+        queue_change(argv[1:])
     elif mode == ["--test-discord"]:
         ok, line = logs.discord_test()
         if not ok:

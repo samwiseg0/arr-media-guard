@@ -14,6 +14,8 @@ It runs `--sub-time` of this checkout on VIDEO as a dry run, with the words of t
 A window the cache lacks hears nothing, and RESULT counts it under `words.missing`. With `--hear --lid-dir DIR`, the
 replay runs `lid.py` for those windows and adds them to the cache, so the next replay of any commit finds them.
 `--code DIR` replays another tree, for example a `git archive` of a commit.
+The model of a words row also names the clock of the audio it heard, see `lid.word_key()`. A cache from 2.18.8 or
+older holds words of the old clock under the model alone, so a replay finds none of them and counts each window missing.
 
 `--plant` moves the cues in memory before the check reads them, so one file gives many cases:
 `+2.0` or `-1.5` (every cue), `step:0.6:-0.9` (the cues from 60% of the duration on), `blk:300:60:-1.5` (the cues that

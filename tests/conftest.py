@@ -60,6 +60,16 @@ def no_stop_left():
 
 
 @pytest.fixture(autouse=True)
+def sigterm_back():
+    """runner.coordinate() sets a SIGTERM handler for the life of the worker, and a test that runs the worker leaves it
+    in the test process. A later test of a SIGTERM on that xdist worker then reached that handler, which only notes
+    the stop. So each test ends with the SIGTERM handler it started with."""
+    handler = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGTERM, handler)
+
+
+@pytest.fixture(autouse=True)
 def one_door(monkeypatch, tmp_path_factory):
     """ff.py is the one door to ffmpeg, ffprobe and PyAV (docs/design.md, "Time reads"). Its audit hook refuses a start
     of ffmpeg or ffprobe, or an import of PyAV, from any other module of the package. A test fails when a call, a read

@@ -20,6 +20,7 @@ faster-whisper and a model directory exist (ARR_LID_MODEL_DIR, default /opt/arr-
 
 Run: pytest tests/test_arr_lid.py
 """
+import array
 import contextlib
 import json
 import os
@@ -35,7 +36,7 @@ import amg
 
 FILES = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, FILES)
-from arr_media_guard import decide as arr_decide, lid as arr_lid, store  # noqa: E402
+from arr_media_guard import decide as arr_decide, ff, lid as arr_lid, store  # noqa: E402
 
 
 def s(lang, prob=0.97, speech=20.0):
@@ -50,7 +51,7 @@ def test_whisper_codes_map_to_classifier_codes():
     # every code the module returns is one the classifier reads as that language
     for w, b in arr_lid.WHISPER.items():
         assert b in arr_decide.codes(b), (w, b)
-    for t, b in arr_lid.ALIAS.items():
+    for t, b in {**arr_lid.ALIAS, **{t: b for b, t in arr_decide.TWINS.items()}}.items():
         if t != "jap":   # a bad tag some files carry, the classifier does not know it yet
             assert b in arr_decide.codes(t) or arr_decide.codes(t) == {t}, (t, b)
 
@@ -157,12 +158,18 @@ def test_carry_never_fails_an_edit(tmp_path):
 def test_the_spans_of_speech_come_from_the_cache_and_follow_an_edit(tmp_path, monkeypatch):
     """speech() answers from the cache by path, size, mtime, stream and the VAD settings, with no model and no ffmpeg.
     An edit changes the mtime and never the audio, so carry() moves the spans to the new stat. A change of the VAD
-    settings misses the row, so the audio is read again, and so does a new faster-whisper, which bundles the VAD model."""
+    settings misses the row, so the audio is read again, and so does a new faster-whisper, which bundles the VAD model.
+    A row of spans from before the file clock, see ff.CLOCK, misses too."""
     media, cache = tmp_path / "a.mkv", str(tmp_path / "lid.sqlite")
     media.write_bytes(b"x")
     st, spans = os.stat(media), [[1.0, 2.5], [4.0, 6.0]]
+    row = lambda how: (str(media), st.st_size, st.st_mtime_ns, 0, how, json.dumps(spans), time.time())
     with contextlib.closing(arr_lid._db(cache)) as db, db:
-        db.execute("INSERT INTO speech VALUES (?, ?, ?, ?, ?, ?, ?)", (str(media), st.st_size, st.st_mtime_ns, 0, arr_lid.speech_how(), json.dumps(spans), time.time()))
+        db.execute("INSERT INTO speech VALUES (?, ?, ?, ?, ?, ?, ?)", row(arr_lid.speech_how().removesuffix("/" + ff.CLOCK)))
+    with pytest.raises(Exception):   # a miss reads the audio, and this file holds none
+        arr_lid.speech(str(media), 0, cache)
+    with contextlib.closing(arr_lid._db(cache)) as db, db:
+        db.execute("INSERT INTO speech VALUES (?, ?, ?, ?, ?, ?, ?)", row(arr_lid.speech_how()))
     assert arr_lid.speech(str(media), 0, cache) == {"spans": spans, "cached": True, "took": pytest.approx(0, abs=1)}
     os.utime(media, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
     arr_lid.carry(str(media), st, cache)
@@ -175,24 +182,227 @@ def test_the_spans_of_speech_come_from_the_cache_and_follow_an_edit(tmp_path, mo
         arr_lid.speech(str(media), 0, cache)
 
 
+SPEECH = """
+import json, sys, types
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+vad = types.ModuleType("faster_whisper.vad")
+vad.get_vad_model = lambda: lambda a: (np.abs(a.reshape(-1, 512)).max(axis=1) > 0.1).astype(np.float32)   # loud frames speak
+sys.modules["faster_whisper"], sys.modules["faster_whisper.vad"] = types.ModuleType("faster_whisper"), vad
+from arr_media_guard import lid
+print(json.dumps(lid.speech(sys.argv[2], 0, sys.argv[3])["spans"]))
+"""   # the spans of speech of a file, in a Python that holds numpy
+
+
+def numpy_python():
+    """This Python when it holds numpy, else the venv of the language detection install that ARR_LID_DIR names, where
+    the speech read runs. Skips with neither."""
+    for py in (sys.executable, os.path.join(os.environ.get("ARR_LID_DIR", "/opt/arr-media-guard-lid"), "venv", "bin", "python")):
+        if os.path.exists(py) and subprocess.run([py, "-c", "import numpy"], capture_output=True).returncode == 0:
+            return py
+    pytest.skip("needs numpy here or in the venv of ARR_LID_DIR")
+
+
+CLOCK_VIDEO = ["-f", "lavfi", "-i", "color=size=32x32:rate=5:duration=50"]
+CLOCK_AUDIO = ["-f", "lavfi", "-i", "aevalsrc=if(between(t\\,5\\,7)+between(t\\,15\\,17)\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d=25"]
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("mkvmerge") is None, reason="no ffmpeg or no mkvmerge")
-def test_the_speech_runs_on_the_files_clock_when_the_audio_starts_late(tmp_path, monkeypatch):
-    """An audio track that starts 1.5 s after the video decodes from its first packet. start_delay() gives the delay, and
-    speech() adds it, so a burst at 5 s of the audio is speech at 6.5 s of the file. A track with no delay gets 0."""
-    src = tmp_path / "av.mkv"
-    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "color=size=32x32:rate=5:duration=12", "-f", "lavfi", "-i",
-                "aevalsrc=if(between(t\\,5\\,7)\\,0.5*sin(2*PI*440*t)\\,0):s=16000:d=12", "-c:v", "mpeg4", "-c:a", "flac", str(src)], check=True)
-    late = tmp_path / "late.mkv"
-    subprocess.run(["mkvmerge", "-q", "-o", str(late), "--sync", "1:1500", str(src)], check=True)
-    assert arr_lid.start_delay(str(src), 0) == 0.0 and arr_lid.start_delay(str(late), 0) == pytest.approx(1.5, abs=0.002)
-    np = pytest.importorskip("numpy")
-    vad = type(sys)("faster_whisper.vad")
-    vad.get_vad_model = lambda: lambda a: (np.abs(a.reshape(-1, 512)).max(axis=1) > 0.1).astype(np.float32)   # loud frames speak
-    monkeypatch.setitem(sys.modules, "faster_whisper", type(sys)("faster_whisper"))
-    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
-    for path, at in ((src, 5.0), (late, 6.5)):
-        (a, b), = arr_lid.speech(str(path), 0, str(tmp_path / "lid.sqlite"))["spans"]
-        assert a == pytest.approx(at, abs=0.05) and b == pytest.approx(at + 2, abs=0.1), (path, a, b)
+@pytest.mark.parametrize("shape, at", [("in time", (5, 15)), ("1.5 s late", (6.5, 16.5)), ("5 s late", (10, 20)), ("22 s late", (27, 37)),
+                                       ("a gap of 4 s", (5, 19)), ("MPEG-TS", (5, 15)), ("MP4 edit list", (7, 17)), ("MP4 from 10 s", (5.064, 15.064))])
+def test_the_speech_runs_on_the_files_clock(tmp_path, shape, at):
+    """The audio holds a tone at 5 s and 15 s of its own samples, and the fake VAD hears the tone as speech. speech()
+    decodes through aresample, which puts each frame at its time from the file's start. So the speech of a track that
+    starts late, or that has a gap, sits where the cues and the speech onsets put it, within 50 ms. ffprobe reads the
+    start of the tracks 5 s and 22 s late as 0. An MPEG-TS starts at 1.4 s and the last MP4 at 9.936 s, and the
+    onsets and the spans count from there. at is where each tone starts on the file's clock."""
+    from arr_media_guard import subtitles
+    ff = lambda *argv: amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", *argv], check=True)
+    path = tmp_path / {"MPEG-TS": "f.ts", "MP4 edit list": "f.mp4", "MP4 from 10 s": "f.mp4"}.get(shape, "f.mkv")
+    if path.suffix == ".mkv":
+        ff(*CLOCK_VIDEO, *CLOCK_AUDIO, "-c:v", "mpeg4", "-c:a", "flac", str(tmp_path / "base.mkv"))
+        if shape == "a gap of 4 s":   # every audio packet from 10 s on moves 4 s later
+            ff("-i", str(tmp_path / "base.mkv"), "-map", "0", "-c", "copy", "-bsf:a", "setts=ts=if(gte(PTS*TB\\,10)\\,PTS+4/TB\\,PTS)", str(tmp_path / "gap.mkv"))
+        srt = tmp_path / "cues.srt"
+        srt.write_text("".join(f"{k + 1}\n00:00:{t:06.3f} --> 00:00:{t + 2:06.3f}\nLine {k + 1}\n\n".replace(".", ",") for k, t in enumerate(at)))
+        late = {"1.5 s late": "1500", "5 s late": "5000", "22 s late": "22000"}.get(shape)
+        subprocess.run(["mkvmerge", "-q", "-o", str(path), *(["--sync", f"1:{late}"] if late else []),
+                        str(tmp_path / ("gap.mkv" if shape == "a gap of 4 s" else "base.mkv")), str(srt)], check=True)
+    else:
+        audio = ["-itsoffset", "2", *CLOCK_AUDIO] if shape == "MP4 edit list" else CLOCK_AUDIO
+        ff(*CLOCK_VIDEO, *audio, "-c:v", "mpeg4", *(["-c:a", "mp2", "-f", "mpegts"] if shape == "MPEG-TS" else ["-c:a", "aac"]),
+           *(["-output_ts_offset", "10"] if shape == "MP4 from 10 s" else []), str(path))
+    got = subprocess.run([numpy_python(), "-c", SPEECH, FILES, str(path), str(tmp_path / "lid.sqlite")], capture_output=True, text=True, check=True)
+    starts = [a for a, _ in json.loads(got.stdout)]
+    j = {"tracks": [{"type": "audio", "properties": {"audio_channels": 1}}]}
+    onsets = [t for t, quiet in subtitles.onsets(str(path), j, 0, [(0.0, 50.0)]) if quiet >= 1 and t < at[-1] + 5]   # the audio ends there
+    assert len(starts) == len(onsets) == 2 and all(abs(a - b) <= 0.05 and abs(a - t) <= 0.1 for a, b, t in zip(starts, onsets, at)), (starts, onsets)
+    if path.suffix == ".mkv":
+        j = json.loads(subprocess.run(["mkvmerge", "-J", str(path)], capture_output=True, text=True, check=True).stdout)
+        cues = [c[0] for c in subtitles.subtitle_cues(str(path), j, {"s1"})["s1"]]
+        assert cues == list(at) and all(abs(a - c) <= 0.05 for a, c in zip(starts, cues)), (starts, cues)
+
+
+def clock_file(tmp_path, shape, audio=CLOCK_AUDIO):
+    """A made-up Matroska file of CLOCK_VIDEO and audio, with the audio 22 s late ("22 s late") or with every audio
+    packet from 10 s on 4 s later ("a gap of 4 s")."""
+    base, path = tmp_path / "base.mkv", tmp_path / "f.mkv"
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", *CLOCK_VIDEO, *audio, "-c:v", "mpeg4", "-c:a", "flac", str(base)], check=True)
+    if shape == "a gap of 4 s":
+        amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(base), "-map", "0", "-c", "copy", "-bsf:a",
+                    "setts=ts=if(gte(PTS*TB\\,10)\\,PTS+4/TB\\,PTS)", str(path)], check=True)
+    else:
+        subprocess.run(["mkvmerge", "-q", "-o", str(path), "--sync", "1:22000", str(base)], check=True)
+    return path
+
+
+def sound_starts(pcm, at):
+    """The file times of each start of sound in raw mono 16 kHz PCM that starts at at seconds: a sample over -20 dB
+    after 0.1 s or more of quiet."""
+    out, quiet = [], 1600
+    for k, x in enumerate(array.array("h", pcm[:len(pcm) // 2 * 2])):
+        if abs(x) > 3277 and quiet >= 1600:
+            out.append(round(at + k / 16000, 3))
+        quiet = 0 if abs(x) > 3277 else quiet + 1
+    return out
+
+
+CLOCK_51 = ["-f", "lavfi", "-i", "aevalsrc=0|0|if(between(t\\,5\\,7)+between(t\\,15\\,17)\\,0.9*sin(2*PI*440*t)\\,0)|0|0|0:s=48000:d=25:c=5.1"]
+# the tones of CLOCK_AUDIO in the centre channel of a 5.1 track at 48 kHz
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("mkvmerge") is None, reason="no ffmpeg or no mkvmerge")
+@pytest.mark.parametrize("shape, window, at, audio", [("22 s late", (12, 30), (27, 37), CLOCK_AUDIO), ("22 s late", (30, 15), (37,), CLOCK_AUDIO),
+                                                     ("a gap of 4 s", (0, 30), (5, 19), CLOCK_AUDIO), ("a gap of 4 s", (12, 15), (19,), CLOCK_AUDIO),
+                                                     ("22 s late", (12, 30), (27, 37), CLOCK_51), ("a gap of 4 s", (12, 15), (19,), CLOCK_51)])
+def test_a_window_of_extract_runs_on_the_files_clock(tmp_path, shape, window, at, audio):
+    """extract() seeks to the start of the window, and ff.clock() fills a late start and a gap with silence. So each
+    tone sits at the start of the window plus its sample offset, within 50 ms of its time in the file. The first window
+    of the late track starts inside its delay and the second after it. A gap window starts before the gap or inside it.
+    The read of 2.18.8 put the last tone of each window 10 s, 0 s, 4 s and 2 s early. A 5.1 track at 48 kHz mixes to
+    mono 16 kHz before the fill, and its centre channel counts."""
+    got = sound_starts(arr_lid.extract(str(clock_file(tmp_path, shape, audio)), 0, *window), window[0])
+    assert len(got) == len(at) and all(abs(g - t) <= 0.05 for g, t in zip(got, at)), got
+
+
+GAP = """
+import json, resource, sys
+sys.path.insert(0, sys.argv[1])
+from arr_media_guard import lid, subtitles
+rss = lambda: resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024
+open(sys.argv[3], "wb").write(lid.extract(sys.argv[2], 0, 0.0, 1830.0))
+read = rss()
+j = {"tracks": [{"type": "audio", "properties": {"audio_channels": 6}}]}
+on = subtitles.onsets(sys.argv[2], j, 0, [(0.0, 600.0), (1210.0, 1820.0)])
+print(json.dumps({"read": read, "all": rss(), "onsets": on}))
+"""   # the audio of the whole gap shape, its onsets in a part of 600 s and in one that starts 600 s before the gap
+# ends, and the peak RSS of their ffmpeg in MB, in a process of its own
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
+def test_a_gap_of_30_minutes_in_a_51_track_fills_on_mono_16_khz(tmp_path):
+    """A 5.1 AAC track at 48 kHz sounds from 0 to 10 s and from 10 to 20 s of its samples, and every packet from 10 s on
+    sits 30 minutes later. ff.clock() mixes to mono 16 kHz before aresample fills the gap, so the ffmpeg of the read
+    peaks under 300 MB, and the gap holds no sound. A fill before the mix peaked at 2.3 GB and left 30 ms of sound at
+    941.8 s, inside the gap. The onsets fill at 48 kHz, 600 s at most in a part, and peak under 300 MB too. The one
+    onset is the sound after the gap."""
+    base, path, raw = tmp_path / "base.mkv", tmp_path / "gap.mkv", tmp_path / "gap.raw"
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*440*t):s=48000:d=20:c=5.1", "-c:a", "aac",
+                str(base)], check=True)
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(base), "-c", "copy", "-bsf:a", "setts=ts=if(gte(PTS*TB\\,10)\\,PTS+1800/TB\\,PTS)",
+                str(path)], check=True)
+    got = json.loads(subprocess.run([sys.executable, "-c", GAP, FILES, str(path), str(raw)], capture_output=True, text=True, check=True).stdout)
+    pcm, at = raw.read_bytes(), lambda t: int(t * 16000) * 2
+    assert got["read"] < 300 and got["all"] < 300 and len(pcm) == pytest.approx(at(1820), abs=at(0.1)), (got, len(pcm) / 32000)
+    assert [t for t, _ in got["onsets"]] == [pytest.approx(1810, abs=0.05)], got["onsets"]
+    assert not pcm[at(10.05):at(1809.95)].strip(b"\0"), "sound inside the gap"
+    assert sound_starts(pcm[:at(10)], 0) == [pytest.approx(0, abs=0.05)] and sound_starts(pcm[at(1809):], 1809) == [pytest.approx(1810, abs=0.05)]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
+@pytest.mark.parametrize("codec, layout", [("eac3", "5.1(side)"), ("aac", "5.1")])
+def test_the_clock_mixes_a_healthy_51_track_as_ac_1_does(tmp_path, codec, layout):
+    """A healthy 5.1 track with a tone of its own in each channel, the centre included. Its whole decode through
+    ff.clock() equals the decode of 2.18.8 with -ac 1 -ar 16000 alone, sample for sample, as lid.speech() reads it. A
+    float aformat would mix 5.1 with another matrix, so CLOCK asks for s16."""
+    path = tmp_path / "h.mkv"
+    tones = "|".join(f"0.3*sin(2*PI*{f}*t)" for f in (300, 500, 700, 60, 900, 1100))
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", f"aevalsrc={tones}:s=48000:d=20:c={layout}", "-c:a", codec, str(path)],
+               check=True)
+    read = lambda *af: subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                                       *af, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"], capture_output=True, check=True).stdout
+    old, new = read(), read("-af", ff.clock())
+    assert len(new) == len(old) > 600000 and new == old
+
+
+LOUD_AUDIO = ["-f", "lavfi", "-i", "aevalsrc=if(between(t\\,0\\,2)+between(t\\,5\\,7)+between(t\\,8\\,12)+between(t\\,15\\,17)\\,"
+              "0.5*sin(2*PI*440*t)\\,0):s=16000:d=25"]   # sound from the first sample, and across 10 s, where the gap goes
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("mkvmerge") is None, reason="no ffmpeg or no mkvmerge")
+@pytest.mark.parametrize("shape, part, at", [("22 s late", (10, 50), [(22, 12), (27, 3), (30, 1), (37, 3)]),
+                                            ("22 s late", (25, 50), [(27, 2), (30, 1), (37, 3)]),
+                                            ("a gap of 4 s", (0, 30), [(5, 3), (8, 1), (14, 4), (19, 3)])])
+def test_the_speech_onsets_count_a_late_start_and_a_gap_as_silence(tmp_path, shape, part, at):
+    """The audio holds sound from its first sample and across 10 s. ff.clock() fills a late start and a gap with
+    silence, so silencedetect ends a silence where the sound starts after either one. at holds each onset and the
+    seconds of silence before it, on the file's clock, within 50 ms. The read of 2.18.8 lost the onsets at 22 s and 14 s."""
+    from arr_media_guard import subtitles
+    subtitles.ONSETS.clear()
+    j = {"tracks": [{"type": "audio", "properties": {"audio_channels": 1}}]}
+    got = [(t, q) for t, q in subtitles.onsets(str(clock_file(tmp_path, shape, LOUD_AUDIO)), j, 0, [part]) if t < at[-1][0] + 5]   # the audio ends there
+    assert len(got) == len(at) and all(abs(t - a) <= 0.05 and abs(q - b) <= 0.05 for (t, q), (a, b) in zip(got, at)), got
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
+def test_the_onsets_of_a_51_track_come_from_its_centre_channel(tmp_path):
+    """The centre channel of a 5.1 track holds tones at 5 s and 15 s, and the front pair a bed that never stops. The
+    onsets hear the centre alone before ff.clock(), so they start at the tones. The mono mix of ff.clock() alone holds
+    the bed, which has no silence."""
+    from arr_media_guard import subtitles
+    path, bed = tmp_path / "c.mkv", "0.5*sin(2*PI*220*t)"
+    centre = "if(between(t\\,5\\,7)+between(t\\,15\\,17)\\,0.5*sin(2*PI*440*t)\\,0)"
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", f"aevalsrc={bed}|{bed}|{centre}|0|0|0:s=48000:d=25:c=5.1", "-c:a", "flac",
+                str(path)], check=True)
+    subtitles.ONSETS.clear()
+    got = subtitles.onsets(str(path), {"tracks": [{"type": "audio", "properties": {"audio_channels": 6}}]}, 0, [(0.0, 25.0)])
+    assert [t for t, q in got if q >= 1] == [pytest.approx(5, abs=0.05), pytest.approx(15, abs=0.05)], got
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
+def test_the_onsets_hear_a_track_at_its_own_sample_rate(tmp_path):
+    """A 48 kHz track holds bursts of 10 kHz at 5 s and 15 s. The onsets fill the clock at the track's rate, so they find
+    both bursts, as silencedetect found them before the clock. At 16 kHz the bursts lie past the band, and on a film
+    about 3 percent of the onsets came out other."""
+    from arr_media_guard import subtitles
+    path = tmp_path / "hi.mkv"
+    amg.ffmpeg(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+                "aevalsrc=if(between(t\\,5\\,7)+between(t\\,15\\,17)\\,0.5*sin(2*PI*10000*t)\\,0):s=48000:d=25", "-c:a", "flac", str(path)], check=True)
+    subtitles.ONSETS.clear()
+    got = subtitles.onsets(str(path), {"tracks": [{"type": "audio", "properties": {"audio_channels": 1}}]}, 0, [(0.0, 25.0)])
+    assert [t for t, q in got if q >= 1] == [pytest.approx(5, abs=0.05), pytest.approx(15, abs=0.05)], got
+
+
+HEAR = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+from arr_media_guard import burnin
+vad = lambda a: (np.abs(a.reshape(-1, 512)).max(axis=1) > 0.1).astype(np.float32)   # loud frames speak
+print(json.dumps([burnin.hear_window(sys.argv[2], 0, a, b, vad)[0] for a, b in json.loads(sys.argv[3])]))
+"""   # the spans of speech of burn-in windows, in a Python that holds numpy
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("mkvmerge") is None, reason="no ffmpeg or no mkvmerge")
+@pytest.mark.parametrize("shape, windows, at", [("22 s late", [(12, 42), (30, 45)], [[27, 37], [37]]),
+                                               ("a gap of 4 s", [(0, 30), (12, 27)], [[5, 19], [19]])])
+def test_the_burn_in_windows_hear_speech_on_the_files_clock(tmp_path, shape, windows, at):
+    """burnin.hear_window() reads its window with extract(), so a span of speech starts where the tone starts in the
+    file, within 50 ms, in a window that starts inside a late start or a gap and in one after it."""
+    path = clock_file(tmp_path, shape)
+    got = subprocess.run([numpy_python(), "-c", HEAR, FILES, str(path), json.dumps(windows)], capture_output=True, text=True, check=True)
+    starts = [[a for a, _ in spans] for spans in json.loads(got.stdout)]
+    assert [len(s) for s in starts] == [len(t) for t in at] and all(abs(a - t) <= 0.05 for s, w in zip(starts, at) for a, t in zip(s, w)), starts
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
@@ -358,6 +568,26 @@ def test_listen_cuts_its_windows_from_the_samples_the_language_check_kept(ears, 
     with monkeypatch.context() as mp:   # after PCM_KEEP the samples are gone
         mp.setattr(arr_lid, "PCM_KEEP", -1)
         assert arr_lid.kept_pcm(cache, media, 1) == []
+
+
+def test_words_and_kept_audio_from_before_the_file_clock_read_again(ears):
+    """Versions before ff.CLOCK cut the audio from the first packet. Their words rows name the model alone, so they miss
+    and listen() hears again. Their kept audio sat in table pcm, which _db() drops."""
+    calls, media, cache = ears
+    st, tag, starts = os.stat(media), arr_lid.tag(arr_lid.MODEL), [200.0, 1000.0]
+    os.makedirs(os.path.dirname(cache))
+    with contextlib.closing(sqlite3.connect(cache)) as db, db:
+        db.execute("CREATE TABLE pcm (path TEXT, size INTEGER, mtime_ns INTEGER, idx INTEGER, start INTEGER, secs INTEGER, pcm BLOB, at REAL)")
+        db.execute("INSERT INTO pcm VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (media, st.st_size, st.st_mtime_ns, 1, 200, 30, b"\0" * 64, time.time()))
+    with contextlib.closing(arr_lid._db(cache)) as db, db:
+        old = [{"at": s, "secs": arr_lid.WORD_SECS, "words": [[0.25, "old"]]} for s in starts]
+        db.execute("INSERT INTO words VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (media, st.st_size, st.st_mtime_ns, 1, tag, "eng",
+                                                                           json.dumps([[s, arr_lid.WORD_SECS] for s in starts]), json.dumps(old), time.time()))
+        assert not db.execute("SELECT name FROM sqlite_master WHERE name = 'pcm'").fetchall()
+    assert arr_lid.words_get(cache, media, 1, tag, "eng", starts) is None and arr_lid.windows_get(cache, media, 1, tag, "eng") == []
+    r = arr_lid.listen(media, 1, starts, "eng", cache=cache)
+    assert not r["cached"] and calls["extract"] == [(1, 200.0, arr_lid.WORD_SECS), (1, 1000.0, arr_lid.WORD_SECS)] and r["model"] == tag
+    assert arr_lid.listen(media, 1, starts, "eng", cache=cache)["cached"] and arr_lid.words_get(cache, media, 1, tag, "eng", starts) == r["windows"]
 
 
 def test_listen_refuses_a_language_whisper_cannot_write(ears):

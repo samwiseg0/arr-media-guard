@@ -43,6 +43,22 @@ def subtitle_read(path, j, want):
                            lambda why: (None, 0.0, why))
 
 
+def tag_read(cues, lang):
+    """(whether a track of cues [(start, end, text)] tagged lang may leave the file for a mismatch, the read as {"lang",
+    "conf", "why"}) (docs/design.md, "Subtitle match"). The read is text_language() of the first TEXT_CUES cues, the
+    blocks subtitle_read() reads of a track. The word check holds the cues already, so it reads no file. The fold of
+    look-alike letters judges every cue, as the word check does, see decide.latin_lookalikes(). A track may
+    leave when its text reads as its tag. text_language() never names a tag whose language is not in TEXT_LANGS, so
+    such a track may leave when its text reads as no language. A text too short to judge gives no sign, and its track
+    stays."""
+    texts = decide.latin_lookalikes([t or "" for _, _, t in cues or ()])
+    got = decide.text_count(t for t in texts[:config.TEXT_CUES] if t)
+    key = decide.lang_key(lang)
+    listed = key in decide.TEXT_KEYS
+    ok = decide.lang_key(got[0]) == key if got[0] else not listed and not got[2].startswith("short")
+    return ok, dict(zip(("lang", "conf", "why"), got))
+
+
 def timed(blocks):
     """[(start, end, text)] of subtitle_blocks() in their order. A cue with no duration ends at the start of the next block
     in time order, as RFC 9559 defines the duration of a block with no BlockDuration. The last such cue has no known
@@ -325,8 +341,6 @@ def subtitle_blocks(path, j, want, codecs, cap, use, failed, capped=None, bad=No
                 out[pos] = use(blocks(number, codec, packed, dd)) if number in cues else failed("the Cues index none of its blocks")
                 if capped is not None and (number in late or len(cues.get(number) or ()) >= cap):
                     capped.add(pos)
-    except content.OutOfTime:
-        raise
     except Exception as ex:   # the text is one signal among others, so a failed read never stops a job
         out.update({p: failed(config.mask(f"the read failed: {type(ex).__name__}: {ex}")[:200]) for p, *_ in tracks.values() if p not in out})
     return out
@@ -616,6 +630,107 @@ def sub_held(res, items, ts, known):
     return res
 
 
+def sub_judged(path, j, items, ts, known, starts=None, line=True, deep=False, streams=None):
+    """The sub_verdicts() of items, then sub_held(), sub_spoken() and sub_others() on them. The check of a Matroska file
+    and the check of a conversion both judge their items here. The arguments are those of the four."""
+    res = sub_held(sub_verdicts(path, j, items, starts, line, deep, streams), items, ts, known)
+    return sub_others(path, j, sub_spoken(path, j, res, items), items, ts)
+
+
+def sub_spoken(path, j, res, items):
+    """res of sub_held() after a read of the spoken language of the windows of each mismatch left (docs/design.md,
+    "Subtitle match"). A right subtitle also translates speech in another language than its own, as in a film with
+    scenes in Arabic. Whisper, told the subtitle's language, hears few of its words there, so such a window reads as a
+    mismatch. One lid.py run names the language of each window that counted, see checks.lid_langs(), and each window
+    logs it as "lang" and "prob". A window whose speech reads as another language does not count. With under two
+    windows left, the mismatch turns into unknown, so the track stays with no change and no alert. So does a read that
+    gives no answer, as with no time left, and a read a stop leaves out, see runner.stop_asked(). The items of one
+    audio track share one read. The reads share the time of one check, SUB_TIMEOUT, within the job's time limit."""
+    bad = [k for k, r in res.items() if r["verdict"] == "mismatch"]
+    left, t0 = config.DEADLINE.left(), time.monotonic()
+    budget = min(config.SUB_TIMEOUT, left - config.LID_RESERVE) if left else config.SUB_TIMEOUT
+    for idx in sorted({items[k][1] for k in bad}):
+        keys = [k for k in bad if items[k][1] == idx]
+        counted = lambda k: [w for w in res[k].get("windows") or () if w["words"] >= subsync.MIN_WORDS]   # the windows the verdict took, see subsync.check()
+        wins = sorted({(w["at"], w.get("secs", subsync.WINDOW)) for k in keys for w in counted(k)})
+        if not wins:   # a verdict no window gave, as a test fakes it
+            continue
+        room = budget - (time.monotonic() - t0)
+        got = {"why": "the run was stopped"} if runner.stop_asked() else checks.lid_langs(path, idx, j, wins, room) if room >= 10 else \
+            {"why": f"no time left of the {max(budget, 0):.0f} seconds the check may take"}
+        said = {(w["at"], w["secs"]): w for w in got.get("windows") or []}
+        for k in keys:
+            r, key = res[k], decide.lang_key(items[k][0])
+            if not said:
+                r.update(verdict="unknown", held=True, why=f'{r["why"]}, but the language of its windows could not be heard: '
+                         f'{config.mask(str(got.get("why") or "no answer"))[:200]}')
+                continue
+            for w in counted(k):
+                h = said.get((w["at"], w.get("secs", subsync.WINDOW))) or {}
+                w.update(lang=h.get("lang"), prob=h.get("prob"))
+            other = [w for w in counted(k) if w["lang"] and decide.lang_key(w["lang"]) != key]
+            langs = ", ".join(sorted({w["lang"] for w in other}))
+            if other and len(counted(k)) - len(other) < 2:
+                r.update(verdict="unknown", held=True, why=f'{r["why"]}, but {len(other)} of its {len(counted(k))} windows speak {langs}, so under two windows count')
+            elif other:
+                r["why"] = f'{r["why"]}, with {len(other)} window{"s" * (len(other) > 1)} in {langs} left out'
+    return res
+
+
+def sub_others(path, j, res, items, ts):
+    """res of sub_held() after one more hearing for each mismatch left (docs/design.md, "Subtitle match"). A right
+    subtitle can follow another audio track of its language than the one the check heard: a commentary track, or a
+    second main track. So each other audio track in that language hears the windows of the first hearing, with the
+    same longer window for a window that hears too little. A window that sub_spoken() left out, as its speech reads as
+    another language, stays out of that hearing and its check. One hearing serves every mismatch of the language. A match
+    there turns the mismatch into unknown, so the track stays with no change and no alert. So does a hearing that
+    gives no answer, as with no time left, and a hearing a stop leaves out, see runner.stop_asked(). "others" logs
+    each hearing, with its cost as the first hearing logs it. The hearings share the time of one check, SUB_TIMEOUT,
+    within the job's time limit. ts is decide.classify(), whose language of each track counts."""
+    bad = {k for k, r in res.items() if r["verdict"] == "mismatch"}
+    audio = [t for t in ts if t["kind"] == "a"]
+    if not bad or len(audio) < 2:
+        return res
+    dur, left, t0, waited = decide.duration(j), config.DEADLINE.left(), time.monotonic(), 0.0
+    budget = min(config.SUB_TIMEOUT, left - config.LID_RESERVE) if left else config.SUB_TIMEOUT
+    for idx, (lang, cues) in sub_groups(items).items():
+        keys = [k for k in sorted(bad) if items[k][1] == idx]
+        first = keys and ((res[keys[0]].get("starts") or [[None]])[0][0])   # the windows of the first hearing
+        if not first:
+            continue
+        more = subsync.windows(cues, dur, decide.STOPWORDS.get(lang, frozenset()), secs=subsync.THIRD, taken=first) or None
+        out = {w["at"] for k in keys for w in res[k].get("windows") or () if w.get("lang") and decide.lang_key(w["lang"]) != decide.lang_key(lang)}
+        part = [i for i, a in enumerate(first) if a not in out]   # more holds one longer window per window of first
+        first, more = [first[i] for i in part], more and [more[i] if i < len(more) else None for i in part]
+        if not first:
+            continue
+        for n, t in enumerate(audio):
+            if not keys:
+                break
+            if n == idx or t["lang"] in decide.UNTAGGED or decide.lang_key(t["lang"]) != decide.lang_key(lang):
+                continue
+            room = budget - (time.monotonic() - t0 - waited)
+            got = {"why": "the run was stopped"} if runner.stop_asked() else \
+                checks.lid_run(path, n, j, (), room, words=(lang, first, subsync.WINDOW, more)) if room >= 10 else \
+                {"why": f"no time left of the {max(budget, 0):.0f} seconds the check may take"}
+            waited += got.get("waited", 0)
+            for k in list(keys):
+                r = res[k]
+                heard = subsync.check(before_cut([w for w in got["windows"] if w["at"] not in out], items[k][2]), items[k][2], lang, dur, gain=False) \
+                    if got.get("windows") else \
+                    {"verdict": "unknown", "why": config.mask(str(got.get("why") or "no words"))[:200], "windows": []}
+                r["others"] = [*r.get("others", ()), {"audio": n, **{x: heard[x] for x in ("verdict", "why", "windows")},
+                                                      **{x: got[x] for x in ("took", "cpu", "cached", "waited") if x in got}}]   # what it cost
+                if heard["verdict"] == "match":
+                    r.update(verdict="unknown", why=f'{r["why"]}, but on {t["pos"]} {heard["why"]}', held=True)
+                elif not got.get("windows"):
+                    r.update(verdict="unknown", why=f'{r["why"]}, but {t["pos"]} is in its language too and could not be heard: {heard["why"]}', held=True)
+                else:
+                    continue
+                keys.remove(k)
+    return res
+
+
 def side_code(s):
     """The 639-2 code of a sidecar's language: its name may give en, and the tracks give eng."""
     base = s["lang"].split("-")[0]
@@ -657,14 +772,15 @@ def sub_match(path, j, d, starts=None, sides=None, known=(), items=None, full=Fa
     """{subtitle position or sidecar name: sub_verdicts() result} for the tracks of sub_targets(), with their cues read
     by subtitle_cues(), and the sidecars sides of mkv_sidecars(). {} when nothing qualifies or the file runs under
     SUB_MIN_SECONDS. So a file with no such track or sidecar costs nothing. known holds the item's original languages,
-    and a mismatch that sub_hold() rules out is unknown. items is sub_items() when the caller read them already, and
+    and a mismatch that sub_hold() rules out is unknown, as is one whose windows speak another language, see
+    sub_spoken(), and one that another audio track of its language matches, see sub_others(). items is sub_items() when the caller read them already, and
     full reads a track the Cues do not index, see full_read(). streams is the stream end of the header probe, see
     sub_verdicts()."""
     sides = sides or {}
     if not (sub_targets(j, d) or sides) or decide.duration(j) < config.SUB_MIN_SECONDS or not checks.lid_ready():
         return {}
     items = items or sub_items(path, j, d, sides, full)
-    return sub_held(sub_verdicts(path, j, items, starts, line, deep, streams), items, d["tracks"], known)
+    return sub_judged(path, j, items, d["tracks"], known, starts, line, deep, streams)
 
 
 def ref_sidecars(path, d):
@@ -746,8 +862,9 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
     different parts gets none and alerts. A fix may keep runs of lines at the file's ends where they are, see
     subsync.shifted(). Such a fix needs a plan of every cue, so a WebVTT track gets none and alerts. A cut read gets no
     fix at all, as the fix would move the lines past the read unseen. The cues read stay in LAYOUT_READ for the plan.
-    A fix stands only when the speech onsets confirm it, see subsync.layout_onsets(). The onsets are read once for the file, in the parts of subsync.onset_parts(), and only when
-    some track has a fix. With subsync.LAYOUT_FIX "alert" a fix then only alerts: "would" holds it, and "unfixed" its
+    A fix stands only when the speech onsets confirm it, see subsync.layout_onsets(). The onsets also judge an offset
+    that gets no fix, and an offset they disagree with only logs. The onsets are read once for the file, in the parts
+    of subsync.onset_parts(), and only when some track has a fix or such an offset. With subsync.LAYOUT_FIX "alert" a fix then only alerts: "would" holds it, and "unfixed" its
     offset. The spans of speech come from one read of the whole audio track that plays, see lid.speech(). A
     track whose read was cut short is judged up to its last cue read, as a file that ends there, see Cut. With stop()
     true before a read, nothing more is read, and the deep analysis checks the file later. With deep, the deep analysis,
@@ -782,16 +899,18 @@ def sub_layout(path, j, d, timed_by, others, stop=None, deep=False):
         upto = dur if end is None else min(dur, end)
         lay = subsync.layout(cs, spans, upto)
         timing = subsync.layout_fix(cs, spans, upto, lay)
+        if (timing or {}).get("fix") or (timing or {}).get("unfixed") is not None:   # the second clock, read once for the file
+            if heard is None and not (stop and stop()):
+                facts["onsets"] = {"cpu": 0.0, "took": 0.0}
+                heard = onsets(path, j, idx, subsync.onset_parts(dur), facts["onsets"])
+            if heard is not None:
+                timing = subsync.layout_onsets(cs, timing, heard, subsync.onset_parts(dur), dur, lay["rate"])
+            elif timing.get("fix"):
+                timing = {"fix": None, "why": f'{timing["why"]}, but the run had no time left to read the speech onsets, so the times stay'}
         if (timing or {}).get("fix") and end is not None:   # a fix would move the lines past the read too, unseen
             timing = {"fix": None, "unfixed": timing["fix"]["offset"], "why": f'{timing["why"]}, but the read of its lines stopped part way, so the times stay'}
         if (timing or {}).get("keep") and codec == "S_TEXT/WEBVTT":   # a partial shift needs every cue in a new plan
             timing = {"fix": None, "unfixed": timing["fix"]["offset"], "why": f'{timing["why"]}, but a WebVTT track is never rewritten, so the times stay'}
-        if (timing or {}).get("fix"):   # the second clock, read once for the file
-            if heard is None and not (stop and stop()):
-                facts["onsets"] = {"cpu": 0.0, "took": 0.0}
-                heard = onsets(path, j, idx, subsync.onset_parts(dur), facts["onsets"])
-            timing = subsync.layout_onsets(cs, timing, heard, subsync.onset_parts(dur), dur) if heard is not None else \
-                {"fix": None, "why": f'{timing["why"]}, but the run had no time left to read the speech onsets, so the times stay'}
         if (timing or {}).get("fix") and subsync.LAYOUT_FIX != "write":   # the fix it would make alerts, see LAYOUT_FIX
             timing = dict(timing, fix=None, unfixed=timing["fix"]["offset"], would=dict(timing["fix"], **({"kept": timing["kept"]} if timing.get("kept") else {})),
                           why=f'{timing["why"]}, but a fix from the speech layout only alerts for now, so the times stay')
@@ -933,10 +1052,12 @@ ONSETS = {}   # (path, size, mtime_ns, audio index, lo, hi) -> the onsets of one
 def onsets(path, j, idx, parts, facts=None):
     """The speech onsets in parts [(lo, hi)] of ffmpeg audio track idx of path, sorted, as [(onset, seconds of silence
     before it)] in seconds of the file. An onset is where ffmpeg's silencedetect at -25 dB ends a silence of 0.3 s or
-    more. A part that starts in a silence counts that silence from its own start. The whole-file timing takes them as a
+    more. A part that starts in a silence counts that silence from its own start. ff.clock() fills a late start and a
+    gap with silence, so an onset after either one counts. The whole-file timing takes them as a
     second clock beside Whisper's word times, see align.vote() (docs/design.md, "Subtitle match"). It counts an onset
     that ends a silence of subsync.ONSET_QUIET or more. A track with a centre channel is heard there,
-    where the dialogue is, and another track as its mono mix. j is the mkvmerge -J probe, which gives the channel
+    where the dialogue is, and another track as the mono mix of ff.clock(), which -ac 1 gives too. silencedetect reads
+    the part at the track's own sample rate. j is the mkvmerge -J probe, which gives the channel
     count. ffprobe names the layout of a track with 3 channels or more. Each part is one ffmpeg read at nice 19 and
     idle I/O. A silence that runs to the end of a part ends no speech there. facts gets the CPU and wall seconds, and
     why a read failed in "onset_why". A failure gives no onsets of that part and never raises. The onsets of each part
@@ -955,7 +1076,7 @@ def onsets(path, j, idx, parts, facts=None):
         for lo, hi in parts:
             r = ff.run("subtitles.onsets", ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-loglevel", "level+info", "-ss", f"{lo:.3f}", "-t",
                                 f"{hi - lo:.3f}", "-i", path, "-map", f"0:a:{idx}", "-vn", "-sn", "-dn", "-af",
-                                ("pan=mono|c0=FC," if centre else "aformat=channel_layouts=mono,") + "silencedetect=noise=-25dB:d=0.3",
+                                ("pan=mono|c0=FC," if centre else "") + ff.clock("silencedetect=noise=-25dB:d=0.3", rate=False),
                                 "-f", "null", "/dev/null"], capture_output=True, text=True, errors="replace", timeout=ONSET_TIMEOUT)
             if r.returncode:
                 why.append(f"ffmpeg exited {r.returncode} at {content.hms(lo)}: {config.mask(r.stderr.strip())[-120:]}")
@@ -1155,10 +1276,14 @@ def raw_srt(raw):
                 raise OSError(f"its text does not decode as {code}: {ex.reason}") from None
 
 
-def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
+def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None, video=None, taken=()):
     """Act on the sidecars beside a Matroska file (docs/design.md, "Subtitle match"). A sidecar that does not match the
-    audio moves into originals_root() as a kept original. A sidecar whose times need a fix, or whose cues flash, with
-    ends {name: flash_plan()}, is written again with new times, and its original is kept the same way. A sidecar whose
+    audio gets a name no player reads beside the Matroska file video, <base>.<lang>.mismatch.srt.txt, see side_plan()
+    and side_rename(). to names it, past the paths in taken, the names a dry run planned for tracks, and past the names
+    of the sidecars before it. With every name taken, it moves into originals_root() as a kept original. The rename
+    runs only where the move would, so with KEEP_ORIGINALS_DAYS 0 the sidecar stays. A sidecar whose times need a fix,
+    or whose cues flash, with ends {name: flash_plan()}, is written again with new times, and its original is kept the
+    same way. A sidecar whose
     lines move, with timed {name: time_plan()} of its cues in file order, is written with the times of its plan, which
     holds its fix and its flash ends. A move and a rewrite need a place to keep the original, so with
     KEEP_ORIGINALS_DAYS 0 the sidecar stays as it is. A rewrite changes only the time lines and keeps every other byte,
@@ -1171,7 +1296,7 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
     side_repair(), else rename, see broken_side(). A repair takes the place of every other change but a move, as for a
     track, see process.subtitle_checks(). Its original is kept as for a rewrite. A repair that fails its proof renames
     the sidecar instead."""
-    out, ends, timed = [], ends or {}, timed or {}
+    out, ends, timed, taken = [], ends or {}, timed or {}, list(taken)
     for n, s in sorted(sides.items()):
         r, plan, times = sync.get(n) or {}, ends.get(n), timed.get(n)
         fix, move = (r.get("timing") or {}).get("fix"), r.get("verdict") == "mismatch"   # the word check holds its own mismatch of garbled text
@@ -1186,17 +1311,32 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                                                                                 times and remux.blocks_moved(times, fix)) if x),
              **({"garbled": {k: g[k] for k in ("codepage", "lang", "read", "cut", "cues")}} if g else {}), **({"later": True} if g and g.get("later") else {})}
         out.append(e)
+        if (b := move and side_plan(s, video, taken)):   # its new name, else the move
+            e["to"] = os.path.basename(b["sidecar"])
+            taken.append(b["sidecar"])   # so the next sidecar of a dry run takes the next number, as in an apply
         if not g and not move and s["glued"] is not None:   # a rewrite keeps the time of the cue a player shows there
             e.update(result="left", left=f"AMG reads the subtitle at line {s['glued'] + 1} as part of the one before, so it would keep its old time")
             continue
+        if not apply and config.CFG.keep_days:   # the keep check of the apply, so a dry run names the same block
+            try:
+                if why := vault.keepable(s["path"], os.stat(s["path"])):
+                    raise OSError(why)
+            except OSError as ex:
+                e.update(result="left", **left_of(ex))
+                continue
         if not apply or not sub_fixes(source):
             e.update(result="dry run") if not apply else e.update(result="left", left="SUBTITLES is set to check")
             continue
         tmp = remux.repack_tmp(s["path"])
         try:
             st = os.stat(s["path"])
-            why = vault.keepable(s["path"], st) if config.CFG.keep_days else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"
-            if why: raise OSError(why)
+            if why := vault.keep_why(s["path"], st):
+                raise OSError(why)
+            if move:
+                moved = side_move(s, b, e, "kept")
+                e.update(moved, result="renamed" if b else "moved", **({"reused": b["reused"]} if b else {}))
+                logs.log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", **moved, why=e["why"]))
+                continue
             if g:
                 try:
                     data = side_repair(s)
@@ -1206,7 +1346,7 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                         b["taken"] = taken
                     out[-1] = broken_side(dict(s, garbled=dict(g, repair=False, why=f'{g["why"]}, but {ex}'), broken=b), apply, app, source)
                     continue
-            elif not move:   # a new file over the name, so the kept hard link holds the old text
+            else:   # a new file over the name, so the kept hard link holds the old text
                 with open(s["path"], "rb") as f:
                     bom, code, text = raw_srt(f.read())
                 try:
@@ -1216,16 +1356,14 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None):
                     raise OSError(f"its new {'times' if times else 'ends'} do not fit its text") from None
                 text = remux.srt_moved(text, fix) if fix and not times else text
                 data = bom + text.encode(code, "surrogatepass")
-            if not move:
-                remux.new_tmp(tmp, st)
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                remux.own_like(tmp, st)
+            remux.new_tmp(tmp, st)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            remux.own_like(tmp, st)
             e["kept"] = vault.keep_original(s["path"], e)
-            os.remove(s["path"]) if move else os.replace(tmp, s["path"])
-            if not move:
-                vault.kept_write(s["path"], e["kept"])
-            e["result"] = "moved" if move else "repaired" if g else "retimed"
+            os.replace(tmp, s["path"])
+            vault.kept_write(s["path"], e["kept"])
+            e["result"] = "repaired" if g else "retimed"
             logs.log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", kept=e["kept"], why=e["why"]))
         except OSError as ex:
             e.update(result="left", **left_of(ex))
@@ -1255,14 +1393,10 @@ def side_repair(s):
 
 
 def broken_side(s, apply, app, source):
-    """Move the bytes of the garbled sidecar s of garbled_sidecars() to the name its plan gives, see
-    remux.broken_plan(), so no player reads them. A hard link gives the new name the sidecar's own file, and the link
-    must hold the bytes the check read. On a share that refuses a hard link, remux.keep_broken() writes a copy, owned
-    like the sidecar, and reads it back. The sidecar's name goes only while it names that file, unchanged since that
-    check, so a sidecar Bazarr writes meanwhile stays. So the bytes never change, and no file is written over. A
-    sidecar that changed since the check stays, and the new name goes. It needs no kept original. A dry run and
-    SUBTITLES check only name the new file. Returns the entry of sidecar_fix(), with action rename, the new name in to,
-    and reused when a file held the bytes already. A failure gives its reason in left, see left_of()."""
+    """Move the bytes of the garbled sidecar s of garbled_sidecars() to the name its plan gives, see side_rename(). It
+    needs no kept original. A dry run and SUBTITLES check only name the new file. Returns the entry of sidecar_fix(),
+    with action rename, the new name in to, and reused when a file held the bytes already. A failure gives its reason
+    in left, see left_of()."""
     g, b = s["garbled"], s["broken"]
     e = {"name": s["name"], "action": "rename", "why": g["why"], "garbled": {k: g[k] for k in ("codepage", "lang", "read", "cut", "cues")},
          **({"to": os.path.basename(b["sidecar"])} if b.get("sidecar") else {})}
@@ -1271,37 +1405,82 @@ def broken_side(s, apply, app, source):
     if not apply or not sub_fixes(source):
         return dict(e, result="dry run") if not apply else dict(e, result="left", left="SUBTITLES is set to check")
     try:
-        with open(s["path"], "rb") as f:
-            st = os.fstat(f.fileno())
-            if f.read() != b["data"]:
-                raise OSError("it changed since the check")
-        if os.path.lexists(b["sidecar"]) and not remux.holds(b["sidecar"], b["data"]) and (why := remux.broken_plan(b["video"], {s["name"]: b})):
-            raise OSError(why)   # a track of this run took the name, so the plan takes the next one
-        e["to"], key = os.path.basename(b["sidecar"]), runner.file_key(st)
-        b.update(reused=remux.holds(b["sidecar"], b["data"]), written=False)
-        try:
-            if not b["reused"]:
-                try:
-                    os.link(s["path"], b["sidecar"])   # never writes over a file
-                except FileExistsError:
-                    raise
-                except OSError:   # a share with no hard links
-                    remux.keep_broken(b, st)
-                else:
-                    b["written"], key = True, runner.file_key(os.stat(b["sidecar"]))
-                    if not remux.holds(b["sidecar"], b["data"]):
-                        raise OSError("it changed since the check")
-            # ponytail: a write between this stat and the unlink still goes. POSIX has no unlink of one inode only.
-            if runner.file_key(os.stat(s["path"])) != key:
-                raise OSError("it changed since the check")
-            os.remove(s["path"])
-        except BaseException:
-            remux.drop_broken([b])
-            raise
-        logs.log(dict(app=app, source=source, path=s["path"], result="sidecar renamed", to=e["to"], why=e["why"]))
-        return dict(e, result="renamed", reused=b["reused"])
+        side_rename(s, b)
     except (OSError, RuntimeError) as ex:
-        return dict(e, result="left", **left_of(ex))
+        return dict(e, to=os.path.basename(b["sidecar"]), result="left", **left_of(ex))
+    logs.log(dict(app=app, source=source, path=s["path"], result="sidecar renamed", to=os.path.basename(b["sidecar"]), why=e["why"]))
+    return dict(e, to=os.path.basename(b["sidecar"]), result="renamed", reused=b["reused"])
+
+
+def side_plan(s, video, taken=()):
+    """The plan of remux.broken_plan() for the bytes of the sidecar s beside the Matroska file video, a sidecar that does
+    not match the audio: <base>.<lang>.mismatch.srt.txt, numbered as a garbled sidecar's name, see side_rename(). lang
+    is the language part of its name. None when every name holds a file of other bytes, and with KEEP_ORIGINALS_DAYS 0,
+    where the sidecar stays, as a track's names are planned, see process.subtitle_checks(). A sidecar that does not
+    read now, as one gone since the check, gets None too, so the move path says why it stayed. taken are the paths
+    other plans of the run hold, see remux.broken_plan()."""
+    if not config.CFG.keep_days:
+        return None
+    try:
+        with open(s["path"], "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    b = {"lang": s["named"] or "und", "data": data, "numbers": range(1, 100), "video": video, "end": remux.MISMATCH_END}
+    return None if remux.broken_plan(video, {s["name"]: b}, taken) else b
+
+
+def side_move(s, b, record, key):
+    """Rename the sidecar s, which does not match the audio, to the name of its plan b, see side_plan(), so no player
+    reads it. With b None it moves into originals_root() as a kept original, with record as its record. record[key]
+    names the kept path before the sidecar's name goes, so a remove that fails still leaves the path in the record.
+    Returns {"to": the new name} or {key: the kept path}. Raises OSError when it cannot, and the sidecar stays."""
+    if not b:
+        record[key] = vault.keep_original(s["path"], record)
+        os.remove(s["path"])
+        return {key: record[key]}
+    try:
+        side_rename(s, b)
+    except RuntimeError as ex:   # a copy that does not read back, see remux.keep_broken()
+        raise OSError(str(ex)) from None
+    return {"to": os.path.basename(b["sidecar"])}
+
+
+def side_rename(s, b):
+    """Move the bytes of the sidecar s to the name of its plan b of remux.broken_plan(), so no player reads them. A hard
+    link gives the new name the sidecar's own file, and the link must hold the bytes of b. On a share that refuses a hard
+    link, remux.keep_broken() writes a copy, owned like the sidecar, and reads it back. The sidecar's name goes only
+    while it names that file, unchanged since the plan, so a sidecar Bazarr writes meanwhile stays. So the bytes never
+    change, and no file is written over. b["reused"] says a file held the bytes already. Raises OSError or RuntimeError
+    when the rename cannot run, and the sidecar stays. A sidecar that changed since the plan stays, and the new name
+    goes."""
+    with open(s["path"], "rb") as f:
+        st = os.fstat(f.fileno())
+        if f.read() != b["data"]:
+            raise OSError("it changed since the check")
+    if os.path.lexists(b["sidecar"]) and not remux.holds(b["sidecar"], b["data"]) and (why := remux.broken_plan(b["video"], {s["name"]: b})):
+        raise OSError(why)   # a track of this run took the name, so the plan takes the next one
+    key = runner.file_key(st)
+    b.update(reused=remux.holds(b["sidecar"], b["data"]), written=False)
+    try:
+        if not b["reused"]:
+            try:
+                os.link(s["path"], b["sidecar"])   # never writes over a file
+            except FileExistsError:
+                raise
+            except OSError:   # a share with no hard links
+                remux.keep_broken(b, st)
+            else:
+                b["written"], key = True, runner.file_key(os.stat(b["sidecar"]))
+                if not remux.holds(b["sidecar"], b["data"]):
+                    raise OSError("it changed since the check")
+        # ponytail: a write between this stat and the unlink still goes. POSIX has no unlink of one inode only.
+        if runner.file_key(os.stat(s["path"])) != key:
+            raise OSError("it changed since the check")
+        os.remove(s["path"])
+    except BaseException:
+        remux.drop_broken([b])
+        raise
 
 
 def left_of(ex):
@@ -1421,7 +1600,7 @@ def garbled_sidecars(path):
     return out
 
 
-def sub_findings(rec, sync, unmatched, starts=None):
+def sub_findings(rec, sync, unmatched, starts=None, cut=()):
     """The findings of the subtitle match check, each a list of sentence codes and facts, see report.SUB_LINES: one
     submatch finding for the tracks and sidecars that do not match the audio and the tracks whose text is garbled, and
     one subtiming finding for the tracks whose times are off and stay. unmatched holds the tracks, by their place
@@ -1432,25 +1611,31 @@ def sub_findings(rec, sync, unmatched, starts=None):
 
     The timing judge gives each subtitle of sync its outcome first, after the moves and the write, in rec["subjudge"],
     see judge.outcomes(). starts are {subtitle: its sorted cue starts}, which count the lines of a stretch still off.
-    The timing sentences come from those outcomes alone, see judge.alert_lines()."""
+    The timing sentences come from those outcomes alone, see judge.alert_lines(). cut holds the tracks of unmatched
+    whose default or forced flag the run turns off. A line of another track of unmatched says nothing of its flags."""
     rp, rm, wrong, late = rec.get("repack") or {}, rec.get("subremux") or {}, [], []
     plan = {} if rec.get("apply", True) else remux_block(rec)
     flags_off, by = sub_fixes(rec.get("source")), "hook" if rec.get("source") in SUB_SOURCES else "run"
     if outs := judge.outcomes(rec, sync, starts or {}, flags_off):
         rec["subjudge"] = outs
     laid = lambda k: {"layout": True} if ((sync.get(k) or {}).get("layout") or {}).get("verdict") == "mismatch" else {}   # see sub_layout()
+    saved = lambda p: {"saved": n} if (n := (rm.get("saved") or {}).get(p)) else {}   # the file of its text beside the video
     for p in rm.get("removed") or []:
-        wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept"), **laid(p)})
+        wrong.append({"code": "removed", "track": p, "why": sync[p]["why"], "by": by, "kept": rm.get("kept"), **laid(p), **saved(p)})
     for p in unmatched:
         gone = p in (rm.get("remove") or []) and not rm.get("removed")   # the remux was to remove it
         wrong.append({"code": "stays", "track": p, "why": sync[p]["why"], "gone": gone, "result": rm["result"] if gone else None,
-                      "kept_back": rm.get("kept_back"), "flags_off": flags_off, **plan, **laid(p)})
+                      # SUBTITLES check keeps every track, the text gate keeps it at any KEEP_ORIGINALS_DAYS, and only then does 0
+                      "kept_back": rm.get("kept_back") if rm.get("kept_back") == "check" else (rm.get("kept_for") or {}).get(p) or rm.get("kept_back"),
+                      "flags_off": flags_off and p in cut, **({"no_flags": True} if flags_off and p not in cut else {}), **plan, **laid(p),
+                      **(saved(p) if gone else {})})
     for e in rec.get("sidecars") or []:
         if e["action"] in ("rename", "repair"):   # a renamed one goes to the unreadable finding below, and a repaired one to repaired
             wrong += [{"code": "repaired", "tracks": [e["name"]], "kept": e["kept"]}] if e["result"] == "repaired" else [] if e["result"] == "renamed" \
                 else [{"code": "garbled_sidecar", "name": e["name"], "to": e.get("to"), "left": e.get("left"), **({"repair": True} if e["action"] == "repair" else {})}]
         elif e["action"] == "move":
-            wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left"), **laid(e["name"])})
+            wrong.append({"code": "sidecar", "name": e["name"], "why": e["why"], "kept": e.get("kept"), "left": e.get("left"), **laid(e["name"]),
+                          **({"to": e["to"], "renamed": e["result"] == "renamed"} if e.get("to") else {})})
         elif e["result"] == "left":
             late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]})
     wrong += [{"code": "layout", "track": k} for k, r in sorted(sync.items()) if laid(k) and r["verdict"] != "mismatch"]   # see subsync.LAYOUT_ACTION
@@ -1476,9 +1661,11 @@ def sub_findings(rec, sync, unmatched, starts=None):
             wrong.append({"code": "garbled", "tracks": sorted(ps, key=lambda p: int(p[1:])), "repair": repair, "flags_off": flags_off, **more,
                           **({"encoding": True} if all(garbled.get(p, {}).get("encoding") for p in ps) else {})})
     for e in rp.get("sidecars_unmatched", []):
-        wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left")})
+        wrong.append({"code": "converted_sidecar", "name": e["name"], "why": e["why"], "kept": e.get("moved"), "left": e.get("left"),
+                      **({"to": e["to"], "renamed": bool(e.get("renamed"))} if e.get("to") else {})})
     for p in [] if rp.get("tracks_kept_back") else rp.get("tracks_unmatched", []):   # a track that stayed: the new file's check says so
-        wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept")})
+        wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept"),
+                      **({"saved": n} if (n := (rp.get("mismatch_text") or {}).get(p)) else {})})
     late += judge.alert_lines(rec, sync, flags_off, plan)
     if unreadable and (mended := [x for x in wrong if x["code"] == "repaired"]):   # one notice per run, with DISCORD_POSTS issues and all
         unreadable[0]["repaired"], wrong = mended, [x for x in wrong if x["code"] != "repaired"]

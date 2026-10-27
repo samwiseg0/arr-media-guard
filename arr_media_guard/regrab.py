@@ -527,7 +527,7 @@ def restore_plans(app, job, files, broken):
                     why, p["checks"][old] = old_file_check(rb, original, kids, f.get("runtime") or 0)
                 if why is None:
                     p["extras"][old] = vault.kept_extras(p["kept"][old]) if old in p["kept"] else old_extras(old, rb)
-            except Exception as ex:   # the time limit too: a check that did not end keeps the old file in the bin
+            except (Exception, content.OutOfTime) as ex:   # the time limit too: a check that did not end keeps the old file in the bin
                 why = config.mask(f"its check failed: {type(ex).__name__}: {ex}")[:200]
             if why:
                 p["not"].append((old, why))

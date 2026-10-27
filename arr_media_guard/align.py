@@ -60,8 +60,9 @@ def anchors(cues, words, stop):
     then steps back over the line's words before it, while each heard word before it is that word and lies under
     "spoken gap" before it. A roll-up line counts by its new text, see subsync.spoken(). A speaker's name is never
     spoken. A line shown under "short line", a line of song lyrics, and two lines in a row with the same content words
-    never anchor."""
-    texts = [subsync.LABEL.sub(r"\1\2", c[2]) for c in subsync.spoken([c[:3] for c in cues])]
+    never anchor. A track whose Cyrillic and Greek letters all look like Latin letters gives the words of those, as in
+    subsync.flat(), see decide.latin_lookalikes()."""
+    texts = decide.latin_lookalikes([subsync.LABEL.sub(r"\1\2", c[2]) for c in subsync.spoken([c[:3] for c in cues])])
     toks = [subsync.tokens(x) for x in texts]
     said = [subsync.words(x, stop) for x in texts]
     bad = {i for i, (c, x) in enumerate(zip(cues, texts)) if c[1] - c[0] < T["short line"] or LYRICS.search(subsync.NOISE.sub(" ", x))}

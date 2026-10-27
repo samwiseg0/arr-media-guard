@@ -674,8 +674,6 @@ def stored_end(path, j):
             r, size = mp4.samples(path), os.path.getsize(path)
             return max((t["time"][k] + t["dur"][k] for t in r["tracks"] if t["kind"] in ("video", "audio") for k in range(len(t["time"]))
                         if t["tag"][k] != mp4.CUT and t["place"][k] + t["size"][k] <= size), default=0) / 1e9
-    except content.OutOfTime:
-        raise
     except Exception:   # a reader that fails, as on a cut box header, gives no end, so the metadata checks still run
         return 0
     return None
@@ -712,8 +710,6 @@ def header_of(path, j=None):
         return None
     try:
         return header_probe(path, j or mkvmerge(path))
-    except content.OutOfTime:
-        raise
     except Exception:
         return None
 
@@ -943,16 +939,27 @@ COPY_KEEP = 1000   # lines of the read pass kept for their places. A healthy rem
 def copy_lines(stream, got):
     """Read the read pass's stderr into got, line by line in a thread of its own, so a long stderr never blocks
     ffmpeg and never fills a disk. got takes the count of NOISE lines, the count of the other lines, and the first
-    COPY_KEEP of those in "kept"."""
+    COPY_KEEP of those in "kept". A repeat count of a kept line stays in "kept" after it, so parse_copy() counts the
+    repeats of an audio decoder. got["audio_unkept"] counts the audio lines that "kept" has no room for, with their
+    repeats, see decide.copy_kind(). It is there only when such a line came."""
+    kept = audio = False   # whether the line before was kept, and whether it was an audio line
     for line in stream:
         if not line.strip():
             continue
         if any(n in line for n in decide.NOISE):
             got["noise"] += 1
+            if kept and decide.REPEAT.match(line) and len(got["kept"]) < COPY_KEEP:
+                got["kept"].append(line.rstrip("\n"))
+            elif audio and (r := decide.REPEAT.match(line)):
+                got["audio_unkept"] = got.get("audio_unkept", 0) + int(r.group(1))
+            kept = audio = False
             continue
         got["lines"] += 1
-        if len(got["kept"]) < COPY_KEEP:
+        kept, audio = len(got["kept"]) < COPY_KEEP, decide.copy_kind(line) == "audio"
+        if kept:
             got["kept"].append(line.rstrip("\n"))
+        elif audio:
+            got["audio_unkept"] = got.get("audio_unkept", 0) + 1
 
 
 PCM_FORMATS = ("matroska", "mov", "mp4")   # ffprobe's format names where the PCM rule holds, see pcm_audio()
@@ -1002,7 +1009,9 @@ def whole_check(path, stop=lambda: None):
     or the time WHOLE_RATE needs, whichever is longer, and a stopped pass gives nothing. Its stderr goes through a pipe
     to copy_lines(). stop() runs as often as zero_scan() and watch() ask, and may raise, see zero_scan(). No ffmpeg
     outlives the check. The zeros field holds the runs in bytes, in "at" as shares of the size, and in "count" the runs
-    that count. fault is zero-filled for a certain verdict. A byte of the read pass that starts the file's zero_pad()
+    that count. fault is zero-filled for a certain verdict. audio holds the audio doubt of decide.whole_verdict(), when
+    an audio decoder printed a line. A doubt that does not post gets one sample of each audio track then, see
+    audio_samples() and decide.audio_sampled(). A byte of the read pass that starts the file's zero_pad()
     moves from pos to padding, because no player reads it. when holds the play_times() of the other bytes, and in the
     zeros field those of the first byte of each run. When the pass printed a line, tail holds the count of bytes past
     the Segment end, and tail_errors says whether they make ffmpeg read the last element again, see tail_errors().
@@ -1010,7 +1019,7 @@ def whole_check(path, stop=lambda: None):
     The read pass leaves out each stream of truehd_cores() that has no sample rate when ffmpeg opens the file. The
     null muxer cannot write a header with such a stream. The pass then printed one error and read nothing. A PID with no
     core PES gives such a core, and so does one whose core PES start after ffmpeg's probe. The TrueHD stream of the PID
-    stays in the read, so the demuxer still reads every PES of the PID."""
+    stays in the read, so the demuxer still reads every PES of the PID. The audio samples leave such a core out too."""
     size, t0, info = os.path.getsize(path), time.monotonic(), stream_probe(path) or {}
     pcm, bare = pcm_audio(path, info), [s["index"] for s in truehd_cores(info.get("streams") or []) if not int(s.get("sample_rate") or 0)]
     bound = max(WHOLE_MIN, size / WHOLE_RATE)
@@ -1032,7 +1041,7 @@ def whole_check(path, stop=lambda: None):
         else:
             stopped = watch(p, lambda: stop() or config.DEADLINE.check() or (f"ran over {bound:.0f} s" if time.monotonic() - t0 > bound else None))
             p.wait(); reader.join()
-            out = None if stopped else dict(decide.parse_copy("\n".join(got["kept"]), p.returncode, size), lines=got["lines"], noise=got["noise"])
+            out = None if stopped else dict(decide.parse_copy("\n".join(got["kept"]), p.returncode, size), **{k: v for k, v in got.items() if k != "kept"})
             if out and out["pos"]:
                 if (pad := zero_pad(path)) in out["pos"]:
                     keep = [b for b in out["pos"] if b != pad]
@@ -1047,8 +1056,27 @@ def whole_check(path, stop=lambda: None):
         reader.join(10)
         p.stderr.close()
     ff.check_stop()   # a stop killed the read pass, so it found nothing
-    certain, zero, more, zeros["count"] = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
-    return certain, zero, more, {"zeros": zeros, "ffmpeg": read_pass, "size": size, "pcm": pcm, "fault": certain and "zero-filled"}
+    certain, zero, more, zeros["count"], sound = decide.whole_verdict(runs, size, out, pcm, zeros.get("when"))
+    if sound and not sound["posts"]:   # the read pass decoded only the first frames of each audio track
+        sound = decide.audio_sampled(sound, out, audio_samples(path, info, bare))
+    return certain, zero, more, {"zeros": zeros, "ffmpeg": read_pass, "size": size, "pcm": pcm, "fault": certain and "zero-filled",
+                                 **({"audio": sound} if sound else {})}
+
+
+def audio_samples(path, info, bare=()):
+    """[(the audio track index, its sample() or None)] of each audio stream of info, stream_probe() of path, for
+    decide.audio_sampled(). bare holds the indexes of the TrueHD cores that the read pass leaves out, see
+    whole_check(). They get no sample, and the track index counts the other audio streams, as a player lists them.
+    One sample of SAMPLE_SECS starts at SAMPLE_AT[0] of the duration, as the first sample of check_audio() does, past
+    the frames the read pass decoded. A file shorter than that sample is sampled from there to its end. With no
+    duration no sample runs, and each track gets None. The seek lands on the keyframe before the start. In a file
+    shorter than about 10 keyframe intervals, as 20 s with a keyframe every 2 s, that is the first keyframe. So the
+    sample decodes the bad first frames again. 6 bad first DTS frames posted that way in a 15 s file with a keyframe
+    every 5 s."""
+    au = [k for k, s in enumerate(x for x in info.get("streams") or [] if x.get("codec_type") == "audio") if s.get("index") not in bare]
+    dur = ffprobe_duration(path) or 0
+    at = dur * decide.SAMPLE_AT[0]
+    return [(i, sample(path, at, k, min(decide.SAMPLE_SECS, dur - at)) if dur > 0 else None) for i, k in enumerate(au)]
 
 
 def tail_errors(path):
@@ -1065,14 +1093,27 @@ def tail_errors(path):
 def stream_gap(path, video):
     """The doubt of a file that is not Matroska whose format duration runs past its video end by more than AV_APART, or
     None. check_audio() needs mkvmerge's duration, which an MP4, AVI or MPEG-TS file lacks. One stray audio packet can set
-    the duration of an MP4 far past its video end."""
+    the duration of an MP4 far past its video end. The doubt names the longest stream by its kind, its number among the
+    streams of that kind and its codec, when it runs past the video end by more than AV_APART. A second ffprobe reads
+    the streams, and only for such a file."""
     with open(path, "rb") as f:
         if f.read(4) == decide.EBML_ID.to_bytes(4, "big"):
             return None
     whole = ffprobe_duration(path)
-    if video and whole and whole - video > decide.AV_APART:
-        return f"the file's tracks run to {content.hms(whole)}, but the video stops at {content.hms(video)}, so another track may be broken"
-    return None
+    if not (video and whole and whole - video > decide.AV_APART):
+        return None
+    try:
+        r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,duration", "-of", "json", path], 120,
+                        use="checks.stream_gap", capture_output=True, text=True, errors="replace")
+        streams = ff.loads(r).get("streams") or []
+        end, s = max(((float(x["duration"]), x) for x in streams if x.get("duration")), key=lambda e: e[0], default=(0.0, None))
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        end, s = 0.0, None
+    if s and end - video > decide.AV_APART:
+        n = [x for x in streams if x.get("codec_type") == s.get("codec_type")].index(s) + 1
+        return (f"the file's {s.get('codec_type')} track {n} ({s.get('codec_name')}) runs to {content.hms(end)}, but the video stops at "
+                f"{content.hms(video)}, so that track may be broken")
+    return f"the file's tracks run to {content.hms(whole)}, but the video stops at {content.hms(video)}, so another track may be broken"
 
 
 def encrypted_video(path):
@@ -1335,8 +1376,6 @@ def video_inputs(path, j=None, hp=None):
     if path.lower().endswith(".mkv") and j is None:
         try:
             j = mkvmerge(path)
-        except content.OutOfTime:
-            raise
         except Exception:
             j = {}
     hp = hp or (header_of(path, j) if j else None)
@@ -1363,7 +1402,7 @@ def video_check(path, again=False, j=None, hp=None):
     try:
         dur, hp, pcm, by = video_inputs(path, j, hp)
         return check_video(path, dur, again, hp, pcm, by)
-    except Exception as ex:
+    except (Exception, content.OutOfTime) as ex:
         return None, [], {"fault": None, "error": config.mask(f"{type(ex).__name__}: {ex}")[:200], "code": "video_check_error"}
 
 
@@ -1429,7 +1468,7 @@ def lid_cached(path, index, j, words=None):
         return False
 
 
-def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None):
+def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None, then=None, yield_to=None, langs=None):
     """One lid.py run on ffmpeg audio stream index. Returns its JSON answer, or {"why": the reason there is none}.
     It runs in its own process group. A timeout or the job's time limit kills the whole group, so no ffmpeg cut
     outlives it. fresh hears past the cache. The hook and the subtitle hunter both call it. keep keeps the samples'
@@ -1437,11 +1476,12 @@ def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None
     or None): the run then gives the words of those windows for the subtitle check instead, see lid.listen(). then
     is a file of the subtitle check's hearings that a language check runs after its own, with the model loaded, see
     lid.jobs(). yield_to is (the gate file, the state store or None) at which a hearing of many windows yields, see lid.waits().
+    langs is [(start, seconds)] of windows whose spoken language the run gives instead, see lid.tongues().
     A run that must hear first waits for a turn at the model, see lid_turn(). timeout starts after that wait,
     and a job's time limit caps it then. A wait of a second or more comes back as "waited"."""
     if not lid_ready():
         return {"why": "language detection is not installed"}
-    start, cached = time.monotonic(), not fresh and lid_cached(path, index, j, words)
+    start, cached = time.monotonic(), not (fresh or langs) and lid_cached(path, index, j, words)
     with contextlib.nullcontext() if cached else LID_ONE:
         left = config.DEADLINE.left()   # a hook job waits only while its time limit leaves room to hear
         turn = None if cached else lid_turn(start + (left - config.LID_RESERVE - 10 if left else float("inf")),
@@ -1453,11 +1493,17 @@ def lid_run(path, index, j, expect, timeout, fresh=False, keep=False, words=None
         try:
             left = config.DEADLINE.left()
             got = lid_cli(path, index, j, expect, min(timeout, left - config.LID_RESERVE) if left else timeout, fresh, keep, words, then, yield_to,
-                          slot=slot)
+                          slot=slot, langs=langs)
             return dict(got, waited=waited) if waited >= 1 else got
         finally:
             if turn:
                 turn.close()
+
+
+def lid_langs(path, index, j, wins, timeout):
+    """The spoken language of each window (start, seconds) of wins on ffmpeg audio stream index, from one lid_run(),
+    see lid.tongues(). Returns lid.py's answer, or {"why": the reason there is none}."""
+    return lid_run(path, index, j, (), timeout, langs=wins)
 
 
 def lid_speech(path, index, j, timeout, yield_to=None):
@@ -1469,7 +1515,7 @@ def lid_speech(path, index, j, timeout, yield_to=None):
     return lid_cli(path, index, j, (), timeout, False, yield_to=yield_to, speech=True)
 
 
-def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None, speech=False, burn=(), slot=0):
+def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then=None, yield_to=None, speech=False, burn=(), slot=0, langs=None):
     """The lid.py process of lid_run() or lid_speech(), killed with its process group after timeout seconds. burn holds
     the flags of a burnin.py run instead, the burned-in subtitle check, which runs in the same venv, see
     process.burn_run(). slot is the turn at the model that lid_run() holds, see lid_turn()."""
@@ -1484,6 +1530,8 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
         argv += ["--group", str(words[4])] if len(words) > 4 and words[4] else []   # the whole-file hearing, see subtitles.sweep_hear()
     elif speech:
         argv.append("--speech")
+    elif langs:
+        argv += ["--langs", *(f"{a}:{s}" for a, s in langs)]
     else:
         argv += (["--fresh"] if fresh else []) + (["--keep-pcm"] if keep else []) + ["--expect", *expect] + (["--then-words", then] if then else [])
     argv += [a for opt, v in zip(("--yield-gate", "--yield-queue"), yield_to or ()) if v for a in (opt, v)]
@@ -1552,15 +1600,18 @@ def hear(path, j, d, original, fresh=False, only=None, keep=False, then=None):
 
 LANGS = []
 def langs():
-    """mkvmerge's language table for decide.retag() and remux.props_fault(), read once per process. Empty when mkvmerge
-    cannot list it: then a tag edit writes the 639-2 code, and a language still changes on two agreeing signals.
+    """mkvmerge's language table for decide.retag(), remux.props_fault() and decide.lang_name(), read once per process,
+    see decide.language_table(). Empty when mkvmerge cannot list it: then a tag edit writes the 639-2 code, a language
+    still changes on two agreeing signals, and lang_name() gives the bare code.
     An empty table is never kept, so the next call reads again. With none, props_fault() refuses a BCP 47 tag that
     mkvmerge wrote for a track with none."""
     if not LANGS:
         try:
-            got = decide.language_table(run_bounded(["mkvmerge", "--list-languages"], 60, capture_output=True, text=True, errors="replace").stdout)
+            # A bound of its own: a late first read, as of an alert text, never takes or ends the job's time limit.
+            got = decide.language_table(ff.run(None, ["mkvmerge", "--list-languages"], timeout=60, capture_output=True, text=True,
+                                               errors="replace").stdout)
         except Exception:   # retag() takes only the BCP 47 form of a new tag from the table, so a failure never stops a job
-            return {}, {}
+            return {}, {}, {}
         if not got[1]:
             return got
         LANGS.append(got)

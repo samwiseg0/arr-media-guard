@@ -3,7 +3,7 @@
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
 import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
 
-from . import apps, checks, config, content, decide, ff, logs, mp4, proof, regrab, remux, runner, store, subtitles, vault
+from . import apps, checks, config, content, decide, ff, logs, matroska, mp4, proof, regrab, remux, runner, store, subtitles, ts, vault
 
 
 # The conversion of a file that is not Matroska into <base>.mkv (docs/design.md, "Conversion"). Every stream is proven at packet
@@ -129,16 +129,24 @@ def split_sync(path, j, streams, skip):
     return dict(zip(video, ms)), ms[-1]
 
 
-def broken_tracks(path, j, streams, folder, size):
+def sub_streams(j, streams):
+    """(the ffprobe subtitle streams of streams, whether the k-th of them is the k-th subtitle track of the mkvmerge -J
+    probe j). mkvmerge lists no track for a CEA-608 caption stream, so those streams are left out. The pairing holds
+    only when the counts match."""
+    subs = [s for s in proof.media_streams(streams) if s.get("codec_type") == "subtitle" and s.get("codec_name") not in proof.CAPTIONS]
+    return subs, len(subs) == len([t for t in j.get("tracks") or [] if t.get("type") == "subtitles"])
+
+
+def broken_tracks(path, j, streams):
     """{place: {stream, id, lang, cues}} of each MP4 timed-text track with a packet whose text is not valid UTF-8
     (docs/design.md, "Conversion"). MP4 timed text must be UTF-8, so every player shows such a track as
     garbage. convert() removes it and keeps its bytes beside the new file, see remux.broken_plan(). place is the track's
     place among the subtitles, s1 for the first, stream its ffprobe index, id its mkvmerge track id, lang its language
     tag and cues the packets of proof.timed_packets(). A failed read raises, and the proof decides."""
-    tt = [s for s in proof.media_streams(streams) if s.get("codec_name") in proof.TIMED_TEXT]
-    subs = [s for s in proof.media_streams(streams) if s.get("codec_type") == "subtitle" and s.get("codec_name") not in proof.CAPTIONS]
+    subs, paired = sub_streams(j, streams)
     tracks = [t for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
-    if not tt or len(subs) != len(tracks):   # the k-th ffprobe subtitle is mkvmerge's k-th
+    tt = [s for s in subs if s.get("codec_name") in proof.TIMED_TEXT] if paired else []
+    if not tt:
         return {}
     read, out = proof.timed_packets(path, [s["index"] for s in tt], streams), {}
     for s in tt:
@@ -147,6 +155,34 @@ def broken_tracks(path, j, streams, folder, size):
             out[f"s{subs.index(s) + 1}"] = {"stream": s["index"], "id": t.get("id"), "lang": decide.track_tag(t.get("properties") or {}),
                                             "cues": read[s["index"]]}
     return out
+
+
+def vobsub_unsized(j, streams):
+    """Why the MP4 that j describes cannot convert because of a VobSub track with no picture size, or None
+    (docs/design.md, "Conversion"). mkvmerge writes the size of the track header into the VobSub header of the MKV.
+    A width or a height of 0 gives such a size, as "size: 0x90", and ffmpeg then opens no decoder for the track, so
+    ffprobe reads no stream of the new file. ffprobe gives such a track of the MP4 no width and no height. A track goes
+    by its number among the subtitle tracks, see sub_streams(), so the reason names no number when the pairing fails.
+    convert() refuses before the remux."""
+    if (j.get("container") or {}).get("type") != "MP4/QuickTime":
+        return None
+    subs, paired = sub_streams(j, streams)
+    bad = [str(n) for n, s in enumerate(subs, 1) if s.get("codec_name") == "dvd_subtitle" and not (s.get("width") and s.get("height"))]
+    if not bad:
+        return None
+    many = len(bad) > 1
+    if not paired:
+        return (f"{len(bad) if many else 'a'} VobSub track{'s' * many} {'have' if many else 'has'} no picture size, and ffmpeg can't read such "
+                "a track in an MKV")
+    return (f"subtitle track{'s' * many} {' and '.join([', '.join(bad[:-1]), bad[-1]] if many else bad)} {'are' if many else 'is'} VobSub with no "
+            f"picture size, and ffmpeg can't read such a track in an MKV")
+
+
+def cut_lead(t):
+    """The indexes of the samples of the mp4.samples() track t that an edit cuts before its first shown sample, where
+    the edit starts."""
+    first = min((x for x, g in zip(t["time"], t["tag"]) if g != mp4.CUT), default=0)
+    return [k for k, (x, g) in enumerate(zip(t["time"], t["tag"])) if g == mp4.CUT and x < first]
 
 
 def start_shift(path, streams, skip, split=False):
@@ -172,12 +208,58 @@ def start_shift(path, streams, skip, split=False):
     # its own rules, so with split the start is not known. An empty edit moves a priming sample past 0, and mkvmerge
     # then drops it.
     priming = lambda t, k: t["kind"] == "audio" and -1e9 < t["time"][k] and t["time"][k] + t["dur"][k] < 1e6
-    first = lambda t: min((x for x, g in zip(t["time"], t["tag"]) if g != mp4.CUT), default=0)   # where the edit starts
-    lead = lambda t: [k for k in range(len(t["time"])) if t["tag"][k] == mp4.CUT and t["time"][k] < first(t)]
     times = [t["time"][k] + t["shift"] for t in got for k in range(len(t["time"])) if t["full"][k]]   # as mkvmerge times them
-    if split and keep and (not times or any(not priming(t, k) for t in got for k in lead(t))):
+    if split and keep and (not times or any(not priming(t, k) for t in got for k in cut_lead(t))):
         return None
     return -min(times, default=0) / 1e9
+
+
+def plays_on(times):
+    """Whether mkvmerge 102 plays an audio track on: a frame of times, in ns in file order, is not later than the frame
+    before it. mkvmerge then times it one frame after that frame, and the new file plays the rest of the track late."""
+    return any(b <= a for a, b in zip(times, times[1:]))
+
+
+def kept_times(path, j, streams, skip, folder):
+    """The mkvmerge options that keep the stored time of each audio frame of the MP4 or TS path (docs/design.md,
+    "Kept audio times"). The times come from mp4.samples() or ts.frames(), as the proof reads them. Each audio track
+    that plays_on() marks gets a v4 timestamps file in folder, one line per frame with data in file order, and
+    --timestamps gives it to mkvmerge. A line is the frame's time less the file start, the earliest time of the tracks
+    the remux keeps, which mkvmerge moves to 0. For an MP4 that is start_shift(), with each video track as mkvmerge
+    presents it, before ffmpeg's start rule. For a TS it is the earliest time of a kept PID. skip holds the ffprobe
+    indexes of the tracks the remux leaves out. mkvmerge numbers each track of j by its track_ID or PID, as ffprobe's
+    id does, and the AC-3 core of a TrueHD PID by that PID, see proof.ts_places(). A PCM track, a track with an empty frame
+    or a time that is not known, a read that fails and a start that is not known get no file. mkvmerge times them,
+    and prove() decides. Another container gets none."""
+    mov = (j.get("container") or {}).get("type") == "MP4/QuickTime"
+    if not mov and (j.get("container") or {}).get("type") != "MPEG transport stream":
+        return []
+    try:
+        r = mp4.samples(path) if mov else ts.frames(path)
+    except Exception:   # a reader that fails, as on a cut box header, see proof.mp4_places()
+        return []
+    if r["error"]:
+        return []
+    tracks = {t["id" if mov else "pid"]: t for t in r["tracks"]}
+    read = lambda n, ac3: (t["core"] if ac3 and (t := tracks.get(n) or {}).get("core") else tracks.get(n))
+    if mov:
+        start = start_shift(path, streams, skip, split=True)
+        lo = None if start is None else round(-start * 1e9)
+    else:
+        keep = [s for s in proof.media_streams(streams) if s["index"] not in skip]
+        lo = min((x for s in keep if (t := read(int(s.get("id") or "0", 16), s.get("codec_name") == "ac3"))
+                  for x, f in zip(t["time"], t["full"]) if f and x != matroska.NONE), default=None)
+    args = []
+    for x in [x for x in j.get("tracks") or [] if x.get("type") == "audio"] if lo is not None else ():
+        t = read((x.get("properties") or {}).get("number"), x.get("codec") == "AC-3")
+        # A time that is not known, matroska.NONE, lies before every start. After an empty edit mkvmerge drops a cut
+        # sample before the first shown one, see cut_lead(), so the lines would not pair with its frames. It keeps a cut
+        # sample at the end.
+        if not t or (x.get("codec") or "").startswith("PCM") or 0 in t["full"] or not plays_on(t["time"]) or min(t["time"]) < lo \
+                or mov and any(mt == -1 for _, mt, _ in t["edits"] or ()) and cut_lead(t):
+            continue
+        args += remux.v4_file(folder, f"kept-{x['id']}.txt", x["id"], (v - lo for v in t["time"]))
+    return args
 
 
 def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), split=None, times=()):
@@ -191,8 +273,9 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
     -copyinkf instead, with streams, its ffprobe streams, and never a new encode. -copyinkf keeps the frames before the
     first keyframe, which the proof reads. The ffmpeg path takes no sidecar and no caption. split holds the --sync of
     split_sync(). Each video track of src then comes from its own input of src, and the other tracks of src from one
-    more, which alone gives the chapters, the tags and the attachments. times holds the --timestamps options of
-    remux.planned_args() for the audio tracks of a Matroska src."""
+    more, which alone gives the chapters, the tags and the attachments. times holds the --timestamps options of the
+    audio tracks of src: remux.planned_args() for a Matroska src, kept_times() for an MP4 or TS src. With split, they go
+    to the input of the other tracks."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in proof.media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
@@ -214,7 +297,7 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
         for v, ms in own.items():
             argv += [*pick({v}), "--sync", f"{v}:{ms}", "-d", str(v), "-A", "-S", "-B", "-M", "--no-chapters", "--no-global-tags", src]
         rest = [i for i in ids if i not in own]
-        argv += [*pick(set(rest)), *[a for i in rest if rest_ms for a in ("--sync", f"{i}:{rest_ms}")], *skip, "-D", src]
+        argv += [*pick(set(rest)), *[a for i in rest if rest_ms for a in ("--sync", f"{i}:{rest_ms}")], *skip, *times, "-D", src]
     else:
         argv += [*names, *skip, *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], *times, src]
     for c in captions:
@@ -232,18 +315,22 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
     forced sidecar is never checked. Returns (the sidecars to mux, [(mkvmerge track id, ffprobe stream index)] of the
     tracks to leave out). info gets the results in subcheck and what changed.
 
-    A sidecar that does not match is not muxed. On apply it moves into originals_root() as a kept original. With
-    KEEP_ORIGINALS_DAYS 0, or no place to keep it, it stays beside the file. A built-in track that does not match is
+    A sidecar that does not match is not muxed. On apply it gets a name no player reads beside the file,
+    <base>.<lang>.mismatch.srt.txt, see subtitles.side_plan(), and entry "to" names it. With every name taken it moves
+    into originals_root() as a kept original. With KEEP_ORIGINALS_DAYS 0, or no place to keep it, it stays beside the
+    file. A built-in track that does not match is
     left out of the remux, and convert() keeps the original. With no place to keep it the track stays in. A sidecar whose times need a fix is kept the same way, and its text with new times goes in
     the remux. A built-in track whose times need a fix gets them after the conversion, from the check of the new
     Matroska file, which reads the same windows and the words carried over, see process(). known holds the item's
-    original languages for sub_hold(). broken holds the ffprobe indexes of the tracks of broken_tracks(), which the
-    remux removes, so the check leaves them out. ready(verdicts) runs before the first move, see convert()."""
+    original languages for sub_hold(). A mismatch whose windows speak another language is unknown, see
+    subtitles.sub_spoken(), as is one that another audio track of its language matches, see subtitles.sub_others(). A built-in track whose text the read keeps stays in the remux, see
+    subtitles.tag_read(). broken holds the ffprobe indexes of the tracks of broken_tracks(), which the remux removes,
+    so the check leaves them out. ready(verdicts) runs before the first move, see convert()."""
     if dur < config.SUB_MIN_SECONDS or not checks.lid_ready():
         return subs, []
     ts = decide.classify(j)
     audio = subtitles.sub_audio(ts)
-    items, text = {}, [x for x in proof.media_streams(streams) if x.get("codec_type") == "subtitle"]
+    items, (text, paired) = {}, sub_streams(j, streams)
     ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"]
     for s in subs:
         lang = subtitles.side_code(s)
@@ -251,7 +338,7 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
         if k in audio and proof.SIDECAR_FLAGS["forced"] not in s["flags"] and subtitles.spaced(lang):
             items[s["name"]] = (lang, audio[k], [(a / 1000, b / 1000, t) for a, b, t in s["cues"]])
     for n, t in enumerate(t for t in ts if t["kind"] == "s"):
-        x = text[n] if len(text) == len(ids) else None   # the k-th ffprobe subtitle is mkvmerge's k-th
+        x = text[n] if paired else None
         k = decide.lang_key(t["lang"])
         if x and x["index"] not in broken and x.get("codec_name") in ("subrip", "ass", "ssa", "webvtt", "mov_text") and t["role"] in config.SUB_ROLES \
                 and k in audio and subtitles.spaced(t["lang"]):
@@ -262,23 +349,27 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
         return subs, []
     c = j.get("container") or {}   # mkvmerge gives no duration for an MP4, and the hearing needs one, so ffprobe's goes in
     timed = j if decide.duration(j) else dict(j, container=dict(c, properties=dict(c.get("properties") or {}, duration=round(dur * 1e9))))
-    got = info["subcheck"] = subtitles.sub_held(subtitles.sub_verdicts(path, timed, items), items, ts, known)
+    got = info["subcheck"] = subtitles.sub_judged(path, timed, items, ts, known)
     if ready:
         ready(got)
-    keep = []
+    keep, planned = [], []   # planned: the new names of the sidecars before, see subtitles.side_plan()
     for s in subs:
         r = got.get(s["name"]) or {}
         fix = (r.get("timing") or {}).get("fix")
         if r.get("verdict") == "mismatch" or (fix and apply):
-            why = (vault.keepable(s["path"], os.stat(s["path"])) or None) if config.CFG.keep_days else "KEEP_ORIGINALS_DAYS is 0"
+            why = vault.keep_why(s["path"])
         if r.get("verdict") == "mismatch":   # rather no subtitle than a wrong one
             entry = {"name": s["name"], "why": r["why"]}
             info.setdefault("sidecars_unmatched", []).append(entry)
             try:
-                if apply and why: raise OSError(why)
+                if b := subtitles.side_plan(s, path, planned):   # a name no player reads beside the video, else the move
+                    entry["to"] = os.path.basename(b["sidecar"])
+                    planned.append(b["sidecar"])
+                if why and (apply or config.CFG.keep_days): raise OSError(why)   # a dry run names the keep folder's block too
                 if apply:
-                    entry["moved"] = vault.keep_original(s["path"], entry)
-                    os.remove(s["path"])
+                    moved = subtitles.side_move(s, b, entry, "moved")
+                    if b:
+                        entry.update(to=moved["to"], renamed=True)
             except OSError as ex:
                 entry["left"] = config.mask(str(ex))[:200]
             continue
@@ -303,14 +394,49 @@ def convert_subs(path, j, streams, subs, dur, apply, folder, info, known=(), bro
             info.setdefault("sidecars_would_retime", []).append(s["name"])
         keep.append(s)
     wrong = [(n, t["pos"]) for n, t in enumerate(t for t in ts if t["kind"] == "s") if (got.get(t["pos"]) or {}).get("verdict") == "mismatch"]
+    # A track leaves the file only when its text lets it, see subtitles.tag_read(). Else it stays, and the
+    # check of the new Matroska file turns its flags off.
+    reads = {p: subtitles.tag_read(items[p][2], items[p][0]) for _, p in wrong}
+    got.update({p: dict(got[p], text=read) for p, (_, read) in reads.items()})
+    wrong = [(n, p) for n, p in wrong if reads[p][0]]
     # A track that leaves the file comes back only from the kept original, see convert(). Without one it stays, and
     # the check of the new Matroska file turns its flags off.
-    why = wrong and ((vault.keepable(path, os.stat(path)) or None) if config.CFG.keep_days else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept")
+    why = wrong and vault.keep_why(path)
     if wrong:
         info["tracks_unmatched"] = [p for _, p in wrong]
         if why:
             info["tracks_kept_back"] = why
     return keep, [] if why else [(ids[n], text[n]["index"]) for n, _ in wrong]
+
+
+def mismatch_texts(path, j, streams, drop, info, taken=()):
+    """(drop, {place: entry of remux.broken_plan()}) for the tracks that convert_subs() leaves out of the remux, drop
+    [(mkvmerge track id, ffprobe stream index)]. The text of each goes beside the new file, as a broken track's does,
+    see broken_tracks(), so it outlives the kept original (docs/design.md, "Subtitle match"). The name ends in
+    remux.MISMATCH_END. Only an MP4 timed-text track has its bytes read here, see proof.timed_packets(). Every other
+    track, a track whose bytes do not read and a track whose names beside the video all hold files stay in the remux.
+    The check of the new Matroska file then takes such a track out with its bytes, see remux.resub(), or turns its
+    flags off. info["tracks_unmatched"] and info["mismatch_stayed"] name the places. A picture track never leaves for a
+    mismatch, so none is here. taken are the paths the names of other plans hold, see remux.broken_plan()."""
+    places = dict(zip(info.get("tracks_unmatched") or [], drop)) if drop else {}
+    codec = {x["index"]: x.get("codec_name") for x in streams}
+    tags = {t.get("id"): decide.track_tag(t.get("properties") or {}) for t in j.get("tracks") or []}
+    texts = {p: {"stream": i, "id": t, "lang": tags.get(t, "und"), "data": None, "end": remux.MISMATCH_END}
+             for p, (t, i) in places.items() if codec.get(i) in proof.TIMED_TEXT}
+    remux.broken_plan(path, texts, taken)   # with no bytes, a name a file holds counts as taken
+    texts = {p: e for p, e in texts.items() if not e["reused"]}
+    try:
+        cues = proof.timed_packets(path, [e["stream"] for e in texts.values()], streams) if texts else {}
+    except (RuntimeError, OSError) as ex:   # the track stays, and the remux of the new file keeps its bytes
+        info["mismatch_read"], texts = config.mask(str(ex))[:200], {}
+    for e in texts.values():
+        e["cues"] = cues[e["stream"]]
+    if stayed := sorted(set(places) - set(texts), key=lambda p: int(p[1:])):
+        info["mismatch_stayed"] = stayed
+        info["tracks_unmatched"] = [p for p in info["tracks_unmatched"] if p not in stayed]
+        if not info["tracks_unmatched"]:
+            del info["tracks_unmatched"]
+    return [x for x in drop if x not in {places[p] for p in stayed}], texts
 
 
 def convert_skip(app, path, new, st, ids, outside=False, keep=False):
@@ -878,7 +1004,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
 
     sub runs the subtitle match check first, see convert_subs(): a sidecar that does not match the audio is moved aside,
     a built-in text track that does not match is left out of the remux, and a sidecar whose times need a fix is muxed
-    with new times. A conversion that leaves a track out keeps the original, as a forced one does. known holds the item's original languages, see sub_hold().
+    with new times. A conversion that leaves a track out keeps the original, as a forced one does, and the track's text
+    goes beside the new file, see mismatch_texts(). known holds the item's original languages, see sub_hold().
 
     A timed-text track with a packet that is not valid UTF-8 is broken, see broken_tracks(). The remux removes it, and
     the proof leaves it out. Its bytes go beside the new file, see remux.broken_plan(), after the proof and the swap's checks
@@ -903,6 +1030,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     dur = decide.duration(j) or checks.ffprobe_duration(path) or 0
     over = lambda s: s["end"] > dur + max(decide.HEADER_OFF, decide.HEADER_SHARE * dur)
     cut = lambda s: over(s) or not s["ordered"]   # timed for another cut
+    kept = lambda s: decide.kept_out(s["misread"]) or (None if s["charset"] else True)   # the key of its row of decide.KEPT_OUT, else None
     late = [s for s in subs if not s["charset"] or cut(s) or s["misread"]]
     subs = [s for s in subs if s not in late]
     audio = {t["lang"] for t in decide.classify(j) if t["kind"] == "a" and t["role"] == "main"}
@@ -915,7 +1043,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             "sidecars": [{**{k: s[k] for k in ("name", "lang", "flags")}, "read": s["read"][0], **({"mismatch": s["mismatch"]} if "mismatch" in s else {})}
                          for s in subs], **({"old_path": path, "new_path": new} if new != path else {})}
     if late:   # it stays beside the file, where it keeps the base name the player looks for
-        info["sidecars_left"] = [f"{s['name']}: " + ("its charset is unknown" if not s["charset"] else "its cues are out of order" if not s["ordered"]
+        info["sidecars_left"] = [f"{s['name']}: " + (decide.KEPT_OUT[kept(s)][0] if kept(s)
+                                 else "its cues are out of order" if not s["ordered"]
                                  else f"its last cue ends at {content.hms(s['end'])}, the file at {content.hms(dur)}" if over(s) else s["misread"])
                                  for s in late]
     if unread := {s["name"]: s["misread"] or True for s in late if not s["charset"] or not cut(s)}:   # the unreadable notice names them, see process.conversion()
@@ -945,10 +1074,12 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             if not why and force is not None and (name := parse_refuses(app, items, [new])):   # the relink names the episodes by id
                 info["forced_name"] = name
         why = why or said("repack_score_refused", score_refuses(app, ids["app_id"], old, new))
+    if not why and (unsized := vobsub_unsized(j, streams)):   # before the remux and in a dry run too. A failed conversion posts its alert.
+        return "repack_failed", f"repack failed: {unsized}", info, path
     folder, broken = runner.work_dir("convert"), {}
     if not why and not unreadable and any(s.get("codec_name") in proof.TIMED_TEXT for s in streams):
         try:
-            broken = broken_tracks(path, j, streams, folder, st.st_size)
+            broken = broken_tracks(path, j, streams)
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as ex:   # the proof reads the text and decides
             info["broken_read"] = config.mask(str(ex))[:200]
         except BaseException:
@@ -973,12 +1104,20 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             raise
     if not why and "planned" not in info:   # no subtitle check heard the tracks
         ready(None)
+    # The names a dry run gave the sidecars it leaves out count as taken, so no two plans name one file
+    taken = [os.path.join(os.path.dirname(path), e["to"]) for e in info.get("sidecars_unmatched") or [] if e.get("to") and not e.get("renamed")]
+    drop, texts = mismatch_texts(path, j, streams, drop, info, taken)
     skip = {e["stream"] for e in broken.values()} | {i for _, i in drop}   # the streams the remux leaves out
+    beside = {**broken, **texts}   # the text of each track the remux leaves out, which goes beside the new file
+    shift = start_shift(path, streams, skip) if beside else 0
+    for e in beside.values():
+        e["data"] = proof.timed_srt(e["cues"], shift)
+    if texts:   # each kind has its own plan, so a taken name of one still names the files of the other
+        why = why or said("repack_name_taken", remux.broken_plan(path, texts, taken))
+        info["mismatch_text"] = {p: os.path.basename(e["sidecar"]) for p, e in texts.items() if e.get("sidecar")}
+        what += "".join(f", take out subtitle track {p[1:]}, its text to {n}" for p, n in info["mismatch_text"].items())
     if broken:   # the decision log names each track by its place in the original, and a dry run names each sidecar too
-        shift = start_shift(path, streams, skip)
-        for e in broken.values():
-            e["data"] = proof.timed_srt(e["cues"], shift)
-        why = said("repack_name_taken", remux.broken_plan(path, broken))
+        why = why or said("repack_name_taken", remux.broken_plan(path, broken))
         facts = {x["i"]: x for x in logs.track_log(decide.classify(j, original=min(known, default=None)))}   # the role and title of the alert's track name
         info["broken"] = {p: {"stream": e["stream"], "lang": e["lang"], "sidecar": e.get("sidecar"), "reused": e.get("reused"),
                               **{k: (facts.get(p) or {}).get(k) for k in ("role", "name", "sdh", "forced")}} for p, e in broken.items()}
@@ -1019,8 +1158,12 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             split[0].update({x["track"]: split[0][x["track"]] + x["ms"] for x in sync if x["track"] in split[0]})   # ffmpeg's MP4 start rule too
             info["split_sync"] = {"video": split[0], "other": split[1]}   # each video track from its own input
         gone = [t for t, _ in drop] + [e["id"] for e in broken.values()]
-        times, plans = remux.planned_args(path, j, [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in gone], folder) \
-            if c.get("type") == "Matroska" else ([], {})   # a WebM, as convert_cmd() orders the tracks
+        if c.get("type") == "Matroska":   # a WebM, as convert_cmd() orders the tracks
+            times, plans = remux.planned_args(path, j, [t.get("id") for t in j.get("tracks") or [] if t.get("id") not in gone], folder)
+        else:
+            times, plans = [] if unreadable else kept_times(path, j, streams, skip, folder), {}
+            if times:   # the decision log names each track that keeps its stored times
+                info["kept_times"] = [int(a.partition(":")[0]) for a in times[1::2]]
         r = ff.run("convert.convert", convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times),
                            capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
@@ -1070,9 +1213,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         sw.check("the app replaced or renamed the original during the repack", keep and not (outside and new != path))
         sw.release()   # from here a stop waits for the swap and the job's end, as for mkvpropedit
         with runner.no_stop():
-            for p, e in broken.items():   # after the proof and the swap's checks, and before the rename, so a failed write leaves the original
+            for p, e in beside.items():   # after the proof and the swap's checks, and before the rename, so a failed write leaves the original
                 remux.keep_broken(e, st)
-                info["broken"][p]["reused"] = e["reused"]
+                if p in broken:
+                    info["broken"][p]["reused"] = e["reused"]
             if new == path:
                 vault.kept_replaced(path)   # no keep_original() before this rename, unless forced
                 os.replace(tmp, path)
@@ -1157,7 +1301,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if undo != "completed":   # the original stays, at its name or the held name, so its kept link goes
             sw.unkeep(path, held)
         if undo not in ("completed", "stranded"):   # the original holds the broken tracks again, so their new sidecars go
-            remux.drop_broken(broken.values())
+            remux.drop_broken(list(beside.values()))
             for p, e in broken.items():
                 info["broken"][p].update({"removed": True} if e.get("removed") else {})
         if sw.stop(ex):

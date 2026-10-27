@@ -35,6 +35,7 @@ READS = {
     "checks.stream_probe": Use((), "the format, the streams and their sample rates"),
     "checks.main_stream": Use(("stream.duration",), "the film's stream duration, which places a window or gates a doubt (plan A3)"),
     "checks.ffprobe_duration": Use(("format.duration",), "the format duration, which places a sample or a window, or gates a doubt (plan A3)"),
+    "checks.stream_gap": Use(("stream.duration",), "the duration of each stream, which names the one that runs past the video end in a doubt"),
     "content.last_packet.film": Use((), "the index of the film's stream"),
     "content.last_packet": Use(("packet.pts_time", "format.start_time", "seek"), "the stored time of the film's last packet, the runtime "
                                f"check in minutes. -read_intervals seeks to the end by time. {SEEK}"),
@@ -48,8 +49,6 @@ READS = {
     "proof.extradata": Use((), "the codec header"),
     "proof.hevc_packets": Use(("packet.pts", "packet.dts"), "the RPU check holds the pts, the dts and the keyframe flag of each HEVC packet "
                               "equal in two reads, and measures no time"),
-    "lid.start_delay": Use(("stream.start_time", "format.start_time"), "the start of the audio stream against the file's, as the container "
-                           "stores them, puts the decoded speech on the file's clock"),
     "subtitles.onsets.layout": Use((), "the channel layout of the audio stream"),
     # ffmpeg
     "checks.sample": Use(("volumedetect", "volumedetect.n_samples", "dump", "seek"), "the peak and the count of decoded samples of one "
@@ -69,10 +68,13 @@ READS = {
                                "every proof. Its times count only for a source with no reader (AVI, ASF), see prove()", ("proof.bad_lines",)),
     "proof.packet_data": Use((), "the bytes of the first packets of a stream"),
     "proof.hevc_packets.data": Use((), "the bytes of each packet of an HEVC stream"),
-    "lid.extract": Use(("seek",), f"raw PCM. The word times count its samples from the -ss start. {SEEK}"),
-    "lid.speech": Use((), "raw PCM of the whole stream. The speech spans count its samples, then move by start_delay()"),
-    "subtitles.onsets": Use(("silencedetect", "silencedetect.silence_end", "silencedetect.silence_duration", "seek"), "the speech onsets of "
-                            f"a window, from its decoded samples after the -ss start, for the word check. {SEEK}"),
+    "lid.extract": Use(("seek", "aresample"), "raw PCM from the -ss start. ff.clock() puts each frame at its time, so the word times and the "
+                       f"speech spans of a window count its samples on the file's clock. {SEEK}"),
+    "lid.speech": Use(("aresample",), "raw PCM of the whole stream. aresample puts each frame at its time from the file's start, with silence "
+                      "before a late start and in a gap, so the speech spans count its samples on the file's clock"),
+    "subtitles.onsets": Use(("silencedetect", "silencedetect.silence_end", "silencedetect.silence_duration", "seek", "aresample"), "the speech "
+                            "onsets of a window, from its decoded samples after the -ss start, for the word check. ff.clock() fills a late start "
+                            f"and a gap with silence, so an onset after either one counts. {SEEK}"),
     "subtitles.ffmpeg_layouts": Use((), "the channels of each layout name"),
     "remux.cover_images": Use(("framemd5",), "the md5 of the first packet of a cover picture, no time"),
     "remux.moved_tracks": Use(("matroska", "setts"), "each moved subtitle track, timed by setts, whose cues prove() checks. setts moves the "
@@ -117,12 +119,29 @@ WRITERS = ("json", "csv")   # ffprobe's output formats
 # format but lavfi, whose -i is a filter graph.
 MUXERS = {"null": None, "data": None, "s16le": None, "framemd5": "framemd5", "framecrc": "framecrc", "framehash": "framehash", "srt": "srt",
           "matroska": "matroska"}
+# The audio clock of each decode whose times meet the cues, the onsets or the video. aformat first mixes the track to
+# mono 16 kHz s16, with the matrix of -ac 1, in one swresample. Then aresample puts each frame at its time from the
+# start of the read, the file's start or the -ss time. It fills a late start and a gap of 0.1 s or more with silence.
+# So the samples count on the file's clock, and a fill costs 32 kB a second. A fill before the mix cost the channel
+# count times the input rate in floats, so a gap of 30 minutes in a 5.1 track took 2.3 GB. A float aformat mixes 5.1
+# with another matrix than -ac 1, so the format is s16. The cache keys of lid.py name CLOCK, so a change of it reads
+# the audio again.
+CLOCK = "aformat=sample_fmts=s16:sample_rates=16000:channel_layouts=mono,aresample=async=1:first_pts=0"
+
+
+def clock(*filters, rate=True):
+    """The -af graph of an audio decode on the file's clock: CLOCK, then filters. rate=False keeps the track's own
+    sample rate, so silencedetect finds the onsets it found before the clock. Then the -t of the read bounds a fill."""
+    return ",".join((CLOCK if rate else CLOCK.replace("sample_rates=16000:", ""), *filters))
+
+
 # The filters and bitstream filters, each as (the channel a use names to pass it or None, a pattern of the arguments
 # it may take). An expression filter evaluates its argument for each frame, and print() in it logs a time. So an
 # argument passes only as AMG writes it. setts takes the move of remux.moved_tracks(), with its offset and rate.
 NUM = r"-?(?:\d+(?:\.\d*)?(?:e[-+]?\d+)?|inf|nan)"   # a float as repr() writes it
 MOVED = lambda ts: rf"\({ts}-\({NUM}\)/TB\)\*{NUM}\*TB\*1000"
-FILTERS = {"aformat": (None, r"sample_rates=48000:channel_layouts=mono|channel_layouts=mono"), "asetpts": (None, r"PTS-STARTPTS"),
+FILTERS = {"aformat": (None, r"sample_rates=48000:channel_layouts=mono|sample_fmts=s16(?::sample_rates=16000)?:channel_layouts=mono"), "asetpts": (None, r"PTS-STARTPTS"),
+           "aresample": ("aresample", r"async=1:first_pts=0"),
            "pan": (None, r"mono\|c0=FC"), "showinfo": ("showinfo", r"(?:checksum=0)?"), "ashowinfo": ("ashowinfo", ""),
            "volumedetect": ("volumedetect", ""), "silencedetect": ("silencedetect", r"noise=-25dB:d=0\.3")}
 BSFS = {"h264_mp4toannexb": (None, ""), "hevc_mp4toannexb": (None, ""), "aac_adtstoasc": (None, ""), "pcm_rechunk": (None, r"n=4096"),

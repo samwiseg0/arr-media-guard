@@ -37,6 +37,8 @@ only a policy change. A decision has four steps.
 - **Audio role.** Main, commentary or description ("AD", "DVS"). Only a main track plays first.
   "Commentary", "cmt" or "Comm" in the title makes a track commentary. So does a *notes title*, which has
   "Production Notes", "Trivia", "Info Text", "Fact Track", "Pop-up" or "Easter Eggs", or is just "Notes".
+  A title that negates commentary holds the dialogue (`NO_COMMENT_TITLE`). Such a title is "No Commentary",
+  "Commentary-free", "Without Commentary", "w/o Commentary" or "Non-Commentary", also after a language or in brackets.
 - **Subtitle role.** Commentary, dub transcript ("English (dub)", "Dubtitle"), lyrics, forced, SDH or full.
   A "forced" or signs title (signs, songs except on a lyrics track, foreign parts, alien, titles only) makes a
   track forced. So does a forced flag, or a density under `sparse_events` (1.5 events a minute). "SDH", "CC" or
@@ -121,6 +123,11 @@ holds every ISO 639-2 code mkvmerge lists, the 3-letter codes of `ALIAS` such as
 macrolanguage. mkvmerge writes the macrolanguage (`may`) as the legacy tag of such a track. `unk`
 names no language. A BCP 47 tag that does not parse has no code.
 
+Twenty languages have a terminology (T) code beside the bibliographic (B) code that mkvmerge lists,
+as `mya` beside `bur`. An MP4 file stores the T code. `decide.TWINS` holds the 20 pairs. It feeds
+`ALIAS`, so `codes()` and `lang_key()` read a T code as its B code. It also feeds the names of
+`language_table()` and `lid.code()`.
+
 `decide.classify()` reads each track of a mkvmerge probe with this rule. So the default tracks, the
 language edits, the Original language flag, the subtitle checks and the alerts use it. The track
 lists that the remux checks compare use it too, see `checks.track_list()`. Some readers take the
@@ -196,6 +203,25 @@ TMDB gives none or one with no 639-2 code, no flag changes.
 - An edit of this flag alone queues no Plex analyze, see `process.changed()`. Plex does not read the flag, and most
   imports get one. Any other edit queues the analyze as before.
 - The decision line's `tracks` shows each track's flag as `orig`, 1, 0 or `null`, as the run found it.
+
+## Commentary flag
+
+Matroska's `FlagCommentary` marks a commentary track, so a player can name it. Many releases title such a track
+"Commentary" and leave the flag out (owner 2026-10-26: set it on titled tracks). `decide.retag()` plans it with the
+language tags, as the mkvpropedit property `flag-commentary` (`decide.COMMENTARY_FLAG`). It takes the path of the
+Original language flag.
+
+- An audio or subtitle track whose title reads as commentary (`COMMENT_TITLE`: "comment", "cmt" or "comm" as a word)
+  and that lacks the flag gets it. A notes title (`NOTES_TITLE`, such as "Production Notes" or "Trivia") gets none,
+  and a flag set already stays. AMG never clears the flag. A title that negates commentary ("No Commentary", see
+  `decide.commentary_title()`) gets none.
+- An edit is `[selector, 1, old, COMMENTARY_FLAG]`, with old `None` for a missing flag, whose undo is `--delete
+  flag-commentary`. A header edit makes it, with no remux. A remux of the same run carries it (`remux.EDIT_OPTS`).
+  `edit()` drops a no-op, and `unapplied()` verifies it. Its rule is `commentary flag set`, and a note names the
+  track and its title. The change post says "Turned the commentary flag on for ...".
+- An undecided or dropped plan gets none. The deep analysis, a recheck and a run on a file no app lists keep the
+  flags, as for the Original language flag. A dry run plans the edit, and `cli.selected()` takes such a file by the
+  `tags` trigger.
 
 ## Plex
 
@@ -366,7 +392,7 @@ hunter links the movie in the Title field of its posts.
 
 | Kind | Fires when |
 | --- | --- |
-| `language` | No main audio track is English, the original language or a language TMDB lists. |
+| `language` | No main audio track is English, the original language or a language TMDB lists. The text names the main audio only. An audio track in a wanted language with another role says why it does not count, as in "The English track is commentary." The last sentence names the source of the original language. That is TMDB when its original agrees, else the app (`process.file_alerts()`). |
 | `runtime` | The trusted duration is far off the listed runtime, see "Metadata checks". |
 | `duration` | The header duration is more than 40 percent off the stored end, or disagrees with the other duration sources. The stored end is where the last video or audio frame ends, see `checks.stored_end()`. A length from the size and a bitrate is an estimate, so no check takes it. A file with no stored end gets the bitrate ceiling: 50 Mbit/s up to 1080p and 150 above, by the film's height. |
 | `episode` | The release names another episode than the one Sonarr imported it as. The alert leads with the imported episode and its title. |
@@ -535,9 +561,12 @@ probe still runs.
 
 A Segment duration can run far past the video. So the windows sit on the video end read from the
 last Clusters, else mkvmerge's DURATION tag, else ffprobe. A file that is not Matroska gets a
-doubt when its format duration runs over 60 seconds past its video end (`AV_APART`). A window stops
+doubt when its format duration runs over 60 seconds past its video end (`AV_APART`). The doubt names
+the longest stream by kind, number and codec, as "audio track 2 (ac3)", when that stream ends so far
+past the video. A window stops
 at 60 seconds or 512 MiB read, because a seek with no index reads from the file start. A time-cap
-stop is a doubt, and a read-cap stop with no error is only logged. In the hook each stage needs time
+stop is a doubt, and a read-cap stop with no error is only logged. A stop with errors is a doubt that
+names the playback errors the window met, or the error lines of a window with no frame. In the hook each stage needs time
 left and keeps `VIDEO_RESERVE` for the edit. An exception gives `video_check_error`, and the edit
 goes ahead.
 
@@ -558,7 +587,7 @@ import's zero probe defers to this check, see "Corrupt video".
 | Pass | What it reads | Certain | Doubt |
 | --- | --- | --- | --- |
 | zero scan | every byte of the span the zero probe reads. A zero run counts from 256 KiB. | runs at 2 or more places | a run at 1 place |
-| read pass | `ffmpeg -v error -i FILE -ignore_unknown -map 0 -c copy -f null -`: every packet of every stream but a TrueHD core with no sample rate (below), with no decode | never | a line it prints |
+| read pass | `ffmpeg -v error -i FILE -ignore_unknown -map 0 -c copy -f null -`: every packet of every stream but a TrueHD core with no sample rate (below). It decodes only the frames of ffmpeg's probe of the streams. | never | a line it prints, but audio lines under a bound with clean samples (below) |
 
 `checks.whole_check()` starts the read pass in an ffmpeg process of its own. Then `checks.zero_scan()` reads the same
 file in the job's process. The slower reader takes the file from the page cache, so the NAS sends it about once. The
@@ -591,6 +620,42 @@ error. So an unconverted TrueHD M2TS alerted "video may be broken". The TrueHD s
 the demuxer still reads every PES of the PID. Any other stream with no sample rate stays in, and its header error is
 a doubt. A file that ffmpeg cannot open, or whose streams it cannot set up, gives no doubt. Neither does a read pass
 that runs over `WHOLE_MIN` seconds or the time the file needs at `WHOLE_RATE`, whichever is longer.
+
+**The stream of a line.** ffmpeg names the logger of each line, as `[eac3 @ 0x57ad]`. `decide.copy_kind()` names its
+stream from that name. A decoder or parser of `AUDIO_CODECS` or `VIDEO_CODECS` is audio or video. So is ffmpeg's logger
+of an audio or video input stream, as `[aist#0:1/eac3 @`. A demuxer, ffmpeg's logger of an input file
+(`[in#0/matroska,webm @`) and a line that names a byte are the container. The read pass decodes only the frames of
+ffmpeg's probe of the streams. In made-up media on ffmpeg 7.1 that was the first packet of an E-AC-3, AC-3 or AAC track
+and the first 7 H.264 frames. A DTS decoder decoded on while its frames failed, up to about 5 s. The h264 parser
+printed lines from any place of the file. So did the TrueHD and MLP parser, for each bad frame. The other audio
+parsers printed none, in MKV, MP4 and MPEG-TS. In 900 random garbles of the first frame of E-AC-3, AC-3, AAC and DTS,
+one bad frame printed at most 2 lines. mpv played past it with no lost samples. An E-AC-3, AC-3 or AAC track with
+every frame bad printed the same 1 or 2 lines. mpv played it as noise or silence.
+
+So the lines of one audio decoder, with ffmpeg's repeat counts, post "Audio may be broken" over `AUDIO_BAD` (10).
+The doubt says "the start of the audio failed to decode, with 2 errors". A TrueHD or MLP line can come from any place,
+so their doubt names no place, as "a full read of the file found 1800 audio errors". The read pass keeps its first
+1000 lines, and the count adds the audio lines past them. A TrueHD track bad in its middle printed 1800 lines.
+
+Under the bound, `checks.audio_samples()` takes one sample of each audio track. It leaves out a TrueHD core that the
+read pass leaves out, and the track numbers count the other audio streams, as a player lists them. A sample decodes
+20 s from 10 percent of the duration, as the import's first audio sample does. A file shorter than that is sampled
+from there to its end. The seek lands on the keyframe before the start. In a file shorter than about 10 keyframe
+intervals, as 20 s with a keyframe every 2 s, that is the first keyframe. The sample then decodes the bad first frames
+again. 6 bad first DTS frames posted that way in a 15 s file with a keyframe every 5 s. A sample opens the file, so
+its probe prints the lines of the read pass again. A sample with more than `AUDIO_BAD` errors past those lines posts
+"Audio may be broken" and names its track, as "A 20 s sample of audio track 2 found 1198 decode errors." A sample with
+up to `AUDIO_BAD` errors past those lines logs only. ffmpeg stops a sample on its error rate when every frame of the
+track fails, and its errors still count. Another sample that does not run posts the doubt of the read pass and says
+so. Else the doubt logs only. The import's own samples miss such a track. They decode only the track that plays. A
+playing E-AC-3 or AC-3 track with every frame bad decoded to noise at full length there, so `audio_verdict()` found
+nothing. The sample runs only for a file whose read pass printed an audio line. That was 2 of 319 live checks in 11
+days.
+
+Video and container lines keep their doubt and its alert, "Video may be broken". A file with both gets one alert, "Video
+may be broken", and its text names the audio doubt when that one posts. The decision line keeps the lines of each kind
+in `whole.ffmpeg.kinds`, each audio decoder and its lines in `whole.ffmpeg.audio`, and the audio doubt and each sample
+in `whole.audio`.
 
 **Zero padding.** Some releases end with a few hundred zero bytes past the Segment end. The hook's flag edit up to
 2.18.3 could grow the Tracks, and mkvpropedit then wrote them at the end of the file, after the zeros. The Segment then
@@ -642,7 +707,7 @@ decision line, `whole.file` names the file the job read and `whole.remux` names 
 job reads the remux, and `whole.original_gone` names a kept original that went.
 
 The job reads with no file lock. It yields to an import that waits, and starts both passes again on its next run. Its
-source is `whole_file`, and its outcome is `corrupt_video`, `video_doubt`, `video_checked` or `file_changed`. `--check`
+source is `whole_file`, and its outcome is `corrupt_video`, `video_doubt`, `audio_doubt`, `video_checked` or `file_changed`. `--check`
 runs it right after its own checks and never re-grabs. A job that a backfill queued queues one too, which alerts only.
 
 ## Restore after a bad upgrade
@@ -758,7 +823,17 @@ listener never forks, and the thread pools of a backfill or a scan share one pro
 because a kill mid-write can break the header. A remux, its proof and its swap have none either. The
 checks after a conversion or after a header repair that runs before them get a new 300 seconds. The limit is a
 deadline, `content.DEADLINE`. Each subprocess, HTTP call and lock wait under it ends at it, and a long read checks it
-between two blocks. It raises `content.OutOfTime`, because a network handler would swallow a TimeoutError. The
+between two blocks. It raises `content.OutOfTime`.
+
+The time limit ends the job. `OutOfTime` is a BaseException, so no `except Exception` takes it, and every other step
+of the job stops there. Six handlers name it and turn it into an outcome. `runner.run_job()` records the outcome
+`error`, and the line keeps what the run wrote, so Plex still analyzes a changed file. `cli.backfill_file()` records an
+error line for a backfill or a --check file. `process.content_checks()` ends the metadata checks and its re-grab lock
+wait with `meta_error`, because the edit is done. `process.quick_check()` leaves the file unsure. The old file check of
+`regrab.restore_plans()` keeps that old file in the recycle bin. `checks.video_check()` gives `video_check_error`,
+because a failed video check never costs the edit, and the run then gets a new limit. The stop line and the alerts at
+the end of a run stop the limit, so their posts have none. tests/test_time_limit_handlers.py pins each place in the
+source that can take `OutOfTime`, so a new one fails the test until someone classes it. The
 metadata checks after the edit get a new 300 seconds. The quick burned-in subtitle check gets the time they leave, see
 "Burned-in subtitles". Every error is logged, and the import never sees one.
 
@@ -766,7 +841,8 @@ metadata checks after the edit get a new 300 seconds. The quick burned-in subtit
 Reads take it shared. An edit, a re-grab and a conversion's swap take it exclusive. Every taker
 first passes `lock.gate`, so a waiting edit stops new readers and waits only for the reads in
 flight. Linux flock gives a waiting exclusive lock no preference, so without the gate a scan could
-keep an edit out. flock cannot upgrade a lock, so a job that takes it exclusive checks the file's
+keep an edit out. A taker lets the lock go before it passes the gate, so no taker waits at the gate with the lock held.
+flock cannot upgrade a lock, so a job that takes it exclusive checks the file's
 inode, size, mtime and the re-grab unit of its download again, and runs again when one changed. Hearing holds no
 lock, because it may wait for a turn at the model. A conversion in a job process builds the new file under the shared lock,
 as a backfill worker does, so the other jobs keep checking and converting. The rest of that job runs under the
@@ -1222,8 +1298,9 @@ under the exclusive lock, and a flag edit could follow a remux in the same run.
 Every video file that is not Matroska becomes `<base>.mkv`, and so does a `.mkv` file that holds
 another container. `--backfill <app> --convert` converts the library. The hook converts an import
 only with `CONVERT=true`, except a `.mkv` file with another container, which always converts. The
-log calls a conversion a repack. A conversion keeps no original, except a forced one and one of
-`--check`. A conversion of `--check` also keeps the sidecars that the new file holds, in the stamp folder of the
+log calls a conversion a repack. A conversion keeps no original, except a forced one, one that leaves out a
+track that does not match, and one of `--check`.
+A conversion of `--check` also keeps the sidecars that the new file holds, in the stamp folder of the
 original. It proves every stream first,
 and the app must list the new file before the original goes. A `--check` run on a file no app lists
 asks no app. It writes the new file beside the original, which stays with its sidecars. An `.mkv` file
@@ -1242,17 +1319,32 @@ that holds another container converts under its own name, so its original goes t
 - a conversion of `--check` with no place to keep the original. A dry run of `--check` and a file
   no app lists never go on the list.
 
+**Refusals before the remux.** An MP4 VobSub track with no picture size, a width or a height of 0 in its track header,
+fails the conversion before the remux, in a dry run too, see `convert.vobsub_unsized()`. mkvmerge writes the size of the
+MP4 track header into the VobSub header of the MKV, and ffmpeg opens no decoder for such a size. An apply posts the
+alert of the failed conversion, and a dry run posts none. The original stays. A VobSub track with a size goes to the
+remux. mkvmerge 102 sets the stop time of each VobSub cue from the length of its MP4 sample. With a gap after a cue,
+ffmpeg's MP4 muxer writes a sample that lasts until the next cue. Each such cue of the MKV would show until the next
+one, and the proof refuses. Cues back to back convert. A made-up track whose muxer fills each gap with an empty sample
+converts too, the shape that libhb/muxavformat.c writes. No HandBrake file was measured.
+
 **The remux.** A `.srt` beside the video that starts with its base name is muxed in, with its
 language, forced and hearing-impaired flags from the name. Its text can overrule the name's language,
 and a name with no language takes the text's. A sidecar in a legacy codepage goes in decoded right.
 A sidecar whose charset is unknown stays beside the file as it is, see "Subtitle text". AMG reads the cues of a
 sidecar as mkvmerge 102 reads them, see `decide.srt_read()`. mkvmerge writes no cue with empty text, and the proof leaves
 such a cue out too. mkvmerge reads some sidecars otherwise than a player shows them, see `proof.misread()`. It may not
-identify the file as SubRip, see `decide.srt_probe()`, and then the remux fails. It stops reading at a number line that
-no timing line follows. It reads a number and a timing line after a text line with no blank line as text of the cue
-before, where a player shows a cue of its own. It drops a cue with text of length 0 and a cue that ends before it
-starts. Such a sidecar stays beside the new file byte for byte. `repack.sidecars_left` says why, as "Movie.es.srt:
-mkvmerge drops 2 of its cues", and the "Subtitles left out of the MKV" notice names it, see "Unreadable subtitles".
+identify the file as SubRip, see `decide.srt_probe()`, and then the remux fails. mkvmerge identifies a sidecar named
+`.srt` that holds ASS or SSA text as SSA, see `decide.ass_text()`. The conversion leaves it out with the reason "it
+holds ASS or SSA text under a .srt name", also when AMG can't tell its charset. mkvmerge also stops reading at a
+number line that no timing line follows. It reads a number and a timing line after a text line with no blank line as
+text of the cue before, where a player shows a cue of its own. It drops a cue with text that ends before it starts,
+which ffmpeg and mpv show up to the next cue. It also drops a cue of length 0, which no player shows. mpv 0.40 showed
+the same cues from such a sidecar and from the new MKV. So a cue of length 0 counts as no cue, in `misread()` and in
+the sidecar proof, and the conversion muxes such a sidecar.
+A sidecar that mkvmerge misreads stays beside the new file byte for byte. `repack.sidecars_left` says why, as
+"Movie.es.srt: mkvmerge drops 1 of its cues", and the "Subtitles left out of the MKV" notice names it, see
+"Unreadable subtitles".
 The proof still refuses a stop and a dropped cue, as a guard. A sidecar that ends past the video, or
 has cues out of order, is timed for another cut and stays beside the file. `repack.sidecars_left` names each sidecar
 that stays and why. `mkvmerge
@@ -1329,6 +1421,22 @@ toward 0 in whole milliseconds (`proof.start_plan()`). mkvmerge drops a frame it
 never rounds past the gap, and the video lands up to 1 ms later than ffmpeg plays it. The decision line names the
 move in `start_sync` with its rule. The proof expects that exact move and refuses any other. A tester's film read
 "stream audio 1 starts -0.083 s from the video in the new file, +0.000 s in the original" in 2.18.5.
+
+**Kept audio times.** mkvmerge 102 times an audio frame on its own where its time is not later than the time of the
+frame before it. It times that frame one frame after the frame before, and plays the rest of the track on. An MP4 can
+store two AAC samples at one time, or three for an iTunes priming run, and a ctts can step back. A TS PES can take the
+PTS of the next one. mpv plays each audio frame at its stored time. So such a copy plays the audio late. At 32 kHz
+it plays 32 ms late to the end, and after a step back of 150 ms it plays 150 ms late. So `kept_times()` gives each such track a v4 timestamps
+file (`--timestamps`) of the times the reader gives, see "Time reads". Each line holds the time of a frame with data,
+in file order, less the file start. The file start is the earliest time of the tracks the remux keeps, which mkvmerge
+moves to 0. For an MP4 it is `start_shift()`, with each video track before ffmpeg's start rule. For a TS it is the
+earliest time of a kept PID. mkvmerge writes each line as it stands. It adds no input start and no `--sync`, so a line
+holds in the input of the other tracks of a split too. The proof then pairs each frame with its stored time within
+the slack. A PCM track, a track with an empty frame or a time that is not known, a read that fails and a start that
+is not known get no file. So does a track with a cut sample after an empty edit, because mkvmerge drops that sample
+and the lines would then not pair with its frames. Those tracks keep mkvmerge's timing, and the proof decides. The
+decision line names each track with a file in `repack.kept_times`. Of 441 MP4 and QuickTime files of a measured
+library, 8 hold such a track, each an iTunes priming run of three samples at one time.
 
 **Blu-ray TrueHD.** A Blu-ray TrueHD PID carries an AC-3 core in PES of its own. ffmpeg names the core as a second
 stream of the PID, also when the PID holds no core PES. mkvmerge 102 writes the core as an AC-3 track after the TrueHD
@@ -1419,33 +1527,27 @@ this rule refuses it. After other lost packets, the kept audio keeps the start c
 where the container keeps them. The proof entry names each lost packet in
 `dropped_start` or `dropped_end`, with its time, size and kind, `lead` for a short lead.
 
-Three more differences pass, each with its own check:
+Two more differences pass, each with its own check:
 
 - An HEVC codec header can hold units that mkvmerge copies into packet 0, such as an SEI. The proof
   filter takes out only the parameter sets. When only packet 0 differs, one packet of each file is
   read. It passes when the new packet 0 holds the original's and units of the header, byte for byte.
   The entry names them in `header_units`.
   mkvmerge also puts the entry point of a VC-1 header in front of packet 0, and the same check passes it.
-- An audio packet may share its time with a neighbour in the original, in any container. The
-  measured case is an MP4 whose first two AAC packets carry one time, which mkvmerge spaces one
-  frame apart. When the time check of an audio stream fails, each time is measured against the
-  video's start. A packet that shares its time may move one frame, and every other packet the slack. Between two
-  Matroska files one frame is the length the original defines, see "Frame times", and for another source the
-  median step of the stream. Video never gets this rule. The entry names it in `times.shared`. Between two Matroska
-  files such a packet may also go on with a chain past an overlap, see "Overlapping blocks".
+  From an MP4 or MOV, mkvmerge puts the whole codec header of MPEG-4 part 2 in front of packet 0, also
+  when packet 0 holds it already. It passes when the new packet 0 is that header and then the
+  original's packet 0, byte for byte. From Matroska and AVI, mkvmerge keeps packet 0 as it is.
 - An MP4 timed-text cue can start and end at one time, beside another cue at that start. mkvmerge
   gives it a length. It passes when it keeps its start and text and ends at or before the next
   cue. The entry names it in `zero_length`.
 
 Any other lost packet fails, and the file keeps its original.
 
-**Known limitation: AAC priming with no edit list.** Some MP4 files, such as one iTunes purchase,
-store the AAC encoder priming as leading packets of zero length, and have no edit list. mkvmerge
-spaces those packets one frame apart and writes no codec delay. Every later audio packet then lands
-two frames (about 44 ms) late, and a player that follows timestamps plays the audio that far behind
-the video. The shared-time rule above allows one frame, so the proof refuses the conversion, and the
-file stays MP4. The alert says the MKV would play the audio 44 ms out of sync with the video, from
-the start to the end. Do not force it, because the forced file keeps the shift.
+**AAC priming with no edit list.** Some MP4 files, such as one iTunes purchase, store the AAC encoder priming as
+leading packets of zero length, and have no edit list. Their first three packets then share one time. mkvmerge 102
+spaces them one frame apart and plays every later packet on, two frames (about 44 ms) late. Up to 2.18.8 the proof
+refused such a conversion, and the file stayed MP4. Now the conversion keeps each stored time, see "Kept audio
+times", and the copy plays as the original.
 
 **Force a conversion.** Some refusals are safe, and only a person can tell. One example is an MP4
 whose edit list hides the last frames of a still picture, which mkvmerge keeps. `--backfill <app>
@@ -1647,10 +1749,11 @@ counts from a first time, which a new file with a coarser scale rounds too, so b
 scale_a) / 2 more. A lossless copy at 0.1 ms into 1 ms moved 30 of 144 B-frame video frames 1 ms that way. All bounds
 get 1 µs more, because times compare in whole microseconds. A source read through ffmpeg keeps 2 ms (`TIME_SLACK`).
 
-**Shared times.** Two audio packets of the original may share one time, as an MP4 gives its first two AAC packets.
-mkvmerge spaces them one frame apart. Such a packet may move one frame more. Between two Matroska files, one frame is
-the DefaultDuration, else the codec length of the first frame, else no move. For a source read through ffmpeg it is
-the median step of the original.
+**Shared times.** Two audio frames of the original may share one time, as an MP4 gives its first two AAC samples.
+Each keeps that time within the slack, as any frame does. mpv plays each audio frame at its stored time. A copy that
+spaces the two one frame apart played the audio 2 to 22 ms off at the first picture, and at 32 kHz 32 ms late to the
+end. So a conversion keeps such times, see "Kept audio times" under "Conversion". Up to 2.18.8 such a frame could move
+one frame.
 
 **Overlapping blocks.** The walk counts, for each audio track, the blocks that start more than one tick before the end
 of the block before them, and the ones that start more than a tick after it. A measured film release stores a DTS
@@ -1659,20 +1762,27 @@ claim the same moment. mkvmerge 102 plays the audio on instead: each frame one f
 gap brings the stored time back. In its copy 400,866 frames sit up to 150 ms later than the original defines them,
 and 308,041 keep their time.
 
-The proof lets an audio frame of two Matroska files move later in one case only: the new file plays on in whole
-frames from the last frame that kept its time, past a block of the original that overlaps the block before it. Its
-new time is that frame's new time plus one frame for each frame between, within the slack. One frame is the
-DefaultDuration, else the codec's frame length. The walk keeps the time of each overlapping block, and the chain must
-hold one after the frame that kept its time. So a slow drift refuses, because its original has no overlap. A frame
-that shares its time with a neighbour and moves more than the slack may go on with the chain by the same rule. When
-it does not, it may move one frame and counts as a frame that kept its time. The move
-may reach 0.2 s (`proof.OVERLAP_MOVE`). A larger move refuses. With an original that holds 2 s of its audio twice,
+The frames of a lace take their times from the block time and their lengths, see "The tags". In that release the
+laces overlap the next block and leave gaps of the same size, so its block times step back and forth. Two parts that
+mkvmerge joined into one file hold one overlap of 34 ms after a lace and no gap. mpv played a copy that closes it 31
+to 34 ms late from the join to the end. The Plex simulation played both the same. A made-up copy that closes an
+overlap of unlaced blocks played the audio late by the move in mpv, 22 ms after a 21 ms overlap and 150 ms after a
+150 ms one. So a plan closes an overlap only after a lace, and only up to a later gap of the original, see "Planned
+audio times". The proof lets an audio frame of two Matroska files move later in one case only: the new file plays on
+in whole frames from the last frame that kept its time, past a block of the original that overlaps the lace before it. Its new time
+is that frame's new time plus one frame for each frame between, within the slack. One frame is the DefaultDuration,
+else the codec's frame length. The walk keeps the time of each block that overlaps a lace (`lapped`), and the chain
+must hold one after the frame that kept its time. So a slow drift refuses, because its original has no overlap. A
+frame that shares its time with the last frame of a lace starts such a block, so it may start a chain too. The move
+may reach 0.2 s (`proof.CLOSE_MOVE`). A larger move refuses. With an original that holds 2 s of its audio twice,
 the new file would play the rest 2 s late. An earlier move refuses, so a gap of the original never closes. A later move that is not one
 such chain refuses too. The proof entry counts the frames that moved so in `times.contiguous`, with the worst move
 and the first time. The reason is the picture. In mpv the original played the audio 51 to 74 ms early against the
 picture of the release, 151 ms at worst, and mkvmerge's copy 0 to 18 ms early. That measurement covered moves up to
-150 ms. VLC ignores the stored block times and showed no change. Any other move past the slack refuses, and the
-refusal names the count of moved frames, the worst move, the first time and the original's overlapping blocks.
+150 ms. VLC ignores the stored block times and showed no change. Of that release's 6,767 overlaps, 6,685 follow a
+lace, and the plan plays 528,371 frames on. The 82 after a one-frame block keep their times. Any other move past the
+slack refuses, and the refusal names the count of moved frames, the worst move, the first time and the original's
+overlapping blocks. Up to 2.18.8 the proof passed a move after any overlap up to 0.2 s.
 
 **Planned audio times.** mkvmerge 102 times some audio frames on its own. Where a frame's time is not later than the
 time before it, as at an overlap of the blocks, it plays the audio on by any amount. An episode with a 2475 ms overlap
@@ -1680,7 +1790,8 @@ to its end would play its last 24 s that much late. A lace with no DefaultDurati
 other frames. For MP2 and MP3 it writes wrong ones (0, 26, 0, 26 ms), up to 144 ms off (`LACE_RETIMED`). It also times
 Vorbis from ffmpeg again, up to 2 ms off (`RETIMED`). So a remux of a Matroska source plans the frame times of some
 audio tracks (`remux.planned_times()`). A track gets a plan when it holds an overlapping block, a bitstream time of
-MP2 or MP3, or a codec in `RETIMED`. mkvmerge gets the plan in a
+MP2 or MP3, or a codec in `RETIMED`. A plan closes only an overlap after a lace, see "Overlapping blocks", and keeps
+every other overlap as the original stores it. mkvmerge gets the plan in a
 v4 timestamps file (`--timestamps`). It keeps each time in the order of the file's lines and rounds it to its
 TimestampScale. The subtitle remux, the header repair and the conversion of a Matroska source, such as a WebM, write
 the plan. mkvmerge keeps the stored and default times of every other track. AAC, AC-3, E-AC-3, DTS with a
@@ -1688,16 +1799,16 @@ DefaultDuration, FLAC and Opus from ffmpeg measured the same. So did the lace fr
 with no DefaultDuration, which hold bitstream times. It times TrueHD up to 1 ms off, within the slack, and both times
 are right, see "The slack" under "Frame times".
 
-Each frame keeps its stored, default or bitstream time. Past a block that starts before the block before it ends,
-the frames play on. Each one then starts one frame after the one before it, until the original's own time comes back.
-The move may reach `CLOSE_MOVE` less half a millisecond. `CLOSE_MOVE` is the move the proof accepts (`OVERLAP_MOVE`,
-0.2 s). The new file rounds each planned time to the millisecond, so a move closer to 0.2 s could round past it. A
+Each frame keeps its stored, default or bitstream time. Past a block that starts before the end of the lace before
+it, the frames play on. Each one then starts one frame after the one before it, until a later gap of the original
+brings its own time back. A run that no gap ends keeps the stored time of each of its frames. That is a run to the end
+of the track, and one that reaches the cap below. The joined parts above give such a run. The move may reach `CLOSE_MOVE` less half a millisecond. `CLOSE_MOVE` is also the move the proof accepts (0.2
+s). The new file rounds each planned time to the millisecond, so a move closer to 0.2 s could round past it. A
 larger overlap keeps every stored time, so the new file holds it as the original does. A move within the rounding of
 the two files (`mkv_slack()` plus half a millisecond) stays. The proof counts it as a frame that kept its time, and
 the frames after it would then follow no overlap and refuse. A frame that shares its time with the frame before it
-plays on as any frame does. So a plan steps back in time only where it keeps an overlap that a move of `CLOSE_MOVE`
-does not close. With `OVERLAP_MOVE` at 0, every frame keeps its time. With `CLOSE_MOVE` at infinity, every overlap
-closes as mkvmerge closes it on its own, and the proof refuses a move past 0.2 s.
+plays on as any frame does. So a plan steps back in time only where it keeps an overlap. That is an overlap after a
+one-frame block, or one whose run no gap ends. With `CLOSE_MOVE` at 0, every frame keeps its time.
 
 `remux.planned_args()` checks each plan with the proof's time check (`times_fault()`). The check rounds each planned
 time half up to the tick of the new file, as mkvmerge rounds it. That tick is 1 ms where a video track stays. mkvmerge
@@ -1726,10 +1837,10 @@ s and mkvpropedit 0.15 s.
 
 A track gets no plan when a frame's time is not known, as for the first lace of a Vorbis track with no
 DefaultDuration. It gets none either when a frame holds no data, or when it is PCM, which mkvmerge cuts into other frames. A header repair that
-laces audio again writes no plan, because a lace stores the time of its first frame only. Those tracks keep mkvmerge's
-timing, and the proof decides as before.
+laces audio again writes no plan, because a lace stores the time of its first frame only. It laces again only when no
+audio track holds an overlapping block. Those tracks keep mkvmerge's timing, and the proof decides as before.
 
-A measured film stores 6,767 DTS blocks that overlap the block before them. The plan plays 529,257 of its frames on,
+A measured film stores 6,767 DTS blocks that overlap the block before them. The plan plays 528,371 of its frames on,
 up to 150.3 ms, with the frames that share a time with the frame before them. mkvmerge's own copy played 400,827 on. On that DTS track mkvmerge returns to the stored time at the
 next block that starts after the block before it ends. It does so by any amount, so the rest of the overlap stays
 there. On unlaced AAC it plays on until the stored time comes back, as the plan does.
@@ -1833,9 +1944,17 @@ reason in review. `ff.py` allows only what it knows. Anything else raises `TimeR
   `ctypes`, `_posixsubprocess` or `multiprocessing` in the package, and the name `ProcessPoolExecutor`, because
   Python 3.13 raises no event for a multiprocessing child.
 
-Whisper's word times and the speech spans count the samples of raw PCM from the `-ss` start, and `lid.start_delay()`
-moves them by the stream start, a named read. volumedetect's `n_samples` counts decoded samples, and a use names it
-as a count. Error and warning lines, as "Non-monotonic DTS", are no channel.
+Each audio decode whose times meet the cues, the onsets or the video goes through `ff.clock()`. These are
+`lid.extract()` for the word windows and the burn-in windows, `lid.speech()` for the speech spans, and
+`subtitles.onsets()`. Its `aformat` first mixes the track to mono 16 kHz s16 in one swresample, with the matrix of
+`-ac 1`. Then its `aresample` puts each frame at its time from the start of the read, the file's start or the `-ss`
+time, a named read. It fills a late start and a gap of 0.1 seconds or more with silence. So the samples count on the
+file's clock, and a fill costs 32 kB a second. A fill before the mix cost the channel count times the input rate in
+floats. A made-up 5.1 track with a gap of 30 minutes took 2.3 GB, and a damaged film with gaps of up to 31 minutes
+took 1965 MB. A float `aformat` mixes 5.1 with another matrix than `-ac 1`, so the mix is s16. A healthy track then decodes
+sample for sample as `-ac 1 -ar 16000` alone. volumedetect's `n_samples` counts decoded samples, and a use names it as a count.
+`checks.sample()` and `checks.full_decode()` read that count with no fill, because a fill would hide the loss they
+find. Error and warning lines, as "Non-monotonic DTS", are no channel.
 
 Each refusal writes one line to `STATE_DIR/ff-faults.jsonl`, because many callers catch every exception. `config.py`
 names the file at load, so each entry has it: the hook, the worker, the subtitle hunter and the listener. Every child
@@ -1987,7 +2106,10 @@ When any audio track holds estimates, the remux runs without `--disable-lacing`,
 laces as it did before ffmpeg's copy. So each lace starts at a frame whose stored time is true, within half a
 millisecond of the sample clock. The record names those streams in `relaced`, and the dry run's result names them too.
 When an audio track starts before the first video keyframe, the estimates stay. A seek to 0 then never loses more audio
-than the file does now, and `relace_skipped` says why.
+than the file does now, and `relace_skipped` says why. When an audio track holds a block that starts before the block
+before it ends (`remux.overlapped()`), the estimates stay too, and `relace_skipped` says so. A relace gives mkvmerge no
+plan, so mkvmerge would play that overlap on. A made-up copy with an overlap of 30 ms after a one-frame block moved 335
+of 939 frames up to 31 ms. With `--disable-lacing` its plan keeps every stored time, see "Planned audio times".
 Each video block stores its keyframe flag. A SimpleBlock holds it in its flags, and a BlockGroup with no
 ReferenceBlock is a keyframe. Each start counts the track's CodecDelay, as a player plays each block at its time less
 that delay (RFC 9559).
@@ -2453,6 +2575,18 @@ a word to match.
   Hindi, Tamil, Telugu, Georgian and Armenian text gets the language of its script. Latin and Cyrillic
   text goes to the lists. Serbian and Macedonian share most Russian stopwords, so one of their own
   letters (ј, љ, њ, ћ, ђ, џ, ѓ, ќ, ѕ) rules out Russian and Ukrainian.
+- The OCR of a picture subtitle can write some letters of English text as Cyrillic or Greek letters that look the
+  same in a subtitle font (`decide.LOOKALIKES`). A real track held them in 18 percent of its letters: every e, c and
+  x, most y, and the capitals A, B, C, E, H, M, O, P and T. When every Cyrillic and Greek letter of a track has a
+  Latin look-alike, each reader of its cue words takes those letters as Latin (`latin_lookalikes()`). The readers are
+  the text read, the text gate of a removal (`subtitles.tag_read()`), the word check (`subsync.flat()`) and the
+  whole-file timing (`align.anchors()`). The rule judges every cue of the track, so one letter with no look-alike
+  anywhere keeps all letters as they are. Real Russian, Ukrainian and Greek text holds such letters, as и, л, я, λ
+  and π, so it never changes. The text read takes the cues as they are until one holds a look-alike letter before any
+  real letter (`real_letter()`). Only then does it read the rest of its cues, so a plain or a Russian track costs no
+  more reads. The read of an import takes at most `TEXT_CUES` blocks, so it judges those. A Greek text written only
+  in capitals that look like Latin letters (Α, Ε, Η, Ι, Κ, Μ, Ν, Ο, Τ, Υ, Χ) folds, so it reads as no language. A real
+  Greek track holds Σ, Λ, Π or a lower-case letter in its first cues. The text of the track never changes.
 - Chinese text must also hold common Chinese characters (`HAN_COMMON`), 20 percent of its Han
   characters at least. Dialogue holds far more. The bytes of another codepage decoded as Chinese give
   rare characters.
@@ -2652,7 +2786,10 @@ original in `kept`, and `later` when its times or words wait for the next run.
 AMG keeps the bytes of subtitles it takes out because no player reads them right in one file beside the video. Three
 callers use one path, `remux.broken_plan()`, `keep_broken()` and `drop_broken()`: a conversion that removes a broken
 MP4 timed-text track, see "Conversion", a subtitle remux that removes a garbled track or a SubRip track with bytes
-that are not UTF-8, and the move of a garbled sidecar, see "Garbled subtitle repair".
+that are not UTF-8, and the move of a garbled sidecar, see "Garbled subtitle repair". A subtitle remux that removes a
+text track that does not match the audio keeps its bytes the same way, under its own name, see "Actions" in
+"Subtitle match". So do a conversion that leaves out such an MP4 timed-text track, and the rename of a sidecar that
+does not match.
 
 **The name.** The file is `<name>.<language>.broken-encoding.<format>.txt`, as `Film (2001).per.broken-encoding.srt.txt`.
 The language is the track's tag, or the language part of a sidecar's name. A track with no tag has no language part.
@@ -2662,24 +2799,30 @@ the file, and Radarr may rename it with its own language part when it renames th
 `.srt` files only. AMG never writes over a file. A file with the same bytes stays, as when the
 same release converts again or Bazarr fetches the same sidecar again. When a file of other bytes holds the name, or
 two entries share the language part and the format, the name takes a number in front of `.broken-encoding`: the
-track's number, as `Film (2001).per.3.broken-encoding.srt.txt`, or 1 and up for a sidecar. No two entries take one
-name. A dry run names each file before the bytes are read, so a name a file holds counts as taken there. A subtitle
-remux plans the same way before its remux. A garbled track whose names all hold files stays in the file then, and the
-alert says why. The remux makes its other fixes.
+track's number, as `Film (2001).per.3.broken-encoding.srt.txt`, or 1 and up for a sidecar. The file of a track that
+does not match ends in `.mismatch.<format>.txt` in place of `.broken-encoding.<format>.txt`, as
+`Film (2001).eng.mismatch.srt.txt`, and numbers the same way. No two entries take one
+name. A dry run names each file before the bytes are read, so a name a file holds counts as taken there. So does a
+name that another plan of the run gave, as a track's text and a sidecar of one language, so a dry run names one file
+once, as an apply does. A subtitle
+remux plans the same way before its remux. A garbled track, or a track that does not match, whose names all hold files
+stays in the file then, and the alert says why. The remux makes its other fixes.
 
 **The write.** `keep_broken()` writes the file with the owner and mode of the file it came from, see `own_like()`, and
 reads it back. It creates the file with that mode, as `new_tmp()` does, so a share that refuses chmod keeps it. It writes after the proof and the swap's checks, and before the rename, so a failed write keeps the
 original. When a later step fails, or an undo puts the original back, `drop_broken()` removes each file it wrote. A
 file it reused stays. The entry of each file holds `sidecar`, `reused`, `written` and `removed`, and the decision line
-keeps them. A subtitle remux names each file in `subremux.garbled_text`, and a failed one the files it removed again
-in `subremux.garbled_text_removed`.
+keeps them. A subtitle remux names each file in `subremux.garbled_text`, or `subremux.mismatch_text` for a track
+that does not match, and a failed one the files it removed again in `subremux.garbled_text_removed`.
 
 **The notice.** `report.unreadable_finding()` builds the one alert, "Unreadable subtitles". It names each track as
 track N of the original file and each sidecar by its name, with the file that holds its bytes. A sidecar that a
-conversion left beside the video as it is goes by its name alone, see "Conversion". Its charset is unknown, or mkvmerge
-reads it otherwise than a player shows it, and its own file still holds its bytes. Several such sidecars share one
-pair of sentences, and then a sentence per reason names them. When AMG reads each sidecar of the alert well, and
-mkvmerge misreads it, the title is "Subtitles left out of the MKV". The alert marker keys on the kind
+conversion left beside the video as it is goes by its name alone, see "Conversion". Its charset is unknown, mkvmerge
+reads it otherwise than a player shows it, or it holds ASS or SSA text under a .srt name. Its own file still holds its
+bytes. Several such sidecars share one pair of sentences, and then a sentence per reason names them. `decide.KEPT_OUT`
+holds one row per reason: the words of its decision line and its sentences in the notice. When AMG reads
+each sidecar of the alert well, and mkvmerge misreads it, the title is "Subtitles left out of the MKV". The alert marker
+keys on the kind
 `unreadable`, see `logs.alert()`. A conversion's alert
 starts with the conversion. A run posts one such alert, and it also says each repair of the run, see
 `subtitles.sub_findings()`. When a run converts the file and then takes out garbled tracks or renames sidecars, the
@@ -2696,7 +2839,8 @@ text subtitle against the audio. The owner's rule is "rather no subtitle than a 
 **What it checks.** A SubRip, ASS, SSA, WebVTT or MP4 timed-text track in a full, SDH or dub role, a `.srt` sidecar in a
 conversion, and a `.srt` sidecar beside a Matroska file, where a program such as Bazarr writes its downloads. Its language must be the
 language of a main audio track. The check hears the track that plays when it speaks that language, else the first main
-track that does. A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
+track that does. A mismatch then hears the other audio tracks in its language, see "A subtitle of another audio
+track". A forced, commentary or picture track, a forced sidecar, a track in another language and a file under
 5 minutes are never checked. Nor is Japanese, Chinese or Thai text, which has no spaces between its words, so the
 check could never give a verdict. The check of a conversion takes the duration ffprobe reads, because mkvmerge gives an
 MP4 none. So a file with no such track or sidecar costs nothing. The check runs on imports and in
@@ -2768,7 +2912,11 @@ later window can sit where the track holds no cue, as in a song or a scene the s
 only later windows show is unknown, and the track stays.
 
 The language check and the subtitle check share their work. The language check keeps its samples for an hour when the
-file has a text subtitle, and a window inside a kept sample is cut from it, so no audio is decoded twice. When the
+file has a text subtitle, and a window inside a kept sample is cut from it, so no audio is decoded twice. Each window
+and each sample decodes on the file's clock (`ff.clock()`, see "Time reads"). A window that starts inside a late start
+or a gap hears silence there, so its word times match the cues. Before, such a window started at the first packet
+after its start, and its words read early by up to the delay. The words and the kept samples cached before read
+again once, because their keys name the clock. When the
 language check runs on a file, it runs the subtitle check's hearings after its own, in the same process, with the model
 it loaded. The hook's own check then finds those words in the cache.
 
@@ -2799,6 +2947,37 @@ unknown:
 A mismatch held this way stays in the decision record as unknown, with the reason. It gets no alert, no flag change
 and no removal, because no one can act on it. A match and a timing fix still count, and the dub's own transcript, the
 "Dubtitle" track, still matches. The same rule holds for sidecars and in a conversion.
+
+**A subtitle of another audio track.** A file can hold more than one audio track in the subtitle's language: a
+commentary, or a second main track with its own words. A subtitle of that track can have no title and no commentary
+flag, so it reads as a full subtitle, and the check compares it with the main track. On real files such a track did
+not match and left the file: an untitled commentary subtitle beside a titled commentary audio, and a subtitle of the
+second of two untitled main tracks. So before a mismatch counts, every other audio track in the subtitle's language
+hears the same windows as the first hearing, with the same 24-second window for a window that hears too little
+(`subtitles.sub_others()`). The language is the one the decision gives the track: its tag, else a language its title
+or its hearing names. So an untagged track titled "English Commentary" hears, and an untagged track with neither
+never hears. One hearing serves every mismatch of that language. A match on any of them makes
+the mismatch unknown: the track stays with no change and no alert, as a translation does. When that hearing gives no
+answer, as when no time is left or a stop was asked, the mismatch is unknown too, and the track stays. No hearing
+starts after a stop. The decision record logs each such hearing in `others`, with its verdict, its windows and
+what it cost (`took`, `cpu`, `cached`, `waited`). A mismatch that no other track matches counts. The rule runs
+after the translation rule, so a mismatch that rule holds pays for no hearing. It holds for sidecars and in a
+conversion too.
+
+**Speech in another language.** A right subtitle also translates speech in another language than its own, as in a film
+with scenes in Arabic. Whisper, told the subtitle's language, hears few of its words there, so such a window reads as
+a mismatch. A right English track of a film with Arabic scenes left the file that way. So before a mismatch counts,
+one lid.py run names the spoken language of each window that counted (`subtitles.sub_spoken()`, `lid.tongues()`,
+`--langs`). Each window needs 4 seconds of speech (`lid.WINDOW_SPEECH`), and a read under 0.6 names no language, as
+for a sample. A window whose speech reads as another language than the subtitle's does not count. With under two
+windows left, the mismatch is unknown: the track stays with no change and no alert. So is a mismatch whose read gives
+no answer, as with no time left or a stop, as for the hearing of another audio track. Each window logs its read as
+`lang` and `prob` in the decision line. The read runs on mismatches only, before the hearing of the other audio
+tracks. A window in another language stays out of that hearing and its check (`subtitles.sub_others()`), so it pays
+for no other hearing and never turns a match there into unknown. Nothing is cached. On 96 real English word-check
+windows of 10 seconds, 17 held under 8 seconds of speech and none under 4, and every one read as English (one at 0.47
+named none). On 84 windows with 4 seconds of speech of 12 episodes in 9 other languages, 80 read the track's language,
+3 named none and 1 read English.
 
 **Timing.** For a match, the check compares each cue start with the first heard word of the cue. Each window's median
 gives a point, and the line through the first and the last point says where the cues sit at the file's start and end.
@@ -2887,6 +3066,32 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   extracted text, the files of single tracks and the proof's reads, go into a folder under `STATE_DIR`, never the
   system temp dir, which is often a small tmpfs. The trim, the damage read, the conversion and the video windows keep
   their work files there too. A worker that starts removes a work folder that a killed step left over a day ago.
+- A track that does not match leaves only when its text reads as its tag. On real files an English-tagged track that
+  held Dutch text, and a right English track in Cyrillic look-alike letters, did not match and left. Such letters
+  now read as Latin, see "Subtitle text". So the check
+  first reads the text of each such track: `decide.text_language()` of its first 200 cues, the blocks
+  `subtitle_read()` reads, from the cues the word check read already (`subtitles.tag_read()`). The decision record
+  logs the read in `text`. A track whose read names another language, or none, stays in the file with its flags off,
+  as with `KEEP_ORIGINALS_DAYS` 0 below, and the alert says that its text doesn't clearly read as its language. The
+  alert says "Turned off their default and forced flags." only when AMG turned one off: the run, or for a deep analysis
+  also its import, whose held alert keeps those tracks in `flags`. A track that had neither flag on gets no sentence on
+  its flags.
+  `subremux.kept_for` names it with `text`. `text_language()` never names a language with no word list, such as
+  Finnish or Hungarian (owner 2026-10-25). A track with such a tag leaves when its read names no language, and stays
+  when its read names another one, as Dutch text tagged Finnish does. On a census of 300 files, 1,884 of 1,982 text
+  tracks in a word-check role may leave on a mismatch this way, and Dutch (16 of 55), Danish (13 of 54) and
+  Norwegian (8 of 29) keep the most. A text too short to judge gives no sign, so its track stays. A picture track has
+  no text to read, so it stays too. In a conversion such a built-in track stays in the new file, and the check of
+  the new file turns its flags off.
+- A text track that leaves has its bytes written beside the video as `<name>.<language>.mismatch.<format>.txt`,
+  through the path of "Unreadable subtitles". So its text outlives the kept original. `subremux.saved` names each
+  file by the track's place, and the alert names it. When every name for it holds a file, the track stays with its
+  flags off, and `kept_for` names it with `names`. A conversion that leaves out an MP4 timed-text track writes its
+  text beside the new file the same way (`convert.mismatch_texts()`). It reads the bytes of each sample, and the
+  times move by the start shift of the new file. Another text track, one whose bytes do not read and one whose names
+  all hold files stay in the conversion, and the check of the new file takes them out with their bytes or turns their
+  flags off. No picture track leaves for a mismatch: the word check reads text tracks only, and the text gate keeps
+  a track with no text. So no file is ever written for one.
 - One mkvmerge call writes the remux, as in the header repair. Up to 2.17.0 ffmpeg wrote it, with each rewritten track
   as an input of its own. Beside a sparse copied track, such as a forced track of three cues, ffmpeg held that input
   back for minutes. Its packets then sat far from their times in the file, and players never showed them. mkvmerge
@@ -2955,21 +3160,27 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
   becomes a default. It loses its default and forced flags with mkvpropedit (`subtitle_audio_mismatch`), and the alert
   says why it stayed. A retime of another track in the same file keeps that. `SUBTITLES=check` keeps the times, the
   tracks, the sidecars and the flags, and alerts.
-- A sidecar beside a Matroska file that does not match moves into `.<NAME>-originals` as a kept original, with a log line and
-  the alert. A sidecar whose times need a fix is written again with new times, and its original is kept the same way.
+- A sidecar beside a Matroska file that does not match gets the name `<base>.<lang>.mismatch.srt.txt` beside the
+  video, with a log line and the alert (`subtitles.side_rename()`). It takes the path of a garbled sidecar's rename,
+  so its bytes stay and players skip it. When every name, numbered 1 to 99, holds a file, it moves into
+  `.<NAME>-originals` as a kept original. The rename runs only where the move would.
+  A sidecar whose times need a fix is written again with new times, and its original is kept the same way.
   Only its time lines change. Every other byte stays, so its text keeps its character set, even one the detection
   misses (`subtitles.raw_srt()`). With `KEEP_ORIGINALS_DAYS` 0 the sidecar stays as it is and alerts. A sidecar with
   a timing line that AMG reads as text of the cue before, with text of its own after it, stays as it is and alerts, see
   `proof.glued_cue()`. A player shows that text as a cue of its own, and a rewrite would keep its old time. The program
   that wrote it, such as Bazarr, can download the same wrong file again, and the hook does not tell it. A later check
-  moves it again.
-- In a conversion, a sidecar that does not match is not muxed. It moves into `.<NAME>-originals`, and with
-  `KEEP_ORIGINALS_DAYS` 0 it stays beside the file. A built-in track that does not match is left out of the remux, and
+  renames it again.
+- In a conversion, a sidecar that does not match is not muxed. It gets the same name, or with every name taken moves
+  into `.<NAME>-originals`, and with `KEEP_ORIGINALS_DAYS` 0 it stays beside the file.
+  A built-in track that does not match is left out of the remux, and
   the proof leaves it out too. The conversion then keeps the original in `.<NAME>-originals`, as a forced conversion does, and
   the alert names it. With `KEEP_ORIGINALS_DAYS` 0, or no place to keep it, the track stays in, and the check of the new
   file turns its flags off. A sidecar whose times need a fix is muxed with new times, and its original is kept. A
   built-in track whose times need a fix gets them after the conversion. The check of the new file reads the same
-  windows and the words carried over, so it hears nothing again.
+  windows and the words carried over, so it hears nothing again. The conversion checks a built-in track only when
+  the k-th subtitle stream of ffprobe is the k-th subtitle track of mkvmerge, see `convert.sub_streams()`. A CEA-608
+  caption stream has no mkvmerge track, so it counts in neither.
 
 **Cost.** The target is 15 CPU seconds per file with a track to check, the model load included, and nothing for a
 file without one. A third window costs one more Whisper run in the same process, only for a file whose window heard
@@ -2979,7 +3190,9 @@ window at too few cues cost one more hearing each, only when the check asks for 
 hearings after the first, so a ratio from the hearing at an offset still gets its middle window. A hearing starts only
 when 10 seconds of the check's time are left. More threads cost more CPU time than they save in wall time, so the
 check runs one thread. A failure or a timeout gives unknown and never stops the import. The check shares the job's
-time limit, 90 seconds at most.
+time limit, 90 seconds at most. A mismatch costs one more hearing for each other audio track in its language, only in
+a file that has one. Those hearings get the check's time again, 90 seconds at most within the job's time limit,
+because on a real file the first check took 70 of its 90 seconds.
 
 **Cache and backfill.** `lid.sqlite` also holds each file's saved result. It holds the version and the findings of each
 check the run made, the app, the run, and the size and mtime of its sidecars. It has a mark when it asks for an action
@@ -3164,7 +3377,9 @@ that hearing of a library would take weeks.
 
      The onsets are a second clock that does not use Whisper. `subtitles.onsets()` reads them with ffmpeg's
      silencedetect at -25 dB, where a silence of 0.3 seconds or more ends. It reads the centre channel when the track
-     has one, because the dialogue is there, and else the mono mix. Only an onset after a silence of 0.5 seconds or
+     has one, because the dialogue is there, and else the mono mix of `-ac 1`. Then `ff.clock()` fills a late start and
+     a gap with silence at the track's own rate, so an onset right after one counts. At 16 kHz about 3 percent of the
+     onsets of a healthy film came out other, so the onsets keep the rate. The `-t` of a part bounds the fill. Only an onset after a silence of 0.5 seconds or
      more counts. The offset between the two clocks is the median of onset less anchor (`align.onset_lead()`). It takes
      the anchored lines with exactly one such onset within 1 second, and needs 10 of them. A line is timed at a place
      when an onset lies within 0.15 seconds of where its speech starts there. Only lines that move over 0.3 seconds
@@ -3316,10 +3531,13 @@ audio. With `SUBTITLES=deep`, an import with a subtitle queues the deep analysis
 **The read.** `lid.speech()` reads the whole audio track that plays, once per file, with one ffmpeg at nice 19 and idle
 I/O, mono at 16 kHz. Silero VAD gives a speech probability for each frame of 32 ms, 10 minutes of audio at a time, so a
 film never sits in memory whole. A span of speech starts at a probability of 0.5 and ends under 0.35, Silero's own
-thresholds (`subsync.voiced()`). Spans less than 0.5 seconds apart join. The decode starts at the track's first packet,
-so the spans move by the delay ffprobe gives the track (`lid.start_delay()`). They then run on the file's clock, as the
-cues and the speech onsets do. Without it, the right subtitles of a file whose audio starts 1.5 seconds late seemed 1.6
-seconds late and alerted. `lid.sqlite` caches the spans by path, size, mtime, stream, those settings and the
+thresholds (`subsync.voiced()`). Spans less than 0.5 seconds apart join. The decode runs through `ff.clock()`, a mix to
+mono 16 kHz, then ffmpeg's `aresample` with `async=1:first_pts=0`. It puts each decoded frame at its time from the file's start, and it fills a late start and
+a gap in the track with silence. So the spans run on the file's clock, as the cues and the speech onsets do. Before,
+the spans moved by the start that ffprobe gives the track. ffprobe gives the file's start for a track whose first
+packet lies past its probe, as for made-up tracks 5 and 22 seconds late. The speech then read early by the delay, and
+right subtitles seemed late by it. A gap in the track moved every later span early by the gap. The cache key names
+the clock, so spans cached before read again once. `lid.sqlite` caches the spans by path, size, mtime, stream, those settings and the
 faster-whisper version, which ships the Silero model. An edit carries them to the new file. Silero VAD needs no Whisper model, so the read takes no turn at the model. It runs without the file lock, as
 the hearing does. The deep analysis asks first whether an import waits, and again after each 10 minutes of audio. When
 one waits, the read stops, caches nothing, and the job goes back to its queue.
@@ -3358,7 +3576,9 @@ cut or for another episode, lifted 0.25 at most.
 episode or version. A weak reference fit with a mismatch alerts the same way. The decision log holds each result under
 `subtime` in `layout`, with its lift, and the read under `speech`. So a soak shows how far right tracks stay from the
 bar. With `LAYOUT_ACTION` set to `remove`, a mismatch acts as one of the word check, see "Actions" in "Subtitle
-match": the track leaves the file in the one remux, and a sidecar moves into `.<NAME>-originals`.
+match": the track leaves the file in the one remux, and a sidecar gets its `.mismatch.srt.txt` name. The track leaves
+only when its text reads as its tag, from the cues the layout check read. A picture track has no text to read, so it
+stays with its flags off.
 
 **Cost.** Decoding the audio costs most: about 0.7 CPU seconds a minute of audio for a 5.1 track, and Silero VAD about
 0.25. A 45-minute episode costs about 40 CPU seconds, and a 2-hour film about 2 CPU minutes. The read reads the whole
@@ -3382,14 +3602,19 @@ this way sat a median of 0.05 seconds from the right times.
 
 The speech onsets are a second clock, as for the whole-file timing in "Subtitle match". They come from silencedetect, and the spans of
 speech from VAD. One read takes the onsets of ten parts of up to 2 minutes, one in each tenth of the file, and only when
-some subtitle has a fix. In each half of the file, at least 3 cue starts must have an onset where the fix puts them,
+some subtitle has a fix or an offset that gets no fix. In each half of the file, at least 3 cue starts must have an onset where the fix puts them,
 0.1 seconds after the start. That count must be twice the count where the cues sat, and rare by chance: a chance of
 0.001 at most. A segment of the whole-file timing also needs 20 percent of its lines. A whole track does not
 (`subsync.LAYOUT_ONSET_SHARE`), because under a music bed silencedetect marks few onsets. Verified real shifts of about
 1 second drew onsets at 9 to 19 percent of their starts in a half, at a chance of 1 in a million or less, and the share
-rule left them off. A half that confirms where the cues sat, or too few onsets, leaves the times as they are, and the
-alert says the subtitles seem late. The onsets confirmed most fixes of shifted right tracks, and no fit of another
-episode's track.
+rule left them off. A half that confirms where the cues sat, or too few onsets, leaves the times as they are. The onsets
+confirmed most fixes of shifted right tracks, and no fit of another episode's track.
+
+The onsets judge an offset that gets no fix the same way, at the ratio of the fit. When no half confirms the offset and
+a half confirms where the cues sat, the second clock puts the lines in time. Then nothing alerts, and the decision log
+holds the offset under `disagreed` in `timing`. Else the alert says the subtitles seem late. A fix that the onsets do
+not confirm follows the same rule. On a film whose speech spans read 22 seconds early, two right tracks alerted as 22
+seconds late. The onsets put the lines of one where they sat, and the other got no fix and so no onset read.
 
 Slices at different offsets keep the times. When two slices or more share an offset at least 0.5 seconds from the rest,
 the alert says the subtitles may be from another version (`subsync.stepped()`, `subsync.TIMING["move"]`), with the least and
@@ -3449,7 +3674,8 @@ partial shift and alerts. With `LAYOUT_FIX` set to `alert`, a fix only alerts. T
 and the alert says how late the subtitles seem against the speech, and how many lines at the start or end would keep
 their times. The decision log then holds the fix under `would` in `timing`.
 
-**Cost.** A fix adds the onset read, about 1 CPU second a minute of the up to 20 minutes it reads. The votes and the
+**Cost.** A fix or an offset with no fix adds the onset read, about 1 CPU second a minute of the up to 20 minutes it
+reads. The votes and the
 checks cost under a second a track.
 
 ## Burned-in subtitles

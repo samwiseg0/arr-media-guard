@@ -4,6 +4,7 @@
 times"). Every file is made up, byte by byte."""
 import itertools
 import random
+import sys
 import zlib
 
 import pytest
@@ -140,6 +141,39 @@ def test_a_block_within_a_tick_of_the_end_before_it_is_no_overlap(tmp_path):
         path = mkv(tmp_path / f"t{at}.mkv", [entry(1, 2, "A_AAC", 21333333, AAC_LC_48K)], [(0, [simple(1, 0, lace, "xiph"), simple(1, at, lace, "xiph")])])
         t = matroska.frames(path)["tracks"][0]
         assert t["overlaps"][0] == over and t["gaps"][0] == 0 and len(t["lapped"]) == over, (at, t["overlaps"], t["gaps"])
+
+
+def test_only_an_overlap_after_a_lace_is_lapped(tmp_path):
+    """The walk counts each audio block that starts more than a tick before the end of the block before it. Only a
+    block whose block before is a lace goes into lapped, as a lace's frames take their times from its block time and
+    their lengths. The block at 10 ms overlaps a one-frame block, and the block at 40 ms overlaps the lace at 10 ms."""
+    path = mkv(tmp_path / "o.mkv", [entry(1, 2, "A_AAC", 21333333, AAC_LC_48K)], [(0, [simple(1, 0, [b"a"]), simple(1, 10, [b"a", b"b"], "xiph"),
+                                                                                    simple(1, 40, [b"a"])])])
+    t = matroska.frames(path)["tracks"][0]
+    assert t["overlaps"][0] == 2 and list(t["lapped"]) == [40 * NS], (t["overlaps"], list(t["lapped"]))
+
+
+def test_overlapped_names_each_audio_track_with_an_overlapping_block(tmp_path):
+    """Track 2 has a block at 10 ms that starts before the block at 0 ms ends, after a one-frame block. Track 3 has
+    none. overlapped() names mkvmerge's id of track 2 only, the k-th audio track by its TrackEntry. A walk that fails
+    names none."""
+    path = mkv(tmp_path / "o.mkv", [entry(1, 1, "V_MPEG4/ISO/AVC", 40 * NS), entry(2, 2, "A_AAC", 21333333, AAC_LC_48K),
+                                    entry(3, 2, "A_AAC", 21333333, AAC_LC_48K)],
+               [(0, [simple(1, 0, [b"v"]), simple(2, 0, [b"a"]), simple(3, 0, [b"a"]), simple(2, 10, [b"b"]), simple(3, 22, [b"b"])])])
+    j = {"tracks": [{"id": 0, "type": "video"}, {"id": 1, "type": "audio"}, {"id": 2, "type": "audio"}]}
+    assert hook.overlapped(path, j) == [1]
+    assert hook.overlapped(str(tmp_path / "gone.mkv"), j) == []
+
+
+def test_overlapped_and_planned_args_walk_the_file_once(tmp_path, monkeypatch):
+    """The header repair asks overlapped() first and planned_args() after it. Both take the walk that matroska.frames()
+    keeps for the file, so the file is walked once (review N1)."""
+    path = mkv(tmp_path / "w.mkv", [entry(1, 2, "A_AAC", 21333333, AAC_LC_48K)], [(0, [simple(1, 0, [b"a"]), simple(1, 10, [b"b"])])])
+    module = sys.modules[hook.overlapped.__module__].matroska
+    j, walks, real = {"tracks": [{"id": 0, "type": "audio", "properties": {"number": 1}}]}, [], module.walk
+    monkeypatch.setattr(module, "walk", lambda p: walks.append(p) or real(p))
+    module.WALKS.clear()
+    assert hook.overlapped(path, j) == [0] and 1 in hook.planned_args(path, j, [0], str(tmp_path))[1] and walks == [path]
 
 
 def test_the_walk_skips_a_zero_run_before_tracks_at_the_end(tmp_path):
@@ -647,19 +681,25 @@ def test_paired_times_drop_an_unknown_time_and_keep_the_file_order():
     assert hook.times_fault("audio 1", "aac", [0.0, 0.0015], [0.0, 0.0], slack=slack, paired=True)[0] is None
 
 
-@pytest.mark.parametrize("length, fault", [(0.0107, None), (None, "the MKV would play the audio 11 ms out of sync"), (0.005, "the MKV")])
-def test_a_shared_time_may_move_the_frame_the_file_defines(length, fault):
-    """Two packets of the original share a time, and the new file spaces them one frame apart. Between two Matroska
-    files the frame is the one the original defines, and a file that defines none allows no move. A median step of
-    the original never counts."""
+def test_the_refusal_detail_skips_a_shared_time_for_audio_only():
+    """Packets 0 and 1 of the original share 0 s, and packets 1 and 2 move 40 ms. The detail of an audio refusal names
+    the first moved packet with a time of its own, packet 2 at 0.080 s, as 2.18.8 did. A video stream names packet 1
+    at 0.000 s, as 2.18.8 did, since it never had the shared rule (review N4)."""
+    x, y = [0.0, 0.0, 0.08, 0.16], [0.0, 0.04, 0.12, 0.16]
+    assert hook.times_fault("audio 1", "aac", x, y)[0].endswith("Detail: audio 1 (aac) moved 40 ms, first at 0.080 s")
+    assert hook.times_fault("video 0", "h264", x, y)[0].endswith("Detail: video 0 (h264) moved 40 ms, first at 0.000 s")
+
+
+@pytest.mark.parametrize("length", [0.0107, None])
+def test_a_frame_that_shares_a_time_keeps_it(length):
+    """Two packets of the original share a time, and the new file spaces them one frame apart. mpv plays each frame at
+    its stored time, so that frame plays 11 ms late, and the check refuses it, whatever frame the original defines."""
     x = [0.0, 0.011, 0.021, 0.021, 0.043, 0.053]
     y = [0.0, 0.011, 0.021, 0.032, 0.043, 0.053]
-    why, check = hook.times_fault("audio 1", "dts", x, y, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=length,
-                                  overlaps=[1, 0.0107, 0.021])
-    assert (why or "").startswith(fault or "") and bool(why) == bool(fault), why
-    if fault:
-        assert why.endswith("1 of 6 frames moved. The original stores 1 block that starts before the block before it ends, up to 11 ms, "
-                            "the first at 0.021 s"), why
+    why, check = hook.times_fault("audio 1", "dts", x, y, hook.mkv_slack(NS, NS, "audio"), paired=True, length=length, overlaps=[1, 0.0107, 0.021])
+    assert why.startswith("the MKV would play the audio 11 ms out of sync") and "shared" not in check, why
+    assert why.endswith("1 of 6 frames moved. The original stores 1 block that starts before the block before it ends, up to 11 ms, "
+                        "the first at 0.021 s"), why
 
 
 def test_stored_places_pair_the_tracks_with_ffprobes_streams(tmp_path, monkeypatch):
@@ -698,20 +738,20 @@ def test_an_overlap_may_close_by_a_contiguous_later_move(case, new, lapped, pass
     frames, the worst move and the first time. An earlier move, or a later move that leaves a gap, refuses. The same
     move refuses when the walk found no overlapping block there, as a slow drift moves the audio."""
     old = LACE + [0.030, 0.030 + L]
-    why, check = hook.times_fault("audio 1", "dts", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=lapped)
+    why, check = hook.times_fault("audio 1", "dts", old, new, hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=lapped)
     assert (why is None) is passes, (why, check)
     if passes:
         assert check["contiguous"] == {"frames": 2, "worst_ms": 2.0, "first": 0.03}, check
 
 
 @pytest.mark.parametrize("past", [-0.01, 0.01])
-def test_a_contiguous_move_may_reach_overlap_move(past):
+def test_a_contiguous_move_may_reach_close_move(past):
     """A lace of 30 frames, and the original's next block starts a whole overlap before it ends. mkvmerge plays the
-    audio on. A player measurement covered such moves up to 150 ms, so a move up to OVERLAP_MOVE passes. A longer one
+    audio on. A player measurement covered such moves up to 150 ms, so a move up to CLOSE_MOVE passes. A longer one
     refuses, and the refusal names the count, the worst move, the first time and the original's overlapping blocks."""
-    lap = hook.OVERLAP_MOVE + past   # the overlap, and so the move of the two frames of the next block
+    lap = hook.CLOSE_MOVE + past   # the overlap, and so the move of the two frames of the next block
     old, new = [k * L for k in range(30)] + [30 * L - lap, 31 * L - lap], [k * L for k in range(32)]
-    why, check = hook.times_fault("audio 1", "dts", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L,
+    why, check = hook.times_fault("audio 1", "dts", old, new, hook.mkv_slack(NS, NS, "audio"), paired=True, length=L,
                                   overlaps=[1, lap, old[30]], lapped=[old[30]])
     if past < 0:
         assert why is None and check["contiguous"]["frames"] == 2, (why, check)
@@ -727,7 +767,7 @@ def test_a_frame_that_kept_its_time_ends_the_overlap_before_it():
     slack. A later move from there needs an overlapping block of its own, so the frame after it refuses."""
     old = LACE + [0.030, 0.030 + L, 0.060, 0.060 + L]
     new = LACE + [3 * L, 4 * L, 0.0614, 0.0614 + L + 0.001]
-    why, check = hook.times_fault("audio 1", "dts", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=[0.030])
+    why, check = hook.times_fault("audio 1", "dts", old, new, hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=[0.030])
     assert why.endswith("1 of 7 frames moved") and check["contiguous"]["frames"] == 2, (why, check)
 
 
@@ -735,7 +775,7 @@ def test_a_refusal_keeps_the_count_of_the_frames_that_played_on():
     """Two frames close the overlap, and a later frame moves 10 ms with no chain. The refusal names that frame, and the
     check still counts the two that played on."""
     old, new = LACE + [0.030, 0.030 + L, 0.060], LACE + [3 * L, 4 * L, 0.070]
-    why, check = hook.times_fault("audio 1", "dts", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=[0.030])
+    why, check = hook.times_fault("audio 1", "dts", old, new, hook.mkv_slack(NS, NS, "audio"), paired=True, length=L, lapped=[0.030])
     assert why.endswith("1 of 6 frames moved") and check["contiguous"]["frames"] == 2, (why, check)
 
 
@@ -743,25 +783,23 @@ def test_a_gap_stays_a_gap():
     """The original's next block starts 10 ms after its lace ends. A new file that closes the gap moves those frames
     earlier, and that refuses."""
     old = LACE + [0.042, 0.042 + L]
-    why, _ = hook.times_fault("audio 1", "dts", old, LACE + [3 * L, 4 * L], (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L)
+    why, _ = hook.times_fault("audio 1", "dts", old, LACE + [3 * L, 4 * L], hook.mkv_slack(NS, NS, "audio"), paired=True, length=L)
     assert why.startswith("the MKV would play the audio 10 ms out of sync"), why
-    assert hook.times_fault("audio 1", "dts", old, old, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=L)[0] is None
+    assert hook.times_fault("audio 1", "dts", old, old, hook.mkv_slack(NS, NS, "audio"), paired=True, length=L)[0] is None
 
 
-@pytest.mark.parametrize("case", ["video", "no frame length", "not paired"])
+@pytest.mark.parametrize("case", ["no frame length", "not paired"])
 def test_only_paired_audio_with_a_frame_length_may_close_an_overlap(case):
-    """The rule needs the frame length the original defines, and it holds for audio of two Matroska files only."""
+    """The rule needs the frame length the original defines, and it holds for two files with stored times only."""
     old, new = LACE + [0.030, 0.030 + L], LACE + [3 * L, 4 * L]
-    kw = dict(video=None if case == "video" else (0.0, 0.0), slack=hook.mkv_slack(NS, NS, "audio"), paired=case != "not paired",
-              length=None if case == "no frame length" else L, lapped=[0.030])
+    kw = dict(slack=hook.mkv_slack(NS, NS, "audio"), paired=case != "not paired", length=None if case == "no frame length" else L, lapped=[0.030])
     assert hook.times_fault("audio 1", "dts", old, new, **kw)[0], case
 
 
 def test_the_first_frame_has_no_frame_before_it():
-    """Two packets of the original share a time, so every move counts from the video's start. The first frame moved
-    10 ms, and the last frame in the file sits one frame before it. That last frame is no frame before the first one,
-    so the first frame does not count as contiguous."""
-    why, check = hook.times_fault("audio 1", "dts", [0.0, 0.0, 0.003], [0.010, 0.021, 0.005], (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"),
+    """No frame keeps its time, so the chain has no frame to start from. The last frame in the file sits one frame
+    before the first frame. That last frame is no frame before the first one, so no frame counts as contiguous."""
+    why, check = hook.times_fault("audio 1", "dts", [0.0, 0.0, 0.003], [0.010, 0.021, 0.005], hook.mkv_slack(NS, NS, "audio"),
                                   paired=True, length=0.005, lapped=[0.0, 0.003])
     assert why and "contiguous" not in check, (why, check)
 
@@ -777,25 +815,33 @@ def planned(tmp_path, blocks, dd=20 * NS, codec="A_AAC"):
 
 def proved_plan(t, plan):
     """times_fault() of the frames of t against plan, both in ms, as prove() pairs a new file that stores the plan."""
-    return hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], [x / 1000 for x in plan], (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"),
+    return hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], [x / 1000 for x in plan], hook.mkv_slack(NS, NS, "audio"),
                             paired=True, length=t["frame"] / 1e9, lapped=[x / 1e9 for x in t["lapped"]])
 
 
 @pytest.mark.parametrize("blocks, want, moved", [
-    ([0, 20, 40, 50, 70, 90, 120, 140], [0, 20, 40, 60, 80, 100, 120, 140], 3),   # 10 ms overlap, a 10 ms gap brings the time back
-    ([0, 20, 40, 50, 70, 110], [0, 20, 40, 60, 80, 110], 2),                       # a larger gap stays, less the move
-    ([0, 20, (30, 3), 100], [0, 20, 40, 60, 80, 100], 3),                         # the frames of a lace play on too
-    ([0, 20, 37, 57], [0, 20, 40, 60], 2),                                         # 3 ms, past the rounding
-    ([0, 20, 38, 58], [0, 20, 38, 58], 0),                                         # 2 ms, within the rounding
-    ([0, 20, 40, 40, 60], [0, 20, 40, 60, 80], 2),                                 # a shared time plays on too
-    ([0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 15, 35], [0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 15, 35], 0),
+    ([0, (20, 2), 50, 70, 90, 120, 140], [0, 20, 40, 60, 80, 100, 120, 140], 3),   # 10 ms overlap, a 10 ms gap brings the time back
+    ([0, (20, 2), 50, 70, 110], [0, 20, 40, 60, 80, 110], 2),                       # a larger gap stays, less the move
+    ([(0, 2), (30, 3), 100], [0, 20, 40, 60, 80, 100], 3),                          # the frames of a lace play on too
+    ([(0, 2), 37, 57, 80], [0, 20, 40, 60, 80], 2),                                 # 3 ms, past the rounding
+    ([(0, 2), 38, 58, 80], [0, 20, 38, 58, 80], 0),                                 # 2 ms, within the rounding
+    ([0, (20, 2), 40, 60, 100], [0, 20, 40, 60, 80, 100], 2),                       # a shared time plays on too
+    ([0, 20, 40, 50, 70], [0, 20, 40, 50, 70], 0),                                  # an overlap after a one-frame block stays
+    ([(0, 2), 37, 57], [0, 20, 37, 57], 0),                                         # no gap ends the run, so it keeps its times
+    ([(0, 2), 30, 50, 70, 90, 110, 130, 150, 170, 190, 210, 35, 55], [0, 20, 30, 50, 70, 90, 110, 130, 150, 170, 190, 210, 35, 55], 0),
+    ([(0, 2), (300, 2), 330, (350, 2), 195, 215, 430], [0, 20, 300, 320, 330, 350, 370, 390, 410, 430], 2),   # a block past the cap starts a run
+    ([0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, (220, 2), 15, 35], [0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 15, 35], 0),
 ])
 def test_a_plan_keeps_each_time_and_plays_on_past_an_overlap_up_to_close_move(tmp_path, blocks, want, moved):
-    """Each frame keeps its stored or default time. Past a block that starts before the block before it ends, the
-    frames play on one frame after the one before, until the original's own time comes back. A frame that shares its
-    time with the one before it plays on too. A move within the rounding of the two files stays. The proof counts it
-    as a frame that kept its time, so the frames after it would follow no overlap. A move past CLOSE_MOVE (245 ms
-    here) stays too. The proof passes every plan, and counts the moved frames as contiguous."""
+    """Each frame keeps its stored or default time. Past a block that starts before the end of the lace before it,
+    the frames play on one frame after the one before, until a gap of the original brings its own time back. A frame
+    that shares its time with the last frame of a lace plays on too. An overlap after a one-frame block keeps every
+    time, as mpv plays it. A move within the rounding of the two files stays. The proof counts it as a frame that kept
+    its time, so the frames after it would follow no overlap. A run that no gap ends keeps its times. That is a run to
+    the end of the track, and a run of a 10 ms overlap that a block 205 ms back stops at the cap. The block at 195 ms
+    stops the run from 330 ms at the cap, and starts a run of its own, 195 ms behind the lace before it, up to the gap
+    at 430 ms. A move past CLOSE_MOVE (245 ms here) stays too. The proof passes every plan, and counts the moved frames
+    as contiguous."""
     got, t = planned(tmp_path, blocks)
     assert got == want, got
     why, check = proved_plan(t, got)
@@ -803,10 +849,12 @@ def test_a_plan_keeps_each_time_and_plays_on_past_an_overlap_up_to_close_move(tm
 
 
 def test_a_plan_steps_back_in_time_only_where_it_keeps_an_overlap_past_close_move(tmp_path):
-    """Made-up tracks with overlaps of 1 to 260 ms, gaps, blocks that share a time and laces. A plan never puts a frame
-    before the frame before it. The one exception is an overlap that a move of CLOSE_MOVE does not close. That frame
-    keeps its stored time, as the original holds it."""
-    seen = {"shared": 0, "kept": 0}
+    """Made-up tracks with overlaps of 1 to 260 ms, gaps, blocks that share a time and laces. A plan puts a frame
+    before the frame before it only where it keeps an overlap, and that frame keeps its stored time. Each run of moved
+    frames ends before the end of the track, at a frame that keeps its time and starts no earlier than the run's last
+    frame, a gap of the original. Every kind shows up: a kept overlap after a lace, one after a one-frame block, and a
+    closed run."""
+    seen = {"shared": 0, "kept after a lace": 0, "after one frame": 0, "closed": 0}
     for seed in range(60):
         rnd = random.Random(seed)
         dd = rnd.choice([10666667, 21333333, 32000000])
@@ -826,11 +874,16 @@ def test_a_plan_steps_back_in_time_only_where_it_keeps_an_overlap_past_close_mov
         got, tr = planned(tmp_path / str(seed), blocks, dd=dd)
         x = [v / NS for v in tr["time"]]
         seen["shared"] += sum(a == b for a, b in zip(x, x[1:]))
+        lap = {v / NS for v in tr["lapped"]}
         for k in range(1, len(got)):
             if got[k] < got[k - 1]:
-                assert got[k] == x[k] and got[k - 1] + dd / NS - x[k] > hook.CLOSE_MOVE * 1000 - 0.5, (seed, k, got[k - 1], got[k], x[k])
-                seen["kept"] += 1
-    assert seen["shared"] and seen["kept"], seen
+                assert got[k] == x[k], (seed, k, got[k - 1], got[k], x[k])
+                seen["kept after a lace" if x[k] in lap else "after one frame"] += 1
+            if got[k - 1] != x[k - 1] and got[k] == x[k]:   # the end of a run
+                assert x[k] >= got[k - 1], (seed, k, got[k - 1], x[k])
+                seen["closed"] += 1
+        assert got[-1] == x[-1], (seed, got[-1], x[-1])
+    assert all(seen.values()), seen
 
 
 @pytest.mark.parametrize("case, new, passes", [
@@ -843,45 +896,17 @@ def test_a_frame_that_shares_its_time_goes_on_with_the_chain(case, new, passes):
     moves it one frame and the frame after it too. That passes as a chain, and the check counts both frames. A move of
     half a frame, or one that leaves a gap, refuses."""
     old = [0.0, 0.020, 0.040, 0.040, 0.060]
-    why, check = hook.times_fault("audio 1", "aac", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=0.020, lapped=[0.040])
+    why, check = hook.times_fault("audio 1", "aac", old, new, hook.mkv_slack(NS, NS, "audio"), paired=True, length=0.020, lapped=[0.040])
     assert (why is None) is passes, (why, check)
     if passes:
         assert check["contiguous"] == {"frames": 2, "worst_ms": 20.0, "first": 0.04}, check
 
 
-def test_a_shared_frame_off_the_chain_counts_as_a_frame_that_kept_its_time():
-    """The shared frame at 40 ms moves 15 ms, within one frame, and off the chain. It counts as a frame that kept its
-    time, as before. The frames after it move 15 ms in whole frames from it, and no block of the original after it
-    overlaps. So they refuse."""
-    old, new = [0.0, 0.020, 0.040, 0.040, 0.060, 0.080], [0.0, 0.020, 0.040, 0.055, 0.075, 0.095]
-    why, check = hook.times_fault("audio 1", "aac", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=0.020, lapped=[0.040])
-    assert why and why.endswith("2 of 6 frames moved") and "contiguous" not in check, (why, check)
-
-
-def test_a_shared_frame_that_kept_its_time_ends_the_chain():
-    """The block at 30 ms overlaps, and two frames play on. The frame at 79 ms then moves 1 ms, within the slack, so
-    it kept its time, though it shares that time with the frame after it. A later move from there needs an overlapping
-    block of its own, so the last frame refuses."""
-    old = [0.0, 0.020, 0.030, 0.050, 0.079, 0.079, 0.099]
-    new = [0.0, 0.020, 0.040, 0.060, 0.080, 0.100, 0.120]
-    why, check = hook.times_fault("audio 1", "aac", old, new, (0.0, 0.0), hook.mkv_slack(NS, NS, "audio"), paired=True, length=0.020, lapped=[0.030])
-    assert why and why.endswith("1 of 7 frames moved") and check["contiguous"]["frames"] == 2, (why, check)
-
-
-@pytest.mark.parametrize("close", [0.0, float("inf")])
-def test_close_move_picks_each_policy(tmp_path, monkeypatch, close):
-    """CLOSE_MOVE at 0 keeps every time. At infinity every overlap closes, as mkvmerge closes it on its own, and the
-    proof refuses a move past OVERLAP_MOVE. The block at 35 ms starts 245 ms before the block before it ends."""
-    monkeypatch.setattr(hook, "CLOSE_MOVE", close)
-    for blocks in ([0, 20, 40, 50, 70], [0, 20, 240, 260, 35, 55]):
-        got, t = planned(tmp_path, blocks)
-        if close == 0:
-            assert got == blocks and proved_plan(t, got)[0] is None, got
-        elif blocks[-1] == 70:
-            assert got == [0, 20, 40, 60, 80] and proved_plan(t, got)[0] is None, got
-        else:
-            assert got == [0, 20, 240, 260, 280, 300], got
-            assert proved_plan(t, got)[0].startswith("the MKV would play the audio 245 ms out of sync"), proved_plan(t, got)
+def test_close_move_at_0_keeps_every_time(tmp_path, monkeypatch):
+    """CLOSE_MOVE at 0 keeps every time, after a lace too, and the proof passes the plan."""
+    monkeypatch.setattr(hook, "CLOSE_MOVE", 0.0)
+    got, t = planned(tmp_path, [0, (20, 2), 50, 70])
+    assert got == [0, 20, 40, 50, 70] and len(t["lapped"]) == 1 and proved_plan(t, got)[0] is None, got
 
 
 @pytest.mark.parametrize("case", ["pcm", "unknown", "empty", "before 0"])
@@ -910,29 +935,30 @@ def test_a_block_the_walk_finds_no_overlap_at_keeps_its_time(tmp_path):
 
 def test_a_track_with_no_frame_length_keeps_each_time(tmp_path):
     """Vorbis defines no frame length in a frame header, so its frames cannot play on, and each keeps its time. Each
-    block lasts 20 ms by its BlockDuration, so the walk finds the overlap at 30 ms."""
+    block lasts 20 ms by its BlockDuration, so the walk finds the overlap at 30 ms. It follows a one-frame block, so
+    here the track takes it in lapped by hand."""
     kids = [group(1, x, b"a", 20) for x in (0, 20, 30, 50)]
     r = matroska.frames(mkv(tmp_path / "v.mkv", [entry(1, 2, "A_VORBIS")], [(0, kids)]))
-    t = r["tracks"][0]
-    assert t["frame"] is None and list(t["lapped"]) == [30 * NS], t
+    t = dict(r["tracks"][0], lapped=[30 * NS])
+    assert t["frame"] is None and r["tracks"][0]["overlaps"][0] == 1, t
     assert [v / NS for v in hook.planned_times(t, r["scale"])] == [0, 20, 30, 50]
 
 
 def test_the_new_files_rounding_keeps_a_planned_move_within_close_move(tmp_path):
     """The original stores 100 us ticks, and the new file rounds each planned time half up to 1 ms. A frame planned at
-    320.6 ms, 199.7 ms after its own time, would store 321 ms, a move of 200.1 ms, which the proof refuses. So a move
+    340.6 ms, 199.7 ms after its own time, would store 341 ms, a move of 200.1 ms, which the proof refuses. So a move
     plays on only up to CLOSE_MOVE less half a tick, here 199.5 ms, and a larger one keeps every time."""
-    def plan(late):   # 15 blocks 20 ms apart, one at 300.6 ms, then two that start late ticks before 320.6 ms
-        ticks = [200 * k for k in range(15)] + [3006, 3206 - late, 3406 - late]
-        r = matroska.frames(mkv(tmp_path / f"c{late}.mkv", [entry(1, 2, "A_AAC", 20 * NS)], [(0, [simple(1, x, [b"a"]) for x in ticks])], scale=100000))
+    def plan(late):   # 15 blocks 20 ms apart, a lace of 2 at 300.6 ms, two blocks that start late ticks before 340.6 ms, a gap
+        ticks = [200 * k for k in range(15)] + [(3006, 2), 3406 - late, 3606 - late, 3806]
+        r = matroska.frames(mkv(tmp_path / f"c{late}.mkv", [entry(1, 2, "A_AAC", 20 * NS)], clustered(ticks), scale=100000))
         return [v / 1e5 for v in hook.planned_times(r["tracks"][0], r["scale"])], r["tracks"][0]
     got, t = plan(1997)
-    assert got[-3:] == [3006, 1209, 1409], got
-    rounded = [(v * 1e5 + NS // 2) // NS * NS / 1e9 for v in got[:-2] + [3206, 3406]]   # the plan of a move up to CLOSE_MOVE
-    why = hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], rounded, (0.0, 0.0), hook.mkv_slack(100000, NS, "audio"), paired=True,
+    assert got[-4:] == [3206, 1409, 1609, 3806], got
+    rounded = [(v * 1e5 + NS // 2) // NS * NS / 1e9 for v in got[:-3] + [3406, 3606, 3806]]   # the plan of a move up to CLOSE_MOVE
+    why = hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], rounded, hook.mkv_slack(100000, NS, "audio"), paired=True,
                            length=0.02, lapped=[x / 1e9 for x in t["lapped"]])[0]
     assert why.startswith("the MKV would play the audio 200 ms out of sync"), why
-    assert plan(1995)[0][-3:] == [3006, 3206, 3406]   # 199.5 ms plays on
+    assert plan(1995)[0][-4:] == [3206, 3406, 3606, 3806]   # 199.5 ms plays on
 
 
 def args_of(path):
@@ -941,42 +967,48 @@ def args_of(path):
 
 
 def clustered(ticks):
-    """Clusters of a one-frame block of track 1 at each time of ticks, in that order, a new Cluster each 30000 ticks."""
+    """Clusters of a one-frame block of track 1 at each time of ticks, or a lace for (time, frames), in that order, a
+    new Cluster each 30000 ticks."""
     out = []
     for x in ticks:
+        x, n = x if isinstance(x, tuple) else (x, 1)
         if not out or out[-1][0] != x // 30000 * 30000:
             out.append((x // 30000 * 30000, []))
-        out[-1][1].append(simple(1, x - out[-1][0], [b"a"]))
+        out[-1][1].append(simple(1, x - out[-1][0], [b"a"]) if n == 1 else simple(1, x - out[-1][0], [b"a"] * n, "fixed"))
     return out
 
 
 @pytest.mark.parametrize("case", ["earliest time moves", "never returns"])
 def test_a_plan_the_proof_would_refuse_keeps_each_time(tmp_path, case):
     """planned_args() checks each plan as prove() would check the new file, rounded to 1 ms. When the proof would
-    refuse it, every frame keeps its time. The frame at 0 ms is the earliest, and the plan moves it to 80 ms, so the
-    first time of the new file moves 40 ms. An AAC run that never returns starts at 21 ms, after a first block stored at
-    60 ms. The plan plays it on for 5999 frames, 60 ms late to the end, so the earliest frame moves too."""
+    refuse it, every frame keeps its time. The frame at 0 ms is the earliest, and the plan moves it to 80 ms, after a
+    lace at 40 ms, until the gap at 120 ms. So the first time of the new file moves 40 ms. An AAC run that never
+    returns starts at 43 ms, after a lace of 2 stored at 60 ms. No gap ends it, so planned_times() keeps every time, and
+    a plan that played it on would move the earliest frame too."""
     scale, dd = NS, 20 * NS if case == "earliest time moves" else 21333333
-    ticks = {"earliest time moves": [40, 60, 0, 20], "never returns": [60] + [round(k * 64 / 3) for k in range(1, 6000)]}[case]
+    ticks = {"earliest time moves": [(40, 2), 0, 20, 120], "never returns": [(60, 2)] + [round(k * 64 / 3) for k in range(2, 6000)]}[case]
     path = tmp_path / "r.mkv"
     r = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", dd)], clustered(ticks), scale=scale))
     t = r["tracks"][0]
     plan = hook.planned_times(t, r["scale"])
+    if case == "never returns":
+        assert plan == list(t["time"]) == args_of(path)
+        plan = [t["time"][0], t["time"][1], *(t["time"][1] + k * dd for k in range(1, len(t["time"]) - 1))]   # the run played on
     rounded = [(v + NS // 2) // NS * NS / 1e9 for v in plan]
-    assert hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], rounded, (0.0, 0.0), hook.mkv_slack(scale, NS, "audio"), paired=True,
+    assert hook.times_fault("audio 1", "aac", [x / 1e9 for x in t["time"]], rounded, hook.mkv_slack(scale, NS, "audio"), paired=True,
                             length=dd / 1e9, lapped=[x / 1e9 for x in t["lapped"]])[0], "the proof refuses the plan"
     assert args_of(path) == list(t["time"]) != plan
 
 
-@pytest.mark.parametrize("at, want", [(424, 85066667), (425, 85166667)])
+@pytest.mark.parametrize("at, want", [(424, 127733334), (425, 127833334)])
 def test_a_plan_the_proof_passes_keeps_its_moves(tmp_path, at, want):
-    """An original of 100 us ticks has a frame at 42.4 or 42.5 ms that the new file stores at 42 or 43 ms. The next
-    frame plays on to 85.067 or 85.167 ms, stored at 85 ms, 0.333 or 0.667 ms off the frame length. The slack of 1.051
-    ms takes both, as the new file also rounds the first time, see proof.mkv_slack(). The proof passes each plan, so
-    planned_args() keeps it."""
+    """An original of 100 us ticks has a lace of 2 at 42.4 or 42.5 ms that the new file stores at 42 or 43 ms. The
+    block at 122.9 ms starts before the lace ends, and plays on to 127.733 or 127.833 ms, stored at 128 ms, 0.333 or
+    0.667 ms off the frame length, up to the gap at 170.5 ms. The slack of 1.051 ms takes both, as the new file also
+    rounds the first time, see proof.mkv_slack(). The proof passes each plan, so planned_args() keeps it."""
     path = tmp_path / "p.mkv"
-    r = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 42666667)], clustered([0, at, 802]), scale=100000))
-    assert args_of(path) == hook.planned_times(r["tracks"][0], r["scale"]) == [0, at * 100000, want]
+    r = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 42666667)], clustered([0, (at, 2), 1229, 1705]), scale=100000))
+    assert args_of(path) == hook.planned_times(r["tracks"][0], r["scale"]) == [0, at * 100000, at * 100000 + 42666667, want, 170500000]
 
 
 def test_a_first_time_off_the_grid_of_the_new_file_keeps_every_time():
@@ -986,21 +1018,21 @@ def test_a_first_time_off_the_grid_of_the_new_file_keeps_every_time():
     ms, so a copy that keeps every time passes (fuzz seed 1569)."""
     x = [(634 + round(k * 426.66667)) * 100000 for k in range(200)]
     new = [(v + NS // 2) // NS * NS for v in x]
-    why, check = hook.times_fault("audio 1", "aac", [v / 1e9 for v in x], [v / 1e9 for v in new], (0.0, 0.0), hook.mkv_slack(100000, NS, "audio"),
+    why, check = hook.times_fault("audio 1", "aac", [v / 1e9 for v in x], [v / 1e9 for v in new], hook.mkv_slack(100000, NS, "audio"),
                                   paired=True, length=0.042666667)
     assert why is None and check["worst_ms"] == 0.7, (why, check)
 
 
 @pytest.mark.parametrize("video, n, kept", [(True, 120, False), (False, 120, False), (False, 40, False)])
 def test_planned_args_checks_a_plan_at_the_tick_of_the_new_file(tmp_path, video, n, kept):
-    """An original of 20833 ns ticks plays on its AAC frames past a 50 ms overlap at frame 10. Where a video track
-    stays, the new file rounds to 1 ms, and the slack is 0.522 ms. A new file of 48 kHz audio alone rounds to 20832 ns,
-    see mux_tick(), and the slack is 0.032 ms. The proof counts the frame length of 21.333 ms as a float, so it passes
-    the runs of 110 and 30 frames at both ticks. Rounded to 1 ms, the stored times of 20833 ns would move up to 0.5 ms,
+    """An original of 20833 ns ticks plays on its AAC frames past a 50 ms overlap at frame 10, after a lace of frames 8
+    and 9, up to a 50 ms gap 10 frames before the end. Where a video track stays, the new file rounds to 1 ms, and the
+    slack is 0.522 ms. A new file of 48 kHz audio alone rounds to 20832 ns, see mux_tick(), and the slack is 0.032 ms.
+    The proof counts the frame length of 21.333 ms as a float, so it passes the runs of 100 and 20 frames at both ticks. Rounded to 1 ms, the stored times of 20833 ns would move up to 0.5 ms,
     past the slack of the finer tick. The options give mkvmerge the finer tick."""
     path = tmp_path / "f.mkv"
-    r = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 21333333)], clustered([round(k * 21333333 / 20833) - (2400 if k >= 10 else 0) for k in range(n)]),
-                            scale=20833))
+    ticks = [round(k * 21333333 / 20833) - (2400 if 10 <= k < n - 10 else 0) for k in range(n)]
+    r = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 21333333)], clustered([*ticks[:8], (ticks[8], 2), *ticks[10:]]), scale=20833))
     t = r["tracks"][0]
     j = {"tracks": [{"id": 0, "type": "audio", "properties": {"number": 1, "audio_sampling_frequency": 48000}},
                     *([{"id": 1, "type": "video", "properties": {"number": 2}}] if video else [])]}
@@ -1035,37 +1067,44 @@ def test_mux_tick_takes_the_timestamp_scale_of_mkvmerge(tracks, ids, tick):
     assert hook.mux_tick(j, ids) == tick
 
 
-def test_a_plan_that_makes_an_overlap_over_lag_slack_worse_keeps_each_time(tmp_path):
+def test_a_plan_that_makes_an_overlap_over_lag_slack_worse_keeps_each_time(tmp_path, monkeypatch):
     """The block at 199 ms starts 1021 ms before the block before it ends, past CLOSE_MOVE, so every frame keeps its
-    time. It sits 1001 ms behind the frame before it, as in the stored times, and proof.lag_over() passes that. With a
-    70 ms overlap at 1050 ms first, the plan moves each frame after it 70 ms later. The block at 199 ms then sits
-    1061 ms behind, 991 ms in the stored times. So every frame keeps its time, as for a plan that the proof refuses. A
+    time. It sits 1001 ms behind the frame before it, as in the stored times, and proof.lag_over() passes that. A
     Vorbis block with no BlockDuration has no known end, so the walk finds no overlap there. Its plan keeps the stored
-    times, with their drop of 1100 ms."""
+    times, with their drop of 1100 ms. planned_times() closes only a run that a gap ends, and the gap then bounds the
+    drop of the plan. So here a plan stands in that plays the 70 ms overlap at 1050 ms on to the step back. The block at
+    199 ms then sits 1061 ms behind, 991 ms in the stored times. So every frame keeps its time, as for a plan that the
+    proof refuses."""
     path = tmp_path / "v.mkv"
     mkv(path, [entry(1, 2, "A_VORBIS")], [(0, [simple(1, x, [b"a"]) for x in [*range(0, 1201, 20), 100]])])
     assert args_of(path)[-1] == 100 * NS
-    for name, ticks in (("same", [*range(0, 1201, 20), 199, 219]), ("worse", [*range(0, 1101, 20), *range(1050, 1191, 20), 199, 219])):
+    for name, ticks in (("same", [*range(0, 1201, 20), 199, 219]), ("worse", [*range(0, 1061, 20), (1080, 2), *range(1050, 1191, 20), 199, 219])):
         path = tmp_path / f"{name}.mkv"
-        t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], [(0, [simple(1, x, [b"a"]) for x in ticks])]))["tracks"][0]
+        t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], clustered(ticks)))["tracks"][0]
         plan = hook.planned_times(t, NS)
+        if name == "worse":   # blocks 1050 to 1190 ms, frames 56 to 63, played on after the lace
+            plan = [v + (70 * NS if 56 <= k <= 63 else 0) for k, v in enumerate(t["time"])]
+            monkeypatch.setattr(hook, "planned_times", lambda tt, scale: plan)
         assert args_of(path) == (plan if name == "same" else list(t["time"])) and (plan == list(t["time"])) == (name == "same")
         assert plan[-3:-1] == [(1200 if name == "same" else 1260) * NS, 199 * NS]   # a drop of 1001 or 1061 ms
 
 
-def test_a_plan_whose_drop_fails_the_lag_rule_after_rounding_keeps_each_time(tmp_path):
+def test_a_plan_whose_drop_fails_the_lag_rule_after_rounding_keeps_each_time(tmp_path, monkeypatch):
     """Reviewer 2026-10-24: planned_args() took the lag rule on the raw plan, and the new file stores it rounded half up
-    to 1 ms. The original stores 100 us ticks. A 0.5 ms gap puts a frame at 1100.5 ms. The plan plays on the five frames
-    of the 70 ms overlap after it, up to 1200.5 ms. Then a block at 200.2 ms steps back 1000.3 ms, which rounds to 1000
-    ms and passes proof.lag_over(). The new file stores 1201 and 200 ms, a step back of 1001 ms, which prove() refuses.
-    The stored times step back 929.8 ms. So every frame keeps its time."""
+    to 1 ms. The original stores 100 us ticks. A 0.5 ms gap puts a lace of 2 at 1100.5 ms. A plan that plays on the five
+    frames of the 90.5 ms overlap after it, up to 1220.5 ms, stands in, as planned_times() closes only a run that a gap
+    ends. Then a block at 220.2 ms steps back 1000.3 ms, which rounds to 1000 ms and passes proof.lag_over(). The new
+    file stores 1221 and 220 ms, a step back of 1001 ms, which prove() refuses. The stored times step back 909.8 ms. So
+    every frame keeps its time."""
     path = tmp_path / "r.mkv"
-    t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], clustered([*range(0, 10801, 200), 11005, *range(10500, 11301, 200), 2002, 2202]),
+    t = matroska.frames(mkv(path, [entry(1, 2, "A_AAC", 20 * NS)], clustered([*range(0, 10801, 200), (11005, 2), *range(10500, 11301, 200), 2202, 2402]),
                             scale=100000))["tracks"][0]
-    plan = hook.planned_times(t, 100000)
+    assert hook.planned_times(t, 100000) == list(t["time"])   # the step back ends the run at the cap
+    plan = [v + (90500000 if 57 <= k <= 61 else 0) for k, v in enumerate(t["time"])]   # frames 57 to 61, the overlap after the lace
+    monkeypatch.setattr(hook, "planned_times", lambda tt, scale: plan)
     drop = lambda ts: max(top - v for top, v in zip(itertools.accumulate(ts, max), ts)) / 1e9
     rounded = [(v + NS // 2) // NS * NS for v in plan]
-    assert (drop(plan), drop(rounded), drop(t["time"])) == (1.0003, 1.001, 0.9298), plan
+    assert (drop(plan), drop(rounded), drop(t["time"])) == (1.0003, 1.001, 0.9098), plan
     assert not hook.lag_over(drop(plan), drop(t["time"])) and hook.lag_over(drop(rounded), drop(t["time"]))
     assert args_of(path) == list(t["time"]) != plan
 

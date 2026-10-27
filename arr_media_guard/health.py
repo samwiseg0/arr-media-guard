@@ -27,8 +27,9 @@ TOKEN = re.compile(r"[A-Za-z0-9_-]{32,}")   # a TMDB key or a JWT segment. A pat
 
 
 def time_limit(ex):
-    """True for the hook's time limit, content.OutOfTime. TimeoutError stays for callers that raise it."""
-    return isinstance(ex, TimeoutError) or type(ex).__name__ == "OutOfTime"
+    """True for a TimeoutError, which a caller may raise as its time limit. The hook's content.OutOfTime is a
+    BaseException, so the handlers here never see it."""
+    return isinstance(ex, TimeoutError)
 
 
 def blank(key):

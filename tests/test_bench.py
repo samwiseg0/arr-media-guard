@@ -4,7 +4,10 @@
 import importlib.util
 import json
 import os
+import shutil
 import statistics
+import subprocess
+import sys
 
 import pytest
 
@@ -85,3 +88,34 @@ def test_the_corpus_counts_name_each_case_that_changed(tmp_path, capsys):
     assert "2 cases, wrong_silence 1 (1 at 1.0 s or more), wrong_alert 0, wrong_text 0" in out
     assert "  + wrong_silence b" in out and "  - wrong_text a" in out
     assert json.loads((tmp_path / "known.json").read_text()) == {"b": ["wrong_silence"]}
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("mkvmerge")), reason="needs ffmpeg and mkvmerge")
+def test_a_replay_finds_the_words_lid_listen_wrote(tmp_path, monkeypatch):
+    """Review N2. replay.py reads a words row by lid.word_key(), as lid.listen() writes it. The first replay of a
+    made-up film with an empty cache names the windows it misses. lid.listen() with a fake Whisper writes the first
+    two, and the second replay finds them."""
+    from arr_media_guard import lid
+    words = "apple bridge candle dragon engine forest garden harbor island jacket kettle ladder marble napkin orange pepper".split()
+    at = lambda x: f"00:{int(x // 60):02d}:{int(x % 60):02d},{round(x % 1 * 1000):03d}"
+    (tmp_path / "a.srt").write_text("\n".join(f"{k + 1}\n{at(10 + 2 * k)} --> {at(11.8 + 2 * k)}\n{words[k % 16]} {words[(k + 5) % 16]}\n"
+                                              for k in range(160)))
+    film, cache = str(tmp_path / "Film A (2020).mkv"), str(tmp_path / "words.sqlite")
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=1:d=330", "-f", "lavfi", "-i", "sine=sample_rate=8000:duration=330",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-ac", "1", str(tmp_path / "v.mkv")], check=True)
+    subprocess.run(["mkvmerge", "-q", "-o", film, "--language", "1:eng", str(tmp_path / "v.mkv"), "--language", "0:eng", str(tmp_path / "a.srt")], check=True)
+    lid._db(cache).close()
+
+    def replay(n):
+        out = tmp_path / f"r{n}.json"
+        subprocess.run([sys.executable, os.path.join(BENCH, "replay.py"), film, "--cache", cache, "--out", str(out)], check=True, capture_output=True, timeout=300)
+        got = json.loads(out.read_text())
+        assert got["error"] is None, got
+        return got["words"]
+    first = replay(1)["missing_at"]
+    monkeypatch.setattr(lid, "load", lambda *a: "model")
+    monkeypatch.setattr(lid, "extract", lambda path, index, start, secs=30: b"\0\0" * int(16000 * secs))
+    monkeypatch.setattr(lid, "transcribe", lambda whisper, pcm, lang: [[1.0, "hello"]])
+    lid.listen(film, 0, first[:2], "eng", cache=cache)
+    second = replay(2)
+    assert second["exact"] == 2 and second["missing_at"] == first[2:], (first, second)

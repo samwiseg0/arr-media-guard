@@ -169,7 +169,8 @@ class App:
 
     def rescan(self, owner, wait=0):
         """Ask the app to rescan one movie or series, so its size, media info and file records follow a change. Returns
-        "sent", or with wait the end state of command(). A scan that could not be sent returns why."""
+        "sent", or with wait the end state of command(). A scan that could not be sent returns why. The job's time limit
+        passes."""
         if not owner: return "no item id"
         try:
             if wait:

@@ -138,9 +138,10 @@ def words(text, stop=frozenset()):
 def flat(cues, stop=frozenset()):
     """[(time, cue index, word, its place in the cue from 0)] of the content words of cues [(start, end, text)], in time
     order. A word's time is its place in the cue's span, which is only a guess, because speech often ends before the
-    cue does. The search uses it. The timing uses the cue starts only, see timing()."""
+    cue does. The search uses it. The timing uses the cue starts only, see timing(). A track whose Cyrillic and Greek
+    letters all look like Latin letters gives the words of those, see decide.latin_lookalikes()."""
     out = []
-    for i, (s, e, text) in enumerate(cues):
+    for i, ((s, e, _), text) in enumerate(zip(cues, decide.latin_lookalikes([c[2] for c in cues]))):
         ws = words(text, stop)
         out += [(s + (k + 0.5) / len(ws) * (e - s), i, w, k) for k, w in enumerate(ws)]
     out.sort()
@@ -149,8 +150,9 @@ def flat(cues, stop=frozenset()):
 
 def word_times(cues, stop=frozenset()):
     """The times of the content words of cues, see flat(), in order. Song lyrics never count, because Whisper hears
-    singing badly. windows() picks its windows by them."""
-    return [x[0] for x in flat([c for c in cues if not MUSIC.search(NOISE.sub(" ", c[2]))], stop)]
+    singing badly. windows() picks its windows by them. flat() reads every cue, so a lyrics cue counts for the fold."""
+    music = {i for i, c in enumerate(cues) if MUSIC.search(NOISE.sub(" ", c[2]))}
+    return [x[0] for x in flat(cues, stop) if x[1] not in music]
 
 
 def windows(cues, duration, stop=frozenset(), have=(), secs=WINDOW, taken=(), parts=PARTS, ts=None):
@@ -1115,9 +1117,9 @@ def onset_parts(duration):
     return [(round((k + 0.5) * tenth - half, 3), round((k + 0.5) * tenth + half, 3)) for k in range(ONSET_PARTS)]
 
 
-def layout_onsets(cues, timing, onsets, read, duration):
-    """timing, a fix of layout_fix(), when the speech onsets confirm it, else no fix and "unfixed". The onsets are a
-    second clock: silencedetect marks them, and VAD the spans of speech. onsets are [(time, seconds of silence before
+def layout_onsets(cues, timing, onsets, read, duration, rate="1/1"):
+    """timing, a fix of layout_fix() or an offset that it gives no fix ("unfixed"), as the speech onsets judge it. The
+    onsets are a second clock: silencedetect marks them, and VAD the spans of speech. onsets are [(time, seconds of silence before
     it)] read in the parts read, see onset_parts(). A cue span start, see spans(), counts where the fix puts it when an
     onset that ends ONSET_QUIET of silence lies within half of TOLERANCE of it less ONSET_LEAD, and likewise where it
     sat. Each half of the file must agree: ONSET_MIN of its starts, and LAYOUT_ONSET_SHARE of them, count where the
@@ -1126,9 +1128,12 @@ def layout_onsets(cues, timing, onsets, read, duration):
     must be ONSET_CHANCE at most. A half where as many count where they sat, and no fewer than at the fix, disagrees.
     Else there are too few. A whole track asks LAYOUT_ONSET_SHARE: under a music bed silencedetect marks few onsets, and verified real shifts of about 1 s drew 9% to 19% of their
     starts there, at a chance of 1e-6 or less.
-    The lines of timing["keep"], which keep their times, see shifted(), do not count. "onsets" holds the counts of each
-    half: starts, where the fix puts them, where they sat, chance."""
-    fix = timing["fix"]
+    The lines of timing["keep"], which keep their times, see shifted(), do not count. An offset with no fix counts as a
+    fix at rate, the ratio of the layout. A fix that both halves confirm stays. When no half agrees and a half
+    disagrees, the lines sit where the onsets put the speech. The timing then holds the offset in "disagreed" and no
+    "unfixed", so it only logs. Else a fix gives way to "unfixed", and an offset with no fix keeps it, so both alert.
+    "onsets" holds the counts of each half: starts, where the fix puts them, where they sat, chance."""
+    fix = timing.get("fix") or {"rate": rate, "offset": timing["unfixed"]}
     times = [t for t, quiet in onsets if quiet >= ONSET_QUIET]
     hits = lambda ps: sum(bool(times[bisect.bisect_left(times, p - TOLERANCE / 2):bisect.bisect_right(times, p + TOLERANCE / 2)]) for p in ps)
     starts = [a for a, _ in spans(unflashed(sorted(c for c in cues if not kept_at(timing.get("keep"), c[0]))))]
@@ -1149,7 +1154,10 @@ def layout_onsets(cues, timing, onsets, read, duration):
         return "agree" if new >= need and new >= 2 * old and 1 - below <= ONSET_CHANCE else "disagree" if old >= need and old >= new else "few"
     said = [judge(*h) for h in halves]
     counts = [[n, a, b, round(c, 2)] for n, a, b, c in halves]
-    if said == ["agree", "agree"]:
+    if "disagree" in said and "agree" not in said:
+        why = f'{timing["why"].removesuffix(", so the times stay")}, {"but" if timing.get("fix") else "and"} the speech onsets put the lines where they sat'
+        return {"fix": None, "disagreed": fix["offset"], "onsets": counts, "why": f"{why}, so the times stay and nothing alerts"}
+    if said == ["agree", "agree"] or not timing.get("fix"):
         return dict(timing, onsets=counts)
     why = "the speech onsets put the lines where they sat" if "disagree" in said else "too few speech onsets confirm it"
     return {"fix": None, "unfixed": fix["offset"], "onsets": counts, "why": f'{timing["why"]}, but {why}, so the times stay'}

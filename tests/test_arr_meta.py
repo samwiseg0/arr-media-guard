@@ -353,6 +353,17 @@ def test_expected_languages_cache_and_failure(tmp_path, monkeypatch):
     assert M.expected_languages("radarr", {"tmdb": 8008}, "t", cache, now=1000) is None   # a network failure is unknown
 
 
+def test_a_tmdb_item_names_its_language_as_codes_reads_it_back(monkeypatch):
+    """--tmdb fills the item's original language with its English name, and decide.codes() reads that name back. A name
+    that reads as another language stays the code: "North Ndebele" reads as nor, and "Turkmen" as tur."""
+    names = {}
+    for iso1, code in M.ISO1.items():
+        monkeypatch.setattr(M, "_get", lambda path, token, iso1=iso1, **q: {"id": 1, "title": "Film A", "original_language": iso1})
+        names[iso1] = M.tmdb_item("movie", 1, token="t")[0]["originalLanguage"]["name"]
+        assert code in M.decide.codes(names[iso1]), (iso1, names[iso1])
+    assert [names[c] for c in ("ja", "el", "fj", "sw", "nd", "tk")] == ["Japanese", "Greek", "Fijian", "Swahili", "nde", "tuk"]
+
+
 def test_no_token_and_no_dll_take_the_copy_of_radarrs_token(monkeypatch):
     """Docker has no Radarr DLL and often no TMDB_TOKEN. TMDB then gets the copy of Radarr's token in the code."""
     sent = []

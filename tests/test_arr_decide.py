@@ -22,7 +22,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from arr_media_guard import decide  # noqa: E402
+from arr_media_guard import checks, decide  # noqa: E402
 
 TEST_POLICY = {"kids": {"genres": {"radarr": ["Family"], "sonarr": ["Children", "Family"]}, "profiles": ["Kids"],
                         "studios": ["Studio A"]},
@@ -108,23 +108,28 @@ def test_the_decision_rules(monkeypatch):
                 "Information", "Signs & Songs")
     assert [t["role"] for t in decide.classify(ff(*[("subtitle", "eng", n, 0, 0, 0, 0) for n in dialogue]))] == ["full"] * 7 + ["forced"]
     # each title as a subtitle and as an audio track. A word that only contains a notes word ("Trivial", "Lollipop",
-    # "Artifact") keeps the role, and SDH or CC in the title wins over the notes words.
+    # "Artifact") keeps the role, and SDH or CC in the title wins over the notes words. A title that negates commentary
+    # ("No Commentary") holds the dialogue.
     notes = ("Notes", "Notes:", "[Notes]", "notes.", "Production Note", "Production Notes", "Pop Up Video", "Pop-Up Video", "Popup", "Pop-Ups",
              "K-Pop Up Close", "Info Text", "Infotext", "Information Text", "Trivia", "Trivia (Forced)", "Fact Track", "Easter Eggs",
              "Easter Egg Guide", "Fun & Trivia", "Easter.Eggs.2023.1080p.WEB", "Pop.Up.S01E01.1080p", "The.Trivia.Hour.S02E03",
-             "Commentary-free", "No Commentary", "Text Commentary")
+             "Text Commentary", "Commentary (no subtitles)", "Non-English Commentary", "Commentary (spoiler-free)")
     kept = {"sdh": ("Pop-on CC", "English CC (pop-up)", "SDH", "English SDH"), "forced": ("Songs & Signs", "Signs & Songs", "Signs", "Forced"),
             "full": ("TL Notes", "English (TL Notes)", "Notes (English)", "English Notes", "Notes - English", "Producer's Notes", "Director's Notes",
                      "Liner Notes", "Notes from the Underground", "Notes on a Scandal", "Lollipop Upgrade", "Info", "Information", "Trivial",
                      "Trivial.Matters.S01E01.720p", "Fun Facts", "Factoids", "Artifact Track", "Easter Parade", "Annotations", "Anmerkungen",
                      "Curiosidades", "Anecdotes", "Nerd Track", "English", "Japanese", "Tagalog", "Português (Brasil)", "Français", "Deutsch",
-                     "中文", "Full")}
+                     "中文", "Full", "No Commentary", "Commentary-free", "Commentary free", "Without Commentary", "w/o Commentary",
+                     "Non-Commentary", "English - No Commentary", "English [No Commentary]")}
     want = {n: ("commentary", "commentary") for n in notes} | {n: (r, "main") for r, ns in kept.items() for n in ns}
     role = lambda kind, n: decide.classify(ff((kind, "eng", n, 2, 0, 0, 0)))[0]["role"]
     assert {n: (role("subtitle", n), role("audio", n)) for n in want} == want
     # English only as commentary (flag or title): the wrong language, nothing changes
     d = decide.decide(ff(("audio", "por", "", 6, 1, 0, 0), ("audio", "eng", "", 2, 0, 0, 1)), "English")
     assert d["edits"] == [] and d["wrong_language"], d
+    # English audio titled "English - No Commentary" is the main audio, so it becomes the default
+    d = decide.decide(ff(("audio", "por", "", 6, 1, 0, 0), ("audio", "eng", "English - No Commentary", 2, 0, 0, 0)), "English")
+    assert d["edits"] == [["track:a1", 0, 1], ["track:a2", 1, 0]] and not d["wrong_language"], d
     # checks. A header of 10:05 on a file whose video and audio stop at 1:02:00.
     size = 4.6e9
     hdr = {"container": {"properties": {"duration": 605 * 10**9, "writing_application": "mkvmerge v92.0"}},
@@ -297,8 +302,9 @@ def test_the_decision_rules(monkeypatch):
     assert decide.retag(langs, table=table)["ask"] == {"a1", "a2", "a3"}   # und main tracks are heard first, the commentary never
     r = decide.retag(langs, {"a1": "eng", "a2": "spa", "a3": "por"}, {"eng"}, table)
     assert r["edits"] == [["track:=1", "en", "und", decide.LANG_EDIT], ["track:=1", "en", None, decide.LANG_IETF],   # the undo deletes the new BCP 47 tag
-                          ["track:=2", "es", "und", decide.LANG_EDIT], ["track:=2", "es", None, decide.LANG_IETF]] and r["set"] == {"a1": "eng", "a2": "spa"}, r
-    assert r["rules"] == ["language tag set"] * 4 and r["notes"][2].startswith("a3 keeps und: por (heard por)"), r
+                          ["track:=2", "es", "und", decide.LANG_EDIT], ["track:=2", "es", None, decide.LANG_IETF],
+                          ["track:=4", 1, None, decide.COMMENTARY_FLAG]] and r["set"] == {"a1": "eng", "a2": "spa"}, r   # its title reads as commentary
+    assert r["rules"] == ["language tag set"] * 4 + ["commentary flag set"] and r["notes"][2].startswith("a3 keeps und: por (heard por)"), r
     spa_eng = tagged(("audio", "eng", "en", "", True, 1), ("subtitles", "eng", "en", "", False, 2))   # a Spanish film tagged eng
     assert decide.retag(spa_eng, {"a1": "spa"}, {"spa"}, table)["edits"] == [["track:=1", "es", "eng", decide.LANG_EDIT]]
     spoken_eng = decide.retag(spa_eng, {"a1": "spa"}, {"spa"}, table, spoken={"eng", "spa"})   # TMDB lists English as spoken, which never backs the tag
@@ -340,7 +346,8 @@ def test_the_decision_rules(monkeypatch):
     assert decide.retag(und, {"a1": "spa"}, {"eng"}, table, spoken={"spa"})["edits"] == []   # a tie: the title and the original against heard and spoken
     assert decide.retag(tagged(("audio", "und", None, "", True, 1)), {"a1": "cze"}, {"eng"}, table, spoken={"cze"})["edits"][0][1] == "cze"   # spoken, und only
     d = decide.with_tags(decide.decide(langs, "English"), r := decide.retag(langs, {"a1": "eng"}, {"eng"}, table))
-    assert d["edits"][-2:] == [["track:=1", "en", "und", decide.LANG_EDIT], ["track:=1", "en", None, decide.LANG_IETF]] and decide.plan_class(d) == "English original: language tag set", d
+    assert d["edits"][-3:] == [["track:=1", "en", "und", decide.LANG_EDIT], ["track:=1", "en", None, decide.LANG_IETF],
+                               ["track:=4", 1, None, decide.COMMENTARY_FLAG]] and decide.plan_class(d) == "English original: commentary flag set, language tag set", d
     assert decide.with_tags(dict(d, undecided="x", edits=[]), r)["edits"] == []
     after = tagged(("audio", "eng", "en", "English", True, 1))
     assert decide.unapplied(after, [["track:=1", "en", "und", decide.LANG_EDIT], ["track:=1", 1, 0]]) == [] and decide.unapplied(after, [["track:=1", "es", "und", decide.LANG_EDIT]])
@@ -383,6 +390,11 @@ def test_the_decision_rules(monkeypatch):
     assert decide.video_verdict([], [capped, capped, ok]) == (None, [])   # the read cap alone is no doubt
     slow = dict(capped, stopped="ran over 60 s")
     assert decide.video_verdict([], [slow, ok, ok]) == (None, ["the video check at 25:02 ran over 60 s, so the file may have no usable index"])
+    met = lambda w, **k: decide.video_verdict([], [at(dict(w, **k), 964), ok, ok])[1]   # a stopped window that met errors names them
+    assert met(capped, errors=4) == ["the video check at 16:04 read over 512 MiB and met 4 playback errors on the way, so the file may have no usable index"]
+    assert met(slow, errors=1) == ["the video check at 16:04 ran over 60 s and met 1 playback error on the way, so the file may have no usable index"]
+    assert met(capped, frames=0, empty=True, noisy=True) == [
+        "the video check at 16:04 read over 512 MiB and found no frame, with errors on the way, so the file may have no usable index"]
     assert decide.bad_window(dict(empty, noisy=True, cut=True)) == "no video"
     assert decide.parse_window("[mpeg4 @ 0x7] [error] low_delay flag set incorrectly, clearing it\n" + frames(120))["errors"] == 0
     unknown = decide.parse_window("[vist#0:0/none @ 0x8] [error] Decoding requested, but no decoder found for: none\n[fatal] Error opening output files", 234)
@@ -612,3 +624,74 @@ def test_the_original_language_flag_marks_the_tracks_in_the_content_language(mon
     # the plan adds them with the default flags, and an audit reads their rule
     d = decide.with_tags(decide.decide(j, "Japanese"), decide.retag(j, {}, {"jpn"}, TABLE, original="jpn", checked={"a1": "jpn", "a2": "jpn", "s2": "jpn"}))
     assert d["edit_rules"][-3:] == ["original flag set"] * 3 and "original flag set" in decide.plan_class(d), d
+
+
+
+# The 20 ISO 639-2/T codes and their /B twins
+T_CODES = dict(x.split(":") for x in """sqi:alb hye:arm eus:baq mya:bur zho:chi ces:cze nld:dut fra:fre kat:geo deu:ger ell:gre isl:ice
+    mkd:mac mri:mao msa:may fas:per ron:rum slk:slo bod:tib cym:wel""".split())
+LIST = """English language name                 | ISO 639-3 code | ISO 639-2 code | ISO 639-1 code
+---------------------------------------+----------------+----------------+---------------
+Fijian                                 | fij            | fij            | fj
+Standard Malay                         | zsm            |                |
+Swahili (macrolanguage)                | swa            | swa            | sw
+Burmese                                | bur            | bur            | my
+Undetermined                           | und            | und            |
+No linguistic content                  | zxx            | zxx            |
+Reserved for local use                 | qaa-qtz        | qaa-qtz        |
+Reserved for local use: qab            | qab            | qab            |
+"""   # rows of the shape of `mkvmerge --list-languages`
+
+
+def test_the_language_names_of_mkvmerges_list():
+    """language_table() names each code of a row: 639-3, 639-2 and 639-1, and the T code of a B code. A name drops
+    "(macrolanguage)". und, mul, mis, zxx and the local-use codes qaa to qtz name no language."""
+    assert decide.language_table(LIST)[2] == {"fij": "Fijian", "fj": "Fijian", "zsm": "Standard Malay", "swa": "Swahili", "sw": "Swahili",
+                                              "bur": "Burmese", "my": "Burmese", "mya": "Burmese"}
+    names = decide.language_table("".join(f"Language {b} | {b} | {b} |\n" for b in T_CODES.values()))[2]
+    assert {t: names.get(t) for t in T_CODES} == {t: f"Language {b}" for t, b in T_CODES.items()}
+
+
+def test_each_terminology_code_counts_as_its_twin(monkeypatch):
+    """decide.TWINS feeds ALIAS and lid.code(), so each T code counts as its B twin. Before, ALIAS held 17 of the 20
+    pairs, so a track tagged mya, mri or bod that lid.py heard as bur, mao or tib got a tag edit to the B code."""
+    from arr_media_guard import lid
+    monkeypatch.setattr(decide, "POLICY", decide.POLICY)
+    decide.set_policy(TEST_POLICY)
+    for t, b in T_CODES.items():
+        assert decide.codes(t) == decide.codes(b) and {t, b} <= decide.codes(b) and lid.code(t) == lid.code(b) == b, (t, b)
+        assert decide.track_tag({"language": "und", "language_ietf": t}) == t and decide.track_tag({"language": t, "language_ietf": b}) == t
+        r = decide.retag(tracks(("audio", t, {})), {"a1": b}, {b}, TABLE)
+        assert r["edits"] == [] and r["reasons"] == [], (t, r)
+
+
+def test_a_name_without_mkvmerge_is_the_code(monkeypatch, tmp_path):
+    """With no mkvmerge on PATH, lang_name() gives the bare code and never raises. LANG_NAMES and ALIAS still name
+    their codes."""
+    monkeypatch.setattr(checks, "LANGS", [])
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert [decide.lang_name(c) for c in ("fij", "fj", "mya", "fre", "und", "nld")] == ["fij", "fij", "mya", "French", "untagged", "Dutch"]
+    assert checks.LANGS == []
+
+
+def test_a_terminology_code_takes_the_name_of_its_twin_and_changes_no_decision(monkeypatch):
+    """A 639-2/T code takes the name of its /B twin: mya reads as bur does. Only lang_name() reads the names, so
+    codes(), track_tag() and retag() give the same answers with and without them. The text of a mismatch note names
+    the language, so only its count is compared."""
+    monkeypatch.setattr(decide, "POLICY", decide.POLICY)
+    decide.set_policy(TEST_POLICY)
+    names = decide.language_table("".join(f"Language {b} | {b} | {b} |\n" for b in T_CODES.values()))[2]
+
+    def answers():
+        out = {}
+        for t, b in T_CODES.items():
+            j = tracks(("audio", t, {}), ("audio", "eng", {"language_ietf": t}), ("subtitles", t, {}), ("subtitles", "eng", {"language_ietf": t}))
+            r = decide.retag(j, {"a1": b, "a2": "eng"}, {b}, TABLE, read={"s1": "eng", "s2": b}, original=b, checked={"a1": b})
+            out[t] = (decide.codes(t), decide.track_tag({"language": t}), decide.track_tag({"language": "eng", "language_ietf": t}),
+                      {k: v for k, v in r.items() if k != "mismatch"}, len(r["mismatch"]))
+        return out
+    monkeypatch.setattr(checks, "langs", lambda: (TABLE[0], TABLE[1], names))
+    got = answers()
+    assert [decide.lang_name(t) for t in ("mya", "bod", "mri")] == ["Language bur", "Language tib", "Language mao"]
+    monkeypatch.setattr(checks, "langs", lambda: ({}, {}, {}))
+    assert answers() == got and decide.lang_name("mya") == "mya"

@@ -33,7 +33,8 @@ def kept_replaced(path, download_id=None, app=None):
     own instance's grab, and of such a grab with no download id, so its restore may use that link. Every other record of
     path goes stale, a claimed one and another instance's too, because the import replaced the file its link kept. A
     change by the hook leaves a claimed record, which holds the file its import replaced. So a restore never brings back
-    an older version. An extra follows its video. Never raises. An error logs a line."""
+    an older version. An extra follows its video. It raises only OutOfTime, the job's time limit. An error logs a
+    line."""
     if not config.CFG.keep_replaced:
         return
     try:
@@ -252,6 +253,11 @@ def keep_folder(path):
     """The folder a keep of path writes in: originals_root() when it exists, else the folder that creates it."""
     root = originals_root(path)
     return root if os.path.isdir(root) else os.path.dirname(root)
+
+
+def keep_why(path, st=None):
+    """keepable() of path with its stat st, or of the file now. KEEP_ORIGINALS_DAYS 0 keeps no original."""
+    return keepable(path, st or os.stat(path)) if config.CFG.keep_days else "KEEP_ORIGINALS_DAYS is 0, so the original could not be kept"
 
 
 def keepable(path, st):

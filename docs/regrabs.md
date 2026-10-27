@@ -89,7 +89,8 @@ file that changed after the grab.
 ## Kept originals
 
 When AMG replaces a file with a changed one, it keeps the old file as a *kept original*. That covers a header repair, a
-subtitle change in the file, and a `.srt` file that AMG moves aside or writes again. A conversion to MKV keeps the old
+subtitle change in the file, and a `.srt` file that AMG writes again. A `.srt` file that does not match the audio gets
+a name players skip beside the video, and moves here only when every such name is taken. A conversion to MKV keeps the old
 file only when you forced it with `--force-convert`, or when it left a subtitle out. Every other conversion keeps
 nothing, because AMG checks every stream of the new file before the old one goes.
 [Force a conversion](commands.md#force-a-conversion) says how to force one.

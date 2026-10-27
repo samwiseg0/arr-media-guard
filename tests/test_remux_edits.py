@@ -205,17 +205,17 @@ def test_the_planned_state_and_the_options_of_each_edit():
     j = {"tracks": [{"id": 0, "type": "video", "properties": {"uid": 1}},
                     {"id": 1, "type": "audio", "properties": {"uid": 2, "language": "eng"}},
                     {"id": 2, "type": "subtitles", "properties": {"uid": 3, "language": "spa", "language_ietf": "es-419", "forced_track": True}}]}
-    edits = [["track:=2", 1, None, decide.ORIGINAL_FLAG], ["track:=3", 0, 1, decide.FORCED_FLAG], ["track:=3", "es-MX", "spa", decide.LANG_EDIT],
-             ["track:=3", "es-MX", "es-419", decide.LANG_IETF], ["track:=3", 0, 1]]
+    edits = [["track:=2", 1, None, decide.ORIGINAL_FLAG], ["track:=2", 1, None, decide.COMMENTARY_FLAG], ["track:=3", 0, 1, decide.FORCED_FLAG],
+             ["track:=3", "es-MX", "spa", decide.LANG_EDIT], ["track:=3", "es-MX", "es-419", decide.LANG_IETF], ["track:=3", 0, 1]]
     want, opts = hook.planned_state(j, edits)
-    assert opts == {1: {"--original-flag": 1}, 2: {"--forced-display-flag": 0, "--language": "es-MX", "--default-track-flag": 0}}
+    assert opts == {1: {"--original-flag": 1, "--commentary-flag": 1}, 2: {"--forced-display-flag": 0, "--language": "es-MX", "--default-track-flag": 0}}
     p1, p2 = want["tracks"][1]["properties"], want["tracks"][2]["properties"]
-    assert p1["flag_original"] is True
+    assert p1["flag_original"] is True and p1["flag_commentary"] is True
     assert (p2["forced_track"], p2["language_ietf"], p2["default_track"], p2["language"]) == (False, "es-MX", False, "spa")
     assert j["tracks"][2]["properties"]["forced_track"] is True   # j stays as it is
     with pytest.raises(RuntimeError):
         hook.planned_state(j, [["track:=9", 1, 0]])
-    for prop in ("flag-unknown", "name", "flag-hearing-impaired", "flag-commentary"):   # decide.unapplied() reads none of these back
+    for prop in ("flag-unknown", "name", "flag-hearing-impaired"):   # decide.unapplied() reads none of these back
         with pytest.raises(RuntimeError):
             hook.planned_state(j, [["track:=2", 1, 0, prop]])
 

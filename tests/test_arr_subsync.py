@@ -1227,18 +1227,41 @@ def test_onset_parts_spread_over_the_file_and_never_overlap():
 
 
 def test_the_speech_onsets_confirm_a_layout_fix():
-    """Onsets where the speech starts confirm the fix in both halves. Onsets where the cues sat, none, onsets in one
-    half only, and onsets after silences under ONSET_QUIET leave no fix, with the offset kept for the alert."""
+    """Onsets where the speech starts confirm the fix in both halves. Onsets where the cues sat leave no fix and only
+    log, with the offset in "disagreed". Such onsets in one half and onsets at the speech in the other, none, onsets
+    in one half only, and onsets after silences under ONSET_QUIET leave no fix, with the offset kept for the alert."""
     cs, speech = moved_to(TALK, offset=30.0), voice(TALK)
     t = s.layout_fix(cs, speech, LONG, s.layout(cs, speech, LONG))
     judge = lambda onsets: s.layout_onsets(cs, t, onsets, s.onset_parts(LONG), LONG)
     agree = judge([(a, 1.0) for a, _ in speech])
     assert agree["fix"] == t["fix"] and all(new > 2 * old for _, new, old, _ in agree["onsets"]), agree
     sat = judge([(a + 0.1, 1.0) for a, _, _ in cs])
-    assert sat["fix"] is None and sat["unfixed"] == t["fix"]["offset"] and "where they sat" in sat["why"], sat
+    assert sat["fix"] is None and "unfixed" not in sat and sat["disagreed"] == t["fix"]["offset"], sat
+    assert sat["why"] == f'{t["why"]}, but the speech onsets put the lines where they sat, so the times stay and nothing alerts', sat
+    both = judge(sorted([(a, 1.0) for a, _ in speech if a < LONG / 2] + [(a + 0.1, 1.0) for a, _, _ in cs if a - 30 > LONG / 2]))
+    assert both["fix"] is None and both["unfixed"] == t["fix"]["offset"] and "where they sat" in both["why"], both
     for onsets in ([], [(a, 1.0) for a, _ in speech if a < LONG / 2], [(a, s.ONSET_QUIET - 0.1) for a, _ in speech]):
         few = judge(onsets)
         assert few["fix"] is None and "too few speech onsets" in few["why"], few
+
+
+def test_the_speech_onsets_judge_an_offset_that_gets_no_fix():
+    """An offset that layout_fix() gives no fix alerts when the onsets agree with it or are too few, with its why. When
+    they put the lines where they sat, it only logs: the timing holds "disagreed" and no "unfixed"."""
+    cs, speech = moved_to(TALK, offset=30.0), voice(TALK)
+    t = {"fix": None, "unfixed": 30.0, "why": "a fix of +30.00 s fits, but a line it moves would pass a line that keeps its time, so the times stay"}
+    judge = lambda onsets: s.layout_onsets(cs, t, onsets, s.onset_parts(LONG), LONG, "1/1")
+    agree, few = judge([(a, 1.0) for a, _ in speech]), judge([])
+    assert agree["unfixed"] == few["unfixed"] == 30.0 and agree["why"] == few["why"] == t["why"], (agree, few)
+    assert all(new > 2 * old for _, new, old, _ in agree["onsets"]) and all(new == 0 for _, new, _, _ in few["onsets"]), (agree, few)
+    sat = judge([(a + 0.1, 1.0) for a, _, _ in cs])
+    assert "unfixed" not in sat and sat["fix"] is None and sat["disagreed"] == 30.0, sat
+    assert sat["why"] == ("a fix of +30.00 s fits, but a line it moves would pass a line that keeps its time, and the speech onsets put the lines "
+                          "where they sat, so the times stay and nothing alerts"), sat
+    cs = moved_to(TALK, rate=Fraction(25, 24), offset=2.0)   # an offset with no fix counts at the layout's ratio
+    t = {"fix": None, "unfixed": 2.0, "why": "the ratios 25/24 and 1/1 fit the slices and move the cues apart, so the ratio is not certain"}
+    got = s.layout_onsets(cs, t, [(a, 1.0) for a, _ in speech], s.onset_parts(LONG), LONG, "25/24")
+    assert got["unfixed"] == 2.0 and all(new > 2 * old and new >= s.ONSET_MIN for _, new, old, _ in got["onsets"]), got
 
 
 def test_a_music_bed_with_few_onsets_still_confirms_a_layout_fix():

@@ -289,17 +289,15 @@ def unreadable(f, t, of="original"):
     num = lambda p: f"{places[p][1:]} of the original file" if p in places else f"{p[1:]} of the {of} file"
     told = [f'{cap(track_name(p, f["tracks"][p]["lang"], num(p), f["tracks"][p]))} can\'t be read as text, so they were '
             f'removed and saved beside the file as {bold(os.path.basename(f["tracks"][p]["sidecar"]))}.' for p in tracks]
-    left = lambda why: ("can't be read as text, because AMG can't tell their character set." if why is True else
-                        "can't go into the MKV as they are, because the MKV would lose some of their lines or show them wrong.") \
-        + " The conversion to MKV left them out, and the file was left beside the video as it is."
+    left = lambda why: decide.KEPT_OUT[decide.kept_out(why)][1] + " The conversion to MKV left them out, and the file was left beside the video as it is."
     rest = [(n, x) for n, x in sorted(f["tracks"].items()) if n not in tracks]
     unread = [(n, x["unread"]) for n, x in rest if x.get("unread")]
     if len(unread) > 1:
         told += [f"The subtitles in {len(unread)} files can't go into the MKV as they are. The conversion to MKV left them out, and the files were "
                  "left beside the video as they are."]
-        lost, unknown = [bold(n) for n, why in unread if why is not True], [bold(n) for n, why in unread if why is True]
-        told += [f"The MKV would lose some of the lines of {and_list(lost)} or show them wrong."] if lost else []
-        told += [f"AMG can't tell the character set of {and_list(unknown)}."] if unknown else []
+        for key, (_, _, many) in decide.KEPT_OUT.items():
+            names = [bold(n) for n, why in unread if decide.kept_out(why) == key]
+            told += [many(and_list(names), len(names))] if names else []
     else:
         told += [f'{cap(sub_name(n, {}))} {left(why)}' for n, why in unread]
     told += [f'{cap(sub_name(n, {}))} can\'t be read as text, so the file was renamed to {bold(x["sidecar"])}.' for n, x in rest if not x.get("unread")]
@@ -363,18 +361,38 @@ def burned(f, t):
     return f"{failed} {after(f)}".rstrip() if f.get("changed") else f"{failed} The original file was not changed."
 
 
+def kept_whole(f):
+    """The sentence after the doubts of a whole-file check alert, with a space before it, or "" for another alert."""
+    return " AMG kept the file and did not re-grab it." if f.get("mark") == "whole" else ""
+
+
+ASIDE = {"commentary": ("is commentary", "are commentary"), "description": ("is an audio description", "are audio descriptions")}
+
+
+def wrong_language(f):
+    """The text of a language finding of process.file_alerts(): the main audio and the wanted language, then why each
+    other audio track in a wanted language does not count, then where the original language comes from."""
+    out = [f'The audio is {bold(decide.lang_names(f["has"]) or "missing")}, but it should be {f["want"]}.']
+    roles = {}
+    for lang, role in f.get("aside") or ():
+        roles[lang, role] = roles.get((lang, role), 0) + 1
+    out += [f'The {decide.lang_name(lang)} track{"s" * (n > 1)} {ASIDE[role][n > 1]}.' for (lang, role), n in roles.items() if role in ASIDE]
+    if f.get("listed"):
+        out.append(f'{f["listed"][0]} lists {f["listed"][1]} as the original language.')
+    return " ".join(out)
+
+
 # The plain words of an edit result that a failed flag edit names, see process.edit()
 EDIT_ERRORS = {"VERIFY FAILED, flags did not change": "the edit ran, but the flags did not change"}
 # Per finding code: the alert title and the text. A fault with an action takes its title from FAULT_TITLES instead.
 FINDINGS = {
-    "language": ("Wrong audio language", lambda f, t: f'The audio is {bold(decide.lang_names(f["has"]) or "missing")}, but it should be {f["want"]}.'),
+    "language": ("Wrong audio language", lambda f, t: wrong_language(f)),
     "runtime": ("Wrong runtime", lambda f, t: f'The file runs {bold(f["runs"])}, but the listed runtime is {bold(str(f["listed"]) + " minutes")}.'),
     "duration": ("Wrong length in the file", lambda f, t: f["why"]),
     "episode": ("Maybe the wrong episode", lambda f, t: f'{cap(content.episode_why(f["imported"], f["said"], f["title"], f["names"], quote))}.'),
     "content": ("Wrong content", lambda f, t: sentences(f["signals"])),
-    "audio": ("Audio may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"])),
-    "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else
-              sentences(f["doubts"]) + (" AMG kept the file and did not re-grab it." if f.get("mark") == "whole" else "")),
+    "audio": ("Audio may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"]) + kept_whole(f)),
+    "video": ("Video may be broken", lambda f, t: f'{cap(f["certain"])}.' if f.get("certain") else sentences(f["doubts"]) + kept_whole(f)),
     "damage": ("Damaged file", damage),
     "repack": ("Conversion to MKV failed", failed_repack),
     "unreadable": ("Unreadable subtitles", unreadable),
@@ -531,8 +549,9 @@ def posts(f, rec=None):
 
 
 def logged(x):
-    """Whether the subtitle sentence x says the program fixed its subtitle, see LOGGED_LINES. A moved sidecar counts."""
-    return x["code"] in LOGGED_LINES or (x["code"] in ("sidecar", "converted_sidecar") and bool(x.get("kept")))
+    """Whether the subtitle sentence x says the program fixed its subtitle, see LOGGED_LINES. A moved or renamed sidecar
+    counts."""
+    return x["code"] in LOGGED_LINES or (x["code"] in ("sidecar", "converted_sidecar") and bool(x.get("kept") or x.get("renamed")))
 
 
 def fixes(f):
@@ -579,10 +598,12 @@ def block(b):
 
 
 # Why a track that does not match stays in the file, per kept_back code of process.subtitle_checks(). names is a
-# garbled track whose file of bytes has no free name, see subtitles.sub_findings().
+# track whose file of bytes has no free name, see subtitles.sub_findings(). text is a track whose text does not read as
+# its tag, see subtitles.tag_read(), and lang is the language of its tag.
 KEPT_BACK = {"check": "SUBTITLES is set to check",
              "keep_days": "KEEP_ORIGINALS_DAYS is 0, and a removal needs a copy of the original",
-             "names": "other files hold the names for their text beside the video"}
+             "names": "other files hold the names for their text beside the video",
+             "text": "their text doesn't clearly read as {lang}"}
 
 
 REWRITE_FAILED = "rewriting the file failed"   # the words of a rewrite that failed, see remux_why()
@@ -634,22 +655,31 @@ def fix_failed(result):
 
 
 def stays(x, t):
-    """The end of the sentence of a track that does not match and stays in the file."""
+    """The end of the sentence of a track that does not match and stays in the file. A track whose flags the run did not
+    edit, as it had neither flag on, gets no sentence on its flags (no_flags)."""
     planned = t == "planned"
     flags = ("--apply would turn their default and forced flags off." if planned else "Turned off their default and forced flags.") \
-        if x["flags_off"] else "Their flags were left as they are."
+        if x["flags_off"] else "" if x.get("no_flags") else "Their flags were left as they are."
     if planned and x.get("hardlinked"):   # edit() and the remux both leave a hardlinked file as it is
         return block({"code": "hardlinked"})
     if planned and not x["gone"] and x.get("kept_back") == "keep_days":
         return ("They would stay in the file, because a removal keeps the original, and KEEP_ORIGINALS_DAYS is 0. Set "
-                f"KEEP_ORIGINALS_DAYS above 0 to remove them. {flags}")
+                f"KEEP_ORIGINALS_DAYS above 0 to remove them. {flags}").rstrip()
     if planned and x["gone"] and x.get("block"):
-        return "--apply would remove them." if x["block"]["code"] == "remux" else f'{block(x["block"])} They would stay in the file. {flags}'
-    why = remux_why(x["result"]) if x["gone"] else KEPT_BACK.get(x.get("kept_back"), "the run could not remove them")
-    return f"They're still in the file, because {why}. {flags}"
+        save = f' and save their text beside the file as {bold(x["saved"])}' if x.get("saved") else ""
+        return f"--apply would remove them{save}." if x["block"]["code"] == "remux" else f'{block(x["block"])} They would stay in the file. {flags}'.rstrip()
+    why = remux_why(x["result"]) if x["gone"] else KEPT_BACK.get(x.get("kept_back"), "the run could not remove them").format(
+        lang=lang_word(x["langs"].get(x["track"])) or "their language")
+    return f"They're still in the file, because {why}. {flags}".rstrip()
 
 
 def where(x):
+    """Where a sidecar that does not match went: a name no player reads (to), see subtitles.side_rename(), the kept
+    originals, or nowhere, and why."""
+    if x.get("renamed"):
+        return f'Renamed the file to {bold(x["to"])}.'
+    if x.get("to") and not x.get("left"):
+        return f'--apply would rename the file to {bold(x["to"])}.'
     return f'Moved the file to {x["kept"]}.' if x.get("kept") else f'The file was left beside the video, because {x.get("left") or "this is a dry run"}.'
 
 
@@ -796,13 +826,15 @@ def no_match(x):
 SIDECAR_NEEDS = {"retime": "are out of sync", "lengthen": "flash by too fast to read"}
 # Per sentence code of a subtitle alert, its text. subtitles.sub_findings() gives the codes and the facts, and sub_line() the track languages.
 SUB_LINES = {
-    "removed": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {no_match(x)}. Removed them and kept the original file at {x["kept"]}.',
+    "removed": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {no_match(x)}. Removed them and kept the original file at {x["kept"]}.'
+                            + (f' Saved their text beside the file as {bold(x["saved"])}.' if x.get("saved") else ""),
     "stays": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {no_match(x)}. {stays(x, t)}',
     "sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {no_match(x)}. {where(x)}',
     "layout": lambda x, t: f'{cap(sub_name(x["track"], x["langs"]))} {NO_LAYOUT}. They were left as they are.',
     "converted_sidecar": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {NO_MATCH}, so the conversion to MKV left them out. {where(x)}',
     "converted_track": lambda x, t: f'Subtitle track {x["track"][1:]} of the original file doesn\'t match what\'s said in the audio, so the '
-                                    f'conversion to MKV left it out. The original file is kept at {x["kept"]}.',
+                                    f'conversion to MKV left it out. The original file is kept at {x["kept"]}.'
+                                    + (f' Saved its text beside the file as {bold(x["saved"])}.' if x.get("saved") else ""),
     "sidecar_left": lambda x, t: f'{cap(sub_name(x["name"], x["langs"]))} {SIDECAR_NEEDS.get(x.get("action"), "need new times")}, but AMG '
                                  f'didn\'t change them, because {x["left"]}.',
     "off": off_line,
@@ -889,7 +921,7 @@ sidecar_step = lambda x: WRITE if x.get("left") and not x["left"].startswith(SET
 # that only reports, and SUBTITLES check give None.
 LINE_STEPS = {
     "removed": None, "converted_track": None, "repaired": None, "layout": None, "check_times": None, "check_flash": None,
-    "stays": lambda x: None if x.get("kept_back") else WRITE,
+    "stays": lambda x: WRITE if x.get("kept_back") == "names" else None if x.get("kept_back") else WRITE,   # as for "garbled"
     "sidecar": sidecar_step, "converted_sidecar": sidecar_step, "sidecar_left": sidecar_step, "garbled_sidecar": sidecar_step,
     "off": lambda x: SHIFT if x.get("offsets") or "moved" in x else None if x.get("would") else HEAR if x.get("unheard") else TEST,   # see off_line()
     "not_retimed": WRITE, "cover": WRITE,
@@ -1088,7 +1120,7 @@ def retime_change(rec, told):
 
 def edit_change(rec, told):
     """The track edit of rec, one sentence per kind: the default flags, the forced flags, the Original language flags,
-    and each language tag. The title names the kinds. A flag an alert says was turned off is left out, see said(). Each
+    the commentary flags, and each language tag. The title names the kinds. A flag an alert says was turned off is left out, see said(). Each
     track goes by its place after the run, as the probe after the edit has it. A language tag edit names the language
     the track had before it, from both old tags, see decide.track_tag()."""
     if "edited" not in (rec.get("result"), rec.get("edit_result")):
@@ -1107,6 +1139,9 @@ def edit_change(rec, told):
     out += [f"Marked {and_list(on)} as the original language."] * bool(on) + [f"Marked {and_list(no)} as not the original language."] * bool(no)
     if on or no:
         heads.append("original language flag" + ("s" if len(on + no) > 1 else ""))
+    if said := [name(e) for e in edits if decide.prop(e) == decide.COMMENTARY_FLAG]:
+        out.append(f"Turned the commentary flag on for {and_list(said)}.")
+        heads.append("commentary flag" + ("s" if len(said) > 1 else ""))
     tags = [e for e in edits if decide.prop(e) == decide.LANG_EDIT]
     # The old BCP 47 tag of each track with a LANG_IETF edit. Any other track had the BCP 47 tag of its legacy
     # language, so its legacy tag alone reads the same.

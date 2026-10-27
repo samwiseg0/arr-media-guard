@@ -63,8 +63,8 @@ def units(path):
             f = node.func
             name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
             owner = f.value.id if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) else None
-            if owner == "ff" and name in CALLS and node.args and isinstance(node.args[0], ast.Constant):
-                u[1].add(node.args[0].value)
+            if owner == "ff" and name in CALLS and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value is not None:
+                u[1].add(node.args[0].value)   # use None starts another tool, as mkvmerge, see ff.run()
             if name == "run_bounded":
                 u[1].update(k.value.value for k in node.keywords if k.arg == "use" and isinstance(k.value, ast.Constant))
             walk(node.func, unit, True)
@@ -143,8 +143,10 @@ def test_the_scan_takes_no_use_whose_names_miss_the_word(tmp_path):
 
 def said(word, texts):
     """Whether a string or an attribute of texts, see units(), holds word as a whole word. seek shows as -ss,
-    -read_intervals or a call of .seek(), the dump as the lines a parser looks for, and a filter in its log name too."""
-    alts = {"seek": ("-ss", "-read_intervals", ".seek()"), "dump": ("Output #", "encv")}.get(word, (word, f"Parsed_{word}_0"))
+    -read_intervals or a call of .seek(), the dump as the lines a parser looks for, aresample as a call of ff.clock(),
+    and a filter in its log name too."""
+    alts = {"seek": ("-ss", "-read_intervals", ".seek()"), "dump": ("Output #", "encv"), "aresample": ("aresample", ".clock()")}.get(
+        word, (word, f"Parsed_{word}_0"))
     return any(t in (f".{w}", f".{w}()") or re.search(rf"(?:(?<![A-Za-z_])|(?<=\\b)){re.escape(w)}(?![A-Za-z_])", t) for t in texts for w in alts)
 
 
@@ -324,9 +326,11 @@ def test_the_decoded_sample_count_is_named_as_a_count(clip, use):
 
 def test_whisper_hears_raw_pcm_with_no_time_field(clip, use):
     """The word times of Whisper count the samples of raw PCM from the -ss start. lid.extract() names no time field,
-    only the seek that ffmpeg's frame times place. A muxer or a filter that gives a time fails."""
-    argv = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", "0.5", "-i", clip, "-t", "1", "-map", "0:a", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"]
-    assert ff.READS["lid.extract"].names == ("seek",) and ff.check("lid.extract", argv)["got"] == {"seek"}
+    only the seek that ffmpeg's frame times place and aresample, which puts the samples on the file's clock. A muxer or
+    a filter that gives a time fails."""
+    argv = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", "0.5", "-i", clip, "-t", "1", "-map", "0:a", "-af", ff.clock(), "-ac", "1", "-ar", "16000",
+            "-f", "s16le", "-"]
+    assert ff.READS["lid.extract"].names == ("seek", "aresample") and ff.check("lid.extract", argv)["got"] == {"seek", "aresample"}
     assert len(ff.run("lid.extract", argv, capture_output=True).stdout) > 30000
     with pytest.raises(ff.TimeRead):
         ff.check("lid.extract", argv[:-3] + ["-af", "ashowinfo", "-f", "s16le", "-"])
@@ -651,7 +655,7 @@ def test_the_hook_holds_in_a_child_and_in_a_pool_worker(clip, tmp_path):
     finally:
         os.environ["AMG_FF_FAULTS"] = old
     with concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
-        assert pool.submit(ff.names, "lid.extract").result() == frozenset(("seek",))   # the worker imports the package
+        assert pool.submit(ff.names, "lid.extract").result() == frozenset(("seek", "aresample"))   # the worker imports the package
         assert pool.submit(eval, "__import__('sys')._amg_ff_audit").result() is True
 
 

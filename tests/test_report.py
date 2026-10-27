@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 import urllib.error
 import urllib.request
@@ -232,6 +233,8 @@ FINDINGS = [
      "because the MKV would lose some of their lines or show them wrong. The conversion to MKV left them out, and the file was left beside the "
      "video as it is. The Persian subtitles (track 2 of the converted file) can't be read as text, so they were removed and saved beside the "
      "file as Film A (1979).per.broken-encoding.srt.txt."),
+    ({"kind": "audio", "doubts": ["the start of the audio failed to decode, with 470 errors"], "mark": "whole"}, "Audio may be broken", "amber",
+     "The start of the audio failed to decode, with 470 errors. AMG kept the file and did not re-grab it."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -562,6 +565,32 @@ SUB_LINES = [
     ({"code": "garbled", "tracks": ["s2"], "repair": False, "flags_off": True, "encoding": True},
      "The Spanish subtitles (track 2) show broken characters, because some of their bytes aren't valid text, so they were left as they are.",
      None),
+    # A removed track's text beside the video, and a track whose text does not read as its tag, see subtitles.tag_read()
+    ({"code": "removed", "track": "s2", "why": "the words differ", "by": "run", "kept": "/k/F.mkv", "saved": "F.spa.mismatch.srt.txt"},
+     "The Spanish subtitles (track 2) don't match what's said in the audio. Removed them and kept the original file at /k/F.mkv. Saved their "
+     "text beside the file as F.spa.mismatch.srt.txt.", None),
+    ({**STAYS, "kept_back": "text"},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, because their text doesn't clearly "
+     "read as English. Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, because their text doesn't clearly "
+     "read as English. --apply would turn their default and forced flags off."),
+    ({**STAYS, "gone": True, "result": "would remux subtitles: remove track 3, its text to F.eng.mismatch.srt.txt", "block": {"code": "remux"},
+      "hardlinked": False, "saved": "F.eng.mismatch.srt.txt"},
+     "The English subtitles (track 1) don't match what's said in the audio. They're still in the file, because rewriting the file failed. "
+     "Turned off their default and forced flags.",
+     "The English subtitles (track 1) don't match what's said in the audio. --apply would remove them and save their text beside the file "
+     "as F.eng.mismatch.srt.txt."),
+    ({"code": "converted_track", "track": "s2", "why": "the words differ", "kept": "/k/F.mp4", "saved": "F.eng.mismatch.srt.txt"},
+     "Subtitle track 2 of the original file doesn't match what's said in the audio, so the conversion to MKV left it out. The original file "
+     "is kept at /k/F.mp4. Saved its text beside the file as F.eng.mismatch.srt.txt.", None),
+    # A sidecar that does not match gets a name no player reads, see subtitles.side_rename()
+    ({"code": "sidecar", "name": "F.es.srt", "why": "the words differ", "kept": None, "left": None, "to": "F.es.mismatch.srt.txt", "renamed": True},
+     "The subtitles in F.es.srt don't match what's said in the audio. Renamed the file to F.es.mismatch.srt.txt.", None),
+    ({"code": "sidecar", "name": "F.es.srt", "why": "the words differ", "kept": None, "left": None, "to": "F.es.mismatch.srt.txt", "renamed": False},
+     "The subtitles in F.es.srt don't match what's said in the audio. --apply would rename the file to F.es.mismatch.srt.txt.", None),
+    ({"code": "converted_sidecar", "name": "F.es.srt", "why": "the words differ", "kept": None, "left": None, "to": "F.es.mismatch.srt.txt", "renamed": True},
+     "The subtitles in F.es.srt don't match what's said in the audio, so the conversion to MKV left them out. Renamed the file to "
+     "F.es.mismatch.srt.txt.", None),
 ]
 
 def test_every_template_has_a_golden():
@@ -596,10 +625,35 @@ def test_each_subtitle_sentence_in_each_tense(x, done, planned):
     assert h.unmarked(h.sub_line(x, "planned", LANGS)) == (planned or done)
 
 
+def test_the_first_name_after_the_time_limit_keeps_the_limit(monkeypatch):
+    """The first name of a process reads mkvmerge's list with a bound of its own. A read after the job's time limit
+    ran out still names the language, and the limit still stops the job at its next check."""
+    monkeypatch.setattr(h, "LANGS", [])
+    deadline = h.arr_meta.DEADLINE
+    deadline.start(0.001)
+    time.sleep(0.01)
+    try:
+        assert h.texts({"kind": "language", "want": "English", "has": ["fij"]}, "done", {})[0] == "The audio is Fijian, but it should be English."
+        with pytest.raises(h.arr_meta.OutOfTime):
+            deadline.check()
+    finally:
+        deadline.stop()
+
+
 def test_a_language_has_its_english_name():
-    """A code in ALIAS takes the name of its set, an unknown code stays as it is."""
-    assert [h.arr_decide.lang_name(c) for c in ("fre", "gle", "zho", "per", "und", None, "xyz")] == \
-        ["French", "Irish", "Chinese", "Persian", "untagged", "untagged", "xyz"]
+    """A code in ALIAS takes the name of its set. Any other code takes its name from the list of the mkvmerge on PATH,
+    and a 639-1 code reads as its 639-2 code. A code with no name there stays as it is: mis, zxx, a local-use code and
+    an unknown code."""
+    assert [h.arr_decide.lang_name(c) for c in ("fre", "gle", "zho", "cmn", "fil", "nld", "per", "und", None, "xyz")] == \
+        ["French", "Irish", "Chinese", "Chinese", "Tagalog", "Dutch", "Persian", "untagged", "untagged", "xyz"]
+    assert [h.arr_decide.lang_name(c) for c in ("fij", "fj", "mya", "zsm", "haw", "el", "swa", "mis", "zxx", "qaa")] == \
+        ["Fijian", "Fijian", "Burmese", "Standard Malay", "Hawaiian", "Greek", "Swahili", "mis", "zxx", "qaa"]   # from mkvmerge 102
+    tags = [("fij", None), ("eng", "fj-FJ"), ("por", "pt-BR"), ("chi", "zh-Hant"), ("ger", "fr"), ("fij", "sm"), ("und", "haw")]
+    assert [h.arr_decide.lang_name(h.arr_decide.track_tag({"language": a, "language_ietf": b})) for a, b in tags] == \
+        ["Fijian", "Fijian", "Portuguese", "Chinese", "French", "Samoan", "Hawaiian"]   # a region or a script names no more
+    rec = dict(decision(), tracks=[{"i": "s2", "lang": "ara"}, {"i": "s4", "lang": "fij"}], subremux={"done": True, "fixed": ["s4"]},
+               subtime={"s4": {"verdict": "match", "timing": {"fix": {"rate": "1/1", "offset": 1.4}, "why": "x"}}})
+    assert h.unmarked(h.retime_change(rec, {"moved": set()})[1]).startswith("The Fijian subtitles (track 4) were about 1.4 s late.")
     assert h.arr_decide.lang_names(["eng", "jpn", "jap"], "or") == "English or Japanese" and h.late_by([2.54, -1.25]) == "2.5 s late and 1.2 s early"
     assert h.late_by([0.52, 0.48, 1.0]) == "0.5 s and 1.0 s late" and h.late_by([-0.5, 0.5, -0.5]) == "0.5 s early and 0.5 s late"
 
@@ -740,7 +794,7 @@ def test_the_embed_target_is_one_embed_per_finding():
 # The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
 # program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
 # track a conversion left out. Every other golden posts, a doubt and a failed restore too.
-LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9, 20, 21}, "sub_lines": {0, 7, 10, 23, 24, 26}}
+LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9, 20, 21}, "sub_lines": {0, 7, 10, 23, 24, 26, 62, 65, 66, 68}}
 SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "garbled_sidecar")   # the sentences of a submatch finding
 
 
@@ -978,6 +1032,22 @@ def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings)
     sent.clear()
     got, rec = changed(findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x"}]}])   # no kept
     assert rec["change_result"][0] == "no text: KeyError: 'kept'" and "Wrong subtitles" not in [e["title"] for e in sent] and len(sent) == 4
+
+
+def test_a_time_limit_that_runs_out_in_the_change_texts_ends_the_job(sent, settings, monkeypatch):
+    """The time limit ends the job. It runs out while the change posts render, so alert_findings() raises it, and the
+    job's handler records the end."""
+    settings(discord_posts="all")
+    real = h.render
+    def render(rec, target, tense=None):
+        if target == "changes":
+            h.arr_meta.DEADLINE.start(5)
+            h.arr_meta.DEADLINE.out()
+        return real(rec, target, tense)
+    monkeypatch.setattr(h, "render", render)
+    with pytest.raises(h.arr_meta.OutOfTime, match="^stopped after 5 seconds$"):
+        changed()
+    assert h.arr_meta.DEADLINE.end is None
 
 
 def test_an_alert_whose_text_fails_posts_a_plain_sentence(sent):
@@ -1272,7 +1342,7 @@ STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "
                          44: "Finding the shift", 45: "Finding the shift", 46: "Finding the shift", 47: "Finding the shift",
                          48: "Finding the shift", 49: "Finding the shift", 50: "Finding the shift", 51: "Finding the shift",
                          52: "Finding the shift", 53: "Finding the shift", 54: "Finding the shift", 56: "Writing the file", 57: "Writing the file",
-                         58: "Writing the file", 59: "Writing the file", 61: "Testing the fix"}}
+                         58: "Writing the file", 59: "Writing the file", 61: "Testing the fix", 64: "Writing the file"}}
 
 
 def test_every_alert_code_has_its_step():
@@ -1693,3 +1763,27 @@ def test_the_documented_undo_reverses_an_edit_from_the_editing_line(tmp_path, se
     script = procedure.split("<<'PY'\n", 1)[1].rsplit("PY\n", 1)[0].replace("/var/log/arr-media-guard.jsonl", str(log))
     subprocess.run([sys.executable, "-c", script], check=True)
     assert flags() == before
+
+
+@pytest.mark.parametrize("audio, tmdb, app, text", [
+    # The EO shape: Polish main audio, an English commentary, and TMDB's original English. The commentary never counts.
+    ([("pol", ""), ("eng", "Commentary")], "eng", "radarr", "The audio is Polish, but it should be English. The English track is commentary. "
+                                                           "TMDB lists English as the original language."),
+    ([("pol", "")], "eng", "radarr", "The audio is Polish, but it should be English. TMDB lists English as the original language."),
+    ([("pol", ""), ("eng", "Commentary"), ("eng", "Director's Commentary"), ("eng", "Audio Description")], None, "sonarr",
+     "The audio is Polish, but it should be English. The English tracks are commentary. The English track is an audio description. "
+     "Sonarr lists English as the original language."),
+    # French is no wanted language, and TMDB's original French disagrees with the app, so the app is the source
+    ([("pol", ""), ("fre", "Commentary")], "fre", "radarr", "The audio is Polish, but it should be English. "
+                                                           "Radarr lists English as the original language."),
+])
+def test_a_wrong_audio_language_names_the_main_audio_and_the_source(audio, tmdb, app, text):
+    """The language finding names the main audio only. An audio track in a wanted language that is no main track says
+    why it does not count. The last sentence names where the original language comes from: TMDB when its original
+    agrees, else the app, so the reader knows which metadata to fix."""
+    j = {"streams": [{"codec_type": "audio", "channels": 2, "tags": {"language": lang, "title": title}, "disposition": {"default": int(not k)}}
+                     for k, (lang, title) in enumerate(audio)]}
+    d = {"tracks": h.arr_decide.classify(j), "wrong_language": True}
+    meta = {"evidence": {"signals": [{"kind": "language", "verdict": "unknown"}]}, "expected": {"original": tmdb} if tmdb else None, "trusted": {}}
+    (f,) = h.file_alerts(d, [], meta, "English", {}, app)
+    assert f["has"] == ["pol"] and h.texts(f, "done", {})[0] == text, f

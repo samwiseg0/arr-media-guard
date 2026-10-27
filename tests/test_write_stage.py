@@ -20,7 +20,7 @@ import pytest
 
 from test_arr_media_guard import (FLAG_PASS, HEADER_HP, REAL_EXIT, REAL_FLOCK, REF, SHAPES, SILENCE, analyzes, backfill_films, burn, check_listed, claimed,  # noqa: F401
                                   convertible, decided, english_film, enqueue, env, films, finals, garbled_av, garbled_run, grabbed, hearing, hook,
-                                  japanese_burn, last_decided, late_english_film, layouts, log_lines, mk, mkvs, mp4_import, mp4_named_mkv,
+                                  japanese_burn, last_decided, late_english_film, layouts, lock_changes, log_lines, mk, mkvs, mp4_import, mp4_named_mkv,
                                   one_alert_film, pool, posted, queue_analysis, radarr_extras, real_convert, real_fork, real_wait, regrabs_counted,
                                   run_worker, silent, sub_probe, sub_time_film, talk, took_out, trace, traced, two_lines, upgrade, verdict,
                                   wrong_film)
@@ -95,12 +95,7 @@ def test_a_planned_remux_under_the_shared_lock_raises_no_replan(env, monkeypatch
     again from the start."""
     calls = header_issue(env, monkeypatch)
     ops = []
-
-    def flock(f, op):
-        if f.name.endswith("/lock"):
-            ops.append({fcntl.LOCK_SH: "shared", fcntl.LOCK_EX: "exclusive", fcntl.LOCK_UN: "unlock"}[op & ~fcntl.LOCK_NB])
-        REAL_FLOCK(f, op)
-    monkeypatch.setattr(hook.fcntl, "flock", flock)
+    monkeypatch.setattr(hook.fcntl, "flock", lock_changes(ops))
     hook.run_job(enqueue(env, 0, env["path"]), [], shared=True)
     assert [r for r in log_lines(env) if r.get("result") == "warning"] == [] and len(calls["checks"]) == 1, log_lines(env)
     assert ops[:3] == ["shared", "unlock", "exclusive"] and calls["repairs"] == [(True, decided(env)["edits"])] and env["mkvpropedit"] == []
@@ -883,6 +878,24 @@ def test_a_stop_between_two_sub_time_files_names_the_file_it_never_ran(env, monk
     assert f"--sub-time --apply did not make every change:\n  {other}: not run, the run was stopped\n" in out, out
 
 
+@pytest.mark.parametrize("asked", [False, True])
+def test_a_time_limit_that_ends_a_remux_ends_the_job(tmp_path, asked):
+    """The time limit ends the job. Swap.stop() reads OutOfTime as a stop: it raises it again, or with a stop asked
+    the run reads as stopped. No limit runs inside a Swap, see Swap.__init__()."""
+    path = tmp_path / "f.mkv"
+    path.write_bytes(b"")
+    hook.STOP.update(asked=asked)
+    sw = hook.Swap(str(path), os.stat(path), str(path) + ".tmp", {})
+    try:
+        if asked:
+            assert sw.stop(hook.arr_meta.OutOfTime("stopped after 300 seconds")) is True and hook.STOP["skipped"] and sw.info["stopped"]
+        else:
+            with pytest.raises(hook.arr_meta.OutOfTime):
+                sw.stop(hook.arr_meta.OutOfTime("stopped after 300 seconds"))
+    finally:
+        sw.release()
+
+
 def test_a_stop_during_a_remux_before_a_write_ends_the_job_at_once(mkvs, tmp_path, monkeypatch, settings):
     """A job process that has not written stops at once. The remux removes its temp file, and Swap.stop() raises the
     stop again, so the job goes back to the queue with no decision line. The original stays."""
@@ -1271,6 +1284,118 @@ def test_a_job_that_a_stop_cut_after_a_header_repair_rescans_in_its_next_run(env
     assert (calls["repairs"], [w[2]["name"] for w in rescans(env)], rec["rescan"]) == ([(True, [])], ["RescanMovie"], "sent"), rec
 
 
+def test_a_time_limit_in_the_rescan_a_stopped_run_left_ends_the_job(env, monkeypatch):
+    """The stopped run of the job repaired the header, and the file needs no flag edit. So the next run writes nothing,
+    and the rescan that the stopped run left runs under the job's time limit. The limit runs out in that call, and the
+    job ends with an error before the metadata checks."""
+    env["probe"] = {"container": {"properties": {"duration": 7200 * 10**9}},   # English plays first, so no flag edit
+                    "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6)]}
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
+    fake = hook.repack
+    monkeypatch.setattr(hook, "repack", lambda *a, **k: [fake(*a, **k), term()][0])
+    job = job_run(held=True)
+    hook.requeue(job)
+    write, ends = hook.arr_write, []
+    def late(app, p, method, body=None):
+        if p == "command" and (body or {}).get("name") == "RescanMovie":
+            ends.append(hook.DEADLINE.end)
+            if hook.DEADLINE.end is not None:
+                env["clock"][0] = hook.DEADLINE.end
+                hook.DEADLINE.check()
+        return write(app, p, method, body)
+    monkeypatch.setattr(hook, "arr_write", late)
+    job_run(job)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (rec["outcome"], rec["result"]) == ("error", f"error: OutOfTime: stopped after {hook.BUDGET} seconds"), rec
+    assert "tmdb" not in rec and len(ends) == 1 and ends[0] is not None, (rec, ends)
+
+
+@pytest.mark.parametrize("where", ["rescan", "languages", "subtitle_checks", "flag_hearing", "deep_drop"])
+def test_a_time_limit_after_the_header_repair_of_the_run_keeps_the_repair_on_the_line(env, monkeypatch, where):
+    """The run repairs the header and needs no flag edit. The time limit runs out in its rescan, or at the start of a
+    step before decision_fields() adds the reason code of the repair. The job ends with an error, and the line keeps
+    the repair and its reason code, so Plex analyzes the new file."""
+    env["probe"] = {"container": {"properties": {"duration": 7200 * 10**9}},   # English plays first, so no flag edit
+                    "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6)]}
+    calls = header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
+    ends = []
+    def late():
+        ends.append(hook.DEADLINE.end)
+        if hook.DEADLINE.end is not None:
+            env["clock"][0] = hook.DEADLINE.end
+            hook.DEADLINE.check()
+    if where == "rescan":
+        write = hook.arr_write
+        def arr_write(app, p, method, body=None):
+            if p == "command" and (body or {}).get("name") == "RescanMovie":
+                late()
+            return write(app, p, method, body)
+        monkeypatch.setattr(hook, "arr_write", arr_write)
+    else:
+        steps = list(hook.STEPS)
+        i = [s.__name__ for s in steps].index(where)
+        real = steps[i]
+        def step(ctx):
+            late()
+            return real(ctx)
+        step.__name__ = where
+        steps[i] = step
+        monkeypatch.setattr(hook, "STEPS", tuple(steps))
+    name, pending = hook.queue_job(hook.Event.from_env("radarr").job()), []
+    assert hook.claim(name)
+    hook.run_job(name, pending, claimed=True)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (rec["outcome"], rec["result"]) == ("error", f"error: OutOfTime: stopped after {hook.BUDGET} seconds"), rec
+    assert (rec["header_repair"]["code"], rec.get("reasons"), hook.changed(rec), len(pending)) == ("header_repaired", ["header_repaired"], True, 1), rec
+    assert len(calls["repairs"]) == 1 and len(ends) == 1 and ends[0] is not None, (calls, ends)
+
+
+def test_an_error_after_the_flag_edit_of_the_run_keeps_the_edit_on_the_line(env, monkeypatch):
+    """The run edits the flags, and an error ends it at the start of after_edit(). The line keeps the edit as
+    edit_result, so Plex analyzes the file. The reason codes stay those of the writes that replaced the file, so they
+    hold no "edited"."""
+    steps = list(hook.STEPS)
+    i = steps.index(hook.after_edit)
+    def after_edit(ctx):
+        raise RuntimeError("made-up error")
+    after_edit.__name__ = "after_edit"
+    steps[i] = after_edit
+    monkeypatch.setattr(hook, "STEPS", tuple(steps))
+    name, pending = hook.queue_job(hook.Event.from_env("radarr").job()), []
+    assert hook.claim(name)
+    hook.run_job(name, pending, claimed=True)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (rec["outcome"], rec["result"], rec["edit_result"]) == ("error", "error: RuntimeError: made-up error", "edited"), rec
+    assert (rec.get("reasons"), bool(rec["edits"]), hook.changed(rec), len(pending)) == (None, True, True, 1), rec
+
+
+def test_a_time_limit_that_ends_the_video_check_gives_the_steps_after_it_a_new_limit(env, monkeypatch):
+    """The time limit runs out in the video check of the header step. The check gives no verdict, and the run gets a
+    new limit, so each step after it runs under one."""
+    env["probe"] = {"container": {"properties": {"duration": 7200 * 10**9}},
+                    "tracks": [mk("video", "und", 1, True), mk("audio", "eng", 2, True, audio_channels=6)]}
+    real_vc = hook.video_check
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
+    monkeypatch.setattr(hook, "video_check", real_vc)
+    def check_video(*a, **k):
+        env["clock"][0] = hook.DEADLINE.end
+        hook.DEADLINE.check()
+    monkeypatch.setattr(hook, "check_video", check_video)
+    steps, seen = list(hook.STEPS), {}
+    for i, s in enumerate(steps):
+        def wrap(ctx, s=s):
+            seen[s.__name__] = hook.DEADLINE.end is not None
+            return s(ctx)
+        wrap.__name__ = s.__name__
+        steps[i] = wrap
+    monkeypatch.setattr(hook, "STEPS", tuple(steps))
+    job_run()
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    after = [n for n in seen if list(seen).index(n) > list(seen).index("header") and n in ("languages", "subtitle_checks", "flag_hearing", "faults", "act")]
+    assert after and all(seen[n] for n in after), seen
+    assert rec["header_repair"]["result"].startswith("not repaired: the video check failed: OutOfTime"), rec["header_repair"]
+
+
 def test_a_deep_analysis_that_a_stop_cut_keeps_its_held_alerts(env, monkeypatch, settings):
     """Reviewer 2026-10-20 (P7): a deep analysis that a stop cut still ran held_after(), which posts or drops the alerts
     the import held, and dropped its read of the subtitles. Its job goes back, and the next run did it all again. Now
@@ -1320,6 +1445,48 @@ def test_a_file_the_app_removes_after_the_write_keeps_its_line(env, monkeypatch,
     hook.main([])
     rec = decided(env)
     assert rec["outcome"] == ("edited" if edits else "no_change") and "evidence" not in rec, rec["result"]
+
+
+def test_a_post_of_the_alerts_runs_with_no_limit_after_the_app_removed_the_file(env, monkeypatch):
+    """The app removes the file after the write, so the metadata checks skip it and stop no limit. alerts() stops the
+    job's limit itself, so a post near the end of the limit still posts, and the line keeps its finding."""
+    monkeypatch.setattr(hook, "needed", lambda j, e: [])
+    real_edit = hook.edit
+    monkeypatch.setattr(hook, "edit", lambda rec, *a, **k: [real_edit(rec, *a, **k), os.remove(rec["path"])][0])
+    monkeypatch.setattr(hook, "file_alerts", lambda *a, **k: [{"kind": "runtime", "listed": 62, "file": 30}])
+    real, live = hook.http, []
+    def http(url, method="GET", body=None, headers=None, timeout=15):
+        if "discord.invalid" in url:
+            live.append(hook.DEADLINE.end is not None)
+            if hook.DEADLINE.end is not None:   # the limit runs out in the post
+                env["clock"][0] = hook.DEADLINE.end
+                hook.DEADLINE.check()
+        return real(url, method, body, headers, timeout)
+    monkeypatch.setattr(hook, "http", http)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], [f["kind"] for f in rec["findings"]], rec["alert_result"], live) == ("no_change", ["runtime"], ["sent"], [False]), rec
+
+
+def test_a_post_of_the_stop_line_runs_with_no_limit(env, monkeypatch, settings):
+    """A job repairs the header, and a stop comes before its checks. stop_line() stops the job's limit, so its change
+    post runs with no limit, and the line keeps the repair and the Plex analyze."""
+    settings(discord_posts="all")
+    header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
+    fake = hook.repack
+    monkeypatch.setattr(hook, "repack", lambda *a, **k: [fake(*a, **k), term()][0])
+    real, live = hook.http, []
+    def http(url, method="GET", body=None, headers=None, timeout=15):
+        if "discord.invalid" in url:
+            live.append(hook.DEADLINE.end is not None)
+            if hook.DEADLINE.end is not None:
+                env["clock"][0] = hook.DEADLINE.end
+                hook.DEADLINE.check()
+        return real(url, method, body, headers, timeout)
+    monkeypatch.setattr(hook, "http", http)
+    job_run(held=True)
+    rec = [r for r in log_lines(env) if "schema" in r][-1]
+    assert (rec["outcome"], rec["reasons"], hook.changed(rec), live) == ("stopped", ["header_repaired"], True, [False]), rec
 
 
 @pytest.mark.parametrize("first", [False, True])

@@ -768,7 +768,7 @@ def test_a_stop_after_the_jobs_own_flag_edit_names_it(env, monkeypatch, tmp_path
 def test_a_sidecar_move_after_the_jobs_own_conversion_runs(env, monkeypatch, settings, tmp_path):
     """Reviewer X4 2026-10-22: after the job's own conversion the rest runs as --check --apply runs it. A subtitle tool
     puts a sidecar with the lines of another film beside the new file as the conversion ends. The check finds the
-    mismatch, and sidecar_fix() moves the sidecar to the kept originals."""
+    mismatch, and sidecar_fix() gives the sidecar a name no player reads beside the new file."""
     from test_arr_media_guard import srt_text
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
     check_listed(env, monkeypatch)
@@ -793,8 +793,8 @@ def test_a_sidecar_move_after_the_jobs_own_conversion_runs(env, monkeypatch, set
     check_plan(env, tmp_path, mp4)
     hook.background(hook.deep_name(mp4), [])
     rec = lines(env, "check_job")[-1]
-    assert rec["outcome"] not in ("plan_refused", "error") and [e["result"] for e in rec.get("sidecars") or []] == ["moved"], rec
-    assert not os.path.exists(mkv[:-4] + ".en.srt")
+    assert rec["outcome"] not in ("plan_refused", "error") and [e["result"] for e in rec.get("sidecars") or []] == ["renamed"], rec
+    assert not os.path.exists(mkv[:-4] + ".en.srt") and os.path.exists(mkv[:-4] + ".en.mismatch.srt.txt")
 
 
 def test_a_blocked_remux_whose_fit_moved_in_the_apply_refuses(env, monkeypatch, tmp_path):

@@ -9,12 +9,9 @@ from . import checks, cli, config, content, convert, decide, ff, matroska, mp4, 
 PROOF_RATE = 10e6         # bytes a second a proof read must reach at least, else it times out
 SYNC = 0.05               # seconds a stream's start may move against the first video stream's
 TS_WRAP = (1 << 33) / 90000   # seconds a TS PTS counts before it wraps
-OVERLAP_MOVE = 0.2        # seconds an audio frame may move later where the original's blocks overlap, see times_fault().
-                          # The player measurement of such a remux covered moves up to 150 ms.
-CLOSE_MOVE = OVERLAP_MOVE  # seconds a remux moves audio frames later, at most, to close such an overlap, see remux.planned_times().
-                          # The owner picked this on 2026-10-21. With OVERLAP_MOVE 0, every frame keeps its time. With
-                          # float("inf") here, every overlap closes, as mkvmerge closes it on its own, and the proof refuses a
-                          # move past OVERLAP_MOVE.
+CLOSE_MOVE = 0.2          # seconds a remux moves audio frames later, at most, to close an overlap after a lace, see
+                          # remux.planned_times() and times_fault(). The owner picked 0.2 s on 2026-10-21, and on
+                          # 2026-10-24 to close only an overlap after a lace. Every other overlap keeps its stored times.
 TIME_SLACK = 0.002        # seconds a packet's time may move against its stream's start when ffmpeg reads the original, see
                           # mkv_slack() for two Matroska files
 LAG_SLACK = 1.0           # seconds a stream may sit behind the other streams of a new file, or 1 ms further than in the original, see lag_over()
@@ -31,7 +28,8 @@ SIDECAR_FLAGS = {"forced": "--forced-display-flag", "hi": "--hearing-impaired-fl
 # and drops its delimiters, and stores H.264 from a transport stream with length prefixes. Filler carries no picture.
 # filter_units rewrites every unit it parses, so it runs on both sides. The parameter sets it takes out of HEVC
 # packets stay in the codec private data of both files. mkvmerge keeps MPEG-4 packed B-frames packed, so MPEG-4 part 2
-# needs no filter. PCM has no frames, and mkvmerge cuts it into other packets, so both sides are cut again into packets
+# needs no filter. From an MP4 or MOV, mkvmerge puts the codec header of MPEG-4 part 2 in front of packet 0, see
+# header_units(). PCM has no frames, and mkvmerge cuts it into other packets, so both sides are cut again into packets
 # of 4,096 samples ("pcm_*").
 NO_AUD = {"h264": "filter_units=remove_types=9|12", "hevc": "filter_units=remove_types=32-35"}
 PROOF_BSF = {("mpegts", "aac"): ("aac_adtstoasc", None),
@@ -89,7 +87,8 @@ def sidecar_subs(path, unknown=False):
     sidecar_text(). end is where its last cue ends, in seconds. ordered says each cue starts no earlier than the one
     before, else mkvmerge warns. read is text_language() of its first cues, and cues is srt_cues() of its text.
     misread is misread() of its text, and glued is glued_cue() of it. A sidecar whose charset is unknown comes only with
-    unknown, with the charset None and no cues. So no check reads its text, and no fix writes it."""
+    unknown, with the charset None and no cues. So no check reads its text, and no fix writes it. Its misread is
+    decide.ASS_TEXT when its bytes read as latin-1 open an SSA or ASS script, see decide.ass_text(), else None."""
     folder, base = os.path.split(os.path.splitext(os.path.abspath(path))[0])
     try:
         names = sorted(n for n in os.listdir(folder) if n.startswith(base + ".") and n.lower().endswith(".srt"))
@@ -100,16 +99,21 @@ def sidecar_subs(path, unknown=False):
         tags = [t for t in n[len(base) + 1:-4].lower().split(".") if t]
         named = tags[0] if tags and tags[0] not in SIDECAR_FLAGS and re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})*", tags[0]) else None
         with open(os.path.join(folder, n), "rb") as f:
-            charset, text = sidecar_text(f.read(), named)
+            raw = f.read()
+        charset, text = sidecar_text(raw, named)
         if charset is None and not unknown:
             continue
         got = decide.srt_read(text or "")
         blocks = [[c[0], c[1], decide.srt_text(got[0], c, " ")] for c in got[2]]   # srt_blocks()
         cues, starts = clean_cues(blocks), [c[0] for c in blocks]
         read = decide.text_language(c[2] for c in cues)
+        # The section lines of an SSA or ASS script are ASCII, so a latin-1 read finds them in any codepage. mkvmerge skips a
+        # UTF-8 BOM before them, as before cp1252 text.
+        latin = raw.removeprefix(b"\xef\xbb\xbf").decode("latin-1")
+        why = misread(*got) if charset else decide.ASS_TEXT if decide.ass_text(decide.srt_lines(latin)[0]) else None
         out.append(dict(path=os.path.join(folder, n), name=n, named=named, lang=named or read[0] or "und", flags=sorted({SIDECAR_FLAGS[t] for t in tags if t in SIDECAR_FLAGS}),
                         charset=charset, end=max((c[1] for c in cues), default=0) / 1000, ordered=starts == sorted(starts), read=read, cues=cues,
-                        misread=misread(*got), glued=glued_cue(got[0], got[2])))
+                        misread=why, glued=glued_cue(got[0], got[2])))
     return out
 
 
@@ -135,13 +139,17 @@ def misread(lines, ends, cues, stop):
     """Why mkvmerge 102 reads a SubRip text, decide.srt_read() of it, otherwise than a player shows it, or None
     (docs/design.md, "Conversion"). mkvmerge cannot identify the text, or it stops reading it. It reads a timing line
     as text of the cue before, where a player shows a cue of its own. Or it drops cues with text, see clean_text(),
-    that end at or before their start. A conversion leaves such a sidecar beside the new file as it is."""
+    that end before their start, which a player shows up to the next cue. A conversion leaves such a sidecar beside the
+    new file as it is. A cue that ends at its start counts as no cue: mkvmerge drops it, and no player shows it. A text
+    that mkvmerge identifies as SSA or ASS gives decide.ASS_TEXT, see decide.ass_text()."""
     if stop is not None:
-        return f"mkvmerge stops reading it at line {stop + 1}" if stop or decide.srt_probe(lines, ends) else "mkvmerge cannot identify it as SubRip"
+        if stop or decide.srt_probe(lines, ends):
+            return f"mkvmerge stops reading it at line {stop + 1}"
+        return decide.ASS_TEXT if decide.ass_text(lines) else "mkvmerge cannot identify it as SubRip"
     timed = next((i for c in cues for i in c[3] if decide.SRT_TIME.match(lines[i])), None)
     if timed is not None:
         return f"mkvmerge reads the timing line at line {timed + 1} as text"
-    dropped = sum(c[1] <= c[0] for c in cues if clean_text(decide.srt_text(lines, c)))
+    dropped = sum(c[1] < c[0] for c in cues if clean_text(decide.srt_text(lines, c)))
     return f"mkvmerge drops {dropped} of its cues" if dropped else None
 
 
@@ -554,8 +562,9 @@ def stored_places(path, streams, fam="matroska", folder=None, timeout=600, whole
     matroska.frames(), MP4 and QuickTime ("mov") with mp4.samples(), MPEG-TS and M2TS with ts.frames(). info holds the
     tick of the file's times in ns (scale), the seconds of one frame or None (frame), [count, worst s, first s] of the
     blocks that start before the block before them ends (overlaps), or None, the stored time in seconds of each such
-    block (lapped), the count of frames whose time is not known (unknown), whether the last frame in time order has no
-    duration (unended), and exact, True when the container stores exact times that a Matroska copy rounds, see
+    block whose block before is a lace (lapped), the count of frames whose time is not known (unknown), whether the last
+    frame in time order has no duration (unended), and exact, True when the container stores exact times that a
+    Matroska copy rounds, see
     mkv_slack(). An MP4 also gives shift, see start_plan(). An empty Matroska frame is a block too, so a frame with data
     before it has an end. PCM has no frames. Both files cut it again into packets of
     4096 samples (PROOF_BSF), and ffmpeg's pcm_rechunk times each one at the stored time of its block plus its sample
@@ -721,9 +730,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     with data and a sha256 over the md5 of each packet, read with -c copy. Where mkvmerge changes packets on purpose, the
     original's packets go through the same bitstream filter first, PROOF_BSF. A packet with no data (an AVI drop frame)
     holds nothing, so it does not count. Timed text, and a sidecar, must keep every cue and its text, see srt_cues().
-    Each stream must start where it started against the first video stream, within SYNC, and the video and the audio
-    must end within 1 s of where they ended. Every packet must also keep its time against its stream's first packet,
-    see times_fault(). Those checks run for every stream, whatever passed its data.
+    A SubRip cue of a sidecar that ends at its start is no cue, see misread(). Each stream must start where it started
+    against the first video stream, within SYNC, and the video and the audio must end within 1 s of where they ended.
+    Every packet must also keep its time against its stream's first packet, see times_fault(). Those checks run for every stream, whatever passed its data.
 
     Some differences pass. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
@@ -751,8 +760,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     A few more packets may go at the ends when every other packet matches in order, see ends_lost(): up to END_LOSS
     video packets at the end, junk and cut frames at the ends of an audio stream, and an audio lead of at most
     LEAD_LOSS seconds, whatever it holds. The entry names them in dropped_start and dropped_end. The first kept packet
-    after a lead must keep its time within TIME_SLACK. An HEVC or VC-1 packet 0 may also hold units of the codec header more, see header_units(), named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length. An
-    audio packet that shares its time with a neighbour may move one frame, see times_fault(). captions maps the stream index of
+    after a lead must keep its time within TIME_SLACK. An HEVC or VC-1 packet 0 may also hold units of the codec header more, see header_units(), named in header_units. A zero-length timed-text cue may get a length, see zero_cues(), named in zero_length.  captions maps the stream index of
     a CEA-608 track to the SubRip file convert_captions() wrote. The track pairs with a subtitle stream after the kept
     ones, and its text must match.
 
@@ -934,8 +942,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             if a:   # the stream now starts at its first kept packet
                 xs = xt[0] if xt and xt[0] is not None else xs
                 proof[-1]["start"][0] = round(xs - va, 3)
-        elif s["codec_name"] in ("hevc", "vc1") and x["count"] == y["count"] and x["digest"] != y["digest"] and \
-                x.get("but_first") == y.get("but_first") and (units := header_units(src, tmp, s["index"], t["index"], f, timeout, s["codec_name"])):
+        elif (s["codec_name"] in ("hevc", "vc1") or s["codec_name"] == "mpeg4" and fam == "mov") and x["count"] == y["count"] and \
+                x["digest"] != y["digest"] and x.get("but_first") == y.get("but_first") and \
+                (units := header_units(src, tmp, s["index"], t["index"], f, timeout, s["codec_name"])):
             proof[-1]["header_units"] = units   # mkvmerge copies units of the codec header into packet 0
         elif s["codec_name"] == "hevc" and x["count"] == y["count"] and x["digest"] != y["digest"] and \
                 (dv := rpu_moves(src, tmp, s["index"], t["index"], timeout)):   # an old mkvmerge put each RPU in the next packet
@@ -1019,16 +1028,15 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         if not why and fam == "avi" and s["codec_type"] == "audio":
             proof[-1]["times"] = {"checked": False, "why": "AVI keeps no audio times"}
         elif not why:
-            video = (va, vb) if s["codec_type"] == "audio" else None   # packets that share a time, see times_fault()
             if both:   # stored times in both files: a muxer that moved a time past the rounding refuses
-                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video, sync if s["codec_type"] == "subtitle" and not absolute else slack,
+                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, sync if s["codec_type"] == "subtitle" and not absolute else slack,
                                                       ((0, 0) if absolute else (va, vb)) if s["codec_type"] == "subtitle" else None, paired=True,
                                                       length=ia.get("frame"), overlaps=ia.get("overlaps"), lapped=ia.get("lapped") or ())
             else:
-                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt, video)
+                why, proof[-1]["times"] = times_fault(name, s["codec_name"], xt, yt)
             if why and fb.startswith("matroska") and not stored:   # ffmpeg's muxer may move a few times of its read, see packet_places()
                 got = [None if v != v else v for v in (pb.get(t["index"]) or [[]])[0]]
-                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, got[ycut], video)
+                why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, got[ycut])
         proof[-1]["match"] = not why
         if why and not fault:
             fault, stream = why, bad
@@ -1055,7 +1063,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                 side, why = raw.decode(PY_CHARSET[sc["charset"]]), None
             except UnicodeDecodeError:   # the file changed since its charset was read
                 side, why = "", f"{what} does not decode as {sc['charset']} now"
-            ca, stop = srt_cues(side), decide.srt_read(side)[3]
+            ca, stop = [c for c in srt_cues(side) if c[0] != c[1]], decide.srt_read(side)[3]   # a cue of length 0 is none, see misread()
             why = why or (stop is not None and f"mkvmerge stops reading {what} at line {stop + 1}") or cue_fault(what, ca, srt_cues(tb[t["index"]]))
             proof.append(dict(stream=f"{s['codec_type']} {s['index']}" if s else sc["name"], codec=s["codec_name"] if s else "subrip",
                               method="caption text" if s else "sidecar text", count=len(ca), match=not why))
@@ -1170,7 +1178,7 @@ def us(t):
     return round(t * 1e6)
 
 
-def times_fault(name, codec, xt, yt, video=None, slack=TIME_SLACK, zero=None, paired=False, length=None, overlaps=None, lapped=()):
+def times_fault(name, codec, xt, yt, slack=TIME_SLACK, zero=None, paired=False, length=None, overlaps=None, lapped=()):
     """(why the packet times of a stream moved in the new file, or None; the check for the proof entry). xt and yt are
     the times of the packets with data, in file order. The one packet an exception left out is already gone. Each list
     is sorted and taken against its own first time. Each pair may differ by slack, TIME_SLACK by default, in whole
@@ -1184,30 +1192,22 @@ def times_fault(name, codec, xt, yt, video=None, slack=TIME_SLACK, zero=None, pa
     In a TS whose audio times go back 0.3 s at 2 minutes, mkvmerge makes the audio continuous. The new file then plays
     0.3 s late from there, and that fails here.
 
-    paired is True for two Matroska files, whose times come from stored_places(). Their packets matched in order, so
-    each pair is the same frame, in file order. No list is sorted then. A pair with a time that is not known (None)
-    drops out of the check. The entry counts it in unknown. slack is then mkv_slack().
-
-    video is (the original's video start, the new file's) for an audio stream. A second check runs when the check
-    fails and packets of the original share a time with a neighbour. It measures every time against the video's start,
-    as the start check does. A packet that shares a time may move one frame, and slack more for the rounding. Every
-    other packet may move slack. For paired files one frame is length, the seconds of a frame the original defines.
-    When the original defines none, a packet that shares a time may move slack only. For other files one frame is the
-    median step of the original. An MP4 can give its first two AAC packets one time, and mkvmerge spaces them one
-    frame apart. The check then names the shared packets in shared.
+    paired is True for two files whose times come from stored_places(). Their packets matched in order, so each pair
+    is the same frame, in file order. No list is sorted then. A pair with a time that is not known (None) drops out of
+    the check. The entry counts it in unknown. slack is then mkv_slack().
 
     An audio frame of paired files may also move later than its defined time. That passes when the new file plays on
     in whole frames from the last frame that kept its time. Its new time is then that frame's new time plus one frame
-    (length) for each frame between, within slack. Where the original's blocks overlap, mkvmerge makes the
-    audio contiguous so. A player then plays it closer to the picture. So the chain must hold a block of the original
-    after the frame that kept its time. That block starts before the block before it ends. lapped holds the stored
-    times of those blocks. The move may reach OVERLAP_MOVE at most. An earlier move refuses, so a gap of the original
-    never closes. A later move that is not contiguous refuses, and so does a chain with no such block. So a slow drift
-    never passes. A frame that shares a time with a neighbour and moves more than slack may go on with the chain by the
-    same rule. When it does not, it counts as a frame that kept its time. The check counts such frames in contiguous, with the worst move and the first time. The refusal says
-    where the new file plays out of sync, see out_of_sync(). It takes the moves of the check that refused. For paired
-    files it also names the count of moved frames. It names overlaps too, see stored_places(). That is [count, worst s,
-    first s] of the original's blocks that start before the block before them ends."""
+    (length) for each frame between, within slack. Where a block of the original starts before the end of the lace
+    before it, the remux plays the audio on so, see remux.planned_times(). A player then plays it closer to the
+    picture. So the chain must hold such a block of the original after the frame that kept its time. lapped holds the
+    stored times of those blocks. The move may reach CLOSE_MOVE at most. An earlier move refuses, so a gap of the
+    original never closes. A later move that is not contiguous refuses, and so does a chain with no such block. So a
+    slow drift never passes, and neither does a move past any other overlap. The check counts such frames in
+    contiguous, with the worst move and the first time. The refusal says where the new file plays out of sync, see
+    out_of_sync(). For paired files it also names the count of moved frames. It names overlaps too, see
+    stored_places(). That is [count, worst s, first s] of the original's blocks that start before the block before
+    them ends."""
     if len(xt) != len(yt) or (not paired and (None in xt or None in yt)):
         return (f"stream {name} ({codec}) has packets with no time", {"checked": False}) if len(xt) == len(yt) else \
             (f"stream {name} ({codec}) holds {len(yt)} timed packets in the new file, {len(xt)} in the original", {"checked": False})
@@ -1216,52 +1216,38 @@ def times_fault(name, codec, xt, yt, video=None, slack=TIME_SLACK, zero=None, pa
     if not paired:
         a, b = sorted(a), sorted(b)
     za, zb = (us(zero[0]), us(zero[1])) if zero else (min(a), min(b)) if a else (0, 0)
-    worst, at = 0, None
-    for p, q in zip(a, b):
-        d = abs((p - za) - (q - zb))
-        if d > worst:
-            worst, at = d, p - za
-    check = {"worst_ms": round(worst / 1000, 1), **({"at": round(at / 1e6, 3)} if at is not None and worst > slack else {}),
+    moves = [abs((q - zb) - (p - za)) for p, q in zip(a, b)]
+    worst = max(moves, default=0)
+    check = {"worst_ms": round(worst / 1000, 1), **({"at": round((a[moves.index(worst)] - za) / 1e6, 3)} if worst > slack else {}),
              **({"unknown": len(xt) - len(known)} if len(known) < len(xt) else {})}
-    same = {j for i in range(1, len(a)) if a[i] == a[i - 1] for j in (i - 1, i)} if worst > slack and video else set()
-    if same and len(set(a)) > 1:
-        steps = sorted(q - p for p, q in zip(a, a[1:]) if q > p) if not paired else []
-        zero = (us(video[0]), us(video[1]))
-        frame, moves = us(length or 0) if paired else steps[len(steps) // 2], [abs((q - zero[1]) - (p - zero[0])) for p, q in zip(a, b)]
-        check["shared"] = {"packets": len(same), "frame_ms": round(frame / 1000, 1), "worst_ms": round(max(moves) / 1000, 1)}
-        if all(d <= (frame if i in same else 0) + slack for i, d in enumerate(moves)):
-            return None, check
-    if worst > slack:
-        if "shared" not in check:   # the moves of the first check, each against its stream's first time
-            moves, frame, same, zero = [abs((q - zb) - (p - za)) for p, q in zip(a, b)], 0, set(), (za, zb)
-        # Each frame may move slack, a frame that shares a time one frame more. An audio frame of paired files may also
-        # move later when the new file plays on in whole frames from the last frame that kept its time (the anchor),
-        # after an overlap of the original's blocks, see "Overlapping blocks".
-        out = [i for i, d in enumerate(moves) if d > (frame if i in same else 0) + slack]
-        step, anchor, closed, moved = (length or 0) * 1e6 if paired and video else 0, None, [], set(out)   # us, kept as a float
-        lap, cap, seen = {us(t) for t in lapped}, us(OVERLAP_MOVE), False   # seen: an overlapping block since the anchor
-        for i in range(len(a)) if step and out else ():
-            seen = (i in moved or i in same and moves[i] > slack) and (seen or a[i] in lap)   # a shared frame may go on with the chain
-            if anchor is not None and seen and moves[i] <= cap and b[i] - zero[1] > a[i] - zero[0] and \
-                    abs(b[i] - b[anchor] - (i - anchor) * step) <= slack:
-                closed.append(i)
-            elif i not in moved:
-                anchor, seen = i, False
-        if closed:
-            check["contiguous"] = {"frames": len(closed), "worst_ms": round(max(moves[i] for i in closed) / 1000, 1),
-                                   "first": round(a[closed[0]] / 1e6 - zero[0] / 1e6 + zero[1] / 1e6, 3)}
-            out = sorted(moved - set(closed))
-        if not out:
-            return None, check
-        sec = lambda v: [x / 1e6 for x in v]
-        why = out_of_sync(name, codec, sec(a), sec(b), out, sec(moves), same, sec(zero))
-        if paired:
-            why += f". {len(out)} of {len(a)} frames moved"
-            one = overlaps and overlaps[0] == 1
-            why += (f". The original stores {overlaps[0]} block{'' if one else 's'} that start{'s' if one else ''} before the block before "
-                    f"{'it' if one else 'them'} ends, up to {overlaps[1] * 1000:.0f} ms, the first at {overlaps[2]:.3f} s") if overlaps else ""
-        return why, check
-    return None, check
+    if worst <= slack:
+        return None, check
+    # A frame may move slack. An audio frame of paired files may also move later when the new file plays on in whole
+    # frames from the last frame that kept its time (the anchor), after a block in lapped, see "Overlapping blocks".
+    out = [i for i, d in enumerate(moves) if d > slack]
+    step, anchor, closed, moved = (length or 0) * 1e6 if paired else 0, None, [], set(out)   # us, kept as a float
+    lap, cap, seen = {us(t) for t in lapped}, us(CLOSE_MOVE), False   # seen: a block of lapped since the anchor
+    for i in range(len(a)) if step and lap else ():
+        seen = i in moved and (seen or a[i] in lap)
+        if anchor is not None and seen and moves[i] <= cap and b[i] - zb > a[i] - za and abs(b[i] - b[anchor] - (i - anchor) * step) <= slack:
+            closed.append(i)
+        elif i not in moved:
+            anchor, seen = i, False
+    if closed:
+        check["contiguous"] = {"frames": len(closed), "worst_ms": round(max(moves[i] for i in closed) / 1000, 1),
+                               "first": round((a[closed[0]] - za + zb) / 1e6, 3)}
+        out = sorted(moved - set(closed))
+    if not out:
+        return None, check
+    sec = lambda v: [x / 1e6 for x in v]
+    same = {j for i in range(1, len(a)) if a[i] == a[i - 1] for j in (i - 1, i)} if name.startswith("audio") else set()   # the detail of audio
+    why = out_of_sync(name, codec, sec(a), sec(b), out, sec(moves), same, sec((za, zb)))
+    if paired:
+        why += f". {len(out)} of {len(a)} frames moved"
+        one = overlaps and overlaps[0] == 1
+        why += (f". The original stores {overlaps[0]} block{'' if one else 's'} that start{'s' if one else ''} before the block before "
+                f"{'it' if one else 'them'} ends, up to {overlaps[1] * 1000:.0f} ms, the first at {overlaps[2]:.3f} s") if overlaps else ""
+    return why, check
 
 
 # Per stream kind: how the new file plays it, and what it plays against, see out_of_sync()
@@ -1271,8 +1257,8 @@ SYNC_WORDS = {"audio": ("play the audio", "the video"), "video": ("show the vide
 def out_of_sync(name, codec, a, b, out, moves, same, zero):
     """The refusal of times_fault(): when the new file would play stream name out of sync, then one technical line. a
     and b hold the sorted times of the original and the new file, out the packets that moved more than they may, moves
-    how far each one moved, same the packets that share a time in the original, and zero the time in each file that
-    the moves count from. The span takes its times from b. mkvmerge starts the new file at 0, so b holds the times a
+    how far each one moved, same the packets of an audio stream that share a time in the original, and zero the time
+    in each file that the moves count from. The span takes its times from b. mkvmerge starts the new file at 0, so b holds the times a
     player shows. The span runs from the first moved packet to the last one, or to the end when the last packet moved
     too. Moved packets with in-sync packets between them name the number of places. A span inside one second is "at"
     that second. The detail names the first moved packet with a time of its own, else the first moved packet. Its time
@@ -1491,8 +1477,15 @@ def header_units(src, tmp, i, k, bsf, timeout, codec):
     one is a unit of the original's codec header, byte for byte, and packet 0 of src is in the new packet 0 in order.
     Else None. mkvmerge copies the units of an HEVC header into packet 0, and bsf removes only the parameter sets. For
     VC-1 (codec "vc1") the units are the sequence header and the entry point of the header. mkvmerge puts the entry
-    point of a header that ffmpeg padded with a byte in front of the frame of packet 0. prove() reads one packet of
-    each file, and only when every other packet matches."""
+    point of a header that ffmpeg padded with a byte in front of the frame of packet 0. For MPEG-4 part 2 (codec
+    "mpeg4") from an MP4 or MOV, mkvmerge puts the whole codec header in front of packet 0, also when packet 0 holds
+    it already. That passes when the new packet 0 is the header and then the original's packet 0, byte for byte, and
+    the result holds the start of the header's hex. prove() reads one packet of each file, and only when every other
+    packet matches."""
+    if codec == "mpeg4":
+        head = extradata(src, i, timeout)
+        old, new = packet_data(src, i, None, 1, timeout), packet_data(tmp, k, None, 1, timeout)
+        return [head.hex()[:64]] if head and old and new == head + old else None
     old = annexb_units(packet_data(src, i, bsf[0], 1, timeout))
     new = annexb_units(packet_data(tmp, k, bsf[1], 1, timeout))
     header = hvcc_units(src, i, timeout) if codec == "hevc" else [u for u in annexb_units(extradata(src, i, timeout)) if u[:1] in (b"\x0e", b"\x0f")]

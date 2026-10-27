@@ -53,6 +53,8 @@ python -m pytest -q
 
 The tests need pytest. The tests on real media files need `ffmpeg` and mkvtoolnix 102, and skip when a tool is
 missing. The README's [Install on a host](../README.md#install-on-a-host) installs mkvtoolnix 102.
+The alert texts take most language names from `mkvmerge --list-languages`, so the text tests need mkvmerge 102 on
+PATH too. They fail without it.
 The burned-in subtitle tests on media in `tests/test_burnin.py` also need numpy, onnxruntime, PyAV and the text
 models, and skip without them.
 The tests of the PyAV video windows need a language detection install with PyAV, at `ARR_LID_DIR` (default

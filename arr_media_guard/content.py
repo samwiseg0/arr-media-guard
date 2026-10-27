@@ -77,9 +77,10 @@ QUALITY = re.compile(r"(?<![a-z0-9])(s\d{1,2}(e\d{1,3})?|s\d{3,4}e\d{1,4}|season
 YEAR = re.compile(r"(?<![0-9a-z])(?:19|20)[0-9]{2}(?![0-9])(?![._ -][01][0-9][._ -][0-3][0-9])", re.I)
 
 
-class OutOfTime(Exception):
-    """The hook's time limit ran out, see Deadline. It is no TimeoutError: a TimeoutError is an OSError, and the network
-    handlers here would swallow it and let the job run on."""
+class OutOfTime(BaseException):
+    """The hook's time limit ran out, see Deadline. Deadline.out() ends the limit before it raises. So a handler that
+    takes OutOfTime lets the job run on with no limit. As a BaseException it passes each except Exception. Only a
+    handler that names it takes it, as runner.run_job() does to record the outcome."""
 
 
 LOCK_POLL = 0.2   # seconds between two tries of a lock under a Deadline. fcntl.flock has no timeout.
@@ -307,10 +308,11 @@ def tmdb_item(kind, tid, season=None, token=None):
              append_to_response="alternative_titles,external_ids" + (f",season/{season}" if kind == "tv" else ""))
     date, ext, alt, lang = d.get("release_date") or d.get("first_air_date") or "", d.get("external_ids") or {}, d.get("alternative_titles") or {}, \
         ISO1.get(d.get("original_language") or "")
+    name = lang and decide.lang_name(lang)   # decide.codes() reads it back. A name it reads as another language stays the code.
     rec = {"id": d["id"], "tmdbId": d["id"], "imdbId": d.get("imdb_id") or ext.get("imdb_id"), "tvdbId": ext.get("tvdb_id"),
            "title": d.get("title") or d.get("name"), "originalTitle": d.get("original_title") or d.get("original_name"),
            "year": int(date[:4]) if date[:4].isdigit() else None, "runtime": d.get("runtime") or 0,
-           "originalLanguage": {"name": decide.lang_name(lang)} if lang else None,
+           "originalLanguage": {"name": name if lang in decide.codes(name) else lang} if lang else None,
            "genres": [KIDS_GENRE.get(g.get("name"), g.get("name")) if kind == "tv" else g.get("name") for g in d.get("genres") or []],
            "studio": next((c.get("name") for c in d.get("production_companies") or []), None),
            "alternateTitles": [{"title": t.get("title")} for t in alt.get("titles") or alt.get("results") or []]}   # a film's titles, a series' results

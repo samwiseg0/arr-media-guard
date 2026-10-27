@@ -52,7 +52,7 @@ words = {"exact": 0, "joined": 0, "missing": 0, "speech_missing": 0, "missing_at
 def rows_of(path, index, lang):
     """({clip key: windows}, {(start, seconds): the first window heard there}) of path in the cache."""
     with sqlite3.connect(f"file:{cache}?mode=ro", uri=True, timeout=60) as db:
-        rows = db.execute("SELECT win, words FROM words WHERE path=? AND idx=? AND model=? AND lang=?", (path, index, TAG, lang)).fetchall()
+        rows = db.execute("SELECT win, words FROM words WHERE path=? AND idx=? AND model=? AND lang=?", (path, index, lid.word_key(TAG), lang)).fetchall()
     exact, one = {w: json.loads(x) for w, x in rows}, {}
     for w, x in sorted(rows):
         for win in json.loads(x):
@@ -155,8 +155,8 @@ def plant(cues, spec, duration):
 BASE, DUR, ASKED = {}, [0.0], []
 
 
-def subtitle_cues(path, j, want, full=False):
-    out = real_cues(path, j, want, full)
+def subtitle_cues(path, j, want, *rest, **kw):
+    out = real_cues(path, j, want, *rest, **kw)
     for p, cues in list(out.items()):
         if cues and isinstance(cues, list) and isinstance(cues[0], tuple):
             BASE.setdefault(p, list(cues))

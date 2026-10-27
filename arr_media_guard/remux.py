@@ -19,9 +19,9 @@ FLAG_OPTS = (("flag-default", "--default-track-flag", "default_track", True), ("
              ("flag-visual-impaired", "--visual-impaired-flag", "flag_visual_impaired", False),
              ("flag-text-descriptions", "--text-descriptions-flag", "flag_text_descriptions", False))
 # The option, mkvmerge -J key and default of each property that a remux may set for an edit, see planned_state(). These
-# are the five that decide edits, and the ones decide.unapplied() can read back. --language sets the legacy tag and the
+# are the six that decide edits, and the ones decide.unapplied() can read back. --language sets the legacy tag and the
 # BCP 47 tag, so a language edit and its LANG_IETF edit share one option.
-EDIT_OPTS = {p: (opt, key, d) for p, opt, key, d in FLAG_OPTS if p in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG)} | {
+EDIT_OPTS = {p: (opt, key, d) for p, opt, key, d in FLAG_OPTS if p in ("flag-default", decide.FORCED_FLAG, decide.ORIGINAL_FLAG, decide.COMMENTARY_FLAG)} | {
     decide.LANG_EDIT: ("--language", "language_ietf", "und"), decide.LANG_IETF: ("--language", "language_ietf", "und")}
 # The lines mkvmerge 102 prints for each input of a file when its read meets the zero run that mkvpropedit encloses in
 # a Segment, see hp["enclosed"]: where the run starts, the last timestamp it read, and the resync that found nothing.
@@ -384,25 +384,37 @@ def planned_times(t, scale):
     """The time in ns of each frame of the audio track t of matroska.frames(), in file order, as a remux writes it, or
     None (docs/design.md, "Planned audio times"). scale is the TimestampScale of t's file in ns.
 
-    Each frame keeps its stored, default or bitstream time. Where a block starts before the block before it ends
+    Each frame keeps its stored, default or bitstream time. Where a block starts before the end of the lace before it
     (t["lapped"]), the frames from that block on play on. Each one then starts one frame (t["frame"]) after the frame
-    before it. The run goes on while that moves a frame later by more than the rounding of the two files. The move is
-    proof.CLOSE_MOVE less half a MUX_TICK at most, so the new file's rounding of a time off its grid keeps the move
-    within CLOSE_MOVE. A frame whose own time comes later ends the run, so a gap of the original stays. The rounding is
-    mkv_slack() plus half a MUX_TICK. The proof takes a smaller move for no move, and a frame after it would then follow
-    no overlap. A frame that shares its time with the frame before it goes on with the run as any frame does. The walk
-    finds its block in t["lapped"], so it starts a run too. A frame past the cap keeps its time. So the plan steps back
-    in time only where it keeps an overlap of the original that a move of CLOSE_MOVE does not close. None when a time
-    lies before 0, as matroska.NONE marks a time that is not known, when a frame holds no data, or when the codec is in
-    REFRAMED."""
+    before it. The run goes on while that moves a frame later by more than the rounding of the two files, and up to
+    proof.CLOSE_MOVE less half a MUX_TICK, so the new file's rounding of a time off its grid keeps the move within
+    CLOSE_MOVE. The rounding is mkv_slack() plus half a MUX_TICK. The proof takes a smaller move for no move, and a
+    frame after it would then follow no overlap. A frame that shares its time with the frame before it goes on with the
+    run as any frame does. It starts a run when the frame before it is the last of a lace.
+
+    A run closes an overlap only when a later gap of the original ends it. That is a frame whose own time comes back to
+    the run within the rounding, or later. The played times then come back to the stored ones, as for the lace times of a
+    measured film whose blocks step back and forth. A run that reaches the end of the track, or the cap, keeps the
+    stored time of each of its frames. Two parts joined into one file hold one overlap and no gap, and mpv played the
+    closed copy 34 ms late from the join to the end. A frame past the cap may start a run of its own. Every other
+    overlap keeps its stored times, as mpv plays them. So the plan steps back in time only where it keeps an overlap
+    of the original. None when a time lies before 0, as matroska.NONE marks a time that is not known, when a frame
+    holds no data, or when the codec is in REFRAMED."""
     if t["codec"].startswith(REFRAMED) or 0 in t["full"]:
         return None
     least, most, step = proof.mkv_slack(scale, MUX_TICK, "audio") * 1e9 + MUX_TICK / 2, proof.CLOSE_MOVE * 1e9 - MUX_TICK / 2, t["frame"]
-    lapped, out, run = set(t["lapped"]), [], False
-    for x in t["time"]:
+    lapped, stored, out, run, start = set(t["lapped"]), list(t["time"]), [], False, 0
+    for k, x in enumerate(stored):
         if out and step and (run or x in lapped):   # the proof finds an overlapping block by its time too
-            run = least < out[-1] + step - x <= most
+            move = out[-1] + step - x
+            if run and move > most:   # the cap: the run keeps its stored times, and this block may start one of its own
+                out[start:] = stored[start:k]
+                run, move = False, out[-1] + step - x
+            go = least < move <= most and (run or x in lapped)
+            start, run = k if go and not run else start, go
         out.append(out[-1] + step if run else x)
+    if run:   # no gap ends the run, so it keeps its stored times
+        out[start:] = stored[start:]
     out = [round(x) for x in out]
     return out if min(out, default=0) >= 0 else None
 
@@ -421,6 +433,16 @@ def mux_tick(j, ids):
     return min(max(int(1e9 / rate - 1), 1000), 10000000) if rate else MUX_TICK
 
 
+def v4_file(folder, name, tid, times):
+    """The mkvmerge option that gives the track tid the times, in ns and in file order, through a v4 timestamps file
+    name in folder. Each line holds one time in ms, exact to the ns."""
+    f = os.path.join(folder, name)
+    with open(f, "w") as fh:
+        fh.write("# timestamp format v4\n")
+        fh.writelines(f"{v // 1000000}.{v % 1000000:06d}\n" for v in times)   # one line at a time
+    return ["--timestamps", f"{tid}:{f}"]
+
+
 def planned_args(path, j, ids, folder):
     """(the mkvmerge options of the input path that give its audio tracks their planned_times(), {the place of each
     such track in the new file, from 1: (its DefaultDuration in ns or None, its planned times)}). j is the mkvmerge -J
@@ -428,6 +450,7 @@ def planned_args(path, j, ids, folder):
     on its own where its time is not later than the time before it, as at an overlap of the blocks, and for a codec in
     RETIMED. It writes wrong times for the frames of a lace with no DefaultDuration of a codec in LACE_RETIMED. So a
     track gets a plan when the walk finds an overlapping block, a bitstream time of such a codec or a codec in RETIMED.
+    The plan closes only an overlap after a lace, and keeps every other overlap as the original stores it.
     mkvmerge keeps the times of every other track, an Opus lace too, and the remux then needs no mkvpropedit.
     The walk finds overlaps and bitstream times on audio tracks only. Each plan goes to a v4 timestamps file in folder, one line per frame in file order, which mkvmerge keeps in
     that order. A walk of path that fails gives no plan.
@@ -451,21 +474,18 @@ def planned_args(path, j, ids, folder):
     drop = lambda ts: max((top - v for top, v in zip(itertools.accumulate(ts, max), ts)), default=0) / 1e9
     for x in j.get("tracks") or []:
         t = tracks.get((x.get("properties") or {}).get("number"))
-        if x.get("id") not in ids or not t or not (t["lapped"] or t["codec"].startswith(LACE_RETIMED) and matroska.BITSTREAM in t["tag"]
+        if x.get("id") not in ids or not t or not (t["overlaps"][0] or t["codec"].startswith(LACE_RETIMED) and matroska.BITSTREAM in t["tag"]
                                                     or t["codec"] in RETIMED):   # audio only
             continue
         if (plan := planned_times(t, r["scale"])) is None:
             continue
         rounded = [(v + step // 2) // step * step for v in plan]   # mkvmerge rounds each planned time half up to the tick
         if plan != (kept := list(t["time"])) and (proof.times_fault(
-                "audio", t["codec"], [v / 1e9 for v in kept], [v / 1e9 for v in rounded], (0.0, 0.0),
+                "audio", t["codec"], [v / 1e9 for v in kept], [v / 1e9 for v in rounded],
                 proof.mkv_slack(r["scale"], step, "audio"), paired=True, length=t["frame"] and t["frame"] / 1e9, lapped=[v / 1e9 for v in t["lapped"]])[0]
                 or proof.lag_over(drop(rounded), drop(kept))):
             plan = kept
-        f = os.path.join(folder, f"times-{x['id']}.txt")
-        with open(f, "w") as fh:
-            fh.write("# timestamp format v4\n" + "".join(f"{v // 1000000}.{v % 1000000:06d}\n" for v in plan))   # ms, exact to the ns
-        args += ["--timestamps", f"{x['id']}:{f}"]
+        args += v4_file(folder, f"times-{x['id']}.txt", x["id"], plan)
         plans[ids.index(x["id"]) + 1] = (t["dd"], plan)
     return [*(["--timestamp-scale", str(tick)] if args and tick else []), *args], plans
 
@@ -558,6 +578,21 @@ def lace_guess(path, j, n=500):
     starts = [t["time"][0] - delay(x) for x, t in zip(own[2], audio) if len(t["time"]) and t["time"][0] != matroska.NONE]
     lead = round((key - delay((own[1] or [{}])[0]) - min(starts)) / 1e9, 3)
     return out, f"{held}, as audio starts {lead * 1000:.0f} ms before the first video keyframe" if lead > 0 else None
+
+
+def overlapped(path, j):
+    """The mkvmerge ids of the audio tracks of path whose walk finds a block that starts before the block before it
+    ends, see matroska.track_frames(). A lace stores the time of its first frame only, so a remux that laces such a
+    track gives mkvmerge no plan, and mkvmerge plays the overlap on by any amount. The header repair then keeps
+    --disable-lacing, and the plan keeps or closes each overlap, see planned_times(). The k-th audio TrackEntry is
+    mkvmerge's k-th audio track. A walk that fails finds none. matroska.frames() keeps the walk, so planned_args() and
+    the frame count of header_checks() take the same one, and the file is walked once."""
+    try:
+        r = matroska.frames(path)
+    except (OSError, ValueError):
+        return []
+    ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == "audio"]
+    return [i for i, t in zip(ids, (t for t in r["tracks"] if t["type"] == 2)) if t["overlaps"][0]]
 
 
 def lace_read(b, entries, blocks, n):
@@ -820,8 +855,8 @@ def repack(path, j, st, apply, hp, edits=()):
     holds up to 170 ms of audio. A file whose audio holds ffmpeg's estimates of laced frame times, see lace_guess(),
     is laced again, so each lace start takes the true time of its first frame, as before ffmpeg's copy. info["relaced"]
     lists those streams, and the dry run's result names them. When an audio track starts before the first video
-    keyframe, the estimates stay, and info["relace_skipped"] says why. Any mkvmerge warning is a fault: it resyncs past
-    a damaged cluster and drops it. The one exception is the resync at the zero run that mkvpropedit encloses in a
+    keyframe, or holds an overlapping block, see overlapped(), the estimates stay, and info["relace_skipped"] says
+    why. Any mkvmerge warning is a fault: it resyncs past a damaged cluster and drops it. The one exception is the resync at the zero run that mkvpropedit encloses in a
     Segment, hp["enclosed"], see resynced(). info["warnings"] keeps what mkvmerge printed. The
     temp file is synced, and header_fault() compares it to the original and to the planned state of edits. The original must still be the file st
     describes, else the app replaced it meanwhile (repack_source_changed). On any fault the temp file goes and the
@@ -845,6 +880,9 @@ def repack(path, j, st, apply, hp, edits=()):
     if why:   # a hard link, the cap, low space or no place for the original: nothing is written
         return "header_repair_skipped", f"{skip}, {why}: {what}", info
     relace, held = lace_guess(path, j)   # before the dry run returns, so its result names them
+    if relace and not held and (lapped := overlapped(path, j)):   # a lace would play the overlap on, see overlapped()
+        held = f"audio stream {', '.join(map(str, relace))} keeps ffmpeg's estimated times, as audio stream {', '.join(map(str, lapped))} " \
+               "holds a block that starts before the block before it ends"
     if held:   # mkvmerge 102 laces all tracks or none
         relace, info["relace_skipped"] = [], held
     elif relace:
@@ -1424,7 +1462,14 @@ def repair_text(r, cut=decide.REPAIR_CUT):
 
 TEXT_EXT = {"S_TEXT/UTF8": "srt", "S_TEXT/ASS": "ass", "S_TEXT/SSA": "ssa", "S_TEXT/WEBVTT": "vtt"}   # the extension of each text format
 BROKEN_END = ".broken-encoding.{}.txt"   # the end of the name of the file that keeps removed subtitle bytes, with its format's extension
-BROKEN_SIDECAR = BROKEN_END.format("srt")
+MISMATCH_END = ".mismatch.{}.txt"   # the same for a track that does not match the audio, see resub()
+
+
+def text_entry(lang, codec, mismatch=False):
+    """The broken_plan() entry, before its bytes are read, of the file that keeps the text of a removed Matroska
+    subtitle track with the language tag lang and the codec id codec. A garbled track takes BROKEN_END, and a track
+    that does not match the audio takes MISMATCH_END. process.subtitle_checks() plans the name, and resub() writes it."""
+    return {"lang": lang, "data": None, "ext": TEXT_EXT[codec], **({"end": MISMATCH_END} if mismatch else {})}
 
 
 def holds(name, data):
@@ -1436,25 +1481,28 @@ def holds(name, data):
     return False
 
 
-def broken_plan(path, broken):
-    """Give each entry of broken, {key: {"lang", "data", "ext", "numbers"}}, its sidecar in "sidecar", and return why no
-    name is free, or None (docs/design.md, "Unreadable subtitles"). It writes nothing. This is the one place that names
-    the file of removed subtitle bytes: of a broken MP4 track, see convert.broken_tracks(), of a garbled track, see
-    resub(), and of a garbled sidecar, see subtitles.broken_side(). An entry's key is a track's place, as s3, or a
-    sidecar's name. lang is its language tag or the language part of its name. data is the bytes of its file, or None
-    for a plan made before they are read. ext is the extension of its format, srt by default. numbers are the numbers
-    its name may take in a clash, the track's own by default.
+def broken_plan(path, broken, taken=()):
+    """Give each entry of broken, {key: {"lang", "data", "ext", "numbers", "end"}}, its sidecar in "sidecar", and return
+    why no name is free, or None (docs/design.md, "Unreadable subtitles"). It writes nothing. This is the one place that
+    names the file of removed subtitle bytes: of a broken MP4 track, see convert.broken_tracks(), of a garbled track
+    and of a track that does not match the audio, see resub(), and of a garbled sidecar, see subtitles.broken_side().
+    An entry's key is a track's place, as s3, or a sidecar's name. lang is its language tag or the language part of
+    its name. data is the bytes of its file, or None for a plan made before they are read. ext is the extension of its
+    format, srt by default. numbers are the numbers its name may take in a clash, the track's own by default. end is
+    the end of its name, BROKEN_END by default, and MISMATCH_END for a track that does not match.
 
-    The name is <base>.<lang>.broken-encoding.<ext>.txt beside the video at path, as Film.per.broken-encoding.srt.txt.
+    The name is <base>.<lang>.broken-encoding.<ext>.txt beside the video at path, as Film.per.broken-encoding.srt.txt,
+    or Film.eng.mismatch.srt.txt with MISMATCH_END.
     An untagged entry has no language part. Players skip a .txt file. Bazarr skips this name, because it does not
     match the video's. Sonarr and Radarr count .txt as a subtitle extension, so a rescan records the file, and Radarr
     may rename it when it renames the movie. Two entries with one
-    language part and one format, and a name that a file of other bytes holds, put a number in front, as
+    language part, one format and one end, and a name that a file of other bytes holds, put a number in front, as
     Film.per.3.broken-encoding.srt.txt. A file with the same bytes stays, and "reused" says so. No two entries take one
-    name, and no file is written over. With data None a name a file holds counts as taken, and with none free the last
+    name, and no file is written over. taken are the paths another plan of the run holds, as a dry run's names for
+    tracks, so they count as taken too. With data None a name a file holds counts as taken, and with none free the last
     name stands, because the write plans again with the bytes."""
-    base, taken = os.path.splitext(path)[0], set()
-    part = {k: ("" if e["lang"] in decide.UNTAGGED else f".{e['lang']}", BROKEN_END.format(e.get("ext", "srt"))) for k, e in broken.items()}
+    base, taken = os.path.splitext(path)[0], set(taken)
+    part = {k: ("" if e["lang"] in decide.UNTAGGED else f".{e['lang']}", e.get("end", BROKEN_END).format(e.get("ext", "srt"))) for k, e in broken.items()}
     for k, e in broken.items():
         (lang, end), alone = part[k], list(part.values()).count(part[k]) == 1
         names = ([f"{base}{lang}{end}"] if alone else []) + [f"{base}{lang}.{n}{end}" for n in e.get("numbers") or [k[1:]]]
@@ -1765,7 +1813,9 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     WebVTT track's go as they are, and mkvextract writes the file with its header, see events_file(). proof.event_text()
     shows the text of each packet in it. After the proof and the kept original, keep_broken() writes the bytes beside
     the video. A failure after that removes each new file, see drop_broken(). info["garbled_text"] names each file,
-    and info["garbled_text_removed"] each one the failure removed again.
+    and info["garbled_text_removed"] each one the failure removed again. A SubRip, ASS, SSA or WebVTT track in drop
+    does not match the audio, and its bytes go beside the video the same way, under the name of MISMATCH_END, with its
+    tag from decide.track_tag() (docs/design.md, "Subtitle match"). info["mismatch_text"] names each such file.
 
     A cover picture track in covers, {mkvmerge track id: its entry of cover_tracks()}, leaves the file, and its image
     becomes an attachment with the entry's name and MIME type, and its track name as the description. The ffmpeg read
@@ -1793,22 +1843,25 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     pictures and the proof's reads go into a folder under STATE_DIR, never the system temp dir, which is often a small
     tmpfs."""
     ends, timed, recode, strip, covers = ends or {}, timed or {}, recode or {}, strip or {}, covers or {}
-    drop = [*drop, *strip]
     place = {i: f"s{n}" for n, i in enumerate((t.get("id") for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
     codec = {t.get("id"): (t.get("properties") or {}).get("codec_id") for t in j.get("tracks") or []}
-    broken = {i: {"lang": lang, "data": None, "ext": TEXT_EXT[codec[i]]} for i, lang in strip.items()}
+    tags = {t.get("id"): decide.track_tag(t.get("properties") or {}) for t in j.get("tracks") or []}
+    broken = {i: text_entry(lang, codec[i]) for i, lang in strip.items()}
+    broken.update({i: text_entry(tags[i], codec[i], True) for i in drop if codec.get(i) in TEXT_EXT})
+    drop = [*drop, *strip]
     broken_plan(path, {place[i]: e for i, e in broken.items()})   # the plan's names. The write names them again with the bytes.
+    name = lambda which: {str(i): os.path.basename(e["sidecar"]) for i, e in broken.items() if (i in strip) == which}
     info = {"old_size": st.st_size, "fixes": {str(i): f for i, f in fixes.items()}, "drop": list(drop), "ends": {str(i): len(e) for i, e in ends.items()},
             **({"timed_cues": {str(i): len(plan) for i, plan in timed.items()}} if timed else {}),
             **({"recode": {str(i): repair_name(r) for i, r in recode.items()}} if recode else {}),
-            **({"garbled_text": {str(i): os.path.basename(e["sidecar"]) for i, e in broken.items()}} if strip else {}),
+            **({"garbled_text": name(True)} if strip else {}), **({"mismatch_text": m} if (m := name(False)) else {}),
             **({"cover_names": {str(i): e["name"] for i, e in covers.items()}} if covers else {})}
     what = "; ".join([f'track {i}: {f["offset"]:+.3f} s' + ("" if f["rate"] == "1/1" else f', ratio {f["rate"]}') for i, f in fixes.items()]
                      + [f"track {i}: new ends for {sum(e != o for _, _, o, e in plan)} of {len(plan)} cues" for i, plan in ends.items()]
                      + [f"track {i}: {blocks_moved(plan, fixes.get(i)) or f'new times for {len(plan)} cues'}" for i, plan in timed.items()]
                      + [f"track {i}: {repair_name(r)}" + (", default flag off" if r.get("default_off") else "") for i, r in recode.items()]
-                     + [f"remove track {i}" for i in drop if i not in strip]
-                     + [f"take out track {i}, its bytes to {os.path.basename(e['sidecar'])}" for i, e in broken.items()]
+                     + [f"remove track {i}" + (f", its text to {os.path.basename(broken[i]['sidecar'])}" if i in broken else "") for i in drop if i not in strip]
+                     + [f"take out track {i}, its bytes to {os.path.basename(e['sidecar'])}" for i, e in broken.items() if i in strip]
                      + [f"track {i}: " + (f"removed, the attachment {e['name']} holds its picture" if e.get("copy") else
                                           f"cover picture to the attachment {e['name']}") for i, e in covers.items()])
     if head := bool(hp and hp.get("issue")):
@@ -1844,9 +1897,9 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
         if moved:
             own.update(zip(moved, moved_tracks([(own.get(i, path), 0 if i in own else index[i], fixes[i], os.path.join(folder, f"{i}.moved.mkv"), i)
                                                 for i in moved])))
-        # The packets of a track in strip, from a read of their own: their md5s, and their bytes as they are for
+        # The packets of a track in strip or a removed text track, from a read of their own: their md5s, and their bytes as they are for
         # mkvextract's file, see below. A SubRip track's file is written from the walk, with the times the file stores.
-        texts = {i: (os.path.join(folder, f"{i}.garbled.{'srt' if codec[i] == 'S_TEXT/UTF8' else 'bin'}"), os.path.join(folder, f"{i}.md5")) for i in strip}
+        texts = {i: (os.path.join(folder, f"{i}.garbled.{'srt' if codec[i] == 'S_TEXT/UTF8' else 'bin'}"), os.path.join(folder, f"{i}.md5")) for i in broken}
         pics = {i: (os.path.join(folder, f"cover-track-{i}"), os.path.join(folder, f"cover-track-{i}.md5")) for i in covers}   # its first packet, its md5s
         if texts or pics:
             argv = ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", path]
@@ -1936,7 +1989,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
             raise RuntimeError(taken)
         for i, e in broken.items():
             keep_broken(e, st)
-            info["garbled_text"][str(i)] = os.path.basename(e["sidecar"])
+            info["garbled_text" if i in strip else "mismatch_text"][str(i)] = os.path.basename(e["sidecar"])
         os.replace(tmp, path)
     except BaseException as ex:
         sw.unkeep(path)

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """Default-track decisions and file checks for arr-media-guard. No I/O, so the hook, the backfill, the audit
-and the tests share one copy. Input is mkvmerge -J or ffprobe JSON plus the item's original language as Sonarr or
-Radarr names it ("English", "Japanese", "Portuguese (Brazil)").
+and the tests share one copy. lang_name() alone reads mkvmerge's language list, once per process, see checks.langs().
+Input is mkvmerge -J or ffprobe JSON plus the item's original language as Sonarr or Radarr names it ("English",
+"Japanese", "Portuguese (Brazil)").
 
 A decision has four steps. Each step reads general signals, so a new case needs data, not a new branch.
 1. classify() reads each audio and subtitle track once. A track gets a language with a confidence, a role and its
@@ -17,7 +18,7 @@ A decision has four steps. Each step reads general signals, so a new case needs 
 4. invariants() checks the final state of every plan. A plan that breaks one is dropped, and "dropped" says why.
 
 An edit is [selector, new, old] for a default flag. An edit that clears a forced flag carries FORCED_FLAG as a fourth item,
-and an edit of the Original language flag ORIGINAL_FLAG, see retag().
+an edit of the Original language flag ORIGINAL_FLAG, and an edit that sets the commentary flag COMMENTARY_FLAG, see retag().
 
 POLICY is the policy file (POLICY_FILE), JSON. The hook passes it to set_policy() at start.
 docs/design.md explains the rules behind it.
@@ -28,12 +29,19 @@ import re
 import statistics
 import unicodedata
 
-ALIAS = [{"jpn", "jap", "japanese"}, {"ger", "deu", "german"}, {"fre", "fra", "french"}, {"chi", "zho", "cmn", "yue", "chinese", "mandarin", "cantonese"},
-         {"dut", "nld", "dutch", "flemish"}, {"cze", "ces", "czech"}, {"gre", "ell", "greek"}, {"rum", "ron", "romanian"}, {"per", "fas", "persian"},
-         {"nor", "nob", "nno", "norwegian"}, {"ice", "isl", "icelandic"}, {"may", "msa", "malay"}, {"wel", "cym", "welsh"}, {"slo", "slk", "slovak"},
+# The 20 ISO 639-2 languages with a terminology (T) code beside the bibliographic (B) code that mkvmerge lists. An MP4
+# file stores the T code, and ffprobe reads it as it is. ALIAS, language_table() and lid.code() take the pairs from here.
+TWINS = dict(x.split(":") for x in """alb:sqi arm:hye baq:eus bur:mya chi:zho cze:ces dut:nld fre:fra geo:kat ger:deu gre:ell ice:isl
+    mac:mkd mao:mri may:msa per:fas rum:ron slo:slk tib:bod wel:cym""".split())
+# The codes and words of one language per set, see codes(). Each T code of TWINS joins the set of its B code, and a
+# pair with no set here is a set of its own.
+ALIAS = [{"jpn", "jap", "japanese"}, {"ger", "german"}, {"fre", "french"}, {"chi", "cmn", "yue", "chinese", "mandarin", "cantonese"},
+         {"dut", "dutch", "flemish"}, {"cze", "czech"}, {"gre", "greek"}, {"rum", "romanian"}, {"per", "persian"},
+         {"nor", "nob", "nno", "norwegian"}, {"ice", "icelandic"}, {"may", "malay"}, {"wel", "welsh"}, {"slo", "slovak"},
          {"slv", "slovenian"}, {"srp", "serbian"}, {"hrv", "croatian"}, {"pan", "punjabi"}, {"tgl", "fil", "tagalog", "filipino"}, {"glg", "galician"},
-         {"alb", "sqi", "albanian"}, {"arm", "hye", "armenian"}, {"baq", "eus", "basque"}, {"geo", "kat", "georgian"}, {"mac", "mkd", "macedonian"},
+         {"alb", "albanian"}, {"arm", "armenian"}, {"baq", "basque"}, {"geo", "georgian"}, {"mac", "macedonian"},
          {"por", "pob", "portuguese"}, {"lav", "latvian"}, {"gle", "irish"}, {"mlt", "maltese"}]
+ALIAS = [s | {TWINS[c] for c in s if c in TWINS} for s in ALIAS] + [{b, t} for b, t in TWINS.items() if all(b not in s for s in ALIAS)]
 UNTAGGED = {"und", "mul", "zxx", ""}
 # ISO 639-1 -> ISO 639-2 codes, as mkvmerge lists them (`mkvmerge --list-languages`). mkvmerge 92 also lists bh, which
 # 102 dropped. A BCP 47 tag names a language by its 639-1 code when it has one, see track_tag().
@@ -71,13 +79,9 @@ LANGWORDS = {"english": "eng", "anglais": "eng", "ingles": "eng", "inglés": "en
              "cantonese": "chi", "国语": "chi", "普通话": "chi", "粤语": "chi", "國語": "chi", "粵語": "chi", "chinese": "chi", "tamil": "tam",
              "telugu": "tel", "thai": "tha", "arabic": "ara", "hebrew": "heb", "dutch": "dut", "swedish": "swe", "danish": "dan", "norwegian": "nor",
              "vietnamese": "vie", "czech": "cze", "hungarian": "hun", "romanian": "rum", "greek": "gre", "ukrainian": "ukr", "persian": "per"}
-# The English names of 639-2 codes for alert texts, see lang_name(). ALIAS names the rest.
-LANG_NAMES = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "German", "ita": "Italian", "por": "Portuguese", "jpn": "Japanese",
-              "kor": "Korean", "chi": "Chinese", "rus": "Russian", "hin": "Hindi", "tur": "Turkish", "dut": "Dutch", "swe": "Swedish",
-              "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "pol": "Polish", "ara": "Arabic", "heb": "Hebrew", "tha": "Thai",
-              "ind": "Indonesian", "vie": "Vietnamese", "gre": "Greek", "cze": "Czech", "hun": "Hungarian", "rum": "Romanian", "ukr": "Ukrainian",
-              "tam": "Tamil", "tel": "Telugu", "tgl": "Tagalog", "may": "Malay", "bel": "Belarusian", "afr": "Afrikaans", "aze": "Azerbaijani",
-              "bos": "Bosnian", "bul": "Bulgarian", "cat": "Catalan", "est": "Estonian", "lit": "Lithuanian", "urd": "Urdu", "und": "untagged"}
+# The names lang_name() gives in place of mkvmerge's. mkvmerge calls und "Undetermined", and an alert says "untagged".
+# The ALIAS sets of chi and tgl hold more than one word, and the first in order is "cantonese" or "filipino".
+LANG_NAMES = {"und": "untagged", "chi": "Chinese", "tgl": "Tagalog"}
 NOT_SPEECH = re.compile(r"\w+\s+(score|sub\w*|dub\w*)", re.I)   # audio titles: "UK Dub / Japanese Score"
 NOT_SUB_SPEECH = re.compile(r"\w+\s+dub\w*", re.I)                 # subtitle titles keep "English Subtitles"
 # Subtitle titles. "English Signs", "Alien Only", "For Foreign Parts Only" and "Titles Only" are forced. "Songs SDH"
@@ -87,6 +91,8 @@ FULL_TITLE = re.compile(r"\bsdh\b|\bcc\b|closed caption|\bfull\b", re.I)
 DUB_TITLE = re.compile(r"\bdub", re.I)
 FORCED_TITLE = re.compile(r"forced", re.I)
 COMMENT_TITLE = re.compile(r"comment|\bcmt\b|\bcomm\b", re.I)   # "Commentary", "cmt", "Director's Comm"
+# A title that negates commentary names the dialogue without it: "No Commentary", "Commentary-free", "w/o Commentary".
+NO_COMMENT_TITLE = re.compile(r"\b(?:no|non|without|w/o)[ ._-]*comment\w*|comment\w*[ ._-]*free\b", re.I)
 # Text that is not the dialogue is commentary too: "Production Notes", "Trivia", "Info Text", "Fact Track", "Pop-up",
 # "Easter Eggs" and a title of "Notes" alone. SDH, CC or "full" in the title overrides these words, so "English CC
 # (pop-up)" stays SDH. "TL Notes" holds dialogue with translator notes.
@@ -104,6 +110,7 @@ POLICY_KEYS = ("kids", "audio", "subtitles", "sparse_events", "forced_flag_event
 FORCED_CLEAR_KEYS = ("events", "english_only_audio", "reference_ratio")
 FORCED_FLAG = "flag-forced"   # the mkvpropedit property of an edit that clears a forced flag
 ORIGINAL_FLAG = "flag-original"   # the mkvpropedit property of an edit of the Original language flag, see retag()
+COMMENTARY_FLAG = "flag-commentary"   # the mkvpropedit property of an edit that sets the commentary flag, see retag()
 # The roles whose Original language flag retag() sets or clears. A commentary or an audio description is no part of the
 # content's own speech, so its flag stays as it is.
 ORIGINAL_ROLES = {"a": ("main",), "s": ("full", "sdh", "forced", "dub", "lyrics")}
@@ -129,11 +136,17 @@ def codes(lang):
 
 
 def lang_name(code):
-    """The English name of a 639-2 code: "fre" -> "French". A code in ALIAS takes the name of its set, or its word,
-    as "gle" takes "Irish". An unknown code stays as it is."""
+    """The English name of a language code: "fre" -> "French", "fij" and "fj" -> "Fijian". A 639-1 code reads as its
+    639-2 code. A code in ALIAS takes the name of its set, or its word, as "gle" takes "Irish". Any other code takes
+    its name in mkvmerge's list, see language_table(). A code with no name there stays as it is, as mis, zxx and qaa
+    do, and so does every code when mkvmerge cannot list them."""
+    code = ISO639_1.get(code, code)
     same = next((s for s in ALIAS if code in s), {code or "und"})
-    known = [LANG_NAMES[c] for c in sorted(same) if c in LANG_NAMES]
-    return known[0] if known else next((w.title() for w in same if len(w) > 3), code)
+    known = [LANG_NAMES[c] for c in sorted(same) if c in LANG_NAMES] + [w.title() for w in sorted(same) if len(w) > 3]
+    if known:
+        return known[0]
+    from . import checks   # the first name starts mkvmerge once per process, see checks.langs()
+    return checks.langs()[2].get(code, code)
 
 
 def lang_names(langs, joint="and"):
@@ -200,6 +213,11 @@ def track_tag(p):
     return legacy if lang_key(code) == lang_key(legacy) else code
 
 
+def commentary_title(title):
+    """True when the title reads as commentary (COMMENT_TITLE). A part that negates commentary (NO_COMMENT_TITLE) does not count."""
+    return bool(COMMENT_TITLE.search(NO_COMMENT_TITLE.sub("", title or "")))
+
+
 def classify(j, heard=None, original=None):
     """mkvmerge -J or ffprobe JSON -> the audio and subtitle tracks in file order, each read once.
 
@@ -209,7 +227,7 @@ def classify(j, heard=None, original=None):
     POLICY["sparse_events"], or by a forced flag on a track under POLICY["forced_flag_events"] or of unknown density. A lyrics
     track never has the forced role. Its title names songs and no other signs word, and it is in the item's original language.
     "conflict" is (kind, sentence) when the density contradicts a forced flag (dense_forced_flag) or a full or SDH title (sparse_full_title).
-    A track's original is its FlagOriginal: 1, 0, or None when the file holds none.
+    A track's original is its FlagOriginal and its commentary its FlagCommentary: 1, 0, or None when the file holds none.
     heard maps an audio track's position ("a2") to the language lid.py heard on it, see language(). It may also map a
     subtitle position to the language retag() gives it from its text.
     The argument original is the item's original language as decide() gets it, an app's name or a code. With none, no
@@ -233,7 +251,7 @@ def classify(j, heard=None, original=None):
         tag = (f["lang"] or "und").lower()
         h = (heard or {}).get(f"{kind}{n[kind]}")
         lang, conf, why = language(tag, title_language(title, kind), h)
-        comment = bool(f["comment"] or COMMENT_TITLE.search(title) or (NOTES_TITLE.search(title) and not FULL_TITLE.search(title)))
+        comment = bool(f["comment"] or commentary_title(title) or (NOTES_TITLE.search(title) and not FULL_TITLE.search(title)))
         described = bool(f["described"] or re.search(r"descri", title, re.I) or re.search(r"\bAD\b|DVS", title))
         titled_forced = bool(FORCED_TITLE.search(title))
         signs = titled_forced or bool(SIGNS_TITLE.search(title) and not FULL_TITLE.search(title))
@@ -254,6 +272,7 @@ def classify(j, heard=None, original=None):
                         ch=f["ch"] or 0, codec=f["codec"], default=int(bool(f["default"])), role=role, extra=role in ("commentary", "description"),
                         forced=forced, forced_flag=bool(f["forced"]), flagged=bool(f["forced"]) or titled_forced, sdh=sdh, events=ev, heard=h,
                         original=None if f["original"] is None else int(bool(f["original"])),
+                        commentary=None if f["comment"] is None else int(bool(f["comment"])),
                         conflict=("dense_forced_flag", f"{kind}{n[kind]} is flagged forced but has {ev:.1f} events a minute") if dense_flag
                         else ("sparse_full_title", f"{kind}{n[kind]} is titled or flagged full or SDH but has {ev:.1f} events a minute")
                         if full_title and sparse else None))
@@ -262,7 +281,7 @@ def classify(j, heard=None, original=None):
 
 def prop(e):
     """The Matroska property an edit sets: flag-default, or the property it carries as its fourth item, such as
-    FORCED_FLAG or ORIGINAL_FLAG."""
+    FORCED_FLAG, ORIGINAL_FLAG or COMMENTARY_FLAG."""
     return e[3] if len(e) > 3 else "flag-default"
 
 
@@ -514,16 +533,24 @@ BCP47 = re.compile(r"^([a-z]{2,3})(-[a-z]{4})?(-(?:[a-z]{2}|\d{3}))?((?:-[a-z0-9
 KEEP_TAGS = {"mul", "zxx"}   # multiple languages and no speech are statements, never a missing tag
 
 
+NO_NAME = re.compile(r"und|mul|mis|zxx|q[a-t][a-z]")   # codes that name no language. q[a-t][a-z] is qaa to qtz, for local use.
+
+
 def language_table(text):
     """`mkvmerge --list-languages` -> ({ISO 639-1, 639-2 or 639-3 code: its 639-2 code}, {639-2 code: the BCP 47
-    language mkvmerge writes for it}). A language with no 639-2 code, such as yue or cmn, is in neither map."""
-    legacy, ietf = {}, {}
+    language mkvmerge writes for it}, {code: its English name}). A language with no 639-2 code, such as yue or cmn, is
+    in neither of the first two maps. The names leave out the codes of NO_NAME and drop "(macrolanguage)": "Swahili
+    (macrolanguage)" is "Swahili". Each T code of TWINS takes the name of its B code."""
+    legacy, ietf, names = {}, {}, {}
     for row in text.splitlines():
         c = [x.strip() for x in row.split("|")]
         if len(c) == 4 and len(c[2]) == 3:
             legacy.update({x: c[2] for x in c[1:] if x})
             ietf[c[2]] = c[3] or c[2]
-    return legacy, ietf
+        codes = [x for x in c[1:] if 1 < len(x) < 4 and x.isalpha()]   # a 2- or 3-letter code, never a header or qaa-qtz
+        if codes and not NO_NAME.fullmatch(codes[0]):
+            names.update(dict.fromkeys(codes + [TWINS[x] for x in codes if x in TWINS], c[0].replace(" (macrolanguage)", "")))
+    return legacy, ietf, names
 
 
 def ietf_form(tag):
@@ -583,12 +610,13 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
     is AGREE, the bar of POLICY["min_confidence"]. A tag alone is not enough, so process.languages() hears such a track
     first, see flag_checks(). AMG is sure of a subtitle when the language read in its text names its language after
     this run. A picture subtitle has no text to read. A track AMG is not sure of keeps its flag, and a note says why.
+    An audio or subtitle track whose title reads as commentary (commentary_title()) and that lacks the commentary flag gets
+    it. A notes title (NOTES_TITLE) gets none, and a flag set already stays.
     checked maps more tracks to the language heard or read for the flag alone, so they change no tag and no other
     finding."""
     ietf_of = table[1]
     key = lang_key
     known, spoken, tags = {key(x) for x in known if x}, {key(x) for x in spoken if x}, language_tags(j)
-    readable = {key(x) for x in TEXT_LANGS}
     out = {"edits": [], "rules": [], "notes": [], "reasons": [], "set": {}, "ask": set(), "to_read": set(), "mismatch": [], "wrong": {}}
     for t in classify(j):
         if t["pos"] not in tags:   # an ffprobe probe has no BCP 47 tag
@@ -654,7 +682,12 @@ def retag(j, heard=None, known=(), table=({}, {}), spoken=(), read=None, origina
                 why = (f"heard {seen}" if main else f"the text reads {seen}") + f", not {now}" if seen else \
                     "it was not heard" if main else "its text was not read"
                 out["notes"].append(f'{pos} {now}: the original language flag stays, because {why}')
-        if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in readable and key(out["set"].get(pos, tag)) != key(h):
+        if commentary_title(t["title"]) and not t["commentary"]:
+            out["edits"].append([t["sel"], 1, t["commentary"], COMMENTARY_FLAG])
+            out["rules"].append("commentary flag set")
+            out["notes"].append(f'{pos}: commentary flag {t["commentary"]} -> 1, the title "{t["title"]}" reads as commentary')
+            out["reasons"] += [] if "commentary_flag_set" in out["reasons"] else ["commentary_flag_set"]
+        if t["kind"] == "s" and h and tag not in UNTAGGED | KEEP_TAGS and key(tag) in TEXT_KEYS and key(out["set"].get(pos, tag)) != key(h):
             out["mismatch"].append(f"subtitle track {pos[1:]} is tagged {lang_name(tag)}, but its text reads as {lang_name(h)}")
             out["wrong"][pos] = h
             out["reasons"] += [] if "subtitle_text_mismatch" in out["reasons"] else ["subtitle_text_mismatch"]
@@ -701,6 +734,7 @@ def unapplied(after, edits):
     def shows(e, t):
         if prop(e) in (LANG_EDIT, LANG_IETF): return e[1] in tags[t["pos"]]
         if prop(e) == ORIGINAL_FLAG: return (t["original"] or 0) == e[1]
+        if prop(e) == COMMENTARY_FLAG: return (t["commentary"] or 0) == e[1]
         return (t["default"] if prop(e) == "flag-default" else int(t["forced_flag"])) == e[1]
     return [e for e in edits if e[0] not in ts or not shows(e, ts[e[0]])]
 
@@ -787,6 +821,7 @@ SCRIPTS = {"GREEK": "gre", "HEBREW": "heb", "ARABIC": "ara", "THAI": "tha", "HAN
 PERSIAN = frozenset("پچژگکی")   # letters Persian writes and Arabic does not
 SOUTH_CYRILLIC = frozenset("јљњћђџѓќѕ")   # Serbian and Macedonian letters. Russian and Ukrainian never write them.
 TEXT_LANGS = frozenset(STOPWORDS) | frozenset(SCRIPTS.values()) | {"per"}   # every language text_language() can name
+TEXT_KEYS = frozenset(map(lang_key, TEXT_LANGS))   # their lang_key()
 # Common Han characters of Chinese dialogue, simplified and traditional. Chinese text holds many of them. The bytes of
 # another codepage decoded as Chinese give rare characters, which hold almost none, see text_judge().
 HAN_COMMON = frozenset("的一是不了在人有我他这這个個们們中来來上大为為和国國地到以说說时時要就出会會可也你对對生能而子那得于着著下自之年"
@@ -803,6 +838,29 @@ TEXT_NOISE = re.compile(r"<[^>]*>|\{[^}]*\}|\\[Nnh]")   # SubRip tags, ASS overr
 # capital I an i, so "HAYIR" and "hayır" both fold to "hayir".
 TEXT_FOLD = str.maketrans("şţёı", "șțеi")
 WORD = re.compile(r"[^\W\d_]+")
+
+
+# Cyrillic and Greek letters and the Latin letters they look like in a subtitle font. The OCR of a picture subtitle can
+# give them in place of the Latin letters of English text: e, c, x, y and some capitals, as measured on a real track.
+# Real Russian, Ukrainian and Greek text also holds letters with no look-alike, such as и, л, я, λ and π.
+LOOKALIKES = str.maketrans("аеорсухАВЕКМНОРСТХіјѕІЈЅΑΒΕΖΗΙΚΜΝΟΡΤΥΧο", "aeopcyxABEKMHOPCTXijsIJSABEZHIKMNOPTYXo")
+
+
+def real_letter(text):
+    """Whether text holds a Cyrillic or Greek letter with no Latin look-alike in LOOKALIKES."""
+    return any(c >= "\u0370" and c.isalpha() and ord(c) not in LOOKALIKES and script_of(c) in ("CYRILLIC", "GREEK") for c in text)
+
+
+def latin_lookalikes(texts):
+    """The list of cue texts texts with each Cyrillic and Greek letter as the Latin letter it looks like, when every
+    Cyrillic and Greek letter of texts has one in LOOKALIKES (docs/design.md, "Subtitle text"). Else texts as they are,
+    so real Russian or Greek text never changes. Every reader of a track's cue words folds with it, on the whole track:
+    text_language(), subtitles.tag_read(), subsync.flat() and align.anchors()."""
+    return texts if any(map(real_letter, texts)) else [t.translate(LOOKALIKES) for t in texts]
+
+
+class Fold(Exception):
+    """text_language() met a look-alike letter before any real letter, so all of its texts decide the fold."""
 
 
 def text_fold(text):
@@ -867,7 +925,28 @@ def text_language(cues):
     most telling words wins when it holds TEXT_SHARE of all telling words, has TEXT_TELL of them, and its whole list
     holds TEXT_COVER of the text. The count runs every TEXT_STEP letters. It stops at the first verdict or at TEXT_STOP
     letters. A text under TEXT_STEP letters is short. Mixed text and a language with no list get None. A share under
-    TEXT_MIXED is mixed at once, and a share just under TEXT_SHARE reads on, because a few early words weigh most."""
+    TEXT_MIXED is mixed at once, and a share just under TEXT_SHARE reads on, because a few early words weigh most.
+    A text whose Cyrillic and Greek letters all look like Latin letters reads with those, see latin_lookalikes(), which
+    judges all of cues. So the result is text_count(latin_lookalikes(list(cues))). The read takes the texts as they are
+    until one holds a look-alike letter before any real letter, see real_letter(). Only then it takes the rest of cues."""
+    cues, seen = iter(cues), []
+
+    def plain():   # the texts as they are, while the fold cannot change them
+        real = False
+        for text in cues:
+            seen.append(text)
+            real = real or real_letter(text)
+            if not real and text.translate(LOOKALIKES) != text:
+                raise Fold
+            yield text
+    try:
+        return text_count(plain())
+    except Fold:
+        return text_count(latin_lookalikes(seen + list(cues)))
+
+
+def text_count(cues):
+    """text_language() of the cue texts cues as they are."""
     words, scripts, letters, check = {}, {}, 0, TEXT_STEP
     for text in cues:
         text = text_fold(TEXT_NOISE.sub(" ", text))
@@ -894,7 +973,7 @@ def sidecar_language(named, read, audio):
     sidecar with, True when its name may still set the forced flag, a note for the log). A player shows a forced track
     in the audio's language by itself, so the forced flag of the name stays only when the text is in an audio language."""
     lang = read[0]
-    if not (lang and named) or lang_key(named) not in {lang_key(x) for x in TEXT_LANGS} or lang_key(named) == lang_key(lang):
+    if not (lang and named) or lang_key(named) not in TEXT_KEYS or lang_key(named) == lang_key(lang):
         return None
     return lang, lang_key(lang) in {lang_key(a) for a in audio}, f"named {named}, but the text reads as {lang}: {read[2]}"
 
@@ -1410,8 +1489,11 @@ def bad_window(w):
 
 
 def stopped_doubt(w):
-    """The doubt of a window that the read cap or the time cap stopped."""
-    return f"the video check at {clock(w['at'])} {w['stopped']}, so the file may have no usable index"
+    """The doubt of a window that the read cap or the time cap stopped. It names the playback errors the window met, as
+    bad_window() counts them, or the error lines of a window with no frame."""
+    n = w.get("errors") or 0
+    met = f" and met {n} playback error{'s' if n > 1 else ''} on the way" if n else " and found no frame, with errors on the way" if w.get("noisy") else ""
+    return f"the video check at {clock(w['at'])} {w['stopped']}{met}, so the file may have no usable index"
 
 
 def read_capped(w):
@@ -1458,8 +1540,28 @@ def video_verdict(zero_hits, windows, checked=ZERO_READS, when=None):
 
 
 # The read pass of the whole-file check (docs/design.md, "Whole-file check"): ffmpeg -v error -i FILE -ignore_unknown
-# -map 0 -c copy -f null -. It demuxes every packet of the file and decodes none.
+# -map 0 -c copy -f null -. It demuxes every packet of the file. It decodes only the frames that ffmpeg's probe of the
+# streams decodes. In made-up media on ffmpeg 7.1 (2026-10-26) that was the first packet of an E-AC-3, AC-3 or AAC
+# track and the first 7 H.264 frames. A DTS decoder decoded on while its frames failed, up to about 5 s.
 UNREADABLE = ("Error opening input", "Error opening output")   # ffmpeg 7 cannot open the file or set up its streams, and exits non-zero
+# The decoders and parsers that print a line under their own name, "[eac3 @ 0x57ad] exponent -2 is out-of-range", by
+# the kind of their stream. The h264 and hevc parsers print lines from any place of the file. Of the audio parsers,
+# only the TrueHD and MLP parser printed lines, for a bad frame at any place of the file. A line under another name
+# has no kind, and it stays a doubt of the read pass.
+AUDIO_CODECS = frozenset("aac aac_fixed aac_latm ac3 ac3_fixed eac3 dca truehd mlp mp1 mp1float mp2 mp2float mp3 mp3float flac alac opus "
+                         "libopus vorbis libvorbis wmav1 wmav2 wmapro wmalossless s302m dolby_e".split())
+VIDEO_CODECS = frozenset("h264 hevc mpeg1video mpeg2video mpeg4 msmpeg4v1 msmpeg4v2 msmpeg4 h263 vc1 wmv1 wmv2 wmv3 av1 libdav1d vp8 vp9 "
+                         "libvpx libvpx-vp9 mjpeg theora prores dvvideo ffv1".split())
+ANYWHERE = frozenset({"truehd", "mlp"})   # the audio decoders whose parser prints a line for a bad frame at any place
+LOGGER = re.compile(r"\[([^\]@]+?) @ (0x[0-9a-f]+)\]")   # the name and the instance of a line's logger
+STREAM_LOGGER = re.compile(r"([avsd])ist#\d+:\d+/")   # ffmpeg 7's logger of an input stream, "aist#0:1/eac3", by its kind
+REPEAT = re.compile(r"\s*Last message repeated (\d+) times")   # ffmpeg's count of the same line again, after that line
+# The most lines one audio decoder may print in the read pass, with the repeats, before the audio doubt posts with no
+# sample. Under it, a sample of each audio track judges the doubt, see audio_sampled(). One bad first frame printed at
+# most 2 lines in 900 random garbles of E-AC-3, AC-3, AAC and DTS (2026-10-26). An E-AC-3, AC-3 or AAC track with every
+# frame bad printed as few, because the probe decoded its first frame only. A DTS track with bad frames from its start
+# printed a line for each one, a frame of 11 ms. So 11 bad DTS frames, 117 ms, post with no sample.
+AUDIO_BAD = 10
 # The byte a demuxer error names: "0x00 at pos 2055615 (0x1f5dbf) invalid as first byte of an EBML number", and
 # "Element at 0x1f5dbf ending at 0x29312a exceeds containing master element". The end may lie past the file.
 POS = re.compile(r"\bpos (\d+)|\bElement at 0x([0-9a-f]+)")
@@ -1497,26 +1599,54 @@ def read_places(found):
     return " and ".join(said)
 
 
+def copy_kind(line):
+    """The stream of one line of the read pass, by the logger ffmpeg names: "audio" or "video" for a decoder or parser
+    of AUDIO_CODECS or VIDEO_CODECS and for ffmpeg's logger of an audio or video input stream (STREAM_LOGGER),
+    "container" for a demuxer (DEMUX), ffmpeg's logger of an input file ("[in#0/matroska,webm @") or a line that names
+    a byte, else None."""
+    if line.startswith((*DEMUX, "[in#")) or POS.search(line):
+        return "container"
+    name = (m := LOGGER.match(line)) and m.group(1)
+    if s := STREAM_LOGGER.match(name or ""):
+        return {"a": "audio", "v": "video"}.get(s.group(1))
+    return "audio" if name in AUDIO_CODECS or (name or "").startswith("pcm_") else "video" if name in VIDEO_CODECS else None
+
+
 def parse_copy(stderr, rc, size):
     """The read pass's stderr and exit code -> a dict. lines: every line except NOISE, as the windows read it. A
     healthy file prints none. The null muxer's complaint of a repeated timestamp names no byte of the file, and
     healthy files print it. ran is False when ffmpeg could not open the file, which is no doubt. pos: the bytes the
     lines name, and at: those as shares of size. loose: the lines that name no place. truncated: the loose lines that
-    start with TAIL_LINE. noise: the NOISE lines. first: the first lines, for the log."""
-    lines = [x.strip() for x in stderr.splitlines() if x.strip() and not any(n in x for n in NOISE)]
+    start with TAIL_LINE. noise: the NOISE lines. first: the first lines, for the log. kinds: the count of lines of
+    each kind of copy_kind(), "other" for None. audio: [decoder name, its lines] for each audio decoder that printed
+    one, where a REPEAT line after one of its lines adds its count."""
+    lines, audio, last = [], {}, None   # audio: {logger instance: [name, lines]}, last: the instance of the line before
+    for x in stderr.splitlines():
+        if (r := REPEAT.match(x)) and last:
+            audio[last][1] += int(r.group(1))
+        if not x.strip() or any(n in x for n in NOISE):
+            last = last if r else None   # the repeats of a NOISE line are no audio errors
+            continue
+        lines.append(x.strip())
+        m, last = LOGGER.match(lines[-1]), None
+        if m and copy_kind(lines[-1]) == "audio":
+            last = m.group(0)
+            audio.setdefault(last, [m.group(1), 0])[1] += 1
     pos = sorted({b for x in lines for d, h in POS.findall(x) if (b := int(d or int(h, 16))) <= size})
+    kinds = collections.Counter(copy_kind(x) or "other" for x in lines)
     return {"ran": not (rc and any(u in x for x in lines for u in UNREADABLE)), "lines": len(lines), "pos": pos,
             "at": [round(b / size, 4) for b in pos] if size else [], "loose": sum(not POS.search(x) for x in lines),
             "truncated": sum(x.startswith(TAIL_LINE) for x in lines if not POS.search(x)),
-            "noise": sum(any(n in x for n in NOISE) for x in stderr.splitlines()), "first": lines[:3]}
+            "noise": sum(any(n in x for n in NOISE) for x in stderr.splitlines()), "first": lines[:3],
+            **({"kinds": dict(kinds), "audio": list(audio.values())} if lines else {})}
 
 
 def whole_verdict(runs, size, read, pcm=False, when=None):
-    """(certain reason or None, [doubts of the zero runs], [doubts of the read pass], the runs that count) of the
-    whole-file check. runs are the zero runs as [first byte, end]. read is parse_copy(), or None when the pass did
-    not run to its end. pcm says the file has a PCM audio track, see checks.pcm_audio(). when holds the play time of
-    the first byte of each run, see checks.play_times(). Each doubt names play times, from when and read["when"], see
-    read_places().
+    """(certain reason or None, [doubts of the zero runs], [doubts of the read pass], the runs that count, the audio
+    doubt or None) of the whole-file check. runs are the zero runs as [first byte, end]. read is parse_copy(), or None
+    when the pass did not run to its end. pcm says the file has a PCM audio track, see checks.pcm_audio(). when holds
+    the play time of the first byte of each run, see checks.play_times(). Each doubt names play times, from when and
+    read["when"], see read_places().
 
     A run is confirmed when a byte the read pass names lies in it, give or take WHOLE_BLOCK, and no other run lies
     nearer. In Matroska a real gap that covers a block edge breaks the container, and the read pass names a byte inside
@@ -1529,7 +1659,13 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
     the tail fault and add no doubt. Those bytes make ffmpeg read the last element again, see matroska.check(). When
     the check finds that case (read["tail_errors"]), the TAIL_LINE lines are the tail fault too. Every other line
     that names no place stays a doubt. Damage in the payload of the last Cluster prints such lines, and mkvmerge
-    copies that damage."""
+    copies that damage.
+
+    The lines of an audio decoder, see copy_kind(), are the audio doubt {"doubts", "posts"}, and the doubts of the
+    read pass leave them out. The probe decodes them at the start of each audio track. A decoder of ANYWHERE prints
+    them for a bad frame at any place, so the doubt names no place then. The count of the doubt adds
+    read["audio_unkept"], the audio lines past the ones checks.copy_lines() keeps. The audio doubt posts when one decoder
+    printed more than AUDIO_BAD lines. Else audio_sampled() judges it."""
     count = runs
     if pcm:
         apart = lambda r, b: max(r[0] - b, b - r[1], 0)   # bytes from b to the run r, 0 inside it
@@ -1542,15 +1678,41 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
     times = dict(zip((a for a, _ in runs), when or ()))
     certain, zero = video_verdict([round(a / size, 3) for a, _ in count], [], None, [times.get(a) for a, _ in count])
     if certain or not read or not read["ran"] or not read["lines"]:
-        return certain, zero, [], count
+        return certain, zero, [], count, None
+    heard = read.get("audio") or []   # [decoder name, its lines], see parse_copy()
+    n = sum(k for _, k in heard) + read.get("audio_unkept", 0)
+    said = (f"a full read of the file found {n} audio error" if any(c in ANYWHERE for c, _ in heard) else
+            f"the start of the audio failed to decode, with {n} error") + "s" * (n != 1)
+    sound = {"doubts": [said], "posts": max(k for _, k in heard) > AUDIO_BAD} if heard else None
     found = zip(read["at"], read.get("when") or [None] * len(read["at"]))
     away = [(a, w) for a, w in found if not any(s / size - NEAR <= a <= e / size + NEAR for s, e in count)]
     if read.get("tail") and all(w == "end" for _, w in away):   # the tail fault, see docs/design.md, "RFC 9559 check"
         away = []
     if away:
-        return None, zero, [f"a full read of the file found damaged data {read_places(away)}"], count
-    n = read["loose"] - (read.get("truncated", 0) if read.get("tail_errors") else 0)
-    return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count
+        return None, zero, [f"a full read of the file found damaged data {read_places(away)}"], count, sound
+    n = read["loose"] - (read.get("truncated", 0) if read.get("tail_errors") else 0) - (read.get("kinds") or {}).get("audio", 0)
+    return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count, sound
+
+
+def audio_sampled(sound, read, samples):
+    """The audio doubt sound of whole_verdict() that does not post, after one sample of each audio track, see
+    checks.audio_samples(). read is parse_copy(). samples holds (the audio track index, its sample, or None when it
+    could not run). The read pass decodes only the first frames of a track, and a track with every frame bad printed
+    as few lines there as one bad frame. A sample opens the file, so its probe prints the lines of the read pass again.
+    A sample whose errors pass those lines, with the repeats of the audio lines, by more than AUDIO_BAD gives the doubt
+    of its track, and the doubt posts. That holds also for a sample that ffmpeg stopped on its error rate, as in a
+    track where every frame fails. Another sample that did not run, or no sample, posts the doubt of the read pass.
+    Else the doubt logs only. "samples" keeps each sample for the log."""
+    probe = read["lines"] - (read.get("kinds") or {}).get("audio", 0) + sum(k for _, k in read.get("audio") or [])
+    past = lambda s: s and s["errors"] - probe > AUDIO_BAD
+    secs = lambda w: f"{w:.1f}" if w < 1 else f"{w:.0f}"   # a file under 1 s gets a window under 1 s
+    doubts = [f"a {secs(s['window'])} s sample of audio track {i + 1} found {s['errors']} decode errors" for i, s in samples if past(s)]
+    failed = [str(i + 1) for i, s in samples if not (s and (s["ran"] or past(s)))]
+    named = ", ".join(failed[:-1]) + " and " + failed[-1] if len(failed) > 1 else "".join(failed)
+    if failed or not samples:
+        doubts.insert(0, f"{sound['doubts'][0]}, and " + (f"the sample of audio track{'s' * (len(failed) > 1)} {named} did not run"
+                                                          if samples else "no audio track could be sampled"))
+    return dict(sound, **({"doubts": doubts, "posts": True} if doubts else {}), samples=[dict(s or {}, track=i + 1) for i, s in samples])
 
 
 # The header check (docs/design.md, "Header repair"). A lossless mkvmerge remux rewrites the Matroska Segment duration, the
@@ -1631,6 +1793,36 @@ def srt_probe(lines, ends):
         i, k = i + 1, -10
     t = lines[i][k + 10:]
     return bool(SRT_TIME.match(t[:100])) and (len(t) >= 100 or not end(i))
+
+
+ASS_HEAD = re.compile(r"\s*\[(script\s+info|v4\+?\s+styles)\]", re.I | re.A)   # the first section of an SSA or ASS script, see ass_text()
+ASS_SKIP = re.compile(r"\s*$|\s*[!;]", re.A)   # a blank line or a comment, which the probe of an SSA or ASS script skips
+ASS_TEXT = "it holds ASS or SSA text under a .srt name"   # why a conversion leaves such a sidecar out, see proof.misread()
+# Why a conversion leaves a sidecar out of the MKV, as sidecars_unread logs it, see convert.convert(): True for an unknown
+# charset, or the words of proof.misread(). Each row holds the words of its decision line, the end of the notice of one
+# such file, and the notice of several files with their names and count, see report.unreadable(). A reason with no
+# row takes the row of None, and its decision line gives its own words. A new reason is one row.
+KEPT_OUT = {
+    None: (None, "can't go into the MKV as they are, because the MKV would lose some of their lines or show them wrong.",
+           lambda names, n: f"The MKV would lose some of the lines of {names} or show them wrong."),
+    ASS_TEXT: (ASS_TEXT, "can't go into the MKV as they are, because the file holds ASS or SSA text under a .srt name.",
+               lambda names, n: f"The file{'s' * (n > 1)} {names} {'hold' if n > 1 else 'holds'} ASS or SSA text under a .srt name."),
+    True: ("its charset is unknown", "can't be read as text, because AMG can't tell their character set.",
+           lambda names, n: f"AMG can't tell the character set of {names}."),
+}
+kept_out = lambda why: why if why in KEPT_OUT else None   # the key of the row of KEPT_OUT of the reason why
+
+
+def ass_text(lines):
+    """Whether mkvmerge 102 takes srt_lines() lines as SSA or ASS subtitles (ssa_parser_c::probe). It reads each line up
+    to its first NUL. Of the first 100 lines, the first one that is not blank and starts with no "!" or ";" comment
+    must open the [Script Info], [V4 Styles] or [V4+ Styles] section, in any case. A blank is a space, a tab, a CR, an
+    LF, a form feed or a vertical tab. Other Unicode spaces count as text (measured on mkvmerge 102)."""
+    for i, line in enumerate(lines[:100]):
+        s = (line[1:] if i == 0 and line[:1] == "\ufeff" else line).split("\0", 1)[0]
+        if not ASS_SKIP.match(s):
+            return bool(ASS_HEAD.match(s))
+    return False
 
 
 def srt_read(text):
