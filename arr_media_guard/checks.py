@@ -1538,7 +1538,6 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
     argv += ["--slot", str(slot)] if slot else []
     if (yield_to or (None, None))[1] and config.JOB:   # a job process yields only for its slot, see runner.import_waits()
         argv += ["--yield-job", config.JOB, str(config.slots()), str(config.CFG.hook_workers)]
-    t0 = time.time()
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
     except OSError as ex:
@@ -1557,14 +1556,7 @@ def lid_cli(path, index, j, expect, timeout, fresh, keep=False, words=None, then
             except ProcessLookupError:
                 pass
             p.wait()
-        with contextlib.suppress(OSError):   # the empty log that onnxruntime of this process left, never an older file of that name
-            log_file = ORT_LOG.format(p.pid)
-            if os.stat(log_file).st_size == 0 and os.stat(log_file).st_mtime >= t0 - 1:
-                os.remove(log_file)
         ff.check_stop()   # a stop killed the helper, so its answer counts for nothing
-
-
-ORT_LOG = "/tmp/mat-debug-{}.log"   # onnxruntime in the Whisper venv creates this empty file on import, always in /tmp
 
 
 def hear(path, j, d, original, fresh=False, only=None, keep=False, then=None):

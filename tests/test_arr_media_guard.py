@@ -22474,31 +22474,6 @@ def test_a_waiting_deep_analysis_keeps_the_held_alert_across_a_restart(env, monk
     _, (deep,) = two_lines(env)
     assert deep["held_result"] == ["sent"] and [t for t, _ in posted(env)] == ["Subtitles out of sync"] and not claimed(), deep
 
-def test_a_hearing_leaves_no_onnxruntime_log_in_the_system_temp_dir(env, monkeypatch, tmp_path):
-    """onnxruntime in the Whisper venv creates an empty log named by the process id on import. The hearing removes the
-    one its own process left. A file of the same name from before the hearing, or one with content, stays."""
-    tmp = tmp_path / "tmp"
-    tmp.mkdir()
-    monkeypatch.setattr(hook, "ORT_LOG", str(tmp / "mat-debug-{}.log"))
-    old = tmp / "mat-debug-40.log"   # from an earlier process that had the pid of the first hearing
-    old.write_text("")
-    os.utime(old, (time.time() - 3600, time.time() - 3600))
-    (tmp / "mat-debug-42.log").write_text("a line")
-
-    class P:
-        def __init__(self, argv, **k):
-            self.pid = P.pid
-            log = tmp / f"mat-debug-{self.pid}.log"
-            if not log.exists():   # a log with content from onnxruntime's debug mode is left as it is
-                log.write_text("")
-        def communicate(self, timeout=None): return ('{"windows": []}', "")
-        def poll(self): return 0
-    for pid in (40, 42, 43):
-        P.pid = pid
-        monkeypatch.setattr(hook.subprocess, "Popen", P)
-        hook.lid_cli(env["path"], 0, env["probe"], (), 60, False, words=("eng", [10.0], 10.0))
-    assert sorted(os.listdir(tmp)) == ["mat-debug-40.log", "mat-debug-42.log"]   # the log of the hearing with pid 43 went
-
 
 def test_the_report_after_a_removal_names_each_track_as_the_check_saw_it():
     """s1, an English track, left the file. The tracks after it moved up, so the report takes the places the check

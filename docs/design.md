@@ -2510,8 +2510,8 @@ under 8 seconds of speech is dropped, and the next cut comes from another positi
 once three samples hold speech. faster-whisper names the language of each one. It uses the `small`
 model, int8 on CPU, because `small` names a wrong language less often than `tiny` and `base`. A
 sample under 0.6 names no language. The module answers only with two or more votes, all for one
-language, averaging 0.8 or more. Otherwise `lang` is null, and `why` names the rule that failed. The onnxruntime of the
-Whisper venv writes an empty `/tmp/mat-debug-<pid>.log` on each start. The hook removes the one its own hearing left.
+language, averaging 0.8 or more. Otherwise `lang` is null, and `why` names the rule that failed. The package sets
+`ORT_DISABLE_TELEMETRY=1` for every helper, so onnxruntime writes no telemetry files.
 
 **What it cannot hear.** Whisper does not know Irish, Scottish Gaelic, Mixtec, Zulu, Xhosa, Quechua
 or Kurdish, and it names a neighbour for them. It knows Belarusian but gets it wrong (`WEAK`). When
