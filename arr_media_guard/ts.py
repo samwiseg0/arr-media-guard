@@ -62,7 +62,7 @@ def frames(path):
     for the whole file. Raises ValueError when the file holds no packets, PAT or PMT, and OSError when the file does not
     open."""
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as b:
-        b.madvise(mmap.MADV_SEQUENTIAL)   # one pass from the start, so the pages read can go
+        b.madvise(mmap.MADV_SEQUENTIAL)   # one pass from the start, so the kernel reads ahead
         size, sync = packet_size(b)
         off = size - 188   # the byte of the sync byte in a packet. An M2TS packet starts with a 4-byte time.
         first = sync - off if sync >= off else sync + 188
@@ -91,6 +91,7 @@ def frames(path):
                         t.read(b, key, p0, size, off)
                     except ValueError as ex:   # the first damage in the file counts
                         error, at = ex.args if at is None or ex.args[1] < at else (error, at)
+                b.madvise(mmap.MADV_DONTNEED)   # the RSS keeps one chunk, see matroska.DROP
                 if error:
                     break
         finally:

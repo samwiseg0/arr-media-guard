@@ -674,6 +674,11 @@ WALKS, LOCK = {}, threading.Lock()   # (path, size, mtime_ns): frames() of the l
 # ponytail: a track whose first frames lie past HEAD_MAX, as audio that starts late, gives head() fewer frames than a
 # whole walk. 500 AC-3 frames are 16 s, 240 MB at 120 Mbit/s. Raise it if a file needs more.
 HEAD_MAX = 512 << 20   # bytes past the Segment start after which head() stops
+# A page of an mmap counts in the RSS until the kernel reclaims it, and MADV_SEQUENTIAL does not unmap it. A header
+# repair of a 13.5 GB film peaked at 3.4 to 8.1 GB that way. So the walk unmaps its pages after each DROP bytes, see
+# walk(), and so do track_frames() and scan(). The pages stay in the page cache, and a later read of one faults it in
+# again.
+DROP = 64 << 20
 
 
 def head(path, enough):
@@ -693,11 +698,12 @@ def head(path, enough):
 def walk(path, enough=None):
     """frames() of path, or head() of it with enough."""
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as b:
-        b.madvise(mmap.MADV_SEQUENTIAL)   # one pass from the start, so the pages read can go
+        b.madvise(mmap.MADV_SEQUENTIAL)   # one pass from the start, so the kernel reads ahead
         seg = decide.segment_start(b)
         if not seg:
             raise ValueError("the file holds no Matroska Segment")
         ds, seg_size = seg
+        drop = ds + DROP   # where the walk next unmaps its pages
         end = len(b) if seg_size is None else min(len(b), ds + seg_size)
         scale, entries, blocks, p, error, whole = 1000000, [], collections.defaultdict(list), ds, None, False
         clustered, hole = False, None   # whether a Cluster came yet, and the first zero run after one
@@ -720,9 +726,9 @@ def walk(path, enough=None):
             try:
                 e = decide.element(b, p)
                 if not e and not b[p]:   # a zero run that an edit left between level-1 elements, see checks.zero_gap()
-                    m = NONZERO.search(b, p, end)
+                    z = scan(b, p, end, True)
                     hole = p if clustered and hole is None else hole
-                    p = m.start() if m else end
+                    p = z if z >= 0 else end
                     continue
                 if not e or e[0] not in decide.LEVEL1:
                     raise damage(f"the Segment holds no level-1 element at byte {p}", p + 1)
@@ -744,6 +750,9 @@ def walk(path, enough=None):
                             top(*h)
                     at, clustered, t, mark = p, True, first_time(b, d, end), {k: len(v) for k, v in blocks.items()}
                     p = cluster(b, d, end if s is None else min(end, d + s), s is None, blocks, reads)
+                    if p >= drop:
+                        b.madvise(mmap.MADV_DONTNEED)
+                        drop = p + DROP
                     if s is not None and d + s > len(b):
                         raise damage(f"the Cluster at byte {at} runs past the end of the file", len(b))
                     mark = None
@@ -754,7 +763,7 @@ def walk(path, enough=None):
                         break
                     continue
                 if s is None or d + s > end:   # every Cluster read whole when no Cluster id follows, in this file or one joined to it. head() skips the search.
-                    whole = not enough and b.find(CLUSTER_ID, d) < 0
+                    whole = not enough and scan(b, d, len(b)) < 0
                     raise damage(f"the element at byte {p} has an unknown size or runs past the Segment end", d)
                 if i in (decide.INFO, decide.TRACKS) and i not in seen:   # the first one counts, as ffmpeg and mkvmerge read it
                     top(i, d, s)
@@ -782,7 +791,7 @@ def walk(path, enough=None):
                 if not w:
                     whole = whole and not resyncs
                     break
-                q = b.find(CLUSTER_ID, at, w[0])
+                q = scan(b, at, w[0])
                 while q >= 0:   # a damaged Cluster before w keeps its blocks before its damage when its Timestamp fits
                     f = found(b, q, end, low, reads)
                     keep = f and f[1] and f[2] is not None and f[0] <= w[1] and f[2] <= w[0]
@@ -791,7 +800,7 @@ def walk(path, enough=None):
                             blocks[k] += v
                         resyncs.append((at, q))
                         at = f[2]
-                    q = b.find(CLUSTER_ID, at if keep else q + 1, w[0])
+                    q = scan(b, at if keep else q + 1, w[0])
                 resyncs.append((at, w[0]))
                 p, hole = w[0], None   # whole is False here: a Cluster id follows, see the level-1 branch
         if error is None and seg_size is not None and ds + seg_size > len(b):   # every Cluster read whole, so the frames are all there
@@ -834,13 +843,31 @@ def found(b, p, end, last, reads):
 def after(b, q, end, last, reads):
     """(its byte, its Timestamp, where it ends) of the first Cluster id from byte q of b whose Cluster found() counts
     and reads whole, or None."""
-    q = b.find(CLUSTER_ID, q, end)
+    q = scan(b, q, end)
     while q >= 0:
         f = found(b, q, end, last, reads)
         if f and f[2] is None:
             return q, f[0], f[3]
-        q = b.find(CLUSTER_ID, q + 1, end)
+        q = scan(b, q + 1, end)
     return None
+
+
+def scan(b, q, end, zero=False):
+    """The byte of the first Cluster id in b[q:end], or with zero of the first byte that is not 0, else -1. It searches
+    up to the next multiple of DROP at a time, and it unmaps the pages after each part that holds no match. So a search
+    through a long zero run or a damaged span keeps few pages mapped, see DROP."""
+    while q < end:
+        w = min(end, (q // DROP + 1) * DROP)
+        if zero:
+            m = NONZERO.search(b, q, w)
+            got = m.start() if m else -1
+        else:
+            got = b.find(CLUSTER_ID, q, min(end, w + 3))   # an id that starts before w
+        if got >= 0:
+            return got
+        b.madvise(mmap.MADV_DONTNEED)
+        q = w
+    return -1
 
 
 def ends(b, q, end):
@@ -850,8 +877,8 @@ def ends(b, q, end):
     while q < end:
         e = decide.element(b, q)
         if not e and not b[q]:
-            m = NONZERO.search(b, q, end)
-            q = m.start() if m else end
+            z = scan(b, q, end, True)
+            q = z if z >= 0 else end
             continue
         if not e and len(b) - q < 12:   # an id and a size take at most 12 bytes
             return True
@@ -877,7 +904,7 @@ def cluster(b, start, end, open_, blocks, reads):
     bytes of its frames to True for Vorbis. The frame heads are lace_heads() of a lace of a track in reads, the first
     byte of an unlaced block of a Vorbis track in reads, else None. vorbis_reader() takes the mode of every packet in
     turn, unlaced ones too. It reads the lace sizes and the frame heads while the block is in memory. After the walk,
-    MADV_SEQUENTIAL has dropped the pages, and a read of each lace faults its page in again. The ValueError holds in at
+    walk() has unmapped the pages, and a read of each lace faults its page in again. The ValueError holds in at
     the byte of the child that does not read, see damage()."""
     ts, q = None, start
     try:
@@ -968,10 +995,14 @@ def track_frames(b, t, blocks, scale):
                     and codec.startswith(("A_AC3", "A_EAC3", "A_DTS", "A_MPEG/L")) else None)
     time, tag, place, dur, full = array.array("q"), bytearray(), array.array("q"), array.array("q"), bytearray()
     over, gap, last, laced, lapped = [0, 0, None], [0, 0, None], None, False, array.array("q")
+    drop = 0   # where the loop next unmaps the pages, see DROP
     try:
         for i, (tk, n, pos, head, end, lacing, bdur, empty, heads) in enumerate(blocks):
             if not i & 0xffff:   # a TrueHD track of a film holds millions of blocks
                 ff.check_stop()
+            if pos >= drop:   # a read of a lace, a packed text frame or a Vorbis packet maps its page again
+                b.madvise(mmap.MADV_DONTNEED)
+                drop = pos + DROP
             t0 = tk * scale
             if n == 1:
                 d = bdur * scale if bdur is not None else dd or NONE

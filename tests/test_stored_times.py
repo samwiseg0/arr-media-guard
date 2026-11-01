@@ -2,7 +2,7 @@
 # Copyright (C) 2026 samwiseg0
 """The MP4 sample reader, mp4.samples(), and the proof that reads it, and the start check of two files with stored
 times (docs/design.md, "Time reads"). Every file is made up by ffmpeg, and some get their edit list patched."""
-import json, re, shutil, struct, subprocess
+import json, mmap, re, shutil, struct, subprocess
 
 import pytest
 
@@ -303,7 +303,7 @@ def test_a_vorbis_lace_takes_the_block_sizes_of_its_modes(tmp_path, monkeypatch,
     got = [None if x == matroska.NONE else round(x / 1e6 - 10, 6) for x in t["time"][len(first or []) + 1:]]
     assert got == [None if w is None else round(w, 6) for w in want], got
     real = matroska.track_frames
-    monkeypatch.setattr(matroska, "track_frames", lambda b, *a: real(bytes(len(b)), *a))
+    monkeypatch.setattr(matroska, "track_frames", lambda b, *a: real(mmap.mmap(-1, len(b)), *a))   # a mapping of zeros
     matroska.WALKS.clear()
     assert matroska.frames(str(tmp_path / "v.mkv"))["tracks"][0]["time"] == t["time"]
 

@@ -3,6 +3,7 @@
 """The frame reader, matroska.frames(), and the time check of two Matroska files that reads it (docs/design.md, "Frame
 times"). Every file is made up, byte by byte."""
 import itertools
+import mmap
 import random
 import sys
 import zlib
@@ -127,7 +128,9 @@ def test_a_packed_text_frame_that_unpacks_to_nothing_holds_no_data():
         blocks.append((k, 1, len(b), len(b), len(b) + len(x), 0, 1, 0, None))
         b += x
     t = {"number": 3, "type": 17, "codec": "S_TEXT/UTF8", "dd": None, "private": b"", "strip": b"", "packed": True}
-    full = lambda **k: list(matroska.track_frames(b, dict(t, **k), blocks, NS)["full"])
+    m = mmap.mmap(-1, len(b))   # track_frames() reads the mapping of the walk
+    m[:] = b
+    full = lambda **k: list(matroska.track_frames(m, dict(t, **k), blocks, NS)["full"])
     assert full() == [0, 1, 1, 1, 0]
     assert full(packed=False) == full(codec="S_HDMV/PGS") == full(type=1) == [1, 1, 1, 1, 0]
 
@@ -440,16 +443,112 @@ def test_the_walk_reads_the_lace_sizes_on_a_track_with_a_default_duration(tmp_pa
 
 
 def test_the_walk_keeps_the_first_bytes_of_each_lace_frame(tmp_path, monkeypatch):
-    """After the walk, MADV_SEQUENTIAL has dropped the pages, and a read of a lace faults its page in again. So the
+    """After the walk, walk() has unmapped the pages, and a read of a lace faults its page in again. So the
     walk keeps the first bytes of each lace frame of a DTS track with no DefaultDuration, and the frame times read
     with every byte of the file 0 after the walk. An AAC lace needs no bytes."""
     path = mkv(tmp_path / "h.mkv", [entry(1, 2, "A_DTS"), entry(2, 2, "A_AAC", private=AAC_LC_48K)],
                [(0, [simple(1, 0, [dts()]), simple(2, 0, [b"p"])]),
                 (100, [simple(1, 0, [dts(), dts(), dts()], "xiph"), simple(2, 0, [b"p", b"q", b"r"], "ebml")])])
     real = matroska.track_frames
-    monkeypatch.setattr(matroska, "track_frames", lambda b, *a: real(bytes(len(b)), *a))
+    monkeypatch.setattr(matroska, "track_frames", lambda b, *a: real(mmap.mmap(-1, len(b)), *a))   # a mapping of zeros
     for t, length in zip(matroska.frames(path)["tracks"], (DTS_FRAME, 1024 * 1e9 / 48000)):
         assert tagged(t) == [(0, "stored"), (100 * NS, "stored")] + [(100 * NS + round(k * length), "bitstream") for k in (1, 2)], t
+
+
+def test_the_walk_that_unmaps_its_pages_after_each_cluster_gives_the_same_frames(tmp_path, monkeypatch):
+    """The walk unmaps its pages after each DROP bytes, so the RSS of a film stays small. A read after that faults
+    each page in again. So with a DROP of 1 byte, the frames, the lace times and the read on past damage stay the
+    same."""
+    cl = lambda k: (k * 100, [simple(1, 0, [dts(), dts(), dts()], "xiph"), simple(2, 0, [b"v"])])
+    path = mkv(tmp_path / "u.mkv", [entry(1, 2, "A_DTS"), entry(2, 1, "V_MPEG4/ISO/AVC", 40 * NS)], [cl(k) for k in range(6)])
+    raw = bytearray(open(path, "rb").read())
+    raw[raw.index(b"\x1f\x43\xb6\x75", raw.index(b"\x1f\x43\xb6\x75") + 4) + 20] ^= 0xFF   # damage in the second Cluster
+    open(path, "wb").write(raw)
+    want = matroska.walk(path)
+    monkeypatch.setattr(matroska, "DROP", 1)
+    got = matroska.walk(path)
+    assert got["resyncs"] and len(got["read_on"][0]["time"]) > len(got["tracks"][0]["time"]), got
+    flat = lambda r: [{k: list(v) if isinstance(v, (bytearray, type(t["time"]))) else v for k, v in t.items()} for t in r["tracks"] + r["read_on"]]
+    assert flat(got) == flat(want) and got["resyncs"] == want["resyncs"] and got["error"] == want["error"]
+
+
+def mapped():
+    """The MB of file pages mapped in the RSS: RssFile, and RssShmem for a file on tmpfs."""
+    with open("/proc/self/status") as f:
+        return sum(int(x.split()[1]) for x in f if x.startswith(("RssFile:", "RssShmem:"))) >> 10
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/status is on Linux only")
+@pytest.mark.parametrize("shape", ["blocks", "late tracks", "zero run", "zero tail", "cut tags", "false id"])
+def test_the_walk_keeps_few_pages_of_a_large_file_mapped(tmp_path, monkeypatch, shape):
+    """A mapped page counts in the RSS until the walk unmaps it. Each file of about 48 MB touches every page. It holds
+    4 KB video blocks, or DTS laces with Tracks after the Clusters, whose frame lengths track_frames() reads after the
+    walk. Or the walk searches 40 MB or more for the next Cluster id or the next byte that is not 0. That span is a zero
+    run between Clusters, a zero run after damage and the last Cluster, or the data of Tags whose size runs past the
+    end. The data of the second such Tags starts with a Cluster id of no Timestamp. With a DROP of 4 MB, the mapped
+    pages stay under 16 MB. A walk that never unmaps holds about 48 MB."""
+    laced = shape == "late tracks"
+    kids = b"".join(simple(2, k * 4, [dts(2000), dts(2000)], "xiph") if laced else simple(1, k * 4, [b"x" * 4000]) for k in range(256))
+    clusters = [el(0x1F43B675, uint(0xE7, c * 1000) + kids) for c in range(48)]
+    if shape == "zero run":
+        clusters[4:44] = [bytes(40 << 20)]
+    elif shape == "zero tail":   # a block id of 0 in the third Cluster
+        clusters[2:] = [clusters[2][:29] + b"\0" + clusters[2][30:], clusters[3], bytes(44 << 20)]
+    elif shape == "cut tags":
+        clusters[4:] = [b"\x12\x54\xc3\x67\x01" + (1 << 30).to_bytes(7, "big") + b"x" * (44 << 20)]
+    elif shape == "false id":
+        clusters[4:44] = [b"\x12\x54\xc3\x67\x01" + (1 << 30).to_bytes(7, "big") + b"\x1f\x43\xb6\x75\x81\0" + b"x" * (40 << 20)]
+    tracks = el(0x1654AE6B, entry(1, 1, "V_MPEG4/ISO/AVC", 40 * NS) + entry(2, 2, "A_DTS"))
+    path = headed(tmp_path / "big.mkv", el(0x1549A966, uint(0x2AD7B1, NS)) + b"".join(clusters + [tracks] if laced else [tracks] + clusters))
+    top = [0]
+
+    def sampled(real):   # the mapped pages before and after each element, Cluster, search and lace read
+        def read(*a):
+            top[0] = max(top[0], mapped())
+            got = real(*a)
+            top[0] = max(top[0], mapped())
+            return got
+        return read
+    monkeypatch.setattr(matroska, "DROP", 4 << 20)
+    for name in ("cluster", "lace_heads", "after", "ends"):
+        monkeypatch.setattr(matroska, name, sampled(getattr(matroska, name)))
+    monkeypatch.setattr(matroska.ff, "check_stop", sampled(matroska.ff.check_stop))
+    start = mapped()
+    got = matroska.walk(path)
+    frames = {"blocks": 48 * 256, "late tracks": 48 * 512, "zero run": 8 * 256, "zero tail": 3 * 256, "cut tags": 4 * 256, "false id": 8 * 256}
+    assert sum(len(t["time"]) for t in got["read_on"] or got["tracks"]) == frames[shape], got["error"]
+    assert (got["error"] is None) == (shape in ("blocks", "late tracks")) and bool(got["resyncs"]) == (shape in ("zero run", "zero tail", "false id"))
+    assert top[0] - start < 16, (start, top[0])
+
+
+def test_each_mmap_of_a_media_file_unmaps_its_pages():
+    """A mapped page of a media file counts in the RSS until the kernel reclaims it, see matroska.DROP. So each
+    function of the package that maps a file names mmap.MADV_DONTNEED, or reads a bounded part, named here. The test
+    reads the syntax tree, so a comment or a string does not count. Each module imports mmap as mmap and uses the name
+    only as mmap.X, so mmap.mmap is the only way to map a file."""
+    import ast
+    import pathlib
+    bounded = {"keyframe": "reads KEY_BLOCKS blocks at most"}
+    found, bad = {}, []
+    for f in sorted(pathlib.Path(matroska.__file__).parent.glob("*.py")):
+        tree = ast.parse(f.read_text())
+        up = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+        for node in ast.walk(tree):
+            at = f"{f.name}:{getattr(node, 'lineno', 0)}"
+            if isinstance(node, ast.Import) and any(a.name == "mmap" and a.asname not in (None, "mmap") for a in node.names):
+                bad.append(at)
+            elif isinstance(node, ast.ImportFrom) and node.module == "mmap" and any(a.name in ("mmap", "*") for a in node.names):
+                bad.append(at)
+            elif isinstance(node, ast.Name) and node.id == "mmap" and not (isinstance(up[node], ast.Attribute) and up[node].value is node):
+                bad.append(at)   # the module under another name, as in m = mmap
+            elif isinstance(node, ast.Attribute) and node.attr == "mmap" and isinstance(node.value, ast.Name) and node.value.id == "mmap":
+                fn = node
+                while fn in up and not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    fn = up[fn]
+                name = getattr(fn, "name", "<module>")
+                found[f"{f.name}:{name}"] = name in bounded or name != "<module>" and any(
+                    isinstance(n, ast.Attribute) and n.attr == "MADV_DONTNEED" for n in ast.walk(fn))
+    assert found and all(found.values()) and not bad, (found, bad)
 
 
 def test_a_late_tracks_reads_the_lace_frames_after_the_walk(tmp_path):

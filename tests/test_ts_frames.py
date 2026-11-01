@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -78,6 +79,40 @@ def test_a_stop_ends_the_read_before_its_next_chunk(tmp_path, monkeypatch):
     monkeypatch.setitem(ts.ff.STOP, "term", signal.SIGTERM)
     with pytest.raises(SystemExit):
         ts.frames(path)
+
+
+def test_a_read_that_unmaps_its_pages_after_each_chunk_gives_the_same_frames(tmp_path, monkeypatch):
+    """The reader unmaps its pages after each chunk, so the RSS of a film stays small. A later read of a page faults it
+    in again. So chunks of 7 packets, where each video PES spans several chunks, give the same frames."""
+    path = clip(tmp_path, "u.ts", ["ac3"])
+    flat = lambda r: [{k: list(v) if isinstance(v, (bytearray, type(t["time"]))) else v for k, v in t.items()} for t in r["tracks"]]
+    want = ts.frames(path)
+    monkeypatch.setattr(ts, "CHUNK", 7)
+    got = ts.frames(path)
+    assert got["error"] is None and flat(got) == flat(want), got["error"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/status is on Linux only")
+def test_the_read_keeps_few_pages_of_a_large_file_mapped(tmp_path, monkeypatch):
+    """A mapped page counts in the RSS until the reader unmaps it. A file of a clip and 48 MB of null packets touches
+    every page, as the reader takes the header of each packet. With chunks of 4 MB, the mapped pages stay under 16 MB.
+    A read that unmaps once at its end holds about 48 MB."""
+    from test_frame_times import mapped
+    src = clip(tmp_path, "s.ts", ["ac3"])
+    path = tmp_path / "big.ts"
+    path.write_bytes(pathlib.Path(src).read_bytes() + (b"\x47\x1f\xff\x10" + b"\xff" * 184) * ((48 << 20) // 188))
+    real, top = ts.Track.read, [0]
+
+    def read(*a):
+        top[0] = max(top[0], mapped())
+        return real(*a)
+    want = [len(t["time"]) for t in ts.frames(src)["tracks"]]
+    monkeypatch.setattr(ts, "CHUNK", (4 << 20) // 188)
+    monkeypatch.setattr(ts.Track, "read", read)
+    start = mapped()
+    got = ts.frames(str(path))
+    assert got["error"] is None and [len(t["time"]) for t in got["tracks"]] == want, got["error"]
+    assert top[0] - start < 16, (start, top[0])
 
 
 def test_an_m2ts_file_has_192_byte_packets(tmp_path):

@@ -1013,6 +1013,12 @@ units, then run `systemctl daemon-reload`. The app needs no restart, because sys
 `OOMPolicy` when the OOM event arrives. Each turn at the language model takes about 0.8 GB, so `BACKGROUND_WORKERS=4`
 can take about 3 GB while the background queue hears.
 
+The block walk of a Matroska file and the read of a TS file map the file. A mapped page counts in the RSS until the
+kernel reclaims it, so each reader unmaps its pages as it goes, after 64 MB and 48 MB. The frame times after the walk
+read some laces and packed text frames again, and they unmap after each 64 MB too. So does a search of the walk
+through a zero run or past damage. A header repair of a 13.5 GB film peaked at 3.4 to 8.1 GB before, with the peak set
+by how soon the kernel reclaimed. It peaks at about 350 MB now.
+
 ```
 # /etc/systemd/system/radarr.service.d/arr-media-guard.conf, the same for sonarr.service
 [Service]
@@ -1688,9 +1694,10 @@ a header repair, the lags and the whole-file read of the subtitles take the time
 
 **The walk.** One pass reads the element headers, the block headers and the lace sizes of every Cluster through mmap.
 Where a lace needs the codec's frame length, the walk keeps the first 16 bytes of each of its frames, and of a Vorbis
-track the first byte of each unlaced block. The walk drops each page behind it, so a second read of a lace reads it
-from the disk again. A 7 GB episode has a DTS track that laces every block with no DefaultDuration. Its frame times
-after the walk took 11 to 15 s cold with that second read. They took 1.1 to 1.6 s with the kept bytes. A file whose
+track the first byte of each unlaced block. The walk unmaps each page behind it. A second read of a lace faults the
+page in again from the page cache, or from the disk once the kernel has reclaimed it. A 7 GB episode has a DTS track
+that laces every block with no DefaultDuration. Its frame times after the walk took 11 to 15 s cold with that second
+read. They took 1.1 to 1.6 s with the kept bytes. A file whose
 Tracks comes after its Clusters reads those bytes after the walk. The walk takes the first Info and the first Tracks,
 as ffmpeg, mpv and mkvmerge read them. A second one after the Clusters does not count. The frames of a text track that zlib packs read after
 the walk too. A packed text frame that unpacks to no byte holds no data, as a frame of 0 bytes does. ffmpeg, mkvextract
