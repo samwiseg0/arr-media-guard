@@ -24,8 +24,9 @@ A decision line holds:
   AMG fixed, or why the post failed. With `SUBTITLES=deep`, a subtitle problem of an import says
   `held for the deep analysis`. The deep analysis checks it again and posts what it still finds.
 - `held_result`, on a deep analysis line whose import held alerts, what became of each one. That is `checked again`,
-  `fixed before the error`, `dropped with the file`, or what its post gave. A held alert posts when nothing judged its
-  subtitles again. That happens after an error, when AMG could not hear the audio, or with `SUBTITLES` set to `off`.
+  `fixed before the error`, `dropped with the file`, or what its post gave. A subtitle that the deep analysis retimed or
+  took out counts as checked again. A held alert posts when nothing checked one of its subtitles again. That happens
+  after an error before the remux, when AMG could not hear the audio, or with `SUBTITLES` set to `off`.
   With `DISCORD_POSTS=all`, an alert that also named a change of the import adds `, change` and what each post of that
   change gave. `said by the deep analysis` there means a posted alert of the deep analysis named that flag change
   already. When the import could not queue the deep analysis, its alerts post at once, and a `warning` line holds their

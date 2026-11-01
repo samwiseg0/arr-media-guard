@@ -235,6 +235,10 @@ FINDINGS = [
      "file as Film A (1979).per.broken-encoding.srt.txt."),
     ({"kind": "audio", "doubts": ["the start of the audio failed to decode, with 470 errors"], "mark": "whole"}, "Audio may be broken", "amber",
      "The start of the audio failed to decode, with 470 errors. AMG kept the file and did not re-grab it."),
+    ({"kind": "subtiming", "lines": [{"code": "check_flash", "track": "s1", "median": 0.25}, {"code": "not_retimed", "tracks": ["s2"], "block": None,
+      "result": "subtitle remux failed: mkvmerge exited 2"}]}, "Rewrite failed", "amber", "The Spanish subtitles (track 2) need new times, but "
+     "rewriting the file failed. The original file was not changed. The English subtitles (track 1) flash by too fast to read. Half the lines "
+     "show for 0.25 s or less. SUBTITLES is set to check, so they were left as they are."),
 ]
 
 # (action, the end it gives the title of broken audio, its text). Each text ends with the restore, see restored().
@@ -725,9 +729,51 @@ def test_a_held_alert_counts_as_judged_only_when_each_subtitle_it_names_got_a_ve
     rec = {"subcheck": {"s1": {"verdict": "match"}, "s2": {"verdict": "unknown"}},
            "subtime": {"s3": {"verdict": "unknown", "layout": {"verdict": "fit"}}, "s4": {"verdict": "weak"}}}
     assert [h.judged(rec, k) for k in (["s1"], ["s1", "s2"], ["s3"], ["s4"], ["s5"], [])] == [True, False, True, False, False, False]
-    rec = {"subremux": {"done": True, "timed": ["s1"], "removed": ["s3"]}, "sidecars": [{"name": "F.en.srt", "result": "retimed"},
-                                                                                       {"name": "F.fr.srt", "result": "left"}]}
-    assert h.remuxed(rec) == {"s1", "s3", "F.en.srt"} and h.remuxed({"subremux": {"done": False, "timed": ["s1"]}}) == set()
+    rec = {"subremux": {"done": True, "timed": ["s1"], "removed": ["s3"], "stripped": {"s4": "F.nl.broken-encoding.srt.txt"}},
+           "sidecars": [{"name": "F.en.srt", "action": "retime", "result": "retimed"}, {"name": "F.fr.srt", "result": "left"},
+                        {"name": "F.de.srt", "result": "renamed"}, {"name": "F.es.srt", "action": "lengthen", "result": "retimed"},
+                        {"name": "F.it.srt", "action": "move", "result": "moved"}]}
+    assert h.remuxed(rec) == {"s1", "s3", "s4", "F.en.srt", "F.de.srt", "F.it.srt"}   # longer ends fix no timing
+    assert h.remuxed({"subremux": {"done": False, "timed": ["s1"], "stripped": {"s4": "F.nl.broken-encoding.srt.txt"}}}) == set()
+
+
+HELD_TIMES = {"kind": "subtiming", "size": 7, "embed": {"title": "Subtitles out of sync", "description": "x"}, "keys": ["s2", "s3", "s4"],
+              "spans": {"s2": [[0.0, 600.0]], "s3": [[0.0, 600.0]], "s4": [[0.0, 600.0]]}}
+JUDGED_OFF = {"subtime": {"s4": {"verdict": "fit"}}, "subjudge": {"s4": {"state": "off"}}}   # still off, and the run's own alert says so
+STRIPPED = {"done": True, "fixed": ["s3"], "stripped": {"s2": "Film A.nl.broken-encoding.srt.txt"}}
+
+
+@pytest.mark.parametrize("outcome, remux, more, held", [
+    ("subtitles_remuxed", STRIPPED, JUDGED_OFF, "checked again"),   # 2026-10-27: s2 garbled and taken out, s3 retimed, s4 judged
+    ("subtitles_remuxed", dict(STRIPPED, fixed=["s3", "s4"]), {}, "checked again"),   # a retime settles a track no verdict judged
+    ("error", STRIPPED, {}, "sent"),   # s4 was neither changed nor judged before the error
+    ("error", dict(STRIPPED, fixed=["s3", "s4"]), {}, "fixed before the error"),
+    ("subtitles_remuxed", dict(STRIPPED, done=False), JUDGED_OFF, "sent"),   # the remux failed, so s2 and s3 stay as they were
+    ("subtitles_remuxed", STRIPPED, {"subtime": {"s4": {"verdict": "fit"}}, "subjudge": {"s4": {"state": "unknown"}}}, "sent"),
+])
+def test_a_held_timing_alert_counts_each_track_the_run_retimed_or_took_out_as_settled(sent, outcome, remux, more, held):
+    """A tester's deep analysis took out a garbled track, retimed three tracks whose remux had failed at the import, and
+    judged one still off. The garbled track had no timing outcome, so the held alert posted "rewriting the file failed",
+    which was false by then. A track the remux took out or retimed is settled for any outcome. A track that nothing
+    settled keeps the held alert, as after an error before its change or a whole-file timing that judged nothing."""
+    job = {"app": "radarr", "path": "/m/Film A (1979)/Film A.mkv", "held": [HELD_TIMES]}
+    assert h.held_after(job, {"outcome": outcome, "subremux": remux, **more}) == [held]
+    assert [e["title"] for e in sent] == (["Subtitles out of sync"] if held == "sent" else [])
+
+
+def test_a_held_alert_that_names_no_subtitle_posts(sent):
+    """A held alert with no keys names nothing a run could settle, so it posts, as before."""
+    job = {"app": "radarr", "path": "/m/Film A (1979)/Film A.mkv", "held": [dict(HELD_TIMES, keys=[], spans={})]}
+    assert h.held_after(job, {"outcome": "subtitles_remuxed", "subremux": STRIPPED}) == ["sent"] and len(sent) == 1
+
+
+def test_a_held_alert_counts_a_sidecar_renamed_as_garbled_as_settled(sent):
+    """The sidecar step renamed a garbled sidecar to a name no player reads, and its own notice posts. No word check judged
+    it, and the held wrong-subtitles alert goes unposted."""
+    held = {"kind": "submatch", "size": 7, "embed": {"title": "Wrong subtitles", "description": "x"}, "keys": ["Film A.nl.srt"]}
+    job, side = {"app": "radarr", "path": "/m/Film A (1979)/Film A.mkv", "held": [held]}, {"name": "Film A.nl.srt", "action": "rename"}
+    assert h.held_after(job, {"outcome": "no_change", "sidecars": [dict(side, result="renamed")]}) == ["checked again"] and sent == []
+    assert h.held_after(job, {"outcome": "no_change", "sidecars": [dict(side, result="left")]}) == ["sent"] and len(sent) == 1
 
 
 def test_a_conversion_a_held_alert_names_posts_once(sent, settings):
@@ -1330,7 +1376,8 @@ def test_an_embed_breaks_its_lines_only_at_the_sentence_ends_of_its_template():
 STOPPED = {"findings": {14: "Converting to MKV", 15: "Replacing the file", 16: "Converting to MKV", 17: "Writing the file",
                         22: "Writing the file", 23: "Writing the file", 24: "Writing the file", 25: "Writing the file",
                         32: "Writing the file", 33: "Writing the file", 40: "Writing the file", 41: "Writing the file", 45: "Writing the file",
-                        46: "Writing the file", 47: "Writing the file", 48: "Writing the file", 49: "Writing the file", 50: "Writing the file"},
+                        46: "Writing the file", 47: "Writing the file", 48: "Writing the file", 49: "Writing the file", 50: "Writing the file",
+                        59: "Writing the file"},
            "actions": {5: "Replacing the file", 8: "Replacing the file", 10: "Replacing the file", 11: "Replacing the file",
                        15: "Replacing the file", 16: "Replacing the file", 19: "Replacing the file"},
            "sub_lines": {1: "Writing the file", 4: "Writing the file", 5: "Writing the file", 6: "Writing the file",
@@ -1411,6 +1458,35 @@ def test_an_alert_names_its_check_and_step_beside_each_other_above_the_item(sour
     item = {"name": "Film A (1979)", "value": "Film A.mkv", "inline": False}
     assert e["fields"] == [{"name": "Check", "value": check, "inline": True}] * bool(check) + \
         [{"name": "Stopped at", "value": step, "inline": True}] * bool(step) + [item]
+
+
+OFF_LINE = {"code": "off", "track": "s3", "ref": "s1", "why": "x", "offsets": [1.0, 3.0], "unfixed": None}
+FAILED = "subtitle remux failed: the packet data of stream subtitle 8 (subrip) differ"   # a proof refusal of the remux
+SKIPPED = "subtitle remux skipped, hardlinked"
+BLOCKED = "subtitle remux skipped, the bytes past the Segment end start another Matroska file"   # no remux ran
+
+
+@pytest.mark.parametrize("result, apply, title, first", [
+    (FAILED, True, "Rewrite failed", "need new times"), (SKIPPED, True, "Subtitles out of sync", "are out of sync"),
+    (FAILED, False, "Subtitles out of sync", "are out of sync"), (BLOCKED, True, "Subtitles out of sync", "are out of sync"),
+    ("subtitle remux failed, the original changed: x", True, "Subtitles out of sync", "are out of sync")])
+def test_a_timing_alert_whose_rewrite_failed_says_so_in_its_title_and_first(result, apply, title, first):
+    """A tester's apply found new times for two tracks, and the remux that wrote them failed its proof. Its alert was
+    titled "Subtitles out of sync". A failed rewrite now gives the title "Rewrite failed", and its sentence comes first.
+    A skip names its own reason under the old title, and a dry run plans the remux."""
+    nr = {"code": "not_retimed", "tracks": ["s4", "s5"], "result": result, "block": None if apply else {"code": "remux"}}
+    f = {"kind": "subtiming", "lines": [OFF_LINE, nr]}
+    tracks = [track("s1"), track("s3", lang="spa"), track("s4"), track("s5")]
+    (e,) = h.render(decision(apply=apply, findings=[f], tracks=tracks), "embed")
+    assert e["title"] == title and first in e["description"].split("\n")[0], e
+    assert sorted(e["description"].split("\n")) == sorted(h.render(decision(apply=apply, findings=[dict(f, lines=[nr, OFF_LINE])], tracks=tracks),
+                                                                  "embed")[0]["description"].split("\n"))   # the same sentences
+    (one,) = h.render(decision(findings=[dict(f, lines=[nr])], tracks=tracks), "embed")
+    assert one["title"] == ("Rewrite failed" if result == FAILED else "Subtitles out of sync")
+    if result in (FAILED, SKIPPED):
+        assert one["description"] == ("**Subtitle tracks 4 and 5 (English)** need new times, but " + (
+            "rewriting the file failed" if result == FAILED else "the fix failed, because the file has another hard link, such as the download client's copy")
+            + ". The original file was not changed.")
 
 
 @pytest.mark.parametrize("source, check", [("worker", "Worker start"), ("backfill", "Command line run")])

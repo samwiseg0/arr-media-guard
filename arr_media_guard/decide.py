@@ -1182,7 +1182,13 @@ SAMPLE_SECS = 20
 #   or the demuxer ("keyframes not correctly marked"). So an error alone never counts, only an error with lost audio.
 # - a container duration longer than the content leaves the late sample empty with no error. Only a real cut logs
 #   "File ended prematurely" (mkv) or "partial file" (mp4).
+# - an audio tail past the video end, 2026-11-01: digital zero peaks at -91 dB, a 16-bit dither of 1 or 2 steps at
+#   -81 or -76 dB after AAC, and the last seconds after the last sound of 9 of 12 films at -55 to -101 dB. The
+#   quietest 60 s of program in those 12 films peaked at -34 dB or more. A tail runs over AV_APART, 60 s. A read to
+#   the stream end decoded 0.9998 to 1.0001 of its window in 3 MP4 films and 1.0000 in made-up MP4s. One stray packet
+#   530 s past the video end decoded 0.0019. So a tail must decode LOSS of its window.
 SILENT_DB = -80.0                # a sample whose loudest point is at or below this is digital silence
+TAIL_DB = -50.0                  # an audio tail past the video end whose loudest point is at or below this is silent, see silent_tail()
 LOSS = 0.95                      # a sample that decodes less than this share of its expected audio lost some
 SHORT_AUDIO = 0.9                # tagged audio that ends before this share of the tagged video is truncated
 HARMLESS = ("keyframes not correctly marked",)
@@ -1213,6 +1219,21 @@ def parse_sample(stderr, rc=0):
             "errors": sum("[error]" in line and not any(h in line for h in HARMLESS) for line in stderr.splitlines()),
             "ran": rc == 0 and "[fatal]" not in stderr, "cut": any(c in stderr for c in CUT),
             "rate": int(m.group(1)) if m else None, "ch": channels(m.group(2).strip()) if m else None}
+
+
+def tail_share(s):
+    """The share of the window of the sample s that decoded: n over the audio its output stream line promises. 0 when
+    that line names no rate or no channel count."""
+    full = (s.get("rate") or 0) * (s.get("ch") or 0) * (s.get("window") or 0)
+    return s["n"] / full if full else 0.0
+
+
+def silent_tail(s):
+    """Whether the parse_sample() result s of an audio tail past the video end is silent: ffmpeg ran, its decoded audio
+    covers LOSS of the tail, see tail_share(), and its peak is at or below TAIL_DB. A tail that decodes no audio, or one
+    with a gap in its packets, as one stray packet far past the video end, is broken audio. A run that timed out or
+    failed did not hear the tail. Neither is silent."""
+    return s["ran"] and tail_share(s) >= LOSS and s["max"] is not None and s["max"] <= TAIL_DB
 
 
 def tag_seconds(value):

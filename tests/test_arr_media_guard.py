@@ -5517,7 +5517,7 @@ def test_a_cover_move_that_failed_posts_once(env, cover_mkvs, pic_mkv, tmp_path,
     REAL_RUN(["mkvmerge", "-q", "-o", str(tmp_path / "both.mkv"), str(cover_mkvs / "one.mkv"), str(pic_mkv / "flash.mkv")], check=True)
     env["http"].clear()
     rec, posts = cover_run(env, monkeypatch, tmp_path / "both.mkv")
-    assert [p[:2] for p in posts] == [("Subtitles out of sync", 'The **English subtitles (track 1)** and the **English subtitles (track 2, "Styled")** '
+    assert [p[:2] for p in posts] == [("Rewrite failed", 'The **English subtitles (track 1)** and the **English subtitles (track 2, "Styled")** '
                                        "need new times, but rewriting the file failed.\nThe original file was not changed.\nThe cover picture in "
                                        "**video track 1** stays a video track too, so a player may show it in place of the video.")], posts
     assert REAL_RUN(["mkvmerge", "-q", "-o", str(tmp_path / "two.mkv"), str(cover_mkvs / "one.mkv"), str(cover_mkvs / "one2.mkv"),
@@ -6004,25 +6004,91 @@ def test_windows_follow_the_video_stream_of_a_file_that_is_not_matroska(tmp_path
     certain, doubts, fields = hook.check_video(str(f), dur)
     assert certain is None and [w["at"] for w in fields["windows"]["list"]] == [7, 35, 60]
     assert doubts == ["the file's audio track 1 (aac) runs to 2:30, but the video stops at 1:10, so that track may be broken"], doubts
+    (tail,) = fields["gap"]   # the tone past the video end has sound
+    assert (tail["track"], tail["at"], tail["silent"]) == (1, 70, False) and tail["max"] > hook.arr_decide.TAIL_DB and abs(tail["window"] - 80) < 0.5, tail
 
 
-@pytest.mark.parametrize("ends, doubt", [
-    ((70.0, 80.0, 150.0), "the file's audio track 2 (ac3) runs to 2:30, but the video stops at 1:10, so that track may be broken"),
-    ((70.0, 80.0, 120.0), "the file's tracks run to 2:30, but the video stops at 1:10, so another track may be broken"),
-    (None, "the file's tracks run to 2:30, but the video stops at 1:10, so another track may be broken"),
+@pytest.mark.parametrize("audio, video, gap", [
+    ("sine=frequency=440:duration=70,apad=whole_dur=150", 70, "silent"),   # the tester's MP4: the last part of the audio is silence
+    ("sine=frequency=440:duration=150,volume=0.008", 70, "silent"),   # a tone at about -60 dB, as a room tone at the end of a film
+    ("sine=frequency=440:duration=150,volume=0.08", 70, "sound"),   # a quiet tone at about -40 dB
+    ("sine=frequency=440:duration=70", 150, None),   # the video is longer
+    ("sine=frequency=440:duration=120", 70, None),   # 50 s past the video end is under AV_APART
+    ("aevalsrc=0:d=601,aselect='lt(t\\,70)+gte(t\\,600)'", 70, "stray"),   # one silent stray packet 530 s past the video end
 ])
-def test_the_stream_gap_names_the_stream_that_runs_long(monkeypatch, tmp_path, ends, doubt):
+def test_an_audio_tail_past_the_video_end_posts_only_with_sound(tmp_path, audio, video, gap):
+    """Tester 2026-10-30: an MP4 holds 5301.6 s of video and 5511.1 s of audio, and the last 3.5 minutes of its audio
+    are silence. The sync is fine, but the stream gap posted "Video may be broken". A silent audio tail past the video
+    end is now logged only, with its peak level and the share of it that decoded. A tail with sound keeps the doubt.
+    So does one stray packet far past the video end, which is broken audio, though it decodes as silence. A file whose
+    tracks end within AV_APART, or whose video runs longer, is as before."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("needs ffmpeg")
+    f = tmp_path / "Film T.mp4"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=24:duration={video}", "-f", "lavfi", "-i", audio,
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(f)], check=True)
+    dur = hook.video_inputs(str(f))[0]
+    doubt, tails = hook.stream_gap(str(f), dur)
+    if gap is None:
+        assert (doubt, tails) == (None, None)
+        return
+    (tail,) = tails
+    assert tail["silent"] is (gap == "silent") and tail["ran"] and tail["n"] > 0 and (tail["max"] <= hook.arr_decide.TAIL_DB) is (gap != "sound"), tail
+    assert (tail["share"] >= hook.arr_decide.LOSS) is (gap != "stray") and (doubt is None) is (gap == "silent"), (doubt, tail)
+
+
+def tail_said(share, peak):
+    """The ffmpeg output of a made-up tail read: 48 kHz stereo, share of its window decoded, peak in dB or None."""
+    return lambda window: ("Output #0, null, to 'pipe:':\n  Stream #0:0: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s\n"
+                           f"[Parsed_volumedetect_0 @ 0x1] n_samples: {int(share * window * 96000)}\n"
+                           + (f"[Parsed_volumedetect_0 @ 0x1] max_volume: {peak} dB\n" if peak else ""))
+
+
+TRACK_2 = "the file's audio track 2 (ac3) runs to 2:30, but the video stops at 1:10, so that track may be broken"
+
+
+@pytest.mark.parametrize("ends, said, rc, doubt, silent", [
+    ((70.0, 80.0, 150.0), tail_said(1.0, "-20.0"), 0, TRACK_2, [False]),   # sound
+    ((70.0, 80.0, 150.0), tail_said(1.0, "-inf"), 0, None, [True]),   # digital silence
+    ((70.0, 80.0, 150.0), tail_said(0.96, "-91.0"), 0, None, [True]),
+    ((70.0, 80.0, 150.0), tail_said(0.94, "-91.0"), 0, TRACK_2, [False]),   # under LOSS of the tail decoded
+    ((70.0, 80.0, 150.0), tail_said(1 / 80, "-91.0"), 0, TRACK_2, [False]),   # one stray second of audio, far past the video end
+    ((70.0, 80.0, 150.0), tail_said(0, None), 0, TRACK_2, [False]),   # no audio decodes there
+    ((70.0, 80.0, 150.0), lambda w: "n_samples: 7680000\nmax_volume: -91.0 dB", 0, TRACK_2, [False]),   # no rate or channels to cover it
+    ((70.0, 80.0, 150.0), lambda w: "[fatal] Error opening input", 1, TRACK_2, [False]),   # the tail was not heard
+    ((70.0, 80.0, 150.0), tail_said(1.0, "-91.0"), 1, TRACK_2, [False]),   # ffmpeg failed after its counts, so they say nothing
+    ((70.0, 140.0, 150.0), tail_said(1.0, "-91.0"), 0, None, [True, True]),   # both audio tracks, each read once
+    ((70.0, 140.0, 150.0), {"0:a:0": tail_said(1.0, "-91.0"), "0:a:1": tail_said(1.0, "-20.0")}, 0, TRACK_2, [True, False]),
+    ((70.0, 140.0, 150.0), {"0:a:0": tail_said(1.0, "-20.0"), "0:a:1": tail_said(1.0, "-91.0")}, 0, TRACK_2, [False]),   # one read is enough
+    ((150.0, 80.0, 70.0), None, 0, "the file's video track 1 (h264) runs to 2:30, but the video stops at 1:10, so that track may be broken", None),
+    ((70.0, 80.0, 120.0), None, 0, "the file's tracks run to 2:30, but the video stops at 1:10, so another track may be broken", None),
+    (None, None, 1, "the file's tracks run to 2:30, but the video stops at 1:10, so another track may be broken", None),
+])
+def test_the_stream_gap_names_the_stream_that_runs_long(monkeypatch, tmp_path, ends, said, rc, doubt, silent):
     """The format duration runs 80 s past the video. The doubt names the longest stream by its kind, its number among
     the streams of that kind and its codec. A stream that ends within AV_APART of the video, or a failed stream read,
-    keeps the doubt that names no track."""
+    keeps the doubt that names no track. When only audio runs long, each such track's tail is read once from the video
+    end to its end. A tail whose audio decodes over LOSS of it and stays at or under TAIL_DB posts nothing. A tail that
+    decodes no audio or too little, as one stray packet, is broken audio and keeps the doubt, as does one not heard."""
     f = tmp_path / "Film F.mp4"
     f.write_bytes(b"\0\0\0\x18ftypisom")
     monkeypatch.setattr(hook, "ffprobe_duration", lambda path: 150.0)
     kinds = (("video", "h264"), ("audio", "aac"), ("audio", "ac3"))
     out = json.dumps({"streams": [{"index": k, "codec_type": t, "codec_name": c, "duration": str(d)} for k, ((t, c), d) in enumerate(zip(kinds, ends))]}) \
         if ends else ""
-    monkeypatch.setattr(hook, "run_bounded", lambda argv, timeout, use=None, **kw: subprocess.CompletedProcess(argv, 0 if ends else 1, out, ""))
-    assert hook.stream_gap(str(f), 70.0) == doubt
+    ran = []
+
+    def run(argv, timeout, use=None, **kw):
+        if argv[0] == "ffprobe":
+            return subprocess.CompletedProcess(argv, 0 if ends else 1, out, "")
+        ran.append((argv[argv.index("-ss") + 1], argv[argv.index("-t") + 1], argv[argv.index("-map") + 1]))
+        return subprocess.CompletedProcess(argv, rc, "", (said if callable(said) else said[ran[-1][2]])(float(ran[-1][1])))
+    monkeypatch.setattr(hook, "run_bounded", run)
+    got, tails = hook.stream_gap(str(f), 70.0)
+    assert got == doubt and (tails and [t["silent"] for t in tails]) == silent, tails
+    long = [(f"{d - 70:.1f}", f"0:a:{i}") for i, d in enumerate((ends or (0, 0, 0))[1:]) if d - 70 > 60]   # the audio tails past AV_APART
+    assert ran == [("70.0", *x) for x in long][:len(silent or ())], ran   # in order, up to the first that is not silent
+    assert all(t["share"] == round(hook.arr_decide.tail_share(t), 4) for t in tails or ()), tails   # the decision line keeps the share
 
 
 def video_regrabs(env):
@@ -19557,6 +19623,29 @@ def test_subtitles_check_reports_a_flash_sidecar_and_leaves_it(env, monkeypatch,
     assert (e["action"], e["result"], e["left"]) == ("lengthen", "left", "SUBTITLES is set to check"), rec["sidecars"]
     assert rec["alert_kinds"] == ["subtiming"] and open(side, newline="").read() == flash_srt() and not os.path.exists(tmp_path / ".kept")
     assert hook.stopped_at(rec["findings"][0], "done") is None
+
+
+def test_a_sidecar_whose_ends_were_only_lengthened_keeps_its_held_timing_alert(env, monkeypatch, settings, tmp_path):
+    """Reviewer 2026-11-01: the sidecar step lengthens the flash ends of a sidecar and gives it the result "retimed". No
+    hearing judged its times. A held timing alert of that sidecar still posts, as before 2.19.2, because longer ends fix
+    no timing."""
+    english_film(env)
+    side = env["path"][:-4] + ".fr.srt"
+    with open(side, "w", newline="") as f:
+        f.write(flash_srt())
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    hook.main([])
+    rec, name = decided(env), os.path.basename(side)
+    (e,) = rec["sidecars"]
+    assert (e["action"], e["result"]) == ("lengthen", "retimed") and name not in hook.remuxed(rec), e
+    sent = []
+    monkeypatch.setattr(hook, "post", lambda app, emb: sent.append(emb) or "sent")
+    monkeypatch.setattr(hook.store, "add", lambda *a: True)
+    held = {"kind": "subtiming", "size": 7, "embed": {"title": "Subtitles out of sync", "description": "x"}, "keys": [name],
+            "spans": {name: [[0.0, 600.0]]}}
+    assert hook.held_after({"app": "radarr", "path": env["path"], "held": [held]}, dict(rec, outcome="sidecars_changed")) == ["sent"]
+    assert [x["title"] for x in sent] == ["Subtitles out of sync"]
 
 
 def test_a_flash_sidecar_is_rewritten_and_its_original_kept(env, monkeypatch, settings, tmp_path):

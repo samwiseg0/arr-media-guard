@@ -1091,17 +1091,24 @@ def tail_errors(path):
 
 
 def stream_gap(path, video):
-    """The doubt of a file that is not Matroska whose format duration runs past its video end by more than AV_APART, or
-    None. check_audio() needs mkvmerge's duration, which an MP4, AVI or MPEG-TS file lacks. One stray audio packet can set
-    the duration of an MP4 far past its video end. The doubt names the longest stream by its kind, its number among the
-    streams of that kind and its codec, when it runs past the video end by more than AV_APART. A second ffprobe reads
-    the streams, and only for such a file."""
+    """(doubt or None, [audio tail] or None) of a file that is not Matroska whose format duration runs past its video
+    end by more than AV_APART. check_audio() needs mkvmerge's duration, which an MP4, AVI or MPEG-TS file lacks. One
+    stray audio packet can set the duration of an MP4 far past its video end. The doubt names the longest stream by
+    its kind, its number among the streams of that kind and its codec, when it runs past the video end by more than
+    AV_APART. A second ffprobe reads the streams, and only for such a file.
+
+    When each stream that runs so far past the video end is audio, sample() reads each such stream once, from the video
+    end to its end, see decide.silent_tail(). One volumedetect run reads a tail, under its time limit, and holds no
+    audio in memory. The reads stop at the first tail that is not silent. When every tail is silent, the sync is fine,
+    and the file gets no doubt. A tail that decodes too
+    little of its window, as one stray packet far past the video end, keeps the doubt. The tails go to the decision
+    line with their peak level and the share of the window that decoded."""
     with open(path, "rb") as f:
         if f.read(4) == decide.EBML_ID.to_bytes(4, "big"):
-            return None
+            return None, None
     whole = ffprobe_duration(path)
     if not (video and whole and whole - video > decide.AV_APART):
-        return None
+        return None, None
     try:
         r = run_bounded(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,duration", "-of", "json", path], 120,
                         use="checks.stream_gap", capture_output=True, text=True, errors="replace")
@@ -1110,10 +1117,19 @@ def stream_gap(path, video):
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
         end, s = 0.0, None
     if s and end - video > decide.AV_APART:
-        n = [x for x in streams if x.get("codec_type") == s.get("codec_type")].index(s) + 1
-        return (f"the file's {s.get('codec_type')} track {n} ({s.get('codec_name')}) runs to {content.hms(end)}, but the video stops at "
-                f"{content.hms(video)}, so that track may be broken")
-    return f"the file's tracks run to {content.hms(whole)}, but the video stops at {content.hms(video)}, so another track may be broken"
+        place = lambda x: [y for y in streams if y.get("codec_type") == x.get("codec_type")].index(x)   # among the streams of its kind
+        long = [x for x in streams if x.get("duration") and float(x["duration"]) - video > decide.AV_APART]
+        tails = [] if all(x.get("codec_type") == "audio" for x in long) else None
+        for x in long if tails is not None else ():
+            t = dict(sample(path, video, place(x), round(float(x["duration"]) - video, 1)), track=place(x) + 1, codec=x.get("codec_name"))
+            tails.append(dict(t, share=round(decide.tail_share(t), 4), silent=decide.silent_tail(t)))
+            if not tails[-1]["silent"]:   # one tail that is not silent keeps the doubt, so the next ones need no read
+                break
+        if tails and all(t["silent"] for t in tails):
+            return None, tails
+        return (f"the file's {s.get('codec_type')} track {place(s) + 1} ({s.get('codec_name')}) runs to {content.hms(end)}, but the video stops at "
+                f"{content.hms(video)}, so that track may be broken"), tails
+    return f"the file's tracks run to {content.hms(whole)}, but the video stops at {content.hms(video)}, so another track may be broken", None
 
 
 def encrypted_video(path):
@@ -1307,8 +1323,10 @@ def video_stages(path, dur, again, hp, pcm=False, by=None):
         doubts.append(f"the file may be missing {short} bytes at its end" + (", after its last flag edit failed" if failed else ""))
     if hp and hp.get("not_whole"):   # the blocked repair alone posts nothing
         doubts.append(hp["not_whole"])
-    if hp is None and short is None and (gap := stream_gap(path, dur)):
-        doubts.append(gap)
+    if hp is None and short is None:
+        gap, tails = stream_gap(path, dur)
+        doubts += [gap] if gap else []
+        fields.update({"gap": tails} if tails else {})
     if left() < config.ZERO_SECS + config.VIDEO_RESERVE:
         fields["zeros"] = {"skipped": f"{left():.0f} s left of the job's time limit"}
         return None, doubts, fields

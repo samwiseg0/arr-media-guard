@@ -317,7 +317,9 @@ no fix tried shows Check alone. A held alert keeps the fields the import gave it
 **Plain words.** A subtitle remux that failed reads "rewriting the file failed" in the alert, see `report.remux_why()`,
 and ends with "The original file was not changed." A failed header repair and a failed garbled-text repair end with the
 same sentence. The decision line keeps its error in `subremux.result`. A skip keeps its own reason, such as low space or
-a second hard link. A sidecar whose new times do not fit its text says so in `left`, and keeps the error in `error`, see
+a second hard link. A timing alert of an apply with a sentence of a failed remux has the title "Rewrite failed", and
+that sentence comes first, see `report.failed_write()`. A skip and a dry run keep "Subtitles out of sync".
+A sidecar whose new times do not fit its text says so in `left`, and keeps the error in `error`, see
 `subtitles.sidecar_fix()`. A fix with a ratio names the offset at the start and at the end of the file, see
 `report.at_end()`. The end comes from the fix and the file's length. A `check_times` sentence, and an `off` sentence
 with `would`, carry that length as `duration`. A change post reads it from the record's `file_duration`. An offset under
@@ -344,17 +346,24 @@ with `runner.held_after()`, which decides each held alert. The alert goes unpost
 item. The app says so with a 404, another movie or series, or other episodes, see `runner.moved()`. A file the app lists
 at its old missing path or at a path this container does not see is not gone, so its held alerts post. A person's
 `--sub-check --apply` or `--sub-time --apply` remux gives the file a new inode too, so it counts as replaced. That run
-checked the subtitles itself. The alert also goes unposted when the job ran to its alerts and judged each subtitle the
-alert names, see `runner.judged()`. A verdict of `match`, `fit` or `mismatch` judges. The `unknown` of a failed hearing
-does not, and with no language model there is no verdict. A held `subtiming` alert also needs the times of each subtitle
-judged again, see `runner.times_judged()`. The timing judge gave each one an outcome other than unknown, see "Timing
-outcome", or the subtitle does not match the audio. That outcome posts itself when lines are still off. A word check that matched
-the words but anchored too few cues to time them judged no times. When the whole-file timing judged nothing either,
-the alert posts. A job whose remux or sidecar
-rewrite retimed, moved or removed those subtitles before an error counts too, see `runner.remuxed()`. Longer ends and
-a repaired text do not. Every other held alert posts through `logs.post_held()`, because nothing judged its subtitles
-again. That is an error, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the run, or a
-third crash in `runner.requeue()`. When the import cannot queue the job, its held alerts post at once. With
+checked the subtitles itself. The alert also goes unposted when the job settled each subtitle the alert names. A
+subtitle is settled when the job ran to its alerts and judged it, see `runner.judged()`. A verdict of `match`, `fit` or
+`mismatch` judges. The `unknown` of a failed hearing does not, and with no language model there is no verdict. A held
+`subtiming` alert also needs the times of each subtitle judged again, see `runner.times_judged()`. The timing judge gave
+each one an outcome other than unknown, see "Timing outcome", or the subtitle does not match the audio. That outcome
+posts itself when lines are still off. A word check that matched the words but anchored too few cues to time them
+judged no times. When the whole-file timing judged nothing either, the subtitle is not settled. A subtitle that the
+job's finished remux or its sidecar step retimed, moved to its speech or took out is settled for any outcome, also
+before an error, see `runner.remuxed()`. The remux takes out a track that does not match and a track it strips as
+garbled. The sidecar step moves away a sidecar that does not match and renames a garbled one. A stripped track and a
+renamed garbled sidecar post their unreadable notice. A removed track, a moved sidecar and a retime are fixes, so they
+post only as a change with `DISCORD_POSTS=all`, see `report.posts()`. A garbled track has no timing outcome, so before 2.19.2 its held alert posted the import's text, as
+"rewriting the file failed", after the deep analysis had fixed the file. Longer ends and a repaired text settle
+nothing. Every other held alert posts through `logs.post_held()`, because nothing settled one of its subtitles. That
+is an error before the remux, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the
+run, or a third crash in `runner.requeue()`. Such a post keeps the import's text, which names the tracks by their
+numbers at the import, and each subtitle the alert named, also one the job settled.
+When the import cannot queue the job, its held alerts post at once. With
 `DISCORD_POSTS=all`, a held finding keeps the change posts of what it says itself as `changes`, see
 `report.held_posts()`. That is a fix of its logged lines, such as a removed track, a flag it says was turned off, and
 the conversion it names. `report.said()` leaves them out of the import's change posts. `logs.held_changes()` posts them
@@ -563,7 +572,18 @@ A Segment duration can run far past the video. So the windows sit on the video e
 last Clusters, else mkvmerge's DURATION tag, else ffprobe. A file that is not Matroska gets a
 doubt when its format duration runs over 60 seconds past its video end (`AV_APART`). The doubt names
 the longest stream by kind, number and codec, as "audio track 2 (ac3)", when that stream ends so far
-past the video. A window stops
+past the video. When each stream that ends so far past the video is audio, `checks.stream_gap()`
+reads each one once with `volumedetect`, from the video end to its end. That read has the 120 s limit
+of `checks.sample()` and holds no audio in memory. A tail is silent when its decoded audio covers
+`LOSS` (95 percent) of it and its peak is at or below `TAIL_DB` (-50 dB), see `decide.silent_tail()`.
+A tail that decodes no audio, or one with a gap in its packets, is broken audio and keeps the doubt.
+One stray packet far past the video end is such a tail. A read that timed out or failed is not
+silent. When every tail is silent, the sync is fine, and the file gets no doubt. The decision line
+keeps each tail in `video.gap`, with its peak in `max` and the decoded share of its window in
+`share`. Digital zero peaks at -91 dB, dither at -81 to -76 dB, and the last seconds after the last
+sound of a film at -55 to -101 dB. The quietest minute of program in 12 films peaked at -34 dB or
+more. A read to the stream end decoded 0.9998 to 1.0001 of its window in 3 MP4 films. One stray
+packet 530 s past the video end decoded 0.0019. A window stops
 at 60 seconds or 512 MiB read, because a seek with no index reads from the file start. A time-cap
 stop is a doubt, and a read-cap stop with no error is only logged. A stop with errors is a doubt that
 names the playback errors the window met, or the error lines of a window with no frame. In the hook each stage needs time

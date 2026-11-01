@@ -35,7 +35,8 @@ READS = {
     "checks.stream_probe": Use((), "the format, the streams and their sample rates"),
     "checks.main_stream": Use(("stream.duration",), "the film's stream duration, which places a window or gates a doubt (plan A3)"),
     "checks.ffprobe_duration": Use(("format.duration",), "the format duration, which places a sample or a window, or gates a doubt (plan A3)"),
-    "checks.stream_gap": Use(("stream.duration",), "the duration of each stream, which names the one that runs past the video end in a doubt"),
+    "checks.stream_gap": Use(("stream.duration",), "the duration of each stream, which names the one that runs past the video end in a doubt, "
+                             "and ends the audio tail that checks.sample() reads"),
     "content.last_packet.film": Use((), "the index of the film's stream"),
     "content.last_packet": Use(("packet.pts_time", "format.start_time", "seek"), "the stored time of the film's last packet, the runtime "
                                f"check in minutes. -read_intervals seeks to the end by time. {SEEK}"),

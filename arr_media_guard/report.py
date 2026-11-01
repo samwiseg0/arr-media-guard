@@ -408,7 +408,8 @@ FINDINGS = {
                                                   f'{cap(EDIT_ERRORS.get(f["error"], f["error"]).rstrip("."))}. {after(f)}'.rstrip()),
     "policy": ("Policy file didn't load", lambda f, t: f'{bold(f["file"])} didn\'t load, so no tracks are changed until it\'s fixed. {f["error"]}'),
     "submatch": ("Wrong subtitles", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
-    "subtiming": ("Subtitles out of sync", lambda f, t: " ".join(sub_line(x, t, f["langs"]) for x in f["lines"])),
+    "subtiming": ("Subtitles out of sync", lambda f, t: " ".join(sub_line(x, t, f["langs"])   # a failed rewrite first, see title()
+                                                                 for x in sorted(f["lines"], key=lambda x: not failed_write(x, t)))),
     "burned_in": ("Burned-in subtitles", lambda f, t: burned(f, t)),
     "cover": ("Cover picture not moved", lambda f, t: cover_line(f)),
 }
@@ -492,10 +493,13 @@ def action_code(a):
     return "deleted" if a["code"] == "restored" else a["code"]
 
 
-def title(f):
-    """(title, color) of the alert of finding f. An unreadable notice of sidecars that AMG reads well and mkvmerge
-    misreads alone gets LEFT_OUT, see unreadable()."""
+def title(f, t="done"):
+    """(title, color) of the alert of finding f in tense t. An unreadable notice of sidecars that AMG reads well and
+    mkvmerge misreads alone gets LEFT_OUT, see unreadable(). A timing finding with a sentence of a failed rewrite gets
+    REWRITE_TITLE, see failed_write(), and that sentence comes first in its text."""
     a = f.get("action")
+    if f["kind"] == "subtiming" and any(failed_write(x, t) for x in f.get("lines") or ()):
+        return REWRITE_TITLE, "amber"
     if f["kind"] in FAULT_TITLES and a:
         return FAULT_TITLES[f["kind"]] + ACTIONS[action_code(a)][0], "amber" if a["code"] in ("unconfirmed", "disagreed", "unsure", "once") else "red"
     if f["kind"] == "repack" and f.get("note"):   # a conversion that a stopped run left
@@ -607,6 +611,16 @@ KEPT_BACK = {"check": "SUBTITLES is set to check",
 
 
 REWRITE_FAILED = "rewriting the file failed"   # the words of a rewrite that failed, see remux_why()
+REWRITE_TITLE = "Rewrite failed"   # the title of a timing alert whose remux ran and failed, see title()
+REMUX_FAILED = "subtitle remux failed"   # the start of the result of a remux that ran and failed, see remux.resub()
+
+
+def failed_write(x, t):
+    """Whether the sentence x of a subtitle alert in tense t says that the remux ran and failed: a not_retimed sentence
+    of an apply whose result starts with REMUX_FAILED and reads REWRITE_FAILED. A skip, as for a hard link, low space or
+    bytes past the Segment end, ran no remux. remux_why() reads an unknown skip as REWRITE_FAILED too."""
+    result = x.get("result") or ""
+    return t != "planned" and x["code"] == "not_retimed" and result.startswith(REMUX_FAILED) and remux_why(result) == REWRITE_FAILED
 
 
 def remux_why(result):
@@ -879,7 +893,7 @@ def alert_embed(rec, f, t, stage=True):
     above the file. The field name is then blank, because Discord shows no link in a field name. With no link, the field
     name is the item's name, as before. A text that failed posts UNTOLD in place of the error. With stage, two inline
     fields above it name the check and the step where the fix stopped, see stage_fields()."""
-    (text, act), (head, color) = texts(f, t, track_langs(rec, after=True), marked=True), title(f)
+    (text, act), (head, color) = texts(f, t, track_langs(rec, after=True), marked=True), title(f, t)
     text = UNTOLD if text.startswith(NO_TEXT) else text
     note = f'{TMDB_SKIPPED[rec["tmdb"]]}, so its language check was skipped' if f["kind"] in ("language", "content") \
         and rec.get("tmdb") in TMDB_SKIPPED else None

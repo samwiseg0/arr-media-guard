@@ -375,12 +375,18 @@ def times_judged(rec, k, spans=()):
 
 
 def remuxed(rec):
-    """The subtitles that a finished subtitle remux or a sidecar rewrite of the run of rec retimed, moved to their speech
-    or removed, by their place before that remux, see process.subtitle_checks() and process.after_edit(). Longer ends
-    and a repaired text fix no timing and no mismatch, so they leave a held alert to post."""
+    """The subtitles that a finished subtitle remux or a sidecar step of the run of rec retimed, moved to their speech
+    or took out, by their place before that remux, see process.subtitle_checks() and process.after_edit(). The remux
+    takes out a track that does not match and one stripped as garbled. The sidecar step moves away a sidecar that does
+    not match and renames a garbled one. A stripped track and a renamed garbled sidecar post their unreadable notice.
+    A removed track, a moved sidecar and a retime are fixes, so they post only as a change with DISCORD_POSTS all,
+    see report.posts(). Longer ends and a repaired text fix no timing and no mismatch, so they leave a held alert to
+    post. A sidecar whose only change was longer ends also gets the result "retimed", so a sidecar counts as retimed
+    only with the action "retime"."""
     rm = rec.get("subremux") or {}
-    done = [p for k in ("fixed", "timed", "removed") for p in rm.get(k) or []] if rm.get("done") else []
-    return set(done) | {e["name"] for e in rec.get("sidecars") or [] if e.get("result") in ("moved", "retimed")}
+    done = [p for k in ("fixed", "timed", "removed", "stripped") for p in rm.get(k) or []] if rm.get("done") else []
+    return set(done) | {e["name"] for e in rec.get("sidecars") or []
+                        if e.get("result") in ("moved", "renamed") or e.get("result") == "retimed" and e.get("action") == "retime"}
 
 
 def app_file(job):
@@ -408,24 +414,25 @@ def gone_for_good(job, rec):
 def held_after(job, rec):
     """What became of the alerts the import held for the deep analysis job, see queue_deep_analysis(), as the decision
     record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(). A job
-    that judged each subtitle a held alert names posted what it still found in its place, see judged(). A held timing
-    alert also needs the times of each subtitle judged again, see times_judged(). Verdicts reach rec only when the run reached
-    its alerts. A job that a stop cut goes back to the queue with its held alerts, so only its next run gets here. A job
-    whose remux changed those subtitles before an error counts too, see remuxed(). A dropped alert still posts the
-    changes it keeps, see logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing.
-    Every other held alert posts now, because nothing judged its subtitles again. That is an error, a failed hearing, a
-    word check that timed nothing, SUBTITLES off, or a file the app moved during the run, or one the app lists where
-    this container does not see it."""
+    that settled each subtitle a held alert names posts what it still found in its place. A subtitle is settled when the
+    run judged it, see judged(), and for a held timing alert judged its times again too, see times_judged(). A subtitle
+    that the remux or the sidecar step retimed or took out is settled for any outcome, see remuxed(), also before an
+    error. Verdicts reach rec only when the run reached its alerts. A job that a stop cut goes back to the queue with its
+    held alerts, so only its next run gets here. A dropped alert still posts the changes it keeps, see
+    logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing. Every other held alert
+    posts now, because nothing settled one of its subtitles. That is an error before the remux, a failed hearing, a word
+    check that timed nothing, SUBTITLES off, or a file the app moved during the run, or one the app lists where this
+    container does not see it."""
     app, out = job["app"], []
     if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
     said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or [] if report.posts(f, rec)))
+    fixed, error = remuxed(rec), rec.get("outcome") == "error"
     for h in job["held"]:
-        timing = h["kind"] != "subtiming" or all(times_judged(rec, k, (h.get("spans") or {}).get(k)) for k in h["keys"])   # the times judged too
-        if judged(rec, h.get("keys")) and timing:   # only a run that reached its alerts holds verdicts, see process.STEPS
-            out += logs.held_changes(app, [h], "checked again", said)
-        elif rec.get("outcome") == "error" and h.get("keys") and set(h["keys"]) <= remuxed(rec):
-            out += logs.held_changes(app, [h], "fixed before the error")
+        timed = lambda k: h["kind"] != "subtiming" or times_judged(rec, k, (h.get("spans") or {}).get(k))   # the times judged too
+        # only a run that reached its alerts holds verdicts, see process.STEPS
+        if h.get("keys") and all(k in fixed or judged(rec, [k]) and timed(k) for k in h["keys"]):
+            out += logs.held_changes(app, [h], "fixed before the error" if error else "checked again", said)
         else:
             out += logs.post_held(app, job["path"], [h])
     return out
