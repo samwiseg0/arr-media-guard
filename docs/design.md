@@ -3136,9 +3136,9 @@ seconds early to 1.5 seconds late against the speech, so the rule takes the wind
 - Two `--engage` options of mkvmerge keep the copied packets as they are. `keep_whitespaces_in_text_subtitles` keeps
   the spaces at the ends of each line of a text subtitle, which mkvmerge trims by default.
   `dont_normalize_parameter_sets` keeps each HEVC keyframe as it is, where mkvmerge would put the header units in
-  front of it. mkvmerge writes each line break of a SubRip packet as CRLF, so the proof compares SubRip packets with
-  each CRLF as LF, see below. It also drops the NUL byte that HandBrake puts at the end of each ASS event. So the
-  proof compares each ASS or SSA packet without that one byte, and changes nothing else. An old mkvmerge put each
+  front of it. mkvmerge changes the line breaks and the NUL bytes of a SubRip cue, and the proof passes only the
+  changes that "SubRip cues in a remux" names. It also drops the NUL byte that HandBrake puts at the end of each ASS
+  event. So the proof compares each ASS or SSA packet without that one byte, and changes nothing else. An old mkvmerge put each
   Dolby Vision RPU (NAL unit 62, the metadata of a frame) at the start of the next packet. mkvmerge moves it to the end
   of the frame it describes. The proof then reads the NAL units of that HEVC track in both files, never
   through a filter, and passes that move alone. Each packet stays as it was, or loses its leading RPU and gains the
@@ -3265,20 +3265,28 @@ events from 0 in that order. HandBrake may skip a ReadOrder. So the proof gives 
 of its ReadOrder. The rank applies only when every ReadOrder of the track is a whole number written in digits alone,
 and no two are equal. Otherwise each packet must keep its ReadOrder. The proof names the count of packets that changed
 in `read_order`. The order of the events stays. `--engage keep_whitespaces_in_text_subtitles` keeps the spaces at the
-ends of each line of the round trip, so a space at the end of an event stays, and the proof holds it.
-mkvmerge stores each line break inside a SubRip cue as CRLF, in a timed track and in a copied one. The mkvmerge that
-made a source may have stored LF. So the proof compares each packet of every SubRip track with each CRLF as LF, in both
-files, and names the count of packets that changed in `crlf`. Any other change of a byte fails. mkvmerge writes U+FFFD
-for each byte of a SubRip packet that is not UTF-8, in any remux, and warns. So a run that reads whole files takes
-such a track out, see "Garbled subtitle repair". An import never makes that check. Any remux it plans for such a file
-fails on the track, so its subtitle fixes wait for a run that reads whole files. Its flag edits still land, and
-mkvpropedit makes them when the remux fails.
+ends of each line of the round trip, so a space at the end of an event stays, and the proof holds it. A SubRip
+packet changes as "SubRip cues in a remux" says.
 The proof then holds each end to the plan. ASS times are centiseconds, and HandBrake writes starts in milliseconds. The
 round trip puts each start on the centisecond grid, up to 5 ms away. So such a track gets one plan of every start and
 end, with each start on the nearest centisecond, and the proof holds both to it. The log counts in `starts_rounded` the
 starts the grid moved off the time of the fix. A sidecar is written again, and its original is kept. A fix goes to the
 log only (`subtitle_ends_lengthened`), and a failed one alerts. `SUBTITLES=check` keeps the ends and alerts. A WebVTT
 track that flashes is reported and never rewritten. Imports, `--sub-check`, `--sub-time` and the deep analysis run it.
+
+**SubRip cues in a remux.** mkvmerge 102 changes a SubRip cue that it reads from Matroska, in a timed track and in a
+copied one. It cuts the cue at its first NUL byte, so `a\0b` becomes `a`. It drops a cue with no text before its first
+NUL. It drops the line breaks at the end of a cue. It stores each line break inside a cue as CRLF, and the mkvmerge
+that made a source may have stored LF. The spaces at the end of a cue stay, see `remux.KEEP_PACKETS`. A source muxer
+may end each cue with one NUL, and a player shows the text of a cue up to its NUL. So the proof drops the last byte of
+each packet of the original that ends in a NUL and holds more than that byte. It names the count of those packets in
+`nul_cut`. It then compares each packet of both files with each CRLF as LF, and names the count of packets whose line
+breaks changed in `crlf`. Any other change of a byte fails. So text after a NUL and a line break before the NUL fail.
+Two NULs at the end fail too, because one NUL stays after the cut. A cue of only a NUL fails, because the new file
+holds one packet less. mkvmerge writes U+FFFD for each byte of a SubRip packet that is not UTF-8, in any remux, and
+warns. So a run that reads whole files takes such a track out, see "Garbled subtitle repair". An import never makes
+that check. Any remux it plans for such a file fails on the track, so its subtitle fixes wait for a run that reads
+whole files. Its flag edits still land, and mkvpropedit makes them when the remux fails.
 
 **Reference timing.** A text track in another language than the audio, Japanese, Chinese or Thai text, a PGS or VobSub
 track, and an `.srt` sidecar the word check leaves out get their times from a reference. A reference is a track or

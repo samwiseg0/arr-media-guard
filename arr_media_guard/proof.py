@@ -284,17 +284,17 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
     packet loses one NUL byte at its very end, if it holds one. HandBrake ends each ASS event so, and mkvmerge drops
     that byte. A packet of one byte keeps it. Its ReadOrder becomes its rank, see read_ranks(). The same read writes
     the packets of each such stream as they
-    are, and their bytes must hash to ffmpeg's md5s. end_nul lists ASS or SSA streams of maps whose packets only lose
-    that NUL byte, as mkvmerge drops it from a track it copies, see remux.resub(). spu lists VobSub streams of maps
-    whose packets count as spu_masked() gives them, their delays in spu. crlf lists the stream indexes of
-    maps whose packets count each CR LF as one LF before their md5 counts, in the same way. mkvmerge may store a line
-    break of a SubRip cue either way, see remux.ended_track().
+    are, and their bytes must hash to ffmpeg's md5s. end_nul lists ASS, SSA or SubRip streams of maps whose packets
+    only lose that NUL byte, as mkvmerge drops it from a track it copies, see remux.resub() and docs/design.md, "SubRip
+    cues in a remux". spu lists VobSub streams of maps whose packets count as spu_masked() gives them, their delays in
+    spu. crlf lists the stream indexes of maps whose packets count each CR LF as one LF before their md5 counts, in the
+    same way, after the NUL cut of end_nul. mkvmerge may store a line break of a SubRip cue either way.
     Returns ({stream index: count (packets with data), empty (packets without), bytes, digest (sha256 over their md5s),
     start and end in seconds, times (the time of each packet with data, in file order), ends (its time plus its
     duration), md5s (their md5s, 16 bytes each) and sizes, for a stream of nul or end_nul nul_cut and read_order, the
     counts of packets that lost a NUL and took another ReadOrder, and for a stream of crlf
-    raw_md5s, the md5s of its packets as they are}, {stream index in texts: its SubRip text}). A timeout raises, and an
-    ffmpeg error raises ReadFailed. A read whose only errors come from a subtitle decoder raises RuntimeError, see
+    raw_md5s, the md5s of its packets before the CR LF step}, {stream index in texts: its SubRip text}). A timeout
+    raises, and an ffmpeg error raises ReadFailed. A read whose only errors come from a subtitle decoder raises RuntimeError, see
     SUB_DECODER."""
     out, argv = os.path.join(folder, uuid.uuid4().hex), ["ionice", "-c3", "nice", "-n", "19", "ffmpeg", "-nostdin", "-v", "error", "-copyts", *opts, "-i", path]
     srt = {i: os.path.join(folder, f"{uuid.uuid4().hex}.srt") for i in texts}
@@ -337,6 +337,7 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
                     b, at[maps[k]] = data[maps[k]][at[maps[k]]:at[maps[k]] + size], at[maps[k]] + size
                     if hashlib.md5(b).hexdigest() != p[5]:
                         raise ReadFailed(path, f"the packets ffmpeg wrote of stream {maps[k]} differ from the ones it hashed")
+                    c = b   # the packet as the rules below change it, in their order
                     if maps[k] in spu:
                         c, delays = spu_masked(b)
                         p[5] = hashlib.md5(c).hexdigest()
@@ -353,9 +354,9 @@ def packet_hashes(path, maps, bsf, texts, folder, timeout, raw=False, opts=(), n
                             new = b"%d" % rank[maps[k]][int(old)]
                             c, s["read_order"] = new + b"," + rest, s["read_order"] + (new != old)
                         size, p[5] = len(c), hashlib.md5(c).hexdigest()
-                    if maps[k] in crlf:
+                    if maps[k] in crlf:   # after the end NUL cut of a SubRip stream
                         s["raw_md5s"] += bytes.fromhex(p[5])
-                        lf = b.replace(b"\r\n", b"\n")
+                        lf = c.replace(b"\r\n", b"\n")
                         size, p[5] = len(lf), hashlib.md5(lf).hexdigest()
                 if size:
                     s["but_last"], s["last"], s["last_pts"] = s["digest"].copy(), size, round(pts * tb[k], 3) if abs(pts) < 1 << 62 else None
@@ -783,15 +784,16 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     also numbers the events from 0 in ReadOrder order. So each packet of the original is compared with the rank of
     its ReadOrder in its place, when its stream's ReadOrders are unique integers, see read_ranks(). The entry counts
     the packets whose ReadOrder changed in read_order. The spaces at the end of an event stay, see
-    remux.KEEP_PACKETS. mkvmerge drops that NUL byte from an ASS or SSA track it
-    copies too, so each packet of every other ASS or SSA stream is compared without it, and nothing else. mkvmerge sets
+    remux.KEEP_PACKETS. mkvmerge drops that NUL byte from an ASS, SSA or SubRip track it
+    copies too, so each packet of every other ASS, SSA or SubRip stream is compared without it, and nothing else, see
+    docs/design.md, "SubRip cues in a remux". mkvmerge sets
     the delay of the stop command inside each packet of a VobSub stream in retimed from the cue's new length. So those
     packets are compared with their delays at 0, see spu_masked(), and each delay of the new file must be the old one
     over the rate, within one SPU_TICK. The stop delay of a cue the fix moved before 0 must be its length from 0 to the
     original's end moved by the fix. mkvmerge
     writes each line break of a SubRip packet as CRLF, and a source may store LF. So each packet of a SubRip stream is
-    compared with each CR LF as one LF in both files, and the entry counts the packets whose line breaks changed in
-    crlf. Any other difference of a byte still refuses. recoded maps the k-th subtitle
+    compared with each CR LF as one LF in both files, after that NUL cut, and the entry counts the packets whose line
+    breaks changed in crlf. Any other difference of a byte still refuses. recoded maps the k-th subtitle
     stream of src, a SubRip track, to a function that gives the cues of the new text from srt_blocks() of the original's
     text, see remux.resub(). The proof compares text then: the new stream must hold those cues, and they must keep the
     original's count and times."""
@@ -806,7 +808,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     by_sub = lambda m: {s["index"]: m[k] for k, s in enumerate(s for s in a if s["codec_type"] == "subtitle") if k in m}
     moved, lengthened, planned, recoded = by_sub(retimed or {}), by_sub(ended or {}), by_sub(timed or {}), by_sub(recoded or {})
     nul = [s["index"] for s in a if s["codec_name"] in ("ass", "ssa") and (s["index"] in lengthened or s["index"] in planned)]   # see packet_hashes()
-    end_nul = [s["index"] for s in a if s["codec_name"] in ("ass", "ssa") and s["index"] not in nul]
+    end_nul = [s["index"] for s in a if s["codec_name"] in ("ass", "ssa", "subrip") and s["index"] not in nul]
     spu = [s["index"] for s in a if s.get("codec_name") == "dvd_subtitle" and s["index"] in moved]
     crlf = [s["index"] for s in a if s["codec_name"] == "subrip"]
     pairs, proof = [], []

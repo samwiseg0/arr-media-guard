@@ -19162,15 +19162,16 @@ def test_srt_track_pairs_each_packet_or_refuses(hb_base, tmp_path):
     (srt_line(3), srt_line(3, b"\r\n\r\n"), "a line break added"),
     (srt_line(3), srt_line(3) + b"\r\n", "a line break added at the end"),
     (srt_line(3), srt_line(7, b"\r\n"), "a byte changed"),
-    (srt_line(3) + b"\0", srt_line(3, b"\r\n"), "a NUL at the end dropped"),
+    (srt_line(3) + b"\0", srt_line(3, b"\r\n"), None),
     (srt_line(3), b"Li\rne 3\nnext", "a CR added inside a line"),
+    (srt_line(3), srt_line(3) + b"\0", "a NUL added"),
 ])
 @pytest.mark.parametrize("plan_of", ["timed", "ended", None])
 def test_the_proof_takes_lf_for_crlf_in_a_subrip_packet(hb_base, tmp_path, old, new, why, plan_of):
     """mkvmerge writes each line break of a SubRip packet as CRLF, so the proof of a SubRip stream compares each packet
     of both files with each CR LF as one LF, with a time plan, a flash plan or none. It counts the packets that changed
-    in crlf. A lone CR, a CR inside a line, a line break added, a changed byte and a dropped NUL still fail. So does a
-    changed line break in an ASS stream."""
+    in crlf. A packet of the original may lose one NUL at its end. A lone CR, a CR inside a line, a line break added, a
+    changed byte and a NUL added still fail. So does a changed line break in an ASS stream."""
     mk = lambda name, third, br: hb_mkv(tmp_path / name, hb_base, [srt_line(i, br) for i in (1, 2)] + [third] + [srt_line(i, br) for i in range(4, 21)],
                                          private=None, codec=b"S_TEXT/UTF8")
     src, tmp = mk("src.mkv", old, b"\n"), mk("tmp.mkv", new, b"\r\n" if why is None else b"\n")
@@ -19186,6 +19187,62 @@ def test_the_proof_takes_lf_for_crlf_in_a_subrip_packet(hb_base, tmp_path, old, 
         ass = lambda name, br: hb_mkv(tmp_path / name, hb_base, [hb_event(i, b"a" + br + b"b") for i in range(1, 21)])
         assert proved(ass("a.mkv", b"\n"), ass("b.mkv", b"\r\n"), [], str(tmp_path), **given)[0] == \
             "the packet data of stream subtitle 2 (ass) differ", "an ASS stream keeps its line breaks"
+
+
+def nul_cues(third=None, br=b"\n"):
+    """The packets of SubRip cues 1 to 20, see srt_line(), each with one NUL at its end. third replaces cue 3."""
+    return [third if i == 3 and third is not None else srt_line(i, br) + b"\0" for i in range(1, 21)]
+
+
+def nul_remux(hb_base, tmp_path, settings, packets, how):
+    """(refusal, proof entry of the SubRip stream, the path) of a remux of a file of the SubRip track packets. how is
+    "timed", resub() with a time plan, or "copy", a plain mkvmerge copy that prove() checks."""
+    path = hb_mkv(tmp_path / "srt.mkv", hb_base, packets, private=None, codec=b"S_TEXT/UTF8")
+    if how == "copy":
+        tmp = str(tmp_path / "copy.mkv")
+        REAL_RUN(["mkvmerge", "-q", *hook.KEEP_PACKETS, "-o", tmp, path], check=True)
+        refused, proof = proved(path, tmp, [], str(tmp_path))
+        return refused, next(e for e in proof if e["stream"] == "subtitle 2"), path
+    settings(keep_days=0)
+    j = REAL_MKVMERGE(path)
+    cues = hook.subtitle_cues(path, j, {"s1"})["s1"]
+    plan = hook.time_plan(cues, None, (), starts=starts_of(cues, 10.0, 20.0, 1.2))
+    _, result, info = hook.resub(path, j, os.stat(path), True, {}, (), None, {2: plan})
+    entry = next((e for e in info.get("proof") or [] if e["stream"] == "subtitle 2"), None)
+    return (None if result == "subtitles remuxed" else result), entry, path
+
+
+@pytest.mark.parametrize("br", [b"\n", b"\r\n"])
+@pytest.mark.parametrize("how", ["timed", "copy"])
+def test_a_subrip_cue_may_lose_the_nul_at_its_end(hb_base, tmp_path, settings, br, how):
+    """mkvmerge cuts a SubRip cue at its first NUL byte, on a copy too. So the proof of a SubRip stream compares a packet
+    that ends in one NUL without it, and the entry counts those packets in nul_cut. The line break rule then takes the
+    cut bytes. With CR LF inside each cue, no line break changes, and the entry names no crlf. The new file's cues are
+    the old cues less their NUL."""
+    packets = nul_cues(br=br)
+    refused, entry, path = nul_remux(hb_base, tmp_path, settings, packets, how)
+    assert refused is None and entry["match"] and entry["nul_cut"] == 20 and entry.get("crlf", 0) == (20 if br == b"\n" else 0), (refused, entry)
+    new = path if how == "timed" else str(tmp_path / "copy.mkv")
+    got = [b for _, _, b in hook.srt_packets(new, REAL_MKVMERGE(new), 2)]
+    assert got == [b[:-1].replace(b"\n", b"\r\n") if br == b"\n" else b[:-1] for b in packets], got[:3]
+
+
+@pytest.mark.parametrize("third, why", [
+    (b"Line 3\0tail", "the packet data of stream subtitle 2 (subrip) differ"),
+    (b"\0", "stream subtitle 2 (subrip) holds 19 packets in the new file, 20 in the original"),
+    (b"Line 3\0\0", "the packet data of stream subtitle 2 (subrip) differ"),
+    (b"Line 3\n\0", "the packet data of stream subtitle 2 (subrip) differ"),
+])
+@pytest.mark.parametrize("how", ["timed", "copy"])
+def test_the_proof_refuses_any_other_nul_change_of_a_subrip_cue(hb_base, tmp_path, settings, third, why, how):
+    """mkvmerge drops the text after a NUL, a cue of only a NUL, both NULs at the end and a line break before the NUL.
+    The proof refuses each, with a time plan and on a copy. The file stays as it was."""
+    path = str(tmp_path / "srt.mkv")
+    refused, entry, _ = nul_remux(hb_base, tmp_path, settings, nul_cues(third), how)
+    if how == "timed":
+        assert refused == f"subtitle remux failed: {why}" and hook.srt_packets(path, REAL_MKVMERGE(path), 2)[2][2] == third, refused
+    else:
+        assert refused == why and not entry["match"], (refused, entry)
 
 
 def damaged_eac3(tmp_path, base):

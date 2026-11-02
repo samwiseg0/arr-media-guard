@@ -1342,8 +1342,8 @@ def ended_track(path, j, tid, plan, folder, text=None):
     exceptions. HandBrake ends each ASS event and its header with a NUL byte and writes no [Events] section, and the
     round trip drops each NUL and adds the section. mkvmerge numbers the ASS events from 0 in ReadOrder order, so the
     events of a track whose ReadOrders skip a number, as HandBrake's may, take new ones. KEEP_PACKETS keeps the spaces
-    and tabs at the ends of each line. mkvmerge may store each line break inside a SubRip cue as CRLF. mkvmerge 92
-    and 102 do, and a source's mkvmerge may store LF. prove() and header_kept() pass only those changes.
+    and tabs at the ends of each line. mkvmerge drops the NUL at the end of a SubRip cue and stores each line break
+    inside it as CRLF, see docs/design.md, "SubRip cues in a remux". prove() and header_kept() pass only those changes.
     resub() gives the track its UID, language, name and flags, see track_args().
     text takes the place of plan for a repair, see resub(): the new SubRip text, which needs no mkvextract, or a
     function of the extracted text. Each RuntimeError it raises starts with "track <tid>:", so the record names the track."""
@@ -1781,7 +1781,8 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     A track with new ends comes from a file of that one track, see ended_track(). A SubRip track's packets go into it as
     they are, see srt_track(). For an ASS or SSA track, mkvextract writes its text, set_ends() puts each new end in, and
     mkvmerge reads it back. The text, the starts and the ASS header stay byte for byte, but for the NUL bytes of a
-    HandBrake ASS track, the ReadOrders of an ASS track, which become their ranks, and the line breaks of a SubRip cue.
+    HandBrake ASS track, the ReadOrders of an ASS track, which become their ranks, and the line breaks and the end NUL
+    of a SubRip cue, see docs/design.md, "SubRip cues in a remux".
     The proof holds each end to the plan. An ASS track whose starts fall between centiseconds goes in as a track in
     timed, with each start on the nearest centisecond, see grid_plan(). Its log and what text stay those of new ends.
     info["starts_rounded"] counts the starts that the grid moved off the time its fix gives, see grid_moved().
