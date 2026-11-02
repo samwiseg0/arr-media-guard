@@ -577,8 +577,9 @@ docker exec arr-media-guard arr-media-guard --queue --pause --wait && reboot
 docker exec arr-media-guard arr-media-guard --queue --resume   # after the restart
 ```
 
-On a host, leave out `docker exec arr-media-guard`. The wait prints `waiting for 2 background jobs to end` once, and
-`no background job runs` at its end.
+On a host, leave out `docker exec arr-media-guard`. While jobs run, the wait prints a line such as
+`waiting for 2 background jobs to end`. It prints the line again with the new count each time the count changes, as
+when a job ends. It prints `no background job runs` at its end. With no job running, it prints only that last line.
 
 - `--wait` looks every 5 seconds and has no time limit of its own. A deep analysis can run for an hour. To give it a
   limit, run it under `timeout` in the container, as

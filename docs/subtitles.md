@@ -58,8 +58,8 @@ arr-media-guard --backfill radarr --sub-check --apply --paths "/data/movies/Film
 `--ids` takes the app's own ids, never TMDB or TVDB ids, see [commands.md](commands.md#dry-runs-and-the-backfill).
 
 `--sub-check` makes the checks of `--sub-time` except [Drift timing](#drift-timing),
-[Subtitle block timing](#subtitle-block-timing) and [Live caption timing](#live-caption-timing), which need much more
-listening.
+[Mid-file jump timing](#mid-file-jump-timing), [Subtitle block timing](#subtitle-block-timing) and
+[Live caption timing](#live-caption-timing), which need much more listening.
 
 - It also takes a file that has only a sidecar to check.
 - A dry run prints each result and the change it would make. An apply acts as an import does.
@@ -74,8 +74,10 @@ listening.
   [Recheck after an update](features.md#recheck-after-an-update).
 - A stopped run goes on where it stopped, because the files it finished are saved.
 - It listens at the backfill's low priority, with one thread of the speech model.
-- The last line counts the files checked, what it found, the timing fixes and the CPU time. It also estimates the time
-  for the whole library.
+- The last line counts the files checked, what the word check found and the CPU time. `whole-track timing fixes`
+  counts the subtitles that get one new shift and frame-rate ratio for all their lines. The line then names the timing
+  that `--sub-check` skips, and says that `--sub-time` runs it on a file. It ends with an estimate of the time for the
+  whole library.
 
 ## Time the subtitles of one file
 

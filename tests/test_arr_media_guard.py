@@ -16121,9 +16121,25 @@ def test_a_backfill_checks_subtitles_only_with_sub_check(env, monkeypatch, capsy
     # KEEP_ORIGINALS_DAYS 0 keeps the track in the file. The dry run plans that --apply turns its flags off.
     (line,) = [x for f in rec["findings"] for x in f["lines"] if x["code"] == "stays"]
     assert not rec["apply"] and (line["track"], line["kept_back"], line["flags_off"], line["gone"]) == ("s2", "keep_days", True, False), line
-    assert "subtitle check: 1 files checked, 1 tracks match, 1 do not, 0 unknown, 1 timing fixes, 12 CPU seconds" in out, out
+    assert "subtitle check: 1 file checked, 1 track matches, 1 does not, 0 unknown, 1 whole-track timing fix, 12 CPU seconds" in out, out
     hook.main(["--backfill", "radarr", "--sub-check"])
     assert len(env["words"]) == 2
+
+
+@pytest.mark.parametrize("files, match, mismatch, fixes, cpu, library, counts, end", [
+    (1, 2, 1, 0, 0.6, 1, "1 file checked, 2 tracks match, 1 does not, 0 unknown, 0 whole-track timing fixes, 1 CPU second",
+     "At 30.0 seconds a file, the 1 file of the library takes about 0.0 hours."),
+    (2, 1, 1, 3, 8.0, 100, "2 files checked, 1 track matches, 1 does not, 0 unknown, 3 whole-track timing fixes, 8 CPU seconds",
+     "At 30.0 seconds a file, all 100 files of the library take about 0.8 hours."),
+    (0, 0, 0, 0, 0.0, 100, "0 files checked, 0 tracks match, 0 do not, 0 unknown, 0 whole-track timing fixes, 0 CPU seconds",
+     "No file ran, so there is no estimate.")])
+def test_the_sub_check_summary_names_the_timing_it_skipped(files, match, mismatch, fixes, cpu, library, counts, end):
+    """The last line of --sub-check says that the run skipped the block, jump, drift and live caption timing, and that
+    --sub-time runs them. Its timing fixes are the whole-track fixes of the word check. A run with no file says it too.
+    Each count takes the singular at 1 on its own, so the counts of a case differ from each other."""
+    c = dict(all=files, all_seconds=30.0 * files, files=files, match=match, mismatch=mismatch, unknown=0, fixes=fixes, cpu=cpu)
+    assert hook.sub_summary(c, library) == f"subtitle check: {counts} for the hearing. The check skipped block, jump, drift and live " \
+        f"caption timing. --sub-time PATH runs them on a file. {end}"
 
 
 def test_a_backfill_with_sub_check_skips_a_file_it_checked(env, monkeypatch, capsys):

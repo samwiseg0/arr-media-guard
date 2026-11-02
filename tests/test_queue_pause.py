@@ -163,6 +163,22 @@ def test_wait_returns_once_no_background_job_runs(env, monkeypatch, settings, ca
     assert sleeps == [hook.POLL]
 
 
+@pytest.mark.parametrize("counts, said", [((3, 3, 2, 1, 0), (3, 2, 1)), ((1, 2, 2, 1, 0), (1, 2, 1))])
+def test_wait_prints_the_count_again_each_time_it_changes(env, monkeypatch, capsys, counts, said):
+    """--wait prints its waiting line at the first look, and again with the new count at each look whose count differs
+    from the last line's. The count falls as a job ends. It rises when a worker starts, as its claimed jobs then count.
+    A fake count gives each look."""
+    hook.main(["--queue", "--pause"])
+    looks = iter(counts)
+    monkeypatch.setattr(hook, "background_busy", lambda: next(looks))
+    monkeypatch.setattr(hook.time, "sleep", lambda s: None)
+    capsys.readouterr()
+    hook.main(["--queue", "--wait"])
+    assert capsys.readouterr().out.splitlines() == [f"waiting for {n} background job{'s' if n != 1 else ''} to end" for n in said] \
+        + ["no background job runs"]
+    assert next(looks, None) is None   # the wait ends at the look that counts 0
+
+
 def test_ctrl_c_ends_the_wait_by_sigint_with_no_traceback(env, monkeypatch, settings, capsys, procs):
     """Ctrl+C during --wait raises KeyboardInterrupt in its sleep. The wait only looks, so it sets SIGINT to its default
     and sends it to itself, with no traceback, and the pause stays. A fake kill records the signal and returns, as a

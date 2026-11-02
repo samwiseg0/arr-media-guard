@@ -208,7 +208,8 @@ def backfill_args(argv):
     ap.add_argument("--plex-later", action="store_true", help="list the folders a conversion changed for --plex-flush")
     ap.add_argument("--force-convert", nargs="+", default=[], metavar="PATH", help="convert these files past the refusal the "
                     "decision log names, and keep each original")
-    ap.add_argument("--sub-check", action="store_true", help="run the subtitle match and timing check too")
+    ap.add_argument("--sub-check", action="store_true", help="run the subtitle match and timing check too, without the block, "
+                    "jump, drift and live caption timing of --sub-time")
     ap.add_argument("--paths", nargs="+", default=[], metavar="PATH", help="only these files")
     ap.add_argument("--recheck", action="store_true", help="with --sub-check, check each file again, whatever its saved result says")
     ap.add_argument("--drop-queued", action="store_true", help="drop the jobs that a backfill queued and that wait or run, of the "
@@ -608,12 +609,19 @@ def sub_count(c, rec, took):
 
 
 def sub_summary(c, library):
-    """The last line of a --sub-check backfill: what it checked, what it found, the CPU time, and an estimate for the
-    whole library at this run's pace."""
+    """The last line of a --sub-check backfill: what it checked, what it found, the CPU time, the timing it skipped, and
+    an estimate for the whole library at this run's pace. The timing fixes are the whole-track fixes of the word check,
+    see sub_count(). --sub-check runs no whole-file timing, see subtitles.SUB_RUNS, so the line names what only
+    --sub-time runs."""
     each = c["all_seconds"] / c["all"] if c["all"] else 0
-    return (f'subtitle check: {c["files"]} files checked, {c["match"]} tracks match, {c["mismatch"]} do not, {c["unknown"]} unknown, '
-            f'{c["fixes"]} timing fixes, {c["cpu"]:.0f} CPU seconds for the hearing. '
-            + (f'At {each:.1f} seconds a file, all {library} files of the library take about {each * library / 3600:.1f} hours.'
+    cpu = f'{c["cpu"]:.0f}'   # the printed value, so 0.6 seconds prints as 1 CPU second
+    lib = f"all {library} files of the library take" if library != 1 else "the 1 file of the library takes"
+    return (f'subtitle check: {c["files"]} file{"s" if c["files"] != 1 else ""} checked, '
+            f'{c["match"]} {"track matches" if c["match"] == 1 else "tracks match"}, {c["mismatch"]} {"does" if c["mismatch"] == 1 else "do"} not, '
+            f'{c["unknown"]} unknown, {c["fixes"]} whole-track timing fix{"es" if c["fixes"] != 1 else ""}, '
+            f'{cpu} CPU second{"s" if cpu != "1" else ""} for the hearing. The check skipped block, jump, drift and live caption timing. '
+            '--sub-time PATH runs them on a file. '
+            + (f'At {each:.1f} seconds a file, {lib} about {each * library / 3600:.1f} hours.'
                if c["all"] else "No file ran, so there is no estimate."))
 
 
@@ -1741,13 +1749,15 @@ def wait_background():
     look reads the pause after the count, so a pause that ended during the wait, by --queue --resume or by a broken
     store that moved aside, exits 2 at the next look, the last one too. The wait only looks, as queue() does, so Ctrl+C
     leaves nothing behind. It then dies by SIGINT with no traceback, as Python does at Ctrl+C. So a shell that runs the
-    wait in a script stops the script too, and the next command, as a restart, never runs. A shell gives exit 130."""
+    wait in a script stops the script too, and the next command, as a restart, never runs. A shell gives exit 130. A
+    look that counts running jobs prints the waiting line when no waiting line printed yet, or when its count differs
+    from the last line's. A first look that counts none prints only the end line."""
     if not (os.path.exists(store.path()) and runner.paused()):
         print("arr-media-guard: --wait needs a paused background queue, as a job can start after the wait. Run --queue --pause --wait.",
               file=sys.stderr)
         sys.exit(2)
     store.db().setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-    told = False
+    told = None   # the count the last waiting line printed
     try:
         while True:
             n = background_busy()
@@ -1758,9 +1768,9 @@ def wait_background():
                 break
             if n is None:
                 sys.exit(WORKER_UNKNOWN)
-            if not told:
+            if n != told:   # a job ended, or a worker started and its claimed jobs count, see background_busy()
                 print(f"waiting for {n} background job{'s' if n != 1 else ''} to end", flush=True)
-                told = True
+                told = n
             time.sleep(config.POLL)
     except KeyboardInterrupt:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
