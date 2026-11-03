@@ -4154,7 +4154,7 @@ def test_wrong_content_regrabs_the_download_when_switched_on(env, monkeypatch, s
     (f,) = [f for f in rec["findings"] if f["kind"] == "content"]
     assert f["action"] == {"code": "regrabbed", "name": "Radarr", "kind": "content", "n": 1, "came": [], "linked": True, "own_copy": True,
                            "others": 0, "stayed": None}
-    assert rec["alert_result"] == ["log only", "log only"] and not [b for m, u, b in env["http"] if m == "POST"]   # the re-grab and its language
+    assert rec["alert_result"] == ["sent", "log only"] and len([b for m, u, b in env["http"] if m == "POST"]) == 1   # the re-grab posts, its language logs
     hook.main([])   # the app deletes the file, the fake does not: a later job of the unit is skipped
     assert (log_lines(env)[-1]["outcome"], log_lines(env)[-1]["fault"]) == ("deleted_with_download", "content") and len(env["writes"]) == 3
     assert hook.content_probe("radarr", "7", "English", False, "", {}, None)(env["path"], {"eps": []}) == (None, {"skipped": "another film"})
@@ -5567,14 +5567,14 @@ def test_a_cover_alert_joins_only_the_alert_that_says_the_rewrite_failed(env, co
 
 def test_a_run_that_re_grabs_the_file_posts_no_cover_alert(env, cover_mkvs, monkeypatch, settings):
     """The cover move waits for the write stage, after the audio check. When the audio is broken and the file is
-    re-grabbed, no remux runs and nothing posts. The decision log keeps the cover finding."""
+    re-grabbed, no remux runs and only the re-grab posts. The decision log keeps the cover finding."""
     settings(keep_days=0)
     monkeypatch.setattr(hook.filecmp, "cmp", lambda a, b, shallow=True: False)
     monkeypatch.setattr(hook, "check_audio", lambda *a, **k: ("the audio fails to play at all 3 places checked", [], []))
     monkeypatch.setattr(hook, "regrab", lambda app, job, fault, probe, kind="audio", alone=False: {"code": "regrabbed", "name": "Film A", "kind": kind, "n": 1})
     rec, posts = cover_run(env, monkeypatch, cover_mkvs / "one-first.mkv", mode="import")
     assert "subremux" not in rec and rec["covers"] and "cover" not in rec["alert_kinds"], rec.get("subremux")
-    assert posts == [] and len(REAL_MKVMERGE(env["path"])["tracks"]) == 3, posts
+    assert [p[0] for p in posts] == ["Broken audio, re-grabbed"] and len(REAL_MKVMERGE(env["path"])["tracks"]) == 3, posts
 
 
 def test_a_cover_moves_only_where_the_subtitle_remux_may_change_the_file(env, cover_mkvs, monkeypatch, settings):
@@ -9078,11 +9078,12 @@ def upgrade(env, monkeypatch, old_name, recycle_name=None, links=True, grab=True
 
 
 def action(env):
-    """The one finding with an action on the decision line, and its action. Its alert went out, unless the hook re-grabbed
-    or put the old file back where the app picked it up, which goes to the decision log only, see report.fixed()."""
+    """The one finding with an action on the decision line, and its action. Its alert went out, unless the hook put the
+    old file of a manual import back where the app picked it up, which goes to the decision log only, see report.posts().
+    A re-grab posts, also when its old file came back."""
     (f,) = [f for f in decided(env)["findings"] if f.get("action")]
-    fixed = hook.fixed(f["action"])
-    assert len([b for m, u, b in env["http"] if m == "POST"]) == (not fixed) and decided(env)["alert_result"] == ["log only" if fixed else "sent"]
+    logged = f["action"]["code"] not in ("regrabbed", "searched") and hook.fixed(f["action"])
+    assert len([b for m, u, b in env["http"] if m == "POST"]) == (not logged) and decided(env)["alert_result"] == ["log only" if logged else "sent"]
     return f, f["action"]
 
 
@@ -26106,11 +26107,12 @@ DISAGREED = "A second check on other frames disagreed, so nothing was changed."
     ("doubt unsure", "Burned-in subtitles, not confirmed", f"{CHINESE}\nA second check on other frames couldn't tell, so nothing was changed.", []),
     ("off", "Burned-in subtitles, re-grab is off", f"{CHINESE}\nRe-grabs for burned-in subtitles are off, so the file was kept.", []),
     ("capped", "Burned-in subtitles", f"{CHINESE}\nThe limit of 0 re-grabs a day was reached, so the file was kept.", []),
-    ("regrab", None, None, [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
+    ("regrab", "Burned-in subtitles, re-grabbed", f"{CHINESE}\nDeleted the file and marked the grab as failed, so Radarr is searching for another copy.",
+     [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
                             ("POST", "history/failed/2101", None)])])
 def test_subtitles_in_another_language_burned_in_get_a_second_pass_then_the_re_grab_of_an_import(env, burn, settings, case, title, text, writes):
     """The second pass on other frames must agree. At fix the re-grab path of an import then decides, with REGRAB and
-    REGRAB_CAP. A re-grab posts nothing, because it fixed the problem. At check the second pass runs too, so the alert
+    REGRAB_CAP. A re-grab posts, because it deleted a file from the library. At check the second pass runs too, so the alert
     says what fix would act on."""
     env["movies"]["history?downloadId=a1b2c3d4&pageSize=1000"] = GRAB
     name = japanese_burn(env, ("eng", True, {}))
@@ -26339,12 +26341,13 @@ def test_a_burn_in_in_the_films_own_language_is_re_grabbed_once_and_the_next_cop
     japanese_film(env, ("eng", True, {}))
     env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
     hook.background(queue_burn(env, inputs=dict(INPUTS, original="Chinese")), [])
-    assert burn_lines(env)[-1]["regrab"] == "regrabbed" and hook.store.get("burned_in_once", "radarr|movie 7")["lang"] == "chi" and posted(env) == []
+    assert burn_lines(env)[-1]["regrab"] == "regrabbed" and hook.store.get("burned_in_once", "radarr|movie 7")["lang"] == "chi"
+    assert posted(env) == [('Burned-in subtitles, re-grabbed', f"{CHINESE}\nDeleted the file and marked the grab as failed, so Radarr is searching for another copy.")]
     writes = list(env["writes"])
     hook.background(queue_burn(env, inputs=dict(INPUTS, original="Chinese")), [])   # the next copy of movie 7
     (rec,) = burn_lines(env)[1:]
     assert env["writes"] == writes and rec["burned_in"]["plan"] == "once" and rec["class"] == "burned-in subtitles, kept after one re-grab"
-    assert posted(env) == [("Burned-in subtitles", f"{CHINESE}\nAn earlier copy was already re-grabbed for this, so this copy was kept.")]
+    assert posted(env)[1:] == [("Burned-in subtitles", f"{CHINESE}\nAn earlier copy was already re-grabbed for this, so this copy was kept.")]
     env["files"][env["path"]] = sub_probe(("eng", True, {}), audio=(("jpn", True),))   # Chinese text over Japanese audio of a Japanese film
     hook.background(queue_burn(env, inputs=JAPANESE), [])
     assert burn_lines(env)[-1]["regrab"] == "regrabbed" and len(env["writes"]) > len(writes)
@@ -26362,17 +26365,20 @@ def test_a_re_grab_that_did_not_happen_never_counts_as_the_one_for_the_item(env,
 
 def test_a_burn_in_in_the_series_own_language_is_re_grabbed_once_per_episode(env, burn, settings, monkeypatch):
     """The one re-grab counts per episode. Another episode of the series with the same burn-in is re-grabbed too. The
-    next copy of the first episode alerts and stays."""
+    next copy of the first episode alerts and stays. Each re-grab posts, and each import has a file id of its own."""
     grabs = []
-    monkeypatch.setattr(hook, "regrab", lambda app, grab, *a: grabs.append(grab["episode_ids"]) or {"code": "regrabbed", "name": "Sonarr"})
+    monkeypatch.setattr(hook, "regrab", lambda app, grab, *a, **k: grabs.append(grab["episode_ids"])
+                        or {"code": "regrabbed", "name": "Sonarr", "kind": "burned_in", "n": 1})
     settings(regrab={"burned_in"})
     japanese_film(env, ("eng", True, {}))
     env["probe"] = sub_probe(("eng", True, {}), audio=(("chi", True),))
-    for eps in ("31", "32", "31"):
-        grab = {"owner": "5", "file_id": "9", "episode_ids": eps, "download_id": "d759"}
-        hook.background(queue_burn(env, app="sonarr", grab=grab, inputs=dict(INPUTS, original="Chinese")), [])
+    for eps, fid in (("31", "9"), ("32", "10"), ("31", "12")):
+        grab = {"owner": "5", "file_id": fid, "episode_ids": eps, "download_id": "d759"}
+        hook.background(queue_burn(env, app="sonarr", grab=grab, ids={"app_id": "5", "file_id": fid}, inputs=dict(INPUTS, original="Chinese")), [])
     assert grabs == ["31", "32"] and [r["burned_in"]["plan"] for r in burn_lines(env)] == ["regrab", "regrab", "once"]
-    assert set(hook.store.items("burned_in_once")) == {"sonarr|episodes 31", "sonarr|episodes 32"} and len(posted(env)) == 1
+    assert set(hook.store.items("burned_in_once")) == {"sonarr|episodes 31", "sonarr|episodes 32"}
+    assert [p[0] for p in posted(env)] == ["Burned-in subtitles, re-grabbed"] * 2 + ["Burned-in subtitles"], posted(env)
+    assert not [p for p in posted(env) if p[1].startswith(hook.UNTOLD)], posted(env)
 
 
 @pytest.mark.parametrize("case", ["re-grab", "failed edit"])
@@ -28205,12 +28211,14 @@ def whole_import(env, monkeypatch, gaps, probe=(), src=None):
 
 def test_the_whole_file_check_regrabs_what_the_imports_check_missed(env, monkeypatch):
     """Owner 2026-10-15: "if regrab is on then it should regrab". The second check measures the two runs again and
-    never reads the whole file twice. The re-grab is fixed, so it posts nothing."""
+    never reads the whole file twice. The re-grab posts its alert."""
     rec = whole_import(env, monkeypatch, (0.3, 0.7))
     assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
                              ("POST", "history/failed/2101", None)]
-    assert (rec["outcome"], rec["regrab"], rec["whole"]["fault"], rec["alert_result"]) == ("corrupt_video", "regrabbed", "zero-filled", ["log only"])
-    assert rec["findings"][0]["certain"] == "the file has blank gaps at 2 places, so the download is incomplete" and posted(env) == []
+    assert (rec["outcome"], rec["regrab"], rec["whole"]["fault"], rec["alert_result"]) == ("corrupt_video", "regrabbed", "zero-filled", ["sent"])
+    assert rec["findings"][0]["certain"] == "the file has blank gaps at 2 places, so the download is incomplete"
+    assert posted(env) == [("Broken video, re-grabbed", "The file has blank gaps at 2 places, so the download is incomplete.\nDeleted the broken file and "
+                            "marked the grab as failed, so Radarr is searching for another copy.")]
     assert rec["whole"]["again"]["read"] <= 2 * 2 * hook.arr_decide.ZERO_RUN and rec["whole"]["ffmpeg"] == {"skipped": "the zero scan was certain"}
     assert hook.deep_analysis_queued() == []
 
@@ -28286,7 +28294,8 @@ def test_silent_pcm_audio_never_regrabs_and_real_gaps_in_it_do(env, monkeypatch,
     rec = whole_import(env, monkeypatch, (), probe=None, src=whole_media / name)
     first = decided(env)["video"]
     assert (first["certain"], first["zeros"]["pcm"], len(first["windows"]["list"])) == (None, True, 3) and len(first["zeros"]["hits"]) >= 2, first
-    assert bool(env["writes"]) == writes and rec["whole"]["pcm"] is True and posted(env) == [], (rec["result"], env["writes"])
+    assert bool(env["writes"]) == writes and rec["whole"]["pcm"] is True, (rec["result"], env["writes"])
+    assert [p[0] for p in posted(env)] == (["Broken video, re-grabbed"] if writes else []), posted(env)   # a re-grab posts, silence alone posts nothing
     if writes:
         assert (rec["outcome"], rec["regrab"], len(rec["whole"]["again"]["runs"])) == ("corrupt_video", "regrabbed", 2)
     else:

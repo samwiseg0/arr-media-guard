@@ -100,7 +100,7 @@ QUICK_SECS = 90   # seconds of the time limit the quick burned-in subtitle check
                   # about 70 seconds in tests. With less left the file goes to the background check.
 BURN_TIMEOUT = 3600   # seconds one full burned-in subtitle check may take, see runner.burn_full(). burnin.py runs at nice 10, and
                       # its speech read's ffmpeg at nice 19. The speech read of a 4K remux over a share took 8 to 11 minutes in tests.
-# What goes to DISCORD_WEBHOOK. issues: what arr-media-guard left unresolved, see report.posts(). all: also one post for
+# What goes to DISCORD_WEBHOOK. issues: what arr-media-guard left unresolved, and each re-grab, see report.posts(). all: also one post for
 # each change it made to a file, see report.changes().
 DISCORD_POSTS = ("issues", "all")
 # PATH_MAP='/tv:/media/tv|/movies:/media/movies' pairs the path an app uses with the path this script sees, as in Docker.

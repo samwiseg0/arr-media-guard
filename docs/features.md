@@ -362,7 +362,8 @@ it. A rejected download is deleted, and the old file stays. It needs `SABNZBD_AP
 
 AMG posts a Discord alert for each problem it leaves unresolved, when `DISCORD_WEBHOOK` is set. A fix that failed, a fix
 a setting turned off, and a doubt all post, once for the same file. A problem AMG fixed goes to the decision log and
-syslog only. Examples are a re-grab, a removed or repaired subtitle, and new subtitle times. With `DISCORD_POSTS=all`,
+syslog only. Examples are a removed or repaired subtitle and new subtitle times. A re-grab posts, because AMG deleted a file
+from the library, and the app may find no other copy. With `DISCORD_POSTS=all`,
 AMG also posts each change it makes to a file, unless an alert already says it. Imports, the burned-in subtitle check,
 the deep analysis and the recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the
 worker starts or a `--convert` run finds it. `--check --apply`, the jobs a backfill queues and the flag backfill's `--apply` post the alerts of a file with an

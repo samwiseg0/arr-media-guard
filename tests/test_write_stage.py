@@ -1190,14 +1190,14 @@ def test_a_stop_after_a_restore_that_deleted_the_file_still_posts_it(env, monkey
 def test_a_stop_after_a_re_grab_still_posts_its_change(env, monkeypatch, settings):
     """Reviewer 2026-10-20 (P1, P6): with DISCORD_POSTS all, SIGTERM during the delete of a re-grab of broken audio lets
     the re-grab end. Its change posted nothing, and the next run logs deleted_with_download, which posts nothing. The
-    change of the re-grab now posts."""
+    re-grab now posts its alert, once."""
     settings(discord_posts="all")
     env["ffmpeg_out"] = [SILENCE]
     grabbed(env, monkeypatch)
     env["on_write"] = lambda app, p, method, body: method == "DELETE" and term()
     job_run()
     rec = decided(env)
-    assert ([f["action"]["code"] for f in rec["findings"]], rec["alert_result"], titles(env)) == (["regrabbed"], ["log only"], ["Broken audio, re-grabbed"]), rec
+    assert ([f["action"]["code"] for f in rec["findings"]], rec["alert_result"], titles(env)) == (["regrabbed"], ["sent"], ["Broken audio, re-grabbed"]), rec
 
 
 def test_a_stop_after_a_flag_edit_still_posts_its_change(env, monkeypatch, settings):

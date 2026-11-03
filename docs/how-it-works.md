@@ -153,7 +153,8 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
 - **Syslog.** A one-line summary of the same, tagged with `NAME`. In Docker it also goes to the container log. It names
   the job, as the listener's `queued` line does. See [monitoring.md](monitoring.md#syslog).
 - **Discord.** One alert for each problem the job left unresolved, to `DISCORD_WEBHOOK`. A problem AMG fixed, such as a
-  re-grab or a removed subtitle, goes to the decision log only. The same alert posts once for the same file. Two fields
+  removed subtitle, goes to the decision log only. A re-grab posts, because AMG deleted a file from the library, and the
+  app may find no other copy. The same alert posts once for the same file. Two fields
   side by side name the check that found the problem and the step where the fix stopped. A step is, for example,
   **Finding the shift** or **Writing the file**. With `DISCORD_POSTS=all`, each change AMG made to the file posts too.
   With `SUBTITLES=deep`, the subtitle alerts wait for the deep analysis, see

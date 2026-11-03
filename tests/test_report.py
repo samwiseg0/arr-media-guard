@@ -838,9 +838,9 @@ def test_the_embed_target_is_one_embed_per_finding():
 
 
 # The goldens whose alert goes to the decision log only, by their place in FINDINGS, ACTIONS and SUB_LINES: a problem the
-# program fixed. That is a re-grab, an old file put back that the app picked up, a removed subtitle, a moved sidecar, a
-# track a conversion left out. Every other golden posts, a doubt and a failed restore too.
-LOG_ONLY = {"findings": {27}, "actions": {0, 1, 2, 3, 4, 6, 7, 9, 20, 21}, "sub_lines": {0, 7, 10, 23, 24, 26, 62, 65, 66, 68}}
+# program fixed. That is an old file of a manual import put back that the app picked up, a removed subtitle, a moved
+# sidecar, a track a conversion left out. Every other golden posts, a re-grab, a doubt and a failed restore too.
+LOG_ONLY = {"findings": {27}, "actions": {9, 21}, "sub_lines": {0, 7, 10, 23, 24, 26, 62, 65, 66, 68}}
 SUB_MATCH = ("removed", "stays", "sidecar", "converted_sidecar", "converted_track", "garbled", "repaired", "garbled_sidecar")   # the sentences of a submatch finding
 
 
@@ -978,14 +978,31 @@ def test_the_unreadable_subtitles_notice_names_each_track_and_its_file(sent, set
 
 
 def test_after_a_re_grab_only_the_re_grab_posts(sent, settings):
-    """The re-grab deleted the file, so its other changes are gone too. issues mode logs the re-grab only."""
+    """The re-grab deleted the file, so its other changes are gone too. The re-grab posts its alert, and no change posts."""
     settings(discord_posts="all")
     got, rec = changed(outcome="wrong_content", result="wrong content: x", edit_result="edited", findings=[REGRAB, LANGUAGE, *CHANGED["findings"]])
-    assert got == ["log only"] * 3 and [e["title"] for e in sent] == ["Wrong content, re-grabbed"] and rec["change_result"] == ["sent"]
+    assert got == ["sent", "log only", "log only"] and [e["title"] for e in sent] == ["Wrong content, re-grabbed"] and rec["change_result"] == []
     sent.clear()
     got, rec = changed(findings=[dict(REGRAB, action={"code": "deleted"})])   # the issue alert says it, and no change posts
     assert got == ["sent"] and rec["change_result"] == [] and [e["title"] for e in sent] == ["Wrong content"]
 
+
+
+def test_each_re_grab_posts_also_when_the_next_copy_has_the_same_path_and_size(monkeypatch):
+    """A re-grab deleted its file, so the next copy is a new download, and its re-grab posts too. Two copies of one post
+    land at the same path with the same size. The re-grab marker keys on the app's file id, else on the decision id. A
+    repeat of one file id posts once, and every other alert still posts once per file, kind and size."""
+    marks = set()
+    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h.store, "add", lambda ns, key: key not in marks and not marks.add(key))
+    monkeypatch.setattr(h.store, "drop", lambda ns, key: marks.discard(key))
+    got = lambda **kw: h.alert_findings(decision(**kw), 7)
+    assert got(ids={"file_id": 10}, findings=[REGRAB]) == ["sent"]
+    assert got(ids={"file_id": 11}, findings=[REGRAB]) == ["sent"]
+    assert got(ids={"file_id": 11}, findings=[REGRAB]) == ["already sent"]
+    assert got(findings=[REGRAB]) == ["sent"] and got(findings=[REGRAB]) == ["already sent"]   # no file id: the decision id
+    assert got(id="b2", findings=[REGRAB]) == ["sent"]
+    assert got(findings=[LANGUAGE]) == ["sent"] and got(id="b3", findings=[LANGUAGE]) == ["already sent"]
 
 LIVE = {"code": "live", "track": "s3", "lag": 4.0, "moved": 900, "cues": 1200, "left": 300, "flags_off": True}
 
@@ -1182,10 +1199,10 @@ def test_the_discord_test_posts_one_message_and_prints_the_answer(monkeypatch, s
 
 
 @pytest.mark.parametrize("findings, want", [
-    ([{"kind": "video", "certain": "x", "action": REGRABBED}, DOUBT], ["log only", "log only"]),   # hd, Outlander S05E08
+    ([{"kind": "video", "certain": "x", "action": REGRABBED}, DOUBT], ["sent", "log only"]),
     ([{"kind": "video", "certain": "x", "action": dict(REGRABBED, code="deleted")}, DOUBT, LANGUAGE], ["sent", "log only", "log only"]),
     ([dict(CONTENT, action={"code": "regrabbed", "name": "Radarr", "kind": "content", "n": 1}), LANGUAGE, RUNTIME, LENGTH],
-     ["log only"] * 4),
+     ["sent", "log only", "log only", "log only"]),
     ([dict(CONTENT, action={"code": "would_regrab", "kind": "content"}, scored=["language", "runtime"]), LANGUAGE, RUNTIME, EPISODE, LENGTH, DOUBT],
      ["sent", "log only", "log only", "sent", "sent", "sent"]),
     ([dict(CONTENT, action={"code": "would_regrab", "kind": "content"}), EPISODE], ["sent", "sent"]),   # the episode signal scores 0 points
@@ -1197,8 +1214,8 @@ def test_the_discord_test_posts_one_message_and_prints_the_answer(monkeypatch, s
     ([{"kind": "audio", "certain": SILENT, "action": dict(ACTIONS[9][0])}, DOUBT], ["log only", "log only"]),
 ])
 def test_a_fix_that_worked_logs_every_finding_of_its_file(monkeypatch, findings, want):
-    """One cause posts once. A re-grab or a restore that worked logs only, and so does every other finding of the file
-    it deleted. A restore that put back no old file of its own, or old files the app did not pick up, posts. A
+    """One cause posts once. A re-grab posts, and every other finding of the file it deleted logs only. A restore of a
+    manual import that worked logs only too. A restore that put back no old file of its own, or old files the app did not pick up, posts. A
     wrong-content alert names each signal that scored. A language or runtime finding logs only beside it when it names
     that signal. The episode signal scores no points, so the episode finding posts. A language finding that only the
     track decision found posts too."""

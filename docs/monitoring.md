@@ -21,7 +21,7 @@ A decision line holds:
   alone.
 - `alerts`, the text of each problem
 - `alert_result`, what the Discord post of each problem gave. That is `sent`, `already sent`, `log only` for a problem
-  AMG fixed, or why the post failed. With `SUBTITLES=deep`, a subtitle problem of an import says
+  AMG fixed, or why the post failed. A re-grab is a fix that posts, so it says `sent`. With `SUBTITLES=deep`, a subtitle problem of an import says
   `held for the deep analysis`. The deep analysis checks it again and posts what it still finds.
 - `held_result`, on a deep analysis line whose import held alerts, what became of each one. That is `checked again`,
   `fixed before the error`, `dropped with the file`, or what its post gave. A subtitle that the deep analysis retimed or

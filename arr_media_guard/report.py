@@ -509,10 +509,14 @@ def title(f, t="done"):
     return FINDINGS[f["kind"]][0], "amber"
 
 
-# The fixes that go to the decision log only, see posts(). The action codes of a fault the program re-grabbed or whose
-# old file it put back, and the sentence codes of a subtitle it removed or left out of a conversion.
+# The fixes, see fixed(). The action codes of a fault the program re-grabbed or whose old file it put back, and the
+# sentence codes of a subtitle it removed or left out of a conversion. A fix goes to the decision log only, except a
+# fix of REGRABS, see posts().
 LOGGED_ACTIONS = ("regrabbed", "restored", "searched")
 LOGGED_LINES = ("removed", "converted_track", "repaired")
+# The action codes of a fix that still posts: the program deleted the file and the app searches for another copy. Unless
+# the old file came back, the item has no file until the app finds one, and the search can find none.
+REGRABS = ("regrabbed", "searched")
 COVERS_LENGTH = ("header", "cut", "subtitle")   # the findings whose alert names the cause of a wrong length in the file
 DELETED = LOGGED_ACTIONS + ("deleted",)   # the action codes of a fault whose file the program deleted
 CONTENT_SIGNALS = ("language", "runtime")   # the findings that share their kind with a signal of the wrong-content evidence
@@ -531,8 +535,8 @@ def fixed(a):
 def posts(f, rec=None):
     """Whether the alert of finding f of the record rec goes to Discord, see logs.alert_findings(). A problem the program
     left unresolved posts: a failed fix, a fix a setting turned off, a fix that cannot run, and a doubt. A problem it
-    fixed goes to the decision log only, see fixed(). A subtitle finding posts when one of its sentences does. A moved
-    sidecar counts as fixed.
+    fixed goes to the decision log only, see fixed(). A re-grab posts all the same, see REGRABS. A subtitle finding
+    posts when one of its sentences does. A moved sidecar counts as fixed.
 
     One cause posts once. When the program deleted the file, its other findings log only. A wrong-content finding names
     each signal that scored, see process.content_finding(). A language or runtime finding logs only beside it when it
@@ -540,7 +544,7 @@ def posts(f, rec=None):
     posts only when no repair fixed it and no alert of COVERS_LENGTH names its cause."""
     found = (rec or {}).get("findings") or []
     if f.get("action"):
-        return not fixed(f["action"])
+        return f["action"].get("code") in REGRABS or not fixed(f["action"])
     if any((x.get("action") or {}).get("code") in DELETED for x in found):
         return False
     if f["kind"] in CONTENT_SIGNALS and any(x["kind"] == "content" and f["kind"] in x.get("scored", ()) for x in found):

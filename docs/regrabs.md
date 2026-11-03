@@ -43,8 +43,9 @@ A manual import has no grab to mark as failed. When it replaced a file and `REST
 and puts the old one back. When no old file comes back, AMG asks the app to search, if the item was monitored. A manual
 import that replaced nothing stays, and an alert says the app has no record of grabbing it.
 
-A re-grab goes to the decision log only, and so does an old file put back that the app picked up again. When AMG deleted
-a file, the other alerts of that file go to the log only too. Every fault that AMG did not re-grab posts an alert, as
+A re-grab posts an alert, also when AMG put the old file back. Without the old file, the item has no file until the
+app finds another copy, and the search can find none. A manual import whose old file came back, and the app picked it up again, goes to the
+decision log only. When AMG deleted a file, the other alerts of that file go to the log only. Every fault that AMG did not re-grab posts an alert, as
 when a setting or the limit stopped it. A restore whose old files the app did not pick up posts too. So does a deleted
 file whose item is not monitored, because no search started.
 

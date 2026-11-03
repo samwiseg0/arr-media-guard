@@ -216,13 +216,23 @@ def alert_findings(rec, size, held=None):
                          **({"spans": spans} if spans else {}), **({"flags": flags} if flags else {})})
             out.append(HOLD_RESULT)
         else:
-            out.append(alert(rec["app"], f.get("mark", f["kind"]), rec["path"], size, e))
+            out.append(alert(rec["app"], marker(f, rec), rec["path"], size, e))
     if config.CFG.discord_posts == "all":
         try:
             rec["change_result"] = [post(rec["app"], e) if isinstance(e, dict) else e for e in report.render(rec, "changes")]
         except Exception as ex:
             rec["change_result"] = [config.mask(f"no text: {type(ex).__name__}: {ex}")[:200]]
     return out
+
+
+def marker(f, rec):
+    """The kind that keys the alert marker of finding f of rec, see alert(). A re-grab of report.REGRABS deleted its file,
+    so the next copy of the item is a new download. That copy can land at the same path with the same size. So a re-grab
+    keys on the app's file id too, or on the decision id when the record has no file id."""
+    kind = f.get("mark", f["kind"])
+    if (f.get("action") or {}).get("code") not in report.REGRABS:
+        return kind
+    return f'{kind}|regrab|{(rec.get("ids") or {}).get("file_id") or rec.get("id")}'
 
 
 def stop_caused(f, rec):

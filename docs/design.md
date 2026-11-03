@@ -278,8 +278,10 @@ the state store stops a repeat, and an upgrade to a file of another size alerts 
 
 **What posts.** `report.posts()` is the one gate, and `logs.alert_findings()` asks it for every finding. A problem the
 hook left unresolved posts. That is a failed fix, a fix that a setting turns off, a fix that cannot run, or a doubt. A
-problem it fixed goes to the decision log only, see `report.fixed()`. That is a fault with the action `regrabbed`, `restored`
-or `searched`, and a subtitle sentence `removed` or `converted_track`, or a `sidecar` or `converted_sidecar` that moved.
+problem it fixed goes to the decision log only, see `report.fixed()`. That is a fault with the action `restored`, and a
+subtitle sentence `removed` or `converted_track`, or a `sidecar` or `converted_sidecar` that moved. A fault with the
+action `regrabbed` or `searched` is fixed too, and it posts all the same, see `report.REGRABS`. Unless the old file came
+back, the item has no file until the app finds another copy, and the search can find none.
 A restore that put back no old file of its own failed, and so did one whose old files the app did not pick up. Both
 post. A subtitle finding posts when one of its sentences does. One cause posts once. When the hook deleted the file, its
 other findings are log only. A `content` finding names each signal that scored, and lists their kinds in `scored`. A

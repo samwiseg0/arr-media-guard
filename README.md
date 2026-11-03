@@ -345,7 +345,7 @@ really sits, after symlinks. Set the environment variable `ARR_MEDIA_GUARD_LIB` 
 | --- | --- | --- |
 | `PLEX_URL`, `PLEX_TOKEN` | empty | After AMG changes a file, Plex reads it again, so Plex shows the new tracks. An empty `PLEX_URL` turns every Plex call off. |
 | `DISCORD_WEBHOOK` | empty | Alerts and scan summaries go here. Empty: nothing is posted. |
-| `DISCORD_POSTS` | `issues` | `issues`: a post for each problem left unresolved. `all`: also a post for each change AMG makes to a file, such as new subtitle times, a flag edit or a re-grab. Any other value, an empty one too, acts as `issues`, and `--selftest` fails on it. |
+| `DISCORD_POSTS` | `issues` | `issues`: a post for each problem left unresolved. `all`: also a post for each change AMG makes to a file, such as new subtitle times or a flag edit. A re-grab posts in both. Any other value, an empty one too, acts as `issues`, and `--selftest` fails on it. |
 | `TMDB_TOKEN` | empty | A TMDB API read token of your own, for the language and wrong-content checks. Empty: Radarr's key, read from `/opt/Radarr/Radarr.Common.dll`, else a copy of it in the code, as in Docker. |
 
 Each alert names the check that found the problem, such as the import check or the deep analysis, the slower subtitle
