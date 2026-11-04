@@ -13,12 +13,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/mkvtoolnix.sh
 
 # The venv from the lock file, each wheel checked by its sha256. lid.py --fetch downloads the pinned model and
-# checks its sha256, so a wrong model fails the build. The marker "ready" turns detection on.
+# checks its sha256, so a wrong model fails the build. The marker "ready" turns detection on. pip comes from Debian's
+# python3-venv and runs only here, so the venv drops it after the install. Image scanners then find no stale pip.
 COPY arr_lid.requirements.txt /opt/arr-media-guard/
 COPY arr_media_guard/lid.py /opt/arr-media-guard/arr_media_guard/
 RUN python3 -m venv /opt/arr-media-guard-lid/venv \
     && /opt/arr-media-guard-lid/venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: \
         -r /opt/arr-media-guard/arr_lid.requirements.txt \
+    && /opt/arr-media-guard-lid/venv/bin/python -m pip uninstall -y -q pip \
     && /opt/arr-media-guard-lid/venv/bin/python /opt/arr-media-guard/arr_media_guard/lid.py --fetch --model-dir /opt/arr-media-guard-lid/models \
     && touch /opt/arr-media-guard-lid/ready
 
