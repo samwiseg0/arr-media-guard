@@ -16,8 +16,10 @@ has subtitle lines in most speech frames and in few silence frames. A logo or a 
   40 keyframes in speech and 40 in silence go through method A. The PP-OCRv4 text detector finds the lines of text.
   A line with the shape and place of a subtitle counts, unless it sits in the same place in many frames (an overlay).
   A label needs three things. Enough speech frames have a subtitle line. That share lifts over the share of the
-  silence frames. The hits spread over enough tenths of the file. Under MIN_SPEECH_FRAMES speech frames the label is
-  unsure. Two recognizers read the lines of up to 10 frames for the script and the language.
+  silence frames. The hits spread over enough tenths of the file. On a full or partial label, the recognizers read
+  every counted line. A text that shows on 3 or more occasions, such as a nameplate or a sign, is scene text, see
+  scene_text(). Its lines stop counting, and the label is taken again. Under MIN_SPEECH_FRAMES speech frames the label
+  is unsure. Two recognizers read the lines of up to 10 frames for the script and the language.
 - ready() checks the models. fetch() downloads them at install, never at run time.
 
 A keyframe needs no other frame to decode, so a sample costs one seek and one decode. Each candidate time seeks to the
@@ -91,6 +93,11 @@ LIMITS = {
     "partial_spread": 2,   # and for "partial"
     "rec_frames": 10,      # speech frames whose subtitle lines the recognizers read
     "rec_conf": 0.6,       # the mean character probability of a line that counts as read
+    "scene_letters": 4,    # letters a key of scene text needs. The shortest nameplate in the study had 5.
+    "scene_gap": 20.0,     # seconds between two frames of a key that start a new occasion. One real line filled 13
+                           # frames inside 5 s in the study.
+    "scene_occasions": 3,  # occasions that make a key scene text. In the study real lines reached 2, nameplates 6 to 9
+                           # and a set sign 3 to 4.
     "lang_letters": 80,    # letters the language needs
     "lang_cover": 0.25,    # the share of the words that the English word list must hold
     "lang_ratio": 1.5,     # and this many times the share of the next language's list
@@ -422,6 +429,49 @@ def script_of(text):
 CJK = {"han": "chi", "kana": "jpn", "hangul": "kor"}
 
 
+def read_line(ocr, f, bx):
+    """(text, conf, ch_text, ch_conf) of line bx in frame f. The Chinese recognizer reads first. When its text is
+    mostly Latin, the English recognizer reads again and gives text and conf, because the Chinese one joins some Latin
+    words. f keeps each read in "reads", so a line is read once."""
+    reads = f.setdefault("reads", {})
+    if bx not in reads:
+        ch = ocr.read(f["rgb"], bx)
+        got = script_of(ch[0])
+        reads[bx] = (*(ocr.read(f["rgb"], bx, "en") if got["latin"] > sum(got.values()) / 2 else ch), *ch)
+    return reads[bx]
+
+
+def scene_text(ocr, frames):
+    """{key: occasions} of the scene text in the subtitle lines of frames, such as a nameplate or a sign, and those
+    lines leave each frame's "sub". The key of a line that reads at rec_conf or more is its letters in lower case, with
+    a CJK letter as one. The frames of a key in time order make an occasion until a gap of more than scene_gap seconds
+    from one frame to the next. A key of scene_letters or more on scene_occasions or more is scene text. A subtitle
+    line shows for a few seconds, so it makes one occasion. The count of lines in a band stays as analyse() took it, so
+    a crowded band stays out."""
+    seen, lines = {}, []
+    for f in frames:
+        for band, bxs in f["sub"].items():
+            for bx in bxs:
+                txt, conf = read_line(ocr, f, bx)[:2]
+                key = "".join(c.lower() for c in txt if c.isalpha()) if conf >= LIMITS["rec_conf"] else ""
+                lines.append((f, band, bx, key))
+                if len(key) >= LIMITS["scene_letters"]:
+                    seen.setdefault(key, []).append(f["at"])
+    scene = {}
+    for key, ts in seen.items():
+        ts.sort()
+        # Frame times have 3 decimals. The rounded gap keeps float error from splitting a gap of exactly scene_gap.
+        n = 1 + sum(1 for a, b in zip(ts, ts[1:]) if round(b - a, 3) > LIMITS["scene_gap"])
+        if n >= LIMITS["scene_occasions"]:
+            scene[key] = n
+    for f, band, bx, key in lines:
+        if key in scene:
+            f["sub"][band].remove(bx)
+    for f in frames:
+        f["sub"] = {band: bxs for band, bxs in f["sub"].items() if bxs}
+    return scene
+
+
 def language(ocr, frames):
     """{"english": True, False or None, "text_lang": 639-2 or None, "script": latin, cjk, other or None, "lines",
     "lines_read"} of the subtitle lines of up to rec_frames speech frames spread over the file. A line read at rec_conf
@@ -435,13 +485,10 @@ def language(ocr, frames):
     for f in pick:
         for bxs in f["sub"].values():
             for bx in bxs:
-                txt, conf = ocr.read(f["rgb"], bx)
-                got = script_of(txt)
-                if conf >= LIMITS["rec_conf"]:
-                    for s, c in got.items():
+                txt, conf, ch, ch_conf = read_line(ocr, f, bx)
+                if ch_conf >= LIMITS["rec_conf"]:
+                    for s, c in script_of(ch).items():
                         sc[s] += c
-                if got["latin"] > sum(got.values()) / 2:   # the Chinese recognizer joins some Latin words
-                    txt, conf = ocr.read(f["rgb"], bx, "en")
                 lines += 1
                 if conf >= LIMITS["rec_conf"]:
                     texts.append(txt)
@@ -650,7 +697,8 @@ def full(path, audio_index, duration, second=False, gate=None, queue=None, cache
     """The background check that decides. {"label": "full", "partial", "none" or "unsure" (under MIN_SPEECH_FRAMES
     speech frames), "english": True, False or None (the
     reader cannot tell), "text_lang", "script", see language(), "speech_share", "silence_share", "lift", "spread",
-    "speech_frames", "silence_frames", "lines", "lines_read", "second", "spans_cached", "took": wall seconds, "cpu": CPU
+    "speech_frames", "silence_frames", "lines", "lines_read", "scene_text": {key: occasions} of up to 5 keys of scene
+    text whose lines stopped counting, see scene_text(), "second", "spans_cached", "took": wall seconds, "cpu": CPU
     seconds}. second samples frames that are no keyframe, so none of them is a frame of the first pass. Many files
     hold too few keyframes in speech for a second set of keyframes. lid.speech() yields
     its speech read at gate, queue and job, see lid.waits(). The sampling asks the same after every 10 frames. A yield
@@ -681,11 +729,14 @@ def full(path, audio_index, duration, second=False, gate=None, queue=None, cache
     if not frames and (want["speech"] or want["silence"]):
         raise RuntimeError("no keyframe decoded")
     frames = analyse([dict(f, **f.pop("look")) for f in frames], W, H)
-    v = verdict(frames, duration)
+    v, scene = verdict(frames, duration), {}
+    if v["label"] in ("full", "partial"):   # the rule only takes hits away, so a file with none reads nothing
+        scene = scene_text(ocr, frames)
+        v = verdict(frames, duration)
     if v["speech_frames"] < MIN_SPEECH_FRAMES:
         v["label"] = "unsure"
-    return dict(v, **language(ocr, frames), second=second, spans_cached=bool(sp.get("cached")),
-                took=round(time.time() - t0, 2), cpu=round(lid.cpu_now() - c0, 2))
+    return dict(v, **language(ocr, frames), scene_text=dict(sorted(scene.items(), key=lambda x: -x[1])[:5]), second=second,
+                spans_cached=bool(sp.get("cached")), took=round(time.time() - t0, 2), cpu=round(lid.cpu_now() - c0, 2))
 
 
 # --- install ---------------------------------------------------------------------------------------------------------

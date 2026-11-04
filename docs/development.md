@@ -312,6 +312,15 @@ files stay as they are until they change.
 - The recheck takes the item from the app when it is queued, as `--sub-check` does. A file no app lists gets no
   recheck.
 
+## Dependency updates
+
+Dependabot opens a pull request each week for a new version of an action in the workflows, see
+[.github/dependabot.yml](../.github/dependabot.yml). For the lock file `arr_lid.requirements.txt` it opens only security
+updates, because the lock file keeps exact pins. Merge a security pull request into a release branch, so it ships with
+the tests of that release.
+The `lock` job of the test workflow installs the lock file as the Dockerfile does. It then runs `pip check` and imports
+the main packages, so a pin that breaks the venv fails CI.
+
 ## Build the image
 
 [docker.md](docker.md#build-the-image-yourself) has the build command.

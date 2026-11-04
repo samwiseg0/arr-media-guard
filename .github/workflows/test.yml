@@ -21,3 +21,22 @@ jobs:
         run: python3 -m venv /venv && /venv/bin/pip install pytest==9.1.1 pytest-xdist==3.8.0
       - name: Run the tests
         run: /venv/bin/python -m pytest -q -n auto
+
+  lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The image installs the language detection venv from the lock file, and the test job never does. This job installs
+    # it as the Dockerfile does, so a pin that breaks the install fails CI. It downloads no Whisper model.
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Python
+        run: apt-get update && apt-get install -y --no-install-recommends python3 python3-venv
+      - name: Install the lock file
+        run: |
+          python3 -m venv /venv
+          /venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r arr_lid.requirements.txt
+      - name: Check the venv
+        run: |
+          /venv/bin/pip check
+          /venv/bin/python -c "import faster_whisper, onnxruntime, av, numpy"

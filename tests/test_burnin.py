@@ -202,6 +202,116 @@ def test_the_recognizers_read_at_most_ten_frames_spread_over_the_file():
     assert seen == [1, 7, 13, 19, 25, 31, 37, 43, 49, 55]
 
 
+class TextOcr:
+    """A stub recognizer: box bx reads as texts[bx], (text, conf). The English model reads en[bx] when en holds bx.
+    reads lists each (bx, model)."""
+    def __init__(self, texts, en=None):
+        self.texts, self.en, self.reads = texts, en or {}, []
+
+    def read(self, rgb, bx, model="ch"):
+        self.reads.append((bx, model))
+        return self.en.get(bx, self.texts[bx]) if model == "en" else self.texts[bx]
+
+
+def scene(rows):
+    """Frames from rows [(kind, time, {band: [(text, conf)]})], and a TextOcr. A line's box is its name, the time, band
+    and place, as "100.0bottom1"."""
+    texts, fs = {}, []
+    for kind, at, bands in rows:
+        sub = {}
+        for band, lines in bands.items():
+            for i, tc in enumerate(lines):
+                texts[f"{at:.1f}{band}{i}"] = tc
+                sub.setdefault(band, []).append(f"{at:.1f}{band}{i}")
+        fs.append({"kind": kind, "at": at, "sub": sub, "rgb": None})
+    return fs, TextOcr(texts)
+
+
+def test_the_limits_of_the_scene_text_rule():
+    """The study set these, see LIMITS."""
+    assert {k: burnin.LIMITS[k] for k in ("scene_letters", "scene_gap", "scene_occasions")} == {
+        "scene_letters": 4, "scene_gap": 20.0, "scene_occasions": 3}
+
+
+def test_nameplates_on_3_occasions_drop_and_the_label_falls_from_full_to_none():
+    """Two nameplates on 3 occasions each fill 16 of 40 speech frames, the bar of full. Their lines drop, no frame
+    keeps a hit, and the label is none."""
+    rows = [("speech", t, {"bottom": [("NADIA", 0.95)]}) for t in (100, 102, 104, 400, 402, 404, 700, 702, 704)]
+    rows += [("speech", t, {"bottom": [("Marcus", 0.9)]}) for t in (250, 252, 254, 550, 552, 850, 852)]
+    rows += [("speech", 5 + 20 * i, {}) for i in range(24)] + [("silence", 15 + 20 * i, {}) for i in range(40)]
+    fs, ocr = scene(rows)
+    assert burnin.verdict(fs, 1000.0)["label"] == "full"
+    assert burnin.scene_text(ocr, fs) == {"nadia": 3, "marcus": 3}
+    assert burnin.verdict(fs, 1000.0)["label"] == "none" and not any(f["sub"] for f in fs)
+
+
+@pytest.mark.parametrize("times, texts, key", [
+    ([0, 20.5, 41], [("Ines", 0.9)], "ines"),   # gaps just over 20 s make 3 occasions, and 4 letters are enough
+    ([0, 100, 200], [("QUIZ NIGHT", 0.9), ("quiz-night!", 0.9), ("Quiz Night 2", 0.9)], "quiznight"),
+    ([0, 100, 200], [("我们走吧", 0.9)], "我们走吧"),   # a CJK letter counts as one
+    ([0, 100, 200], [("NADIA", 0.6)], "nadia"),   # a read at rec_conf is clear
+])
+def test_scene_text_drops(times, texts, key):
+    """The key is the letters in lower case. Spaces, punctuation and digits go."""
+    fs, ocr = scene([("speech", t, {"top": [texts[i % len(texts)]]}) for i, t in enumerate(times)])
+    assert burnin.scene_text(ocr, fs) == {key: 3} and not any(f["sub"] for f in fs)
+
+
+@pytest.mark.parametrize("times, text, conf", [
+    ([100 + 0.4 * i for i in range(13)], "I will never let you go", 0.9),   # one real line in 13 frames inside 5 s
+    ([100, 101, 500], "Where are you going", 0.9),   # a real line on 2 occasions
+    ([0, 20, 40, 60], "Mama", 0.9),   # gaps of 20 s make one occasion
+    ([0, 100, 200, 300, 400], "Yes!", 0.9),   # a key of 3 letters on 5 occasions
+    ([0, 100, 200], "你好吗", 0.9),   # 3 CJK letters
+    ([0, 100, 200, 300, 400], "QU1Z:N1GHT:", 0.55),   # a garbled read under rec_conf on 5 occasions
+    ([100, 300, 101, 301, 102], "Where are you going", 0.9),   # 2 occasions in the order sample() takes frames
+    ([15.0 * i for i in range(6)], "Mama", 0.9),   # the gap runs from frame to frame, so a 15 s chain is one occasion
+    ([31.904, 51.904, 100.0], "Mama", 0.9),   # 51.904 - 31.904 is 20.000000000000004 in floats, still one occasion
+])
+def test_a_real_line_stays(times, text, conf):
+    fs, ocr = scene([("speech", t, {"bottom": [(text, conf)]}) for t in times])
+    assert burnin.scene_text(ocr, fs) == {} and all(f["sub"] for f in fs)
+
+
+def test_a_silence_frame_makes_an_occasion_too():
+    fs, ocr = scene([("speech", 100, {"bottom": [("NADIA", 0.9)]}), ("speech", 400, {"bottom": [("NADIA", 0.9)]}),
+                     ("silence", 700, {"top": [("NADIA", 0.9)]})])
+    assert burnin.scene_text(ocr, fs) == {"nadia": 3} and not any(f["sub"] for f in fs)
+
+
+def test_the_key_of_a_latin_line_is_the_english_read():
+    """The Chinese recognizer spells the nameplate three ways. The English recognizer reads it again the same way each
+    time, so it is one key."""
+    fs, ocr = scene([("speech", t, {"bottom": [(txt, 0.9)]}) for t, txt in ((0, "NADIA"), (100, "NAD1A"), (200, "NADlA"))])
+    ocr.en = {bx: ("Nadia", 0.9) for bx in ocr.texts}
+    assert burnin.scene_text(ocr, fs) == {"nadia": 3}
+
+
+@pytest.mark.parametrize("ch, en, script", [
+    ([("Hello 你", 0.9), ("你好你好你好", 0.9)], ("Hello there my friend", 0.9), "cjk"),   # the Chinese read's letters count
+    ([("Hello there", 0.9)], ("Hello there", 0.3), "latin"),   # at the Chinese read's conf
+])
+def test_the_script_comes_from_the_chinese_read(ch, en, script):
+    """language() takes the script from the Chinese read of each line, and the text from the read that counts."""
+    ocr = TextOcr(dict(enumerate(ch)), {0: en})
+    assert burnin.language(ocr, [{"kind": "speech", "sub": {"bottom": list(range(len(ch)))}, "rgb": None}])["script"] == script
+
+
+def test_a_frame_with_a_nameplate_and_a_subtitle_keeps_its_hit():
+    """Only the nameplate's lines leave, in both bands. A band that analyse() found crowded stays out after the drop."""
+    fs, ocr = scene([("speech", 0, {"bottom": [("NADIA", 0.9)]}), ("speech", 100, {"bottom": [("NADIA", 0.9), ("Then we eat now", 0.9)],
+                                                                                "top": [("NADIA", 0.9)]}), ("speech", 200, {"top": [("NADIA", 0.9)]})])
+    assert burnin.scene_text(ocr, fs) == {"nadia": 3}
+    assert [f["sub"] for f in fs] == [{}, {"bottom": ["100.0bottom1"]}, {}]
+    plate = [box(0.5, 0.9, 0.1 + i / 100, 0.04) for i in range(4)]   # it moves a little with each cut
+    lines = [box(0.5, y, 0.3 + y / 10, 0.04) for y in (0.75, 0.8, 0.85)]
+    fs = [{"kind": "speech", "at": 100.0 * i, "boxes": [plate[i]] + lines * (i == 3), "rgb": None} for i in range(4)]
+    fs = burnin.analyse(fs + [{"kind": "silence", "at": 50.0 + i, "boxes": []} for i in range(20)], W, H)
+    assert [len(f["sub"].get("bottom", [])) for f in fs[:4]] == [1, 1, 1, 0]   # 4 lines in a band are credits
+    ocr = TextOcr({bx: ("NADIA", 0.9) for bx in plate} | {bx: ("A credit line", 0.9) for bx in lines})
+    assert burnin.scene_text(ocr, fs) == {"nadia": 3} and not any(f["sub"] for f in fs)
+
+
 def fake_models(tmp_path, monkeypatch):
     """MODELS pinned to small made-up files, served by a fake urlopen. Returns the served URLs."""
     blobs = {name: f"weights {name}".encode() for name in burnin.MODELS}
@@ -289,22 +399,27 @@ class FakeSampler:
 
 
 class FakeDetector:
-    """Ocr with no model: a subtitle line on every picture whose time burned(t) names, and an English text."""
+    """Ocr with no model: a subtitle line on every picture whose time burned(t) names. Its text is said(t), by default
+    an English line with a word of its own at each time. reads lists each read as (time, model)."""
 
-    def __init__(self, burned):
-        self.burned = burned
+    def __init__(self, burned, said=None):
+        self.burned, self.reads = burned, []
+        self.said = said or (lambda t: "We have to leave before the storm comes back " + "".join("abcdefghij"[int(d)] for d in f"{t * 5:.0f}"))
 
     def boxes(self, pic):
         return [box(0.5, 0.85, 0.3 + (pic[1] % 7) / 50, 0.04)] if self.burned(pic[1]) else []
 
     def read(self, pic, bx, model="ch"):
-        return "We have to leave before the storm comes back", 0.9
+        self.reads.append((pic[1], model))
+        return self.said(pic[1]), 0.9
 
 
-def fake_full(monkeypatch, spans, burned=lambda t: False, sampler=None):
+def fake_full(monkeypatch, spans, burned=lambda t: False, sampler=None, said=None):
+    """The fakes of full(). The sampler's det is the FakeDetector."""
     sm = sampler or FakeSampler()
+    sm.det = FakeDetector(burned, said)
     monkeypatch.setattr(burnin, "Sampler", lambda path: sm)
-    monkeypatch.setattr(burnin, "Ocr", lambda model_dir: FakeDetector(burned))
+    monkeypatch.setattr(burnin, "Ocr", lambda model_dir: sm.det)
     monkeypatch.setattr(burnin.lid, "speech", lambda path, idx, cache, gate=None, queue=None, job=None: {"spans": spans, "cached": True})
     return sm
 
@@ -373,6 +488,55 @@ def test_full_yields_inside_the_sampling(monkeypatch):
     monkeypatch.setattr(burnin.lid, "waits", lambda gate, queue, job: (gate, queue, job) == ("g", "q", ("j", 4, 2)))
     assert burnin.full("f.mkv", 0, 1200.0, gate="g", queue="q", job=("j", 4, 2)) == {"yielded": True, "took": pytest.approx(0, abs=5)} and sm.closed
     assert burnin.full("f.mkv", 0, 1200.0)["label"] == "none"
+
+
+def in_speech(t):
+    return any(a <= t <= b for a, b in SPANS)
+
+
+def test_full_drops_scene_text_in_each_pass_on_its_own_frames(monkeypatch):
+    """A nameplate in every fourth stretch of speech makes partial. Each pass reads the lines of its own frames and drops
+    it, so both are none. The result keeps the 5 keys with the most occasions."""
+    sm = fake_full(monkeypatch, SPANS, burned=lambda t: in_speech(t) and t // 8 % 4 == 0, said=lambda t: "NADIA")
+    monkeypatch.setattr(burnin, "scene_text", lambda ocr, frames, real=burnin.scene_text: real(ocr, frames))
+    before = burnin.verdict
+    labels = []
+    monkeypatch.setattr(burnin, "verdict", lambda frames, dur: labels.append(before(frames, dur)["label"]) or before(frames, dur))
+    first = burnin.full("f.mkv", 0, 1200.0)
+    one = {t for t, _ in sm.det.reads}
+    second = burnin.full("f.mkv", 0, 1200.0, second=True)
+    two = {t for t, _ in sm.det.reads} - one
+    assert labels == ["partial", "none"] * 2 and (first["label"], second["label"]) == ("none", "none"), (labels, first, second)
+    assert list(first["scene_text"]) == list(second["scene_text"]) == ["nadia"] and first["scene_text"]["nadia"] >= 3
+    assert one and two and all(t % 2 == 0 for t in one) and not any(t % 2 == 0 for t in two)   # keyframes, then frames between
+    names = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHOES", "FOXTROT", "GOLFER"]
+    sm = fake_full(monkeypatch, SPANS, burned=in_speech, said=lambda t: names[int(t // 8) % 7])
+    found = []
+    monkeypatch.setattr(burnin, "scene_text", lambda ocr, frames, real=burnin.scene_text: found.append(real(ocr, frames)) or found[-1])
+    r = burnin.full("f.mkv", 0, 1200.0)
+    assert len(found[0]) == 7 and r["scene_text"] == dict(sorted(found[0].items(), key=lambda x: -x[1])[:5]), (found, r)
+
+
+def test_the_rule_runs_under_the_speech_floor(monkeypatch):
+    """Three short stretches of speech hold 3 speech frames, so the label is unsure. Their verdict is partial, so the
+    rule still runs and the shares leave out the nameplate."""
+    spans = [[100.0, 104.0], [300.0, 304.0], [500.0, 504.0]]
+    fake_full(monkeypatch, spans, burned=lambda t: any(a <= t <= b for a, b in spans), said=lambda t: "NADIA")
+    r = burnin.full("f.mkv", 0, 1200.0)
+    assert (r["label"], r["speech_frames"], r["speech_share"], r["scene_text"]) == ("unsure", 3, 0.0, {"nadia": 3}), r
+
+
+def test_full_reads_each_line_once_and_a_file_with_none_reads_only_for_the_language(monkeypatch):
+    """The rule reads every line of a full file once, and language() takes those reads. A file with lines in speech
+    and silence alike has no lift, so it is none. Its rule reads nothing, and language() reads 10 frames."""
+    sm = fake_full(monkeypatch, SPANS, burned=in_speech)
+    r = burnin.full("f.mkv", 0, 1200.0)
+    assert (r["label"], r["english"], r["scene_text"], r["lines"]) == ("full", True, {}, burnin.LIMITS["rec_frames"]), r
+    assert len(sm.det.reads) == len(set(sm.det.reads)) == 2 * burnin.N   # each speech line once in each recognizer
+    sm = fake_full(monkeypatch, SPANS, burned=lambda t: t // 8 % 2 == 0)
+    r = burnin.full("f.mkv", 0, 1200.0)
+    assert (r["label"], r["scene_text"], r["lines"]) == ("none", {}, burnin.LIMITS["rec_frames"]) and r["silence_share"] > 0.4, r
+    assert len(sm.det.reads) == 2 * burnin.LIMITS["rec_frames"]
 
 
 def fake_quick(monkeypatch, speech, burned=lambda t: False, hdr=False, cueless=False):

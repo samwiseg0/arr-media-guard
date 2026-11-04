@@ -235,6 +235,11 @@ check. The full check finds the speech in the whole audio, runs a text detector 
 quiet parts, and reads the language of the lines. HDR video always gets the full check, because the quick check misses
 text on it. So does an MKV file without cues, its seek index, because the quick check cannot seek in it fast.
 
+Text that comes back on 3 or more occasions, such as a nameplate or a sign on a show's set, is no subtitle. An occasion
+is a run of frames with the same text, each at most 20 seconds after the one before. A subtitle line shows for a few
+seconds, so it makes one occasion. The full check reads all of the text only when it finds a burn-in. The rule can
+only take a burn-in away.
+
 - **A second look.** When AMG finds a full burn-in and can read its language, it checks again on different frames. If
   the second check disagrees, or cannot tell, AMG changes nothing and the alert says the problem was not confirmed.
 - **English subtitles over audio in another language.** AMG turns off the default and forced flags of every English

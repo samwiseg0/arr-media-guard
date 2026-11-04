@@ -1,0 +1,15 @@
+# Dependabot opens pull requests for the actions of the workflows each week. For the lock file of the language
+# detection venv, arr_lid.requirements.txt, it opens only security updates. The lock file keeps exact pins, and a bump
+# is a deliberate change, see the comment at its top. A limit of 0 turns off version updates, and security updates
+# have a limit of their own.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

@@ -3747,6 +3747,21 @@ heard never turns subtitles off. When the first pass finds a full burn-in and re
 on what `fix` would act on. When an import arrives during the second pass, the job keeps the first pass in the queue,
 and its next run makes only the second.
 
+**Scene text.** Text in the picture can sit where subtitles sit, such as a nameplate or a sign on a show's set. When
+the verdict of a pass is full or partial, `burnin.scene_text()` reads every subtitle line of that pass's frames, in
+speech and in silence. The Chinese recognizer reads first, and the English one reads a mostly Latin line again, as for
+the language. A read with a mean character probability under `rec_conf` (0.6) gives no key. The key of a line is its
+letters in lower case, with no spaces, punctuation or digits. A CJK character counts as one letter. An *occasion* of a
+key is a run of its frames in time order, each at most 20 seconds after the one before. A key of 4 or more letters on 3
+or more occasions is scene text. Its lines stop counting, and the verdict is taken again. A real subtitle line shows
+for a few seconds, so its frames make one occasion. The count of lines in a band stays the count before the drop, so a
+band of credits stays out. The rule only removes hits, so it never adds a label, and a pass whose verdict is none
+reads no more lines. The language takes its reads from the same lines. The result keeps up to 5 dropped keys and their
+occasions in `scene_text`, and the decision line keeps the result. Each pass applies the rule to its own frames. The
+quick check has no recognizer and does not use it. A study on 44 real burn-ins and 114 files without one set the
+numbers. Real lines reached at most 2 occasions there, a game show's nameplates 6 to 9 and its set sign 3 to 4. The
+rule lost no real burn-in and added no label.
+
 | Verdict | At `check` | At `fix` |
 | --- | --- | --- |
 | none, partial or unsure | log | log |

@@ -4,9 +4,11 @@
 FROM debian:trixie-slim
 
 # ffmpeg comes from Debian 13. mkvtoolnix.sh installs mkvtoolnix at its pinned version from MKVToolNix's own repository,
-# and checks the repository's key by its fingerprint. The test workflow runs the same script.
+# and checks the repository's key by its fingerprint. The test workflow runs the same script. The upgrade installs
+# Debian's newest fixes of the base image's own packages, such as apt, which a base image can lack.
 COPY docker/mkvtoolnix.sh /tmp/
 RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         python3 python3-venv ffmpeg logrotate tzdata tini \
     && sh /tmp/mkvtoolnix.sh \
