@@ -1328,9 +1328,10 @@ def audit(argv):
             say("warning", apps.no_key(app, ex) or f"{app.capitalize()} is not set up, so the audit prunes no kept folder under its root folders.")
         except Exception as ex:
             say("warning", config.mask(f"kept folders under the root folders not pruned: {type(ex).__name__}: {ex}")[:200])
-        for root in sorted(roots):
+        for root in sorted(roots):   # the kept folders of every app, so the first audit of the night prunes them all
             gone = vault.prune_originals(root)
-            if gone: say("audit", f"removed {len(gone)} kept folders older than {config.CFG.keep_days} days under {root}")
+            text = f"removed {len(gone)} kept folder{'' if len(gone) == 1 else 's'} older than {config.CFG.keep_days} days under {root}"
+            if gone: print(f"arr-media-guard: - audit: {text}" if config.SERVE else text)   # names no app, as serve.note() does without one
         with contextlib.suppress(sqlite3.Error):   # a busy store shrinks the next night
             store.shrink()
         runner.queue_rechecks()   # on a host the first nightly audit of a new version queues its rechecks

@@ -1563,6 +1563,19 @@ def test_an_alert_with_both_stage_fields_fits_the_embed_limit(monkeypatch):
         (e,) = h.render(long, "embed")
         assert size(e) <= limit and e["fields"][:2] == [{"name": "Check", "value": "Deep analysis", "inline": True},
                                                         {"name": "Stopped at", "value": "Writing the file", "inline": True}]
+        assert all(f["value"].endswith("…") for f in e["fields"][2:]), e["fields"]
+
+
+def test_a_cut_description_ends_at_a_whole_line_with_an_ellipsis():
+    """Arc's Jumper (2008) alert, 2026-11-05: 20 subtitle tracks out of sync ran past 2000 characters, and the cut fell
+    inside a bold span. The cut keeps whole lines and says "…". One long line is cut at a word with its bold closed."""
+    text = " ".join(f"The {h.bold(f'Track{n} subtitles (track {n})')} are out of sync by different amounts, "
+                    f"{h.bold('between 4.9 s late and 7.1 s early')}. One shift can't fix that, so they were left as they are." for n in range(20))
+    desc = h.embed("radarr", "Subtitles out of sync", text, "amber", [], footer="x")["description"]
+    assert len(desc) <= 2000 and desc.endswith(".\n…") and all(x.count("**") % 2 == 0 for x in desc.splitlines()), desc
+    line = h.clipped(h.markdown(h.bold("between 4.9 s late " * 20)), 50)
+    assert len(line) <= 50 and line.endswith("late**…") and line.count("**") == 2, line
+    assert not h.clipped(h.escaped("_" * 600), 100).endswith("\\…")   # a cut escape leaves no lone backslash
 
 
 def test_a_change_post_names_no_check_and_no_step(sent, settings):

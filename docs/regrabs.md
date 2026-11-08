@@ -145,7 +145,8 @@ and network mounts do, it keeps a copy instead.
 ### How long they stay
 
 The nightly audit and the worker's daily clean-up remove the kept originals and the `KEEP_REPLACED` copies older than
-`KEEP_ORIGINALS_DAYS`. They do this in every folder AMG kept a file in, also one below a root folder.
+`KEEP_ORIGINALS_DAYS`. They do this in every folder AMG kept a file in, also one below a root folder. The first audit
+of the night clears the folders of every app, so its container log line names no app.
 
 - `0` keeps nothing new.
 - At `0` a clean-up removes every `KEEP_REPLACED` copy, and leaves the originals already kept.

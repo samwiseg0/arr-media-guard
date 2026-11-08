@@ -2991,7 +2991,7 @@ def test_a_maximal_embed_stays_under_discords_limit(env):
     long = "x" * 5000
     e = hook.embed("radarr", long, long, "red", [("Title", long), ("File", long), ("Action", long), ("App", long)])
     total = len(e["title"]) + len(e["description"]) + len(e["footer"]["text"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])
-    assert total <= 6000 and len(e["description"]) == 2000 and len(e["title"]) == 256 and len(e["fields"]) == 4
+    assert total <= 6000 and len(e["description"]) <= 2000 and e["description"].endswith("…") and len(e["title"]) == 256 and len(e["fields"]) == 4
     assert all(len(f["value"]) <= 1024 for f in e["fields"])
 
 
@@ -9762,8 +9762,8 @@ def test_a_grab_leaves_the_prune_to_the_audit_and_a_record_stays_while_its_link_
 @pytest.mark.parametrize("days, serve", [(7, False), (0, False), (7, True)])
 def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, settings, tmp_path, capsys, days, serve):
     """With KEEP_ORIGINALS_DAYS set to 0 after use, the audit removes every grab link folder, so no link stays for ever.
-    It leaves the originals at 0, as every release before 1.7.0 did. Under the listener, the line names the app, because
-    four apps share one container log."""
+    It leaves the originals at 0, as every release before 1.7.0 did. Under the listener, the line names no app, because
+    the prune covers the kept folders of every app."""
     monkeypatch.setattr(hook, "SERVE", serve)
     root = keep_on(monkeypatch, tmp_path)
     settings(keep_days=days)
@@ -9776,8 +9776,8 @@ def test_the_nightly_audit_prunes_the_grab_links_too(env, monkeypatch, settings,
     hook.main(["--audit", "radarr", "--since", "24h"])
     left = [] if days == 0 else stamps[1:]
     assert keep_names(root) == left and sorted(keep_names(tmp_path / "media" / hook.CFG.keep_dir)) == (stamps if days == 0 else left)
-    line = f"removed {2 - len(left)} kept folders older than {days} days under {root}"
-    assert (f"arr-media-guard: radarr audit: {line}" if serve else line) in capsys.readouterr().out.splitlines()
+    line = f"removed {2 - len(left)} kept folder{'s' if days == 0 else ''} older than {days} days under {root}"
+    assert (f"arr-media-guard: - audit: {line}" if serve else line) in capsys.readouterr().out.splitlines()
 
 
 def show_mount(monkeypatch, tmp_path):

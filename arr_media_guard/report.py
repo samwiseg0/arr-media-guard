@@ -83,6 +83,19 @@ def markdown(text):
     return escaped(text).replace(B, "**").replace(E, "**").replace(GLUE, " ")
 
 
+def clipped(text, n):
+    """The markdown text of markdown() or escaped() in n characters at most. A longer text keeps its whole lines that
+    fit and ends with a line "…". A first line that does not fit is cut at a word, with "…" after it and its open bold
+    span closed."""
+    if len(text) <= n:
+        return text
+    head = text[:max(0, n - 3)]   # room for a closing ** and the "…"
+    if "\n" in head:
+        return head.rsplit("\n", 1)[0] + "\n…"
+    head = (head.rsplit(" ", 1)[0] if " " in head else head).rstrip(" ,;:\\")   # a cut escape leaves a lone backslash
+    return head + "**" * (head.count("**") % 2) + "…"
+
+
 def sentences(xs):
     """Phrases as sentences, each one capitalised and ended with a full stop."""
     return " ".join(f"{cap(x)}." for x in xs)
