@@ -780,7 +780,7 @@ def test_a_conversion_a_held_alert_names_posts_once(sent, settings):
     """A sidecar that did not match the audio at the conversion to MKV stayed beside the file, and its held alert names
     the conversion. So the import posts no conversion change. When the deep analysis checks the sidecar again, the
     conversion posts as a change. When nothing checks it, the held alert posts and names the conversion itself."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     side = {"kind": "submatch", "lines": [{"code": "converted_sidecar", "name": "Film A.en.srt", "why": "x", "kept": None,
                                           "left": "the folder is read-only"}]}
     rec, held = decision(outcome="no_change", result="no change", edits=[], findings=[side], container="MP4/QuickTime",
@@ -810,7 +810,7 @@ def test_a_held_alert_that_goes_unposted_still_posts_the_fix_of_the_import_in_al
     """The import removed a track and left a sidecar that does not match. Their one alert waits for the deep analysis,
     which checks again and posts in its place. all mode still posts the removal, as the change the import made. issues
     mode posts nothing. When nothing checks again, the whole alert posts, and it names the removal itself."""
-    settings(discord_posts=posts)
+    settings(notification_posts=h.post_names(posts))
     rec, held = decision(outcome="no_change", result="no change", edits=[], findings=[MIXED], subremux={
         "done": True, "removed": ["s1"], "kept": "/k/Film A.mkv", "tracks_before": [{"i": "s1", "lang": "fre"}]}), []
     assert h.alert_findings(rec, 7, held) == [h.HOLD_RESULT] and sent == []
@@ -855,7 +855,7 @@ def post_all(monkeypatch):
     """alert_findings() of each golden in a record of its own, with each post faked. A re-grab decides for the other
     findings of its record, so each golden needs its own. Returns (what each finding gave, the titles posted)."""
     sent = []
-    monkeypatch.setattr(h, "post", lambda app, emb: sent.append(emb["title"]) or "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: sent.append(emb["title"]) or "sent")
     monkeypatch.setattr(h.store, "add", lambda *a: True)   # no marker from an earlier post
     tracks = [{"i": k, "lang": v} for k, v in LANGS.items()]
     return [h.alert_findings(dict(decision(), tracks=tracks, findings=[f]), 1)[0] for *_, f in every_alert()], sent
@@ -901,7 +901,7 @@ CHANGED = dict(
     after=[{"sel": "track:=1", "pos": "a1", "lang": "jpn", "default": True}, {"sel": "track:=2", "pos": "a2", "lang": "eng", "default": False},
            {"sel": "track:=3", "pos": "s1", "lang": "eng", "default": True}, {"sel": "track:=5", "pos": "s2", "lang": "spa", "default": False}],
     findings=[{"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "kept": "/k/Film A.mkv"}]}])
-CHANGE_POSTS = [  # (title, color, description) of each post of CHANGED with DISCORD_POSTS all
+CHANGE_POSTS = [  # (title, color, description) of each post of CHANGED with NOTIFICATION_POSTS all
     ("Wrong subtitles", "amber", "The **French subtitles (track 1 of the original file)** don't match what's said in the audio. Removed them and "
      "kept the original file at /k/Film A.mkv."),
     ("Converted to MKV", "green", "Converted the MP4/QuickTime file to MKV.\nIts video and audio stayed the same.\nThe original file is kept "
@@ -930,23 +930,23 @@ def described(sent):
 def sent(monkeypatch):
     """The embeds that post() would send. No marker of an earlier post stops one."""
     out = []
-    monkeypatch.setattr(h, "post", lambda app, emb: out.append(emb) or "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: out.append(emb) or "sent")
     monkeypatch.setattr(h.store, "add", lambda *a: True)
     return out
 
 
-def test_discord_posts_issues_posts_nothing_for_a_change(sent):
+def test_notification_posts_issues_posts_nothing_for_a_change(sent):
     """The default, issues: a run that changed its file in every way and fixed its problems posts nothing."""
-    assert h.CFG.discord_posts == "issues"
+    assert h.CFG.notification_posts == h.post_names("issues")
     got, rec = changed()
     assert got == ["log only"] and sent == [] and "change_result" not in rec
 
 
-def test_discord_posts_all_posts_one_per_change_and_nothing_for_no_change(sent, settings):
+def test_notification_posts_all_posts_one_per_change_and_nothing_for_no_change(sent, settings):
     """all: one post for each change, in the words of the issue posts. A fix that the issue gate logs only keeps its
     alert. A change no finding words posts in green. Every post names a track by its place in the file after the run.
     A clean check, a dry run and an issue alone post no change."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     got, rec = changed()
     assert got == ["log only"] and rec["change_result"] == ["sent"] * len(CHANGE_POSTS)
     assert [(e["title"], e["color"], e["description"]) for e in sent] == [(t, h.COLORS[c], d) for t, c, d in CHANGE_POSTS]
@@ -963,9 +963,9 @@ def test_discord_posts_all_posts_one_per_change_and_nothing_for_no_change(sent, 
 
 def test_the_unreadable_subtitles_notice_names_each_track_and_its_file(sent, settings):
     """One notice for a conversion that took out broken tracks: each track by its number in the original file, as a
-    player names it, with the file that holds its bytes, and the kept original. With DISCORD_POSTS all it is the only
+    player names it, with the file that holds its bytes, and the kept original. With NOTIFICATION_POSTS all it is the only
     post of the conversion."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     side = lambda n: {"lang": "per", "sidecar": f"/m/Film A (1979).per.{n}.broken-encoding.srt.txt", "role": "forced" if n == 4 else "full", "name": "",
                       "sdh": False, "forced": n == 4}
     f = {"kind": "unreadable", "container": "MP4/QuickTime", "kept": "/k/Film A.mp4", "tracks": {"s4": side(4), "s2": side(2)}}
@@ -977,9 +977,231 @@ def test_the_unreadable_subtitles_notice_names_each_track_and_its_file(sent, set
     assert h.render(rec, "log")["alerts"] == ["unreadable: " + h.unmarked(h.texts(f, "done")[0])]
 
 
+@pytest.fixture
+def wired(monkeypatch, settings):
+    """The titles that reach Discord through the real gate of logs.post(), and the alert markers in the store."""
+    out, marks = [], set()
+    settings(discord_webhook=HOOK)
+    monkeypatch.setattr(h, "QUIET_UNTIL", 0.0)
+    monkeypatch.setattr(h, "http", lambda url, method="GET", body=None, headers=None, timeout=15: out.extend(e["title"] for e in body["embeds"]))
+    monkeypatch.setattr(h.store, "add", lambda ns, key: key not in marks and not marks.add(key))
+    monkeypatch.setattr(h.store, "drop", lambda ns, key: marks.discard(key))
+    return out, marks
+
+
+def test_a_list_of_names_posts_only_those_and_drops_the_left_out_sentences(wired, settings):
+    """The tester's case: everything but the default and Original language flag sentences. The Tracks changed post that
+    also holds a forced flag edit and a language tag edit keeps those two sentences, and its title names only them. A
+    change whose name is left out is never built, so change_result has no entry for it."""
+    sent, _ = wired
+    edits = CHANGED["edits"] + [["track:=1", 1, None, "flag-original"]]
+    settings(notification_posts=h.post_names("all") - {"default", "original"})
+    got, rec = changed(edits=edits)
+    assert got == ["log only"] and rec["change_result"] == ["sent"] * 5
+    assert sent == [t for t, c, d in CHANGE_POSTS[:-1]] + ["Forced flag and language tag changed"]
+    tracks = [e for e in h.render(rec, "changes") if e[1]["title"].endswith("changed")]
+    assert [(n, e["description"]) for n, e in tracks] == [(("default", "forced", "original", "commentary", "tag"),
+        "Turned the forced flag off for the **Spanish subtitles (track 2)**. Tagged the **audio (track 1)** as **Japanese**.")]
+    sent.clear()
+    settings(notification_posts=h.post_names("issues, retime, subremoved"))
+    got, rec = changed(edits=edits)
+    assert got == ["log only"] and rec["change_result"] == ["sent"] * 2 and sent == ["Wrong subtitles", "Subtitles retimed"]
+    sent.clear()
+    settings(notification_posts=h.post_names("issues, original"))
+    got, rec = changed(edits=edits)
+    assert rec["change_result"] == ["sent"] and sent == ["Original language flag changed"]
+    sent.clear()
+    settings(notification_posts=h.post_names("issues, default"))
+    got, rec = changed(edits=[e for e in edits if h.decide.prop(e) == "flag-original"])
+    assert rec["change_result"] == [] and sent == []   # no sentence left, so no post
+
+
+def test_a_left_out_re_grab_posts_nothing_and_its_result_says_why(wired, settings):
+    """A re-grab has its own name, regrab, and any post can be left out. The decision line's alert_result says why it
+    did not post. A finding kind that is listed still posts, and a re-grab never rides on its kind."""
+    sent, marks = wired
+    settings(notification_posts=h.post_names("all") - {"regrab"})
+    got, rec = changed(outcome="wrong_content", result="wrong content: x", edit_result="edited", findings=[REGRAB, LANGUAGE, *CHANGED["findings"]])
+    assert got == ["left out by NOTIFICATION_POSTS", "log only", "log only"] and sent == [] and rec["change_result"] == [] and not marks
+    settings(notification_posts=h.post_names("regrab"))
+    assert changed(findings=[REGRAB])[0] == ["sent"] and sent == ["Wrong content, re-grabbed"]
+    assert [h.post("radarr", n, {"title": n}) for n in ("audit", ("default", "forced"))] == ["left out by NOTIFICATION_POSTS"] * 2 and len(sent) == 1
+    assert changed(findings=[dict(REGRAB, action={"code": "would_regrab", "kind": "content"}), RUNTIME])[0] == ["left out by NOTIFICATION_POSTS"] * 2
+
+
+@pytest.mark.parametrize("action, title", [({"code": "deleted"}, "Wrong content"), (dict(NOTHING_BACK, code="restored"), "Wrong content")])
+def test_every_alert_whose_action_deleted_the_file_is_a_regrab(wired, settings, action, title):
+    """Owner 2026-11-08: regrab covers every alert whose action deleted the file. That is also an item that is not
+    monitored, so no search started, and a manual import whose old file did not come back. A manual import whose old
+    file came back is the fix restored, which only all holds."""
+    sent, _ = wired
+    f, off = dict(REGRAB, action=action), "left out by NOTIFICATION_POSTS"
+    for names, want in ((h.post_names("all") - {"regrab"}, off), (h.post_names("content"), off), (h.post_names("regrab"), "sent")):
+        settings(notification_posts=names)
+        assert changed(findings=[f])[0] == [want]
+    assert h.post_name(f) == "regrab" and sent == [title]
+    came = dict(REGRAB, action=dict(RESTORED, code="restored"))
+    settings(notification_posts=h.post_names("regrab, convert"))   # a change name, so the change posts are built
+    got, rec = changed(findings=[came])
+    assert got == ["log only"] and len(sent) == 1 and rec["change_result"] == []   # restored is not listed
+    settings(notification_posts=h.post_names("restored"))
+    got, rec = changed(findings=[came])
+    assert got == ["log only"] and rec["change_result"] == ["sent"] and sent[1:] == ["Wrong content, old file restored"]
+
+
+def test_a_left_out_alert_writes_no_marker_so_the_next_one_posts_once_listed(wired, settings, monkeypatch):
+    """logs.alert() checks the name before it claims the marker of the file, kind and size. A user who adds the name
+    later sees the next alert of that file, and then once only."""
+    sent, marks = wired
+    settings(notification_posts=h.post_names("audio, scan"))
+    with monkeypatch.context() as m:
+        m.setattr(h.store, "add", lambda ns, key: pytest.fail("a left-out alert claimed a marker"))
+        assert h.alert("radarr", "language", "language", "/m/Film A.mkv", 7, {"title": "Wrong audio language"}) == "left out by NOTIFICATION_POSTS"
+    assert not marks and sent == []
+    settings(notification_posts=h.post_names("issues"))
+    assert [h.alert("radarr", "language", "language", "/m/Film A.mkv", 7, {"title": "Wrong audio language"}) for _ in "ab"] == ["sent", "already sent"]
+    assert len(marks) == 1 and sent == ["Wrong audio language"]
+
+
+def test_a_left_out_deep_kind_is_never_held_and_its_flags_post_as_a_change(wired, settings):
+    """An import holds a subtitle alert for the deep analysis. A left-out one is never held, so nothing posts it later.
+    It says nothing, so the Tracks changed post of the import names the forced flag it would have named."""
+    sent, _ = wired
+    f = {"kind": "submatch", "lines": [{"code": "stays", "track": "s2", "why": "x", "flags_off": True}]}
+    for names, result, title in ((h.post_names("all"), h.HOLD_RESULT, "Default tracks and language tag changed"),
+                                 (h.post_names("all") - {"submatch"}, "left out by NOTIFICATION_POSTS", CHANGE_POSTS[-1][0])):
+        settings(notification_posts=names)
+        held, rec = [], decision(**dict(CHANGED, findings=[f], repack={}, header_repair={}, subremux={}, whole={}, flash={}, subcheck={}))
+        assert h.alert_findings(rec, 1, held) == [result] and len(held) == (result == h.HOLD_RESULT) and sent == [title], sent
+        sent.clear()
+
+
+SIDE = {"lang": "per", "sidecar": "/m/Film A (1979).per.2.broken-encoding.srt.txt", "role": "full", "name": "", "sdh": False, "forced": False}
+# Per shape, the finding that names the conversion to MKV and its post name: an unreadable notice, a wrong sidecar the
+# conversion left out (an alert), and a subtitle track the conversion left out (a fix).
+CONVERTS = {"unreadable": ({"kind": "unreadable", "container": "MP4/QuickTime", "kept": "/k/Film A.mp4", "tracks": {"s2": SIDE}}, "unreadable"),
+            "sidecar": ({"kind": "submatch", "lines": [{"code": "converted_sidecar", "name": "Film A (1979).fr.srt", "why": "x",
+                                                        "left": "KEEP_ORIGINALS_DAYS is 0"}]}, "submatch"),
+            "leftout": ({"kind": "submatch", "lines": [{"code": "converted_track", "track": "s3", "why": "x", "kept": "/k/Film A.mp4"}]}, "subleftout")}
+
+
+@pytest.mark.parametrize("deep", [False, True])
+@pytest.mark.parametrize("shape", list(CONVERTS))
+def test_a_left_out_alert_or_fix_never_hides_the_conversion(wired, settings, shape, deep):
+    """Review 2026-11-08 (must-fix): an alert or a fix that names the conversion to MKV says it, so no "Converted to
+    MKV" post repeats it. A left-out one says nothing, so the conversion posts on its own, with a deep analysis after the
+    import or none. With every name listed, the conversion posts once, in the alert or the fix."""
+    sent, _ = wired
+    f, name = CONVERTS[shape]
+    for names, converted in ((h.post_names("all") - {name}, True), (h.post_names("convert"), True), (h.post_names("all"), False)):
+        settings(notification_posts=names)
+        held, rec = [] if deep else None, decision(**dict(CHANGED, findings=[f], header_repair={}, subremux={}, whole={}, flash={}, subcheck={}, edits=[]))
+        h.alert_findings(rec, 1, held)
+        assert ("Converted to MKV" in sent) == converted and len(sent) == (1 if converted or not (deep and shape == "sidecar") else 0), (names, sent)
+        assert not h.said(rec)["converted"] == converted
+        sent.clear()
+
+
+def test_a_fix_post_says_the_conversion_only_by_the_sentences_it_keeps(settings):
+    """Review 2026-11-08 (M42): a fix post that keeps its removed track and leaves out its track the conversion left out
+    names no conversion, so "Converted to MKV" posts on its own."""
+    fix = {"kind": "submatch", "lines": [{"code": "removed", "track": "s1", "why": "x", "kept": "/k/Film A.mkv"},
+                                         {"code": "converted_track", "track": "s2", "why": "x", "kept": "/k/Film A.avi"}]}
+    rec = decision(**dict(CHANGED, findings=[fix], header_repair={}, subremux={}, whole={}, flash={}, subcheck={}, edits=[]))
+    for names, converted in (("all", True), ("issues, subremoved, convert", False)):
+        settings(notification_posts=h.post_names(names))
+        assert h.said(rec)["converted"] == converted, names
+
+
+def test_the_deep_analysis_counts_only_a_wanted_alert_as_saying_a_flag(wired, settings):
+    """runner.held_after(): a posted alert of the deep analysis that names a flag edit says it, so the held change of
+    that flag posts nothing. A left-out alert says nothing, so the held change posts."""
+    sent, _ = wired
+    change = {"post": {"title": "Forced flag changed"}, "name": ["default", "forced"], "flags": ["s2"]}
+    job = {"app": "radarr", "path": "/m/Film A.mkv", "held": [{"kind": "submatch", "size": 1, "embed": {"title": "Wrong subtitles"}, "keys": ["s3"],
+                                                              "changes": [change]}]}
+    rec = decision(findings=[{"kind": "sublang", "muted": ["s2 x"], "track": "s2"}], subremux={"done": True, "fixed": ["s3"]})
+    settings(notification_posts=h.post_names("all"))
+    assert h.held_after(job, rec) == ["checked again, change said by the deep analysis"] and sent == []
+    settings(notification_posts=h.post_names("all") - {"sublang"})
+    assert h.held_after(job, rec) == ["checked again, change sent"] and sent == ["Forced flag changed"]
+
+
+def test_a_held_alert_keeps_only_the_wanted_changes_and_posts_them_by_their_names(wired, settings):
+    """The change posts a held alert says itself follow the names too: the conversion by convert, and each flag sentence
+    by default or forced. They post by those names when the held alert goes unposted, see logs.held_changes()."""
+    sent, _ = wired
+    lines = [{"code": "stays", "track": "s2", "why": "x", "flags_off": True}, CONVERTS["sidecar"][0]["lines"][0]]
+    rec = lambda: decision(**dict(CHANGED, findings=[{"kind": "submatch", "lines": lines}], header_repair={}, subremux={}, whole={}, flash={},
+                                  subcheck={}, edits=[["track:=5", 0, 1], ["track:=5", 0, 1, "flag-forced"]]))
+    titles = lambda held: [c["post"]["title"] for c in held[0]["changes"]]
+    for names, want in ((h.post_names("all"), ["Converted to MKV", "Default tracks and forced flag changed"]),
+                        (h.post_names("all") - {"convert", "forced"}, ["Default tracks changed"]),
+                        (h.post_names("all") - {"default"}, ["Converted to MKV", "Forced flag changed"])):
+        settings(notification_posts=names)
+        held = []
+        assert h.alert_findings(rec(), 1, held) == [h.HOLD_RESULT] and titles(held) == want and sent == []
+        assert h.held_changes("radarr", held, "checked again") == ["checked again, change " + ", ".join(["sent"] * len(want))] and sent == want
+        sent.clear()
+
+
+def test_a_held_change_saved_without_a_name_posts_when_any_change_name_is_listed(wired, settings):
+    """A deep analysis job that 2.20.1 queued holds changes with no name. Each posts when NOTIFICATION_POSTS lists any
+    name of config.CHANGES, and is left out when it lists none."""
+    sent, _ = wired
+    held = [{"kind": "submatch", "changes": [{"post": {"title": "Converted to MKV"}}]}]
+    settings(notification_posts=h.post_names("issues, retime"))
+    assert h.held_changes("radarr", held, "checked again") == ["checked again, change sent"] and sent == ["Converted to MKV"]
+    settings(notification_posts=h.post_names("issues"))
+    assert h.held_changes("radarr", held, "checked again") == ["checked again, change left out by NOTIFICATION_POSTS"] and len(sent) == 1
+
+
+def test_a_held_alert_posts_by_its_kind(wired, settings):
+    """post_held() posts a held subtitle alert by its kind, which is never regrab."""
+    sent, _ = wired
+    held = [{"kind": "submatch", "size": 1, "embed": {"title": "Wrong subtitles"}}, {"kind": "subtiming", "size": 1, "embed": {"title": "Subtitles out of sync"}}]
+    settings(notification_posts=h.post_names("submatch"))
+    assert h.post_held("radarr", "/m/Film A.mkv", held) == ["sent", "left out by NOTIFICATION_POSTS"] and sent == ["Wrong subtitles"]
+
+
+def test_a_language_tag_sentence_keeps_its_bcp_47_edit_when_only_tag_is_listed(settings):
+    """A LANG_IETF edit helps word the language tag sentence, so it has the name tag. With only tag listed, the
+    sentence still names the language the track had before, from both old tags."""
+    settings(notification_posts=h.post_names("tag"))
+    rec = decision(edits=[["track:=2", "en", "eng", "language"], ["track:=2", "en", "ja", "language-ietf"]], findings=[],
+                   after=[{"sel": "track:=2", "pos": "a1", "lang": "eng", "default": True}])
+    assert [(n, t, h.markdown(x)) for n, t, x in h.changes(rec)] == [(tuple(dict.fromkeys(h.EDIT_NAMES.values())), "Language tag changed",
+                                                                     "Changed the language of the **audio (track 1)** from Japanese to **English**.")]
+
+
+@pytest.mark.parametrize("line, name", [({"code": "sidecar", "name": "Film A (1979).fr.srt", "why": "x", "kept": "/k/Film A (1979).fr.srt"}, "submoved"),
+                                        ({"code": "converted_sidecar", "name": "Film A (1979).fr.srt", "why": "x", "to": "a.txt", "renamed": True}, "submoved"),
+                                        ({"code": "removed", "track": "s1", "why": "x", "kept": "/k/Film A.mkv"}, "subremoved"),
+                                        ({"code": "repaired", "tracks": ["s2"], "kept": "/k/Film A.mkv"}, "subrepaired")])
+def test_each_subtitle_fix_posts_by_its_own_name(wired, settings, line, name):
+    """A moved or renamed sidecar is submoved, a removed track subremoved and a repaired track subrepaired. A fix post
+    goes out when NOTIFICATION_POSTS lists the name of its sentence, and only then."""
+    sent, _ = wired
+    for names in (h.post_names(name), h.post_names("all") - {name}):
+        settings(notification_posts=names)
+        got, rec = changed(findings=[{"kind": "submatch", "lines": [line]}], repack={}, header_repair={}, subremux={}, whole={}, flash={},
+                           subcheck={}, edits=[])
+        assert got == ["log only"] and ("Wrong subtitles" in sent) == (name in names), (names, sent)
+        sent.clear()
+
+
+def test_a_post_name_the_code_does_not_know_raises():
+    """config.wanted() raises for a name that config.POSTS lacks, so a wrong name in the code fails in the first test
+    that reaches it. A group name is no post name."""
+    for bad in ("", "AUDIT", "issues", "all", "regrabs"):
+        with pytest.raises(ValueError, match="^no post name "):
+            h.post("radarr", bad, {"title": "x"})
+    assert h.wanted("restored") is False and h.wanted(("restored", "language")) is True
+
+
 def test_after_a_re_grab_only_the_re_grab_posts(sent, settings):
     """The re-grab deleted the file, so its other changes are gone too. The re-grab posts its alert, and no change posts."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     got, rec = changed(outcome="wrong_content", result="wrong content: x", edit_result="edited", findings=[REGRAB, LANGUAGE, *CHANGED["findings"]])
     assert got == ["sent", "log only", "log only"] and [e["title"] for e in sent] == ["Wrong content, re-grabbed"] and rec["change_result"] == []
     sent.clear()
@@ -993,7 +1215,7 @@ def test_each_re_grab_posts_also_when_the_next_copy_has_the_same_path_and_size(m
     land at the same path with the same size. The re-grab marker keys on the app's file id, else on the decision id. A
     repeat of one file id posts once, and every other alert still posts once per file, kind and size."""
     marks = set()
-    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: "sent")
     monkeypatch.setattr(h.store, "add", lambda ns, key: key not in marks and not marks.add(key))
     monkeypatch.setattr(h.store, "drop", lambda ns, key: marks.discard(key))
     got = lambda **kw: h.alert_findings(decision(**kw), 7)
@@ -1024,16 +1246,17 @@ def test_a_fix_an_alert_says_posts_once(sent, settings, kw, want):
     """A live caption alert says which lines moved, and so does an alert of moved parts with lines still off. A stays or
     a language alert says which flags went off, and a track a conversion left out names the conversion. Their change
     posts would say it twice."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     changed(**dict(dict(repack={}, header_repair={}), **kw))
     assert [e["title"] for e in sent] == want, described(sent)
 
 
 def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
     """A fix of the speech layout that moves only the lines that agree with it, see subsync.layout_fix()."""
+    settings(notification_posts=h.post_names("all"))
     rec = decision(edits=[], findings=[], subremux={"done": True, "fixed": ["s3"], "kept": "/k/F.mkv", "tracks_before": [{"i": "s3", "lang": "fre"}]},
                    subtime={"s3": {"verdict": "fit", "timing": {"fix": {"offset": 4.2, "rate": "1/1"}, "keep": [[0.0, 50.0, 6]], "kept": 6}}})
-    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [("Subtitles retimed", (
+    assert [(t, h.markdown(x)) for _, t, x in h.changes(rec)] == [("Subtitles retimed", (
         "The **French subtitles (track 3)** were **about 4.2 s late**.\nRetimed them to match the speech.\nKept the times of 6 lines at the start "
         "or end.\nThe original file is kept at /k/F.mkv."))]
 
@@ -1057,27 +1280,30 @@ def test_a_partial_shift_says_how_many_lines_kept_their_times(sent, settings):
     ([["track:=2", 1, None, "flag-original"], ["track:=4", 0, 1, "flag-original"]], "eng",
      ("Original language flags changed", "Marked the **English audio (track 1)** as the original language. Marked the **English subtitles "
                                          "(track 1)** as not the original language."))])
-def test_a_track_edit_says_each_kind_it_made_and_only_those(edits, after, want):
+def test_a_track_edit_says_each_kind_it_made_and_only_those(settings, edits, after, want):
     """A language tag edit alone is no change of the default tracks. The title follows the kinds of edit. A language tag
     edit names the language the track had before it, from its two old tags, see decide.track_tag(). So eng/ja had
     Japanese and eng/unk had none."""
+    settings(notification_posts=h.post_names("all"))
     rec = decision(edits=edits, findings=[], after=[{"sel": "track:=2", "pos": "a1", "lang": after, "default": True},
                                                     {"sel": "track:=4", "pos": "s1", "lang": "eng", "default": False}])
-    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [want]
+    assert [(t, h.markdown(x)) for _, t, x in h.changes(rec)] == [want]
 
 
-def test_a_repair_that_removes_and_trims_says_both():
+def test_a_repair_that_removes_and_trims_says_both(settings):
+    settings(notification_posts=h.post_names("all"))
     rec = decision(edits=[], findings=[], header_repair={"code": "subtitle_removed", "removed": {"4": {}}, "trimmed": {"3": 4}})
-    assert h.changes(rec) == [("File repaired", "Removed the subtitles that kept going past the end of the video and audio. Cut the subtitle "
+    assert h.changes(rec) == [("repair", "File repaired", "Removed the subtitles that kept going past the end of the video and audio. Cut the subtitle "
                                                 "lines that kept going past the end of the video and audio.")]
 
 
-def test_a_cover_move_names_an_attachment_that_is_no_cover_art():
+def test_a_cover_move_names_an_attachment_that_is_no_cover_art(settings):
     """Only an attachment named cover is the file's cover art. Picture B came first and took cover.jpg, so the two
     tracks of picture A went into cover2.jpg, and the post names that attachment."""
+    settings(notification_posts=h.post_names("all"))
     rec = decision(edits=[], findings=[], subremux={"done": True, "covers": ["v2", "v3", "v4"], "copies": ["v4"]},
                    covers={"v2": {"name": "cover.jpg"}, "v3": {"name": "cover2.jpg"}, "v4": {"name": "cover2.jpg", "copy": True}})
-    assert [(t, h.markdown(x)) for t, x in h.changes(rec)] == [
+    assert [(t, h.markdown(x)) for _, t, x in h.changes(rec)] == [
         ("File repaired", "Moved the cover picture out of **video track 2 of the original file** into the file's cover art.\nMoved the picture in "
                           "**video track 3 of the original file** into the attachment **cover2.jpg**.\nRemoved **video track 4 of the original "
                           "file**, which held the same picture as **cover2.jpg**.\nThe video and audio stayed the same.")]
@@ -1086,8 +1312,8 @@ def test_a_cover_move_names_an_attachment_that_is_no_cover_art():
 def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings):
     """The change posts follow the voice of the issue posts. A broken fact costs only its own change: it posts nothing,
     its line in change_result says why, and the other changes still post. It never costs the decision line."""
-    settings(discord_posts="all")
-    said = [h.unmarked(t + " " + x) for t, x in h.changes(decision(**CHANGED))] + [h.unmarked(t + " " + x) for t, x in h.REPAIRS.items()]
+    settings(notification_posts=h.post_names("all"))
+    said = [h.unmarked(t + " " + x) for _, t, x in h.changes(decision(**CHANGED))] + [h.unmarked(t + " " + x) for t, x in h.REPAIRS.items()]
     assert not [(s, INTERNAL.findall(s)) for s in said if INTERNAL.search(s)] and not [s for s in said if INSTRUCTION.search(s)]
     got, rec = changed(whole={"s3": {"moves": {0: {}}}})
     assert rec["change_result"] == ["sent"] * 3 + ["no text: Subtitles retimed: KeyError: 'why'", "sent"]
@@ -1100,7 +1326,7 @@ def test_a_change_post_says_no_internal_word_and_gives_no_advice(sent, settings)
 def test_a_time_limit_that_runs_out_in_the_change_texts_ends_the_job(sent, settings, monkeypatch):
     """The time limit ends the job. It runs out while the change posts render, so alert_findings() raises it, and the
     job's handler records the end."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     real = h.render
     def render(rec, target, tense=None):
         if target == "changes":
@@ -1140,12 +1366,12 @@ def test_a_post_waits_out_each_429_up_to_its_tries(monkeypatch, settings, tries,
     monkeypatch.setattr(h, "QUIET_UNTIL", 0.0)
     monkeypatch.setattr(h.time, "sleep", sleeps.append)
     monkeypatch.setattr(h.time, "monotonic", lambda: clock[0])
-    assert h.post("radarr", {"title": "x"}) == want and len(calls) == calls_n and sleeps == [wait] * sleeps_n
+    assert h.post("radarr", "language", {"title": "x"}) == want and len(calls) == calls_n and sleeps == [wait] * sleeps_n
     if want == "sent":
         return
-    assert h.post("radarr", {"title": "y"}) == f"skipped, Discord asked for no posts for {wait:.0f} s more" and len(calls) == calls_n
+    assert h.post("radarr", "language", {"title": "y"}) == f"skipped, Discord asked for no posts for {wait:.0f} s more" and len(calls) == calls_n
     clock[0] += wait
-    assert h.post("radarr", {"title": "z"}) == "sent" and len(calls) == calls_n + 1
+    assert h.post("radarr", "language", {"title": "z"}) == "sent" and len(calls) == calls_n + 1
 
 
 def test_an_overrun_alert_after_a_strip_names_the_track_that_runs_over():
@@ -1219,7 +1445,7 @@ def test_a_fix_that_worked_logs_every_finding_of_its_file(monkeypatch, findings,
     wrong-content alert names each signal that scored. A language or runtime finding logs only beside it when it names
     that signal. The episode signal scores no points, so the episode finding posts. A language finding that only the
     track decision found posts too."""
-    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: "sent")
     monkeypatch.setattr(h.store, "add", lambda *a: True)
     assert h.alert_findings(decision(findings=findings), 1) == want
 
@@ -1235,7 +1461,7 @@ def test_a_fix_that_worked_logs_every_finding_of_its_file(monkeypatch, findings,
 def test_a_wrong_length_posts_once_and_only_when_no_repair_ran(monkeypatch, code, others, want):
     """One cause posts once. A wrong length in the file logs only when the repair fixed it, or when the alert of a failed
     repair, a cut file or a subtitle past the end already names its cause."""
-    monkeypatch.setattr(h, "post", lambda app, emb: "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: "sent")
     monkeypatch.setattr(h.store, "add", lambda *a: True)
     rec = decision(findings=[LENGTH, *others], **({"header_repair": {"code": code}} if code else {}))
     assert h.alert_findings(rec, 1) == want
@@ -1580,7 +1806,7 @@ def test_a_cut_description_ends_at_a_whole_line_with_an_ellipsis():
 
 def test_a_change_post_names_no_check_and_no_step(sent, settings):
     """Change posts stay as they were: the item field alone."""
-    settings(discord_posts="all")
+    settings(notification_posts=h.post_names("all"))
     changed()
     assert sent and all([f["name"] for f in e["fields"]] == ["Film A (1979)"] for e in sent)
 
@@ -1643,7 +1869,7 @@ def test_an_item_with_no_slug_alerts_as_before(monkeypatch, settings):
     """An error record, or an item whose app lookup failed, has no slug. Its alert has no link and still posts."""
     settings(radarr={"link": MOVIES})
     sent = []
-    monkeypatch.setattr(h, "post", lambda app, emb: sent.append(emb) or "sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: sent.append(emb) or "sent")
     monkeypatch.setattr(h.store, "add", lambda *a: True)
     for ids in (None, {}, {"slug": None}, {"slug": ""}):
         rec = decision(**({} if ids is None else {"ids": ids}), findings=[{"kind": "language", "want": "English", "has": ["por"]}])

@@ -118,7 +118,7 @@ RUNS = list(dict.fromkeys([(f"shape {k} {named(r)}", tuple(r), "ok") for k, r in
 def test_planted_lines(env, monkeypatch, settings, case, runs, mode):
     """An English film with the lines of runs off, through the import and its deep analysis (dry: a --sub-time dry
     run). The write succeeds, or fails (fail), and every change posts too (all)."""
-    settings(subtitles="deep", **({"discord_posts": "all"} if mode == "all" else {}))
+    settings(subtitles="deep", **({"notification_posts": hook.post_names("all")} if mode == "all" else {}))
     english_film(env, ("eng", False, {}))
     track = talk.cues(talk.RIGHT, where=plant(runs))
     hearing(env, monkeypatch, {"s1": track})

@@ -293,7 +293,7 @@ when a `header`, `cut` or `subtitle` finding of the file posts its cause. It pos
 caused posts nothing, and `alert_result` says `not posted, the run was stopped`, see `logs.stop_caused()`. That is a
 re-grab or a restore that the stop kept from its step, and a conversion whose remux it cut. A run that a stop ended
 before its alert step keeps its re-grabs and the unreadable notice of its conversion in the findings, see
-`process.stop_line()`. They post, because no later run finds them again. The change posts of `DISCORD_POSTS=all` go
+`process.stop_line()`. They post, because no later run finds them again. The change posts that `NOTIFICATION_POSTS` lists go
 out too. The decision line names the stop, and the next run of the file posts what it still finds. An alert whose text
 fails still posts, with its title and its file, and the sentence `report.UNTOLD` in place of the error. Its line in
 `alerts` keeps the error.
@@ -327,13 +327,32 @@ A sidecar whose new times do not fit its text says so in `left`, and keeps the e
 with `would`, carry that length as `duration`. A change post reads it from the record's `file_duration`. An offset under
 0.05 seconds reads "in sync", see `report.about()`.
 
-**Every change.** With `DISCORD_POSTS=all`, `logs.alert_findings()` also posts each change of the run, see
-`report.render()` target `changes`. A finding of `report.fixes()` that the gate logs only keeps its alert's words and
-color. A change that no finding words posts in green, see `report.changes()`. That is a conversion to MKV, a file
-repair, retimed subtitles or a track edit. A track edit says each kind it made: default flags, forced flags and
-language tags. One fix posts once. A change that a posted alert already says is left out, see `report.said()`: lines a
+**Post names.** Each post has one name, and `NOTIFICATION_POSTS` lists the names that go out, see
+`config.POSTS` and the README table. `config.settings()` reads the list once into a set and expands the groups `issues`
+and `all`. `all` is every name of the running release. `logs.post()` is the one gate. It takes the post name and gives
+`left out by NOTIFICATION_POSTS` for a name the set lacks, see `config.wanted()`. A name that `config.POSTS` lacks
+raises `ValueError`. An alert takes `report.post_name()`. That
+is `regrab` for an action of `report.DELETED`, which deleted the file, else its finding kind. So a deletion never rides
+on its kind. A restore whose old file came back is the fix `restored`. `logs.alert()` checks the name before it claims its marker, so a left-out alert writes none, and the next
+one posts once the name is listed. A left-out alert of `logs.DEEP_KINDS` is never held. `report.said()` and
+`runner.held_after()` count only a posted alert whose name is listed. `report.said()` counts the conversion to MKV
+also for a fix post that keeps a sentence that names it. So a left-out alert or fix never hides the "Converted to MKV"
+post. The decision line keeps the result in
+`alert_result`. A change post whose name is left out is never built, so `change_result` has no entry for it. An env
+file that still sets `DISCORD_POSTS`, the key before 2.21.0, gets a warning that names the new key, see
+`config.Settings.warnings`. The start check and `--selftest` print it, and `--selftest` passes. Its value is never
+read.
+
+**Every change.** When `NOTIFICATION_POSTS` lists a name of `config.CHANGES`, `logs.alert_findings()` also posts each
+change of the run whose name it lists, see `report.render()` target `changes`. A finding of `report.fixes()` that the
+gate logs only keeps its alert's words and color, with the sentences whose fix name is listed, see
+`report.wanted_fix()`. A change that no finding words posts in green, see `report.changes()`. That is a conversion to
+MKV, a file repair, retimed subtitles or a track edit. A track edit says each kind it made: default flags, forced flags,
+Original language flags, commentary flags and language tags. Each kind has its own name, see `report.EDIT_NAMES`. A
+kind that is left out drops from the post and from its title. One fix posts once. A change that a posted alert already says is left out, see `report.said()`: lines a
 live caption alert moved, lines an alert of moved parts counts, flags a `stays` or `sublang` alert turned off, and a
-conversion that a subtitle sentence names. After a re-grab deleted the file, only the re-grab posts, as in issues mode. A change whose text fails posts
+conversion that a subtitle sentence or the unreadable subtitles alert names. A fix post that keeps such a sentence
+names the conversion too. After a re-grab deleted the file, only the re-grab posts, as with `issues`. A change whose text fails posts
 nothing. Its line in `change_result` starts with `no text:`, and the other changes still post. These posts skip the
 marker, because a second run finds nothing left to change. `change_result` in the decision line keeps what each post
 gave.
@@ -359,15 +378,15 @@ job's finished remux or its sidecar step retimed, moved to its speech or took ou
 before an error, see `runner.remuxed()`. The remux takes out a track that does not match and a track it strips as
 garbled. The sidecar step moves away a sidecar that does not match and renames a garbled one. A stripped track and a
 renamed garbled sidecar post their unreadable notice. A removed track, a moved sidecar and a retime are fixes, so they
-post only as a change with `DISCORD_POSTS=all`, see `report.posts()`. A garbled track has no timing outcome, so before 2.19.2 its held alert posted the import's text, as
+post only as a change whose name `NOTIFICATION_POSTS` lists, see `report.posts()`. A garbled track has no timing outcome, so before 2.19.2 its held alert posted the import's text, as
 "rewriting the file failed", after the deep analysis had fixed the file. Longer ends and a repaired text settle
 nothing. Every other held alert posts through `logs.post_held()`, because nothing settled one of its subtitles. That
 is an error before the remux, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the
 run, or a third crash in `runner.requeue()`. Such a post keeps the import's text, which names the tracks by their
 numbers at the import, and each subtitle the alert named, also one the job settled.
-When the import cannot queue the job, its held alerts post at once. With
-`DISCORD_POSTS=all`, a held finding keeps the change posts of what it says itself as `changes`, see
-`report.held_posts()`. That is a fix of its logged lines, such as a removed track, a flag it says was turned off, and
+When the import cannot queue the job, its held alerts post at once. When
+`NOTIFICATION_POSTS` lists a name of `config.CHANGES`, a held finding keeps the change posts of what it says itself
+and whose names it lists as `changes`, see `report.held_posts()`. That is a fix of its logged lines, such as a removed track, a flag it says was turned off, and
 the conversion it names. `report.said()` leaves them out of the import's change posts. `logs.held_changes()` posts them
 when the held alert goes unposted. It skips a flag edit that a posted alert of the deep analysis says already, as when
 the deep analysis finds the same mismatch. A held alert that posts names the change itself. So each change posts once.
@@ -1110,8 +1129,8 @@ Then the job queues the burn-in job, the whole-file check and the deep analysis 
 whole-file check carry `check` in their grab fields, so they never re-grab either. A full backfill reads every file
 once more for the whole-file check. The deep analysis names the job in `from`,
 so it waits behind every job a backfill queued. A file whose saved deep analysis still holds gets
-none, see `subtitles.sub_cached()`. The alerts the job held for it count as checked again. With
-`DISCORD_POSTS=all` the changes they name still post. The import check keeps that saved result,
+none, see `subtitles.sub_cached()`. The alerts the job held for it count as checked again. The
+changes they name still post when `NOTIFICATION_POSTS` lists them. The import check keeps that saved result,
 because a result that asks for nothing never replaces a deeper one that still holds, see
 `subtitles.sub_cache()`. A flag edit that a hard link or a read-only file refuses asks for nothing.
 So such a file gets one deep analysis. `--drop-queued` drops the jobs a backfill queued, and the
@@ -1119,7 +1138,7 @@ jobs they queued stay.
 
 **The flag backfill.** A plan option runs the flag backfill, which fixes the default tracks and
 language tags. Its `--apply` posts the alerts as a job a backfill queued does, through
-`logs.alert_findings()`. A problem posts once per file, kind and size. With `DISCORD_POSTS=all` each change posts
+`logs.alert_findings()`. A problem posts once per file, kind and size. Each change that `NOTIFICATION_POSTS` lists posts
 too. A dry run posts nothing. It runs at nice 19 and idle I/O, with the hook's file lock
 for each file. It runs language detection, the metadata checks and the header check like the hook,
 but it never re-grabs. It reads each `.mkv` file's own tracks, because the app's stored media info goes stale. It
@@ -2326,7 +2345,7 @@ adds. It finds an attachment the file keeps by its UID, which mkvmerge keeps, an
 attachments may share a name, so `cover_tracks()` names an attachment by its id. `proof.prove()` matches every kept
 track packet for packet, and the tracks keep their properties and UIDs. Any fault keeps the original. A done move adds
 `cover_attached` to the reasons, and the app rescans the item. A remux that moved only covers logs "cover picture moved
-to an attachment", or "cover picture track removed as a copy" when each track was a copy. With `DISCORD_POSTS=all` the
+to an attachment", or "cover picture track removed as a copy" when each track was a copy. With `NOTIFICATION_POSTS=all` the
 "File repaired" post says it. It names the attachment a removed copy matched, and the attachment of a picture that is
 not the file's cover art, as `cover2.jpg`. Only an attachment named `cover` is the file's cover art.
 
@@ -2857,7 +2876,7 @@ starts with the conversion. A run posts one such alert, and it also says each re
 `subtitles.sub_findings()`. When a run converts the file and then takes out garbled tracks or renames sidecars, the
 alert names the conversion first, then the tracks taken out after it, see `process.after_edit()`. Such a track goes
 by its number in the original file when it came from one of the original's tracks, see `process.conversion()`. A
-track the conversion added, as a muxed sidecar, goes as track N of the converted file. It posts with `DISCORD_POSTS`
+track the conversion added, as a muxed sidecar, goes as track N of the converted file. It posts with `NOTIFICATION_POSTS`
 issues, from the deep analysis and a recheck too. With `all` it is the only post of a conversion and of the repairs.
 
 ## Subtitle match
@@ -3537,7 +3556,7 @@ says what moved and where lines are still off, and never that the lines were lef
 stretch from where to where, as "12 lines from 3:10 to 4:05". A stretch that runs to the last line reads "from 3:10
 on", and one that starts at the first line reads "from the start to 4:05". So the count and the times name the same
 lines, the unheard lines at a file end included. One stretch that holds every line reads as the whole subtitle off,
-never as "in parts". With `DISCORD_POSTS=all`, the count of moved lines is in the alert only. A failed write posts
+never as "in parts". With `NOTIFICATION_POSTS=all`, the count of moved lines is in the alert only. A failed write posts
 only its failure. A held import alert follows the outcome of the deep analysis, see "Alerts". It keeps the places its
 outcome left off, and the deep analysis drops it only after it heard each of them again (`judge.heard_again()`).
 
@@ -3806,7 +3825,7 @@ alert. When the store is too busy to record it, the decision line gets a note, a
 more. Text in any other language follows the normal rule above.
 
 **One alert.** The job posts one `burned_in` alert per file and size. A failed flag edit is part of that alert, never a
-separate "edit" alert. With `DISCORD_POSTS=all`, no change post repeats the flags the alert names.
+separate "edit" alert. With `NOTIFICATION_POSTS=all`, no change post repeats the flags the alert names.
 
 **Drops.** Each time the job takes the lock, it checks by the inode that the file is still the one its import checked.
 Like a deep analysis, it drops itself when the file is gone or replaced, and follows a move, see "How it runs". A queued

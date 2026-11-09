@@ -73,7 +73,7 @@ def test_two_writes_of_one_run_keep_one_original_and_both_posts_name_it(tmp_path
     REAL_RUN(["mkvmerge", "-q", "-o", str(path), "--language", "1:eng", str(d / "av.mkv"), "--language", "0:eng", "--default-track-flag", "0:0",
               str(d / "eng.srt"), "--language", "0:spa", "--default-track-flag", "0:0", str(d / "spa.srt"), "--language", "0:eng", "--track-name",
               "0:SDH", "--default-track-flag", "0:0", str(d / "late.srt")], check=True)
-    settings(log=str(tmp_path / "log.jsonl"), keep_days=7, subtitles="fix", header_repair=True, discord_posts="all")
+    settings(log=str(tmp_path / "log.jsonl"), keep_days=7, subtitles="fix", header_repair=True, notification_posts=hook.post_names("all"))
     monkeypatch.setattr(hook, "mount_top", lambda f: str(tmp_path / "lib"))
     monkeypatch.setattr(hook, "lid_ready", lambda: True)
     monkeypatch.setattr(hook, "hear", lambda *a, **k: ({}, {}))
@@ -93,7 +93,7 @@ def test_two_writes_of_one_run_keep_one_original_and_both_posts_name_it(tmp_path
     assert rec["header_repair"]["code"] == "subtitle_trimmed" and rec["subremux"]["done"], json.dumps(rec, default=str)[:2000]
     assert os.stat(kept).st_ino == imported.st_ino and rec["header_repair"]["kept"] == rec["subremux"]["kept"] == kept
     assert rec["subremux"]["kept_how"] == hook.KEPT_BEFORE and "kept_how" not in rec["header_repair"]
-    posts = dict(hook.changes(rec))
+    posts = {t: x for _, t, x in hook.changes(rec)}
     assert sorted(posts) == ["File repaired", "Subtitles retimed"] and all(f"The original file is kept at {kept}." in t for t in posts.values()), posts
 
 

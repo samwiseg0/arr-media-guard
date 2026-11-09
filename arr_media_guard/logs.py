@@ -145,14 +145,17 @@ POST_TRIES = 4   # tries of one post while Discord answers 429. Several job proc
 # from another limit, as after too many refused requests.
 POST_WAIT = 10
 QUIET_UNTIL = 0.0   # the time.monotonic() until which Discord asked this process for no posts, see post()
+OFF_RESULT = "left out by NOTIFICATION_POSTS"   # what post() gives for a post whose name NOTIFICATION_POSTS leaves out
 
 
-def post(app, emb):
-    """One embed to DISCORD_WEBHOOK, as the app ("Radarr <INSTANCE>"). A 429 waits retry_after and tries again, up to
-    POST_TRIES tries in all. A retry_after over POST_WAIT, or the last try, gives up. Every later post of this process
-    then skips until the time Discord named, and its result says so. A wait ends at the job's time limit, which
-    passes."""
+def post(app, name, emb):
+    """One embed to DISCORD_WEBHOOK, as the app ("Radarr <INSTANCE>"). This is the one gate of NOTIFICATION_POSTS. A post
+    whose name it leaves out sends nothing and gives OFF_RESULT, see config.wanted(). A 429 waits retry_after and tries
+    again, up to POST_TRIES tries in all. A retry_after over POST_WAIT, or the last try, gives up. Every later post of
+    this process then skips until the time Discord named, and its result says so. A wait ends at the job's time limit,
+    which passes."""
     global QUIET_UNTIL
+    if not config.wanted(name): return OFF_RESULT
     hook_url = config.CFG.discord_webhook
     if not hook_url: return "no webhook configured"
     if (left := QUIET_UNTIL - time.monotonic()) > 0:
@@ -190,7 +193,8 @@ def alert_findings(rec, size, held=None):
     report.named(), with the places its timing outcome left off as "spans", see report.named_spans(), and the places
     after the run of the tracks whose flags it says were turned off as "flags", see report.tells(). It gives
     HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
-    nothing judged those subtitles again, see runner.held_after(). With DISCORD_POSTS all, a held finding keeps the
+    nothing judged those subtitles again, see runner.held_after(). An alert whose name NOTIFICATION_POSTS leaves out is
+    never held, see report.post_name(). When NOTIFICATION_POSTS lists a name of config.CHANGES, a held finding keeps the
     change posts of what it says itself in "changes", see report.held_posts(): a removed track, a flag it says was
     turned off, and the conversion it names. The change posts of rec leave those out, see report.said(). held_changes()
     posts them when the held alert goes unposted, so each change posts once.
@@ -199,28 +203,28 @@ def alert_findings(rec, size, held=None):
     line names it, and the next run of the file posts what it still finds. Every other finding posts as it would
     without the stop. A re-grab that acted before the stop is one, and no later run finds it again.
 
-    With DISCORD_POSTS all, each change the run made to the file posts too, see report.render() "changes". They skip the
-    marker of alert(), because a second run finds nothing left to change. rec["change_result"] says what each post gave.
-    A change whose text fails posts nothing, and its line there says so. A failure must never cost the decision line.
-    The job's time limit passes."""
+    When NOTIFICATION_POSTS lists a name of config.CHANGES, each change the run made to the file whose name it lists
+    posts too, see report.render() "changes". They skip the marker of alert(), because a second run finds nothing left
+    to change. rec["change_result"] says what each post gave. A change whose text fails posts nothing, and its line
+    there says so. A failure must never cost the decision line. The job's time limit passes."""
     out = []
     for f, e in zip(rec["findings"], report.render(rec, "embed")):
         if not report.posts(f, rec):
             out.append("log only")
         elif runner.STOP["skipped"] and stop_caused(f, rec):
             out.append(STOPPED_RESULT)
-        elif held is not None and f["kind"] in DEEP_KINDS:
-            changes = report.held_posts(rec, f, report.tense_of(rec)) if config.CFG.discord_posts == "all" else []
+        elif held is not None and f["kind"] in DEEP_KINDS and config.wanted(report.post_name(f)):
+            changes = report.held_posts(rec, f, report.tense_of(rec)) if config.wanted(config.CHANGES) else []
             spans = report.named_spans(rec, f) if f["kind"] == "subtiming" else {}   # the places the deep analysis must hear again
             flags = sorted(report.tells(f, report.track_langs(rec, after=True))["flags"])   # the deep analysis says them again, see process.subtitle_checks()
             held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {}),
                          **({"spans": spans} if spans else {}), **({"flags": flags} if flags else {})})
             out.append(HOLD_RESULT)
         else:
-            out.append(alert(rec["app"], marker(f, rec), rec["path"], size, e))
-    if config.CFG.discord_posts == "all":
+            out.append(alert(rec["app"], report.post_name(f), marker(f, rec), rec["path"], size, e))
+    if config.wanted(config.CHANGES):
         try:
-            rec["change_result"] = [post(rec["app"], e) if isinstance(e, dict) else e for e in report.render(rec, "changes")]
+            rec["change_result"] = [post(rec["app"], name, e) if isinstance(e, dict) else e for name, e in report.render(rec, "changes")]
         except Exception as ex:
             rec["change_result"] = [config.mask(f"no text: {type(ex).__name__}: {ex}")[:200]]
     return out
@@ -267,8 +271,11 @@ def discord_test():
         return False, hide(f"The test message failed: {type(ex).__name__}: {ex}")
 
 
-def alert(app, kind, path, size, emb):
-    """Post the embed emb once per file, problem kind and size. A marker in the store remembers each one sent."""
+def alert(app, name, kind, path, size, emb):
+    """Post the embed emb of the post name once per file, problem kind and size. A marker in the store remembers each
+    one sent. A post whose name NOTIFICATION_POSTS leaves out writes no marker, so the next one posts once the name is
+    listed, see post()."""
+    if not config.wanted(name): return OFF_RESULT
     mark = hashlib.sha1(f"{kind}|{path}|{size}".encode()).hexdigest()
     try:   # the marker is claimed before the post, so two job processes never send the same embed
         if not store.add("alert", mark):
@@ -277,7 +284,7 @@ def alert(app, kind, path, size, emb):
         mark = None
     sent = None
     try:
-        sent = post(app, emb)
+        sent = post(app, name, emb)
     finally:
         if sent != "sent" and mark:   # a later run tries again, also after a stop during the post
             with ff.held_off(), contextlib.suppress(sqlite3.Error, OSError):   # the store's checks would raise the stop again
@@ -287,19 +294,21 @@ def alert(app, kind, path, size, emb):
 
 def post_held(app, path, held):
     """Post the alerts an import held for the deep analysis of path, see alert_findings(), each once per file, kind and
-    size, see alert(). Each embed takes the time of the post. Returns what each post gave."""
+    size, see alert(). A held alert is of DEEP_KINDS, so its kind is its post name. Each embed takes the time of the
+    post. Returns what each post gave."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    return [alert(app, h["kind"], path, h["size"], dict(h["embed"], timestamp=now)) for h in held]
+    return [alert(app, h["kind"], h["kind"], path, h["size"], dict(h["embed"], timestamp=now)) for h in held]
 
 
 def held_changes(app, held, why, flags=frozenset()):
     """Post the changes each held alert keeps, see alert_findings() and report.held_posts(), when the alert itself goes
     unposted. A flag edit whose tracks are all in flags posts nothing, because a posted alert of the deep analysis says
     those flags already. Returns one entry per held alert: why, and what each of its change posts gave. A change whose
-    text failed posts nothing."""
+    text failed posts nothing. A change that 2.20.1 held has no name, so it posts when NOTIFICATION_POSTS lists any name
+    of config.CHANGES."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     post_one = lambda c: "said by the deep analysis" if c.get("flags") and set(c["flags"]) <= set(flags) else \
-        post(app, dict(c["post"], timestamp=now)) if isinstance(c["post"], dict) else c["post"]
+        post(app, c.get("name", config.CHANGES), dict(c["post"], timestamp=now)) if isinstance(c["post"], dict) else c["post"]
     return [f'{why}, change {", ".join(post_one(c) for c in h["changes"])}' if h.get("changes") else why for h in held]
 
 

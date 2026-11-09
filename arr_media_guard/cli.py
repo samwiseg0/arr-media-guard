@@ -95,7 +95,7 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, pl
     --convert takes every file that is not .mkv, so selected() does not apply. With --sub-check a file whose subtitle
     check is saved and asks for nothing more is skipped, and the result is "checked", unless --recheck is given, see
     subtitles.sub_cached(). A file with a sidecar is taken then, whatever its tracks. An apply of the flag backfill
-    posts its alerts as a job does, by DISCORD_POSTS. --convert, --sub-check and --sub-time post none here.
+    posts its alerts as a job does, by NOTIFICATION_POSTS. --convert, --sub-check and --sub-time post none here.
 
     job is the job of a --check run, see check(). The file then runs as an import, under an import's time limit, or as
     the deep analysis after it when job holds deep. An apply posts its alerts when an app names the file. The caller
@@ -1355,7 +1355,7 @@ def audit(argv):
         print(title); print(text)
         for name, value in fields: print(f"\n{name}:\n{value}")
     if a.post and worth:
-        print(f"arr-media-guard: {app} audit post:", logs.post(app, logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))])
+        print(f"arr-media-guard: {app} audit post:", logs.post(app, "audit", logs.embed(app, title, text, "amber", fields[:24] + [("App", logs.app_name(app))])
                                                               if a.plan_from else logs.audit_embed(app, title, files, tmdb)))
 
 
@@ -1511,7 +1511,7 @@ def scan(app, a, kind):
         + (f" Files that left the library during their check: {gone}." if gone else "")
     emb = logs.embed(app, f"{kind.capitalize()} scan: {logs.app_name(app)}", text, "amber",
                 [("Problems this run", str(found)), ("Problems in this pass", str(len(rows))), ("List", f"{base}.txt"), ("App", logs.app_name(app))])
-    print(f"{text} {found} with a problem this run, {len(rows)} in this pass. The list is in {base}.txt.", logs.post(app, emb) if found else "")
+    print(f"{text} {found} with a problem this run, {len(rows)} in this pass. The list is in {base}.txt.", logs.post(app, "scan", emb) if found else "")
 
 
 HELP = """arr-media-guard: set the default audio and subtitle tracks of an imported mkv, and flag broken files.
@@ -1813,6 +1813,8 @@ def main(argv):
         if os.path.exists(store.path()):   # a selftest creates no store
             with contextlib.suppress(sqlite3.Error):
                 print(queue_line())
+        for why in config.CFG.warnings:   # a key that a release renamed, see Settings.warnings. The selftest passes.
+            print(f"warning: {why}")
         if config.CFG.errors:
             sys.exit("selftest failed: " + " ".join(config.CFG.errors))
         if decide.POLICY is None:

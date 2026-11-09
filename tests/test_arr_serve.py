@@ -1896,10 +1896,11 @@ def image_env():
 
 def test_a_fresh_env_file_gets_a_password_and_the_listener_takes_it(tmp_path):
     """The image's env file as the first start writes it, with the paths of this test. The listener generates the
-    password, starts and takes the pair from the file. Its output never shows the password."""
+    password, starts and takes the pair from the file. Its output never shows the password. A DISCORD_POSTS line left
+    from before 2.21.0 gets one start check line that names NOTIFICATION_POSTS, and the listener runs on."""
     port, env, out = free_port(), tmp_path / "arr-media-guard.env", tmp_path / "out"
     env.write_text(image_env() + f"AUDIT_TIME=''\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\nRADARR_DIR='/nonexistent'\nSONARR_DIR='/nonexistent'\n"
-                   f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\n")
+                   f"POLICY_FILE='{os.path.abspath(os.path.join(FILES, 'examples', 'policy.json'))}'\nDISCORD_POSTS='all'\n")
     with open(out, "w") as f:
         p = subprocess.Popen([sys.executable, "-c", LISTENER, os.path.abspath(FILES), str(port)], stdout=f, stderr=subprocess.STDOUT,
                              env=dict(os.environ, ARR_MEDIA_GUARD_ENV=str(env), ARR_MEDIA_GUARD_RELEASE="9.9.9"))
@@ -1921,6 +1922,7 @@ def test_a_fresh_env_file_gets_a_password_and_the_listener_takes_it(tmp_path):
         p.wait(timeout=20)
     text = out.read_text()
     assert text.count("arr-media-guard: generated a Webhook password") == 1 and pw not in text, text
+    assert text.count("arr-media-guard: DISCORD_POSTS is no longer read, so its value is ignored. NOTIFICATION_POSTS took its place") == 1, text
 
 
 def test_each_start_writes_the_example_and_only_the_first_start_the_env_file(tmp_path, monkeypatch):

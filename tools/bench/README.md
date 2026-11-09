@@ -47,7 +47,7 @@ form of `lid.listen()`, for a harness that calls the timing functions of `subsyn
 ## The regression corpus
 
 `tests/test_regressions.py` runs every planted shape that a review of the timing check found, on every commit: blocks
-and steps through an import and its deep analysis (with a failed write, `DISCORD_POSTS=all` and a dry run), unsure
+and steps through an import and its deep analysis (with a failed write, `NOTIFICATION_POSTS=all` and a dry run), unsure
 word-check windows, held import alerts, and the jump finder's hostile shapes. Each case knows the lines it planted off
 and scores the outcome in kinds: `wrong_silence` (3 or more lines in a row 0.5 s or more off, and no alert),
 `wrong_alert` (an alert, and no such lines), `wrong_text` ("left as they are" after a move, "0.0 s", or the moved

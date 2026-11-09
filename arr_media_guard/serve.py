@@ -463,7 +463,7 @@ def main(argv):
     name = f"{config.RELEASE} ({config.VERSION})" if config.RELEASE else config.VERSION
     print(f"arr-media-guard {name}: listening on port {PORT}. Path maps: {maps}. Nightly audit: {at or 'off'}. "
           f"Apps with an API key: {', '.join(apps_on()) or 'none'}.", flush=True)
-    for why in config.CFG.errors:
+    for why in config.CFG.errors + config.CFG.warnings:
         print(f"arr-media-guard: {why}", flush=True)
     threading.Thread(target=start_check, args=(), daemon=True).start()   # the apps and Plex may still be starting
     while not stop:

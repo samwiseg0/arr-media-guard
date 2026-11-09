@@ -1188,10 +1188,10 @@ def test_a_stop_after_a_restore_that_deleted_the_file_still_posts_it(env, monkey
 
 
 def test_a_stop_after_a_re_grab_still_posts_its_change(env, monkeypatch, settings):
-    """Reviewer 2026-10-20 (P1, P6): with DISCORD_POSTS all, SIGTERM during the delete of a re-grab of broken audio lets
+    """Reviewer 2026-10-20 (P1, P6): with NOTIFICATION_POSTS all, SIGTERM during the delete of a re-grab of broken audio lets
     the re-grab end. Its change posted nothing, and the next run logs deleted_with_download, which posts nothing. The
     re-grab now posts its alert, once."""
-    settings(discord_posts="all")
+    settings(notification_posts=hook.post_names("all"))
     env["ffmpeg_out"] = [SILENCE]
     grabbed(env, monkeypatch)
     env["on_write"] = lambda app, p, method, body: method == "DELETE" and term()
@@ -1201,9 +1201,9 @@ def test_a_stop_after_a_re_grab_still_posts_its_change(env, monkeypatch, setting
 
 
 def test_a_stop_after_a_flag_edit_still_posts_its_change(env, monkeypatch, settings):
-    """Reviewer 2026-10-20 (P6): with DISCORD_POSTS all, SIGTERM during mkvpropedit lets the edit end. The change post
+    """Reviewer 2026-10-20 (P6): with NOTIFICATION_POSTS all, SIGTERM during mkvpropedit lets the edit end. The change post
     of the edit never went out, and the next run finds nothing left to change. The change now posts."""
-    settings(discord_posts="all")
+    settings(notification_posts=hook.post_names("all"))
     run = hook.subprocess.run
     monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: [argv[0] == "mkvpropedit" and term(), run(argv, **kw)][1])
     job_run()
@@ -1471,7 +1471,7 @@ def test_a_post_of_the_alerts_runs_with_no_limit_after_the_app_removed_the_file(
 def test_a_post_of_the_stop_line_runs_with_no_limit(env, monkeypatch, settings):
     """A job repairs the header, and a stop comes before its checks. stop_line() stops the job's limit, so its change
     post runs with no limit, and the line keeps the repair and the Plex analyze."""
-    settings(discord_posts="all")
+    settings(notification_posts=hook.post_names("all"))
     header_issue(env, monkeypatch, issue=HEADER_HP["issue"], first=True)
     fake = hook.repack
     monkeypatch.setattr(hook, "repack", lambda *a, **k: [fake(*a, **k), term()][0])

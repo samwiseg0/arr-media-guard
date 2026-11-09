@@ -52,7 +52,7 @@ Each problem gets one Discord post. The import posts the problems it could not f
 holds its subtitle alerts, because the deep analysis checks the subtitles again. The deep analysis posts only what it
 still finds wrong. When it ends in an error or cannot judge the subtitles, the held alerts post then. Each alert names
 the check that found the problem, and the step where the fix stopped. A held alert keeps the import's check and step.
-With `DISCORD_POSTS=all`, each change AMG made to the file posts too. See [6. What you see](#6-what-you-see) and
+With `NOTIFICATION_POSTS=all`, each change AMG made to the file posts too. See [6. What you see](#6-what-you-see) and
 [7. The deep analysis](#7-the-deep-analysis).
 
 ## 1. The app tells AMG about the file
@@ -156,7 +156,7 @@ After a remux or a conversion, AMG asks the app to scan the item again, so the a
   removed subtitle, goes to the decision log only. A re-grab posts, because AMG deleted a file from the library, and the
   app may find no other copy. The same alert posts once for the same file. Two fields
   side by side name the check that found the problem and the step where the fix stopped. A step is, for example,
-  **Finding the shift** or **Writing the file**. With `DISCORD_POSTS=all`, each change AMG made to the file posts too.
+  **Finding the shift** or **Writing the file**. With `NOTIFICATION_POSTS=all`, each change AMG made to the file posts too.
   With `SUBTITLES=deep`, the subtitle alerts wait for the deep analysis, see
   [7. The deep analysis](#7-the-deep-analysis). See [features.md](features.md#alerts).
 - **Plex.** After a change, AMG asks Plex to read the item again, so Plex shows the new tracks. A new import is often
@@ -226,7 +226,8 @@ In Docker, the listener runs a start check when it starts, and answers the apps 
 whether the burned-in subtitle check can run. It asks
 an app or a service that does not answer again, for 2 minutes in all. A failed check prints a warning, and the listener
 keeps running. `--selftest` runs the same checks on the command line. It fails on a setting it cannot read, an env file
-that is there and cannot be read, or a policy file that does not load. It only warns about the apps and services.
+that is there and cannot be read, or a policy file that does not load. It only warns about the apps and services, and
+about `DISCORD_POSTS`, the key that `NOTIFICATION_POSTS` replaced in 2.21.0.
 
 ## The nightly audit
 

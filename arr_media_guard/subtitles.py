@@ -1667,7 +1667,7 @@ def sub_findings(rec, sync, unmatched, starts=None, cut=()):
         wrong.append({"code": "converted_track", "track": p, "why": rp["subcheck"][p]["why"], "kept": rp.get("kept"),
                       **({"saved": n} if (n := (rp.get("mismatch_text") or {}).get(p)) else {})})
     late += judge.alert_lines(rec, sync, flags_off, plan)
-    if unreadable and (mended := [x for x in wrong if x["code"] == "repaired"]):   # one notice per run, with DISCORD_POSTS issues and all
+    if unreadable and (mended := [x for x in wrong if x["code"] == "repaired"]):   # one notice per run, at issues and at all
         unreadable[0]["repaired"], wrong = mended, [x for x in wrong if x["code"] != "repaired"]
     out = ([{"kind": "submatch", "lines": wrong}] if wrong else []) + ([{"kind": "subtiming", "lines": late}] if late else [])
     judge.check_outcome(rec, out)

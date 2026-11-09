@@ -38,7 +38,7 @@ and subtitle track in the original language. It takes the flag off a track in an
   their flags. So does every track of a file TMDB does not know.
 - An edit of this flag alone does not ask Plex to read the file again, because Plex does not use the flag.
 - The edit is one more flag in the same `mkvpropedit` call, with the same undo line. The decision log shows it with the
-  other flag edits. With `DISCORD_POSTS=all` a change post says, for example, "Marked the **Japanese audio (track 2)**
+  other flag edits. With `NOTIFICATION_POSTS=all` a change post says, for example, "Marked the **Japanese audio (track 2)**
   as the original language." It never posts an alert.
 - Imports set it. A backfill or `--sub-check` with `--apply` sets it on the files it checks. A backfill also reads a
   file with one audio track and no subtitle when its flag may change. The deep analysis and a recheck keep the flags
@@ -104,7 +104,7 @@ the line where each jump starts. Each part of the subtitle between jumps that si
 moves onto it. It runs in the deep analysis and with `--sub-time`, see
 [subtitles.md](subtitles.md#mid-file-jump-timing).
 
-A fixed jump posts nothing. With `DISCORD_POSTS=all` the change post says how many lines moved, for example "Moved
+A fixed jump posts nothing. With `NOTIFICATION_POSTS=all` the change post says how many lines moved, for example "Moved
 **230 lines** of the English subtitles (track 1) to their speech." A subtitle that AMG times against the speech or
 another subtitle, such as one in a language no audio track speaks, gets no jump fix. When its parts sit half a second
 or more apart, an alert says so, with the least and the most they sit off.
@@ -368,8 +368,9 @@ it. A rejected download is deleted, and the old file stays. It needs `SABNZBD_AP
 AMG posts a Discord alert for each problem it leaves unresolved, when `DISCORD_WEBHOOK` is set. A fix that failed, a fix
 a setting turned off, and a doubt all post, once for the same file. A problem AMG fixed goes to the decision log and
 syslog only. Examples are a removed or repaired subtitle and new subtitle times. A re-grab posts, because AMG deleted a file
-from the library, and the app may find no other copy. With `DISCORD_POSTS=all`,
-AMG also posts each change it makes to a file, unless an alert already says it. Imports, the burned-in subtitle check,
+from the library, and the app may find no other copy. With `NOTIFICATION_POSTS=all`,
+AMG also posts each change it makes to a file, unless an alert already says it. `NOTIFICATION_POSTS` can also list
+single posts by name, see [Post names](../README.md#post-names). Imports, the burned-in subtitle check,
 the deep analysis and the recheck post alerts. A conversion that a stop left unfinished gets an alert too, when the
 worker starts or a `--convert` run finds it. `--check --apply`, the jobs a backfill queues and the flag backfill's `--apply` post the alerts of a file with an
 item. `--sub-check` and `--sub-time` post nothing else. A scan or the audit posts one summary when it finds a problem.
@@ -405,7 +406,7 @@ subtitle hunter's posts.
 
 With `SUBTITLES=deep`, each problem gets one alert. The import holds back its subtitle alerts, because the deep analysis
 checks those subtitles again. The deep analysis then posts once, and only what it still finds wrong. A subtitle problem
-it fixes gets no alert. With `DISCORD_POSTS=all` it gets the one post of the change. A held alert still posts when
+it fixes gets no alert. With `NOTIFICATION_POSTS=all` it gets the one post of the change. A held alert still posts when
 nothing judged its subtitles again. That happens after an error, when AMG could not hear the audio or its listening
 stopped part way, or when `SUBTITLES` is `off` by then. It shows the Check and Stopped at of the import. With `HOOK_WORKERS` or `BACKGROUND_WORKERS` at 2 or
 more, it also posts when the deep analysis crashes three times. With both at 1, a deep analysis that crashes the worker
@@ -413,7 +414,7 @@ runs again at the next start, and its held alert waits. A held alert waits with 
 restart keeps it. When the app renames or moves the file, the deep analysis asks the app where it is and checks it
 there. A held alert goes unposted only when the app replaced the file, or the app says it no longer has the file for
 that item. When the app lists the file where AMG cannot see it, as while a mount is down, the held alert posts. With
-`DISCORD_POSTS=all`, each change the import made posts once, such as a removed track or a flag it turned off. A held
+`NOTIFICATION_POSTS=all`, each change the import made posts once, such as a removed track or a flag it turned off. A held
 alert that posts names the change itself. Otherwise the change posts on its own. Every other alert of the import posts
 at once, such as wrong content, broken audio or video, and a failed flag change.
 

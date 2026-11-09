@@ -139,9 +139,12 @@ def burn_run(path, index, duration, flags, timeout, queue=None):
 
 
 def tmdb_key_alert(app, code):
-    """The ops embed "TMDB key not working", at most once a day per host, or None."""
+    """The ops embed "TMDB key not working", at most once a day per host, or None. A post that NOTIFICATION_POSTS
+    leaves out gives logs.OFF_RESULT before the daily mark, so the next one posts once it lists tmdb."""
+    if code == "tmdb_token_rejected" and not config.wanted("tmdb"):
+        return logs.OFF_RESULT
     k = content.key_alert(code, token=config.CFG.tmdb_token, mark=report.bold)
-    return logs.post(app, logs.embed(app, k[0], k[1], "amber", [("App", logs.app_name(app))])) if k else None
+    return logs.post(app, "tmdb", logs.embed(app, k[0], k[1], "amber", [("App", logs.app_name(app))])) if k else None
 
 
 MODES = ("import", "backfill", "sub_check", "sub_time", "convert", "deep")   # the runs of process(), see Ctx

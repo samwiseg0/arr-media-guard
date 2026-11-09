@@ -180,7 +180,8 @@ def env(tmp_path, monkeypatch, settings):
             calls["movie"]["movieFile"] = dict(calls["movie"]["movieFile"], id=10001, size=os.path.getsize(new))
         return {"id": 1, "status": "queued"}
 
-    def fake_post(app, emb):
+    def fake_post(app, name, emb):
+        assert name == "subhunt", name   # every post of the hunter has the name subhunt
         calls["posts"].append(emb)
         return "sent"
 

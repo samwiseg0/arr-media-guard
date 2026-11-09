@@ -257,7 +257,7 @@ and with `--sub-time`. An import never does it.
 - Lines with no heard words between the last line heard before a jump and the first line heard after it stay where
   they are.
 - A jump that moved posts nothing when no lines are still off. Else one alert says what moved and where lines are
-  still off. With `DISCORD_POSTS=all` the change post says how many lines moved.
+  still off. With `NOTIFICATION_POSTS=all` the change post says how many lines moved.
 - A subtitle that AMG times against the speech or another subtitle gets no jump fix. When its parts sit half a second
   or more apart, it alerts, see [Foreign subtitle timing](#foreign-subtitle-timing).
 - Known limit: a jump under half a second stays.

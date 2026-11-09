@@ -1052,7 +1052,7 @@ def test_a_discord_429_wait_ends_at_the_time_limit(monkeypatch, settings):
     settings(discord_webhook="https://discord.invalid/ops")
     hook.DEADLINE.start(5)
     with pytest.raises(hook.arr_meta.OutOfTime, match="^stopped after 5 seconds$"):   # the time limit ends the job
-        hook.post("radarr", {"title": "x"})
+        hook.post("radarr", "language", {"title": "x"})
     assert sleeps == [5] and tries == [5]
 
 
@@ -2750,7 +2750,8 @@ def scan_rows(base):
     return sorted(hook.store.items(os.path.basename(base)).values(), key=lambda r: r["file_id"])
 
 
-def test_audio_scan_resumes_and_posts_a_summary_only_for_a_run_with_a_problem(env, monkeypatch, tmp_path):
+def test_audio_scan_resumes_and_posts_a_summary_only_for_a_run_with_a_problem(env, monkeypatch, tmp_path, settings):
+    settings(notification_posts=hook.post_names("scan"))   # the scan summary has the name scan
     scan_library(monkeypatch, tmp_path, 3)
     env["ffmpeg_out"] = [SILENCE] * 3 + env["ffmpeg_out"] * 6   # file 1 silent, files 2 and 3 fine
     real_run = hook.subprocess.run
@@ -3264,7 +3265,8 @@ def plan_line(label, cls, edits=(), undecided=None, tracks=None):
             "dropped": [], "cls": "english", "orig": ["eng"], "tracks": tracks}
 
 
-def test_audit_of_a_dry_run_groups_classes_and_posts_one_embed(env, tmp_path, capsys):
+def test_audit_of_a_dry_run_groups_classes_and_posts_one_embed(env, tmp_path, capsys, settings):
+    settings(notification_posts=hook.post_names("audit"))   # the audit post has the name audit
     off = [["track:=2", 0, 1]]
     rows = [plan_line(f"Film {i}", "English original: English subtitle off", off) for i in range(3)]
     rows += [plan_line("Film D", "undecided", undecided="the app says Spanish, but the only audio is tagged eng and its title names no language"),
@@ -5486,10 +5488,10 @@ def cover_run(env, monkeypatch, src, apply=True, mode="sub_check", linked=False)
 
 
 def test_a_run_moves_a_cover_track_into_an_attachment(env, cover_mkvs, monkeypatch, settings):
-    """--sub-check --apply moves a cover track in the subtitle remux, a change Plex analyzes. With DISCORD_POSTS
+    """--sub-check --apply moves a cover track in the subtitle remux, a change Plex analyzes. With NOTIFICATION_POSTS
     all the change posts. A track whose frames differ stays, with no remux and no alert. So does every track in the
     flag backfill, which never remuxes."""
-    settings(keep_days=0, discord_posts="all")
+    settings(keep_days=0, notification_posts=hook.post_names("all"))
     rec, posts = cover_run(env, monkeypatch, cover_mkvs / "one-first.mkv", mode="backfill")
     assert ("covers" in rec, "subremux" in rec, posts) == (False, False, []) and len(REAL_MKVMERGE(env["path"])["tracks"]) == 3, rec
     rec, posts = cover_run(env, monkeypatch, cover_mkvs / "differ-second.mkv")
@@ -5819,8 +5821,8 @@ def test_a_group_of_one_picture_takes_the_next_free_cover_name(cover_mkvs, mkvs,
                                          "video and audio stayed the same.")])
 def test_a_copy_of_a_cover_picture_leaves_the_file(env, cover_mkvs, monkeypatch, settings, tmp_path, name, attachments, said):
     """The tracks go, every kept track matches packet for packet, and the attachments the file held stay byte for byte
-    with their UIDs. With DISCORD_POSTS all the change posts."""
-    settings(keep_days=0, discord_posts="all")
+    with their UIDs. With NOTIFICATION_POSTS all the change posts."""
+    settings(keep_days=0, notification_posts=hook.post_names("all"))
     rec, posts = cover_run(env, monkeypatch, cover_mkvs / name)
     before, new = REAL_MKVMERGE(str(cover_mkvs / name))["attachments"], REAL_MKVMERGE(env["path"])
     assert rec["subremux"]["done"] and [t["type"] for t in new["tracks"]] == ["video", "audio"], rec["subremux"]
@@ -6786,13 +6788,13 @@ def test_regrab_counts_stay_whole_under_parallel_processes(tmp_path, monkeypatch
 
 
 def test_log_lines_and_alert_markers_stay_whole_across_processes(env, monkeypatch):
-    monkeypatch.setattr(hook, "post", lambda app, emb: trace("post") or "sent")
+    monkeypatch.setattr(hook, "post", lambda app, name, emb: trace("post") or "sent")
     pids = []
     for i in range(6):
         pid = real_fork()
         if not pid:
             try:
-                hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"})
+                hook.alert("radarr", "language", "language", env["path"], 1000, {"title": "Wrong language"})
                 for n in range(50):
                     hook.log(dict(source="test", writer=i, n=n, pad="x" * 30000))   # past a pipe's atomic size and the write buffer
             finally:
@@ -6917,6 +6919,30 @@ def test_a_corrupt_store_moves_aside_and_the_import_runs_on_a_new_one(env, monke
     break_store()
     hook.check_store()
     assert len(moved()) == 9 and len(posts()) == 2
+
+
+def test_a_left_out_notice_writes_no_daily_mark(env, settings):
+    """The state store notice and the TMDB key alert post at most once a day, by a mark. A notice that NOTIFICATION_POSTS
+    leaves out writes no mark, so the next one posts once the list names it."""
+    state = hook.CFG.state_dir
+    posts = lambda: [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "discord" in u]
+    def break_store():
+        hook.store.close()
+        with open(os.path.join(state, "state.sqlite"), "wb") as f:
+            f.write(b"no database " * 400)
+    settings(notification_posts=hook.post_names("audio"))
+    hook.store.db()
+    break_store()
+    hook.check_store()
+    assert hook.tmdb_key_alert("radarr", "tmdb_token_rejected") == "left out by NOTIFICATION_POSTS"
+    assert posts() == [] and not os.path.exists(os.path.join(state, hook.STORE_ALERT)) and hook.store.get("mark", "tmdb-key-alert") is None
+    settings(notification_posts=hook.post_names("issues") - {"tmdb"})   # each notice posts by its own name
+    real_wait(1.1)   # the next move gets a name of its own
+    break_store()
+    hook.check_store()
+    assert hook.tmdb_key_alert("radarr", "tmdb_token_rejected") == "left out by NOTIFICATION_POSTS" and posts() == ["State store moved"]
+    settings(notification_posts=hook.post_names("issues") - {"store"})
+    assert hook.tmdb_key_alert("radarr", "tmdb_token_rejected") == "sent" and posts() == ["State store moved", "TMDB key not working"]
 
 
 def test_the_jobs_of_a_store_with_a_broken_index_go_to_the_new_store(env):
@@ -7422,6 +7448,17 @@ def test_sigterm_after_an_edit_skips_the_checks_left_and_puts_the_job_back(pool,
     assert hook.store.get("plex", "pending") is None
 
 
+def test_the_worker_logs_a_discord_posts_line_left_from_before_2_21_0(tmp_path, monkeypatch):
+    """The worker logs each settings warning at its start, as the listener prints it. A DISCORD_POSTS line warns."""
+    (tmp_path / "queue").mkdir()
+    (tmp_path / "env").write_text(f"DISCORD_POSTS='all'\nSTATE_DIR='{tmp_path}'\nLOG='{tmp_path}/log.jsonl'\n")
+    monkeypatch.setenv("ARR_MEDIA_GUARD_ENV", str(tmp_path / "env"))
+    m = amg.load("arr_media_guard_env")
+    m.worker(m.try_lock("worker.lock"))   # an empty queue, so it only starts and exits
+    notes = [json.loads(line).get("note") for line in open(tmp_path / "log.jsonl")]
+    assert notes == [m.CFG.warnings[0]] and notes[0].startswith("DISCORD_POSTS is no longer read"), notes
+
+
 @pytest.mark.parametrize("value, workers", [("4", 4), ("x", 1), ("0", 1), ("-2", 1), ("", 2)])
 def test_a_bad_hook_workers_value_falls_back_to_one_and_says_so(tmp_path, monkeypatch, value, workers):
     (tmp_path / "queue").mkdir()
@@ -7435,28 +7472,28 @@ def test_a_bad_hook_workers_value_falls_back_to_one_and_says_so(tmp_path, monkey
 
 
 def test_a_stop_during_the_post_frees_the_alert_marker(env, monkeypatch):
-    def stopped(app, emb):
+    def stopped(app, name, emb):
         raise SystemExit(143)
     monkeypatch.setattr(hook, "post", stopped)
     with pytest.raises(SystemExit):
-        hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"})
-    monkeypatch.setattr(hook, "post", lambda app, emb: "sent")
-    assert hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"}) == "sent"
+        hook.alert("radarr", "language", "language", env["path"], 1000, {"title": "Wrong language"})
+    monkeypatch.setattr(hook, "post", lambda app, name, emb: "sent")
+    assert hook.alert("radarr", "language", "language", env["path"], 1000, {"title": "Wrong language"}) == "sent"
 
 
 def test_a_recorded_stop_during_the_post_frees_the_alert_marker(env, monkeypatch):
     """ff.on_stop() records the stop, so each later check raises it again, as the store's do. The marker drop holds the
     stop off, and the next run of the job posts the alert."""
-    def stopped(app, emb):
+    def stopped(app, name, emb):
         hook.STOP["term"] = signal.SIGTERM   # what ff.on_stop() records while the post waits for Discord
         hook.DEADLINE.check()   # as apps.http() checks when its call ends
     monkeypatch.setattr(hook, "post", stopped)
     with pytest.raises(SystemExit):
-        hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"})
+        hook.alert("radarr", "language", "language", env["path"], 1000, {"title": "Wrong language"})
     assert hook.STOP["term"] == signal.SIGTERM
     hook.STOP["term"] = None   # the next run of the job
-    monkeypatch.setattr(hook, "post", lambda app, emb: "sent")
-    assert hook.alert("radarr", "language", env["path"], 1000, {"title": "Wrong language"}) == "sent"
+    monkeypatch.setattr(hook, "post", lambda app, name, emb: "sent")
+    assert hook.alert("radarr", "language", "language", env["path"], 1000, {"title": "Wrong language"}) == "sent"
 
 
 # --- header repair -------------------------------------------------------------------------------
@@ -8337,7 +8374,7 @@ def test_an_applied_header_repair_with_no_flag_edit_names_the_repair(env, monkey
 
 def test_a_flag_backfill_apply_posts_a_failed_header_repair_once(env, monkeypatch, tmp_path, capsys):
     """Tester 2026-10-19: a flag backfill never posted. Its --apply now posts as a queued backfill job does. At the
-    default DISCORD_POSTS issues a failed repair posts once. A second --apply posts it no more, and the audit leaves it
+    default NOTIFICATION_POSTS issues a failed repair posts once. A second --apply posts it no more, and the audit leaves it
     out, because its alert went out."""
     plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys, result=("header_repair_failed", "header repair failed: the size changed"))
     for sent in ("sent", "already sent"):
@@ -8348,8 +8385,8 @@ def test_a_flag_backfill_apply_posts_a_failed_header_repair_once(env, monkeypatc
     assert "0 files with an open problem since" in capsys.readouterr().out
 
 
-def test_an_applied_header_repair_posts_its_change_at_discord_posts_all(env, monkeypatch, tmp_path, capsys, settings):
-    settings(discord_posts="all")
+def test_an_applied_header_repair_posts_its_change_at_notification_posts_all(env, monkeypatch, tmp_path, capsys, settings):
+    settings(notification_posts=hook.post_names("all"))
     plans, _, _ = header_backfill(env, monkeypatch, tmp_path, capsys)
     hook.main(["--backfill", "radarr", "--apply", "--plan-from", str(plans)])
     assert posted(env) == [("File repaired", "Repaired the file. Its video, audio and subtitles stayed the same.")]
@@ -14936,10 +14973,10 @@ def test_a_broken_track_in_a_file_with_no_audio_keeps_its_times(tmp_path, settin
 
 @pytest.mark.parametrize("level", ["issues", "all"])
 def test_a_conversion_that_removed_a_broken_track_posts_one_notice(env, monkeypatch, settings, level):
-    """An import whose conversion took out a broken track posts one notice, with the default DISCORD_POSTS issues and
+    """An import whose conversion took out a broken track posts one notice, with the default NOTIFICATION_POSTS issues and
     with all. With all, no second post says that the file was converted."""
     mp4, mkv = mp4_import(env, monkeypatch, sidecars=())
-    settings(discord_posts=level)
+    settings(notification_posts=hook.post_names(level))
     took_out(monkeypatch, mkv)
     hook.main([])
     rec = decided(env)
@@ -19714,7 +19751,7 @@ def test_a_sidecar_whose_ends_were_only_lengthened_keeps_its_held_timing_alert(e
     (e,) = rec["sidecars"]
     assert (e["action"], e["result"]) == ("lengthen", "retimed") and name not in hook.remuxed(rec), e
     sent = []
-    monkeypatch.setattr(hook, "post", lambda app, emb: sent.append(emb) or "sent")
+    monkeypatch.setattr(hook, "post", lambda app, name, emb: sent.append(emb) or "sent")
     monkeypatch.setattr(hook.store, "add", lambda *a: True)
     held = {"kind": "subtiming", "size": 7, "embed": {"title": "Subtitles out of sync", "description": "x"}, "keys": [name],
             "spans": {name: [[0.0, 600.0]]}}
@@ -22385,7 +22422,7 @@ def one_alert_film(env, monkeypatch, settings, then="fixed", posts="issues"):
     fix that lines them up. Its deep analysis then hears the file. With then fixed, a block of lines moves to its
     speech and the rest is in time. With then left, a block sits too far off to move, see FAR. With then error, the deep
     analysis raises."""
-    settings(subtitles="deep", discord_posts=posts)
+    settings(subtitles="deep", notification_posts=hook.post_names(posts))
     sub_time_film(env, monkeypatch, [("eng", False, {})], {"s1": REF})
     monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
         k: dict(LATE if line or then == "left" else HEARD_IN_TIME, audio=0, starts=[]) for k in items if k == "s1"})   # line: an import
@@ -22571,7 +22608,7 @@ def test_all_mode_names_the_flag_change_of_a_held_alert_once(env, monkeypatch, s
     off. The held alert names that, so the import posts no change for it. When the deep analysis finds the track
     matches, the held alert goes, and the flag change posts in its place. When the deep analysis finds the mismatch
     too, its own alert says the flags, so the change posts nothing. After an error the held alert posts and says it."""
-    settings(subtitles="deep", discord_posts="all")
+    settings(subtitles="deep", notification_posts=hook.post_names("all"))
     sub_time_film(env, monkeypatch, [("eng", True, {})], {"s1": REF})
     wrong = {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best", "windows": [], "timing": None}
     monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {
@@ -25230,11 +25267,11 @@ def test_a_sidecar_repair_never_writes_over_a_new_download_or_at_subtitles_check
 @pytest.mark.parametrize("level", ["issues", "all"])
 def test_a_deep_analysis_posts_one_notice_for_the_subtitles_it_took_out(env, monkeypatch, settings, tmp_path, garbled_av, level):
     """The deep analysis renames a garbled sidecar. It alerts on the subtitles only, and the notice of the new file is
-    one of them, with DISCORD_POSTS issues and all."""
+    one of them, with NOTIFICATION_POSTS issues and all."""
     texts = SHAPES["pol_lost"][0]()
     path = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, scene_srt(old_mux(texts, "cp1250")).encode(),
                         os.path.basename(env["path"][:-4]) + ".pol.srt")
-    settings(subtitles="deep", discord_posts=level)
+    settings(subtitles="deep", notification_posts=hook.post_names(level))
     hook.deep_analysis(queue_analysis(env, env["path"]), [])
     rec = last_decided(env)
     titles = [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
@@ -25246,7 +25283,7 @@ def test_a_deep_analysis_posts_one_notice_for_the_subtitles_it_took_out(env, mon
 def test_a_run_that_converts_and_takes_out_garbled_subtitles_posts_one_notice(env, monkeypatch, settings, tmp_path, garbled_av, level):
     """A .mkv that holds MP4, with a Polish track an old tool garbled from cp1250. The deep analysis converts it, and its
     conversion takes out a broken track. Then the garbled track leaves the new file. One notice names the conversion,
-    both tracks and both files, with DISCORD_POSTS issues and all. With all, no second post says it was converted."""
+    both tracks and both files, with NOTIFICATION_POSTS issues and all. With all, no second post says it was converted."""
     texts = SHAPES["pol_lost"][0]()
     garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, "x") for i in range(3)], "utf-8", "eng")
     srt = tmp_path / "src" / "pol.srt"
@@ -25255,7 +25292,7 @@ def test_a_run_that_converts_and_takes_out_garbled_subtitles_posts_one_notice(en
               "-metadata:s:s:0", "language=pol", "-f", "mp4", env["path"]], check=True)
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
     took_out(monkeypatch, env["path"])
-    settings(discord_posts=level, subtitles="deep")
+    settings(notification_posts=hook.post_names(level), subtitles="deep")
     hook.deep_analysis(queue_analysis(env, env["path"]), [])
     rec = last_decided(env)
     titles = [b["embeds"][0]["title"] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
@@ -25482,13 +25519,13 @@ def test_a_sidecar_to_rename_leaves_the_word_check(env, monkeypatch, settings, t
 
 @pytest.mark.parametrize("level", ["issues", "all"])
 def test_one_run_that_renames_and_repairs_posts_once(env, monkeypatch, settings, tmp_path, garbled_av, level):
-    """One deep analysis renames a Czech sidecar and repairs a French one. One notice says both, with DISCORD_POSTS
+    """One deep analysis renames a Czech sidecar and repairs a French one. One notice says both, with NOTIFICATION_POSTS
     issues and all, and no second post says the repair."""
     stem = os.path.basename(env["path"][:-4])
     cze = garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, scene_srt(old_mux(CZE, "utf-8")).encode(), stem + ".cze.srt")
     with open(os.path.join(os.path.dirname(cze), stem + ".fre.srt"), "wb") as f:
         f.write(scene_srt(double_encoded(FRE_SIDE)).encode())
-    settings(subtitles="deep", discord_posts=level)
+    settings(subtitles="deep", notification_posts=hook.post_names(level))
     hook.deep_analysis(queue_analysis(env, env["path"]), [])
     rec = last_decided(env)
     posts = [b["embeds"][0] for m, u, b in env["http"] if m == "POST" and "embeds" in b]
@@ -26148,8 +26185,8 @@ def test_a_burn_in_re_grab_judges_its_own_file_and_leaves_the_other_files_of_the
 def test_an_import_of_a_japanese_film_with_english_burned_in_ends_with_its_english_subtitles_off(env, burn, settings):
     """The whole flow at SUBTITLES deep: the import turns the English subtitles on, the quick check flags the file, and
     the burn-in job turns them off before the deep analysis runs. The deep analysis keeps them off. One post says what
-    is burned in and what changed, and DISCORD_POSTS all adds no post of the same change."""
-    settings(subtitles="deep", discord_posts="all")
+    is burned in and what changed, and NOTIFICATION_POSTS all adds no post of the same change."""
+    settings(subtitles="deep", notification_posts=hook.post_names("all"))
     japanese_film(env, ("eng", False, {}))
     burn["full"] = [verdict("full", True, "eng")]
     hook.main([])
@@ -27321,7 +27358,7 @@ def test_a_backfill_job_that_converted_its_file_yields_no_more(env, monkeypatch,
     mp4, mkv = mp4_import(env, monkeypatch)
     calls = header_issue(env, monkeypatch)
     check_listed(env, monkeypatch)
-    settings(keep_days=7, discord_posts="all")
+    settings(keep_days=7, notification_posts=hook.post_names("all"))
     monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
     monkeypatch.setattr(hook.os, "nice", lambda n: None)
     hook.main(["--backfill", "radarr", "--apply"])

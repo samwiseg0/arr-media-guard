@@ -495,7 +495,7 @@ def test_an_environment_variable_that_is_no_setting_is_ignored(tmp_path):
 
 @pytest.mark.parametrize("key, value", [("HEADER_REPAIR", "off"), ("HOOK_WORKERS", "0"), ("REPACK_MAX_GB", "lots"), ("SUBTITLES", ""),
                                         ("REGRAB", "sound"), ("PLEX_PATH_MAP", "/a"), ("NAME", "a b"), ("APP_INSTANCES", "sonarr-4k"),
-                                        ("DISCORD_POSTS", "every")])
+                                        ("NOTIFICATION_POSTS", "every")])
 def test_a_bad_value_from_the_environment_fails_the_selftest_as_in_the_env_file(tmp_path, monkeypatch, capsys, key, value):
     """The same parsers read both, so the reading and the error are the same. The selftest line names the key."""
     from_file = load(tmp_path, f"{key}='{value}'\n")
@@ -684,3 +684,56 @@ def test_the_selftest_names_the_mkvmerge_version_and_warns_below_102(tmp_path, c
     warned = [x for x in out if x.startswith("warning: ") and "mkvmerge" in x]
     assert f"mkvmerge version: {version}" in out and out[-1] == "selftest ok", out
     assert len(warned) == warns and all(x.endswith('AMG supports mkvmerge 102, see "Install on a host" in README.md.') for x in warned), warned
+
+
+@pytest.mark.parametrize("value, want, errors", [
+    ("", "issues", ["NOTIFICATION_POSTS is blank, so it acts as issues."]),
+    (" , ", "issues", ["NOTIFICATION_POSTS is blank, so it acts as issues."]),
+    ("issues", "issues", []), ("ALL", "all", []), ("Issues, Retime ,tag", "issues,retime,tag", []),
+    ("retime,flags,tag,flags", "retime,tag", ["NOTIFICATION_POSTS names flags, which is no post name, so it is left out. The names are issues, all, "]),
+    ("every", "", ["NOTIFICATION_POSTS names every, which is no post name, so it is left out. The names are issues, all, "])])
+def test_notification_posts_lists_names_and_an_unknown_name_warns(tmp_path, value, want, errors):
+    """NOTIFICATION_POSTS lists post names by commas, in any case. An empty list acts as issues. An unknown name warns
+    with every valid name and is left out, and the rest of the list applies. Both fail the selftest, as a bad value did."""
+    m = load(tmp_path, f"NOTIFICATION_POSTS='{value}'\n")
+    assert m.CFG.notification_posts == m.post_names(want)
+    assert [e[:len(errors[0])] for e in m.CFG.errors] == errors if errors else m.CFG.errors == []
+    if errors and "no post name" in errors[0]:
+        assert m.CFG.errors[0].endswith(", ".join(m.POSTS) + ".")
+
+
+def test_the_groups_expand_to_their_names(tmp_path):
+    """issues holds exactly the posts that DISCORD_POSTS=issues sent: each finding kind, each re-grab and the notices.
+    all holds every name, so a name a later release adds posts with no edit."""
+    m = load(tmp_path)
+    assert m.CFG.notification_posts == m.post_names("issues") == frozenset(k for k, g in m.POSTS.items() if g == "issues")
+    assert set(m.report.FINDINGS) | {"regrab", "audit", "scan", "tmdb", "store", "subhunt"} == m.post_names("issues")
+    assert m.post_names("all") == frozenset(m.POSTS) and set(m.CHANGES) == set(m.POSTS) - m.post_names("issues")
+    assert set(m.report.FIX_NAMES.values()) | set(m.report.EDIT_NAMES.values()) | {"restored", "convert", "repair", "retime"} == set(m.CHANGES)
+
+
+@pytest.mark.parametrize("value", ["all", "issues", ""])
+def test_an_old_discord_posts_line_warns_and_its_value_is_ignored(tmp_path, monkeypatch, capsys, mkvmerge_says, value):
+    """2.21.0 renamed DISCORD_POSTS to NOTIFICATION_POSTS with no migration (owner rule). An env file that still sets the
+    old key gets one start check line that names the new key. The selftest prints it and passes (owner 2026-11-08). Its
+    value never carries over, so DISCORD_POSTS='all' still posts only issues."""
+    mkvmerge_says()
+    m = load(tmp_path, f"DISCORD_POSTS='{value}'\n")
+    line = "DISCORD_POSTS is no longer read, so its value is ignored. NOTIFICATION_POSTS took its place in 2.21.0. Set NOTIFICATION_POSTS instead."
+    assert m.CFG.warnings == [line] and m.CFG.errors == [] and m.CFG.notification_posts == m.post_names("issues")
+    m.main(["--selftest"])
+    assert f"\nwarning: {line}\n" in capsys.readouterr().out
+    assert load(tmp_path).CFG.warnings == []
+    assert load(tmp_path, f"DISCORD_POSTS='{value}'\nNOTIFICATION_POSTS='all'\n").CFG.notification_posts == m.post_names("all")
+
+
+def test_the_readme_lists_every_post_name_and_its_group(tmp_path):
+    """The tester asked which post fires for which setting. The README table "Post names" lists each name of POSTS once,
+    and nothing else, with yes in its last column when issues holds it."""
+    m = load(tmp_path)
+    text = open(os.path.join(FILES, "README.md")).read()
+    table = text[text.index("#### Post names"):].split("\n\n")[2]
+    rows = [[c.strip() for c in line.strip("|").split("|")] for line in table.splitlines()[2:]]
+    names = [r[0].strip("`") for r in rows]
+    assert sorted(names) == sorted(m.POSTS) and len(names) == len(set(names)), names
+    assert {r[0].strip("`"): r[-1] for r in rows} == {k: "yes" if g == "issues" else "no" for k, g in m.POSTS.items()}

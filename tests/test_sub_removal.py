@@ -743,9 +743,9 @@ def test_a_deep_alert_names_the_flags_its_import_turned_off(env, monkeypatch, se
     """The import calls the English track a mismatch, keeps it with no original kept, and holds its alert for the deep
     analysis, which finds the mismatch again. Its alert takes the place of the import's, so it says the flags went off
     when the import turned them off, see logs.alert_findings(). A track that had no flag on gets no such sentence. With
-    DISCORD_POSTS all the import's flag change then posts nothing of its own. --check --apply runs both at once."""
+    NOTIFICATION_POSTS all the import's flag change then posts nothing of its own. --check --apply runs both at once."""
     from test_arr_media_guard import REF, block_stand_ins, check_listed, checked, posted, sub_time_film, two_lines
-    settings(subtitles="deep", discord_posts=posts)
+    settings(subtitles="deep", notification_posts=hook.post_names(posts))
     sub_time_film(env, monkeypatch, [("eng", default, {})], {"s1": REF})
     wrong = {"verdict": "mismatch", "why": "the heard words match the cues at 5%, 8% at best", "windows": [], "timing": None}
     monkeypatch.setattr(hook, "sub_verdicts", lambda path, j, items, starts=None, line=True, deep=False, streams=None: {

@@ -21,19 +21,21 @@ A decision line holds:
   alone.
 - `alerts`, the text of each problem
 - `alert_result`, what the Discord post of each problem gave. That is `sent`, `already sent`, `log only` for a problem
-  AMG fixed, or why the post failed. A re-grab is a fix that posts, so it says `sent`. With `SUBTITLES=deep`, a subtitle problem of an import says
+  AMG fixed, `left out by NOTIFICATION_POSTS` for a post whose name `NOTIFICATION_POSTS` does not list, or why the post
+  failed. A re-grab is a fix that posts, so it says `sent`. With `SUBTITLES=deep`, a subtitle problem of an import says
   `held for the deep analysis`. The deep analysis checks it again and posts what it still finds.
 - `held_result`, on a deep analysis line whose import held alerts, what became of each one. That is `checked again`,
   `fixed before the error`, `dropped with the file`, or what its post gave. A subtitle that the deep analysis retimed or
   took out counts as checked again. A held alert posts when nothing checked one of its subtitles again. That happens
   after an error before the remux, when AMG could not hear the audio, or with `SUBTITLES` set to `off`.
-  With `DISCORD_POSTS=all`, an alert that also named a change of the import adds `, change` and what each post of that
-  change gave. `said by the deep analysis` there means a posted alert of the deep analysis named that flag change
+  When `NOTIFICATION_POSTS` lists a fix or change name, an alert that also named a change of the import adds `, change`
+  and what each post of that change gave. `said by the deep analysis` there means a posted alert of the deep analysis named that flag change
   already. When the import could not queue the deep analysis, its alerts post at once, and a `warning` line holds their
   `held_result`. A job a backfill queued whose saved deep analysis still holds queues none. Its line with result
   `checked again` holds their `held_result`.
-- `change_result`, with `DISCORD_POSTS=all` only, what the post of each change to the file gave. That is `sent`, why the
-  post failed, or `skipped` while Discord asked AMG to wait. A change whose text could not be built posted nothing, and
+- `change_result`, only when `NOTIFICATION_POSTS` lists a fix or change name, such as with `all`, what the post of each
+  change to the file gave. That is `sent`, why the post failed, or `skipped` while Discord asked AMG to wait. A change
+  whose name it does not list is never built, so it has no entry. A change whose text could not be built posted nothing, and
   its entry starts `no text:`. A run that changed nothing has an empty list.
 - `deep`, true on the deep analysis line that `--check` writes after its own checks. The nightly audit never takes
   that line as the file's latest result.

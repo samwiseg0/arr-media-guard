@@ -62,7 +62,7 @@ On a host, leave out `docker exec -it arr-media-guard`.
   and its options. An apply that stops part way, as at Ctrl+C, writes the line with the counts so far.
 - A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to four
   times: from its job, its burned-in subtitle check, its whole-file check and its deep analysis. With
-  `DISCORD_POSTS=all`, each file whose default tracks change also posts "Default tracks changed".
+  `NOTIFICATION_POSTS=all`, each file whose default tracks change also posts "Default tracks changed".
 - With no instance it takes every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`. A line
   `== <instance>` starts each one. It skips an instance you did not set up. An instance that fails, as one that does
   not answer, ends with one line, and the run goes on to the next one. The exit code is then 1.
@@ -71,7 +71,7 @@ On a host, leave out `docker exec -it arr-media-guard`.
 
 A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. It fixes the default tracks and
 language tags of the Matroska files the app lists, at the lowest CPU and disk priority. Its `--apply` posts as a job
-above does. It posts each problem not posted yet, once per file and kind. With `DISCORD_POSTS=all` it posts each
+above does. It posts each problem not posted yet, once per file and kind. With `NOTIFICATION_POSTS=all` it posts each
 change too. A dry run posts nothing. It shares a lock with the imports, so the two never change one file at the same
 time. It skips a file only when no check that can write has work for it, as a file with one audio track, its flags
 and language tag right, no subtitle and a header with no issue. Each such check has one trigger in `cli.TRIGGERS`.
@@ -79,7 +79,7 @@ A new check that can write adds its trigger there.
 
 Run a large flag backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one
 file. A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them.
-A *canary* is a small sample, spread across the plan groups, that you apply first. At `DISCORD_POSTS=all` an apply
+A *canary* is a small sample, spread across the plan groups, that you apply first. At `NOTIFICATION_POSTS=all` an apply
 posts once or more for each file it changes.
 
 ```
@@ -699,7 +699,7 @@ Each command needs `/config`. The last column of the table names what else it ne
   Its decision line comes at once and lists the steps left out in `not_run`. A file stopped before its decision gets
   the outcome `stopped`. The next run of the file makes the rest.
 - A stop posts no alert about itself. A re-grab that acted before the stop still posts. So does the "Unreadable
-  subtitles" notice of a conversion that took out a track. With `DISCORD_POSTS=all`, the change posts of the writes that
+  subtitles" notice of a conversion that took out a track. With `NOTIFICATION_POSTS=all`, the change posts of the writes that
   finished go out too. The next run of the file posts what it still finds.
 - A command with no stop of its own, such as `--plex-flush`, ends at once. Its exit code is 143 after `docker stop` and
   130 after Ctrl+C.

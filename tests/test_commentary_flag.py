@@ -42,8 +42,8 @@ def test_a_title_that_reads_as_commentary_sets_the_flag(kind, title, flag, edit)
 
 def test_an_import_sets_the_flag_and_says_so(env, monkeypatch, settings):
     """The flag goes on in the header edit, with no remux. The decision line names the rule and the note, the edit
-    verifies, and with DISCORD_POSTS all the change post says it. A track with the flag keeps it."""
-    settings(discord_posts="all")
+    verifies, and with NOTIFICATION_POSTS all the change post says it. A track with the flag keeps it."""
+    settings(notification_posts=hook.post_names("all"))
     env["probe"] = film(("audio", "Commentary", {}), ("audio", "Director's Commentary", {"flag_commentary": True}), ("subtitles", "Commentary", {}),
                         ("subtitles", "Production Notes", {}))
     hook.main([])

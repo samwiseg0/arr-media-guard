@@ -100,9 +100,18 @@ QUICK_SECS = 90   # seconds of the time limit the quick burned-in subtitle check
                   # about 70 seconds in tests. With less left the file goes to the background check.
 BURN_TIMEOUT = 3600   # seconds one full burned-in subtitle check may take, see runner.burn_full(). burnin.py runs at nice 10, and
                       # its speech read's ffmpeg at nice 19. The speech read of a 4K remux over a share took 8 to 11 minutes in tests.
-# What goes to DISCORD_WEBHOOK. issues: what arr-media-guard left unresolved, and each re-grab, see report.posts(). all: also one post for
-# each change it made to a file, see report.changes().
-DISCORD_POSTS = ("issues", "all")
+# Each post by the name NOTIFICATION_POSTS lists it by, with the smallest group that holds it. issues holds the posts of
+# what arr-media-guard left unresolved, each re-grab and the notices of its jobs, see report.posts(). all holds every
+# name, so it also holds each fix and each change to a file, see report.changes(). A finding kind of report.FINDINGS
+# names its alert, and regrab names an alert whose action deleted the file, see report.post_name(). A fix takes the
+# name of its sentence code, see report.FIX_NAMES, and a sentence of "Tracks changed" the name of its kind, see
+# report.EDIT_NAMES. README.md lists them.
+POSTS = {**dict.fromkeys(("language", "runtime", "duration", "episode", "content", "audio", "video", "damage", "repack", "unreadable", "header",
+                          "cut", "frame_rate", "subtitle", "sublang", "edit", "policy", "submatch", "subtiming", "burned_in", "cover", "regrab",
+                          "audit", "scan", "tmdb", "store", "subhunt"), "issues"),
+         **dict.fromkeys(("restored", "subremoved", "subleftout", "subrepaired", "submoved", "convert", "repair", "retime", "default", "forced",
+                          "original", "commentary", "tag"), "all")}
+CHANGES = tuple(k for k, g in POSTS.items() if g == "all")   # the names only all holds: the fixes and the changes to a file
 # PATH_MAP='/tv:/media/tv|/movies:/media/movies' pairs the path an app uses with the path this script sees, as in Docker.
 # SONARR_PATH_MAP, RADARR_PATH_MAP and PLEX_PATH_MAP pair the paths of one program the same way. Each one that is empty
 # or missing takes PATH_MAP, see Settings.map_of(). An instance of APP_INSTANCES has its own, see env_key().
@@ -135,7 +144,8 @@ class AppSettings:
 class Settings:
     """The env file and the environment, read once by settings(). A field holds the key of its name in upper case, or the key its comment
     names. errors holds one sentence for each value the script cannot read. Such a value takes the safest reading.
-    --selftest fails on errors, and the worker logs them."""
+    --selftest fails on errors, and the worker logs them. warnings holds one sentence for each key that reads but needs
+    a change, as a key that a release renamed. --selftest prints them and passes, and the worker logs them."""
     instance: str            # the name of this host in logs and alerts
     log: str                 # the decision log
     state_dir: str
@@ -149,7 +159,7 @@ class Settings:
     map_error: str           # every map's error, or None. --serve refuses to start on it.
     env_error: str           # why the env file, which is there, does not read, or None. The Test fails on it.
     discord_webhook: str
-    discord_posts: str       # one of DISCORD_POSTS
+    notification_posts: frozenset   # the names of POSTS that NOTIFICATION_POSTS lists, its groups expanded, see post_names()
     tmdb_token: str
     webhook_user: str
     webhook_password: str
@@ -176,6 +186,7 @@ class Settings:
     background_workers: int  # jobs of the background queue the worker runs at once while no import waits, see runner.coordinate()
     apps: dict               # instance name: AppSettings. The default instances radarr and sonarr come first, then APP_INSTANCES.
     errors: list
+    warnings: list
     from_env: tuple          # the keys the environment gave, sorted. --selftest names them.
     keep_dir = property(lambda s: f".{s.name}-originals")   # hidden, so the apps and Plex never scan it
     recycle_dir = property(lambda s: f".{s.name}-recycle")   # hidden too, see replaced_root()
@@ -240,7 +251,7 @@ def settings(path, environ=os.environ):
         kept, env_error = env_file(path), None
     except OSError as ex:
         kept, env_error = {}, f"uid {os.getuid()} and gid {os.getgid()} cannot read the env file {path} ({ex.strerror or ex}), so its settings take their defaults."
-    env, errors = Lookup(environ, kept), [env_error] if env_error else []
+    env, errors, warnings = Lookup(environ, kept), [env_error] if env_error else [], []
     env.taken = set()
 
     def number(key, default, bad, why, least=None, cast=int):
@@ -274,6 +285,21 @@ def settings(path, environ=os.environ):
         """key as an API key. The placeholder CHANGE_ME of docker/compose.yml counts as empty, so that app is not set up."""
         raw = env.get(key, "")
         return "" if raw == "CHANGE_ME" else raw
+
+    def posts(key, default):
+        """The names of POSTS that key lists by commas, see post_names(). An empty list acts as default. An unknown name is
+        an error and is left out, and the rest of the list applies. DISCORD_POSTS, the key before 2.21.0, is a warning,
+        and its value is ignored."""
+        listed = [k.strip().lower() for k in env.get(key, default).split(",") if k.strip()]
+        if env.get("DISCORD_POSTS") is not None:
+            warnings.append(f"DISCORD_POSTS is no longer read, so its value is ignored. {key} took its place in 2.21.0. Set {key} instead.")
+        if not listed:
+            errors.append(f"{key} is blank, so it acts as {default}.")
+            listed = [default]
+        if unknown := [k for k in listed if k not in POSTS and k not in ("issues", "all")]:
+            errors.append(f"{key} names {', '.join(dict.fromkeys(unknown))}, which is no post name, so it is left out. "
+                          f"The names are issues, all, {', '.join(POSTS)}.")
+        return post_names(",".join(listed))
 
     def kinds(key, default, known):
         """The kinds of known that key lists by commas. 'none' lists none. An empty list or an unknown kind is an error,
@@ -329,7 +355,7 @@ def settings(path, environ=os.environ):
         lid_dir=env.get("LID_DIR", "/opt/arr-media-guard-lid"), name=name, plex_url=env.get("PLEX_URL", ""), plex_token=env.get("PLEX_TOKEN", ""),
         plex_path_map=maps["PLEX_PATH_MAP"][0], path_map=maps["PATH_MAP"][0], map_error=" ".join(map_errors) or None, env_error=env_error,
         discord_webhook=env.get("DISCORD_WEBHOOK", ""),
-        discord_posts=level("DISCORD_POSTS", "issues", DISCORD_POSTS, "issues", "Discord gets only the problems arr-media-guard leaves unresolved"),
+        notification_posts=posts("NOTIFICATION_POSTS", "issues"),
         tmdb_token=env.get("TMDB_TOKEN", ""), webhook_user=env.get("WEBHOOK_USER", ""),
         webhook_password=env.get("WEBHOOK_PASSWORD", ""), sabnzbd_api_key=env.get("SABNZBD_API_KEY", ""),
         newznab_api_key=env.get("NEWZNAB_API_KEY", ""), sabnzbd_url=env.get("SABNZBD_URL", ""), newznab_url=env.get("NEWZNAB_URL", ""),
@@ -343,7 +369,25 @@ def settings(path, environ=os.environ):
         repack_max=repack_max, subtitles=subtitles, burned_in=burned_in, convert_max=number("CONVERT_MAX_FILES", 200, 200, whole, least=1),
         convert_workers=number("CONVERT_WORKERS", 1, 1, whole, least=1), scan_workers=number("SCAN_WORKERS", 1, 1, whole, least=1),
         background_workers=number("BACKGROUND_WORKERS", 1, 1, whole, least=1),
-        hook_workers=hook_workers, errors=errors, apps=apps, from_env=tuple(sorted(env.taken)))
+        hook_workers=hook_workers, errors=errors, warnings=warnings, apps=apps, from_env=tuple(sorted(env.taken)))
+
+
+def post_names(text):
+    """The names of POSTS that text lists by commas, in any case. issues gives each name of that group, and all every
+    name, also each name a later release adds. An unknown name gives none."""
+    out = set()
+    for k in (x.strip().lower() for x in text.split(",")):
+        out |= set(POSTS) if k == "all" else {n for n, g in POSTS.items() if g == "issues"} if k == "issues" else {k} & POSTS.keys()
+    return frozenset(out)
+
+
+def wanted(name):
+    """Whether NOTIFICATION_POSTS lists the post name, see POSTS. A tuple or list of names is wanted when it holds one
+    wanted name, as for a post whose sentences have names of their own. A name that POSTS does not hold raises
+    ValueError, so a wrong name in the code fails at once."""
+    if isinstance(name, str) and name not in POSTS:
+        raise ValueError(f"no post name {name!r}")
+    return bool(CFG.notification_posts & ({name} if isinstance(name, str) else set(name)))
 
 
 CFG = settings(ENV_FILE)

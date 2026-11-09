@@ -407,7 +407,7 @@ def hunt(app, mid, a, cred, ctx):
     shown = report.link(label, apps.ARR[app].page(m.get("titleSlug")))   # the movie's name, a link to its page in Radarr
 
     def post(title, text, color, release):
-        return logs.post(app, logs.embed(app, title, text, color, [("Title", shown), ("Release", release), ("App", logs.app_name(app))]))
+        return logs.post(app, "subhunt", logs.embed(app, title, text, color, [("Title", shown), ("Release", release), ("App", logs.app_name(app))]))
 
     if item.get("keep") and os.path.exists(item["keep"]):   # an earlier run left the old file linked. Never go past it.
         text = (f'An earlier run left a copy of the old file of {label} at {item["keep"]}. Radarr may list the new file, the old '
@@ -515,7 +515,7 @@ def hunt(app, mid, a, cred, ctx):
         tried = "\n".join(f'{t["title"]}, {t["why"]}' for t in item["tried"])
         text = (f"No release of {label} passed the check, so the current file stays. Later searches for English subtitles skip "
                 "this movie.")
-        sent = logs.post(app, logs.embed(app, "No release with English subtitles", text, "amber",
+        sent = logs.post(app, "subhunt", logs.embed(app, "No release with English subtitles", text, "amber",
                                    [("Title", shown), ("Tried", tried), ("App", logs.app_name(app))]))
         return note("no_subbed_release", f'no_subbed_release: tried {len(item["tried"])}', tried=item["tried"], alert_result=[sent])
     finally:   # the paused jobs a pass never reached, and every job of a run that broke off, SIGTERM included

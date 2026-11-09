@@ -306,7 +306,7 @@ A setting from the environment follows these rules.
 
 - An empty variable counts as set. It empties a URL, a token, a key, `LOG`, `STATE_DIR`, `LID_DIR` and `INSTANCE`, and
   turns `AUDIT_TIME` off. An empty `WEBHOOK_USER` or `WEBHOOK_PASSWORD` stops the listener. For `NAME`, `REGRAB`,
-  `SUBTITLES` and `DISCORD_POSTS` it is a bad value. Every other key takes its default.
+  `SUBTITLES` and `NOTIFICATION_POSTS` it is a bad value. Every other key takes its default.
 - A value from the environment takes the same reading and the same checks as one from the file.
 - Any other variable is ignored. `--selftest` names the keys it took from the environment, and never their values.
 - In Docker, set them in `environment:` of the compose file, as [docker/compose.yml](docker/compose.yml) does. Run
@@ -345,11 +345,66 @@ really sits, after symlinks. Set the environment variable `ARR_MEDIA_GUARD_LIB` 
 | --- | --- | --- |
 | `PLEX_URL`, `PLEX_TOKEN` | empty | After AMG changes a file, Plex reads it again, so Plex shows the new tracks. An empty `PLEX_URL` turns every Plex call off. |
 | `DISCORD_WEBHOOK` | empty | Alerts and scan summaries go here. Empty: nothing is posted. |
-| `DISCORD_POSTS` | `issues` | `issues`: a post for each problem left unresolved. `all`: also a post for each change AMG makes to a file, such as new subtitle times or a flag edit. A re-grab posts in both. Any other value, an empty one too, acts as `issues`, and `--selftest` fails on it. |
+| `NOTIFICATION_POSTS` | `issues` | The posts that go out, as names joined by `,`. Case does not matter. `issues` holds a post for each problem left unresolved, each re-grab and the notices of AMG's jobs. `all` holds every post, also each fix and each change AMG makes to a file, and each post a later release adds. A list such as `issues, retime, convert` adds names to a group. See [Post names](#post-names). An unknown name is left out, and `--selftest` fails on it. An empty value acts as `issues`. |
 | `TMDB_TOKEN` | empty | A TMDB API read token of your own, for the language and wrong-content checks. Empty: Radarr's key, read from `/opt/Radarr/Radarr.Common.dll`, else a copy of it in the code, as in Docker. |
 
 Each alert names the check that found the problem, such as the import check or the deep analysis, the slower subtitle
 check after an import. It also names the step where AMG's fix stopped. See [docs/features.md](docs/features.md#alerts).
+
+#### Post names
+
+Each post has one name. A post goes out when `NOTIFICATION_POSTS` lists its name, or a group that holds it. `all` holds
+every name. A track edit posts once, with one sentence per kind of edit, and each sentence has its own name. Its title
+names the kinds, as "Default tracks and forced flag changed". A sentence whose name is left out drops from the post,
+and the title names only the kinds left. The fix names work the same way in a "Wrong subtitles" post. `DISCORD_POSTS`, the key before 2.21.0, is no longer read. While the env file still sets
+it, the start check and `--selftest` print one warning that names `NOTIFICATION_POSTS`.
+
+| Name | Post | In `issues` |
+| --- | --- | --- |
+| `language` | Wrong audio language | yes |
+| `runtime` | Wrong runtime | yes |
+| `duration` | Wrong length in the file | yes |
+| `episode` | Maybe the wrong episode | yes |
+| `content` | Wrong content, unless AMG deleted the file | yes |
+| `audio` | Audio may be broken, or Broken audio, unless AMG deleted the file | yes |
+| `video` | Video may be broken, or Broken video, unless AMG deleted the file | yes |
+| `damage` | Damaged file, unless AMG deleted the file | yes |
+| `repack` | Conversion to MKV failed, or Stopped conversion | yes |
+| `unreadable` | Unreadable subtitles, or Subtitles left out of the MKV | yes |
+| `header` | File repair failed | yes |
+| `cut` | File may be cut short | yes |
+| `frame_rate` | Variable frame rate | yes |
+| `subtitle` | Subtitles run past the end | yes |
+| `sublang` | Subtitle language may be wrong | yes |
+| `edit` | Track flag change failed | yes |
+| `policy` | Policy file didn't load | yes |
+| `submatch` | Wrong subtitles, for a problem left unresolved | yes |
+| `subtiming` | Subtitles out of sync, or Rewrite failed | yes |
+| `burned_in` | Burned-in subtitles, unless AMG deleted the file | yes |
+| `cover` | Cover picture not moved | yes |
+| `regrab` | A fault for which AMG deleted the file. Its title ends "re-grabbed" or "old file restored". When no search started, as for an item that is not monitored, it has the plain title of the fault, such as Broken audio. A manual import whose old file came back is `restored`. | yes |
+| `audit` | Open problems, the nightly audit. It also lists a failed conversion or repair whose own post was left out. | yes |
+| `scan` | Audio scan or Video scan, the summary of a scan | yes |
+| `tmdb` | TMDB key not working | yes |
+| `store` | State store moved | yes |
+| `subhunt` | Each post of the subtitle hunter | yes |
+| `restored` | A fault of a manual import whose title ends "old file restored", when the app picked up the old file again. AMG deleted the file and put the old one back. | no |
+| `subremoved` | Wrong subtitles, for a subtitle track that does not match the audio and that AMG removed | no |
+| `subleftout` | Wrong subtitles, for a subtitle track that the conversion to MKV left out | no |
+| `subrepaired` | Wrong subtitles, for garbled subtitles that AMG replaced with readable ones | no |
+| `submoved` | Wrong subtitles, for a subtitle file that does not match and that AMG moved away or renamed | no |
+| `convert` | Converted to MKV | no |
+| `repair` | File repaired | no |
+| `retime` | Subtitles retimed | no |
+| `default` | Default tracks changed, the sentence of a track edit on the default flags | no |
+| `forced` | Forced flag changed, the sentence of a track edit on the forced flags | no |
+| `original` | Original language flag changed, the sentence of a track edit on the Original language flags | no |
+| `commentary` | Commentary flag changed, the sentence of a track edit on the commentary flags | no |
+| `tag` | Language tag changed, the sentences of a track edit on the language tags | no |
+
+This list posts what `all` posts today, less the sentences on the default and Original language flags:
+`NOTIFICATION_POSTS='issues, restored, subremoved, subleftout, subrepaired, submoved, convert, repair, retime, forced, commentary, tag'`.
+Unlike `all`, it gets no name that a later release adds.
 
 `arr-media-guard --test-discord` posts one test message to `DISCORD_WEBHOOK` and prints Discord's answer. It fails
 when Discord refuses the message. In Docker, run `docker exec arr-media-guard arr-media-guard --test-discord`.

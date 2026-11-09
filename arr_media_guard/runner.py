@@ -379,8 +379,8 @@ def remuxed(rec):
     or took out, by their place before that remux, see process.subtitle_checks() and process.after_edit(). The remux
     takes out a track that does not match and one stripped as garbled. The sidecar step moves away a sidecar that does
     not match and renames a garbled one. A stripped track and a renamed garbled sidecar post their unreadable notice.
-    A removed track, a moved sidecar and a retime are fixes, so they post only as a change with DISCORD_POSTS all,
-    see report.posts(). Longer ends and a repaired text fix no timing and no mismatch, so they leave a held alert to
+    A removed track, a moved sidecar and a retime are fixes, so they post only as a change whose name
+    NOTIFICATION_POSTS lists, see report.posts(). Longer ends and a repaired text fix no timing and no mismatch, so they leave a held alert to
     post. A sidecar whose only change was longer ends also gets the result "retimed", so a sidecar counts as retimed
     only with the action "retime"."""
     rm = rec.get("subremux") or {}
@@ -419,14 +419,16 @@ def held_after(job, rec):
     that the remux or the sidecar step retimed or took out is settled for any outcome, see remuxed(), also before an
     error. Verdicts reach rec only when the run reached its alerts. A job that a stop cut goes back to the queue with its
     held alerts, so only its next run gets here. A dropped alert still posts the changes it keeps, see
-    logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing. Every other held alert
+    logs.held_changes(). A flag edit that a posted alert of the job says already posts nothing. An alert whose name
+    NOTIFICATION_POSTS leaves out posts nothing, so it says nothing. Every other held alert
     posts now, because nothing settled one of its subtitles. That is an error before the remux, a failed hearing, a word
     check that timed nothing, SUBTITLES off, or a file the app moved during the run, or one the app lists where this
     container does not see it."""
     app, out = job["app"], []
     if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
-    said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or [] if report.posts(f, rec)))
+    said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or []
+                         if report.posts(f, rec) and config.wanted(report.post_name(f))))
     fixed, error = remuxed(rec), rec.get("outcome") == "error"
     for h in job["held"]:
         timed = lambda k: h["kind"] != "subtiming" or times_judged(rec, k, (h.get("spans") or {}).get(k))   # the times judged too
@@ -623,7 +625,7 @@ def queue_after(name, job, rec, run, inputs, deep=True, audited=None):
     analysis, unless deep is False, the burn-in job and the whole-file check. inputs are the decision inputs of the
     import. When no deep analysis queued, the alerts that run held for it post now, so none is lost. deep False says
     that a saved deep analysis of the file still holds, see subtitles.sub_cached(). It judged those subtitles, so the
-    held alerts count as checked again. Only the change posts of DISCORD_POSTS=all go out, see logs.held_changes().
+    held alerts count as checked again. Only their change posts go out, see logs.held_changes().
     See run_job(). A job that a stop cut queues nothing, as it goes back to the queue, see drop_job(). Its next run
     queues them. audited holds the plans of a queued --check's row for the deep analysis and the burn-in job, see
     deep_analysis(). Each job keeps its plan in "audited", an empty one too, so a job the dry run planned none for
@@ -1835,11 +1837,11 @@ def check_store():
     logs.decision(dict(source="hook", outcome="store_corrupt", result=f"error: the state store {why}, so it moved to {name} and a new one "
                        f"started. {jobs}."), time.time())
     mark = os.path.join(config.CFG.state_dir, STORE_ALERT)
-    if os.path.exists(mark) and time.time() - os.path.getmtime(mark) < content.KEY_ALERT_EVERY:
-        return
+    if not config.wanted("store") or os.path.exists(mark) and time.time() - os.path.getmtime(mark) < content.KEY_ALERT_EVERY:
+        return   # a left-out post writes no mark, so the next move posts once NOTIFICATION_POSTS lists store
     open(mark, "w").close()
     app = next(iter(config.CFG.apps))
-    logs.post(app, logs.embed(app, "State store moved", f"The state store {why}. It moved to {name}, and a new one started. {jobs}. "
+    logs.post(app, "store", logs.embed(app, "State store moved", f"The state store {why}. It moved to {name}, and a new one started. {jobs}. "
                               "Its other records are not in the new one.", "amber", []))
 
 
@@ -1854,7 +1856,7 @@ def worker(lock):
     for app in config.CFG.apps:   # a conversion a kill stopped halfway: reported for a person, nothing moves
         with contextlib.suppress(Exception):
             convert.pending_recover(app, False)
-    for why in config.CFG.errors:
+    for why in config.CFG.errors + config.CFG.warnings:
         logs.log(dict(source="hook", result="warning", note=why[:300]))
     if config.CFG.from_env and not config.SERVE:   # a host hook reads the app's environment, where a stray key such as LOG wins
         logs.log(dict(source="hook", result="warning", note=f"keys from the environment win over the env file: {', '.join(config.CFG.from_env)}"))

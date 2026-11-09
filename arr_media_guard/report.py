@@ -535,6 +535,34 @@ DELETED = LOGGED_ACTIONS + ("deleted",)   # the action codes of a fault whose fi
 CONTENT_SIGNALS = ("language", "runtime")   # the findings that share their kind with a signal of the wrong-content evidence
 
 
+# The post name of the fix that each sentence code of logged() says, see config.POSTS
+FIX_NAMES = {"removed": "subremoved", "converted_track": "subleftout", "repaired": "subrepaired", "sidecar": "submoved", "converted_sidecar": "submoved"}
+# The post name of each sentence kind of "Tracks changed" by the property of its edit, see edit_change(). A LANG_IETF
+# edit only helps word the language tag sentence.
+EDIT_NAMES = {"flag-default": "default", decide.FORCED_FLAG: "forced", decide.ORIGINAL_FLAG: "original", decide.COMMENTARY_FLAG: "commentary",
+              decide.LANG_EDIT: "tag", decide.LANG_IETF: "tag"}
+
+
+def post_name(f):
+    """The post name of the alert of finding f, see config.POSTS. It is regrab for an action of DELETED, which deleted
+    the file, else the kind of f. A restore whose old file came back is a fix that posts as restored, see wanted_fix()."""
+    return "regrab" if (f.get("action") or {}).get("code") in DELETED else f["kind"]
+
+
+def wanted_fix(f):
+    """(post name, finding) of the fix post of finding f with only the sentences whose fix NOTIFICATION_POSTS lists, see
+    FIX_NAMES, or None when it lists none. A fix of an action is a restore. A name of several sentences is a tuple."""
+    if f.get("action"):
+        return ("restored", f) if config.wanted("restored") else None
+    lines = [x for x in f.get("lines") or [] if config.wanted(FIX_NAMES[x["code"]])]
+    return (tuple(dict.fromkeys(FIX_NAMES[x["code"]] for x in lines)), dict(f, lines=lines)) if lines else None
+
+
+def wanted_edits(edits):
+    """The edits whose sentence kind NOTIFICATION_POSTS lists, see EDIT_NAMES. An edit of another property stays."""
+    return [e for e in edits if decide.prop(e) not in EDIT_NAMES or config.wanted(EDIT_NAMES[decide.prop(e)])]
+
+
 def fixed(a):
     """Whether the action a fixed its fault, see LOGGED_ACTIONS. A re-grab or a search fixes it also when its own old
     file stayed out, because the app searches for another copy. A restore of a manual import fixes it only when its own
@@ -994,8 +1022,8 @@ def stage_fields(rec, f, t):
 
 
 def fix_post(rec, f, t):
-    """The change post of finding f of rec, a fix in its alert's words and color, for DISCORD_POSTS all. A text that
-    failed gives its line, which posts nothing, see changes(). A change post names no check and no step."""
+    """The change post of finding f of rec, a fix in its alert's words and color, see wanted_fix(). A text that failed
+    gives its line, which posts nothing, see changes(). A change post names no check and no step."""
     text = texts(f, t, track_langs(rec, after=True))[0]
     return text if text.startswith(NO_TEXT) else alert_embed(rec, f, t, stage=False)
 
@@ -1009,14 +1037,19 @@ def said(rec):
     """What the posted alerts of rec say of its changes already, so no change post says it again: "flags", the places
     after the run of the tracks whose default and forced flags an alert says were turned off, "moved", the places of the
     tracks whose moved lines an alert counts, live captions or parts moved to their speech, and "converted", whether a
-    subtitle sentence or the unreadable subtitles alert names the conversion to MKV."""
+    subtitle sentence or the unreadable subtitles alert names the conversion to MKV. A fix post says the conversion too,
+    when it keeps a sentence that names it, see wanted_fix(). An alert or a fix whose name NOTIFICATION_POSTS leaves out
+    says nothing, see post_name(), so the change posts say it."""
     langs, out = track_langs(rec, after=True), {"flags": set(), "moved": set(), "converted": False}
     for f in rec.get("findings") or []:
-        told = tells(f, langs)
-        out["converted"] |= told["converted"]
         if posts(f, rec):
-            out["flags"] |= told["flags"]
-            out["moved"] |= told["moved"]
+            if config.wanted(post_name(f)):
+                told = tells(f, langs)
+                out["converted"] |= told["converted"]
+                out["flags"] |= told["flags"]
+                out["moved"] |= told["moved"]
+        elif fixes(f) and (fix := wanted_fix(f)):
+            out["converted"] |= tells(fix[1], langs)["converted"]
     return out
 
 
@@ -1032,19 +1065,20 @@ def tells(f, langs):
 
 
 def held_posts(rec, f, t):
-    """The change posts of the run of rec that its held finding f says itself, for DISCORD_POSTS all, see
-    logs.alert_findings(). Each is {"post": the embed, or the line of a text that failed}, and the flag edit adds
-    "flags", the places of its tracks after the run. They are the fixes of its logged lines, see fix_post(), the
-    conversion to MKV it names, and the flags it says were turned off. said() leaves them out of the change posts of
-    rec, and logs.held_changes() posts them when the held alert goes unposted."""
-    told, fixed, after = tells(f, track_langs(rec, after=True)), [x for x in f.get("lines") or [] if logged(x)], {
+    """The change posts of the run of rec that its held finding f says itself and whose names NOTIFICATION_POSTS lists,
+    see logs.alert_findings(). Each is {"post": the embed, or the line of a text that failed, "name": its post name},
+    and the flag edit adds "flags", the places of its tracks after the run. They are the fixes of its logged lines, see
+    wanted_fix(), the conversion to MKV it names, and the flags it says were turned off. said() leaves them out of the
+    change posts of rec, and logs.held_changes() posts them when the held alert goes unposted."""
+    told, fixed, after = tells(f, track_langs(rec, after=True)), wanted_fix(dict(f, lines=[x for x in f.get("lines") or [] if logged(x)])), {
         x["sel"]: x for x in rec.get("after") or []}
-    flags = [e for e in rec.get("edits") or [] if decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and not e[1]
+    flags = [e for e in wanted_edits(rec.get("edits") or []) if decide.prop(e) in ("flag-default", decide.FORCED_FLAG) and not e[1]
              and (after.get(e[0]) or {}).get("pos") in told["flags"]]
-    out = [{"post": fix_post(rec, dict(f, lines=fixed), t)}] if fixed else []
+    out = [{"post": fix_post(rec, fixed[1], t), "name": fixed[0]}] if fixed else []
     none = {"flags": set(), "moved": set(), "converted": False}
-    for head, step, of, more in (("Converted to MKV", conversion_change, told["converted"] and rec, {}),
-                                 ("Tracks changed", edit_change, flags and dict(rec, edits=flags), {"flags": sorted(told["flags"])})):
+    for head, step, of, more in (("Converted to MKV", conversion_change, told["converted"] and config.wanted("convert") and rec, {"name": "convert"}),
+                                 ("Tracks changed", edit_change, flags and dict(rec, edits=flags),
+                                  {"name": ("default", "forced"), "flags": sorted(told["flags"])})):
         try:
             got = step(of, none) if of else None
         except Exception as ex:
@@ -1191,19 +1225,22 @@ def edit_change(rec, told):
 
 
 def changes(rec):
-    """(title, text) of each change the run of rec made to its file that no finding of rec words, for DISCORD_POSTS
-    all: a conversion to MKV, a file repair, retimed subtitles and a track edit. A dry run makes none. A change that a
-    posted alert says already is left out, see said(). A text that fails gives (None, a line that says so), so it
-    posts nothing and the other changes still post."""
+    """(post name, title, text) of each change the run of rec made to its file that no finding of rec words: a
+    conversion to MKV, a file repair, retimed subtitles and a track edit. A change whose name NOTIFICATION_POSTS leaves
+    out is never built. A track edit keeps only the sentence kinds it lists, see wanted_edits(), and its name is the
+    tuple of every kind. A dry run makes none. A change that a posted alert says already is left out, see said(). A
+    text that fails gives (its name, None, a line that says so), so it posts nothing and the other changes still post."""
     told, out = said(rec), []
-    for head, step in (("Converted to MKV", conversion_change), ("File repaired", repair_change), ("Subtitles retimed", retime_change),
-                       ("Tracks changed", edit_change)):
+    for head, step, name in (("Converted to MKV", conversion_change, "convert"), ("File repaired", repair_change, "repair"),
+                             ("Subtitles retimed", retime_change, "retime"), ("Tracks changed", edit_change, tuple(dict.fromkeys(EDIT_NAMES.values())))):
+        if not config.wanted(name):
+            continue
         try:
-            got = step(rec, told)
+            got = step(dict(rec, edits=wanted_edits(rec.get("edits") or [])) if head == "Tracks changed" else rec, told)
         except Exception as ex:
             got = None, config.mask(f"{NO_TEXT}{head}: {type(ex).__name__}: {ex}")[:200]
         if got:
-            out.append(got)
+            out.append((name, *got))
     return out
 
 
@@ -1225,8 +1262,8 @@ def render(rec, target, tense=None):
     logfmt: its one-line summary for syslog. Loki reads its keys, so they stay. A deep analysis line adds from, the job
     of the import that queued it. An error line ends with error, its result cut to 150 characters.
     embed: one Discord embed per finding.
-    changes: one Discord embed per change to the file, for DISCORD_POSTS all, see changes(). A change whose text
-    failed is the line that says so, in place of its embed.
+    changes: (post name, Discord embed) of each fix and each change to the file whose name NOTIFICATION_POSTS lists,
+    see wanted_fix() and changes(). A change whose text failed has the line that says so, in place of its embed.
     cli: the line of a backfill."""
     t = tense or tense_of(rec)
     if t not in TENSES:
@@ -1250,8 +1287,9 @@ def render(rec, target, tense=None):
     if target == "changes":   # the fixes that the issue gate logs only keep their alert's words and color. A text that failed is its line.
         found = rec.get("findings") or []
         gone = any((f.get("action") or {}).get("code") in DELETED for f in found)   # the file is gone: only its re-grab posts
-        return [fix_post(rec, f, t) for f in found if fixes(f) and not posts(f, rec) and (f.get("action") or not gone)] + \
-            ([] if gone else [item_embed(rec, head, text, "green") if head else text for head, text in changes(rec)])
+        fix = [wanted_fix(f) for f in found if fixes(f) and not posts(f, rec) and (f.get("action") or not gone)]
+        return [(name, fix_post(rec, f, t)) for name, f in filter(None, fix)] + \
+            ([] if gone else [(name, item_embed(rec, head, text, "green") if head else text) for name, head, text in changes(rec)])
     if target == "cli":
         return cli_line(rec, t)
     raise ValueError(f"no target {target}")
