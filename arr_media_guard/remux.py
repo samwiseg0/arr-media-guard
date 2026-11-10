@@ -971,11 +971,18 @@ def legacy_639_3(pa, pb, t):
 
 
 def avc_header(pa, pb, t):
-    """Whether the AVC header (avcC) of pb is the one of pa with bytes 1 to 3, the profile, the compatibility flags and
-    the level, set from its first SPS. mkvmerge 4.9.1 wrote them as 0."""
+    """Whether the AVC header (avcC) of pb is the one that mkvmerge's avcc_c::pack() writes from the one of pa. Bytes 1
+    to 3, the profile, the compatibility flags and the level, take those of the first SPS where they are 0. mkvmerge
+    4.9.1 wrote them as 0. Bytes 4 and 5, the NAL length size and the SPS count, get their reserved bits set. Every
+    other byte stays. mkvmerge reads the count with the mask 0x0f (avcc_c::unpack()), so a count of 16 or more would
+    come out as another count, and it refuses."""
     a, b = private(pa, pb) or (b"", b"")
-    sps = a[8:8 + int.from_bytes(a[6:8], "big")] if len(a) > 8 and a[5] & 0x1f else b""
-    return len(sps) >= 4 and len(a) == len(b) and b[1:4] == sps[1:4] and a[:1] + a[4:] == b[:1] + b[4:]
+    n = a[5] & 0x1f if len(a) > 8 else 0
+    sps = a[8:8 + int.from_bytes(a[6:8], "big")] if 0 < n < 16 else b""
+    if len(sps) < 4:
+        return False
+    head = bytes(x or y for x, y in zip(a[1:4], sps[1:4])) + bytes([0xfc | a[4] & 0x03, 0xe0 | n])
+    return b == a[:1] + head + a[6:]
 
 
 def vc1_header(pa, pb, t):
@@ -1082,7 +1089,7 @@ REWRITES = (
     Rewrite(None, ("language_ietf",), "BCP 47 tag added, the one mkvmerge's table gives the legacy tag", bcp47_added),
     Rewrite(None, ("language",), "legacy tag added beside a BCP 47 tag, one that names its language", legacy_added),
     Rewrite(None, ("language", "language_ietf"), "a legacy 639-3 code becomes the BCP 47 tag, a 639-2 code the legacy tag", legacy_639_3),
-    Rewrite((AVC,), ("codec_private_data",), "bytes 1 to 3 (profile, compatibility, level) set from the first SPS", avc_header),
+    Rewrite((AVC,), ("codec_private_data",), "bytes 1 to 3 (profile, compatibility, level) set from the first SPS where 0, reserved bits of bytes 4 and 5 set", avc_header),
     Rewrite((VC1,), ("codec_private_data",), "biSize set to the length, biXPelsPerMeter and biYPelsPerMeter 0 set to 1", vc1_header),
     Rewrite(("A_VORBIS",), ("codec_private_data",), "comment list emptied, vendor kept", vorbis_header),
     Rewrite(("V_VP9",), ("codec_private_data",), "Codec Feature Metadata added where the track has no header", vp9_header),

@@ -18927,17 +18927,24 @@ def hb_mkv(path, base, packets, private=HB_HEAD, ms=lambda i: 0, length=1500, cu
 
 def test_header_kept_takes_the_avc_and_vc1_bytes_mkvmerge_writes_again():
     """mkvmerge writes the profile, compatibility and level bytes of an avcC from its first SPS, where an old mkvmerge
-    wrote 0. It writes biSize of a WVC1 BITMAPINFOHEADER as the header's length, and the pixels-per-meter fields as 1
-    where they are 0. Those exact bytes pass, in place. Any other change fails, and props_fault() takes the rule for
-    every track."""
+    wrote 0. It sets the reserved bits of bytes 4 and 5, the NAL length size and the SPS count, as an Almost Human
+    WEB-DL wrote byte 5 as 0x01. It writes biSize of a WVC1 BITMAPINFOHEADER as the header's length, and the
+    pixels-per-meter fields as 1 where they are 0. Those exact bytes pass, in place. Any other change fails, and
+    props_fault() takes the rule for every track."""
     sps = bytes([0x67, 0x64, 0x00, 0x29, 0xac, 0x1b, 0x1a, 0x50])   # made up: profile 100, level 4.1
-    avcc = lambda head: bytes([1, *head, 0xff, 0xe1]) + len(sps).to_bytes(2, "big") + sps + b"\x01\x00\x04\x68\xee\x3c\x80"
+    avcc = lambda head, size=0xff, count=0xe1: bytes([1, *head, size, count]) + len(sps).to_bytes(2, "big") + sps + b"\x01\x00\x04\x68\xee\x3c\x80"
     old, ok = avcc((0, 0, 0)), avcc((0x64, 0x00, 0x29))
     kept = lambda a, b, codec=hook.AVC: hook.header_kept(a.hex(), b.hex(), codec)
     assert kept(old, ok) and kept(ok, ok) and not kept(old, ok, "V_MPEGH/ISO/HEVC")
+    assert kept(avcc((0x64, 0x00, 0x29), count=0x01), ok) and kept(avcc((0, 0, 0), 0x03, 0x01), ok), "reserved bits set"
+    for count in (0x11, 0x10, 0xf0):   # 17 SPS would come out as 1, and a count of 0 or 16 leaves no SPS to read
+        assert not kept(avcc((0x64, 0x00, 0x29), count=count), ok[:5] + bytes([0xe0 | count & 0x0f]) + ok[6:]), hex(count)
     for why, new in (("another level", avcc((0x64, 0x00, 0x28))), ("a byte after the head", ok[:4] + b"\xfe" + ok[5:]), ("a byte more", ok + b"\0"),
-                     ("an SPS byte", ok.replace(b"\xac\x1b", b"\xac\x1c"))):
+                     ("an SPS byte", ok.replace(b"\xac\x1b", b"\xac\x1c")), ("another SPS count", avcc((0x64, 0x00, 0x29), count=0xe2)),
+                     ("another NAL length size", avcc((0x64, 0x00, 0x29), 0xfe))):
         assert not kept(old, new), why
+    assert not kept(avcc((0x64, 0x00, 0x28)), ok), "mkvmerge keeps a level that is not 0"
+    assert not kept(avcc((0x64, 0x00, 0x29), count=0x01), avcc((0x64, 0x00, 0x29), count=0x21)), "a reserved bit left clear"
     head = bytearray(40)
     head[0:4], head[4:8], head[8:12], head[12:16], head[16:20] = (71).to_bytes(4, "little"), (1920).to_bytes(4, "little"), (1080).to_bytes(4, "little"), \
         b"\x01\x00\x18\x00", b"WVC1"
@@ -18958,14 +18965,17 @@ def test_header_kept_takes_the_avc_and_vc1_bytes_mkvmerge_writes_again():
     assert hook.props_fault(j, new) == "track 0 changed its codec_private_data"
 
 
-def test_resub_takes_the_avc_profile_and_level_mkvmerge_writes_from_the_sps(sync_mkv, tmp_path, settings):
-    """mkvmerge 4.9.1 wrote the profile, compatibility and level bytes of an avcC as 0. A remux writes them from the
-    SPS, and passes. Every other byte of the header stays, and every packet matches."""
+@pytest.mark.parametrize("cleared", ["profile", "reserved"])
+def test_resub_takes_the_avc_header_bytes_mkvmerge_writes_again(sync_mkv, tmp_path, settings, cleared):
+    """mkvmerge 4.9.1 wrote the profile, compatibility and level bytes of an avcC as 0. An Almost Human WEB-DL left the
+    reserved bits of the SPS count clear, and here the NAL length size's too. A remux writes those bytes again, and
+    passes. Every other byte of the header stays, and every packet matches."""
     path = str(tmp_path / "f.mkv")
     data = (sync_mkv / "f.mkv").read_bytes()
     made = bytes.fromhex(REAL_MKVMERGE(str(sync_mkv / "f.mkv"))["tracks"][0]["properties"]["codec_private_data"])
-    assert data.count(made) == 1 and made[1:4] != b"\0\0\0"
-    (tmp_path / "f.mkv").write_bytes(data.replace(made, made[:1] + b"\0\0\0" + made[4:]))
+    assert data.count(made) == 1 and made[1:4] != b"\0\0\0" and made[4] & 0xfc == 0xfc and made[5] & 0xe0 == 0xe0
+    head = b"\0\0\0" + made[4:6] if cleared == "profile" else made[1:4] + bytes([made[4] & 0x03, made[5] & 0x1f])
+    (tmp_path / "f.mkv").write_bytes(data.replace(made, made[:1] + head + made[6:]))
     settings(keep_days=0)
     _, result, info = hook.resub(path, REAL_MKVMERGE(path), os.stat(path), True, {2: {"rate": "1/1", "offset": 1.0}})
     assert result == "subtitles remuxed" and all(e["match"] for e in info["proof"]), (result, info)

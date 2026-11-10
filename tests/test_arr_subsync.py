@@ -149,9 +149,12 @@ def test_a_right_track_timed_for_24_fps_gets_the_ratio_1001():
 
 
 def test_a_cut_with_two_offsets_alerts_and_keeps_its_times():
-    """The late half of the track is 8 seconds late, a scene the audio lacks. No frame-rate ratio explains it."""
+    """The late half of the track is 8 seconds late, a scene the audio lacks. No frame-rate ratio explains it. The
+    reason words each window's sign as late or early, in time order, as the alert does."""
     r = run(cues(RIGHT, where=lambda i: 8.0 if FIRST + GAP * i > DURATION / 2 else 0.0))
     assert r["verdict"] == "match" and r["timing"]["fix"] is None and r["timing"]["piecewise"], r["timing"]
+    assert r["timing"]["why"] == "the cues are off by 0.00 s early and 8.00 s late from the first window to the last, which no " \
+                                 "frame-rate ratio explains", r["timing"]
 
 
 @pytest.mark.parametrize("cut", [1.4, 2.1])

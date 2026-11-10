@@ -1129,15 +1129,17 @@ def side_stats(path):
 # for a change of speed or wording, keeps every older result. tests/test_arr_media_guard.py checks each entry against
 # SUB_FINDINGS and the version.
 SUB_CHECKS = {
-    "subtitle_match": {"version": 3, "fixes": {2: ["off", "steps"]}},   # the word check of a subtitle in an audio
+    "subtitle_match": {"version": 4, "fixes": {2: ["off", "steps"]}},   # the word check of a subtitle in an audio
                                                        # language, and its fix. Version 2 reads a roll-up caption by its new
                                                        # line, and the deep analysis of 2.7.0 fitted a drift. Both can fix or
                                                        # clear times that version 1 left off or in steps. In version 3 the
                                                        # whole-file timing takes the place of its fix in --sub-time and the
                                                        # deep analysis, and block timing 5 rechecks those results. Alone,
                                                        # at an import or --sub-check, it fixes no more than version 2, so
-                                                       # version 3 adds no entry.
-    "reference_timing": {"version": 1, "fixes": {}},   # a subtitle timed against one whose words matched
+                                                       # version 3 adds no entry. Version 4 words each window's offset as
+                                                       # late or early, and adds no entry.
+    "reference_timing": {"version": 2, "fixes": {}},   # a subtitle timed against one whose words matched. Version 2 words
+                                                       # each slice's offset as late or early, and adds no entry.
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
     "garbled_repair": {"version": 4, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,

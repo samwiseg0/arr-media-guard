@@ -412,10 +412,11 @@ def fit(got, ends, pairs, cues, duration, lead=CUE_LEAD, unit="window"):
         mid, half = (max(m) + min(m)) / 2, (max(m) - min(m)) / 2
         if half <= TOLERANCE and miss <= TOLERANCE and max(abs(b0 - mid), abs(b1 - mid)) < MIN_SHIFT:
             fits[r] = (round(mid - lead * float(r), 3), max(abs(b0 - mid), abs(b1 - mid)))
-    span = "".join(f", {x:+.2f} s" for x in d[1:-1]) + f" and {d[-1]:+.2f} s late"
+    said = lambda x: f"{abs(x):.2f} s {'late' if x > 0 else 'early'}"   # the sign as report.late_by() words it
+    span = "".join(f", {said(x)}" for x in d[1:-1]) + f" and {said(d[-1])}"
     if not fits:
         return {"fix": None, "piecewise": True, "offsets": d,
-                "why": f"the cues are off by {d[0]:+.2f} s early{span}, which no frame-rate ratio explains"}
+                "why": f"the cues are off by {said(d[0])}{span} from the first {unit} to the last, which no frame-rate ratio explains"}
     rate = min(fits, key=lambda r: fits[r][1])   # the least error at the file's ends, and a plain offset on a near tie
     rate = Fraction(1) if Fraction(1) in fits and fits[Fraction(1)][1] <= fits[rate][1] + TOLERANCE / 2 else rate
     to = lambda r, t: (t - fits[r][0]) / float(r)   # where a cue at t moves

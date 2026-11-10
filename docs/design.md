@@ -2205,8 +2205,11 @@ remux. The rows:
   639-2 code, such as chi, as the legacy tag. That code must be und or name the same language, see
   `decide.lang_key()`, so zsm to may refuses. The code any keeps its refusal. HandBrake writes any for Any, and BCP 47
   reads it as the Anyin language.
-- AVC header. Bytes 1 to 3, the profile, the compatibility flags and the level, take those of the first SPS.
-  mkvmerge 4.9.1 wrote them as 0.
+- AVC header. mkvmerge writes the avcC again from its fields (avcc_c::pack()). Bytes 1 to 3, the profile, the
+  compatibility flags and the level, take those of the first SPS where they are 0. mkvmerge 4.9.1 wrote them as 0.
+  Bytes 4 and 5, the NAL length size and the SPS count, get their reserved bits set. A tester's Almost Human (2013)
+  WEB-DL wrote byte 5 as 0x01, and mkvmerge wrote 0xe1. Every other byte stays, the SPS and the PPS too. mkvmerge
+  reads the count with the mask 0x0f, so a count of 16 or more refuses, as 17 SPS would come out as 1.
 - VC-1 header. biSize of a BITMAPINFOHEADER of FourCC WVC1 becomes the header's length, and biXPelsPerMeter and
   biYPelsPerMeter become 1 where they are 0. ffmpeg writes a byte of padding past biSize and both as 0.
 - Vorbis comments. mkvmerge empties the comment list and keeps the vendor. The identification and setup headers stay
