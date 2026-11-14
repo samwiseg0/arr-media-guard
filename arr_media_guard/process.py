@@ -448,7 +448,8 @@ def conversion(ctx):
                        **({} if would else {"skipped": f"not Matroska: {container}"})}
     failed = None
     if got == "repack_failed":   # one embed, like a failed flag edit. A skip, a dry run or a changed original posts nothing.
-        failed = {"kind": "repack", "container": container, "why": result.partition(": ")[2][:200]}
+        failed = {"kind": "repack", "container": container, "why": result.partition(": ")[2][:200],
+                  **({"skipped": s} if (s := rec["repack"].get("skipped_audio")) else {})}
     if not would and review:
         convert.convert_list(ctx.app, rec)
     damage = rec["repack"].get("damage")

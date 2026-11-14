@@ -1190,6 +1190,8 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if fault and seen != force:
             if damage := proof.audio_damage(out, j, streams, dur, refused):   # invalid data, and the same audio stream refused
                 info["damage"] = damage
+            elif skipped := proof.skipped_audio(out, j, streams, dur, refused, info["proof"]):   # the alert names it, see report.failed_repack()
+                info["skipped_audio"] = skipped
             raise RuntimeError(fault)
         if fault:
             info["forced"] = fault

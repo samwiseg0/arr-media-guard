@@ -274,7 +274,15 @@ def after(f):
 def failed_repack(f, t):
     if f.get("note"):   # a conversion that a stopped run left, see convert.pending_recover()
         return f'{cap(f["note"])}.'
-    return f'Couldn\'t convert the {f["container"]} file to MKV, so the original was kept. {cap(f["why"])}.'
+    head, s = f'Couldn\'t convert the {f["container"]} file to MKV, so the original was kept.', f.get("skipped")
+    if not s:
+        return f'{head} {cap(f["why"])}.'
+    # mkvmerge skipped invalid audio data away from the ends, see proof.skipped_audio()
+    near = f'The {f["container"]} file is damaged near {content.hms(s["at"])}'
+    if s.get("packets"):
+        kind, new, old = s["packets"]
+        return f'{head} {near}, and the copy lost {old - new} of {old} {kind} packets. Only a different release fixes it.'
+    return f'{head} {cap(f["why"])}. {near}. Only a different release fixes it.'
 
 
 def unreadable_finding(tracks, kept=None, container=None, mark=None, remux=None):

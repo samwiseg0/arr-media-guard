@@ -1693,6 +1693,12 @@ warning alone, or a warning with a refusal of another stream. A skip near an end
 zero bytes after the last audio frame, and a clean proof converts that file. Each of these stays a
 refusal with its "Conversion to MKV failed" alert, and the original stays.
 
+The alert of such a refusal still names a skip away from the ends. It says that the file is damaged near the first skip, and that only a different release fixes
+it. A refusal for fewer packets in the new file names the packets the copy lost in place of the
+refusal, as in "The AVI file is damaged near 14:44, and the copy lost 8 of 121436 video packets." The
+decision line keeps the skip in `repack.skipped_audio`, and each proof row refused for its
+packet count keeps the count of the new file in `new_count`. Only the words change. The file never re-grabs for it.
+
 The re-grab uses the steps and safeguards of "Broken audio". They are the grab record, `REGRAB_CAP`,
 the download as one unit, the second check and "Restore after a bad upgrade". The second check runs
 the read that showed the damage again, from scratch. mkvmerge remuxes into `/dev/null` and must skip

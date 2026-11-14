@@ -10298,6 +10298,7 @@ def test_a_damaged_source_re_grabs_the_import(env, monkeypatch, signal, line, me
     assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "regrabbed"), rec
     assert rec["repack"]["damage"] == dict({"read": signal, "fault": fault, "line": line},
                                            **({"refusal": REFUSAL, "stream": 1} if signal == "mkvmerge" else {}))
+    assert "skipped_audio" not in rec["repack"]   # the damage alert names the skip, see skipped_audio()
     assert env["writes"] == [("DELETE", "moviefile/11", None), ("PUT", "movie/editor", {"movieIds": [7], "monitored": True}),
                              ("POST", "history/failed/2101", None)]
     assert env["mkvpropedit"] == [] and "audio" not in rec and len(reads) == 2   # the read that showed it, then the second check
@@ -10495,6 +10496,65 @@ def test_invalid_audio_pairs_no_track_with_a_lone_core():
     assert hook.truehd_cores([{k: v for k, v in s.items() if k != "id"} for s in streams]) == []   # ffprobe names no PID outside a TS
 
 
+def test_a_refused_avi_names_the_invalid_audio_data_of_another_stream():
+    """A DivX AVI with MP3 audio, 5076 s long. mkvmerge skipped invalid data in the audio track at 14:44, and the proof
+    refused the video for 8 packets fewer in the new file. audio_damage() counts no damage, so the alert names the skip
+    and the packets lost."""
+    path = "/m/Show (1999)/Specials/Show (1999) - S00E05 - The Film [SDTV].avi"
+    text = "\n".join(f"Warning: '{path}' track 1: This audio track contains {n} bytes of invalid data which were skipped before timestamp {t}. "
+                     "The audio/video synchronization may have been lost." for n, t in ((536, "00:14:44.112000000"), (398, "00:14:44.136000000")))
+    j = {"container": {"type": "AVI"}, "tracks": [{"id": 0, "type": "video"}, {"id": 1, "type": "audio"}]}
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "msmpeg4v3"}, {"index": 1, "codec_type": "audio", "codec_name": "mp3"}]
+    why = "stream video 0 (msmpeg4v3) holds 121428 packets in the new file, 121436 in the original"
+    rows = [{"stream": "video 0", "count": 121436, "new_count": 121428, "match": False}, {"stream": "audio 1", "count": 211608, "match": False}]
+    assert hook.audio_damage(text, j, streams, 5076.41, (0, why)) is None
+    skipped = hook.skipped_audio(text, j, streams, 5076.41, (0, why), rows)
+    assert skipped == {"stream": 1, "at": 884.112, "packets": ["video", 121428, 121436]}, skipped
+    assert hook.FINDINGS["repack"][1]({"container": "AVI", "why": why, "skipped": skipped}, "done") == (
+        "Couldn't convert the AVI file to MKV, so the original was kept. The AVI file is damaged near 14:44, and the copy lost 8 of 121436 video "
+        "packets. Only a different release fixes it.")
+    assert hook.skipped_audio(text, j, streams, 5076.41, (0, why), [dict(rows[0], new_count=121440)]) == {"stream": 1, "at": 884.112}   # more packets
+    assert hook.skipped_audio(text, j, streams, 0, (0, why), rows) is None   # no known length, see invalid_audio()
+    dub = text.replace("track 1:", "track 2:").replace("00:14:44.", "00:10:02.")   # a second audio track skips earlier
+    two = (dict(j, tracks=j["tracks"] + [{"id": 2, "type": "audio"}]), streams + [{"index": 2, "codec_type": "audio", "codec_name": "mp3"}])
+    assert hook.skipped_audio(f"{text}\n{dub}", *two, 5076.41, (0, why), []) == {"stream": 2, "at": 602.112}
+
+
+SHORT = (0, "stream video 0 (h264) holds 30912 packets in the new file, 30920 in the original")   # the packet count refusal of prove()
+SHORT_ROWS = [{"stream": "video 0", "codec": "h264", "method": "packets", "count": 30920, "new_count": 30912, "match": False}]
+FAILED = "Couldn't convert the MP4/QuickTime file to MKV, so the original was kept. "
+
+
+@pytest.mark.parametrize("case, out, refused, rows, words", [
+    ("packets lost", INVALID_AUDIO, SHORT, SHORT_ROWS,
+     "The MP4/QuickTime file is damaged near 4:21, and the copy lost 8 of 30920 video packets. Only a different release fixes it."),
+    ("another refusal", INVALID_AUDIO, (0, "the packet data of stream video 0 (h264) differ"), [],
+     "The packet data of stream video 0 (h264) differ. The MP4/QuickTime file is damaged near 4:21. Only a different release fixes it."),
+    ("no warning", "", SHORT, SHORT_ROWS, "Stream video 0 (h264) holds 30912 packets in the new file, 30920 in the original."),
+    ("end skip", invalid_audio("00:09:58.806000000", "00:09:58.832000000"), SHORT, SHORT_ROWS,
+     "Stream video 0 (h264) holds 30912 packets in the new file, 30920 in the original."),
+])
+@pytest.mark.parametrize("argv", [["--backfill", "radarr", "--convert", "--apply"], ["--check", None, "--apply"]], ids=["convert", "check"])
+def test_a_failed_conversion_names_invalid_audio_data_away_from_the_ends(env, monkeypatch, capsys, case, out, refused, rows, words, argv):
+    """mkvmerge skipped invalid data in audio stream 1 at 4:21 of the 600 s file, and the proof refused video stream 0.
+    The alert adds that the file is damaged there. A refusal for fewer packets in the new file names the packets lost
+    in place of the refusal. The conversion fails as before and re-grabs nothing. No skip, or a skip near an end, keeps
+    the refusal's words. --convert --apply posts no alert, so the decision line and the --check output carry the words."""
+    (mp4,) = mp4_films(env, monkeypatch, 1)
+    check_listed(env, monkeypatch)
+    env["repack_rc"], env["repack_out"], env["proof"] = 1, out, (refused, rows)
+    hook.main([a or mp4 for a in argv])
+    (rec,) = [r for r in log_lines(env) if r.get("outcome") and r.get("path") == mp4]
+    text = f"repack: {FAILED}{words}"
+    assert (rec["outcome"], rec["result"], rec["alerts"]) == ("repack_failed", f"repack failed: {refused[1]}", [text]), rec
+    assert "damage" not in rec["repack"] and ("skipped_audio" in rec["repack"]) == ("damaged near" in words), rec["repack"]
+    assert os.path.exists(mp4) and env["writes"] == [] and "regrab" not in rec
+    if argv[0] == "--check":
+        assert f"ALERT {text}" in capsys.readouterr().out
+    else:
+        assert [u for m, u, b in env["http"] if m == "POST"] == []
+
+
 @pytest.mark.parametrize("code, out, why", [(-9, "", "mkvmerge exited -9"), (2, "Error: not a file", "mkvmerge exited 2: Error: not a file"),
                                             (-6, "malloc(): corrupted top size", "mkvmerge exited -6: malloc(): corrupted top size")])
 def test_an_mkvmerge_probe_that_a_signal_ends_fails_with_its_text(monkeypatch, code, out, why):
@@ -10594,6 +10654,7 @@ def test_a_backfill_lists_a_damaged_source_and_never_re_grabs(env, monkeypatch):
     hook.main(["--backfill", "radarr", "--convert", "--apply"])
     (rec,) = [r for r in log_lines(env) if r.get("outcome")]
     assert (rec["outcome"], rec["repack"]["damage"]["read"]) == ("repack_failed", "mkvmerge") and "regrab" not in rec, rec
+    assert "skipped_audio" not in rec["repack"] and rec["alerts"] == [f"repack: {FAILED}The packet data of stream audio 1 (mp3) differ."]
     assert os.path.exists(mp4) and env["writes"] == [] and [u for m, u, b in env["http"] if m == "POST"] == []
     (line,) = open(os.path.join(hook.CFG.state_dir, "convert-radarr.txt")).read().splitlines()
     assert line.split("\t")[1] == "repack_failed" and line.endswith(mp4)
@@ -13869,6 +13930,7 @@ def test_up_to_three_video_packets_may_go_at_the_end(monkeypatch, tmp_path, lost
                      {0: packets_of(datas, times, frame)}, {0: packets_of(kept, [round(t, 3) for t in times[at]], frame)})
     got, proof = proved(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
     assert got == fault, got
+    assert proof[0].get("new_count") == (200 - abs(lost) if fault else None), proof   # for the alert, see skipped_audio()
     if not fault:
         assert proof[0]["match"] and proof[0]["dropped_end"] == [{"pts": round(times[i], 3), "size": 100 + i, "kind": "lost"} for i in (197, 198, 199)]
 

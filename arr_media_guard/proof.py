@@ -971,6 +971,7 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                        f"{((yt[1] - vb) - (xt[1] - va)) * 1000:+.0f} ms")
         elif x["count"] != y["count"]:
             why, bad = f"stream {name} ({s['codec_name']}) holds {y['count']} packets in the new file, {x['count']} in the original", s["index"]
+            proof[-1]["new_count"] = y["count"]   # the alert of a failed conversion names the packets lost, see skipped_audio()
         elif x["digest"] != y["digest"]:
             why, bad = f"the packet data of stream {name} ({s['codec_name']}) differ", s["index"]
         if not why and (walked := next((f"the {side}" for side, z in (("original", x), ("new file", y)) if "walked" in z), None)):
@@ -1129,6 +1130,21 @@ def audio_damage(text, j, streams, dur, fault):
     index, why = fault
     line = invalid_audio(text, j, streams, dur).get(index)
     return {"read": "mkvmerge", "fault": DAMAGE["mkvmerge"][1], "line": line, "stream": index, "refusal": why[:200]} if line else None
+
+
+def skipped_audio(text, j, streams, dur, fault, rows):
+    """The facts for the alert of a refusal fault that audio_damage() does not count, or None when invalid_audio()
+    names no skip. "stream" and "at" are the audio stream and the time in seconds of the first skip. When fault is the
+    packet count refusal of a stream with fewer packets in the new file, "packets" holds that stream's kind and its
+    counts in the new file and in the original. They come from its row of rows, see prove(). The decision stays a
+    refusal."""
+    skips = {i: m for i, line in invalid_audio(text, j, streams, dur).items() if (m := re.search(r"before timestamp (\d+):(\d+):(\d+(?:\.\d+)?)", line))}
+    if not skips:
+        return None
+    at, index = min((int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]), i) for i, m in skips.items())
+    kind = next((s["codec_type"] for s in streams if s["index"] == fault[0]), None)
+    row = next((r for r in rows if r["stream"] == f"{kind} {fault[0]}" and "new_count" in r), None)
+    return {"stream": index, "at": at, **({"packets": [kind, row["new_count"], row["count"]]} if row and row["new_count"] < row["count"] else {})}
 
 
 def source_read(damage, path, j):
