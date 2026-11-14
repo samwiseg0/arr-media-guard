@@ -941,7 +941,9 @@ def copy_lines(stream, got):
     ffmpeg and never fills a disk. got takes the count of NOISE lines, the count of the other lines, and the first
     COPY_KEEP of those in "kept". A repeat count of a kept line stays in "kept" after it, so parse_copy() counts the
     repeats of an audio decoder. got["audio_unkept"] counts the audio lines that "kept" has no room for, with their
-    repeats, see decide.copy_kind(). It is there only when such a line came."""
+    repeats, see decide.copy_kind(). got["loose_unkept"] counts the other lines that "kept" has no room for. No place
+    they name is read, so decide.whole_verdict() counts them as lines that name no place. got["truncated_unkept"]
+    counts those of them that start with decide.TAIL_LINE. Each field is there only when such a line came."""
     kept = audio = False   # whether the line before was kept, and whether it was an audio line
     for line in stream:
         if not line.strip():
@@ -960,6 +962,10 @@ def copy_lines(stream, got):
             got["kept"].append(line.rstrip("\n"))
         elif audio:
             got["audio_unkept"] = got.get("audio_unkept", 0) + 1
+        else:
+            got["loose_unkept"] = got.get("loose_unkept", 0) + 1
+            if line.strip().startswith(decide.TAIL_LINE):
+                got["truncated_unkept"] = got.get("truncated_unkept", 0) + 1
 
 
 PCM_FORMATS = ("matroska", "mov", "mp4")   # ffprobe's format names where the PCM rule holds, see pcm_audio()

@@ -1460,7 +1460,7 @@ def repair_text(r, cut=decide.REPAIR_CUT):
         if got is None:
             raise RuntimeError(f'the sidecar {r["sidecar"]["name"]} no longer fits the track')
         why = (f"{got[2]} of {len(texts)} cues were cut short" if got[2] > cut * len(texts) else None) \
-            or decide.repair_fault(got[0], r["lang"])
+            or decide.repair_fault(got[0], r["lang"], r["codepage"])
         if why:
             raise RuntimeError(why)
         return got[0]

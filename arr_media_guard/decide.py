@@ -993,6 +993,7 @@ CP1252_TEXT = "".join(chr(b) if b in CP1252_HOLES else bytes([b]).decode("cp1252
 CP1252_MAP = codecs.charmap_build(CP1252_TEXT)
 CP1252_RUNS = re.compile("[" + re.escape(CP1252_TEXT) + "]+")   # the runs of a text that cp1252 writes
 REPAIR_CUT = 0.02   # the share of a track's cues a read-back may find cut short, see subtitles.garbled_tracks()
+REPAIR_PAGES = ("utf-8", "gbk")   # the codepages of a read-back that garbled() repairs. GBK has a live case, see repair_fault().
 # The share of the letters a read-back must change to show garbled text, see recode(). In its right codepage, text
 # changes only in a few borrowed words, such as an Italian "perchè" in Romanian dialogue.
 GARBLE_SHARE = 0.01
@@ -1108,9 +1109,9 @@ def garbled(texts, tag):
     letters that read as Hebrew by their script alone. Else the reading in the tag's language wins, then one in any
     language, then the first one. The verdict is
     {"repair", "codepage", "lang", "read", "cut", "cues", "why"}. repair is True under the repair rule: the reading is
-    UTF-8 and reads as the tag's language. A UTF-8 read-back checks itself, because each character must decode. The
-    read-back of another codepage can give wrong letters with no sign, as when the muxer lost a byte. read is the
-    language the texts read as."""
+    in a codepage of REPAIR_PAGES and reads as the tag's language. A UTF-8 read-back checks itself, because each
+    character must decode. A GBK read-back must also pass repair_fault(). The read-back of another codepage can give
+    wrong letters with no sign, as when the muxer lost a byte. read is the language the texts read as."""
     texts = list(texts)
     read = text_language(texts)
     got = recode(texts, bool(read[0])) if not read[2].startswith("short") else []
@@ -1118,18 +1119,31 @@ def garbled(texts, tag):
         return None
     got = [g for g in got if g[0] == "utf-8"] or got   # text that decodes as UTF-8 is UTF-8, even when the muxer cut most of it
     cp, lang, _, cut = min(got, key=lambda g: (lang_key(g[1]) != lang_key(tag), g[1] is None))
-    why = f"the track is tagged {tag}" if not (lang and lang_key(lang) == lang_key(tag)) else None if cp == "utf-8" else \
-        "only a UTF-8 read-back is repaired"
+    why = f"the track is tagged {tag}" if not (lang and lang_key(lang) == lang_key(tag)) else None if cp in REPAIR_PAGES else \
+        "only a UTF-8 or GBK read-back is repaired"
     return {"repair": not why, "codepage": cp, "lang": lang, "read": read[0], "cut": cut, "cues": len(texts),
             "why": f"read back as {cp}, the text reads as {lang or 'no language'}" + (f", but {why}" if why else "")}
 
 
-def repair_fault(texts, tag):
-    """Why the repaired cue texts of a track tagged tag may not go in, or None. They must read as the tag's language,
-    and garbled() must find no reading in them, as it finds in text garbled twice."""
+def gb2312(c):
+    """Whether the character c is ASCII or a character of GB2312, two bytes of 0xA1 or more in GBK."""
+    return c.isascii() or min(c.encode("gbk", "replace")) >= 0xA1
+
+
+def repair_fault(texts, tag, cp="utf-8"):
+    """Why the repaired cue texts of a track tagged tag, read back as the codepage cp, may not go in, or None. They
+    must read as the tag's language, and garbled() must find no reading in them, as it finds in text garbled twice. In
+    GBK no cue may be cut, and every character must pass gb2312(). The muxer cut a cue at each byte cp1252 leaves
+    undefined, and GB2312 writes no byte under 0xA1. So a character outside GB2312 shows that the text may hold such a
+    byte, and a cut there can end a cue between two characters with no sign. A byte lost inside a cue pairs the bytes
+    after it wrong. That leaves a byte alone at the cue's end, or a pair outside GB2312."""
     read = text_language(texts)[0]
     if lang_key(read) != lang_key(tag):
         return f"the repaired text reads as {read or 'no language'}, not as {tag}"
+    if cp == "gbk" and (cut := sum("\N{REPLACEMENT CHARACTER}" in t for t in texts)):
+        return f"{cut} of {len(texts)} cues were cut short, and a GBK repair takes none"
+    if cp == "gbk" and (c := next((c for t in texts for c in t if not gb2312(c)), None)):
+        return f"the repaired text holds {c!r}, which GB2312 does not write"
     if g := garbled(texts, tag):
         return f"the repaired text is still garbled: {g['why']}"
     return None
@@ -1680,7 +1694,8 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
     the tail fault and add no doubt. Those bytes make ffmpeg read the last element again, see matroska.check(). When
     the check finds that case (read["tail_errors"]), the TAIL_LINE lines are the tail fault too. Every other line
     that names no place stays a doubt. Damage in the payload of the last Cluster prints such lines, and mkvmerge
-    copies that damage.
+    copies that damage. The count of that doubt adds read["loose_unkept"], the lines other than audio lines past the
+    ones checks.copy_lines() keeps. No place they name is read. Of them, read["truncated_unkept"] start with TAIL_LINE.
 
     The lines of an audio decoder, see copy_kind(), are the audio doubt {"doubts", "posts"}, and the doubts of the
     read pass leave them out. The probe decodes them at the start of each audio track. A decoder of ANYWHERE prints
@@ -1711,7 +1726,8 @@ def whole_verdict(runs, size, read, pcm=False, when=None):
         away = []
     if away:
         return None, zero, [f"a full read of the file found damaged data {read_places(away)}"], count, sound
-    n = read["loose"] - (read.get("truncated", 0) if read.get("tail_errors") else 0) - (read.get("kinds") or {}).get("audio", 0)
+    tail = read.get("truncated", 0) + read.get("truncated_unkept", 0) if read.get("tail_errors") else 0
+    n = read["loose"] + read.get("loose_unkept", 0) - tail - (read.get("kinds") or {}).get("audio", 0)
     return None, zero, [f"a full read of the file found {n} error{'s' if n != 1 else ''}"] if n else [], count, sound
 
 

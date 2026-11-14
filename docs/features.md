@@ -170,16 +170,17 @@ why. A sidecar named .srt that holds ASS or SSA text stays beside the new file t
 ## Garbled subtitle repair
 
 An old muxer could store a subtitle track in the wrong character set, so Greek "Καλημέρα" shows as "ÊáëçìÝñá". AMG
-repairs such *garbled* text only when it was UTF-8 read the wrong way and reads as the track's language, because only
-that repair checks itself. A sidecar with the same lines fills in lines the old muxer cut short. Text from an older
-character set, such as Windows-1250 or Windows-1256, often lost letters on the way, so AMG takes that track out of the
-file. It does the same with a garbled ASS, SSA or WebVTT track, and with a SubRip track that holds bytes that are not
-valid text, which every player shows as broken characters. A garbled `.srt` sidecar gets the same repair, or else
-a new name. The bytes stay as they are beside the video, as `<name>.<language>.broken-encoding.srt.txt`, or `.ass.txt`, `.ssa.txt` or
-`.vtt.txt` for a track in those formats. Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as
-a subtitle file, and Radarr may rename it when it renames the movie. The alert "Unreadable
-subtitles" names each file. It runs in the deep analysis and with `--sub-check` and `--sub-time`, see
-[subtitles.md](subtitles.md#garbled-subtitle-repair).
+repairs such *garbled* text only when it reads as the track's language and it was UTF-8 read the wrong way, or Chinese
+GBK with every line whole and every character in the common simplified set. A UTF-8 repair checks itself. A GBK repair
+can miss one rare cut, which ends a line early with its right letters. A sidecar with the same lines fills in lines
+the old muxer cut short. Text from an older character set, such as Windows-1250 or Windows-1256, often lost letters on
+the way, so AMG takes that track out of the file. It does the same with a garbled ASS, SSA or WebVTT track, and with a
+SubRip track that holds bytes that are not valid text, which every player shows as broken characters. A garbled `.srt`
+sidecar gets the same repair, or else a new name. The bytes stay as they are beside the video, as
+`<name>.<language>.broken-encoding.srt.txt`, or `.ass.txt`, `.ssa.txt` or `.vtt.txt` for a track in those formats.
+Players skip a `.txt` file, and so does Bazarr. Sonarr and Radarr list it as a subtitle file, and Radarr may rename it
+when it renames the movie. The alert "Unreadable subtitles" names each file. It runs in the deep analysis and with
+`--sub-check` and `--sub-time`, see [subtitles.md](subtitles.md#garbled-subtitle-repair).
 
 ## Broken audio and corrupt video
 

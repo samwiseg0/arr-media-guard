@@ -1142,7 +1142,7 @@ SUB_CHECKS = {
                                                        # each slice's offset as late or early, and adds no entry.
     "foreign_timing": {"version": 1, "fixes": {}},     # Foreign subtitle timing and Incorrect subtitle identification. A
                                                        # version 2 that fixes the subtitles 1 left off adds 2: ["off"].
-    "garbled_repair": {"version": 4, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
+    "garbled_repair": {"version": 5, "fixes": {2: None}},   # Version 2 repairs only UTF-8 text, takes out a garbled ASS,
                                                        # SSA or WebVTT track, and repairs or renames a garbled .srt sidecar.
                                                        # Version 1 checked no sidecar and no ASS, SSA or WebVTT track. A
                                                        # result names no codec, so each older result gets one recheck.
@@ -1152,6 +1152,8 @@ SUB_CHECKS = {
                                                        # change, a run names it, or its result is pending. Version 4 judges
                                                        # each cue and keeps right CJK text. It only drops false verdicts, and
                                                        # a recheck cannot bring back a track taken out, so it adds no entry.
+                                                       # Version 5 repairs GBK text too. A track it repairs was taken out
+                                                       # before, unless a run kept it, so it adds no entry either.
     "flash": {"version": 3, "fixes": {2: ["fix"], 3: ["fix"]}},    # lines that flash by too fast to read. Version 2
                                                        # writes the new ends of a HandBrake ASS track, whose events end in a
                                                        # NUL byte. Version 1 failed there, and its result says fix. Version 3
@@ -1558,7 +1560,7 @@ def garbled_tracks(path, j, sides, full=False):
                     got, side = fit, (s, blocks)
                     break
             new, filled, left = got
-            why = (f"{left} of {len(cues)} cues were cut short" if left > decide.REPAIR_CUT * len(cues) else None) or decide.repair_fault(new, tags[p])
+            why = (f"{left} of {len(cues)} cues were cut short" if left > decide.REPAIR_CUT * len(cues) else None) or decide.repair_fault(new, tags[p], g["codepage"])
             if why:
                 g = dict(g, repair=False, why=f'{g["why"]}, but {why}')
             elif side:

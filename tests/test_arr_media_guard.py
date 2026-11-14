@@ -23802,17 +23802,51 @@ def scene_srt(texts):
 def test_a_garbled_track_reads_back_in_its_codepage(name, cp):
     """An old muxer read a sidecar of each codepage as cp1252. The cp1252 bytes of the garbled text read back as that
     codepage, in the text's language. That holds for Latin text whose words stay readable too, as French or Polish.
-    Only a UTF-8 reading is repaired, because only its decode checks each character. Each cue reads back whole, or is
-    cut where the muxer cut it. UTF-8 marks a cut with U+FFFD."""
+    Only a UTF-8 or GBK reading is repaired, because only their read-backs show a lost byte, see
+    test_a_gbk_read_back_that_may_have_lost_a_byte_is_not_repaired(). Each cue reads back whole, or is cut where the
+    muxer cut it. UTF-8 marks a cut with U+FFFD."""
     d, texts = hook.arr_decide, scene(name)
     lang = "chi" if name == "trad" else name
     bad = old_mux(texts, cp)
     g = d.garbled(bad, lang)
-    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, cp == "utf-8"), g
-    assert g["why"].endswith(", but only a UTF-8 read-back is repaired") == (cp != "utf-8"), g
+    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, cp in ("utf-8", "gbk")), g
+    assert g["why"].endswith(", but only a UTF-8 or GBK read-back is repaired") == (cp not in ("utf-8", "gbk")), g
     back = [d.read_back(t, cp) for t in bad]
     assert all(b.endswith("\ufffd") == cut and t.startswith(b.removesuffix("\ufffd")) for (b, cut), t in zip(back, texts))
     assert g["cut"] == sum(cut for _, cut in back) and (g["cut"] > 0) == ((name, cp) in (("rus", "utf-8"), ("jpn", "cp932"))), g
+
+
+def test_a_gbk_read_back_that_may_have_lost_a_byte_is_not_repaired():
+    """A real track tagged chi held GBK bytes that a tool read as Latin-1 and wrote as UTF-8, so "你好" showed as
+    "ÄãºÃ". Its GBK read-back is repaired when no cue is cut and every character is one of GB2312, whose bytes are
+    0xA1 or more. The muxer cuts a cue at each byte cp1252 leaves undefined. Each shape that may hide a lost byte is
+    not repaired: a cue cut inside a character (倎 is 0x82 0x81), a byte lost inside a cue, a character outside GB2312
+    (啰 is 0x86 0xAA, which the muxer keeps), and the control character a Latin-1 muxer leaves (匯 is 0x85 0x52). The
+    right cues of a mixed track stay as they are, and so do spaces and tags. The limit: 亖 is 0x81 0x81, so the muxer cuts its cue between two
+    characters. In a track with no other sign, that cue ends early with its right letters."""
+    d, texts = hook.arr_decide, scene("chi")
+    fault = lambda bad: d.repair_fault(hook.repaired(bad, "gbk")[0], "chi", "gbk")
+    bad = old_mux(texts, "gbk")
+    assert d.garbled(bad, "chi")["repair"] and hook.repaired(bad, "gbk") == (texts, [], 0) and fault(bad) is None
+    mixed = [t if k % 4 else bad[k] for k, t in enumerate(texts)]   # a garbled cue, then three right ones
+    marked = [f"<i>{t}</i>" if k % 2 else f"- {t[:3]} {t[3:]}" for k, t in enumerate(texts)]   # ASCII in each cue
+    assert d.garbled(old_mux(marked, "gbk"), "chi")["repair"] and hook.repaired(old_mux(marked, "gbk"), "gbk")[0] == marked
+    assert fault(old_mux(marked, "gbk")) is None
+    assert d.garbled(mixed, "chi")["repair"] and hook.repaired(mixed, "gbk")[0] == texts and fault(mixed) is None
+    inside = old_mux(texts + ["我们去倎那里"], "gbk")
+    assert inside[-1] == "ÎÒÃÇÈ¥\u201a" and fault(inside) == f"1 of {len(inside)} cues were cut short, and a GBK repair takes none"
+    other = old_mux(texts + ["今天啰天气很好。"], "gbk")
+    assert d.garbled(other, "chi")["repair"] and fault(other) == "the repaired text holds '啰', which GB2312 does not write"
+    raw = "今天天气很好，我们走吧。".encode("gbk")
+    lost = bad + [(raw[:15] + raw[16:]).decode("cp1252")]   # the bytes after the lost one pair wrong, and the last is alone
+    assert hook.repaired(lost, "gbk")[0][-1] == "今天天气很好，蚊亲甙伞\ufffd" and fault(lost) == f"1 of {len(lost)} cues were cut short, and a GBK repair takes none"
+    early = bad + [(raw[:5] + raw[6:]).decode("cp1252")]   # here a pair after the lost byte is no GBK character
+    assert d.garbled(early, "chi") is None   # no codepage reads every cue back
+    latin1 = bad + ["今天匯天气".encode("gbk").decode("latin-1")]
+    g = d.garbled(latin1, "chi")
+    assert g["codepage"] == "gbk" and fault(latin1) == "the repaired text holds '\\x85', which GB2312 does not write", (g, fault(latin1))
+    limit = old_mux(texts + ["我看亖这个"], "gbk")
+    assert limit[-1] == "ÎÒ¿´" and fault(limit) is None and hook.repaired(limit, "gbk")[0][-1] == "我看"
 
 
 @pytest.mark.parametrize("name", sorted(CORPUS))
@@ -23828,13 +23862,13 @@ def test_right_cjk_text_with_punctuation_is_not_garbled(name, cp, mark, every):
     """Right CJK text with a mark at the end of 1 cue in every. The cp1252 bytes of "——" read back as cp932 give one
     kanji, so a cp932 reading of right Japanese text counted. Garbled text holds only the letters cp1252 writes, and
     this text holds CJK letters, so it is not garbled. The same text from an old muxer still is, with the mark when
-    the codepage writes it."""
+    the codepage writes it. Of these codepages only GBK is repaired."""
     d, lang = hook.arr_decide, "chi" if name == "trad" else name
     texts = [t + mark if k % every == 0 else t for k, t in enumerate(scene(name))]
     assert d.garbled(texts, lang) is None
     fits = mark.encode(cp, "replace").decode(cp) == mark
     g = d.garbled(old_mux(texts if fits else scene(name), cp), lang)
-    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, False), g
+    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, cp == "gbk"), g
 
 
 def test_a_cue_with_a_letter_cp1252_does_not_write_stays_as_it_is():
@@ -23853,10 +23887,10 @@ def test_a_cue_with_a_letter_cp1252_does_not_write_stays_as_it_is():
                                              ("kor", "cp949", 60)])
 def test_a_garbled_track_with_right_cues_reads_back(name, cp, share):
     """An old muxer garbled a CJK track, and share percent of its cues hold right text. The right cues stay as they
-    are, and the garbled ones read back, so the track is garbled."""
+    are, and the garbled ones read back, so the track is garbled. Of these codepages only GBK is repaired."""
     lang, right, bad = "chi" if name == "trad" else name, scene(name), old_mux(scene(name), cp)
     g = hook.arr_decide.garbled([r if k * share % 100 < share else b for k, (r, b) in enumerate(zip(right, bad))], lang)
-    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, False), g
+    assert (g["codepage"], g["lang"], g["repair"]) == (cp, lang, cp == "gbk"), g
 
 
 THREE = ["待って", "本当か", "知らん", "何故だ", "嘘だろ", "急げよ", "逃げろ", "黙れよ", "寒いね", "眠いよ", "帰るぞ", "やめろ", "まさか", "なんで"]
@@ -24005,7 +24039,7 @@ def test_garbled_repair_2_rechecks_every_result_that_made_the_check_once():
     with or without a finding. An import makes no garbled check, so its result stays, and so does one of version 2.
     Version 3 takes out a SubRip track with bytes that are not UTF-8, and version 4 keeps right CJK cues. Neither
     rechecks a result."""
-    assert hook.SUB_CHECKS["garbled_repair"] == {"version": 4, "fixes": {2: None}}
+    assert hook.SUB_CHECKS["garbled_repair"] == {"version": 5, "fixes": {2: None}}
     for mode in ("sub_check", "sub_time", "deep"):
         old = saved(mode)
         old["checks"]["garbled_repair"]["version"] = 1
@@ -24984,18 +25018,23 @@ def test_a_garbled_track_that_flashes_and_cannot_be_repaired_is_taken_out(env, m
 # The shapes of garbled text the owner's rule tells apart (2026-10-16), each as (texts, the codepage the old muxer read as
 # cp1252, the tag). pol_lost is Polish from cp1250 with a lost byte: Ź is 0x8F, which cp1252 leaves undefined, so the
 # muxer cut the cue there. per is Persian from cp1256, which loses پ, چ and گ the same way. utf8 is Polish from UTF-8.
-# fre is French in its right encoding. ara_credits is Arabic from cp1256 after Latin credit lines.
-SHAPES = {"pol_lost": (lambda: scene("pol", 2) + ["Źle się czuję, wiesz?"], "cp1250", "pol"),
+# fre is French in its right encoding. ara_credits is Arabic from cp1256 after Latin credit lines. gbk is Chinese from
+# GBK, as a live track. gbk_cut adds 倎, 0x82 0x81, so the muxer cut its cue inside the character. gbk_ext adds 啰,
+# 0x86 0xAA, which the muxer keeps and GB2312 does not write.
+SHAPES = {"gbk": (lambda: scene("chi", 2), "gbk", "chi"), "gbk_cut": (lambda: scene("chi", 2) + ["我们去倎那里"], "gbk", "chi"),
+          "gbk_ext": (lambda: scene("chi", 2) + ["今天啰天气很好。"], "gbk", "chi"),
+          "pol_lost": (lambda: scene("pol", 2) + ["Źle się czuję, wiesz?"], "cp1250", "pol"),
           "per": (lambda: [t.replace("ی", "ي").replace("ک", "ك") for t in scene("per", 6)], "cp1256", "per"),   # as cp1256 writes Persian
           "utf8": (lambda: [t for t in scene("pol", 2) if not set(t.encode()) & set(hook.arr_decide.CP1252_HOLES)], "utf-8", "pol"),
           "fre": (lambda: scene("fre", 2), "cp1252", "fre"), "ara_credits": (lambda: CREDIT_LINES + scene("ara", 2), "cp1256", "ara")}
 
 
 @pytest.mark.parametrize("kind, want", [("pol_lost", "removed"), ("per", "removed"), ("utf8", "repaired"), ("fre", None),
-                                        ("ara_credits", "removed")])
+                                        ("ara_credits", "removed"), ("gbk", "repaired"), ("gbk_cut", "removed"), ("gbk_ext", "removed")])
 def test_each_shape_of_a_garbled_track(env, monkeypatch, settings, tmp_path, garbled_av, kind, want):
     """A track that reads right only in a one-byte codepage leaves the file, and its packets go beside the video byte
-    for byte. A track of UTF-8 read as cp1252 is repaired. A right track stays as it is."""
+    for byte. A track of UTF-8 or GBK read as cp1252 is repaired, but a GBK track with a cue cut leaves the file. A
+    right track stays as it is."""
     texts, cp, tag = SHAPES[kind][0](), SHAPES[kind][1], SHAPES[kind][2]
     garbled_run(env, monkeypatch, settings, tmp_path, garbled_av, [(10 + 3.0 * i, 12.5 + 3.0 * i, t) for i, t in enumerate(texts)], cp, tag)
     monkeypatch.setattr(hook, "sub_verdicts", lambda *a, **k: {})
@@ -25008,7 +25047,7 @@ def test_each_shape_of_a_garbled_track(env, monkeypatch, settings, tmp_path, gar
         assert "garbled" not in rec and codes is None and not os.path.exists(side), rec.get("garbled")
     elif want == "repaired":
         got = [t for _, _, t in REAL_SUBTITLE_CUES(env["path"], REAL_MKVMERGE(env["path"]), {"s1"}, True)["s1"]]
-        assert (rec["garbled"]["s1"]["codepage"], codes, got) == ("utf-8", ["subtitle_repaired"], texts) and not os.path.exists(side), codes
+        assert (rec["garbled"]["s1"]["codepage"], codes, got) == (cp, ["subtitle_repaired"], texts) and not os.path.exists(side), codes
     else:
         assert (rec["garbled"]["s1"]["codepage"], rec["garbled"]["s1"]["repair"], codes) == (cp, False, ["subtitle_garbled_removed"]), rec["garbled"]
         assert hook.sub_codecs(REAL_MKVMERGE(env["path"])) == {} and open(side, "rb").read() == raw
@@ -25033,7 +25072,8 @@ def garbled_side(env, monkeypatch, settings, tmp_path, garbled_av, raw, name, fi
     return path
 
 
-@pytest.mark.parametrize("kind, want", [("pol_lost", "renamed"), ("per", "renamed"), ("utf8", "repaired"), ("fre", None), ("cp1250", None)])
+@pytest.mark.parametrize("kind, want", [("pol_lost", "renamed"), ("per", "renamed"), ("utf8", "repaired"), ("fre", None), ("cp1250", None),
+                                        ("gbk", "repaired"), ("gbk_cut", "renamed"), ("gbk_ext", "renamed")])
 def test_each_shape_of_a_garbled_sidecar(env, monkeypatch, settings, tmp_path, garbled_av, kind, want):
     """A UTF-8 .srt sidecar whose text reads right only in another codepage is renamed with its bytes as they are. One
     of UTF-8 read as cp1252 is repaired as a track is: only the text of its cues changes, and its original is kept. A

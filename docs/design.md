@@ -676,7 +676,9 @@ every frame bad printed the same 1 or 2 lines. mpv played it as noise or silence
 So the lines of one audio decoder, with ffmpeg's repeat counts, post "Audio may be broken" over `AUDIO_BAD` (10).
 The doubt says "the start of the audio failed to decode, with 2 errors". A TrueHD or MLP line can come from any place,
 so their doubt names no place, as "a full read of the file found 1800 audio errors". The read pass keeps its first
-1000 lines, and the count adds the audio lines past them. A TrueHD track bad in its middle printed 1800 lines.
+1000 lines, and the count adds the audio lines past them. A TrueHD track bad in its middle printed 1800 lines. The
+error count of the other lines adds the lines past them too. AMG reads no place they name, so they count as lines
+that name no place. Up to 2.21.1 a file with 1216 lines said "a full read of the file found 1000 errors".
 
 Under the bound, `checks.audio_samples()` takes one sample of each audio track. It leaves out a TrueHD core that the
 read pass leaves out, and the track numbers count the other audio streams, as a player lists them. A sample decodes
@@ -717,7 +719,7 @@ place stays a doubt. Damage in the payload of the last Cluster prints such lines
 mkvmerge copies that damage with no warning, so the header repair cannot end it. The tail fault adds no doubt, and the
 note of the decision line says the header repair removes it. The decision line keeps the count of those bytes in
 `whole.ffmpeg.tail` and the check's answer in `whole.ffmpeg.tail_errors`. `whole.ffmpeg.truncated` counts the
-"Truncating packet" lines. The same errors in a file with no such bytes stay a doubt.
+"Truncating packet" lines, and `whole.ffmpeg.truncated_unkept` those past the kept lines. The same errors in a file with no such bytes stay a doubt.
 
 **Play times.** The doubts of the whole-file check and of the import's zero probe name play times, from the Cues, see
 `checks.play_times()`. So a gap reads the same whichever check found it. The read pass names the time of each byte, one
@@ -2740,13 +2742,26 @@ tag wins. The check reads the dialogue of an ASS, SSA or WebVTT cue: override bl
 the drawing commands after `{\p1}` and WebVTT tags drop out, see `subtitles.dialogue()`. A no-break space stays,
 because garbled "à" holds one.
 
-**The repair rule.** A garbled SubRip track is repaired when its reading is UTF-8 and reads as the language of its tag.
-Every character of a UTF-8 read-back must decode, so the read-back checks itself. A one-byte codepage decodes almost
-every byte. When the muxer lost a byte, the read-back drops or changes letters and nothing shows it. Persian in cp1256
-loses letters such as پ, چ and گ that way. A latin-1 muxer leaves control characters that read back as wrong letters.
-So any other reading leaves the file. So does a reading that matches no language or another language than the tag,
-and a garbled ASS, SSA or WebVTT track, because the proof checks the new text of a SubRip track only. The rule holds
-for Latin text such as French, whose garbled words still read as French, because most of them are plain ASCII.
+**The repair rule.** A garbled SubRip track is repaired when its reading is UTF-8 or GBK and reads as the language of
+its tag (`REPAIR_PAGES`). Every character of a UTF-8 read-back must decode, so the read-back checks itself. A one-byte
+codepage decodes almost every byte. When the muxer lost a byte, the read-back drops or changes letters and nothing shows
+it. Persian in cp1256 loses letters such as پ, چ and گ that way. A latin-1 muxer leaves control characters that read
+back as wrong letters. So any other reading leaves the file. So does a reading that matches no language or another
+language than the tag, and a garbled ASS, SSA or WebVTT track, because the proof checks the new text of a SubRip track
+only. The rule holds for Latin text such as French, whose garbled words still read as French, because most of them are
+plain ASCII.
+
+A GBK read-back is repaired only when no cue is cut and every character is one of GB2312, ASCII or two bytes of 0xA1 or
+more (`decide.gb2312()`, in `decide.repair_fault()`). The muxer cuts a cue at each byte cp1252 leaves undefined, and
+GB2312 writes no such byte. A character outside GB2312, as 啰 (0x86 0xAA), shows that the text may hold one. A cut at
+the second byte of a character leaves the first byte alone at the cue's end, which reads back as U+FFFD. A byte lost
+inside a cue pairs the bytes after it wrong. That leaves a byte alone at the cue's end, a pair outside GB2312, or a
+pair that does not decode. The control character of a latin-1 muxer is outside GB2312 too. One limit stays: a cut at
+the first byte of a character outside GB2312, as 亖 (0x81 0x81), ends the cue between two characters. In a track that
+shows no other such character, that cue ends early with its right letters, and nothing shows it. A real track tagged
+chi held GBK bytes that a tool read as Latin-1, so "你好" (0xC4 0xE3 0xBA 0xC3) showed as "ÄãºÃ". All 793 cues read
+back whole, in GB2312, and 2.21.1 and older took it out. Big5 (cp950), cp949 and cp932 stay closed, with no real
+case. cp932 cuts most Japanese tracks, because 0x81, the first byte of "、" and "。", is undefined in cp1252.
 
 **The word check.** The word check of "Subtitle match" compares the heard words with the cue text, so it cannot judge
 garbled text. A garbled track whose words do not match keeps its place: its verdict becomes `unknown` with `held`, and
@@ -2758,7 +2773,7 @@ alerts and nothing is pending, see "Long subtitle track handling".
 rebuilds the text from the same inputs, so it shows that the remux wrote the plan, never that the plan
 is right. These guards carry that:
 
-- The track's own text is read back from UTF-8.
+- The track's own text is read back from UTF-8 or GBK.
 - A cue cut inside a character gets U+FFFD there and counts as cut. When more than 2 percent of the cues are cut
   (`REPAIR_CUT`), the track is not repaired. The remux counts again over every cue it writes, and a cue that does not
   read back stops it.

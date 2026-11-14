@@ -346,6 +346,8 @@ file. An import does not. This check needs no language detection.
 
 - When the track was UTF-8 read the wrong way and its text then reads as the language of its tag, AMG writes the track
   back readable. It does that in one remux, which it checks line by line. Only a SubRip track is repaired.
+- A Chinese track in GBK read the wrong way gets the same repair when no line was cut short and every character is one
+  of GB2312, the common simplified set. Else it goes out of the file.
 - A line the old muxer cut short stays cut, unless a sidecar holds it whole. Such a sidecar, as the `Movie.3.srt` Radarr
   writes, must hold the same lines as the track.
 - When more than 2 percent of the lines were cut short, AMG does not repair the track.

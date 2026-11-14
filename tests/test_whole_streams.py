@@ -97,6 +97,26 @@ def test_truehd_lines_name_no_place_and_count_past_the_kept_lines():
                                 "    Last message repeated 3 times\n"), got)
     assert (len(got["kept"]), got["lines"], got["audio_unkept"]) == (hook.COPY_KEEP, hook.COPY_KEEP + 2, 1 + 449)
 
+
+def test_the_error_count_takes_the_lines_past_the_kept_ones():
+    """A tester's alert said "A full read of the file found 1000 errors", and the read pass printed 1216 lines. The
+    lines past the COPY_KEEP kept ones count as lines that name no place, also when one names a byte. The audio lines
+    past them stay in the audio doubt. The "Truncating packet" lines past them are the tail fault only with
+    tail_errors."""
+    h264, tail = "[h264 @ 0x1] Invalid NAL unit size (9 > 4).", "Truncating packet of size 5036 to 69"
+    got = {"kept": [], "lines": 0, "noise": 0}
+    hook.copy_lines(io.StringIO(f"{h264}\n" * 1216), got)
+    read = dict(D.parse_copy("\n".join(got["kept"]), 0, SIZE), **{k: v for k, v in got.items() if k != "kept"})
+    assert (read["lines"], read["loose"], read["loose_unkept"]) == (1216, hook.COPY_KEEP, 216), read
+    assert D.whole_verdict([], SIZE, read)[2] == ["a full read of the file found 1216 errors"]
+    got = {"kept": [], "lines": 0, "noise": 0}
+    hook.copy_lines(io.StringIO(f"{h264}\n" * hook.COPY_KEEP + "[dca @ 0x2] x\n    Last message repeated 5 times\n"
+                                f"[h264 @ 0x1] bad bytes at pos 500\n{tail}\n{tail}\n"), got)
+    read = dict(D.parse_copy("\n".join(got["kept"]), 0, SIZE), **{k: v for k, v in got.items() if k != "kept"})
+    assert (read["audio_unkept"], read["loose_unkept"], read["truncated_unkept"], read["pos"]) == (6, 3, 2, []), read
+    assert D.whole_verdict([], SIZE, read)[2] == [f"a full read of the file found {hook.COPY_KEEP + 3} errors"]
+    assert D.whole_verdict([], SIZE, dict(read, tail=1, tail_errors=True))[2] == [f"a full read of the file found {hook.COPY_KEEP + 1} errors"]
+
 def test_a_sample_past_the_lines_of_the_probe_posts():
     """Review F1 2026-10-26: a track with every frame bad printed 2 lines in the read pass, as one bad frame does. Each
     sample opens the file and prints the probe's lines again, so only the errors past them count. A sample that did
@@ -292,6 +312,18 @@ def test_the_truehd_count_takes_the_lines_past_the_kept_ones(streams_media, tmp_
     monkeypatch.setattr(hook, "COPY_KEEP", 2)
     cut = check(streams_media, "truehd_all")["whole"]
     assert "audio_unkept" not in full["ffmpeg"] and cut["ffmpeg"]["audio_unkept"] > D.AUDIO_BAD and cut["audio"] == full["audio"], (full, cut)
+
+
+def test_the_video_count_takes_the_lines_past_the_kept_ones(streams_media, tmp_path, settings, monkeypatch):
+    """The doubt of bad H.264 frames keeps its count when the kept lines stop after the first one."""
+    settings(state_dir=str(tmp_path))
+    full = check(streams_media, "video_start")["whole"]["ffmpeg"]
+    monkeypatch.setattr(hook, "COPY_KEEP", 1)
+    rec = check(streams_media, "video_start")
+    cut = rec["whole"]["ffmpeg"]
+    n = full["loose"]
+    assert n > 1 and "loose_unkept" not in full and (cut["lines"], cut["loose"], cut["loose_unkept"]) == (n, 1, n - 1), (full, cut)
+    assert rec["findings"][0]["doubts"] == [f"a full read of the file found {n} errors"], rec
 
 
 @pytest.mark.parametrize("name, kind, words", [
