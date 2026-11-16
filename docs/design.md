@@ -1057,8 +1057,8 @@ conversion, a header repair and Plex did. `outcome` holds the outcome code, `res
 `recheck` the plan right after an edit, which the audit reads. `findings` holds each finding with its
 facts and its action, `alert_kinds` their kinds, and `alerts` their text, see "Alerts". A job whose file the re-grab of
 its download deleted logs `deleted_with_download`, with the fault kind of that re-grab in `fault`. An error line of a run
-of `process.STEPS` has an `id`, the exception in `result` and its first frames in `trace`. The frames reach the step that
-raised, and its line.
+of `process.STEPS` has an `id`, the exception in `result` and its frames in `trace`: the four outermost, which reach the step that
+raised, and the four nearest the line that raised, with a line of dots for the frames between them.
 
 The outcome, reason and Plex codes are stable, so queries and alerts can match on them. Each step
 that makes a result gives its outcome code with it, and a result with no code logs `other`. The

@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The decision log, its summary in syslog, and the Discord posts. report.py words them."""
-import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, urllib.error, urllib.request
+import contextlib, datetime, hashlib, json, os, re, sqlite3, syslog, time, traceback, urllib.error, urllib.request
 
 from . import apps, checks, config, decide, ff, health, report, runner, store
+
+
+def trace(ex):
+    """The trace of an error line: the four outermost frames, which reach the step of process.STEPS that raised, and the
+    four nearest the line that raised. A line of dots stands for the frames between them."""
+    tb, fmt = traceback.extract_tb(ex.__traceback__), traceback.format_list
+    return "".join(fmt(tb) if len(tb) <= 8 else fmt(tb[:4]) + ["  ...\n"] + fmt(tb[-4:]))[:2400]
 
 
 def log(rec):

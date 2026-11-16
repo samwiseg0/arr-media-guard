@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
-import collections, contextlib, dataclasses, datetime, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, traceback, types, urllib.error, urllib.parse, urllib.request, uuid
+import collections, contextlib, dataclasses, datetime, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, types, urllib.error, urllib.parse, urllib.request, uuid
 
 from . import apps, checks, cli, config, content, convert, decide, ff, gate, judge, logs, plex, process, regrab, remux, report, store, subsync, subtitles, vault
 
@@ -697,7 +697,7 @@ def follow_up(name, pending, claimed, source, act):
         if job.get("path") and (drop := deep_replaced(job)):   # the app replaced or removed the file during the run
             rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
         else:
-            rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500], trace=traceback.format_exc(limit=3)[-800:])
+            rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500], trace=logs.trace(ex))
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
         rec["from"] = job["from"]
     if job.get("time"):   # the time of its queue, as on a deep analysis line
@@ -1195,7 +1195,7 @@ def deep_analysis(name, pending, claimed=False):
             rec.update(drop, note=config.mask(f"{type(ex).__name__}: {ex}")[:300])
         else:
             rec.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:500])
-            rec["trace"] = traceback.format_exc(limit=4)[-800:]   # deep_analysis, run, process.process and the step that raised
+            rec["trace"] = logs.trace(ex)
             if getattr(ctx, "rec", None):   # what the run changed before the error, see held_after()
                 rec.update({k: ctx.rec[k] for k in ("subremux", "sidecars") if k in ctx.rec})
     if job.get("from"):   # the import job that queued it, so a reader can match the two lines
@@ -2052,7 +2052,7 @@ def job_process(name, w, sigmask):
                 os.write(w, json.dumps({"broken": str(ex)}).encode())
         with contextlib.suppress(Exception):
             logs.decision(dict(source="hook", job=name, outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300],
-                               trace=traceback.format_exc(limit=3)[-800:]), started)
+                               trace=logs.trace(ex)), started)
     finally:
         os._exit(code)
 
@@ -2284,7 +2284,7 @@ def run_job(name, pending, shared=False, claimed=False):
         if isinstance(ex, subsync.Broken):   # only a run with AMG_INVARIANTS=1 raises one, and a test run must see it
             raise
         rec.update(outcome="error", result=f"error: {type(ex).__name__}: {ex}"[:500])
-        rec["trace"] = traceback.format_exc(limit=3)[-800:]
+        rec["trace"] = logs.trace(ex)
         if getattr(run, "rec", None):   # what the run wrote before the error, so the line names it and Plex reads the file again
             rec.update({k: run.rec[k] for k in ("label", "path", "header_repair", "repack", "subremux", "sidecars") if k in run.rec})
             if wrote := [r for r in process.own_writes(run) if r != "edited"]:   # from the write fields, so they hold before decision_fields() too

@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """Sonarr and Radarr behind one interface, ARR[app] for each instance app, with the HTTP client, the API keys and the path maps."""
-import contextlib, contextvars, datetime, json, os, re, sys, time, urllib.parse, urllib.request
+import contextlib, contextvars, datetime, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 
 from . import config, convert, decide, logs, plex, regrab, vault
 
 
 def http(url, method="GET", body=None, headers=None, timeout=15):
-    """One HTTP call. Its timeout is cut to the job's time left. A call that ends past it raises OutOfTime."""
+    """One HTTP call. Its timeout is cut to the job's time left. A call that ends past it raises OutOfTime. A timeout names
+    the URL with no query and the seconds, because "timed out" alone tells a reader of the alert nothing."""
     req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", "User-Agent": "arr-media-guard", **(headers or {})})
+    wait = config.DEADLINE.bound(timeout)
     try:
-        with urllib.request.urlopen(req, timeout=config.DEADLINE.bound(timeout)) as r:
+        with urllib.request.urlopen(req, timeout=wait) as r:
             raw = r.read()
+    except (TimeoutError, urllib.error.URLError) as ex:   # the same error class, with the server and the wait in its text
+        late = ex if isinstance(ex, TimeoutError) else ex.reason
+        if not isinstance(late, TimeoutError):
+            raise
+        text = f"{config.mask(url).split('?')[0]} gave no answer in {wait:.0f} seconds"   # masked first: a webhook holds its token in the path
+        raise (TimeoutError(text) if ex is late else urllib.error.URLError(TimeoutError(text))) from None   # callers test the reason's class
     finally:
         config.DEADLINE.check()
     return json.loads(raw) if raw.strip()[:1] in (b"{", b"[") else raw

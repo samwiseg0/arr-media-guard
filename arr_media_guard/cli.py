@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The command line: main(), the backfill, --sub-time, --check, the audit and the scans."""
-import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, traceback, types, uuid
+import argparse, collections, concurrent.futures, contextlib, datetime, fcntl, json, os, re, signal, sqlite3, subprocess, sys, threading, time, types, uuid
 
 from . import apps, checks, config, content, convert, decide, ff, gate, logs, plex, process, regrab, report, runner, store, subsync, subtitles, vault
 
@@ -78,10 +78,20 @@ def selected(path, original=None, kids=False, release="", sub_check=False):
     return any(fires(f) for fires in TRIGGERS.values())
 
 
-def upgrade(lock, path, st):
-    """exclusive() for a backfill file, which has no time limit and no download. It trades the shared file lock for the
-    exclusive one before an edit, and raises Replan when the file changed since the checks started from st."""
-    runner.gated(lock, fcntl.LOCK_EX)
+def upgrade(lock, path, st, limited=False):
+    """exclusive() for a backfill file, which has no download. It trades the shared file lock for the exclusive one
+    before an edit, and raises Replan when the file changed since the checks started from st. limited is True for a
+    job that runs under an import's time limit, as a job of the background queue does. Its wait stops that limit and
+    has LOCK_WAIT of its own, because the other workers can read their files for longer than BUDGET. After the wait
+    the job has a limit, even when a step turned it off, as in exclusive(). A direct backfill and a deep analysis have
+    no limit, so their wait has none."""
+    if not limited:
+        runner.gated(lock, fcntl.LOCK_EX)
+    else:
+        with config.DEADLINE.paused() as left:
+            runner.gated(lock, fcntl.LOCK_EX, content.Deadline(config.LOCK_WAIT, f"gave up after waiting {config.LOCK_WAIT} seconds for the exclusive lock"))
+        if left is None:
+            config.DEADLINE.start(config.BUDGET)
     runner.same_file(path, st)
 
 
@@ -123,17 +133,21 @@ def backfill_file(app, f, info, a, keep_plan, pool=None, job=None, save=None, pl
                         return "checked"
                     if not (job or a.sub_time or a.plan_from or a.convert or selected(path, original, kids, f.get("sceneName") or "", a.sub_check)):
                         return None
-                    rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st), settle=lambda: None, turn=lambda: None,
+                    rec = run(lock, types.SimpleNamespace(exclusive=lambda st: upgrade(lock, path, st, mode == "import"), settle=lambda: None, turn=lambda: None,
                                                           reshare=lambda st: runner.reshared(lock, path, st)), pool)
             except runner.Replan:
-                with runner.locked() as lock:
+                wait = config.DEADLINE
+                if mode == "import":   # as in upgrade(): the wait is outside the job's limit, which run() starts again
+                    config.DEADLINE.stop()
+                    wait = content.Deadline(config.LOCK_WAIT, f"gave up after waiting {config.LOCK_WAIT} seconds for the lock")
+                with runner.locked(wait=wait) as lock:
                     rec = run(lock, False, None)
     except (Exception, content.OutOfTime) as ex:
         if isinstance(ex, (subsync.Broken, subtitles.Yielded)):   # only a run with AMG_INVARIANTS=1 raises Broken, and a test run must see it
             raise
         rec = dict(id=uuid.uuid4().hex[:12], app=app, source="check" if job else "backfill", apply=a.apply, ids=ids, label=label, path=path,
                    outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300],
-                   trace=traceback.format_exc(limit=4)[-800:])   # backfill_file, run, process.process and the step of process.STEPS that raised
+                   trace=logs.trace(ex))
     return time.time() - started, rec
 
 

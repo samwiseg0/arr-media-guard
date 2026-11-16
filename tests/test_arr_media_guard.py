@@ -903,6 +903,49 @@ def test_a_job_whose_limit_a_handler_took_has_one_again_after_its_exclusive_wait
     assert rec["video"]["code"] == "video_check_error" and after == [hook.BUDGET] and rec["outcome"] == "edited", (rec["result"], after)
 
 
+def test_a_queued_backfill_job_waits_for_the_exclusive_lock_outside_its_time_limit(env, monkeypatch):
+    """A job of the background queue runs under BUDGET. The other workers can read their files for longer, so the
+    wait of upgrade() has LOCK_WAIT of its own and costs the job none of its time. A direct backfill has no limit."""
+    waits = []
+    def gated(lock, op, wait=hook.DEADLINE):
+        waits.append((wait is hook.DEADLINE, wait.left()))
+        env["clock"][0] += hook.BUDGET + 60
+        wait.check()
+    monkeypatch.setattr(hook, "gated", gated)
+    st = os.stat(env["path"])
+    hook.DEADLINE.start(hook.BUDGET)
+    hook.upgrade(None, env["path"], st, True)
+    assert waits == [(False, hook.LOCK_WAIT)] and hook.DEADLINE.left() == hook.BUDGET
+    hook.DEADLINE.stop()   # a failed conversion turned the limit off: the wait is still bound, and the job has a limit after it
+    hook.upgrade(None, env["path"], st, True)
+    assert waits[1] == (False, hook.LOCK_WAIT) and hook.DEADLINE.left() == hook.BUDGET
+    hook.DEADLINE.stop()
+    hook.upgrade(None, env["path"], st)   # a direct backfill
+    assert waits[2] == (True, None) and hook.DEADLINE.end is None
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timed out"), urllib.error.URLError(TimeoutError("timed out"))])
+def test_an_http_timeout_names_the_url_and_the_seconds(monkeypatch, error):
+    """A timeout of the connect is a URLError and one of the read a TimeoutError. Each keeps its class. The text leaves
+    the query out, which can hold a key."""
+    def urlopen(req, timeout):
+        raise error
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+    with pytest.raises(type(error), match=r"http://sonarr:8989/api/v3/parse gave no answer in 60 seconds") as ex:
+        hook.http("http://sonarr:8989/api/v3/parse?title=x&apikey=k", timeout=60)
+    assert "apikey" not in str(ex.value) and isinstance(getattr(ex.value, "reason", ex.value), TimeoutError)   # arr_subhunt tests the reason
+    refused = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", lambda req, timeout: (_ for _ in ()).throw(refused))
+    with pytest.raises(urllib.error.URLError) as ex:
+        hook.http("http://sonarr:8989/api/v3/parse")
+    assert ex.value is refused
+    monkeypatch.setattr(hook, "CFG", dataclasses.replace(hook.CFG, discord_webhook="https://discord.com/api/webhooks/123/secret-token"))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+    with pytest.raises(type(error)) as ex:   # a webhook holds its token in the path
+        hook.http("https://discord.com/api/webhooks/123/secret-token?wait=true")
+    assert "secret-token" not in str(ex.value) and "gave no answer" in str(ex.value)
+
+
 def test_a_job_that_fails_leaves_no_time_limit(env, monkeypatch):
     """A deep analysis or a Plex pass after the job runs in the same process, and has no time limit."""
     monkeypatch.setattr(hook, "check_audio", lambda *a, **k: 1 / 0)
@@ -27608,6 +27651,39 @@ def test_an_error_line_keeps_an_id_and_names_the_step_that_raised(env, monkeypat
     (rec,) = checked(env, "hook" if run == "import" else "backfill_job")
     assert (rec["outcome"], rec["result"], len(rec["id"])) == ("error", "error: OutOfTime: stopped after 300 seconds", 12), rec
     assert ", in header\n    ctx.asked = checks.tmdb_ask(" in rec["trace"], rec["trace"]
+
+
+def test_a_long_trace_keeps_both_ends():
+    """The outer frames name the step, and the inner ones the line that raised."""
+    def down(n):
+        return step(n)
+    def step(n):
+        return down(n - 1) if n else 1 / 0
+    try:
+        down(5)
+    except ZeroDivisionError as ex:
+        text = hook.logs.trace(ex)
+    first, _, last = text.partition("  ...\n")
+    assert "in test_a_long_trace_keeps_both_ends" in first and first.count("  File ") == last.count("  File ") == 4 and "1 / 0" in last, text
+
+
+def test_the_second_run_of_a_queued_backfill_job_waits_for_the_lock_outside_its_time_limit(env, monkeypatch):
+    """A file that changed during the checks runs again with the lock exclusive. The other workers can hold the lock
+    for longer than BUDGET, so that wait has LOCK_WAIT, and the second run has BUDGET again."""
+    check_listed(env, monkeypatch)
+    name = backfill_job(env, monkeypatch)
+    real, waits, limits = hook.gated, [], []
+    def gated(f, op, wait=hook.DEADLINE):
+        waits.append((op == fcntl.LOCK_EX, wait is hook.DEADLINE, wait.left()))
+        return real(f, op, wait)
+    monkeypatch.setattr(hook, "gated", gated)
+    def upgrade(*a):
+        limits.append(hook.DEADLINE.left())
+        raise hook.Replan("the file changed since the checks")
+    monkeypatch.setattr(hook, "upgrade", upgrade)
+    hook.background(name, [])
+    (rec,) = checked(env, "backfill_job")
+    assert rec["outcome"] != "error" and len(limits) == 1 and waits[-1] == (True, False, hook.LOCK_WAIT), (rec["result"], limits, waits)
 
 
 @pytest.mark.parametrize("first, pending, kept", [("deep", False, "deep"), ("deep", True, "import"), ("import", False, "import")])
