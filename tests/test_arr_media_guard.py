@@ -776,6 +776,14 @@ def test_sonarr_episode_uses_the_episode_runtime(env, monkeypatch):
     assert rec["findings"] == [{"kind": "runtime", "runs": "10:05", "listed": 62}]   # header and last packet agree
 
 
+def test_sonarr_label_of_three_episodes_in_a_row_is_a_range(env, monkeypatch):
+    """Sonarr lists the episodes of a file in no fixed order. The label of the log line sorts them and joins the run."""
+    as_sonarr(monkeypatch, env, {"title": "Show D", "tvdbId": 90301, "originalLanguage": {"name": "English"}, "runtime": 20},
+              [{"seasonNumber": 2, "episodeNumber": n, "runtime": 20} for n in (6, 4, 5)])
+    hook.main([])
+    assert [r["label"] for r in log_lines(env) if r.get("label")][-1] == "Show D S02E04-E06"
+
+
 @pytest.mark.parametrize("season", [2, 0])
 def test_sonarr_episode_far_over_its_listing_is_long_outside_season_0(env, monkeypatch, season):
     """The item carries the season to the runtime check. A long episode alerts on the runtime point alone and never

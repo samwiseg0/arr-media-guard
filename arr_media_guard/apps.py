@@ -530,8 +530,7 @@ def episode_item(s, eps, series_eps=None):
     """movie_item() for the episodes of one Sonarr file. ctx lists each episode's runtime, never their sum, because a
     segment show lists every segment at the whole slot. Its season is the first episode's, for the runtime check.
     series_eps, all episodes of the series, saves the title check one list call per file, see episode_title()."""
-    num = "".join(f'E{e["episodeNumber"]:02d}' for e in eps)
-    label = f'{s["title"]} S{eps[0]["seasonNumber"]:02d}{num}' if eps else s["title"]
+    label = f'{s["title"]} S{eps[0]["seasonNumber"]:02d}{episode_numbers(eps)}' if eps else s["title"]
     want = {"guids": guids(s, ("tvdb", "tmdb", "imdb")), "title": s["title"], "show": True}
     ctx = {"ids": {"tmdb": s.get("tmdbId"), "tvdb": s.get("tvdbId")}, "year": s.get("year"),
            "listed": [e.get("runtime") or 0 for e in eps], "season": eps[0].get("seasonNumber") if eps else None,
@@ -540,6 +539,20 @@ def episode_item(s, eps, series_eps=None):
            **({"episodes": series_eps} if series_eps else {})}
     return (label, (s.get("originalLanguage") or {}).get("name"), episode_runtime(eps), want, decide.kids_title("sonarr", s.get("genres")),
             ctx)
+
+
+def episode_numbers(eps):
+    """The episode part of a label: E04, E04E05 for two episodes, and E04-E09 for three or more in a row. Numbers that
+    do not follow each other stay apart, as E01-E03E07. Sonarr lists a file's episodes in no fixed order, so they are
+    sorted here."""
+    nums, out, i = sorted(e["episodeNumber"] for e in eps), "", 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out += f"E{nums[i]:02d}-E{nums[j]:02d}" if j - i >= 2 else "".join(f"E{n:02d}" for n in nums[i:j + 1])
+        i = j + 1
+    return out
 
 
 def episode_runtime(eps):

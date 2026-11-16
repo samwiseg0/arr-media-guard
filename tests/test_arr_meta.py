@@ -932,3 +932,19 @@ def test_each_release_of_one_search_gets_its_verdict(name, want):
     title = M.release_episode_title(name)
     v = title and M.episode_title_verdict(title, SPONGE, [GHOST_HOST], ["SpongeBob SquarePants"])
     assert (None if not v else (v["verdict"], v["names"]) if v["verdict"] == "other" else v["verdict"]) == want, (title, v)
+
+
+@pytest.mark.parametrize("numbers, label", [
+    ([4], "E04"),
+    ([1, 2], "E01E02"),
+    ([4, 5, 6, 7, 8, 9], "E04-E09"),
+    ([1, 2, 3, 7], "E01-E03E07"),
+    ([1, 3, 5], "E01E03E05"),
+    ([1, 2, 4, 5, 6], "E01E02E04-E06"),
+    ([3, 1, 2], "E01-E03"),
+    ([2, 1], "E01E02"),
+])
+def test_episode_label_joins_three_or_more_in_a_row_as_a_range(numbers, label):
+    """A file of six episodes reads S02E04-E09 in an alert. Two episodes keep the usual double-episode form."""
+    from arr_media_guard import apps
+    assert apps.episode_numbers([{"episodeNumber": n} for n in numbers]) == label
