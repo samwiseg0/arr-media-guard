@@ -738,7 +738,11 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     Some differences pass. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
     cut first frame, alone or with its cut last frame. The entry names it in
-    dropped_first, and the stream's start is then its second packet, which must keep its time within TIME_SLACK.
+    dropped_first, and the stream's start is then its second packet, which must keep its time within TIME_SLACK. In an
+    AVI whose audio header has a sample size, that packet may also start at the time of its bytes, the fragment's time
+    plus its size over the header's bytes a second, within TIME_SLACK. The entry names that time in byte_time. The first
+    frame of an AVI video with a plain header that opens with empty chunks may show earlier, inside them, see
+    empty_lead(). The entry names it in empty_lead, and every other frame keeps its time.
     mkvmerge may instead trim that fragment. A smaller first MP3 or MP2 packet passes when every other packet matches
     and the second packet keeps its time.
     The entry names both sizes in trimmed_first. The stream may also lose its cut last frame then, when the new packet
@@ -892,6 +896,14 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             x["times"], x["ends"] = [None if t is None else t + lift for t in x["times"]], [None if e is None else e + lift for e in x["ends"]]
             x["start"], x["end"] = x["start"] + lift, x["end"] + lift
     none = {"count": 0, "empty": 0, "digest": "", "start": 0, "end": 0}
+    heads, leads = convert.avi_heads(src) if fam == "avi" else [], {}   # each stream's own header, and its first frame that moved
+    for s, t in packets:   # an AVI video that opens with empty chunks, see empty_lead()
+        x = ha.get(s["index"])
+        if s["index"] < len(heads) and (gap := empty_lead(heads[s["index"]], x, hb.get(t["index"]))):
+            k = x["times"].index(min(x["times"]))
+            leads[s["index"]] = {"pts": round(x["times"][k], 3), "moved": round(-gap[0], 3), "empty": round(gap[1], 3)}
+            x["times"][k] -= gap[0]   # the first frame where the new file shows it, so the time check holds every other frame
+            x["start"] = round(x["start"] - gap[0], 3)   # and the starts of the other streams count from it, in ms as packet_hashes() gives them
     video = lambda h, side: min(((h.get(p[side]["index"]) or none)["start"] for p in packets if p[0]["codec_type"] == "video"), default=0)
     va, vb, fault, stream = video(ha, 0), video(hb, 1), None, None
     for s, t in packets:
@@ -901,7 +913,8 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                           + (f", new file through {f[1]}" if f[1] else ""),
                           count=x["count"], **({"empty": x["empty"]} if x["empty"] else {}), **{c: x[c] for c in ("nul_cut", "read_order") if x.get(c)},
                           hash=x["digest"][:16],
-                          match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)]))
+                          match=(x["count"], x["digest"]) == (y["count"], y["digest"]), start=[round(x["start"] - va, 3), round(y["start"] - vb, 3)],
+                          **({"empty_lead": leads[s["index"]]} if s["index"] in leads else {})))
         if proof[-1]["match"] and (n := sum(x["raw_md5s"][k:k + 16] != y["raw_md5s"][k:k + 16] for k in range(0, len(x.get("raw_md5s") or b""), 16))):
             proof[-1]["crlf"] = n   # packets whose line breaks changed between LF and CRLF, and nothing else
         xt, yt, xs, why, ycut, bad = x.get("times") or [], y.get("times") or [], x["start"], None, slice(None), None   # bad: refused for its packets
@@ -930,6 +943,15 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                 proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[1:len(xt) - (x["count"] - y["count"] - 1)]
             xs = xt[0] if xt and xt[0] is not None else xs   # the stream now starts at its second packet
+            h = heads[s["index"]] if s["index"] < len(heads) else {}
+            if h.get("type") == b"auds" and h["size"] and h["scale"] and h["rate"] and (x.get("times") or [None])[0] is not None:
+                # mkvmerge times AVI audio whose header has a sample size by its bytes, at dwRate * dwSampleSize /
+                # dwScale bytes a second. ffmpeg times the frames of the fragment's chunk from the fragment's time,
+                # a frame each.
+                rate = h["rate"] * h["size"] / h["scale"]
+                at = x["times"][0] + x["first"] / rate
+                proof[-1]["byte_time"] = {"at": round(at, 3), "ffmpeg": round(xs, 3), "rate": round(rate, 3)}
+                xs = at if abs(us((y["start"] - vb) - (at - va))) <= us(TIME_SLACK) else xs
             proof[-1]["start"][0] = round(xs - va, 3)
         elif x["count"] + 1 == y["count"] and y.get("but_last") == x["digest"] and fam == "mov" and \
                 edit_list_sample(src, s["index"], f[0], y, folder, timeout):   # the sample the MP4's edit list cuts off
@@ -1358,6 +1380,25 @@ def ends_lost(src, x, y, s, bsf, timeout):
         kind = lambda i, cut: "lead" if not junk and i < a else "zero" if zero(i) else "header" if i in heads else cut
         return a, b, [entry(i, kind(i, "cut")) for i in lead] + [entry(i, kind(i, "cut")) for i in tail]
     return None
+
+
+def empty_lead(head, x, y):
+    """(move, span) in seconds when an AVI video stream with a plain header opens with empty chunks and the new file
+    shows its first frame earlier, inside them, else None. head is the stream's entry of convert.avi_heads(), x and y
+    the packet_hashes() of the stream in the original and the new file. ffmpeg skips an empty chunk and times each
+    frame by its place in the index, so the first frame comes span seconds after the stream's start in the header, see
+    convert.avi_plain_start(). mkvmerge drops the empty chunks too, and shows the first frame from that start. move is
+    how much earlier the first frame shows against the second, more than TIME_SLACK and at most span, within
+    TIME_SLACK. Both lists are sorted, as in times_fault(), because an AVI video stream has decode times only. prove()
+    then moves the first frame and the stream's start by move in the original, so the time check holds every other
+    frame to its time, and the other streams start against the frames that kept their times. Any other header shape
+    gives None, so its proof stays as before."""
+    xt, yt, start = (x or {}).get("times") or [], (y or {}).get("times") or [], convert.avi_plain_start(head)
+    if start is None or len(xt) < 2 or len(xt) != len(yt) or None in xt or None in yt:
+        return None
+    (a0, a1), (b0, b1) = heapq.nsmallest(2, xt), heapq.nsmallest(2, yt)
+    move, span = (b1 - b0) - (a1 - a0), a0 - start
+    return (move, span) if us(TIME_SLACK) < us(move) <= us(span) + us(TIME_SLACK) else None
 
 
 def junk_head(src, tmp, i, k, bsf, timeout):

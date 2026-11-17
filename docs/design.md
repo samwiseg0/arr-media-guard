@@ -1429,13 +1429,19 @@ original.
 
 An AVI stream header can hold `dwStart`, the time the stream starts after the start of the file.
 ffmpeg honours it, and mkvmerge starts every track at 0. A video that starts 2 frames late would then
-play 83 ms early against the audio. So for an AVI, ffprobe reads the first packet of each video and
-audio stream, and mkvmerge gets each start of 1 ms to 10 seconds back with `--sync`. When one stream
-starts later than that, no stream gets `--sync`. mkvmerge then starts every track at 0 as before
-2.11.2, and the proof decides. The first packet decides, because ffprobe's stream start time can say
-0 for such a stream. The decision line names each start in `repack.start_sync`. Other containers get
-no `--sync` for a late start, because mkvmerge reads an MP4 edit list and the times of a TS itself. The proof still
-checks every start.
+play 83 ms early against the audio. So for an AVI, mkvmerge gets each start of 1 ms to 10 seconds
+back with `--sync`. When one stream starts later than that, no stream gets `--sync`. mkvmerge then
+starts every track at 0 as before 2.11.2, and the proof decides. ffprobe's stream start time can say 0
+for such a stream. A video with a plain header (`dwSampleSize` 0, `dwScale` and `dwRate` not 0) takes
+its start from the header, `dwStart` times `dwScale` over `dwRate` (`avi_plain_start()`). Its first
+packet does not decide, because a video can open with empty chunks. ffmpeg skips them and times the
+first frame by its place, 120 ms late after 3 chunks at 25 fps. mkvmerge shows that frame from 0 and
+every later frame at its time, so a `--sync` of 120 ms played the video 120 ms late. Audio, and a
+video with any other header, take the time of the first packet as ffmpeg reads it. ffmpeg reads the
+start of those headers in other ways, for example with the sample size, or with the block size
+(`nBlockAlign`) of the audio format in its place. The decision line names each start in
+`repack.start_sync`. Other containers get no `--sync` for a late start, because mkvmerge reads an MP4
+edit list and the times of a TS itself. The proof still checks every start.
 
 **An MP4 video in its own input.** mkvmerge hands the frames of each track to the code that writes that track, and
 this code can hold frames back. When one track of an input reads its last packet, mkvmerge tells the code of every
@@ -1552,8 +1558,15 @@ The proof allows a cut last frame and a cut first audio frame that mkvmerge drop
 frame cannot decode. After a cut first frame, the second packet must keep its time within 2 ms
 (`TIME_SLACK`). mkvmerge drops an MP4's cut first audio frame after an empty edit and keeps it with
 none, so a `--sync` of `split_sync()` from its time plays the audio a frame early. The proof refuses
-that file. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That
-passes when every other packet matches and the second packet keeps its time. mkvmerge re-times the
+that file. mkvmerge times the audio of an AVI header with a sample size (`dwSampleSize`) by its
+bytes, at `dwRate` times the size over `dwScale` bytes a second. ffmpeg times the frames that share a
+chunk with a cut first frame one frame apart from the fragment's time. With 360 bytes of a cut AC-3
+frame at 24,000 bytes a second, ffmpeg puts the first whole frame at 32 ms and mkvmerge at 15 ms. So
+in such an AVI the second packet may also start at the time of its bytes, the fragment's time plus its
+size over the bytes a second, within 2 ms. The entry names that time, ffmpeg's time and the bytes a
+second in `byte_time`. A header with no sample size, as for VBR MP3, counts frames and keeps ffmpeg's
+time. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That passes when every
+other packet matches and the second packet keeps its time. mkvmerge re-times the
 stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
 The first MP3 or MP2 packet can also hold junk before a whole frame, zeros or a RIFF header of at
 most 128 bytes, and the stream can end on a cut frame that mkvmerge drops. The rule runs in any
@@ -1950,9 +1963,15 @@ packet read took 89 s.
 times for PCM in every container.
 
 **AVI.** An AVI stores no times. Frame k of the video index plays at k times the stream's scale over its rate, after
-its start (dwStart), and ffmpeg reads exactly that. So AMG reads AVI times through ffmpeg, and `avi_sync()` gives
-mkvmerge the start back. ffmpeg counts audio from its bytes and mkvmerge from its samples, and the two drift over a
-film, so the proof leaves AVI audio out of the time check and keeps its start and its data.
+its start (dwStart). ffmpeg reads exactly that from a plain video header, and reads other header shapes in other ways.
+So AMG reads AVI times through ffmpeg, and `avi_sync()` gives mkvmerge the start back. ffmpeg counts audio from its
+bytes and mkvmerge from its samples, and the two drift over a film, so the proof leaves AVI audio out of the time
+check and keeps its start and its data. ffmpeg skips an empty video chunk, so a video that opens with empty chunks
+has its first frame after the start. mkvmerge shows that frame from the start and every later frame at its time. For
+a video with a plain header, the proof then moves the first frame of the original by the move of the new file, at
+most the span of the empty chunks within 2 ms (`empty_lead()`). The time check holds every other frame to its time,
+and the other streams start against the frames that kept their times. The entry names the frame's time, its move
+and the span in `empty_lead`. A video with another header shape keeps the proof as before.
 
 **The slack.** A Matroska copy of an MP4 or TS file rounds each time to its tick, and mkvmerge moves the file by its
 earliest time, which is not on that tick. A time and the time it counts from each round, so a move reaches one tick

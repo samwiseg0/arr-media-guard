@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
-import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, subprocess, threading, time, urllib.parse, uuid
+import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, struct, subprocess, threading, time, urllib.parse, uuid
 
 from . import apps, checks, config, content, decide, ff, logs, matroska, mp4, proof, regrab, remux, runner, store, subtitles, ts, vault
 
@@ -45,30 +45,65 @@ def convert_captions(path, streams, folder, size, shift=0.0):
     return out, None
 
 
+def avi_heads(path):
+    """[{type, scale, rate, start, size}] of each stream header (strh) of the AVI path, in file order, or [] for a file
+    that is not RIFF AVI. ffmpeg numbers the streams in this order and skips a "pads" header, so the k-th entry is
+    ffprobe stream k. type is the fourcc, such as b"vids" or b"auds", scale and rate are dwScale and dwRate, start is
+    dwStart and size dwSampleSize. The header lies before the movi list, in the first MiB."""
+    with open(path, "rb") as f:
+        data = f.read(1 << 20)
+    out, pos = [], 12
+    if data[:4] != b"RIFF" or data[8:12] != b"AVI ":
+        return out
+    while pos + 8 <= len(data) and data[pos:pos + 4] + data[pos + 8:pos + 12] != b"LISTmovi":
+        tag, n = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        if tag == b"strh" and n >= 48 and pos + 56 <= len(data) and data[pos + 8:pos + 12] != b"pads":
+            out.append(dict(zip(("type", "scale", "rate", "start", "size"), struct.unpack_from("<4s16xIII12xI", data, pos + 8))))
+        pos += 12 if tag == b"LIST" else 8 + n + (n & 1)   # into a list, or past a chunk
+    return out
+
+
+def avi_plain_start(head):
+    """The start in seconds, start * scale / rate, of an entry of avi_heads() that is a plain video header: type
+    b"vids", size 0, and a scale and a rate that are not 0. ffmpeg starts such a stream there and times each frame by
+    its place in the index. Any other entry gives None, and so does a start after an hour, which ffmpeg reads as 0.
+    ffmpeg reads the start of other header shapes in other ways, so their callers take ffmpeg's first packet instead."""
+    plain = head.get("type") == b"vids" and not head["size"] and head["scale"] and head["rate"]
+    return head["start"] * head["scale"] / head["rate"] if plain and head["start"] * head["scale"] <= 3600 * head["rate"] else None
+
+
 def avi_sync(path, j, streams):
-    """[{stream, track, ms}] of each video and audio track of the AVI path whose first packet, as ffmpeg reads it,
-    starts from 1 ms to START_MAX seconds after 0. An AVI stream header can hold dwStart, the time the stream starts
-    after the file's start, in the stream's own units. ffmpeg honours it, and mkvmerge starts every track at 0, so
-    convert_cmd() gives mkvmerge the start back with --sync. ffprobe's stream start_time can say 0 then, so the first
-    packet decides. stream names the ffprobe stream as prove() does, track is the mkvmerge track id, ms the start in
-    milliseconds. The k-th video or audio track of j is the k-th stream of its kind in streams. A subtitle gets none,
-    because its first packet is its first cue. Another container gets none, because mkvmerge reads an MP4 edit list
-    and TS times itself. A count that differs, or a read that fails, gives none for that kind, and prove() decides. One
-    video or audio start after START_MAX gives none to any stream, so the remux starts every track at 0 as before
-    2.11.2, and prove() decides."""
+    """[{stream, track, ms}] of each video and audio track of the AVI path that starts from 1 ms to START_MAX seconds
+    after 0. An AVI stream header can hold dwStart, the time the stream starts after the file's start, in the stream's
+    own units. ffmpeg honours it, and mkvmerge starts every track at 0, so convert_cmd() gives mkvmerge the start back
+    with --sync. ffprobe's stream start time can say 0 then. A video with a plain header takes its start from the
+    header, see avi_plain_start(). Its first packet comes late when the video opens with empty chunks, and mkvmerge
+    shows that frame from the start and every later frame at its time, see proof.empty_lead(). Audio, and a video with
+    any other header or none, take the time of the first packet as ffmpeg reads it. stream names the ffprobe stream as
+    prove() does, track is the mkvmerge track id, ms the start in milliseconds. The k-th video or audio track of j is
+    the k-th stream of its kind in streams. A subtitle gets none, because its first packet is its first cue. Another
+    container gets none, because mkvmerge reads an MP4 edit list and TS times itself. A count that differs, or a read
+    that fails, gives none for that kind, and prove() decides. One video or audio start after START_MAX gives none to
+    any stream, so the remux starts every track at 0 as before 2.11.2, and prove() decides."""
     if (j.get("container") or {}).get("type") != "AVI":
         return []
+    try:
+        heads = avi_heads(path)
+    except OSError:
+        heads = []
     out = []
     for kind in ("video", "audio"):
         ids = [t.get("id") for t in j.get("tracks") or [] if t.get("type") == kind]
         kin = [s for s in proof.media_streams(streams) if s.get("codec_type") == kind]
         for n, s in enumerate(kin):
+            t = avi_plain_start(heads[s["index"]]) if kind == "video" and s["index"] < len(heads) else None
             try:
-                r = checks.run_bounded(["ffprobe", "-v", "error", "-select_streams", str(s["index"]), "-show_entries", "packet=pts_time,dts_time",
-                                        "-read_intervals", "%+#1", "-of", "json", path], 120, use="convert.avi_sync", capture_output=True,
-                                       text=True, errors="replace")
-                p = (ff.loads(r, "{}").get("packets") or [{}])[0] if r.returncode == 0 else {}
-                t = float(p.get("pts_time") or p.get("dts_time") or 0)   # AVI video with B-frames has a decode time only
+                if t is None:
+                    r = checks.run_bounded(["ffprobe", "-v", "error", "-select_streams", str(s["index"]), "-show_entries", "packet=pts_time,dts_time",
+                                            "-read_intervals", "%+#1", "-of", "json", path], 120, use="convert.avi_sync", capture_output=True,
+                                           text=True, errors="replace")
+                    p = (ff.loads(r, "{}").get("packets") or [{}])[0] if r.returncode == 0 else {}
+                    t = float(p.get("pts_time") or p.get("dts_time") or 0)   # AVI video with B-frames has a decode time only
             except (subprocess.TimeoutExpired, ValueError):
                 continue
             if t > START_MAX:

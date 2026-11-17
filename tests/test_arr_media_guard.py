@@ -13000,9 +13000,10 @@ def test_a_short_lead_spans_at_most_a_tenth_of_a_second(span, kept):
 
 def test_avi_sync_reads_the_start_of_each_stream(avi48, tmp_path):
     """mkvmerge puts the video track first, so in an AVI that starts with audio the track id differs from the ffprobe
-    index. The k-th stream of a kind is the k-th track of that kind. A video with B-frames has a decode time only. A
-    start of one frame, 42 ms, gets --sync, though the proof allows 50 ms. A start under 1 ms gets none. One start after
-    START_MAX, 10 s, gives no stream --sync."""
+    index. The k-th stream of a kind is the k-th track of that kind. Each header counts its start in its own units:
+    video frames, frames of an MP3 header that counts frames, bytes of one that counts bytes. A start of one frame,
+    42 ms, gets --sync, though the proof allows 50 ms. A start under 1 ms gets none. One start after START_MAX, 10 s,
+    gives no stream --sync."""
     path = tmp_path / "Multi.avi"
     amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=4", "-f", "lavfi", "-i",
                 "sine=duration=4:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=880:duration=4:sample_rate=48000", "-map", "1:a",
@@ -13034,6 +13035,113 @@ def test_the_damage_read_of_an_avi_gives_mkvmerge_its_stream_starts(avi48, tmp_p
     monkeypatch.setattr(hook, "convert_cmd", lambda *a, **k: seen.append(k.get("sync")) or real(*a, **k))
     assert hook.source_read({"read": "mkvmerge", "stream": 1}, str(path), hook.mkvmerge(str(path))) is None
     assert seen == [[{"stream": "video 0", "track": 0, "ms": 83}]]
+
+
+def avi_empty_lead(src, dst, n):
+    """A copy of the AVI src at dst whose video opens with n empty chunks, as some old AVIs do with a header start
+    (dwStart) of 0: n video chunks of 0 bytes go in front of the first video chunk, in the movi list and in idx1, and
+    the video counts n frames more. ffmpeg's AVIs keep no other index."""
+    d = bytearray(open(src, "rb").read())
+    movi, idx = d.find(b"movi"), d.rfind(b"idx1")
+    pos = movi + 4
+    while d[pos:pos + 4] != b"00dc":
+        pos += 8 + struct.unpack_from("<I", d, pos + 4)[0] + 1 & ~1
+    size = struct.unpack_from("<I", d, idx + 4)[0]
+    rows = [list(struct.unpack_from("<4sIII", d, idx + 8 + k)) for k in range(0, size, 16)]   # ckid, flags, offset from movi, size
+    for r in rows:
+        r[2] += 8 * n if r[2] >= pos - movi else 0
+    at = next(k for k, r in enumerate(rows) if r[0] == b"00dc")
+    rows[at:at] = [[b"00dc", 0, pos - movi + 8 * k, 0] for k in range(n)]
+    index = b"idx1" + struct.pack("<I", size + 16 * n) + b"".join(struct.pack("<4sIII", *r) for r in rows)
+    d = d[:pos] + b"00dc\0\0\0\0" * n + d[pos:idx] + index + d[idx + 8 + size:]
+    struct.pack_into("<I", d, 4, len(d) - 8)
+    struct.pack_into("<I", d, movi - 4, struct.unpack_from("<I", d, movi - 4)[0] + 8 * n)
+    for at in (d.find(b"avih") + 8 + 16, d.find(b"strh") + 8 + 32):   # dwTotalFrames and the video's dwLength
+        struct.pack_into("<I", d, at, struct.unpack_from("<I", d, at)[0] + n)
+    open(dst, "wb").write(d)
+
+
+@pytest.mark.parametrize("starts, sync, lead, start, fault", [
+    ({}, [], 0.125, 0.0, "stream audio 1 starts -0.125 s from the video in the new file, +0.000 s in the original"),
+    ({0: 2}, [{"stream": "video 0", "track": 0, "ms": 83}], 0.208, -0.083,   # a header start of 2 frames too
+     "stream audio 1 starts -0.208 s from the video in the new file, -0.083 s in the original"),
+])
+def test_an_avi_whose_video_opens_with_empty_chunks_converts(avi48, tmp_path, settings, starts, sync, lead, start, fault):
+    """An AVI video can open with empty chunks. ffmpeg skips them and times the first frame by its place, 3 frames
+    (125 ms) after the start in the header (dwStart). mkvmerge shows that frame from that start and every later frame
+    at its time. So the video gets the header's start as --sync, and none for a start of 0. The proof accepts the
+    first frame inside the empty chunks and names it in empty_lead, and the audio starts against the frames that kept
+    their times. A remux with --sync of the first frame's time moves every later frame, and it fails."""
+    path, out = tmp_path / "Clip.avi", tmp_path / "synced.mkv"
+    avi_empty_lead(avi48, path, 3)
+    avi_patched(path, path, starts=starts)
+    j = hook.mkvmerge(str(path))
+    assert hook.avi_sync(str(path), j, hook.ff_streams(str(path))[1]) == sync
+    result, info = converted(path, tmp_path, settings)
+    assert result == "repacked" and info.get("start_sync", []) == sync, (result, info)
+    assert info["proof"][0]["empty_lead"] == {"pts": lead, "moved": -0.125, "empty": 0.125}, info["proof"]
+    assert [p["start"] for p in info["proof"]] == [[0.0, 0.0], [start, start]] and all(p["match"] for p in info["proof"]), info["proof"]
+    REAL_RUN(hook.convert_cmd(str(path), str(out), j, [], sync=[{"track": 0, "ms": round(lead * 1000)}])[5:], check=True)
+    assert proved(str(path), str(out), [], str(tmp_path))[0] == fault
+
+
+def test_an_avi_audio_start_is_the_time_of_its_first_packet(tmp_path, settings):
+    """ffmpeg reads the start (dwStart) of an AVI audio header in ways of its own. With a sample size (dwSampleSize)
+    of 1 and a block size (nBlockAlign) of 2, it counts the 4,800 of dwStart as bytes and starts the 16-bit PCM at
+    2,400 samples, 50 ms. The audio gets the time of its first packet as --sync, and the conversion proves clean."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    path = tmp_path / "Pcm.avi"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
+                "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "pcm_s16le", str(path)], check=True)
+    data = bytearray(path.read_bytes())
+    strh = data.find(b"strh", data.find(b"strh") + 4) + 8   # the audio's stream header, after the video's
+    struct.pack_into("<I", data, strh + 28, 4800)   # dwStart
+    struct.pack_into("<I", data, strh + 44, 1)      # dwSampleSize, and nBlockAlign stays 2
+    path.write_bytes(data)
+    assert hook.avi_sync(str(path), hook.mkvmerge(str(path)), hook.ff_streams(str(path))[1]) == [{"stream": "audio 1", "track": 1, "ms": 50}]
+    result, info = converted(path, tmp_path, settings)
+    assert result == "repacked" and [p["start"] for p in info["proof"]] == [[0.0, 0.0], [0.05, 0.05]], (result, info)
+
+
+def avi_header(*heads):
+    """The bytes of an AVI header with a stream header (strh) for each (fourcc, dwScale, dwRate, dwStart,
+    dwSampleSize) of heads, and nothing else."""
+    strl = b"".join(b"LIST" + struct.pack("<I", 68) + b"strl" + b"strh" + struct.pack("<I", 56) + struct.pack("<4s16xIII12xI8x", *h) for h in heads)
+    hdrl = b"LIST" + struct.pack("<I", 4 + len(strl)) + b"hdrl" + strl
+    return b"RIFF" + struct.pack("<I", 4 + len(hdrl)) + b"AVI " + hdrl
+
+
+ALL_MOVED = "the MKV would show the video 120 ms out of sync with the audio, from the start to the end. Detail: video 0 (mpeg4) moved 120 ms, first at 0.040 s"
+
+
+@pytest.mark.parametrize("case, start, fault", [
+    ("empty lead", 0, None),   # 3 empty chunks at 25 fps, and the first frame shows at 0
+    ("later frame moved", 0, "the MKV would show the video 10 ms out of sync with the audio, at 0:02. Detail: video 0 (mpeg4) moved 10 ms, first at 2.120 s"),
+    ("past the empty chunks", 2, ALL_MOVED),   # the header starts the video at 2 frames, so 1 chunk is empty
+    ("no empty chunks", 3, ALL_MOVED),   # the header starts the video at its first frame
+])
+def test_only_the_first_frame_moves_and_only_inside_the_empty_chunks(monkeypatch, tmp_path, case, start, fault):
+    """The first frame of an AVI video may show earlier in the new file, inside the empty chunks before it, from the
+    start in the header on. Every other frame keeps its time. A later frame that moves fails, and so does a first frame
+    that moves past the empty chunks, or one with no empty chunks before it."""
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"}, {"index": 1, "codec_type": "audio", "codec_name": "mp3"}]
+    monkeypatch.setattr(hook, "ff_streams", lambda p: ("avi" if p.endswith(".avi") else "matroska,webm", streams, 10.0))
+    video, audio = [0.12 + 0.04 * k for k in range(247)], [0.024 * k for k in range(416)]
+    new = [0.0] + video[1:]
+    if case == "later frame moved":
+        new[50] += 0.01
+    stats = lambda t, d: {"count": len(t), "empty": 0, "digest": d, "start": round(min(t), 3), "end": round(max(t) + 0.04, 3), "times": list(t)}
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, *a, **k: ({0: stats(video if path.endswith(".avi") else new, "v"), 1: stats(audio, "a")}, {}))
+    fake_places(monkeypatch, {0: stats(new, "v"), 1: stats(audio, "a")})   # the reread of the new file's blocks gives the same times
+    src, tmp = tmp_path / "Clip.avi", tmp_path / ".Clip.avi.repack-tmp"
+    src.write_bytes(avi_header((b"vids", 1, 25, start, 0), (b"auds", 1, 16000, 0, 1)))
+    tmp.touch()
+    got, proof = proved(str(src), str(tmp), [], str(tmp_path))
+    assert got == fault, got
+    assert ("empty_lead" in proof[0]) == (start == 0), proof   # the entry names the move it accepted, and the time check still runs
+    if not fault:
+        assert proof[0]["empty_lead"] == {"pts": 0.12, "moved": -0.12, "empty": 0.12} and [p["start"] for p in proof] == [[0.0, 0.0], [0.0, 0.0]], proof
 
 
 def test_a_wmv_that_starts_before_its_first_keyframe_converts_whole(tmp_path):
@@ -13208,6 +13316,80 @@ def test_a_cut_first_audio_frame_passes_and_is_logged(monkeypatch, tmp_path, cas
     if not fault:
         assert proof[1]["dropped_first"] == {"pts": 0.0, "size": 144} and proof[1]["match"] and proof[1]["start"] == [0.032, 0.032]
         assert proof[1].get("dropped") == ({"pts": 390.96, "size": 412} if case.startswith("both") else None)
+
+
+def avi_cut_audio(src, dst, cut, join):
+    """A copy of the AVI src at dst whose first audio chunk loses its first cut bytes and takes the data of the join
+    audio chunks after it, as in an AVI cut out of a longer one, and whose audio header counts bytes, 24,000 a second.
+    movi and idx1 are written again. ffmpeg's AVIs keep no other index."""
+    d = open(src, "rb").read()
+    movi, idx = d.find(b"movi"), d.rfind(b"idx1")
+    n = struct.unpack_from("<I", d, idx + 4)[0]
+    flags = [struct.unpack_from("<I", d, idx + 12 + k)[0] for k in range(0, n, 16)]   # idx1 lists each chunk of movi, in order
+    rows, pos, end = [], movi + 4, movi + struct.unpack_from("<I", d, movi - 4)[0]
+    while pos < end:
+        size = struct.unpack_from("<I", d, pos + 4)[0]
+        rows.append([d[pos:pos + 4], d[pos + 8:pos + 8 + size], flags[len(rows)]])
+        pos += 8 + size + (size & 1)
+    audio = [k for k, r in enumerate(rows) if r[0] == b"01wb"]
+    rows[audio[0]][1] = rows[audio[0]][1][cut:] + b"".join(rows[k][1] for k in audio[1:join + 1])
+    body, index = b"movi", b""
+    for tag, data, fl in (r for k, r in enumerate(rows) if k not in audio[1:join + 1]):
+        index += struct.pack("<4sIII", tag, fl, len(body), len(data))
+        body += tag + struct.pack("<I", len(data)) + data + b"\0" * (len(data) & 1)
+    out = bytearray(d[:movi - 8] + b"LIST" + struct.pack("<I", len(body)) + body + b"idx1" + struct.pack("<I", len(index)) + index + d[idx + 8 + n:])
+    struct.pack_into("<I", out, 4, len(out) - 8)
+    strh = [m.start() for m in re.finditer(b"strh", out)][1] + 8
+    struct.pack_into("<II", out, strh + 20, 1, 24000)   # dwScale and dwRate
+    struct.pack_into("<I", out, strh + 44, 1)           # dwSampleSize
+    struct.pack_into("<IH", out, out.find(b"strf", strh) + 16, 24000, 1)   # nAvgBytesPerSec and nBlockAlign
+    open(dst, "wb").write(out)
+
+
+def test_a_cut_first_ac3_frame_of_an_avi_starts_at_the_time_of_its_bytes(tmp_path, settings):
+    """An AVI with AC-3 at 192 kbit/s opens with the last 360 bytes of a frame, in one chunk with 3 whole frames, and
+    its header counts bytes. ffmpeg times the first whole frame one frame after the fragment, 32 ms, and the next chunk
+    by its bytes. mkvmerge drops the fragment and times the frames by their bytes, the first at 15 ms. The proof passes
+    at the time of the bytes and names it in byte_time. A new file that starts at neither time fails."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, path, out = tmp_path / "full.avi", tmp_path / "Clip.avi", tmp_path / "late.mkv"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
+                "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "ac3", "-b:a", "192k", str(full)], check=True)
+    avi_cut_audio(full, path, 408, 3)
+    result, info = converted(path, tmp_path, settings)
+    audio = info["proof"][1]
+    assert result == "repacked" and audio["dropped_first"] == {"pts": 0.0, "size": 360} and audio["start"] == [0.015, 0.015], (result, audio)
+    assert audio["byte_time"] == {"at": 0.015, "ffmpeg": 0.032, "rate": 24000.0}, audio
+    REAL_RUN(hook.convert_cmd(str(path), str(out), hook.mkvmerge(str(path)), [], sync=[{"track": 1, "ms": 10}])[5:], check=True)
+    assert proved(str(path), str(out), [], str(tmp_path))[0] == "stream audio 1 lost its cut first frame, and its first kept packet moved -7 ms"
+
+
+@pytest.mark.parametrize("codec, head, start, fault", [
+    ("ac3", (1, 24000, 0, 1), 0.015, None),    # 360 bytes at 24,000 bytes a second, as mkvmerge times it
+    ("ac3", (1, 24000, 0, 1), 0.032, None),    # ffmpeg's time passes as before
+    ("ac3", (1, 24000, 0, 1), 0.025, "stream audio 1 lost its cut first frame, and its first kept packet moved -7 ms"),
+    ("mp3", (1152, 48000, 0, 0), 0.015, "stream audio 1 lost its cut first frame, and its first kept packet moved -17 ms"),   # VBR
+])
+def test_only_avi_audio_that_counts_bytes_starts_at_the_time_of_its_bytes(monkeypatch, tmp_path, codec, head, start, fault):
+    """After a cut first frame, the first kept packet of AVI audio whose header counts bytes may start at the time of
+    its bytes, or at ffmpeg's time as before. A start at neither time fails. A header that counts frames, as one of VBR
+    MP3 does, has no time of the bytes, and the first kept packet keeps ffmpeg's time."""
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"}, {"index": 1, "codec_type": "audio", "codec_name": codec}]
+    monkeypatch.setattr(hook, "ff_streams", lambda p: ("avi" if p.endswith(".avi") else "matroska,webm", streams, 10.0))
+    video = {"count": 250, "empty": 0, "digest": "v", "start": 0.0, "end": 10.0, "times": [0.04 * k for k in range(250)]}
+    audio = {"count": 312, "empty": 0, "digest": "a", "but_first": "a1", "first": 360, "first_pts": 0.0, "start": 0.0, "end": 10.0,
+             "times": [0.032 * k for k in range(16)] + [0.015 + 0.032 * k for k in range(16, 312)]}   # the next chunk by its bytes
+    new = {"count": 311, "empty": 0, "digest": "a1", "start": start, "end": 10.0}
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, *a, **k: ({0: video, 1: audio if path.endswith(".avi") else new}, {}))
+    fake_places(monkeypatch)
+    src, tmp = tmp_path / "Clip.avi", tmp_path / ".Clip.avi.repack-tmp"
+    src.write_bytes(avi_header((b"vids", 1, 25, 0, 0), (b"auds", *head)))
+    tmp.touch()
+    got, proof = proved(str(src), str(tmp), [], str(tmp_path))
+    assert got == fault, got
+    assert proof[1].get("byte_time") == ({"at": 0.015, "ffmpeg": 0.032, "rate": 24000.0} if head[3] else None), proof[1]
+    assert proof[1]["start"] == [0.015 if start == 0.015 and head[3] else 0.032, start], proof[1]
 
 
 @pytest.mark.parametrize("case, fault", [
