@@ -10300,7 +10300,7 @@ REFUSAL = "the packet data of stream audio 1 (mp3) differ"   # the proof after m
 REFUSED = (1, REFUSAL)   # as prove() returns it, with the stream it refuses
 
 
-def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ, refusal=REFUSED, second=None):
+def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ, refusal=REFUSED, second=None, rows=()):
     """An MP4 import of Film A with a grab record, whose conversion shows the damage signal. mkvmerge's invalid-data
     warning comes with the proof's refusal. The second check from scratch finds the signal again when repeat. For
     mkvmerge, second is what its second run says instead. REGRAB lists damage. Returns (mp4, each read that showed it)."""
@@ -10311,7 +10311,7 @@ def damaged_import(env, monkeypatch, signal, repeat=True, message=BAD_READ, refu
     if signal == "mkvmerge":
         outs = iter([INVALID_AUDIO, second if second is not None else INVALID_AUDIO if repeat else ""])
         env["during_repack"] = lambda: env.update(repack_out=next(outs)) or reads.append(env["repacks"][-1])
-        env["repack_rc"], env["proof"] = 1, (refusal, [])
+        env["repack_rc"], env["proof"] = 1, (refusal, list(rows))
     elif signal == "ffmpeg":
         def bad_read(path, maps, bsf, *a, **k):
             reads.append((path, bsf))
@@ -10558,7 +10558,11 @@ def test_a_refused_avi_names_the_invalid_audio_data_of_another_stream():
     streams = [{"index": 0, "codec_type": "video", "codec_name": "msmpeg4v3"}, {"index": 1, "codec_type": "audio", "codec_name": "mp3"}]
     why = "stream video 0 (msmpeg4v3) holds 121428 packets in the new file, 121436 in the original"
     rows = [{"stream": "video 0", "count": 121436, "new_count": 121428, "match": False}, {"stream": "audio 1", "count": 211608, "match": False}]
-    assert hook.audio_damage(text, j, streams, 5076.41, (0, why)) is None
+    assert hook.audio_damage(text, j, streams, 5076.41, (0, why), rows) is None   # the audio row names no packet refusal
+    data = "the packet data of stream audio 1 (mp3) differ"   # the video failed first, and the proof refused the audio's packets too
+    assert hook.audio_damage(text, j, streams, 5076.41, (0, why), [rows[0], dict(rows[1], refused=data)]) == {
+        "read": "mkvmerge", "fault": "part of the audio cannot be read", "line": text.splitlines()[0].partition("track 1: ")[2][:200], "stream": 1,
+        "refusal": data}
     skipped = hook.skipped_audio(text, j, streams, 5076.41, (0, why), rows)
     assert skipped == {"stream": 1, "at": 884.112, "packets": ["video", 121428, 121436]}, skipped
     assert hook.FINDINGS["repack"][1]({"container": "AVI", "why": why, "skipped": skipped}, "done") == (
@@ -10569,6 +10573,19 @@ def test_a_refused_avi_names_the_invalid_audio_data_of_another_stream():
     dub = text.replace("track 1:", "track 2:").replace("00:14:44.", "00:10:02.")   # a second audio track skips earlier
     two = (dict(j, tracks=j["tracks"] + [{"id": 2, "type": "audio"}]), streams + [{"index": 2, "codec_type": "audio", "codec_name": "mp3"}])
     assert hook.skipped_audio(f"{text}\n{dub}", *two, 5076.41, (0, why), []) == {"stream": 2, "at": 602.112}
+
+
+def test_invalid_audio_data_re_grabs_when_the_video_failed_first(env, monkeypatch):
+    """mkvmerge skipped invalid data in audio stream 1. The proof refused the video first, and the packets of that
+    audio stream too. The import re-grabs as when the audio is the first refusal, and the alert names the audio's refusal."""
+    video = "the packet data of stream video 0 (h264) differ"
+    damaged_import(env, monkeypatch, "mkvmerge", refusal=(0, video), rows=[{"stream": "video 0", "match": False, "refused": video},
+                                                                          {"stream": "audio 1", "match": False, "refused": REFUSAL}])
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["regrab"], rec["result"]) == ("damaged_source", "regrabbed", "damaged source: part of the audio cannot be read"), rec
+    assert rec["repack"]["damage"]["refusal"] == REFUSAL and rec["repack"]["damage"]["stream"] == 1
+    assert rec["findings"][0]["refusal"] == REFUSAL
 
 
 SHORT = (0, "stream video 0 (h264) holds 30912 packets in the new file, 30920 in the original")   # the packet count refusal of prove()
@@ -10709,6 +10726,19 @@ def test_a_backfill_lists_a_damaged_source_and_never_re_grabs(env, monkeypatch):
     assert os.path.exists(mp4) and env["writes"] == [] and [u for m, u, b in env["http"] if m == "POST"] == []
     (line,) = open(os.path.join(hook.CFG.state_dir, "convert-radarr.txt")).read().splitlines()
     assert line.split("\t")[1] == "repack_failed" and line.endswith(mp4)
+
+
+def test_a_backfill_names_the_skip_when_the_video_failed_first(env, monkeypatch):
+    """The library conversion finds damage in the audio after a refusal of the video. It re-grabs nothing, so its
+    alert keeps the words of the skip and the packets the video lost."""
+    (mp4,) = mp4_films(env, monkeypatch, 1)
+    env["repack_rc"], env["repack_out"] = 1, INVALID_AUDIO
+    env["proof"] = (SHORT, SHORT_ROWS + [{"stream": "audio 1", "match": False, "refused": REFUSAL}])
+    hook.main(["--backfill", "radarr", "--convert", "--apply"])
+    (rec,) = [r for r in log_lines(env) if r.get("outcome")]
+    assert (rec["outcome"], rec["repack"]["damage"]["stream"], rec["repack"]["skipped_audio"]["at"]) == ("repack_failed", 1, 261.517), rec
+    assert rec["alerts"] == [f"repack: {FAILED}The MP4/QuickTime file is damaged near 4:21, and the copy lost 8 of 30920 video packets. "
+                             "Only a different release fixes it."] and os.path.exists(mp4) and env["writes"] == []
 
 
 @pytest.mark.parametrize("signal", ["mkvmerge", "ffmpeg", "ffprobe"])
@@ -13557,7 +13587,12 @@ def test_a_refusal_names_the_stream_of_its_packets(monkeypatch, tmp_path, case, 
                         (old if path.endswith(".src") else new, {}))
     fake_places(monkeypatch)
     (tmp_path / "a.src").touch(); (tmp_path / "a.mkv").touch()
-    assert hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))[0] == refused
+    got, rows = hook.prove(str(tmp_path / "a.src"), str(tmp_path / "a.mkv"), [], str(tmp_path))
+    assert got == refused
+    # each row refused for its packets holds its own refusal, also after the first one, see audio_damage()
+    want = {"audio count": [None, refused and refused[1]], "video data": [refused and refused[1], None],
+            "video data, audio count": [refused and refused[1], "stream audio 1 (aac) holds 12 packets in the new file, 10 in the original"]}
+    assert [r.get("refused") for r in rows] == want.get(case, [None, None])
 
 
 LOST_ONE = "stream audio 1 (mp3) holds 999 packets in the new file, 1000 in the original"

@@ -1223,9 +1223,10 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
         if fault and force and seen != force:
             info["not_forced"] = f"the last refusal in the decision log differs: {force.partition(': ')[2][:200]}"
         if fault and seen != force:
-            if damage := proof.audio_damage(out, j, streams, dur, refused):   # invalid data, and the same audio stream refused
+            if damage := proof.audio_damage(out, j, streams, dur, refused, info["proof"]):   # invalid data, and the same audio stream refused
                 info["damage"] = damage
-            elif skipped := proof.skipped_audio(out, j, streams, dur, refused, info["proof"]):   # the alert names it, see report.failed_repack()
+            # The alert of a refusal of another stream names the skip, see report.failed_repack(). A run that does not act on the damage posts it.
+            if (not damage or damage["stream"] != refused[0]) and (skipped := proof.skipped_audio(out, j, streams, dur, refused, info["proof"])):
                 info["skipped_audio"] = skipped
             raise RuntimeError(fault)
         if fault:

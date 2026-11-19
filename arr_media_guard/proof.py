@@ -1091,6 +1091,8 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                 got = [None if v != v else v for v in (pb.get(t["index"]) or [[]])[0]]
                 why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, got[ycut])
         proof[-1]["match"] = not why
+        if why and bad is not None:
+            proof[-1]["refused"] = why   # refused for its packets: audio_damage() counts it when another stream failed first
         if why and not fault:
             fault, stream = why, bad
     for s, t in text:
@@ -1174,12 +1176,13 @@ def invalid_audio(text, j, streams, dur):
     return out
 
 
-def audio_damage(text, j, streams, dur, fault):
+def audio_damage(text, j, streams, dur, fault, rows=()):
     """damage_of() for mkvmerge: its warning of invalid audio data counts only when the proof then refused that same
-    audio stream for its packet count or its packet data, see invalid_audio(). The refusal is fault, see prove()."""
-    index, why = fault
-    line = invalid_audio(text, j, streams, dur).get(index)
-    return {"read": "mkvmerge", "fault": DAMAGE["mkvmerge"][1], "line": line, "stream": index, "refusal": why[:200]} if line else None
+    audio stream for its packet count or its packet data, see invalid_audio(). The refusal is fault, see prove(), or
+    the "refused" of that stream's row of rows when an earlier stream gave the fault."""
+    whys = {f"audio {fault[0]}": fault[1], **{r["stream"]: r["refused"] for r in rows if r.get("refused")}}
+    hit = next(((i, line) for i, line in sorted(invalid_audio(text, j, streams, dur).items()) if f"audio {i}" in whys), None)
+    return hit and {"read": "mkvmerge", "fault": DAMAGE["mkvmerge"][1], "line": hit[1], "stream": hit[0], "refusal": whys[f"audio {hit[0]}"][:200]}
 
 
 def skipped_audio(text, j, streams, dur, fault, rows):

@@ -1707,7 +1707,9 @@ re-grabs the import. Only these signs count:
 
 - mkvmerge warns "This audio track contains N bytes of invalid data which were skipped" for an audio
   track, or "1 byte ... which was skipped", more than `SKIP_EDGE` (5) seconds from either end of the
-  file. The proof then refuses that same audio stream, for its packet count or its packet data. The
+  file. The proof then refuses that same audio stream, for its packet count or its packet data. That
+  counts when another stream failed first too. The proof row of a stream refused for its packets
+  holds the refusal in `refused`. A run that does not re-grab then posts the skip words below. The
   k-th audio track of mkvmerge is the k-th audio stream of ffprobe, as the proof pairs them. A TrueHD core that
   mkvmerge leaves out has no place in that count, see "Blu-ray TrueHD".
 - ffmpeg does not read the original cleanly in the proof, with "NAL unit size", "Invalid data found" or
@@ -1718,7 +1720,7 @@ re-grabs the import. Only these signs count:
   found" or "partial file". An empty message or a read error of the file system is no damage.
 
 A proof refusal alone, over an edit list, the times, the cues or a packet count, is no damage. So is a
-warning alone, or a warning with a refusal of another stream. A skip near an end is often junk, such as
+warning alone, or a warning when the proof refuses only other streams. A skip near an end is often junk, such as
 zero bytes after the last audio frame, and a clean proof converts that file. Each of these stays a
 refusal with its "Conversion to MKV failed" alert, and the original stays.
 
