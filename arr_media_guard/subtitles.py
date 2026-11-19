@@ -1610,7 +1610,7 @@ def sub_findings(rec, sync, unmatched, starts=None, cut=()):
     one subtiming finding for the tracks whose times are off and stay. unmatched holds the tracks, by their place
     before any remux, that stayed in the file and lost their flags instead. A line of a subtitle that the speech layout
     check found off, or whose times it could not fix, says layout. Such a subtitle whose verdict stays, see
-    subsync.LAYOUT_ACTION, gets a layout line. A dry run also records what --apply would do with the file, see
+    subsync.LAYOUT_ACTION, gets a layout line, unless a remux that ran took it out as unreadable. A dry run also records what --apply would do with the file, see
     remux_block().
 
     The timing judge gives each subtitle of sync its outcome first, after the moves and the write, in rec["subjudge"],
@@ -1642,7 +1642,10 @@ def sub_findings(rec, sync, unmatched, starts=None, cut=()):
                           **({"to": e["to"], "renamed": e["result"] == "renamed"} if e.get("to") else {})})
         elif e["result"] == "left":
             late.append({"code": "sidecar_left", "name": e["name"], "why": e["why"], "left": e["left"], "action": e["action"]})
-    wrong += [{"code": "layout", "track": k} for k, r in sorted(sync.items()) if laid(k) and r["verdict"] != "mismatch"]   # see subsync.LAYOUT_ACTION
+    # A track a remux that ran took out as unreadable has its own notice, so no line says it was left, see
+    # subsync.LAYOUT_ACTION. After a dry run or a remux that did not run, the track is still in the file.
+    wrong += [{"code": "layout", "track": k} for k, r in sorted(sync.items())
+              if laid(k) and r["verdict"] != "mismatch" and not (rm.get("done") and k in (rm.get("stripped") or {}))]
     # The tracks whose text is garbled, by their place before any remux. A track that cannot be repaired is taken out
     # with its bytes kept beside the video, or stays when a setting keeps it or its read was cut, see subtitle_checks().
     # The tracks taken out and the garbled sidecars renamed go to one unreadable finding, as a conversion's do. The

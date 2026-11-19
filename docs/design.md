@@ -1566,13 +1566,29 @@ in such an AVI the second packet may also start at the time of its bytes, the fr
 size over the bytes a second, within 2 ms. The entry names that time, ffmpeg's time and the bytes a
 second in `byte_time`. A header with no sample size, as for VBR MP3, counts frames and keeps ffmpeg's
 time. mkvmerge may also keep only the tail of a cut first MP3 or MP2 frame. That passes when every
-other packet matches and the second packet keeps its time. mkvmerge re-times the
-stream from the first frame it keeps, so junk longer than one frame would make the audio play early.
-The first MP3 or MP2 packet can also hold junk before a whole frame, zeros or a RIFF header of at
-most 128 bytes, and the stream can end on a cut frame that mkvmerge drops. The rule runs in any
+other packet matches and the second packet keeps its time, within 0.05 seconds (`SYNC`) for an AVI. Junk that
+moved the stream would move the second packet with every later one, so that check catches it.
+The first MP3 or MP2 packet can also hold junk before a whole frame, and the stream can end on a cut
+frame that mkvmerge drops. Junk is zeros, a RIFF header of at most 128 bytes, or the tail of a cut frame. Such a tail
+holds fewer bytes than the whole frame after it and starts with no frame sync. The rule runs in any
 container, and the measured files are AVIs. It passes when one read of packet 0 of each file shows
 the new packet 0 is the tail of the old one after the junk. The entry names the junk in
-`trimmed_first.junk` and the cut frame in `dropped`. The proof also allows a last sample that an MP4 edit list hides.
+`trimmed_first.junk` and the cut frame in `dropped`.
+
+mkvmerge 102 plays the junk as a delay of its bytes. In an AVI whose header has a sample size, the
+stream may then start at the junk's size over the bytes a second, within 2 ms. ffmpeg times packet 0
+and the rest of its chunk a frame apart, so their times leave the junk out. It times the first packet
+of the next chunk by its bytes. That packet must come within 0.6 seconds of the start (`CHUNK_MAX`),
+and the new file must hold it at the same time within 2 ms. The dropped last frame must then hold
+fewer bytes than the new packet 0, a whole frame. Only the frames of the first chunk move against
+ffmpeg's read. With
+1,599 zero bytes at 16,000 bytes a second, mkvmerge starts the stream at 100 ms. In ffmpeg's read,
+packets 1 to 15 come 100 ms before the time of their bytes. Packet 16 comes at 0.518 seconds, the
+time of its bytes and its time in the new file. A first chunk that holds the whole stream gives no such packet, and neither does
+one with 2 seconds of zeros and 1 second of frames. The entry names the start, ffmpeg's start, the
+bytes a second and that packet in `byte_time`. The tail of a cut frame passes only so. A container or
+a header with no time of the bytes refuses it. Zeros and a header that fail it keep the check of the
+second packet against ffmpeg's time. The proof also allows a last sample that an MP4 edit list hides.
 
 A few packets more may go at the ends when every other packet matches in order. The video may lose
 up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose
@@ -2916,7 +2932,9 @@ each sidecar of the alert well, and mkvmerge misreads it, the title is "Subtitle
 keys on the kind
 `unreadable`, see `logs.alert()`. A conversion's alert
 starts with the conversion. A run posts one such alert, and it also says each repair of the run, see
-`subtitles.sub_findings()`. When a run converts the file and then takes out garbled tracks or renames sidecars, the
+`subtitles.sub_findings()`. When the remux ran and took a track out as unreadable, no other line of the run says
+that the track stays in the file. That covers the layout line and the line of a mismatch that stays. A dry run and
+a remux that failed or did not run keep those lines, because the track is still in the file. When a run converts the file and then takes out garbled tracks or renames sidecars, the
 alert names the conversion first, then the tracks taken out after it, see `process.after_edit()`. Such a track goes
 by its number in the original file when it came from one of the original's tracks, see `process.conversion()`. A
 track the conversion added, as a muxed sidecar, goes as track N of the converted file. It posts with `NOTIFICATION_POSTS`

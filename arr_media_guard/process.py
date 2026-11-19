@@ -1079,7 +1079,7 @@ def write(ctx):
         ctx.read, ctx.wrong, ctx.heard = subtitles.renumber(ctx.read, gone), subtitles.renumber(ctx.wrong, gone), subtitles.renumber(ctx.heard, gone)
         ctx.checked = subtitles.renumber(ctx.checked, gone)
         ctx.unmatched = set(subtitles.renumber(dict.fromkeys(ctx.unmatched), gone))
-        ctx.stay = [p for p in ctx.stay if p not in rec["subremux"]["removed"]]
+        ctx.stay = [p for p in ctx.stay if p not in rec["subremux"]["removed"] and p not in (rec["subremux"].get("stripped") or {})]   # an unreadable one has its own notice
         if ctx.hp and ctx.hp["issue"] and not head:   # mkvmerge wrote a new header, and a retime can end a subtitle overrun
             now = checks.header_of(path, ctx.j)
             ctx.ended, ctx.hp = bool(now and not now["issue"]), now or ctx.hp   # its places are of the new file, see write_findings()

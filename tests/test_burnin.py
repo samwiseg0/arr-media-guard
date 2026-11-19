@@ -849,7 +849,7 @@ def test_the_video_is_the_first_stream_that_is_no_cover(clips, tmp_path, monkeyp
     cover, video = stream(av.stream.Disposition.attached_pic, 200), stream(av.stream.Disposition.default, 640)
     box_ = type("Box", (), {"start_time": None, "close": lambda self: None})()
     box_.streams = type("S", (), {"video": [cover, video]})()
-    monkeypatch.setattr(av, "open", lambda path: box_)
+    monkeypatch.setattr(av, "open", lambda path, **kw: box_)
     sm = burnin.Sampler("cover.mp4")
     assert (sm.v, sm.size, sm.start, sm.hdr) == (video, (640, 352), 0.0, False)
     box_.streams.video = [cover]
@@ -868,7 +868,7 @@ def test_the_video_is_never_a_still_image_track_before_it(monkeypatch):
     stream = lambda name, pic=0: types.SimpleNamespace(disposition=pic, codec_context=types.SimpleNamespace(width=640, height=360, color_trc=1, name=name))
     cover, still, film = stream("png", 1), stream("mjpeg"), stream("h264")
     box_ = types.SimpleNamespace(start_time=None, close=lambda: None, streams=types.SimpleNamespace(video=[cover, still, film]))
-    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path: box_, stream=types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path, **kw: box_, stream=types.SimpleNamespace(
         Disposition=types.SimpleNamespace(attached_pic=1))))
     assert burnin.Sampler("film.mkv").v is film
     box_.streams.video = [cover, still]
@@ -886,7 +886,7 @@ def test_a_seek_goes_by_the_films_own_index(monkeypatch):
     cover, film = (types.SimpleNamespace(disposition=0, time_base=fractions.Fraction(1, 1000), codec_context=cc(n)) for n in ("mjpeg", "h264"))
     box_ = types.SimpleNamespace(start_time=2_000_000, close=lambda: None, streams=types.SimpleNamespace(video=[cover, film]),
                                  seek=lambda *a, **k: seeks.append((a, k)), demux=lambda v: iter(()), decode=lambda v: iter(()))
-    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path: box_, stream=types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "av", types.SimpleNamespace(open=lambda path, **kw: box_, stream=types.SimpleNamespace(
         Disposition=types.SimpleNamespace(attached_pic=1))))
     sm = burnin.Sampler("film.mkv")
     assert sm.keyframe(30) == (None, None) and sm.frame_at(60) == (None, None)
@@ -927,6 +927,31 @@ def test_the_samples_of_a_film_with_a_cover_track_land_where_asked(tmp_path, cov
     run("mkvmerge", "-q", "-o", str(tmp_path / "f.mkv"), *[str(tmp_path / p) for p in parts])
     got = json.loads(run(py, "-c", SAMPLES, FILES, str(tmp_path / "f.mkv")).stdout)
     assert got == ["h264", [30.0, 60.0, 90.0], [30, 60, 90]], got
+
+
+TAGGED = """import sys
+sys.path.insert(0, sys.argv[1])
+from arr_media_guard import avwindow, burnin
+sm = burnin.Sampler(sys.argv[2])
+print(sm.v.codec_context.name)
+sm.close()
+sys.exit(avwindow.main(sys.argv[2], 0, 0.0, 1.0))
+"""   # the sampler's film, then a window of 1 s, in a Python that holds PyAV
+
+
+def test_a_tag_that_is_not_utf8_opens(tmp_path):
+    """The software tag (ISFT) of a real AVI held the byte 0xc0, which is not UTF-8. PyAV raised UnicodeDecodeError when
+    it opened the file, so the burn-in check ended in an error. The sampler and the window open it with the byte replaced."""
+    py = pyav_python()
+    if not shutil.which("ffmpeg"):
+        pytest.skip("needs ffmpeg")
+    path = tmp_path / "tag.avi"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=2", "-c:v", "mpeg4", str(path)], check=True)
+    data = bytearray(path.read_bytes())
+    data[data.find(b"ISFT") + 10] = 0xc0   # inside "Lavf..."
+    path.write_bytes(data)
+    r = subprocess.run([py, "-c", TAGGED, FILES, str(path)], capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.split() == ["mpeg4"], r.stderr[-500:]
 
 
 def test_method_b_needs_enough_strokes_with_dark_on_both_sides():

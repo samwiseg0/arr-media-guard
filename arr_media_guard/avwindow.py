@@ -48,7 +48,7 @@ def main(path, index, start, secs):
     av = ff.pyav("avwindow.main")
     av.logging.set_level(av.logging.INFO)
     logging.getLogger("libav").addHandler(Libav())
-    with av.open(path) as c:   # a file that does not open raises, and exits 1
+    with av.open(path, metadata_errors="replace") as c:   # a file that does not open raises, and exits 1
         s = c.streams[index]
         for o in c.streams:   # as ffmpeg's -map, so a damaged audio track never shows in the window
             if o is not s:

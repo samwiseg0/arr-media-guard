@@ -13318,10 +13318,11 @@ def test_a_cut_first_audio_frame_passes_and_is_logged(monkeypatch, tmp_path, cas
         assert proof[1].get("dropped") == ({"pts": 390.96, "size": 412} if case.startswith("both") else None)
 
 
-def avi_cut_audio(src, dst, cut, join):
+def avi_cut_audio(src, dst, cut, join, head=b"", tail=0):
     """A copy of the AVI src at dst whose first audio chunk loses its first cut bytes and takes the data of the join
     audio chunks after it, as in an AVI cut out of a longer one, and whose audio header counts bytes, 24,000 a second.
-    movi and idx1 are written again. ffmpeg's AVIs keep no other index."""
+    head goes in front of the first audio chunk, and the last audio chunk loses its last tail bytes. movi and idx1 are
+    written again. ffmpeg's AVIs keep no other index."""
     d = open(src, "rb").read()
     movi, idx = d.find(b"movi"), d.rfind(b"idx1")
     n = struct.unpack_from("<I", d, idx + 4)[0]
@@ -13332,7 +13333,8 @@ def avi_cut_audio(src, dst, cut, join):
         rows.append([d[pos:pos + 4], d[pos + 8:pos + 8 + size], flags[len(rows)]])
         pos += 8 + size + (size & 1)
     audio = [k for k, r in enumerate(rows) if r[0] == b"01wb"]
-    rows[audio[0]][1] = rows[audio[0]][1][cut:] + b"".join(rows[k][1] for k in audio[1:join + 1])
+    rows[audio[0]][1] = head + rows[audio[0]][1][cut:] + b"".join(rows[k][1] for k in audio[1:join + 1])
+    rows[audio[-1]][1] = rows[audio[-1]][1][:len(rows[audio[-1]][1]) - tail]
     body, index = b"movi", b""
     for tag, data, fl in (r for k, r in enumerate(rows) if k not in audio[1:join + 1]):
         index += struct.pack("<4sIII", tag, fl, len(body), len(data))
@@ -13390,6 +13392,112 @@ def test_only_avi_audio_that_counts_bytes_starts_at_the_time_of_its_bytes(monkey
     assert got == fault, got
     assert proof[1].get("byte_time") == ({"at": 0.015, "ffmpeg": 0.032, "rate": 24000.0} if head[3] else None), proof[1]
     assert proof[1]["start"] == [0.015 if start == 0.015 and head[3] else 0.032, start], proof[1]
+
+
+@pytest.mark.parametrize("junk, at, ms, fault", [
+    ("cut", 0.015, -15, "stream audio 1 (mp3) lost 360 bytes of a cut frame before its first frame, and does not start at the time of those bytes"),
+    ("zero", 0.1, -40, "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +60 ms"),
+])
+def test_mp3_junk_before_the_first_frame_of_an_avi_starts_at_the_time_of_its_bytes(tmp_path, settings, junk, at, ms, fault):
+    """An AVI with MP3 at 192 kbit/s opens with junk and 2 whole frames in one chunk, and ends on a cut frame. Its
+    header counts bytes, 24,000 a second. The junk is the last 360 bytes of a frame, or 2,400 zero bytes. mkvmerge plays
+    the junk as a delay of its bytes, 15 or 100 ms, and drops the cut frame. ffmpeg times packet 1 a frame after packet 0,
+    so its time leaves the junk out. The proof passes at the time of the junk's bytes and names it in byte_time. A new
+    file that starts the tail of a cut frame at 0 fails, and so do zeros that start at neither time."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, path, out = tmp_path / "full.avi", tmp_path / "Clip.avi", tmp_path / "early.mkv"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=8", "-f", "lavfi", "-i",
+                "sine=duration=8:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame", "-b:a", "192k", str(full)], check=True)
+    head = hook.packet_data(str(full), 1, None, 2, 60)[-360:] if junk == "cut" else bytes(2400)   # the tail of frame 1
+    avi_cut_audio(full, path, 0, 1, head, 200)
+    result, info = converted(path, tmp_path, settings)
+    audio = info["proof"][1]
+    assert result == "repacked" and audio["trimmed_first"] == {"pts": 0.0, "size": [len(head) + 576, 576], "junk": junk}, (result, audio)
+    chunk = round(at + 0.048, 3)   # packet 2 opens the next chunk, and ffmpeg times it by its bytes
+    assert audio["byte_time"] == {"at": at, "ffmpeg": 0.0, "rate": 24000.0, "chunk": {"packet": 2, "pts": [chunk, chunk]}}, audio
+    assert audio["start"] == [at, at] and audio["dropped"]["size"] == 376, audio
+    REAL_RUN(hook.convert_cmd(str(path), str(out), hook.mkvmerge(str(path)), [], sync=[{"track": 1, "ms": ms}])[5:], check=True)
+    assert proved(str(path), str(out), [], str(tmp_path))[0] == fault
+
+
+@pytest.mark.parametrize("zeros, frames", [
+    (21600, None),   # 0.9 s of zeros, and every frame but the last chunk in the first chunk
+    (48000, None),   # 2 s of zeros
+    (48000, 41),     # 2 s of zeros and 41 frames, about 1 s of audio, then a chunk a frame
+])
+def test_mp3_zeros_that_move_the_whole_first_chunk_fail(tmp_path, settings, zeros, frames):
+    """An AVI with MP3 at 192 kbit/s opens with 0.9 s or 2 s of zero bytes in front of the first frame, and its first
+    chunk holds every frame but the last one, or 41 frames. mkvmerge delays the stream by the zeros. ffmpeg times each
+    frame of the first chunk a frame apart from 0, so it plays them 0.9 s or 2 s earlier than the new file. No packet
+    that ffmpeg times by its bytes comes in the first 0.6 s, so the proof keeps the check of ffmpeg's time and fails."""
+    if not (shutil.which("ffmpeg") and shutil.which("mkvmerge")):
+        pytest.skip("needs ffmpeg and mkvmerge")
+    full, path = tmp_path / "full.avi", tmp_path / "Clip.avi"
+    amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=20", "-f", "lavfi", "-i",
+                "sine=duration=20:sample_rate=48000", "-c:v", "mpeg4", "-vtag", "DX50", "-c:a", "libmp3lame", "-b:a", "192k", str(full)], check=True)
+    n = int(REAL_RUN(["ffprobe", "-v", "error", "-select_streams", "1", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
+                      str(full)], capture_output=True, text=True, check=True).stdout)   # one frame a chunk
+    avi_cut_audio(full, path, 0, (frames or n - 1) - 1, bytes(zeros), 200)
+    result, info = converted(path, tmp_path, settings)
+    assert result == f"repack failed: stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +{zeros // 24} ms", (result, info["proof"])
+
+
+CUT_UNTIMED ="stream audio 1 (mp3) lost 160 bytes of a cut frame before its first frame, and does not start at the time of those bytes"
+
+
+@pytest.mark.parametrize("case, fault", [
+    ("cut", None),   # 160 bytes of a cut frame at 16,000 bytes a second: the stream starts 10 ms later
+    ("zeros", None),   # 1,600 zero bytes: the stream starts 100 ms later, and packet 16 keeps the time of its bytes
+    ("cut, start at 0", CUT_UNTIMED),
+    ("cut, VBR header", CUT_UNTIMED),   # a header that counts frames gives no time of the bytes
+    ("cut, MP4", CUT_UNTIMED),
+    ("cut, no chunk in 0.6 s", CUT_UNTIMED),
+    ("cut of a whole frame", "stream audio 1 (mp3) holds 999 packets in the new file, 1000 in the original"),
+    ("cut with a frame sync", "stream audio 1 (mp3) holds 999 packets in the new file, 1000 in the original"),
+    ("zeros, start at 60 ms", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +60 ms"),   # ffmpeg's time as before
+    ("zeros, no chunk in 0.6 s", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +100 ms"),
+    ("zeros, chunk moved", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +100 ms"),
+    ("zeros, whole last frame", "stream audio 1 (mp3) lost a trimmed first frame, and its second packet moved +100 ms"),   # no byte time, so the 2.21.6 check
+])
+def test_mp3_junk_passes_only_at_the_time_of_its_bytes(monkeypatch, tmp_path, case, fault):
+    """Junk before the first MP3 frame of an AVI whose header counts bytes: the stream may start at the time of the
+    junk's bytes. ffmpeg times packets 1 to 15 a frame apart, and packet 16, the first of the next chunk, by its bytes.
+    That packet must come within 0.6 s and keep its time in the new file. Zeros that fail that keep the check of
+    ffmpeg's time. The tail of a cut frame passes only at the time of its bytes, so a start at 0, a header that counts
+    frames, an MP4 and a next chunk past 0.6 s fail. A tail of a whole frame or more, or one that starts with a frame
+    sync, is no junk, and the last packet mkvmerge drops must be shorter than a whole frame."""
+    head = {"zeros": bytes(1600), "cut of a whole frame": bytes(i % 200 + 1 for i in range(417)),
+            "cut with a frame sync": b"\xff\xfb" + MP3_FRAME[50:208]}.get(case.partition(",")[0], MP3_FRAME[50:210])
+    old0, rate, jump = head + MP3_FRAME, 16000, 40 if "no chunk" in case else 16
+    at = 0.0 if case == "cut, start at 0" else 0.06 if case.endswith("60 ms") else round(len(head) / rate, 3)
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg4"}, {"index": 1, "codec_type": "audio", "codec_name": "mp3"}]
+    monkeypatch.setattr(hook, "ff_streams", lambda p: ("mov,mp4,m4a,3gp,3g2,mj2" if case.endswith("MP4") and p.endswith(".avi") else
+                                                       "avi" if p.endswith(".avi") else "matroska,webm", streams, 26.0))
+    video = {"count": 650, "empty": 0, "digest": "v", "start": 0.0, "end": 26.0, "times": [i * 0.04 for i in range(650)]}
+    sizes = [len(old0)] + [417] * 998 + [417 if "whole" in case else 200]
+    by_bytes = [sum(sizes[:i]) / rate for i in range(1000)]   # the time of each packet's bytes
+    old = {"count": 1000, "empty": 0, "digest": "a", "but_first": "a-first", "but_ends": "a-ends", "first": len(old0), "first_pts": 0.0,
+           "last": sizes[-1], "last_pts": 25.974, "start": 0.0, "end": 26.0, "sizes": sizes,
+           "times": [i * 0.026 for i in range(jump)] + by_bytes[jump:]}   # the next chunk by its bytes
+    shift = len(head) / rate - at   # how much earlier than its bytes the new file plays each packet
+    new = {"count": 999, "empty": 0, "digest": "b", "but_first": "a-ends", "first": len(MP3_FRAME), "start": at, "end": 25.974,
+           "times": [at] + [round(t - shift + (0.01 if case.endswith("chunk moved") and i == jump else 0), 3) for i, t in enumerate(by_bytes[1:999], 1)]}
+    monkeypatch.setattr(hook, "packet_hashes", lambda path, maps, bsf, texts, folder, timeout, raw=False, opts=():
+                        ({0: video, 1: old if path.endswith(".avi") else new}, {}))
+    fake_places(monkeypatch)
+    monkeypatch.setattr(hook, "packet_data", lambda path, index, bsf, n, timeout: old0 if path.endswith(".avi") else MP3_FRAME)
+    src, tmp = tmp_path / "Clip.avi", tmp_path / ".Clip.avi.repack-tmp"
+    src.write_bytes(avi_header((b"vids", 1, 25, 0, 0), (b"auds", *((1152, 48000, 0, 0) if case.endswith("VBR header") else (1, rate, 0, 1)))))
+    tmp.touch()
+    got, proof = proved(str(src), str(tmp), [], str(tmp_path))
+    assert got == fault, got
+    if not fault:
+        junk = "zero" if case == "zeros" else "cut"
+        assert proof[1]["trimmed_first"] == {"pts": 0.0, "size": [len(old0), len(MP3_FRAME)], "junk": junk} and proof[1]["match"], proof[1]
+        chunk = round(by_bytes[16], 3)
+        assert proof[1]["byte_time"] == {"at": at, "ffmpeg": 0.0, "rate": 16000.0, "chunk": {"packet": 16, "pts": [chunk, chunk]}}, proof[1]
+        assert proof[1]["start"] == [at, at], proof[1]
 
 
 @pytest.mark.parametrize("case, fault", [
@@ -24874,12 +24982,12 @@ def garbled_mkv(tmp_path_factory):
     return d
 
 
-def not_utf8_film(env, tmp_path):
+def not_utf8_film(env, tmp_path, cues=None):
     """env["path"]: a real film of talk.DURATION with REF in English, the same lines 2 s late in French and Spanish, and
-    the late lines in Dutch with one cue that holds "café" in cp1252, a byte that is not UTF-8. ffmpeg copies the
-    Dutch track, written by hand, beside the others, so its packets keep that byte. Returns the Dutch cues."""
+    the late lines in Dutch, or cues, with one cue that holds "café" in cp1252, a byte that is not UTF-8. ffmpeg copies
+    the Dutch track, written by hand, beside the others, so its packets keep that byte. Returns the Dutch cues."""
     late = talk.moved_to(REF, offset=2.0)
-    dut = [(a, b, t + (" caf\xe9" if k == 5 else "")) for k, (a, b, t) in enumerate(late)]
+    dut = [(a, b, t + (" caf\xe9" if k == 5 else "")) for k, (a, b, t) in enumerate(cues or late)]
     av = tmp_path / "av.mp4"
     amg.ffmpeg(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc=size=64x36:rate=1:duration={talk.DURATION}", "-f", "lavfi", "-i",
                 f"sine=sample_rate=8000:duration={talk.DURATION}", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac", str(av)],
@@ -24938,6 +25046,43 @@ def test_sub_time_takes_out_a_subrip_track_with_bytes_that_are_not_utf8(env, mon
     got = REAL_SUBTITLE_CUES(env["path"], new, {"s2", "s3"})
     assert all(abs(c[0][0] - REF[0][0]) < 0.02 for c in got.values()), {p: c[0] for p, c in got.items()}
     assert f"can't be read as text, so they were removed and saved beside the file as {os.path.basename(side)}." in out, out
+
+
+@pytest.mark.parametrize("action, fails", [("alert", False), ("remove", False), ("alert", True), ("remove", True)])
+def test_a_track_taken_out_as_unreadable_is_never_said_to_stay(env, monkeypatch, settings, tmp_path, capsys, action, fails):
+    """The Dutch track holds a byte that is not UTF-8, and its lines do not line up with the speech. --sub-time --apply
+    takes it out as unreadable, and its notice says so. No line says it stays in the file: no layout line with
+    LAYOUT_ACTION alert, and no stays line with remove, which makes it a mismatch. A dry run, and an --apply whose remux
+    fails, leave the track in the file, so they keep that line."""
+    monkeypatch.setattr(hook.arr_subsync, "LAYOUT_ACTION", action)
+    real_resub = hook.resub
+    dut = not_utf8_film(env, tmp_path, talk.show(12, n=170))
+    late = talk.moved_to(REF, offset=2.0)
+    sub_time_film(env, monkeypatch, [("eng", False, {}), ("fre", False, {}), ("spa", False, {}), ("dut", False, {})], {"s1": REF, "s2": late, "s3": late, "s4": dut})
+    for name, real in (("resub", real_resub), ("subtitle_cues", REAL_SUBTITLE_CUES), ("mkvmerge", REAL_MKVMERGE), ("prove", REAL_PROVE), ("FULL", {})):
+        monkeypatch.setattr(hook, name, real)
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: None if argv[:2] == ["ionice", "-c3"] and "-p" in argv else REAL_RUN(argv, **kw))
+    speech_read(monkeypatch)
+    settings(keep_days=7)
+    monkeypatch.setattr(hook, "originals_root", lambda p: str(tmp_path / ".kept"))
+    said = lambda rec: [x["code"] for f in rec["findings"] for x in f.get("lines") or [] if x.get("track") == "s4" and x["code"] in ("layout", "stays")]
+    stays = ["layout" if action == "alert" else "stays"]   # the line that says the track stays
+    hook.main(["--sub-time", env["path"]])
+    rec = last_decided(env)
+    assert list(rec["subremux"]["stripped"]) == ["s4"] and not rec["subremux"]["done"] and said(rec) == stays, rec["findings"]
+    capsys.readouterr()
+    if fails:
+        monkeypatch.setattr(hook, "resub", lambda path, j, st, apply, **k: ("subtitle_remux_failed", "subtitle remux failed: mkvmerge exited 2", {}) if apply
+                            else real_resub(path, j, st, apply, **k))
+    with pytest.raises(SystemExit) if fails else contextlib.nullcontext():   # --apply exits SUB_TIME_MISSED, the remux failed
+        hook.main(["--sub-time", env["path"], "--apply"])
+    rec, out = last_decided(env), capsys.readouterr().out
+    s4, rm = rec["subtime"]["s4"], rec["subremux"]
+    assert s4["layout"]["verdict"] == "mismatch" and s4["verdict"] == ("mismatch" if action == "remove" else "weak") and list(rm["stripped"]) == ["s4"], (s4, rm)
+    assert rm["done"] is not fails and "s4" not in rm["removed"], rm
+    assert said(rec) == (stays if fails else []), rec["findings"]
+    assert ("may be from another episode or version. They were left as they are." in out) is (fails and action == "alert"), out
+    assert ("can't be read as text, so they were removed and saved beside the file as" in out) is not fails, out
 
 
 def test_a_cut_read_gets_no_repair_and_no_flash_ends(garbled_mkv, pic_mkv, monkeypatch):

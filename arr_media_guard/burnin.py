@@ -162,7 +162,7 @@ class Sampler:
     def __init__(self, path, threads=THREADS):
         from . import decide, ff   # here, as the image fetches the models with burnin.py and lid.py alone
         self.av = av = ff.pyav("burnin.Sampler")
-        self.c = av.open(path)
+        self.c = av.open(path, metadata_errors="replace")   # an AVI tag can hold bytes that are not UTF-8
         vs = list(self.c.streams.video)
         v = decide.main_video([{"index": k, "codec_type": "video", "codec_name": getattr(x.codec_context, "name", None),   # None: no decoder
                                 "disposition": {"attached_pic": bool(x.disposition & av.stream.Disposition.attached_pic)}} for k, x in enumerate(vs)])

@@ -20,6 +20,9 @@ JUNK_MAX = 16             # audio packets the ends of a stream may lose as junk 
 LEAD_LOSS = 0.1           # seconds of the original an audio stream may lose at its start, whatever the packets hold
 JUNK_HEADERS = (b"RIFF",)  # a stray container header that an audio stream may hold as a packet of its own
 JUNK_HEADER_MAX = 128     # bytes such a header packet holds at most
+CHUNK_MAX = 0.6           # seconds from the start of an AVI MP3 stream that opens with junk to the first packet ffmpeg times by
+                          # its bytes, at most, see prove(). That packet opens the second chunk. The measured files have it at
+                          # 0.518 and 0.526 s, and the bound adds 0.072 s, three MP3 frames at 8 kHz.
 SIDECAR_FLAGS = {"forced": "--forced-display-flag", "hi": "--hearing-impaired-flag", "sdh": "--hearing-impaired-flag",
                  "cc": "--hearing-impaired-flag"}
 # Where mkvmerge changes packets on purpose, per ffprobe format and codec, "*" for any format: (the bitstream filter for
@@ -746,7 +749,12 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     mkvmerge may instead trim that fragment. A smaller first MP3 or MP2 packet passes when every other packet matches
     and the second packet keeps its time.
     The entry names both sizes in trimmed_first. The stream may also lose its cut last frame then, when the new packet
-    0 is the tail of the old one after zeros or a stray header, see junk_head(). The new file may also hold one
+    0 is the tail of the old one after junk, see junk_head(). mkvmerge plays the junk as
+    a delay of its bytes. In an AVI whose audio header has a sample size, the stream may then start at the junk's size
+    over the header's bytes a second, within TIME_SLACK. The first packet that ffmpeg times by its bytes, the first of
+    the second chunk, must then come within CHUNK_MAX of the start and keep its time in the new file within
+    TIME_SLACK. The entry names the start and that packet in byte_time. Junk that is the tail of a cut frame passes
+    only so. The new file may also hold one
     packet more, the sample an MP4's edit list cuts off. A read with -ignore_editlist must then match it, see
     edit_list_sample(), and the entry names it in edit_list. The time check leaves that one packet out. When src and
     tmp are both Matroska, the times and ends of every stream are the ones its blocks store or RFC 9559 defines, see
@@ -923,6 +931,10 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
         ia, ib = (x["info"], y["info"]) if both else ({}, {})
         slack = mkv_slack(ia.get("scale", 1e6), ib.get("scale", 1e6), s["codec_type"], ia.get("exact")) if both else None
         sync = slack if both else SYNC   # a start counts from the video's start, which the slack holds, see mkv_slack()
+        # mkvmerge times AVI audio whose header has a sample size by its bytes, at dwRate * dwSampleSize / dwScale bytes a
+        # second. ffmpeg times the frames of a chunk from the time of the chunk, a frame each.
+        h = heads[s["index"]] if s["index"] < len(heads) else {}
+        byte_rate = h["rate"] * h["size"] / h["scale"] if h.get("type") == b"auds" and h["size"] and h["scale"] and h["rate"] else None
         if s["index"] in moved:   # the times the fix gives, see remux.moved_tracks()
             fx = moved[s["index"]]
             to = lambda t: max(0.0, (t - float(fx["offset"])) / float(fractions.Fraction(fx["rate"])))   # unrounded, see mkv_slack()
@@ -943,14 +955,9 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                 proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
             xt = xt[1:len(xt) - (x["count"] - y["count"] - 1)]
             xs = xt[0] if xt and xt[0] is not None else xs   # the stream now starts at its second packet
-            h = heads[s["index"]] if s["index"] < len(heads) else {}
-            if h.get("type") == b"auds" and h["size"] and h["scale"] and h["rate"] and (x.get("times") or [None])[0] is not None:
-                # mkvmerge times AVI audio whose header has a sample size by its bytes, at dwRate * dwSampleSize /
-                # dwScale bytes a second. ffmpeg times the frames of the fragment's chunk from the fragment's time,
-                # a frame each.
-                rate = h["rate"] * h["size"] / h["scale"]
-                at = x["times"][0] + x["first"] / rate
-                proof[-1]["byte_time"] = {"at": round(at, 3), "ffmpeg": round(xs, 3), "rate": round(rate, 3)}
+            if byte_rate and (x.get("times") or [None])[0] is not None:   # the second packet at the time of its bytes
+                at = x["times"][0] + x["first"] / byte_rate
+                proof[-1]["byte_time"] = {"at": round(at, 3), "ffmpeg": round(xs, 3), "rate": round(byte_rate, 3)}
                 xs = at if abs(us((y["start"] - vb) - (at - va))) <= us(TIME_SLACK) else xs
             proof[-1]["start"][0] = round(xs - va, 3)
         elif x["count"] + 1 == y["count"] and y.get("but_last") == x["digest"] and fam == "mov" and \
@@ -980,15 +987,36 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
                 (y.get("first") or 0) < (x.get("first") or 0) and \
                 (x["count"] == y["count"] or (junk := junk_head(src, tmp, s["index"], t["index"], f, timeout))):   # a trimmed cut first frame
             proof[-1].update(trimmed_first={"pts": x.get("first_pts"), "size": [x["first"], y["first"]]})
+            on_bytes = False   # the stream starts at the time of the junk's bytes
             if x["count"] > y["count"]:   # junk inside packet 0, and a cut last frame mkvmerge drops
                 proof[-1]["trimmed_first"]["junk"] = junk
                 proof[-1].update(dropped={"pts": x.get("last_pts"), "size": x["last"]})
                 xt = xt[:-1]
-            # mkvmerge re-times the stream from the first frame it keeps. Junk longer than one frame would shift every
-            # later packet, and the first packets still start together, so the second packet must keep its time.
-            if None in (xt[1:2] or [None]) + (yt[1:2] or [None]):
+                if byte_rate and xt and xt[0] is not None:
+                    # mkvmerge 102 plays the junk as a delay of its bytes, and each kept frame at the time of its bytes.
+                    # ffmpeg times the packets of the chunk of packet 0 a frame apart, so their times leave the junk out.
+                    # It times packet k, the first of the next chunk, by its bytes. Packet k must come within CHUNK_MAX
+                    # of the start and keep its time in the new file, so only the frames of the first chunk move.
+                    at = xt[0] + (x["first"] - y["first"]) / byte_rate
+                    proof[-1]["byte_time"] = {"at": round(at, 3), "ffmpeg": round(xs, 3), "rate": round(byte_rate, 3)}
+                    k, n, last = 1, x["first"], min(len(xt), len(yt))   # packet k and the bytes before it
+                    while k < last and xt[k] is not None and xt[k] - xt[0] <= CHUNK_MAX and abs(us(xt[k] - xt[0] - n / byte_rate)) > us(TIME_SLACK):
+                        n, k = n + x["sizes"][k], k + 1
+                    # A header that counts bytes means one frame size, so a last packet under packet 0 of the new file is cut.
+                    if on_bytes := k < last and None not in (xt[k], yt[k]) and xt[k] - xt[0] <= CHUNK_MAX and x["last"] < y["first"] and \
+                            abs(us((y["start"] - vb) - (at - va))) <= us(TIME_SLACK) and abs(us((yt[k] - vb) - (xt[k] - va))) <= us(TIME_SLACK):
+                        xs = at
+                        proof[-1]["start"][0] = round(xs - va, 3)
+                        proof[-1]["byte_time"]["chunk"] = {"packet": k, "pts": [round(xt[k] - va, 3), round(yt[k] - vb, 3)]}
+            # The tail of a cut frame passes only at the time of its bytes. Other junk keeps the check of the second packet
+            # against ffmpeg's time. When mkvmerge times the stream from the first frame it keeps, junk moves every later
+            # packet and packet 0 still starts at its time.
+            if x["count"] > y["count"] and junk == "cut" and not on_bytes:
+                why = (f"stream {name} ({s['codec_name']}) lost {x['first'] - y['first']} bytes of a cut frame before its first frame, "
+                       f"and does not start at the time of those bytes")
+            elif not on_bytes and None in (xt[1:2] or [None]) + (yt[1:2] or [None]):
                 why = f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet has no time"
-            elif abs((xt[1] - va) - (yt[1] - vb)) > sync:
+            elif not on_bytes and abs((xt[1] - va) - (yt[1] - vb)) > sync:
                 why = (f"stream {name} ({s['codec_name']}) lost a trimmed first frame, and its second packet moved "
                        f"{((yt[1] - vb) - (xt[1] - va)) * 1000:+.0f} ms")
         elif x["count"] != y["count"]:
@@ -1402,15 +1430,19 @@ def empty_lead(head, x, y):
 
 
 def junk_head(src, tmp, i, k, bsf, timeout):
-    """"zero" or "header" when packet 0 of stream k of tmp is the tail of packet 0 of stream i of src, and the part
-    before it is zeros or a stray header of JUNK_HEADERS of at most JUNK_HEADER_MAX bytes, else None. The first audio
-    packet can hold such junk in any container, and mkvmerge keeps only the frame after it. The measured files are AVIs.
+    """"zero", "header" or "cut" when packet 0 of stream k of tmp is the tail of packet 0 of stream i of src, and the
+    part before it is junk, else None. Junk is zeros, a stray header of JUNK_HEADERS of at most JUNK_HEADER_MAX bytes,
+    or the tail of a cut frame. Such a tail is shorter than the new packet 0, a whole frame, and starts with no frame
+    sync and no stray header. The first audio packet can hold such junk in any container, and mkvmerge keeps only the
+    frame after it. The measured files are AVIs. prove() passes the tail of a cut frame only at the time of its bytes.
     One packet of each file is read."""
     old, new = packet_data(src, i, bsf[0], 1, timeout), packet_data(tmp, k, bsf[1], 1, timeout)
     head = old[:len(old) - len(new)]
     if not new or not head or not old.endswith(new):
         return None
-    return "zero" if not head.strip(b"\0") else "header" if head.startswith(JUNK_HEADERS) and len(head) <= JUNK_HEADER_MAX else None
+    if head.startswith(JUNK_HEADERS):
+        return "header" if len(head) <= JUNK_HEADER_MAX else None
+    return "zero" if not head.strip(b"\0") else "cut" if len(head) < len(new) and not re.match(rb"\xff[\xe0-\xff]", head) else None
 
 
 def annexb_units(data):
