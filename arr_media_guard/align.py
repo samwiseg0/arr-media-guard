@@ -9,7 +9,8 @@ Whisper hears the whole file. run() then times every line of a subtitle against 
    or jump aligns.
 2. curve(): one offset curve over the anchors. Each segment has a frame-rate ratio and a level, and the curve may
    change at any line. A change costs a fixed amount, so only real jumps start a segment. run() fits it twice: first
-   the file's offset, drift and jumps, then local blocks against that.
+   the file's offset, drift and jumps, then local blocks against that. The first fit also tries the ratio the anchors
+   draw through the whole file, see free_rate().
 3. plan(): one gate for every segment. The fewer anchors a segment has, the farther off it must sit to move on
    Whisper alone. The speech onsets can agree or disagree. A segment moves the lines it covers, see owners().
 4. The moves keep the screen sound. An anchored line moves toward its own speech and never past it. A line with no
@@ -133,6 +134,29 @@ def curve(xs, ys, change, rates=subsync.RATES):
     return segs
 
 
+def free_rate(xs, ys, lines):
+    """(rate,) of the frame-rate ratio that points (x, y) in time order draw by themselves, or (). Here x is a line's
+    anchor, y its start, and lines the seconds from the track's first line to its last. A slope is the median slope of
+    the pairs of points half the points apart. The rate is the slope of all points, and the level the median off it. It
+    counts with "free anchors" points or more, whose starts span "free share" of lines or more, when "free fit" of the
+    points lie within "fit cap" of its line. It, and the slope of each half of the points alone, must also drift "free
+    far" or more from each ratio of subsync.RATES over the anchors' span. A subtitle timed for a video of another speed
+    than any RATES ratio drifts so through the whole file. Steps of another cut lie off any one line, and one jump
+    leaves each half at the ratio of the track."""
+    n = len(xs)
+    if n < T["free anchors"] or lines <= 0 or ys[-1] - ys[0] < T["free share"] * lines:
+        return ()
+
+    def slope(a, b):
+        h = (b - a) // 2
+        return statistics.median((ys[k + h] - ys[k]) / (xs[k + h] - xs[k]) for k in range(a, b - h) if xs[k + h] > xs[k])
+    r = slope(0, n)
+    v = statistics.median(y - r * x for x, y in zip(xs, ys))
+    near = sum(abs(y - r * x - v) < T["fit cap"] for x, y in zip(xs, ys))
+    far = min(abs(s - float(q)) for s in (r, slope(0, n // 2), slope(n // 2, n)) for q in subsync.RATES) * (xs[-1] - xs[0])
+    return (Fraction(round(r * 10 ** 6), 10 ** 6),) if r > 0 and near >= T["free fit"] * n and far >= T["free far"] else ()
+
+
 def owners(cues, keys, seg_of, sizes):
     """{line index: segment} of every line a segment covers: its anchored lines, and each unanchored line whose
     anchored neighbours both lie in that segment. Both must lie within "line reach" of it, unless the segment has
@@ -248,7 +272,11 @@ def plan(cues, at, segs, keys, onsets, most, step):
 def short_of_speech(cues, at, mv):
     """mv with the move of each anchored line cut so it ends at its own speech at most: toward it, never past it. A line
     with no anchor then moves the smaller of these moves of the anchored lines on each side at most. It stays when one
-    of them stays or moves the other way. At a file edge only the one side counts."""
+    of them stays or moves the other way. At a file edge only the one side counts. The smaller move can put the first
+    line next to the anchored line on the side it moves away from within "shown" of that line's new start. Then the
+    lines between the two anchored lines move the two moves weighed by their place between them at most, so they keep
+    their order. Else apply_order() cuts that anchored line short, or sends it back with the lines beyond it. Weighing
+    scales every gap between the two anchored lines alike. It applies only when no gap then needs an order cut."""
     out = {}
     for i, m in mv.items():
         if i in at:
@@ -256,12 +284,19 @@ def short_of_speech(cues, at, mv):
             m = 0.0 if d * m <= 0 else (m if abs(m) <= abs(d) else d)
         if abs(m) > DROP:
             out[i] = m
-    keys = sorted(at)
+    keys, s = sorted(at), [c[0] for c in cues]
     for i, m in list(out.items()):
         if i not in at:
             q = bisect.bisect_left(keys, i)
             near = [out.get(keys[k], 0.0) for k in (q - 1, q) if 0 <= k < len(keys)]
             cap = min((abs(x) if x * m > 0 else 0.0 for x in near), default=abs(m))
+            if cap and len(near) == 2:   # j, k: the anchored line it moves away from and the line next to it, in start order
+                (p, a), (n, b) = (keys[q - 1], near[0]), (keys[q], near[1])
+                j, k = (p, p + 1) if m > 0 else (n - 1, n)
+                if s[k] + b - s[j] - a < min(T["shown"], s[k] - s[j]) and s[n] + b > s[p] + a:
+                    f = 1 + (b - a) / (s[n] - s[p])   # every gap from p to n scales by f, and none may need an order cut
+                    if all((s[x + 1] - s[x]) * f >= min(T["shown"], s[x + 1] - s[x]) - 1e-9 for x in range(p, n)):
+                        cap = abs(a + (b - a) * (s[i] - s[p]) / (s[n] - s[p]))
             if cap > DROP:
                 out[i] = math.copysign(min(abs(m), cap), m)
             else:
@@ -387,20 +422,21 @@ def run(cues, windows, onsets=(), lang="eng"):
     - "moves": {line index: {"start", "end", "segs", "why"}} of each line whose times change. "segs" are the indices
       in "curve" of the segments that moved it. "why" is "curve" (it moved with its segments), "speech" (it stops at
       its own speech), "order" (it stops short of a line next to it), "live" (onto its own speech), "between" (by
-      the smaller move of the anchored lines around it) or "end" (only its end changes, as the next line moved).
+      the smaller move of the anchored lines around it, or the two moves weighed by its place) or "end" (only its end changes, as the next line moved).
     - "judge": the view of judged() at the new starts.
 
-    The first pass fits the curve at every ratio of subsync.RATES and plans its moves. Over "live scatter" each line
-    moves on its own instead. Else a second pass fits ratio 1 with "fine change" at the starts the first pass gives,
-    and plans local blocks of "block most" at most. The two moves add up."""
+    The first pass fits the curve at every ratio of subsync.RATES, and at the ratio of free_rate() when the anchors
+    draw one, and plans its moves. Over "live scatter" each line moves on its own instead. Else a second pass fits
+    ratio 1 with "fine change" at the starts the first pass gives, and plans local blocks of "block most" at most. The
+    two moves add up."""
     stop = decide.STOPWORDS.get(lang, frozenset())
     at = anchors(cues, heard(windows), stop)
     keys = sorted(at)
     out = {"anchors": at, "curve": [], "scatter": None, "live": False, "moves": {}}
     if len(keys) < T["fit anchors"]:
         return dict(out, judge=judged(cues, at, {}))
-    xs = [at[i] for i in keys]
-    segs = curve(xs, [cues[i][0] for i in keys], T["fit change"])
+    xs, ys = [at[i] for i in keys], [cues[i][0] for i in keys]
+    segs = curve(xs, ys, T["fit change"], rates=subsync.RATES + free_rate(xs, ys, cues[-1][0] - cues[0][0]))
     mv, recs = plan(cues, at, segs, keys, onsets, T["block most"], "whole")
     out["scatter"] = scatter = statistics.median(abs(cues[keys[k]][0] - float(r) * xs[k] - v) for a, b, r, v in segs for k in range(a, b + 1))
     if scatter >= T["live scatter"]:

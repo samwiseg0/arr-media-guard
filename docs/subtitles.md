@@ -180,7 +180,9 @@ line against it. An import never does this, because it takes minutes.
    neither do the repeated lines of [roll-up captions](#roll-up-captions).
 3. AMG fits one timing through the anchors. It is a chain of stretches. Each stretch sits off the speech by a steady
    amount, or drifts at a frame-rate ratio. A new stretch starts only at a real change, such as a jump in the middle of
-   the file. A second pass looks for short stretches inside the first ones.
+   the file. A second pass looks for short stretches inside the first ones. When 90 percent of 60 or more anchored
+   lines lie within a second of one drifting line through the file, AMG also tries the ratio of that line, see
+   [Drift timing](#drift-timing).
 4. A stretch that sits half a second or more off its speech moves onto it when the evidence is strong enough.
    - A stretch of 30 anchored lines or more moves on the heard words alone.
    - A shorter stretch moves when the moments where speech starts after a pause agree with the move. It never moves
@@ -191,7 +193,8 @@ line against it. An import never does this, because it takes minutes.
 5. A line with no anchor moves with its stretch when the anchored lines on both sides of it belong to that stretch.
    They must lie within 15 seconds of it, unless the stretch holds 30 anchored lines or more. An anchored line moves
    toward its own speech, and never past it. A line with no anchor moves no farther than the anchored lines next to
-   it. Lines never change order. Two lines stay half a
+   it. When the smaller of their moves would put it before the anchored line it moves away from, it moves by both
+   moves weighed by where it sits between them. Lines never change order. Two lines stay half a
    second apart, or as close as they were. A line that would start before the file's start stays.
 6. A moved line keeps how long it shows. It ends two frames before the next line starts, and shows half a second at
    least, unless the next line starts sooner. Lines shown inside a long line do not count as its next line. A line
@@ -223,7 +226,9 @@ fixed, posts nothing. Under 20 anchored lines AMG judges nothing, and under 10 i
 A subtitle made for another frame rate drifts. Its lines start in sync, or nearly, and fall further behind or ahead as
 the file plays. A DVD subtitle can drift by about a second over an episode. The deep analysis and `--sub-time` read a
 drift as one stretch at a frame-rate ratio. They move every line onto its speech, see
-[Whole-file timing](#whole-file-timing).
+[Whole-file timing](#whole-file-timing). A subtitle timed for a video of another speed, such as a reconstruction,
+drifts at a ratio no frame rate names. One drifted 57 seconds over 22 minutes. AMG measures that ratio from the
+anchored lines and times the file at it, see [design.md](design.md#subtitle-match).
 
 The check of an import hears two or three short parts of the audio. One of them can fall on lines the subtitle's
 author timed badly. No single fix then fits them, and the import alerts that the subtitle is out of sync by different

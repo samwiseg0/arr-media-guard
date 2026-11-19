@@ -3480,6 +3480,26 @@ that hearing of a library would take weeks.
      anchors off its ratio. The first pass fits the file's offset, drift and jumps. A second pass fits ratio 1, at a
      change cost of 1 second, to the starts the first pass gives. It finds local blocks against them. The moves of the
      two passes add up.
+
+     A subtitle timed for a video of another speed drifts at a ratio that no entry of `subsync.RATES` names. So the
+     first pass also tries the ratio the anchors draw themselves (`align.free_rate()`), when they draw one through the
+     whole file. A slope is the median slope of the pairs of anchors half the anchors apart. The ratio is the slope of
+     all anchors, and the record names it to a millionth. It counts only when all of these hold:
+     - The track has 60 anchors or more, twice the 30 that move a segment on Whisper alone.
+     - Their line starts span half of the track's time, from the first line to the last, or more.
+     - 90 percent of the anchors lie within 1 second of its line. A line through a step of 3 seconds holds about 67
+       percent.
+     - The ratio, and the slope of each half of the anchors alone, drift 2 seconds or more over the anchors' span from
+       each ratio of `subsync.RATES`. Under 2 seconds, one segment at the nearest ratio holds every anchor within 1
+       second. One jump leaves each half at the track's own ratio.
+
+     The ratio is one more candidate, and the fit still prices every segment. A subtitle of another cut sits off by
+     steps. Steps of 2 seconds or more draw no ratio. Smaller steps can draw one, and the fit then picks it only
+     where it costs less than the ratios of `subsync.RATES`. A small block still moves 10 seconds at most. The first case drifted from
+     12 seconds late at 3:23 to 44 seconds early at 22:30, a ratio of 0.9516. Its 248 anchors lay a median of 0.18
+     seconds from that line, 95 percent within 1 second, and the line drifted 8.8 seconds from 960/1001, the nearest
+     ratio. With `subsync.RATES` alone the fit cut it into 8 segments 12 to 45 seconds off, and the four under 30
+     anchors stayed. The truths of the 21 real episodes of the jump bench, and its 455 plants, draw no ratio.
   3. *The gate* (`align.plan()`, `align.gate()`). A segment moves when its first or last anchored line sits 0.5 seconds
      or more off its speech, and its evidence passes one rule.
      - A segment of 30 anchors or more moves on Whisper alone, at any distance.
@@ -3508,7 +3528,13 @@ that hearing of a library would take weeks.
      when as many lines are timed where they sit, and enough to judge.
   4. *The screen* (`align.short_of_speech()`, `align.apply_order()`, `align.ends()`). An anchored line moves toward its
      own speech and never past it. A line with no anchor then moves the smaller of these moves of the anchored lines on
-     each side at most, and stays when one of them stays or moves the other way. No line crosses another. Two line starts stay 0.5 seconds apart after the moves, or
+     each side at most, and stays when one of them stays or moves the other way. The smaller move can start the first
+     such line within 0.5 seconds of the anchored line on the side it moves away from, or past it. The order step would
+     then cut that anchored line short, or send it back to its old start with each line beyond it. So the lines between
+     the two anchored lines then move the two moves weighed by their place between them at most, and keep their order.
+     That holds only when no gap between them then needs an order cut. Else they take the smaller move as before. On
+     a drift of 45 seconds, one long line that its author started 4.6 seconds late sent 192 lines back that way.
+     No line crosses another. Two line starts stay 0.5 seconds apart after the moves, or
      as far apart as they were. The line that moved toward the other yields, and never past its old start. A line cut
      more than 1 second short of its move stays, so later lines never pile up behind it. A move that would start a
      line before the file's start drops. A moved line keeps its length. It stops two frames, 0.083 seconds, before the

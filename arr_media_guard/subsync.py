@@ -81,6 +81,13 @@ TIMING = {
     "fine change": 1.0,     # the same in the second pass, which finds local blocks against the first pass's curve
     "fit rate": 2.0,        # the extra cost, in units of "fit cap", to enter a segment at a frame-rate ratio other than 1
     "fit step": 0.02,       # one level of the fit's grid
+    "free anchors": 60,     # anchored lines a track needs before the first pass also tries the ratio they draw, see
+                            # align.free_rate(). It is twice "whole anchors".
+    "free share": 0.5,      # the share of the track's span from its first line to its last that their starts must span
+    "free fit": 0.9,        # the share of them that must lie within "fit cap" of that ratio's line. A line through a
+                            # step of 3 s holds about 67 percent.
+    "free far": 2.0,        # seconds that ratio must drift from each ratio of RATES over the anchors' span. Under twice
+                            # "fit cap", one segment at the nearest ratio holds every anchor within "fit cap".
     "fit anchors": 10,      # anchored lines a track needs before any line moves
     "judge anchors": 20,    # anchored lines a track needs before its times are judged
     "whole anchors": 30,    # a segment of this many anchors moves from "move" off on Whisper alone, with every line

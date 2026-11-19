@@ -81,6 +81,88 @@ def test_a_drift_fits_its_frame_rate_ratio():
     assert all(abs(s - (t + LEAD)) < 0.05 for s, t in zip(starts(cues, got), speech))
 
 
+FREE = 0.951621   # the ratio the 248 anchors of a real track drew: 9 s late at 3:23, 0 at 7:30, 40 s early at 22:30
+
+
+def free_track(n=300, rate=FREE, seed=3):
+    """track() of n lines 4.5 s apart, each starting at rate times its speech plus 21.5 s."""
+    return track(n, late=lambda i: (rate - 1) * (5.0 + 4.5 * i) + 21.533, gap=lambda i: 4.5, seed=seed)
+
+
+def test_a_drift_of_no_frame_rate_ratio_fits_the_ratio_its_anchors_draw():
+    """The lines drift from 21 s late to 43 s early, a ratio of no RATES entry. The first pass also tries the ratio the
+    anchors draw. One segment of every anchor moves every line onto its speech, and nothing is left off."""
+    cues, ws, speech = free_track()
+    got = align.run(cues, ws)
+    (seg,) = [r for r in got["curve"] if r["pass"] == "whole"]
+    assert Fraction(seg["rate"]) == pytest.approx(FREE, abs=1e-5) and seg["moves"] and seg["why"] == "whole"
+    assert (seg["first"], seg["last"], seg["anchors"]) == (0, len(cues) - 1, len(cues))
+    assert all(abs(s - (t + LEAD)) < 0.05 for s, t in zip(starts(cues, got), speech))
+    assert got["judge"]["off"] == []
+
+
+def test_a_track_at_ratio_1_with_scatter_draws_no_ratio():
+    """Each line sits up to 0.4 s off its speech at random. The anchors draw no ratio, and the first pass tries RATES
+    only."""
+    rnd = random.Random(11)
+    offs = [rnd.uniform(-0.4, 0.4) for _ in range(300)]
+    cues, ws, _ = track(300, late=offs.__getitem__)
+    at = align.anchors(cues, align.heard(ws), frozenset())
+    keys = sorted(at)
+    assert len(keys) == 300 and align.free_rate([at[i] for i in keys], [cues[i][0] for i in keys], cues[-1][0] - cues[0][0]) == ()
+    assert {r["rate"] for r in align.run(cues, ws)["curve"]} <= {str(q) for q in subsync.RATES}
+
+
+def test_a_track_at_a_frame_rate_ratio_times_as_before(monkeypatch):
+    """A track timed for 25 fps on a 24 fps video draws 25/24 itself, so the result is the result of RATES alone."""
+    cues, ws, _ = track(300)
+    cues = [(s * 25 / 24, e * 25 / 24, x) for s, e, x in cues]
+    got = align.run(cues, ws)
+    monkeypatch.setattr(align, "free_rate", lambda *a: ())
+    assert got == align.run(cues, ws) and got["curve"][0]["rate"] == "25/24"
+
+
+def test_one_jump_leaves_each_half_at_ratio_1_and_draws_no_ratio():
+    """Lines from the middle on sit 1.5 s late. A line through all anchors drifts 3 s from ratio 1 and holds every anchor
+    within "fit cap", but each half alone lies at ratio 1."""
+    cues, ws, _ = track(300, late=lambda i: 1.5 if i >= 150 else 0.0, gap=lambda i: 4.5)
+    xs, ys = [5.0 + 4.5 * i for i in range(300)], [c[0] for c in cues]
+    assert align.free_rate(xs, ys, ys[-1] - ys[0]) == ()
+    assert {r["rate"] for r in align.run(cues, ws)["curve"]} == {"1"}
+
+
+def test_a_jump_whose_whole_line_drifts_far_is_stopped_by_its_halves():
+    """A jump of 1.8 s draws a line through all anchors that drifts over "free far" from every ratio and holds "free
+    fit". Each half alone lies at ratio 1, so the anchors draw no ratio. With "free far" asked of the whole line
+    only, they would."""
+    xs = [5.0 + 4.5 * i for i in range(300)]
+    ys = [x + (1.8 if i >= 150 else 0.0) for i, x in enumerate(xs)]
+    assert align.free_rate(xs, ys, ys[-1] - ys[0]) == ()
+    assert align.free_rate(xs[:150], ys[:150], ys[149] - ys[0]) == ()
+    whole = sorted((ys[k + 150] - ys[k]) / (xs[k + 150] - xs[k]) for k in range(150))[75]
+    assert min(abs(whole - float(q)) for q in subsync.RATES) * (xs[-1] - xs[0]) >= T["free far"]
+
+
+def test_lines_that_all_start_together_draw_no_ratio():
+    """Every cue starts at the same time, so the track spans 0 s. The anchors draw no ratio, and run() returns."""
+    assert align.free_rate([float(i) for i in range(80)], [0.0] * 80, 0.0) == ()
+    assert align.free_rate([float(i) for i in range(80)], [5.0] * 80, 10.0) == ()
+
+
+def test_dense_unheard_lines_take_the_smaller_move_when_weighing_would_cut_them():
+    """Line 10 moves 10 s and line 18 only 7.6 s, to its speech. Lines 11 to 17 have no anchor and start 0.55 s apart.
+    Weighing the two moves would shrink each of those gaps under "shown", the order cuts would add up past "pile",
+    and lines 0 to 10 would go back. The lines take the smaller move instead, and line 10 is cut under "pile" short."""
+    s = [3.0 * i for i in range(11)] + [32.0 + 0.55 * i for i in range(7)] + [35.85] + [38.85 + 3.0 * i for i in range(10)]
+    cues = [(x, x + 0.4, f"l{i}") for i, x in enumerate(s)]
+    at = {i: x + 10.0 - LEAD for i, x in enumerate(s) if not 10 < i < 18}
+    at[18] = s[18] + 7.6 - LEAD
+    want = align.short_of_speech(cues, at, {i: 10.0 for i in range(len(cues))})
+    assert [round(want[i], 2) for i in range(11, 18)] == [7.6] * 7
+    news = align.apply_order(cues, {i: cues[i][0] + m for i, m in want.items()})
+    assert sorted(news) == list(range(len(cues)))
+
+
 def test_live_captions_move_line_by_line():
     """Each line sits 1 to 5 s late by its own amount. The track reads as live captions, and each line moves onto its
     own speech."""
@@ -330,6 +412,36 @@ def test_a_frame_rate_ratio_costs_2_to_enter():
         assert seg[2] == rate, (span, seg)
 
 
+def drawn(n=100, rate=0.95, span=1000.0, off=(), lines=None):
+    """free_rate() of n points over span seconds at rate, with the points of off 3 s above their line."""
+    xs = [span * k / (n - 1) for k in range(n)]
+    ys = [rate * x + 20.0 + (3.0 if k in off else 0.0) for k, x in enumerate(xs)]
+    return align.free_rate(xs, ys, lines or ys[-1] - ys[0])
+
+
+@pytest.mark.parametrize("n, added", [(60, True), (59, False)])
+def test_a_measured_ratio_needs_60_anchors(n, added):
+    assert bool(drawn(n)) is added
+
+
+@pytest.mark.parametrize("share, added", [(0.51, True), (0.49, False)])
+def test_a_measured_ratio_needs_anchors_over_half_of_the_lines(share, added):
+    assert bool(drawn(lines=950.0 / share)) is added
+
+
+@pytest.mark.parametrize("off, added", [(10, True), (11, False)])
+def test_a_measured_ratio_needs_90_percent_of_the_anchors_within_1_s(off, added):
+    """off of 100 anchors, spread through the file, sit 3 s off the line."""
+    assert bool(drawn(off={9 * k + 4 for k in range(off)})) is added
+
+
+@pytest.mark.parametrize("rate, added", [(0.9969, True), (0.9971, False)])
+def test_a_measured_ratio_drifts_2_s_from_each_ratio_of_rates(rate, added):
+    """Over 1000 s, 0.9969 drifts 2.1 s from 1000/1001, and 0.9971 drifts 1.9 s."""
+    got = drawn(rate=rate)
+    assert bool(got) is added and (not got or got[0] == Fraction(rate).limit_denominator(10 ** 6))
+
+
 def test_the_level_is_the_median_off_the_grid():
     xs = [10.0 * k for k in range(9)]
     ys = [x + d for x, d in zip(xs, (0.0, 0.0, 0.03, 0.03, 0.013, 0.0, 0.03, 0.0, 0.03))]
@@ -386,3 +498,33 @@ def test_two_stretches_side_by_side_of_opposite_sign_keep_every_line():
     want = [[i for i, t in enumerate(speech) if lo <= t <= hi] for lo, hi in ((50, 72), (74, 96))]
     assert len(j["off"]) == 2 and all(x["first"] <= w[0] and w[-1] <= x["last"] and x["lines"] <= len(w) + 1 and x["late"] * d > 0
                                       for x, w, d in zip(j["off"], want, (1, -1))), j["off"]
+
+
+def unheard_track(gap99, n=120):
+    """track() whose lines from 40 on sit 8 s late, line 97 4 s late only. Lines 98 and 99 are never heard, and line
+    100's speech starts gap99 seconds after line 99's."""
+    cues, ws, speech = track(n, late=lambda i: 4.0 if i == 97 else 8.0 if i >= 40 else 0.0,
+                             gap=lambda i: {96: 6.0, 99: gap99}.get(i, 3.0))
+    heard = [x for x in ws[0]["words"] if not any(speech[i] <= x[0] < speech[i] + 1.0 for i in (98, 99))]
+    return cues, [dict(ws[0], words=heard)], speech
+
+
+def test_unheard_lines_after_a_line_cut_short_keep_their_order():
+    """The segment moves lines 40 on 8 s early, and line 97 moves 4 s, to its speech. Line 100 starts 3 s after line 99.
+    With the smaller move, line 99 would start 1 s after line 100's new start, and line 100 would stay with every line
+    after it. Lines 98 and 99 take the two moves weighed by their place instead, so every line from 40 on moves."""
+    cues, ws, speech = unheard_track(3.0)
+    got = align.run(cues, ws)
+    new = starts(cues, got)
+    assert moved(got) == list(range(40, len(cues)))
+    assert all(abs(new[i] - (speech[i] + LEAD)) < 0.01 for i in moved(got) if i not in (98, 99))
+    assert new[97] + T["shown"] <= new[98] < new[99] <= new[100] - T["shown"]
+    assert {got["moves"][i]["why"] for i in (98, 99)} == {"between"}
+
+
+def test_unheard_lines_far_enough_from_the_line_ahead_take_the_smaller_move():
+    """Line 100 starts 6 s after line 99. The smaller move, 4 s, keeps line 99 2 s before line 100's new start, so lines
+    98 and 99 move 4 s, as before."""
+    cues, ws, _ = unheard_track(6.0)
+    got = align.run(cues, ws)
+    assert [round(got["moves"][i]["start"] - cues[i][0], 2) for i in (98, 99)] == [round(LEAD - 4.0, 2)] * 2
