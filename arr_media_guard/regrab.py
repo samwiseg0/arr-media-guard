@@ -131,6 +131,18 @@ RESULT_CODES = {"audio": ("broken_audio", "audio_checked"), "content": ("wrong_c
                 "burned_in": ("burned_in_full", "burned_in_checked")}
 
 
+def grab_facts(grab):
+    """{"indexer", "posted"} of the app's grab record of a download, each only when the record holds it, for the alert
+    of its re-grab, see report.source(). indexer is the host of the release's info page, else the app's name of the
+    indexer. An aggregator indexer gives every release one name, and the host names the indexer behind it. posted is
+    the UTC date of the indexer's post, as 2025-01-09."""
+    d, host = grab.get("data") or {}, None
+    with contextlib.suppress(ValueError):   # an info URL that does not parse names no host
+        host = urllib.parse.urlsplit(str(d.get("nzbInfoUrl") or "")).hostname
+    posted = str(d.get("publishedDate") or "")[:10]
+    return {k: v for k, v in (("indexer", host or d.get("indexer")), ("posted", posted if re.fullmatch(r"\d{4}-\d\d-\d\d", posted) else None)) if v}
+
+
 def stop_action(step, **more):
     """The action of a re-grab or a restore that a stop kept from step, see runner.stop_asked(). It changed nothing in
     the app. "stopped" keeps its alert off Discord, see logs.alert_findings(), and the next run of the job checks again."""
@@ -142,7 +154,8 @@ def regrab(app, job, fault, probe, kind="audio", alone=False):
     mark the grab failed once. That order matters: the app searches at once, and a faulty file still on disk would
     make it reject the replacement as not an upgrade. Clean files stay. Returns the action, {"code", **facts}, which
     report.ACTIONS words. code is regrabbed, would_regrab, check, unconfirmed, capped, no_grab or failed. The facts of a
-    re-grab that put old files back come from restore_facts().
+    re-grab that put old files back come from restore_facts(), and the indexer and the posted date of its grab from
+    grab_facts().
 
     fault is the certain fault found in the job's file. probe(path, f, fresh) checks a file from scratch and returns
     (its certain fault or None, log fields), see audio_probe(), content_probe(), video_probe() and damage_probe(). Every
@@ -214,7 +227,7 @@ def regrab(app, job, fault, probe, kind="audio", alone=False):
         return stop_action("the delete")
     if not unit["failed"] and not unit["deleted"] and not count_regrab(app):   # a new unit counts once, and only now that it acts
         return capped
-    step, done = "the delete", {"code": "regrabbed", "name": name, "kind": kind, "n": len(broken)}
+    step, done = "the delete", {"code": "regrabbed", "name": name, "kind": kind, "n": len(broken), **grab_facts(grabs[0])}
     try:
         with runner.no_stop():   # the changes finish before a SIGTERM lands, so a stop never leaves a deleted file unmarked
             try:

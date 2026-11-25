@@ -101,7 +101,7 @@ def test_a_later_write_within_keep_days_reuses_the_keep_and_its_days_start_again
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     _, result, info = retime(path)
     kept, root = info["kept"], hook.originals_root(path)
-    folder = os.path.relpath(kept, root).split(os.sep)[0]
+    folder = os.path.relpath(os.path.dirname(kept), root)
     assert result == "subtitles remuxed" and os.stat(kept).st_ino == imported.st_ino and "kept_how" not in info, result
     clock(monkeypatch, 6)   # a later run, 6 days after the first write
     hook.store.put("wrote", "/gone.mkv", {"keep": "/gone.mkv", "file": [1, 2, 3]}, at=time.time() - 8 * 86400)
@@ -376,7 +376,7 @@ def test_a_keep_in_its_last_hour_is_not_reused(sync_mkv, tmp_path, monkeypatch, 
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     first = retime(path)[2]["kept"]
     root = hook.originals_root(path)
-    folder = os.path.join(root, os.path.relpath(first, root).split(os.sep)[0])
+    folder = os.path.dirname(first)
     clock(monkeypatch, 7, at=hook.stamp_time(folder) - hook.KEEP_MARGIN - 1)
     _, result, info = retime(path)
     assert result == "subtitles remuxed" and info["kept"] == first and info["kept_how"] == hook.KEPT_BEFORE, info

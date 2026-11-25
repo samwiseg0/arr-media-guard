@@ -11,7 +11,7 @@ A *re-grab* deletes a broken file through the app and marks its grab as failed, 
 runs at import. For burned-in subtitles and the whole-file check it runs later, when the check in the background
 confirms the fault. Before it deletes anything, AMG checks the file a second time from scratch, and the second check
 must find the same fault. The whole-file check measures again only the gaps it found, so it never reads the whole file
-twice. AMG then checks the other files of the same download, such as the other episodes of a season pack, and deletes
+twice for them. Video damage that its second read confirms gets one more read of the video as the second check. AMG then checks the other files of the same download, such as the other episodes of a season pack, and deletes
 each one that is broken too. The files that check clean stay. Burned-in subtitles and the whole-file check are the
 exceptions. Their re-grab covers one file, because every file of the download gets a check of its own.
 
@@ -22,7 +22,7 @@ exceptions. Their re-grab covers one file, because every file of the download ge
 | `audio` | The audio that plays is broken. |
 | `video` | The video is cut short or damaged, or the whole-file check finds gaps of zero bytes at two or more places, see [features.md](features.md#broken-audio-and-corrupt-video). |
 | `content` | The file holds another film or episode, by the TMDB and runtime checks, see [features.md](features.md#wrong-content). |
-| `damage` | A conversion to MKV shows that the source file is damaged. |
+| `damage` | A conversion to MKV or the subtitle rewrite of an import shows that the source file is damaged, or the whole-file check finds video errors and a second read of the video fails on them too. |
 | `burned_in` | Subtitles in a language other than English are burned into the picture, and a second check on other frames agrees, see [features.md](features.md#burned-in-subtitles). When the text is in the language of the audio, or of the movie or show itself, AMG re-grabs each movie or episode only once. |
 
 - In an MKV, MP4 or MOV file with PCM audio, the import's quick zero probe only logs the gaps of zero bytes it finds,
@@ -44,7 +44,10 @@ and puts the old one back. When no old file comes back, AMG asks the app to sear
 import that replaced nothing stays, and an alert says the app has no record of grabbing it.
 
 A re-grab posts an alert, also when AMG put the old file back. Without the old file, the item has no file until the
-app finds another copy, and the search can find none. A manual import whose old file came back, and the app picked it up again, goes to the
+app finds another copy, and the search can find none. The alert names the indexer and the posted date of the download
+AMG deleted, as "The download came from nzbs.example.org, posted on 2025-01-09." So each re-grab of one item reads
+apart from the one before. The indexer is the host of the release's info page, else its name in the app. A fact the
+app's grab record lacks is left out. A manual import whose old file came back, and the app picked it up again, goes to the
 decision log only. When AMG deleted a file, the other alerts of that file go to the log only. Every fault that AMG did not re-grab posts an alert, as
 when a setting or the limit stopped it. A restore whose old files the app did not pick up posts too. So does a deleted
 file whose item is not monitored, because no search started.
@@ -105,11 +108,19 @@ grab or an edit by hand, gets a new kept original.
 
 | Folder | What it holds |
 | --- | --- |
-| `.<NAME>-originals` | The kept originals, at `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. |
-| `.<NAME>-recycle` | The copies `KEEP_REPLACED` keeps at a grab. |
+| `.<NAME>-originals` | The kept originals, at `<folder>/.<NAME>-originals/<folders of the path from the folder>/<UTC time>/<file name>`. |
+| `.<NAME>-recycle` | The copies `KEEP_REPLACED` keeps at a grab, in the same layout. |
 | `.<NAME>-convert` | Beside a video. It holds the new file while AMG writes it, and during a conversion also the old file and its extras. |
 
 `NAME` is `arr-media-guard` by default, so the first folder is `.arr-media-guard-originals`.
+
+The folders of the show or film come first, as in the apps' recycle bin. Each keep gets a time folder beside the file,
+and the subtitles, `.nfo` and images kept with a video sit in its time folder. Two keeps of one file give two time
+folders side by side. An episode kept on 24 November 2026 at 17:36 UTC sits at
+`.arr-media-guard-originals/TV Shows/Show (1998)/Season 4/20261124T173600Z/Show (1998) - S04E07.mkv`.
+
+Up to 2.22.0 the time folder came first, at `.<NAME>-originals/<UTC time>/<path from the folder>`. AMG does not move
+those keeps. The clean-up removes them when they expire.
 
 ### Where the folders go
 
@@ -151,6 +162,8 @@ of the night clears the folders of every app, so its container log line names no
 - `0` keeps nothing new.
 - At `0` a clean-up removes every `KEEP_REPLACED` copy, and leaves the originals already kept.
 - Move a kept original out of its folder to keep it longer.
+- After it removes a time folder, the clean-up removes each folder above it that is left empty. It never removes the
+  kept folder itself, or a folder that holds a file.
 - A later change of the file starts the days again. Its time folder then holds a `.renewed` file, whose time is that of
   the latest change.
 
@@ -164,6 +177,6 @@ change, so a file can have several kept originals in different time folders. Loo
 the file's last import, while it is still there. It holds the file as it was before AMG first changed it.
 
 ```
-mv "/media/TV/.arr-media-guard-originals/<UTC time>/Show A/Season 1/Show A - S01E02.mkv" \
+mv "/media/TV/.arr-media-guard-originals/Show A/Season 1/<UTC time>/Show A - S01E02.mkv" \
    "/media/TV/Show A/Season 1/Show A - S01E02.mkv"
 ```

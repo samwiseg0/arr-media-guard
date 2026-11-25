@@ -604,9 +604,23 @@ PART = re.compile(r"(.*?)(?: (?:part |pt )?(\d{1,2}|one|two|three|four|five|six|
 
 def parts(a, b):
     """Whether two keys name two parts of one story: the same words with another part number, or none on one side, as
-    "versus the ring" and "versus the ring part 2". Neither names the other then, so a swap of two parts shows."""
+    "versus the ring" and "versus the ring part 2". Neither names the other then, so a swap of two parts shows. Two
+    "episode N" keys with two numbers count too. difflib finds "episode 129" within TITLE_NEAR of "episode 130"."""
     (base_a, part_a), (base_b, part_b) = PART.fullmatch(a).groups(), PART.fullmatch(b).groups()
-    return base_a == base_b and part_a != part_b
+    num_a, num_b = title_number(a), title_number(b)
+    return base_a == base_b and part_a != part_b or None not in (num_a, num_b) and num_a != num_b
+
+
+def title_number(title, series=()):
+    """N of a title that holds only a number behind a series key or the word "Episode", as "Show A 30", "Show A - #30"
+    or "Episode 30", else None. series: the series keys. A number alone, as "30", gives None, because it can be a real
+    title."""
+    k = title_key(title)
+    for s in [""] + [s + " " for s in series if s]:
+        m = k.startswith(s) and re.fullmatch(r"(episode )?(\d+)", k[len(s):])
+        if m and (s or m[1]):
+            return int(m[2])
+    return None
 
 
 def episode_title_verdict(title, episodes, imported, series_titles=(), said="the release name", anime=False):
@@ -620,6 +634,13 @@ def episode_title_verdict(title, episodes, imported, series_titles=(), said="the
     - "other": the title matches another episode, one that no other episode shares the title with. A special counts
       only for a special, because a special often repeats the title of a regular episode. The release's episode tag
       plays no part. Sonarr's scene numbering can send a new episode to an old one with the same tag.
+    - The number rule, when no title matches by words. A title that holds only a number, see title_number(), and an
+      "Episode N" key give N. Neither matches another episode by words. The candidates are the episodes titled
+      "Episode N". When the series titles a number in two seasons, it counts per season, and only the candidates in
+      the imported episode's season count. The number of an imported episode's title gives "imported". So does its
+      place in the series, Sonarr's absolute number or else its place among the regular episodes in order. The one
+      candidate of a number gives "other". When no candidate is alone and each imported episode is an "Episode N" of
+      another number, the verdict is "other" and names no episode. The number rule scores no point.
     - "none": no episode matches.
     said names where the title comes from, such as "the release's NFO". anime adds each episode's absolute number.
     Returns a signal of wrong_content_evidence(): {"kind", "verdict", "points", "why", "episodes", "names", "imported",
@@ -636,19 +657,40 @@ def episode_title_verdict(title, episodes, imported, series_titles=(), said="the
             owners.setdefault(k, set()).add(e["id"])
     wanted |= {k for w in list(wanted) for k in covered(w, owners)}
     near = lambda a, b: not parts(a, b) and (difflib.SequenceMatcher(None, a, b).ratio() >= TITLE_NEAR or f" {a} " in f" {b} " or f" {b} " in f" {a} ")
-    found = []
+    segments = re.split(r"\s*[/+]\s*", title or "")
+    numbers = ({title_number(p, series) for p in segments} | {title_number(k) for k in wanted}) - {None}
+    numbered = {k for p in segments if title_number(p, series) is not None for k in title_keys(p, series)}   # "30" of "<Series> 30"
+    number = {e["id"]: title_number(e.get("title")) for e in episodes}   # N of an episode titled "Episode N"
+    own_numbers = {number[e["id"]] for e in mine}
+    special = any(e.get("seasonNumber") == 0 for e in mine)
+    pick = lambda ids: sorted((e for e in episodes if e["id"] in ids and (e.get("seasonNumber") or special)),
+                              key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
+    seasons = {}   # the regular seasons of each "Episode N" number
+    for e in episodes:
+        if number[e["id"]] is not None and e.get("seasonNumber"):
+            seasons.setdefault(number[e["id"]], set()).add(e["seasonNumber"])
+    per_season, own_seasons = any(len(v) > 1 for v in seasons.values()), {e.get("seasonNumber") or 0 for e in mine}
+    regular = sorted((e for e in episodes if e.get("seasonNumber")), key=lambda e: (e["seasonNumber"], e.get("episodeNumber") or 0))
+    place = {e["id"]: i for i, e in enumerate(regular, 1)}
+    places = {e.get("absoluteEpisodeNumber") or place.get(e["id"]) for e in mine}   # each imported episode's place in the series
+    found, points = [], 0
     if any(near(k, o) for e in mine for o in title_keys(e.get("title"), series) for k in wanted):
         verdict = "imported"
-    else:
-        ids = {i for k in wanted for i in owners.get(k, ()) if len(owners[k]) == 1}
-        special = any(e.get("seasonNumber") == 0 for e in mine)
-        found = sorted((e for e in episodes if e["id"] in ids and (e.get("seasonNumber") or special)),
-                       key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
-        verdict = "other" if found else "none"
+    elif found := pick({i for k in wanted - numbered if title_number(k) is None for i in owners.get(k, ()) if len(owners[k]) == 1}):
+        verdict, points = "other", EPISODE_TITLE_POINTS
+    elif numbers & (own_numbers | places):
+        verdict = "imported"
+    else:   # the number rule. It scores no point, so it alerts only.
+        candidates = {}
+        for e in pick({i for i, n in number.items() if n in numbers}):
+            if not per_season or (e.get("seasonNumber") or 0) in own_seasons:
+                candidates.setdefault(number[e["id"]], []).append(e["id"])
+        found = pick({ids[0] for ids in candidates.values() if len(ids) == 1})
+        verdict = "other" if found or (numbers and None not in own_numbers) else "none"
     names, ours = and_join([episode_name(e, anime) for e in found]), [[episode_name(e, anime), e.get("title") or None] for e in mine]
-    return {"kind": "episode_title", "verdict": verdict, "points": EPISODE_TITLE_POINTS if found else 0, "episodes": [e["id"] for e in found],
+    return {"kind": "episode_title", "verdict": verdict, "points": points, "episodes": [e["id"] for e in found],
             "names": names, "imported": ours, "said": said, "title": title,
-            "why": episode_why(ours, said, title, names) if found else f'{said} calls it "{title}"'}
+            "why": episode_why(ours, said, title, names) if verdict == "other" else f'{said} calls it "{title}"'}
 
 
 def and_join(xs):
@@ -659,9 +701,11 @@ def and_join(xs):
 def episode_why(imported, said, title, names, quote=lambda s: f'"{s}"'):
     """The words of an episode title that names another episode, as in: imported as S01E02 "Overnight". The release
     name calls it "Anxious Times at Show Alpha", which is S01E03. imported holds the [number, Sonarr's title or None] of
-    each imported episode. quote marks a title. The Discord embed bolds the titles with it, see report.quote()."""
+    each imported episode. quote marks a title. The Discord embed bolds the titles with it, see report.quote(). Empty
+    names: the title's number is not the imported one's, and no single episode has it, see episode_title_verdict()."""
     ours = and_join([n + (f" {quote(t)}" if t else "") for n, t in imported])
-    return f"imported as {ours}. {said[:1].upper()}{said[1:]} calls it {quote(title)}, which is {names}"
+    end = f", which is {names}" if names else ", and the numbers differ"
+    return f"imported as {ours}. {said[:1].upper()}{said[1:]} calls it {quote(title)}{end}"
 
 
 def episode_name(e, anime=False):

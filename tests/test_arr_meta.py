@@ -857,6 +857,188 @@ def test_an_episode_title_never_adds_a_point():
     assert ev["signals"][-1] is sig and ev["points"] == 1 and not ev["regrab"] and "Ship Voyage" not in ev["why"], ev
 
 
+# A series whose episodes Sonarr titles "Episode N", by a count across the whole series, so the count and the S/E
+# numbers differ.
+NUMBERED = [ep(41, 2, 11, "Episode 26"), ep(42, 2, 12, "Episode 32"), ep(45, 2, 15, "Episode 29"), ep(46, 2, 16, "Episode 30"),
+            ep(47, 2, 17, "Episode 27"), ep(48, 2, 18, "Episode 33"), ep(51, 7, 10, "Episode 130"), ep(52, 7, 9, "Episode 129")]
+TESTER_NUMBERED = [("Show D 30", 45, "S02E16"), ("Show D 33", 47, "S02E18"), ("Show D 32", 41, "S02E12")]
+
+
+@pytest.mark.parametrize("nfo, own, names", TESTER_NUMBERED)
+def test_a_numbered_nfo_title_names_the_episode_of_its_number(nfo, own, names):
+    """The tester's case. A release named by wrong S/E numbers was imported to them. Its NFO title gives the series
+    name and the count of the right episode, which no word of an episode title matches."""
+    item = {"series_id": 7, "episodes": NUMBERED, "episode_ids": [own], "titles": [("Show D", 2008)]}
+    v = process.episode_title("sonarr", item, nfo, f"Show D S02E15 {nfo} 1080p NF WEB-DL AAC2 0 H 264-GRP", "/tv/Show D/a.mkv")
+    assert (v["verdict"], v["names"], v["points"]) == ("other", names, 0), v
+
+
+def test_the_alert_of_a_numbered_title_names_both_episodes():
+    from arr_media_guard import report
+    v = M.episode_title_verdict("Show D 30", NUMBERED, [45], ["Show D"], "the release's NFO")
+    assert v["why"] == 'imported as S02E15 "Episode 29". The release\'s NFO calls it "Show D 30", which is S02E16', v
+    (f,) = process.file_alerts({"tracks": [], "wrong_language": False}, [], {"evidence": {"signals": [v]}, "trusted": {}}, "English", {})
+    assert report.unmarked(report.FINDINGS["episode"][1](f, None)) == \
+        'Imported as S02E15 "Episode 29". The release\'s NFO calls it "Show D 30", which is S02E16.'
+
+
+@pytest.mark.parametrize("title, own, verdict, names", [
+    ("Show D 29", 45, "imported", ""),   # the file's own number
+    ("Show D 030", 46, "imported", ""),   # the file's own number, though no word matches
+    ("Show D #30", 45, "other", "S02E16"),
+    ("Show D - 30", 45, "other", "S02E16"),
+    ("Show.D.30", 45, "other", "S02E16"),
+    ("Show D Episode 30", 45, "other", "S02E16"),
+    ("Episode #30", 45, "other", "S02E16"),
+    ("Episode 030", 45, "other", "S02E16"),
+    ("Episode 130", 52, "other", "S07E10"),   # difflib finds "episode 130" within TITLE_NEAR of "episode 129"
+    ("Episode 130", 51, "imported", ""),
+])
+def test_a_title_of_a_number_matches_the_episode_titled_with_that_number(title, own, verdict, names):
+    v = M.episode_title_verdict(title, NUMBERED, [own], ["Show D"])
+    assert (v["verdict"], v["names"], v["points"]) == (verdict, names, 0), v
+
+
+def test_a_numbered_title_alerts_when_its_number_differs_though_no_single_episode_has_it():
+    """When no episode has the title "Episode 30", the alert names no episode. It says the numbers differ. An imported
+    episode with a real title gives no number to compare, so the verdict stays "none"."""
+    never = [e for e in NUMBERED if e["id"] != 46]
+    v = M.episode_title_verdict("Show D 30", never, [45], ["Show D"], "the release's NFO")
+    assert (v["verdict"], v["episodes"], v["names"], v["points"]) == ("other", [], "", 0), v
+    assert v["why"] == 'imported as S02E15 "Episode 29". The release\'s NFO calls it "Show D 30", and the numbers differ', v
+    real = [dict(e, title="Lot Day") if e["id"] == 45 else e for e in never]
+    assert M.episode_title_verdict("Show D 30", real, [45], ["Show D"])["verdict"] == "none"
+    (f,) = process.file_alerts({"tracks": [], "wrong_language": False}, [], {"evidence": {"signals": [v]}, "trusted": {}}, "English", {})
+    from arr_media_guard import report
+    assert report.unmarked(report.FINDINGS["episode"][1](f, None)) == \
+        'Imported as S02E15 "Episode 29". The release\'s NFO calls it "Show D 30", and the numbers differ.'
+
+
+REAL_NUMBERED = NUMBERED + [ep(70, 3, 5, "30 Days"), ep(71, 3, 6, "Episode 30: The Return"), ep(72, 3, 7, "Part 2"), ep(73, 3, 8, "30")]
+
+
+@pytest.mark.parametrize("title, own, verdict, names", [
+    ("30 Days", 45, "other", "S03E05"),   # by words
+    ("Episode 30: The Return", 45, "other", "S03E06"),
+    ("Part 2", 45, "other", "S03E07"),
+    ("Show D 30", 45, "other", "S02E16"),   # the number rule only, as for "Episode 30", though S03E08 is titled "30"
+    ("Episode 30", 71, "imported", ""),   # the file's own title holds its words
+    ("60 Days", 45, "none", ""),   # the title holds words beside the number, so the number rule skips it
+    ("Episode 31: The End", 45, "none", ""),
+    ("Part 3", 45, "none", ""),
+    ("31", 45, "none", ""),   # a number alone can be a real title
+    ("Lot Day", 45, "none", ""),
+])
+def test_a_real_title_with_a_number_keeps_its_verdict(title, own, verdict, names):
+    """Each verdict is the one of 20bf8dc, before the number rule, except "Show D 30". It takes the number rule, as
+    "Episode 30" does."""
+    v = M.episode_title_verdict(title, REAL_NUMBERED, [own], ["Show D"])
+    assert (v["verdict"], v["names"]) == (verdict, names), v
+
+
+@pytest.mark.parametrize("title, verdict, names", [
+    ("Show D 30", "imported", ""),   # one of the file's two numbers
+    ("Show D 33", "other", "S02E18"),
+    ("Show D 33/Show D 32", "other", "S02E12 and S02E18"),   # each segment has its number
+    ("Show D 34", "other", ""),   # no episode has 34, and both imported numbers differ
+])
+def test_a_numbered_title_of_a_two_episode_file(title, verdict, names):
+    v = M.episode_title_verdict(title, NUMBERED, [45, 46], ["Show D"])
+    assert (v["verdict"], v["names"]) == (verdict, names), v
+    real = [dict(e, title="Lot Day") if e["id"] == 46 else e for e in NUMBERED]
+    assert M.episode_title_verdict("Show D 34", real, [45, 46], ["Show D"])["verdict"] == "none"   # one title is real, so no numbers compare
+
+
+def test_a_numbered_anime_title_names_the_episode_of_its_title_or_the_absolute_number_of_the_file():
+    anime = [ep(1, 5, 10, "Episode 10", 120), ep(2, 5, 20, "Episode 20", 130)]
+    v = M.episode_title_verdict("Show D 20", anime, [1], ["Show D"], anime=True)
+    assert (v["verdict"], v["names"]) == ("other", "S05E20 (absolute 130)"), v
+    v = M.episode_title_verdict("Show D 130", anime, [1], ["Show D"], anime=True)   # no episode is titled "Episode 130"
+    assert (v["verdict"], v["names"]) == ("other", ""), v
+    v = M.episode_title_verdict("Show D 120", anime, [1], ["Show D"], anime=True)   # the release counts by the absolute number
+    assert (v["verdict"], v["names"]) == ("imported", ""), v
+
+
+# A series that titles each season "Episode 1".."Episode 10", with Sonarr's absolute numbers 1..32, and two specials. S03
+# holds 12 episodes, so "Episode 11" and "Episode 12" exist in S03 only.
+PER_SEASON = [ep(100 * s + e, s, e, f"Episode {e}", 10 * (s - 1) + e) for s in (1, 2, 3) for e in range(1, 11 if s < 3 else 13)] + \
+    [ep(1, 0, 1, "Episode 1"), ep(2, 0, 2, "Episode 2")]
+
+
+@pytest.mark.parametrize("title, own, verdict, names", [
+    ("Show P 5", 205, "imported", ""),
+    ("Show P 6", 205, "other", "S02E06"),   # the number of the file's season, though S01 and S03 have an "Episode 6" too
+    ("Episode 6", 205, "other", "S02E06"),   # an "Episode N" title counts by its number, as "Show P 6"
+    ("Show P 6/Show P 7", 205, "other", "S02E06 and S02E07"),
+    ("Episode 6 and Episode 7", 205, "other", "S02E06 and S02E07"),   # two titles, no "/", see covered()
+    ("Show P 15", 205, "imported", ""),   # S02E05 is the 15th episode of the series
+    ("Show P 25", 205, "other", ""),   # S02 has no "Episode 25", and the file is the 15th episode
+    ("Show P 12", 205, "other", ""),   # only S03 has an "Episode 12"
+    ("Episode 12", 205, "other", ""),
+    ("Show P 12", 311, "other", "S03E12"),
+    ("Show P 2", 205, "other", "S02E02"),   # a special counts for a special only
+    ("Show P 2", 1, "other", "S00E02"),
+    ("Show P 1", 1, "imported", ""),
+])
+def test_a_numbered_title_of_a_series_that_counts_per_season_names_an_episode_of_the_file_season(title, own, verdict, names):
+    v = M.episode_title_verdict(title, PER_SEASON, [own], ["Show P"])
+    assert (v["verdict"], v["names"], v["points"]) == (verdict, names, 0), v
+
+
+def test_the_place_of_the_file_counts_from_the_regular_episodes_when_sonarr_has_no_absolute_number():
+    """S02E05 is the 15th regular episode. The two specials do not count."""
+    eps = [dict(e, absoluteEpisodeNumber=None) for e in PER_SEASON]
+    assert M.episode_title_verdict("Show P 15", eps, [205], ["Show P"])["verdict"] == "imported"
+    assert M.episode_title_verdict("Show P 17", eps, [205], ["Show P"])["verdict"] == "other"
+    assert M.episode_title_verdict("Show P 31", eps, [1], ["Show P"])["verdict"] == "other"   # a special has no place
+
+
+def test_a_series_that_counts_across_seasons_names_the_episode_of_the_number_in_any_season():
+    """The tester's series counts across seasons, and Sonarr's absolute number of each episode is its title number. A
+    number in two seasons makes the series count per season, so "Show D 30" then names the "Episode 30" of the file's
+    season. A special with the number never counts for a regular episode."""
+    counted = [dict(e, absoluteEpisodeNumber=M.title_number(e["title"])) for e in NUMBERED]
+    for title, own, names in TESTER_NUMBERED + [("Show D 129", 45, "S07E09")]:
+        v = M.episode_title_verdict(title, counted, [own], ["Show D"])
+        assert (v["verdict"], v["names"], v["points"]) == ("other", names, 0), v
+    for extra in ([ep(60, 3, 1, "Episode 30")], [ep(60, 0, 1, "Episode 30")]):
+        v = M.episode_title_verdict("Show D 30", counted + extra, [45], ["Show D"])
+        assert (v["verdict"], v["names"]) == ("other", "S02E16"), v
+    v = M.episode_title_verdict("Show D 129", counted + [ep(60, 0, 1, "Episode 129")], [45], ["Show D"])
+    assert (v["verdict"], v["names"]) == ("other", "S07E09"), v   # a special never makes the series count per season
+    v = M.episode_title_verdict("Show D 129", counted + [ep(60, 3, 1, "Episode 30")], [45], ["Show D"])
+    assert (v["verdict"], v["names"]) == ("other", ""), v   # S07E09 is in another season
+
+
+def test_the_number_rule_never_changes_the_regrab_decision(monkeypatch):
+    """A short runtime scores one point. Each number verdict leaves the points, the re-grab decision and the reason as
+    with no title signal, which is what 20bf8dc gave for these titles. The number rule scores no point at any
+    EPISODE_TITLE_POINTS. A match by words scores EPISODE_TITLE_POINTS."""
+    from arr_media_guard import regrab
+    tracks = [{"kind": "a", "role": "main", "lang": "eng", "conf": 1.0}]
+    args = (tracks, "English", tmdb("eng", ["eng"], 0), {"seconds": 600, "trust": "agree"}, [50], "Show.D.S02E15.Show.D.30.1080p",
+            "episode", 2008, [("Show D", 2008)])
+    base = M.wrong_content_evidence(*args)
+    sigs = [M.episode_title_verdict(t, NUMBERED, [own], ["Show D"]) for t, own, _ in TESTER_NUMBERED] + \
+        [M.episode_title_verdict("Show D 30", NUMBERED[:3], [45], ["Show D"])]   # no episode has 30
+    for sig in sigs:
+        ev = M.wrong_content_evidence(*args, episode=sig)
+        assert sig["verdict"] == "other" and (ev["points"], ev["regrab"], ev["why"]) == (base["points"], base["regrab"], base["why"]), ev
+        assert regrab.without_language(ev, "x")["points"] == base["points"] == 1 and not base["regrab"]
+    monkeypatch.setattr(M, "EPISODE_TITLE_POINTS", 1)
+    assert M.episode_title_verdict("30 Days", REAL_NUMBERED, [45], ["Show D"])["points"] == 1   # by words
+    for title, own in (("Show D 30", 45), ("Episode 30", 45), ("Episode 130", 52), ("Show D 6", 205)):
+        v = M.episode_title_verdict(title, PER_SEASON if own == 205 else NUMBERED, [own], ["Show D", "Show P"])
+        assert (v["verdict"], v["points"]) == ("other", 0), v
+    assert M.episode_title_verdict("Show D 30", NUMBERED[:3], [45], ["Show D"])["points"] == 0
+    for name in ("30", "Show D 30", "Show D #30"):   # reviewer 2026-11-25: these matched "Show D 30" by words and scored 1
+        eps = NUMBERED + [ep(73, 3, 8, name)]
+        v, by_number = (M.episode_title_verdict(t, eps, [45], ["Show D"]) for t in ("Show D 30", "Episode 30"))
+        assert (v["verdict"], v["names"], v["points"]) == (by_number["verdict"], by_number["names"], 0) == ("other", "S02E16", 0), v
+    v = M.episode_title_verdict("Show D 30/30 Days", REAL_NUMBERED, [45], ["Show D"])   # a segment with words still matches by words
+    assert (v["verdict"], v["names"], v["points"]) == ("other", "S03E05", 1), v
+
+
 
 # --- the tester's case: one interactive search for S04E15 of a cartoon in three episode orders ---------------------------
 

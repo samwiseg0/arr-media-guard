@@ -208,7 +208,8 @@ check off or make it alert only. See [features.md](features.md#burned-in-subtitl
 Each import also puts a whole-file check in the background queue, before its deep analysis. It reads every byte of the
 file once. It looks for gaps of zero bytes, as a torrent piece that never downloaded leaves, and ffmpeg reads every
 packet beside it. Gaps at two or more places re-grab the file when `REGRAB` lists `video`, as at import. One gap, or an
-error of the full read, posts one alert. Silent PCM audio is zero bytes too, so in an MKV, MP4 or MOV file with PCM
+error of the full read, posts one alert. Video errors get a second read of the video. When it fails too, the file is
+damaged. It re-grabs when `REGRAB` lists `damage`, and its deep analysis and subtitle rewrite never run. Silent PCM audio is zero bytes too, so in an MKV, MP4 or MOV file with PCM
 audio a gap counts only where the full read breaks. When the import converted or repaired the file, the check reads the original that
 AMG kept, because a remux leaves the gaps out. See [design.md](design.md#whole-file-check).
 

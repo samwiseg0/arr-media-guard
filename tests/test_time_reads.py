@@ -493,6 +493,18 @@ def test_debug_output_a_report_and_encoder_stats_fail(clip, use, tmp_path, monke
         ff.check(use(), base[:2] + ["-v", "error"] + base[2:])
 
 
+def test_fflags_takes_only_genpts_and_its_use_names_it(clip, use):
+    """-fflags +genpts fills the PTS of a packet that stores none, so a use names genpts to pass it. Another flag may
+    drop or move a time, so any other value fails. The proof's packet read names genpts for an MPEG-PS original."""
+    argv = lambda v: ["ffmpeg", "-nostdin", "-v", "error", "-fflags", v, "-i", clip, "-f", "null", "-"]
+    assert "genpts" in ff.check(use("genpts"), argv("+genpts"))["got"] and "genpts" in ff.READS["proof.packet_hashes"].names
+    with pytest.raises(ff.TimeRead, match="opens genpts"):
+        ff.check(use(), argv("+genpts"))
+    for v in ("+igndts", "+genpts+igndts", "genpts", "-genpts", "+discardcorrupt", "+nofillin", "+sortdts"):
+        with pytest.raises(ff.TimeRead, match="-fflags"):
+            ff.check(use("genpts"), argv(v))
+
+
 def test_an_output_with_no_muxer_fails(clip, use, tmp_path):
     """A7: ffmpeg guesses the muxer of an output with no -f from its name: x.srt writes cue times, x.ffmeta chapters."""
     for outs in ([str(tmp_path / "x.srt")], [str(tmp_path / "x.ffmeta")], ["-f", "null", "-", str(tmp_path / "x.srt")]):

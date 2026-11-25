@@ -162,16 +162,17 @@ def logged_refusals(paths):
     """{path: the last refusal of its conversion in the decision log, as the result text of a failed repack, or ""}
     for paths. The store keeps the decision lines, see logs.decision(). A forced conversion's line counts with the
     refusal it overrode. --force-convert forces a file only for that refusal, so a file that now fails for another
-    reason stays."""
+    reason stays. The text holds every refusal of the proof, uncut, see convert.convert(). A line of an older version
+    gives its result, which names one refusal."""
     out = dict.fromkeys(paths, "")
     for path in out:
         for raw, in store.read("SELECT rec FROM decisions WHERE path = ? ORDER BY rowid", path):
             r = json.loads(raw)
             rp = r.get("repack") or {}
             if rp.get("forced"):
-                out[path] = config.mask(f"repack failed: {rp['forced']}")[:500]
+                out[path] = config.mask(f"repack failed: {rp['forced']}")
             elif r["outcome"] == "repack_failed":
-                out[path] = r["result"]
+                out[path] = config.mask(f"repack failed: {'; '.join(rp['refusals'])}") if rp.get("refusals") else r["result"]
     return out
 
 

@@ -117,6 +117,32 @@ def test_ffmpegs_start_rule_moves_a_video_whose_edit_keeps_its_delay(tmp_path, f
     assert hook.mp4_sync(str(path), j, streams) == [{"stream": "video 0", "track": 0, "ms": ms, "rule": "ffmpeg's MP4 start"}]
 
 
+def test_a_video_move_that_would_drop_the_hidden_keyframe_goes_to_the_other_tracks(tmp_path):
+    """The video's edit starts half a frame into its second frame, so it hides the first keyframe. mkvmerge starts the
+    file at that keyframe, 62.5 ms before 0. ffmpeg's start rule moves the video 20 ms earlier, and --sync 0:-20 would
+    drop the keyframe. So the audio moves 20 ms later instead, and the video keeps every packet. The proof checks the
+    video's move against the audio's move. The old move, and a move the conversion does not name, still refuse. In a
+    file with no start rule, a move of the audio alone moves the video against it, and refuses. 2.22.0 refused the
+    plan of the old move: "stream video 0 (h264) holds 95 packets in the new file, 96 in the original"."""
+    path = patch_edit(make(tmp_path / "a.mp4"), 1, media_time=2002 + 1001 + 500)
+    v, a = mp4.samples(str(path))["tracks"]
+    j, streams = hook.mkvmerge(str(path)), hook.ff_streams(str(path))[1]
+    assert v["tag"][0] == mp4.CUT and v["time"][0] + v["shift"] == -62541667 == round(-hook.start_shift(str(path), streams, set()) * 1e9)
+    assert proof.start_plan(v["shift"]) == -20 and a["shift"] == 0
+    assert hook.mp4_sync(str(path), j, streams) == [{"stream": "audio 1", "track": 1, "ms": 20, "rule": hook.ON_OTHERS}]
+    refused, rows = converted(path, tmp_path / "b.mkv")
+    assert refused is None and rows[0]["match"] and rows[1]["match"] and rows[1]["start"][0] == rows[1]["start"][1], rows
+    assert hook.prove(str(path), str(tmp_path / "b.mkv"), [], str(tmp_path))[0][1] == (
+        "stream video 0 moves +0 ms in the conversion, and ffmpeg's start rule of the MP4 needs -20 ms")
+    assert hook.prove(str(path), str(tmp_path / "b.mkv"), [], str(tmp_path), synced={1: 19})[0][1].startswith("stream video 0 moves -19 ms")
+    old = remux(path, tmp_path / "old.mkv", "--sync", "0:-20")
+    assert hook.prove(str(path), str(old), [], str(tmp_path), synced={0: -20})[0][1] == "stream video 0 (h264) holds 95 packets in the new file, 96 in the original"
+    plain = make(tmp_path / "plain.mp4")   # no start rule: a move of the audio alone moves the video against it
+    moved = remux(plain, tmp_path / "moved.mkv", "--sync", "1:5")
+    assert hook.prove(str(plain), str(moved), [], str(tmp_path), synced={1: 5})[0][1] == (
+        "stream video 0 moves -5 ms in the conversion, and ffmpeg's start rule of the MP4 needs +0 ms")
+
+
 @pytest.mark.parametrize("chunks", [0, 1])
 def test_a_trak_with_no_samples_turns_ffmpegs_start_rule_off_for_the_traks_after_it(tmp_path, chunks):
     """ffmpeg turns its advanced edit lists off for the whole file at the first trak with no samples (mov.c,

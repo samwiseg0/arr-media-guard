@@ -440,12 +440,13 @@ def test_an_edit_that_breaks_the_layout_is_repaired_in_the_same_run(layouts, tmp
     real, blocked = hook.repack, []
     monkeypatch.setattr(hook, "repack", lambda *a, **k: blocked.append(signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, [])) or real(*a, **k))
     hook.mute_mark(path)   # a burn-in job turned the subtitles off, and the repair keeps its mark
+    hook.damage_mark(path, {"fault": "parts of the file cannot be read"})   # the repair keeps the video, and so the damage mark
     seen = runs(monkeypatch)
     rec = hook.edit({"path": path}, j, edits, True)
     assert (rec["outcome"], rec["header_repair"]["code"], writes(seen), blocked) == ("edited", "header_repaired", (1, 1), [False]), rec
     assert rec["header_repair"]["issue"] == [LAYOUT, hook.RFC_ISSUE + "Segment: 3 SeekHead elements, where RFC 9559 allows 2"] and "layout" not in rec
     assert hook.layout_of(path) is None and D.unapplied(hook.mkvmerge(path), edits) == [] and hook.muted(path) and hook.header_of(path)["rfc"] == {}
-    assert [r.get("outcome", r["result"]) for r in log_lines(None)] == ["editing", "header_repaired"]
+    assert [r.get("outcome", r["result"]) for r in log_lines(None)] == ["editing", "header_repaired"] and hook.damaged(path)
 
 
 def test_a_layout_the_edit_broke_after_a_failed_repair_waits(layouts, tmp_path, settings, monkeypatch):

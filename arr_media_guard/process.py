@@ -314,8 +314,9 @@ def refresh(ctx, duration=True):
     """Probe the file at the start and again after a step replaced it: its stat, its size and mkvmerge -J. The record
     takes the new size, mtime and duration. duration False keeps the record's duration, as after a subtitle remux."""
     was, ctx.st = getattr(ctx, "st", None), os.stat(ctx.path)
-    if was:   # a remux of AMG's own keeps the mark of a burn-in job, see runner.muted()
+    if was:   # a remux of AMG's own keeps the marks of a burn-in job and of a damaged file, see runner.muted() and runner.damaged()
         runner.mute_mark(ctx.path, was)
+        runner.damage_carry(ctx.path, was)
         ctx.waits = ctx.yields   # a job a backfill queued yields no more. A yield would lose the post and the decision line of the change,
         # and the job's import time limit bounds the rest. A deep analysis and a recheck have no time limit, so they still yield.
     ctx.size = ctx.st.st_size; ctx.j = checks.mkvmerge(ctx.path)
@@ -449,7 +450,8 @@ def conversion(ctx):
     failed = None
     if got == "repack_failed":   # one embed, like a failed flag edit. A skip, a dry run or a changed original posts nothing.
         failed = {"kind": "repack", "container": container, "why": result.partition(": ")[2][:200],
-                  **({"skipped": s} if (s := rec["repack"].get("skipped_audio")) else {})}
+                  **({"skipped": s} if (s := rec["repack"].get("skipped_audio")) else {}),
+                  **({"refusals": [x[:200] for x in r]} if len(r := rec["repack"].get("refusals") or []) > 1 else {})}   # each refused stream
     if not would and review:
         convert.convert_list(ctx.app, rec)
     damage = rec["repack"].get("damage")
@@ -1007,10 +1009,17 @@ def write(ctx):
     writable gets no edits carried, so edit() gives it read_only, as before. After the remux the file is probed and
     planned again, see replan(), and edit() makes what that plan still asks for: mkvmerge's statistics tags or a
     removed track can change it. rec["replan_edits"] counts those edits. With no remux planned, or when the remux
-    fails or cannot run, edit() makes the edits of the decision without the garbled tracks the remux takes out, as
+    fails, cannot run, or skips a file marked damaged, see runner.damaged(), edit() makes the
+    edits of the decision without the garbled tracks the remux takes out, as
     before the remux was planned, and a dry run records them. After a failed remux, edit() keeps the flags of a file
     that a flag edit would enclose bytes in, see edit(). Returns True when the app replaced the file of a deep analysis
-    or a recheck during the remux, see deep_drop()."""
+    or a recheck during the remux, see deep_drop(), and when the file of a deep analysis or a recheck is marked damaged.
+    That run then drops as at its start, see runner.deep_analysis().
+
+    The remux of an import that could not read the original, see remux.resub(), shows the file damaged, as a conversion
+    does, see conversion(). The file then re-grabs under REGRAB=damage in place of the flag edits, as for a certain
+    fault, see act(). An apply that keeps the file marks it, see runner.damage_mark(). The Damaged file alert is then
+    the one post on its subtitles, see after_edit()."""
     rec, j, path, sub, head = ctx.rec, ctx.j, ctx.path, ctx.subplan, ctx.head
     replan_of = lambda after: muted_plan(replan(after, plan_inputs(ctx)), ctx.muted)
     edits = flag_edits(ctx, ctx.d, ctx.unmatched | set(ctx.strip))
@@ -1030,7 +1039,12 @@ def write(ctx):
     hp = ctx.stage if ctx.stage is not None else checks.header_of(path, j) or {}
     blocked = "; ".join(hp.get("edit_blocked") or [])
     if sub:
-        code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {blocked}", {}) if blocked else gate.allow(
+        hurt = runner.damaged(path, ctx.st)   # the subtitles of a damaged file get no rewrite, see runner.whole_act()
+        if hurt and ctx.background:   # it drops as at its start, so it posts no subtitle alert, see runner.deep_analysis()
+            ctx.rec = dict(app=ctx.app, source=ctx.source, path=ctx.path, outcome="file_damaged", result=f"dropped, {report.DAMAGED_SKIP}: {hurt['fault']}")
+            return True
+        skip = blocked or (hurt and f"{report.DAMAGED_SKIP}: {hurt['fault']}")
+        code, result, info = ("subtitle_remux_skipped", f"subtitle remux skipped, {skip}", {}) if skip else gate.allow(
             ctx, "subtitle remux", lambda: remux.resub(path, j, ctx.st, ctx.apply, **sub, **({"edits": carried} if carried else {}), **({"hp": head} if head else {})),
             **ctx.wrote)
         done = code == "subtitles_remuxed"
@@ -1053,6 +1067,14 @@ def write(ctx):
             hcode, hresult = (("tail_removed", "tail removed") if tail else ("header_repaired", "header repaired")) if done else \
                 ({"would_remux_subtitles": "would_repair_header", "subtitle_remux_skipped": "header_repair_skipped"}.get(code, "header_repair_failed"), result)
             rec["header_repair"] = dict(issue=head["issue"], result=hresult, code=hcode, remux="subtitles")
+        if (damage := info.get("damage")) and ctx.mode == "import":   # the remux could not read the original, see remux.resub()
+            action = regrab.regrab(ctx.app, ctx.job, damage["fault"], proof.damage_probe(damage, j), "damage")
+            rec.update(outcome="damaged_source", result=f"damaged source: {damage['fault']}", regrab=action["code"])
+            ctx.damaged = {"kind": "damage", "fault": damage["fault"], "line": damage["line"], "rewrite": True, "action": action}
+            ctx.first.append(ctx.damaged)
+            if ctx.apply and action["code"] not in report.DELETED + ("unconfirmed",) and not action.get("stopped"):
+                runner.damage_mark(path, damage)
+            return
     else:
         code, result, info = ("header_repair_skipped", f"header repair skipped, {blocked}: {'; '.join(head['issue'])}", {}) if blocked else gate.allow(
             ctx, "header repair", lambda: remux.repack(path, j, ctx.st, ctx.apply, head, **({"edits": carried} if carried else {})), **ctx.wrote)
@@ -1179,10 +1201,14 @@ def quiet_result(rec, apply, source):
 
 
 def after_edit(ctx):
-    """The rescan after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix()."""
+    """The rescan after a change, the sidecars, the subtitle cache and alerts, then the lock goes, see sidecar_fix(). A
+    file whose subtitle remux showed it damaged gets no sidecar fix and no subtitle alert, see write(). So does a file
+    marked damaged before, see runner.damaged(), in every run that reaches this step, as a backfill job, --sub-check
+    and --sub-time."""
     rec, d = ctx.rec, ctx.d
+    hurt = (ctx.damaged or {}).get("rewrite") or runner.damaged(ctx.path)
     rescan(ctx)
-    if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain):   # the sidecars beside the file, under the lock of the edit
+    if ctx.acts and ctx.mkv and not (ctx.certain or ctx.vcertain or hurt):   # the sidecars beside the file, under the lock of the edit
         planned = [os.path.join(os.path.dirname(ctx.path), n) for n in ((rec.get("subremux") or {}).get("saved") or {}).values()]   # a dry run's, once
         rec["sidecars"] = gate.allow(ctx, "sidecars", lambda: subtitles.sidecar_fix(
             {n: ctx.sides[n] for n in ctx.acts}, ctx.sync_all, ctx.apply, ctx.app, ctx.source, ctx.side_ends,
@@ -1212,7 +1238,7 @@ def after_edit(ctx):
             ctx.unreadable["remux"] = remux
         else:
             ctx.rest.append(report.unreadable_finding({}, rec["repack"].get("kept"), rec["container"], remux=remux))
-    ctx.rest += found
+    ctx.rest += [] if hurt else found
     if ctx.mkv and ctx.subs_on and checks.lid_ready():   # a backfill with --sub-check skips the file while it stays as it is and needs nothing more
         planned = ctx.fixes or ctx.remove or ctx.ends or ctx.moves or ctx.recode or ctx.strip
         done = ctx.apply and rec["outcome"] in ("edited", "no_change", "subtitles_remuxed", "sidecars_changed") and (rec.get("subremux") or {}).get("done", not planned) \
@@ -1555,6 +1581,7 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
         own = own or os.stat(path).st_ino == before.st_ino   # an import during the edit gives another inode, and it gets nothing
     if own:   # before the exit code. A failed mkvpropedit can still turn the subtitles off, and the mark follows the flags.
         runner.mute_mark(path, before)
+        runner.damage_carry(path, before)   # mkvpropedit can grow the file, and the damage in its video stays
     if not remuxed and e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
@@ -1607,4 +1634,5 @@ def relayout(rec, path, j):
     logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
     checks.lid_carry(path, st)
     runner.mute_mark(path, st)
+    runner.damage_carry(path, st)
     return checks.mkvmerge(path)

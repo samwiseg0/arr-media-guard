@@ -65,8 +65,10 @@ READS = {
     "convert.convert": Use(("matroska",), "the ffmpeg copy of a container mkvmerge cannot read (ASF), whose every packet prove() checks",
                            ("convert.convert_cmd",)),
     "convert.convert_subs": Use(("srt",), "the cues of a text subtitle, for the word check of a conversion"),
-    "proof.packet_hashes": Use(("framemd5", "framemd5.dts", "framemd5.pts", "framemd5.duration", "srt"), "the packet data and counts of "
-                               "every proof. Its times count only for a source with no reader (AVI, ASF), see prove()", ("proof.bad_lines",)),
+    "proof.packet_hashes": Use(("framemd5", "framemd5.dts", "framemd5.pts", "framemd5.duration", "srt", "genpts"), "the packet data and "
+                               "counts of every proof. Its times count only for a source with no reader (AVI, ASF, MPEG-PS), see prove(). "
+                               "They give the kept audio times of an MPEG-PS too, see convert.kept_times(). -fflags +genpts gives an MPEG-PS "
+                               "picture with no PTS the time of its place in the display order", ("proof.bad_lines",)),
     "proof.packet_data": Use((), "the bytes of the first packets of a stream"),
     "proof.hevc_packets.data": Use((), "the bytes of each packet of an HEVC stream"),
     "lid.extract": Use(("seek", "aresample"), "raw PCM from the -ss start. ff.clock() puts each frame at its time, so the word times and the "
@@ -107,7 +109,7 @@ FFMPEG = {**dict.fromkeys(("-nostdin", "-hide_banner", "-nostats", "-y", "-copyt
           **dict.fromkeys(("-v", "-loglevel", "-i", "-f", "-map", "-c", "-codec", "-af", "-vf", "-filter", "-filter_complex", "-lavfi", "-bsf",
                            "-frames", "-ac", "-ar", "-threads", "-skip_loop_filter", "-ignore_editlist"), (1, None)),
           **dict.fromkeys(("-ss", "-t", "-to", "-sseof"), (1, "seek")), "-progress": (1, "progress"), "-debug_ts": (0, "debug_ts"),
-          "-stats": (0, "stats"), "-report": (0, "report"), "-fdebug": (1, "fdebug"),
+          "-stats": (0, "stats"), "-report": (0, "report"), "-fdebug": (1, "fdebug"), "-fflags": (1, "genpts"),
           **dict.fromkeys(("-stats_enc_pre", "-stats_enc_post", "-stats_mux_pre", "-stats_enc_pre_fmt", "-stats_enc_post_fmt",
                            "-stats_mux_pre_fmt"), (1, "stats_enc"))}
 GRAPHS = ("-af", "-vf", "-filter", "-filter_complex", "-lavfi")
@@ -341,6 +343,8 @@ def opened(use, tool, args):
                 got |= chain(use, v, FILTERS, "filter")
             elif base == "-bsf":
                 got |= chain(use, v, BSFS, "bitstream filter", ",")
+            elif base == "-fflags" and v != "+genpts":   # genpts fills a missing PTS. Another flag may drop or move a time
+                refuse(f"{use} passes ffmpeg -fflags {v!r}. ff.py allows only +genpts")
             elif a == "-progress" and v != "pipe:1":
                 refuse(f"{use} writes ffmpeg's progress to {v!r}. ff.py reads it from the pipe only")
             elif a in SHOW:

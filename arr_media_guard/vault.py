@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The files the hook keeps: the original of a remux, the grab links, and their prune."""
-import calendar, contextlib, errno, hashlib, os, shutil, sqlite3, time
+import calendar, contextlib, errno, hashlib, os, re, shutil, sqlite3, time
 
 from . import apps, config, logs, regrab, runner, store
 
@@ -100,8 +100,8 @@ def keep_grab(app, owner, download_id, eps=()):
     restores. The app deletes the old file before the import calls the hook, so the Grab event is the last moment the
     file is there. eps are the episode ids of a Sonarr grab. A file that holds several of them is linked once. A file
     the app does not list gives nothing. A file the app lists and that is not on disk gives a note, because the import
-    won the race. The links of one grab share one UTC stamp folder, with the path from the mount below, as
-    keep_original() lays them out. When a link fails, the hook keeps nothing of that file, because a copy of a large
+    won the race. The links of one grab share one UTC stamp, laid out by kept_path(), so the extras of a video sit in
+    its stamp folder. When a link fails, the hook keeps nothing of that file, because a copy of a large
     file can lose the race to the import. An error after the first link removes every link of the grab, so no link
     stays without its record. The nightly audit prunes the folder, so the app never waits for it here. Returns the
     decision log line it wrote, or None when it kept and noted nothing. With KEEP_ORIGINALS_DAYS 0 it keeps nothing."""
@@ -109,16 +109,16 @@ def keep_grab(app, owner, download_id, eps=()):
         return None
     paths = apps.ARR[app].grab_paths(owner, eps)
     now, kept, made, roots, stamps = time.time(), [], [], set(), set()
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    stamp = time.strftime(STAMP, time.gmtime(now))
     missed = [f"{p}: the file is not on disk" for p in sorted({p for p in paths if p and not os.path.isfile(p)})]
     try:
         for p in sorted({p for p in paths if p and os.path.isfile(p)}):
             root, (stem, folder) = replaced_root(p), (os.path.splitext(os.path.basename(p))[0], os.path.dirname(p))
             extras = [os.path.join(folder, n) for n in sorted(os.listdir(folder)) if extra_of(stem, n) and os.path.isfile(os.path.join(folder, n))]
             for x in [p] + extras:
-                k = os.path.join(root, stamp, os.path.relpath(x, os.path.dirname(root)))
-                if not os.path.lexists(os.path.join(root, stamp)):
-                    stamps.add(os.path.join(root, stamp))
+                k = kept_path(root, x, stamp)
+                if not os.path.lexists(os.path.dirname(k)):
+                    stamps.add((os.path.dirname(k), root))
                 try:
                     os.makedirs(os.path.dirname(k), exist_ok=True)
                     os.link(x, k)
@@ -139,10 +139,8 @@ def keep_grab(app, owner, download_id, eps=()):
                 os.remove(k)
         raise
     finally:   # a stamp folder this call made and left empty, after a failed link or the removal above
-        for d in stamps:
-            for sub, _, _ in os.walk(d, topdown=False):
-                with contextlib.suppress(OSError):
-                    os.rmdir(sub)
+        for d, root in stamps:
+            drop_empty(d, root)
     for root in sorted(roots):
         remember_folder(root)
         plex_ignore(root)
@@ -276,15 +274,57 @@ def keepable(path, st):
 
 KEPT_BEFORE = "kept at an earlier write"   # note["kept_how"] of a keep that keep_original() reused, see Swap.unkeep()
 RENEWED = ".renewed"   # the file in a stamp folder whose mtime is the latest write that reused a keep there, see stamp_time()
+STAMP = "%Y%m%dT%H%M%SZ"   # the UTC time that names a stamp folder
 
 
 def stamp_time(folder):
     """The time a stamp folder of keep_dir or recycle_dir ages from: its name, a UTC stamp, or the mtime of its RENEWED
     file when that is later. Raises ValueError for a name that is no stamp."""
-    t = calendar.timegm(time.strptime(os.path.basename(folder), "%Y%m%dT%H%M%SZ"))
+    t = calendar.timegm(time.strptime(os.path.basename(folder), STAMP))
     with contextlib.suppress(OSError):
         t = max(t, os.stat(os.path.join(folder, RENEWED)).st_mtime)
     return t
+
+
+def is_stamp(name):
+    """Whether name is the name of a stamp folder, see stamp_time(). strptime() also reads short forms such as
+    "202011T111Z", so the name must hold every digit of STAMP. A library folder with such a name then stays."""
+    if not re.fullmatch(r"\d{8}T\d{6}Z", name):
+        return False
+    try:
+        time.strptime(name, STAMP)
+        return True
+    except ValueError:
+        return False
+
+
+def kept_path(root, path, stamp):
+    """Where a keep in root, a keep_dir or recycle_dir, puts path in the stamp folder named stamp:
+    <root>/<folders of the path from the folder that holds root>/<stamp>/<file name>. A user who looks for one show
+    finds its folders first and the stamp folders of its keeps beside the files."""
+    rel = os.path.relpath(path, os.path.dirname(root))
+    return os.path.join(root, os.path.dirname(rel), stamp, os.path.basename(rel))
+
+
+def stamp_folder(keep, root):
+    """The stamp folder of keep, a kept path in root, or None when keep is not below root. kept_path() puts keep in
+    its stamp folder. Before that layout, a keep sat at <root>/<stamp>/<path>, so the first folder below root is the
+    stamp folder of an old keep. A name that is no stamp makes stamp_time() of the result raise ValueError."""
+    parts = os.path.relpath(keep, root).split(os.sep)
+    if parts[0] == os.pardir or len(parts) < 2:
+        return None
+    return os.path.dirname(keep) if is_stamp(parts[-2]) else os.path.join(root, parts[0])
+
+
+def drop_empty(folder, root):
+    """Remove folder and each folder above it while it is empty, up to root, which stays. A folder that holds
+    anything stays, and so does each folder above it. A folder outside root is never removed."""
+    while os.path.relpath(folder, root).split(os.sep)[0] not in (os.curdir, os.pardir):
+        try:
+            os.rmdir(folder)
+        except OSError:   # it holds a file or another keep, or another host removed it
+            return
+        folder = os.path.dirname(folder)
 
 
 def kept_of(path):
@@ -298,11 +338,10 @@ def kept_of(path):
         r = store.get("wrote", path)
         if not r or list(runner.file_key(os.stat(path))) != r["file"] or not os.path.isfile(r["keep"]):
             return None
-        root = originals_root(path)
-        top = os.path.relpath(r["keep"], root).split(os.sep)[0]
-        if top == os.pardir or time.time() - stamp_time(os.path.join(root, top)) > config.CFG.keep_days * 86400 - regrab.KEEP_MARGIN:
+        folder = stamp_folder(r["keep"], originals_root(path))
+        if not folder or time.time() - stamp_time(folder) > config.CFG.keep_days * 86400 - regrab.KEEP_MARGIN:
             return None
-        return r["keep"], os.path.join(root, top)
+        return r["keep"], folder
     except (OSError, ValueError, sqlite3.Error):
         return None
 
@@ -333,9 +372,10 @@ def kept_carry(path, before):
 
 
 def keep_original(path, note=None, stamp_of=None):
-    """Keep path at <originals_root>/<UTC stamp>/<path from the mount> and return that path. The rename of the new file
-    over path follows, so path is never missing. The keep holds the original for keep_days, see prune_originals().
-    stamp_of is a kept path whose stamp folder the keep takes, so a sidecar kept later stays with its original.
+    """Keep path in originals_root() at kept_path() with a new UTC stamp, and return that path. The rename of the new
+    file over path follows, so path is never missing. The keep holds the original for keep_days, see prune_originals().
+    stamp_of is a kept path whose stamp folder, see stamp_folder(), takes the keep under its file name, so a sidecar
+    kept later stays with its original.
 
     A file has one kept original, its bytes before the hook's first write. When path holds the hook's own output and
     its original is still kept, see kept_of(), the call keeps nothing new. It returns that keep, and note["kept_how"]
@@ -357,8 +397,8 @@ def keep_original(path, note=None, stamp_of=None):
             note["kept_how"] = KEPT_BEFORE
         return got[0]
     root = originals_root(path)
-    stamp = os.path.relpath(stamp_of, root).split(os.sep)[0] if stamp_of else time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time()))
-    keep = os.path.join(root, stamp, os.path.relpath(path, os.path.dirname(root)))
+    folder = stamp_folder(stamp_of, root) if stamp_of else None
+    keep = os.path.join(folder, os.path.basename(path)) if folder else kept_path(root, path, time.strftime(STAMP, time.gmtime(time.time())))
     os.makedirs(os.path.dirname(keep), exist_ok=True)
     remember_folder(root)
     plex_ignore(root)
@@ -403,16 +443,20 @@ def keep_original(path, note=None, stamp_of=None):
 
 
 def prune_originals(root):
-    """Remove the stamp folders under root older than keep_days, by stamp_time(). Returns their names. An error keeps
-    the folder."""
+    """Remove the stamp folders at any depth below root older than keep_days, by stamp_time(), then each folder above
+    one that is left empty, up to root, see drop_empty(). The walk never enters a stamp folder or follows a symlink, so
+    the old layout's stamp folders at the top of root go whole. A folder whose name is no stamp goes only when a removal
+    leaves it empty. Returns the paths from root of the stamp folders removed. An error keeps the folder."""
     gone = []
-    try:
-        names = sorted(os.listdir(root))
-    except OSError:
-        return gone
-    for n in names:
-        with contextlib.suppress(ValueError, OSError):   # a folder the other host's audit removes at the same time
-            if time.time() - stamp_time(os.path.join(root, n)) > config.CFG.keep_days * 86400:
-                shutil.rmtree(os.path.join(root, n))
-                gone.append(n)
-    return gone
+    for top, dirs, _ in os.walk(root):
+        for n in sorted(dirs):
+            if not is_stamp(n):
+                continue
+            dirs.remove(n)
+            with contextlib.suppress(ValueError, OSError):   # a folder the other host's audit removes at the same time
+                if time.time() - stamp_time(os.path.join(top, n)) > config.CFG.keep_days * 86400:
+                    shutil.rmtree(os.path.join(top, n))
+                    gone.append(os.path.relpath(os.path.join(top, n), root))
+    for g in gone:
+        drop_empty(os.path.dirname(os.path.join(root, g)), root)
+    return sorted(gone)

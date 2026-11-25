@@ -416,9 +416,13 @@ shows no link in a field name, so the field name is then blank. The page is `/se
 anyway, and the decision line keeps it in `ids.slug`. The base is `<KEY>_LINK` alone, because behind a reverse proxy
 or in Docker the address a browser opens differs from `<KEY>_URL`. An empty `<KEY>_LINK` gives no link. The link keeps
 only the scheme, host, port and path of the base, so it never holds a user, a password or a query. A record with no
-slug, as an error, gets the field of before: the name, then the file. So does a name whose brackets do not pair,
-because Discord ends a link at a lone bracket. `report.link()` marks the link, and only an embed shows it. The subtitle
-hunter links the movie in the Title field of its posts.
+slug, as an error, gets the field of before: the name, then the file. Discord formats markdown inside the text of a
+link and prints an escape there with its backslash, so `A\*B\*C\*D` showed up to 2.22.0. A name with `*`, `_`, `~`, a
+backquote or `|` shows as plain text with its escapes, and a short link with the app's name follows it, as
+`A\*B\*C\*D S02E07 (Sonarr)`. So does a name whose brackets do not pair, because Discord ends a link at a lone
+bracket, a name that holds a URL, because Discord shows no link then, and a name with a backslash before a bracket or
+at its end. Every other name is the link text as written. `report.link()` marks the link, and only an embed shows it.
+The subtitle hunter links the movie in the Title field of its posts, and the nightly audit links each file's name.
 
 | Kind | Fires when |
 | --- | --- |
@@ -523,6 +527,12 @@ share that one count, and 0 turns every re-grab off. The count and its check run
 record, the worker only alerts. `REGRAB` lists the kinds that re-grab, `audio,video` by default. A
 kind it does not list still gets the grab record, the cap and the second check. The worker then logs
 `would_regrab` for wrong content, posts "re-grab is off" and deletes nothing.
+
+The post of a re-grab names the indexer and the posted date of the download it deleted, from the grab record, as "The
+download came from nzbs.example.org, posted on 2025-01-09." So each re-grab of one item reads apart from the one
+before. The indexer is the host of the release's info page, because an aggregator indexer gives every release one
+name. A record with no info page gives the app's name of the indexer. The date is the UTC date of the post. A fact the
+record lacks is left out, and a record with neither keeps the post as it was.
 
 ## Corrupt video
 
@@ -744,13 +754,44 @@ When the import's own probe found the one gap and its alert named it, the job lo
 its own, so an earlier video alert of the file never holds it back. A file that changed or went during the scan gets no
 verdict, so a doubt of the old file never posts against a new one.
 
+**Second read of the video.** When the read pass prints video lines and keeps a doubt, the video streams of the file
+it read get one more read, the read of the original that a subtitle remux runs. It copies with `-c copy` through the
+bitstream filter of `PROOF_BSF`, hashes the packets into a work file and decodes nothing (`proof.source_read()` with
+`kind` video). The h264 parser
+prints "Invalid NAL unit size" for a NAL length of 0 and the copy goes on. `filter_units` fails on such a packet, so a
+later subtitle remux of the file would fail. When this read fails with a `DAMAGE` message of ffmpeg, the file is damaged.
+One "Damaged file" alert takes the place of "Video may be broken", and it names the ffmpeg message after the fault in
+plain words. The file re-grabs as a damaged source under `REGRAB=damage`, alone, with the cap and the restore, and the
+re-grab's second check reads the video once more. That read runs before the global lock, as the second pass of a
+burn-in re-grab does, so no import waits for it. A job of a backfill or of `--check` only says what an import would
+do. An apply that keeps the file marks it in the store (`runner.damaged()`), by inode and size, so a new file at the
+path clears the mark. When AMG edits the flags or remuxes the file itself, the mark moves to the new inode and size
+(`runner.damage_carry()`), because a flag edit can grow the file in place. The deep analysis or recheck of a marked file drops itself at its start (outcome
+`file_damaged`), and the alerts its import held drop with it, because the Damaged file alert said it. A deep analysis
+or recheck that started before the mark drops the same way at its subtitle remux, so it posts no subtitle alert. An
+import, a backfill job, `--sub-check` and `--sub-time` skip the subtitle remux of a marked file. They fix no sidecar
+and post no subtitle alert for it (`process.after_edit()`). Its flag edits still run. A marked file whose
+second read fails again gets no second Damaged file alert and no second re-grab. Its line logs the damage.
+When the second read passes, the doubt and its alert stay as they were. The decision line keeps the read's time in
+`whole.reread.took`, and the damage in `whole.reread.damage`. The read runs only on a file whose read pass printed video
+lines. Audio lines alone keep their own check, the samples above.
+
+An import or a backfill job can remux the subtitles of its file before this check runs, because the check runs after
+the job in the background queue. That remux reads the original the same way, so it fails on the same damage first.
+When the proof of that remux fails on the original with a `DAMAGE` message of ffmpeg, the file is damaged at once
+(`subremux.damage`), as in a conversion, with the same read of the original when the new file's read failed first. The file re-grabs as a damaged source under `REGRAB=damage`, with the second
+check of a conversion's damage, in place of the flag edits. A backfill job only says what an import would do. An apply
+that keeps the file marks it. One "Damaged file" alert opens with "Rewriting the file to fix its subtitles showed that
+it's damaged". The run fixes no sidecar and posts no subtitle alert. A remux that fails any other way keeps its
+"Rewrite failed" alert. A deep analysis or recheck whose own remux fails on the original keeps that alert too.
+
 A conversion, a header repair or a subtitle remux of the import writes the file again, and a remux reads past the
 damage and leaves the zeros out. So the job reads the original that the first remux kept, while it is kept. In the
 decision line, `whole.file` names the file the job read and `whole.remux` names the remux. With no kept original the
 job reads the remux, and `whole.original_gone` names a kept original that went.
 
 The job reads with no file lock. It yields to an import that waits, and starts both passes again on its next run. Its
-source is `whole_file`, and its outcome is `corrupt_video`, `video_doubt`, `audio_doubt`, `video_checked` or `file_changed`. `--check`
+source is `whole_file`, and its outcome is `corrupt_video`, `damaged_source`, `video_doubt`, `audio_doubt`, `video_checked` or `file_changed`. `--check`
 runs it right after its own checks and never re-grabs. A job that a backfill queued queues one too, which alerts only.
 
 ## Restore after a bad upgrade
@@ -791,9 +832,11 @@ searched.
 this host does not see, no old file comes back. `KEEP_REPLACED=true` covers these cases. The app
 deletes the old file before the import calls the hook, so the hook keeps it at the Grab event, which
 the app sends when it picks a release. For each item of the grab that has a file, the hook
-hard-links the video and its extras into `<mount>/.<NAME>-recycle/<UTC time>/<path from the mount>`,
-the layout of the kept originals. `replaced_root()` picks the folder. A Sonarr grab can cover a
-season, and a file of several episodes is linked once. An anime batch can cross a season, so for an
+hard-links the video and its extras into
+`<mount>/.<NAME>-recycle/<folders of the path from the mount>/<UTC time>/<file name>`, the layout of
+the kept originals. The extras sit in the time folder of their video. `replaced_root()` picks the
+folder. A Sonarr grab can cover a season, and each season folder then gets one time folder for the
+grab. A file of several episodes is linked once. An anime batch can cross a season, so for an
 anime series the hook matches the absolute episode numbers. A link needs no space at the grab, and
 the file keeps its space until the prune. A copy could lose the race to the import, so where the
 file system refuses a link, the hook keeps nothing of that file and logs one line. A file the app
@@ -1349,8 +1392,8 @@ another container. `--backfill <app> --convert` converts the library. The hook c
 only with `CONVERT=true`, except a `.mkv` file with another container, which always converts. The
 log calls a conversion a repack. A conversion keeps no original, except a forced one, one that leaves out a
 track that does not match, and one of `--check`.
-A conversion of `--check` also keeps the sidecars that the new file holds, in the stamp folder of the
-original. It proves every stream first,
+A conversion of `--check` also keeps the sidecars that the new file holds, in the time folder of the
+original, under their file names. It proves every stream first,
 and the app must list the new file before the original goes. A `--check` run on a file no app lists
 asks no app. It writes the new file beside the original, which stays with its sidecars. An `.mkv` file
 that holds another container converts under its own name, so its original goes to the kept originals.
@@ -1472,10 +1515,19 @@ time 0, the edit keeps that delay, and ISO/IEC 14496-12 presents the video 2 fra
 mkvmerge 102 writes it so. ffmpeg moves the track earlier by that gap ("Offset DTS by N to make first pts zero").
 ffmpeg turns the rule off for every trak after the first trak with no samples, and the reader does the same.
 `mp4.ffmpeg_lead()` reads that rule from the sample tables, and `mp4_sync()` gives mkvmerge the move with `--sync`,
-toward 0 in whole milliseconds (`proof.start_plan()`). mkvmerge drops a frame it would time before 0, so the move
-never rounds past the gap, and the video lands up to 1 ms later than ffmpeg plays it. The decision line names the
-move in `start_sync` with its rule. The proof expects that exact move and refuses any other. A tester's film read
-"stream audio 1 starts -0.083 s from the video in the new file, +0.000 s in the original" in 2.18.5.
+toward 0 in whole milliseconds (`proof.start_plan()`). So the video lands up to 1 ms later than ffmpeg plays it.
+mkvmerge starts the file at the earliest sample it keeps (`start_shift()`), and drops a sample that `--sync` moves
+before that start. So the move takes a video frame when it puts a video sample with data before that start, as when
+the edit list hides the first keyframe. ffmpeg flags such a keyframe D (decode, never show). Then every track the remux keeps moves later
+by the largest move, the base. The video with that move takes no `--sync`, and each other track keeps its move against
+it. A track with no move of its own names the rule "ffmpeg's MP4 start, on the other tracks". mkvmerge gives a track
+with `--timestamps` no `--sync`, so each of its lines adds the base, see "Kept audio times". The input of the other
+tracks of a split adds the base to its `--sync`. The caption cues and the text a conversion writes beside the file add
+it too. A sidecar keeps its times. The decision line names each move in `start_sync` with its rule. The proof checks
+the move of each track against the move of the other tracks, and refuses any other. A tester's film read "stream
+audio 1 starts -0.083 s from the video in the new file, +0.000 s in the original" in 2.18.5. In 2.22.0, `--sync 0:-16`
+took the hidden keyframe of an episode, and the proof refused it: "stream video 0 (h264) holds 44108 packets in the
+new file, 44109 in the original".
 
 **Kept audio times.** mkvmerge 102 times an audio frame on its own where its time is not later than the time of the
 frame before it. It times that frame one frame after the frame before, and plays the rest of the track on. An MP4 can
@@ -1486,12 +1538,28 @@ file (`--timestamps`) of the times the reader gives, see "Time reads". Each line
 in file order, less the file start. The file start is the earliest time of the tracks the remux keeps, which mkvmerge
 moves to 0. For an MP4 it is `start_shift()`, with each video track before ffmpeg's start rule. For a TS it is the
 earliest time of a kept PID. mkvmerge writes each line as it stands. It adds no input start and no `--sync`, so a line
-holds in the input of the other tracks of a split too. The proof then pairs each frame with its stored time within
+holds in the input of the other tracks of a split too. A line adds the base of "ffmpeg's MP4 start" itself. The proof then pairs each frame with its stored time within
 the slack. A PCM track, a track with an empty frame or a time that is not known, a read that fails and a start that
 is not known get no file. So does a track with a cut sample after an empty edit, because mkvmerge drops that sample
 and the lines would then not pair with its frames. Those tracks keep mkvmerge's timing, and the proof decides. The
 decision line names each track with a file in `repack.kept_times`. Of 441 MP4 and QuickTime files of a measured
 library, 8 hold such a track, each an iTunes priming run of three samples at one time.
+
+mkvmerge 102 writes the audio of an MPEG program stream with no gaps. Where the MP2 PTS jumps forward, it times the
+next frame right after the frame before, and the rest of the track plays early. mpv plays each frame at its stored
+time. A tester's episode stored 12 forward jumps of 181 to 294 ms, and its copy played the audio 2.94 s early at the
+end. So a program-stream track gets a file too when a frame starts more than `TIME_SLACK` after the end of the frame
+before. Its times come from the proof's ffmpeg read with `-fflags +genpts`, see "Time reads". The file start is the
+earliest time of a kept stream in that read. ffmpeg's muxer moves a time that goes back to the time before it, so a
+track that steps back in that read gets no file, and the proof decides. mkvmerge names each track by its stream id,
+and an audio track in private stream 1 by its substream id too. ffprobe's id is that substream id, else 0x100 plus
+the stream id, so the tracks pair by that id (`track_stream()`).
+
+Each frame of a track with a file keeps its time against the track's first frame, so only the start check sees a file
+start that is off. For an MP4 or TS the start check allows one tick of the new file (`proof.mkv_slack()`). The proof
+holds the start of every audio track of a program stream to `TIME_SLACK`, because ffmpeg reads the stored PTS of each
+frame. A program-stream file start one MP2 frame (26 ms) late passed the 50 ms of `SYNC`, and so did a copy with the
+video one frame (40 ms) late.
 
 **Blu-ray TrueHD.** A Blu-ray TrueHD PID carries an AC-3 core in PES of its own. ffmpeg names the core as a second
 stream of the PID, also when the PID holds no core PES. mkvmerge 102 writes the core as an AC-3 track after the TrueHD
@@ -1511,8 +1579,11 @@ container, see "Time reads", and each frame and each stream's start against the 
 of the two files (`proof.mkv_slack()`). A copy that moves one track by 2 ms refuses. The video and audio must end
 within 1 second. A source with no reader (AVI, ASF, MPEG-PS) reads its times through ffmpeg: each stream must start
 within 0.05 seconds of where it started (`SYNC`), and each packet time may move 2 ms at most (`TIME_SLACK`), because
-a stream whose times jump back can pass the digest and still play late. Times compare in whole microseconds. A
-subtitle remux counts each subtitle time from 0, and any other proof from the video's start.
+a stream whose times jump back can pass the digest and still play late. An MPEG-PS audio track must start within
+`TIME_SLACK`, see "Kept audio times". ffmpeg reads an MPEG-PS original with
+`-fflags +genpts`, see "Time reads".
+Times compare in whole microseconds. A subtitle remux counts each subtitle time from 0, and any other proof from the
+video's start.
 When the times fail, the refusal says where the MKV would play out of sync. It says "from 2:00 to
 the end" or "in 2 places between 0:10 and 1:49", for example. The times count from the start of the MKV, as a
 player shows them. Then it names the stream, how far it moved, and the time of the first packet that
@@ -1573,10 +1644,17 @@ frame that mkvmerge drops. Junk is zeros, a RIFF header of at most 128 bytes, or
 holds fewer bytes than the whole frame after it and starts with no frame sync. The rule runs in any
 container, and the measured files are AVIs. It passes when one read of packet 0 of each file shows
 the new packet 0 is the tail of the old one after the junk. The entry names the junk in
-`trimmed_first.junk` and the cut frame in `dropped`.
+`trimmed_first.junk` and the cut frame in `dropped`. The junk can hold 4 bytes that read as a frame
+header. ffmpeg then ends a packet where that false frame ends, so the first 2 packets of the original
+split the junk and the first frames at other places. The rule then joins the first 2 packets of the
+original and the first 1 or 2 packets of the new file, and every later packet must match in order. Each packet of
+the new head must start with a frame sync, because mkvmerge writes whole frames. A new head of 2 packets that split
+the first 2 frames 3 bytes off passed the join, and a decoder would lose both frames. The
+entry names both counts in `trimmed_first.packets` and both joined sizes in `trimmed_first.size`.
 
 mkvmerge 102 plays the junk as a delay of its bytes. In an AVI whose header has a sample size, the
-stream may then start at the junk's size over the bytes a second, within 2 ms. ffmpeg times packet 0
+stream may then start at the junk's size over the bytes a second, within 2 ms, when the junk lasts
+0.2 seconds at most at that rate (`JUNK_TIME_MAX`). Every measured file has 0.1 seconds or less. ffmpeg times packet 0
 and the rest of its chunk a frame apart, so their times leave the junk out. It times the first packet
 of the next chunk by its bytes. That packet must come within 0.6 seconds of the start (`CHUNK_MAX`),
 and the new file must hold it at the same time within 2 ms. The dropped last frame must then hold
@@ -1588,7 +1666,10 @@ time of its bytes and its time in the new file. A first chunk that holds the who
 one with 2 seconds of zeros and 1 second of frames. The entry names the start, ffmpeg's start, the
 bytes a second and that packet in `byte_time`. The tail of a cut frame passes only so. A container or
 a header with no time of the bytes refuses it. Zeros and a header that fail it keep the check of the
-second packet against ffmpeg's time. The proof also allows a last sample that an MP4 edit list hides.
+first packet after the head against ffmpeg's time. The refusal names that packet of the original, the second after a
+head of one packet and the third after a head of 2. Junk of more than 0.2 seconds at the header's rate refuses first. The
+refusal and the alert name its time and the cap, as "the audio starts with 0.31 s of unreadable data, more
+than the 0.2 s AMG converts". The entry holds the time in `trimmed_first.junk_time`. The proof also allows a last sample that an MP4 edit list hides.
 
 A few packets more may go at the ends when every other packet matches in order. The video may lose
 up to 3 packets at its end (`END_LOSS`), a loss of up to 3 frames that is accepted. The audio may lose
@@ -1632,10 +1713,14 @@ whose edit list hides the last frames of a still picture, which mkvmerge keeps. 
 --convert --apply --force-convert PATH [PATH ...]` takes only the listed files. The force is bound
 to the refusal a person saw. A file converts when the proof refuses it with the same text as the
 last refusal the decision log holds for its path. Another refusal, or none in the log, is not
-forced, and the run reports it. Every other step runs as normal: the remux, the swap, the app's
+forced, and the run reports it. A refusal of one stream lets the proof of the others go on, and the text holds every
+refusal, so a force covers each refused stream. Up to 2.22.0 the proof stopped at its first refusal, and a second
+refused stream converted unseen. The decision line keeps each refusal in `repack.refusals`, and the "Conversion to MKV
+failed" alert names each one in a sentence of its own. A line of an older version names one refusal, so a file that
+now refuses more streams is not forced. Every other step runs as normal: the remux, the swap, the app's
 import, the extras and the checks after them. The original is kept in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, as a
 header repair keeps it, so one move undoes the conversion. See "Kept originals" for the hard link and its copy fallback. The option needs `KEEP_ORIGINALS_DAYS`
-above 0. The decision line names the refusal in `repack.forced`. A listed path that is not in the run's work list is reported and skipped. The hook
+above 0. The decision line names the refusals in `repack.forced`. A listed path that is not in the run's work list is reported and skipped. The hook
 never forces a conversion.
 
 A listed Sonarr file also skips `parse_refuses()` for its own new name. Scene numbering can put specials at the start of
@@ -1735,6 +1820,9 @@ the download as one unit, the second check and "Restore after a bad upgrade". Th
 the read that showed the damage again, from scratch. mkvmerge remuxes into `/dev/null` and must skip
 invalid data in the same audio stream, away from the ends, again. ffmpeg reads the original through the
 proof's filters, and ffprobe probes it. A line of a subtitle decoder is no damage there either. The proof does not run again, and its refusal stands. The
+proof reads the original and the new file at once, and the new file holds the broken packets of the original too, so
+either read can fail first. When the read of the new file fails first with a `DAMAGE` message, the original is read
+again from scratch, and only that read names the damage (`proof.read_damage()`). The
 re-grab judges only the job's own file. Another file of the download shows its damage in its own
 conversion, and joins the unit then. A re-grab that deletes the file ends the job. Otherwise the
 original stays and gets the import's audio and video checks. The decision line has the outcome
@@ -1947,7 +2035,8 @@ the audio checks, `checks.stored_frames()`.
 | MP4, MOV | `mp4.samples()` | stts, ctts and the edit list (ISO/IEC 14496-12 8.6.6), then ffmpeg's start rule |
 | MPEG-TS, M2TS | `ts.frames()` | each PES PTS (ISO/IEC 13818-1), the frames of an audio PES by their codec lengths, TrueHD and LATM too |
 | AVI | ffmpeg | the container's own definition, frame k of the index at k / rate, audio by its bytes or chunks |
-| ASF, MPEG-PS, others | ffmpeg | an estimate, held to `SYNC` and `TIME_SLACK` |
+| MPEG-PS | ffmpeg with `-fflags +genpts` | each PES PTS, a picture with none at its place in the display order, held to `SYNC` and `TIME_SLACK` |
+| ASF, others | ffmpeg | an estimate, held to `SYNC` and `TIME_SLACK` |
 
 **MP4.** The reader reads the top-level box headers and the moov box. Each sample gets its byte, its size and its
 time. A sample that no edit presents is cut, and it keeps its time on the edit's line, as ffmpeg and mkvmerge time
@@ -1991,6 +2080,15 @@ most the span of the empty chunks within 2 ms (`empty_lead()`). The time check h
 and the other streams start against the frames that kept their times. The entry names the frame's time, its move
 and the span in `empty_lead`. A video with another header shape keeps the proof as before.
 
+**MPEG-PS.** A PES PTS applies to the first picture that starts in the PES. So an I or P picture that starts inside a
+PES stores no PTS, and a plain ffmpeg read times it at its DTS, one frame or more before its display time. A tester's
+episode held 1,815 such pictures, and the proof refused its copy by 34 ms in 1,504 places. mkvmerge and the decoders
+show each such picture at its display time. With `-fflags +genpts` ffmpeg gives it the DTS of the next picture whose
+PTS differs from its DTS, the MPEG display rule for an I or P picture. A B picture with no PTS keeps its DTS, which is
+its display time. Every packet that stores a PTS keeps it. In that episode the genpts read gave the decoder's time of
+each of the 39,258 frames. So the proof reads an MPEG-PS original with genpts, and `ff.py` allows `-fflags` with the
+value `+genpts` only.
+
 **The slack.** A Matroska copy of an MP4 or TS file rounds each time to its tick, and mkvmerge moves the file by its
 earliest time, which is not on that tick. A time and the time it counts from each round, so a move reaches one tick
 of the new file, `mkv_slack(exact=True)`. Between two Matroska files, a time counts from the video's start or the
@@ -2006,11 +2104,12 @@ reason in review. `ff.py` allows only what it knows. Anything else raises `TimeR
 - **The argv.** `ff.check()` parses each call. Each option, log level, ffprobe section and field, output format,
   filter, bitstream filter, muxer and protocol must be on an allow list of `ff.py`. Each one that gives a time must be
   named by the use. These are an ffprobe time field, a muxer other than null, data and s16le, a filter that logs a
-  time, setts, `-progress`, `-debug_ts`, `-report` or `FFREPORT`. A filter and a bitstream filter take only the
-  arguments AMG gives them, because `print()` in an expression of asetpts or setts logs a time for each frame. `-ss`,
-  `-t` and a `-read_intervals` time need `seek`, because ffmpeg's own frame times place that cut. Each ffmpeg output
-  names its muxer with `-f`. A lavfi input is a filter graph. Only `ionice` and `nice` may come before ffmpeg or
-  ffprobe, and the argv is a list with no shell. A named ffprobe field that the call does not ask for raises too.
+  time, setts, `-progress`, `-debug_ts`, `-fflags +genpts`, `-report` or `FFREPORT`. `-fflags` takes no other value. A
+  filter and a bitstream filter take only the arguments AMG gives them, because `print()` in an expression of asetpts
+  or setts logs a time for each frame. `-ss`, `-t` and a `-read_intervals` time need `seek`, because ffmpeg's own
+  frame times place that cut. Each ffmpeg output names its muxer with `-f`. A lavfi input is a filter graph. Only
+  `ionice` and `nice` may come before ffmpeg or ffprobe, and the argv is a list with no shell. A named ffprobe field
+  that the call does not ask for raises too.
 - **The output.** Text that needs a filter must come back as captured text, or to an `ff.Log` for a `popen()`.
   ffprobe JSON keeps the known keys of each section, nested ones too, so the DURATION tag goes, and `ff.loads()`
   gives mappings that raise on any other key, with `[]`, `.get()` or `in`. At level info ffmpeg prints the input dump
@@ -2407,8 +2506,11 @@ A run that re-grabs the file posts no cover alert.
 A header repair, a tail cut, a trim and a subtitle removal keep the file they replaced for `KEEP_ORIGINALS_DAYS` (7),
 counted from the latest write, see "One original per file" below. 0 drops it at once. A conversion keeps nothing,
 except a forced one and one that leaves out a subtitle track that does not match, see "Subtitle match". The original is
-hard-linked to `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. A hard link needs no space and never
-leaves the path missing. `keep_root()` picks the folder, the same way for `.<NAME>-recycle`:
+hard-linked to `<folder>/.<NAME>-originals/<folders of the path from the folder>/<UTC time>/<file name>`, for example
+`.arr-media-guard-originals/TV Shows/Show (1998)/Season 4/20261124T173600Z/Show (1998) - S04E07.mkv`. `kept_path()`
+builds that path. A user who looks for one show opens its folders, as in the apps' recycle bin, and finds a time
+folder per keep beside the file. A hard link needs no space and never leaves the path missing. `keep_root()` picks the
+folder, the same way for `.<NAME>-recycle`:
 
 1. The top of the mount that holds the file, when `.<NAME>-originals` exists there and is writable.
 2. The mount top, when it is writable. With the app root folders and the Plex sections below the mount, nothing
@@ -2434,7 +2536,14 @@ file that looks kept. The log and the report of `--sub-time` say "copied" instea
 error skips the fix. To undo a repair, move the kept file back and rescan the item.
 `NAME` names the hidden folders, `.<NAME>-originals`, `.<NAME>-recycle` and `.<NAME>-convert`. A `NAME` with other
 characters than letters, digits, `.`, `_` and `-` fails `--selftest`, and the script uses `arr-media-guard`.
-Each keep and the nightly audit remove the time folders older than the setting, see `stamp_time()`.
+Each keep, the nightly audit and the worker's daily prune remove the time folders older than the setting, see
+`stamp_time()`. `prune_originals()` finds a time folder at any depth below `.<NAME>-originals` or `.<NAME>-recycle`,
+by its name. The name must hold all 15 marks of the time, as `20261124T173600Z`. Python's `strptime()` also reads
+short forms such as `202011T111Z`, so a library folder with such a name stays. After it removes one, it removes each folder above it that is left empty, up to the kind folder, which
+stays. A folder whose name is no time goes only when such a removal leaves it empty. It never follows a symlink. Up to
+2.22.0 a keep sat at `<folder>/.<NAME>-originals/<UTC time>/<path from the folder>`. No migration runs. The prune
+removes those top-level time folders when they expire, and `stamp_folder()` still finds the time folder of such a
+keep.
 
 **One original per file.** A file has one kept original, its bytes before the hook's first write. That holds within a
 run, where a header cut before the checks and the write stage can both write, and across runs, as a deep analysis
@@ -2457,7 +2566,8 @@ held the hook's own output and a full extra copy for the setting's days.
   later of its name and that mtime, so the latest write can be undone for the full setting. A keep in its last hour
   (`regrab.KEEP_MARGIN`) is not reused, and the write keeps a new original. A prune that decided before the renewal
   can remove such a keep during the write. The other host's NFS cache can show the old `.renewed` mtime for about a
-  minute. Sidecars kept with the video share its time folder and stay with it.
+  minute. Sidecars kept with the video share its time folder and stay with it. `stamp_folder()` reads the time
+  folder of a kept path in both layouts, so a keep of 2.22.0 or older is reused too.
 - A failed write after a reuse leaves the keep. `Swap.unkeep()` removes only a keep its own write made.
 - Sidecars follow the same rule. A sidecar the hook wrote again reuses its own keep. A copy keep is reused as a link
   is. A conversion that keeps its original records the new path, so a later remux of the new `.mkv` names the old file.
@@ -2578,6 +2688,24 @@ checks after the flag edit.
   restarts its season numbers, and the scene numbering then sends the new episode to an old one. The alert
   names the imported episode with Sonarr's title, then the episode the release's title belongs to,
   in Sonarr's order, with its absolute number for anime.
+
+  Some series list each episode as "Episode N", by a count across the whole series. A release of
+  such a series may give the title as "<Series> 30", and no word of it matches an episode. The
+  number rule runs when no title matches by words. A title that holds only a number behind the
+  series title or the word "Episode" matches by its number. "<Series> 30", "<Series> #30",
+  "<Series> - Episode 30" and "Episode 030" all give 30. A number alone, as "30", stays a word
+  title, because a real title can be a number. An "Episode N" or "<Series> N" title never matches
+  another episode by words, so "Episode 30" and "<Series> 30" give one verdict, also when an
+  episode is titled "30". The candidates are the episodes titled "Episode N". Other series start each season at "Episode 1". When the series titles one number in two
+  regular seasons, it counts per season, and only the candidates in the file's own season count. The
+  number of one of the file's own "Episode N" titles gives "imported". So does the file's place in
+  the series, because a release can count by it. The place is Sonarr's absolute number, else the
+  place among the regular episodes in season order, specials left out. The one candidate with the
+  number gives "other". A special counts only for a special. When no candidate or several have it,
+  and each of the file's own episodes is an "Episode N" of another number, the alert names no
+  episode. It says the numbers differ. Two "Episode N" keys of two numbers are never near, because
+  difflib finds "episode 129" within 0.8 of "episode 130". The number rule scores 0 at any
+  `EPISODE_TITLE_POINTS`, and so does an "Episode N" title.
 
 **The re-grab rule.** A re-grab needs two points. The wrong language scores one. So does a release
 name that names that language, for movies only. A short or long runtime scores one, and so does a

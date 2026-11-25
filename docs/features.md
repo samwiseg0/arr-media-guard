@@ -197,7 +197,10 @@ so. See [regrabs.md](regrabs.md#re-grabs).
 After the import, a *whole-file check* reads each file whole in the background queue. It looks for gaps of zero bytes,
 as a torrent piece that never downloaded leaves, and ffmpeg reads every packet beside it. Gaps at two or more places
 re-grab the file when `REGRAB` lists `video`. One gap, or an error of the full read, only alerts. That alert names the
-play time of the gap or of each error, as the import's alert of one gap does. An error of an audio decoder alerts as
+play time of the gap or of each error, as the import's alert of one gap does. Video errors get a second read of the
+video, the read a subtitle rewrite needs. When it fails too, the alert is "Damaged file", the file re-grabs when
+`REGRAB` lists `damage`, and AMG never retimes or rewrites the subtitles of that file. A subtitle rewrite of the import
+that cannot read the file gives the same one alert. An error of an audio decoder alerts as
 "Audio may be broken". Up to 10 such errors of one decoder go to the decision log only, when a 20 s sample of each
 audio track finds at most 10 more. A player plays past one bad frame at the start. The sample finds a track whose every
 frame is bad. Silent PCM audio is zero bytes too, so in
@@ -221,7 +224,11 @@ and two points mark the content as wrong. An episode's runtime counts as a sign 
 about 1.67 times its listed runtime. A long episode in an animated series is often a live-action remake that landed
 in the wrong slots. AMG re-grabs it only when `REGRAB` lists `content`. Else an alert "Wrong
 content, re-grab is off" names each sign. For an episode, AMG reads the episode title from the release's NFO file or
-name. When it belongs to another episode, an alert "Maybe the wrong episode" names both. That alert never re-grabs.
+name. When it belongs to another episode, an alert "Maybe the wrong episode" names both. A title such as
+"<Series> 30" or "Episode 30" belongs to the episode that Sonarr titles "Episode 30". A series that starts each season
+at "Episode 1" counts per season, so the number names an episode of the imported episode's season. A number equal to
+the imported episode's place in the whole series names that episode. When no single episode has the title, and the
+imported episode is an "Episode N" of another number, the alert says the numbers differ. That alert never re-grabs.
 
 ## Burned-in subtitles
 

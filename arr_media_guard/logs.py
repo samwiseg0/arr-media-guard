@@ -388,7 +388,8 @@ def audit_embed(app, title, files, tmdb):
     content.tmdb_day_status()."""
     body = []
     for k, (label, text, url) in enumerate(files):
-        shown = report.link(label, url)
+        label = report.glued(label)   # a plain label breaks no line at a full stop either, see markdown()
+        shown = report.link(label, url, app)
         line = f"{report.bold(label) if shown == label else shown}: {report.glued(text)}"   # one line per file, see markdown()
         if sum(len(report.markdown(x)) + 1 for x in body + [line]) > AUDIT_CHARS:
             body.append(f"and {len(files) - k} more")

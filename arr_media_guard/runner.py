@@ -3,7 +3,7 @@
 """The queue, the worker, the job processes and the file lock. hook() is the Custom Script entry."""
 import collections, contextlib, dataclasses, datetime, fcntl, hashlib, http.client, json, os, re, select, shutil, signal, sqlite3, sys, tempfile, time, types, urllib.error, urllib.parse, urllib.request, uuid
 
-from . import apps, checks, cli, config, content, convert, decide, ff, gate, judge, logs, plex, process, regrab, remux, report, store, subsync, subtitles, vault
+from . import apps, checks, cli, config, content, convert, decide, ff, gate, judge, logs, plex, process, proof, regrab, remux, report, store, subsync, subtitles, vault
 
 
 def gated(f, op, wait=config.DEADLINE):
@@ -413,7 +413,8 @@ def gone_for_good(job, rec):
 
 def held_after(job, rec):
     """What became of the alerts the import held for the deep analysis job, see queue_deep_analysis(), as the decision
-    record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(). A job
+    record rec of the job ends, one entry each. A job whose file is gone for good drops them, see gone_for_good(), and
+    so does a job that dropped itself because its file is damaged, see damaged(). A job
     that settled each subtitle a held alert names posts what it still found in its place. A subtitle is settled when the
     run judged it, see judged(), and for a held timing alert judged its times again too, see times_judged(). A subtitle
     that the remux or the sidecar step retimed or took out is settled for any outcome, see remuxed(), also before an
@@ -427,6 +428,8 @@ def held_after(job, rec):
     app, out = job["app"], []
     if rec.get("outcome") in ("file_gone", "file_replaced") and gone_for_good(job, rec):
         return logs.held_changes(app, job["held"], "dropped with the file")
+    if rec.get("outcome") == "file_damaged":   # the Damaged file alert of the whole-file check said it, see whole_act()
+        return logs.held_changes(app, job["held"], "dropped, the file is damaged")
     said = set().union(*(report.tells(f, report.track_langs(rec))["flags"] for f in rec.get("findings") or []
                          if report.posts(f, rec) and config.wanted(report.post_name(f))))
     fixed, error = remuxed(rec), rec.get("outcome") == "error"
@@ -731,7 +734,16 @@ def whole_act(name, job, rec, pending, post=True):
 
     --check runs it with no name and check in grab, see cli.whole_later(). It then never yields, and its re-grab
     only says what an import would do, so it takes no lock. A job a backfill queued gives check in grab too. post False
-    keeps the alert off Discord."""
+    keeps the alert off Discord.
+
+    When the read pass found video errors, the video streams of the file it read get a second read, the read of the
+    original that a subtitle remux runs, see proof.source_read(). rec["whole"]["reread"] holds its time. When that read
+    fails with a DAMAGE message too, the file is damaged. A Damaged file alert then takes the place of the video doubt,
+    and the file re-grabs as a damaged source, under REGRAB=damage, with a third read as the second check of regrab().
+    That read runs before the lock, so no import waits for it. An apply that keeps the file marks it, see damage_mark(),
+    so no later step retimes or rewrites its subtitles or sidecars, see process.after_edit(). When the second read
+    passes, the video doubt stands. A file marked damaged before, as by the subtitle remux of its import,
+    see process.write(), gets no second Damaged file alert and no second re-grab, and its line logs the damage."""
     app, grab, original = job["app"], dict(job.get("grab") or {}, app=job["app"], path=job["path"]), job.get("original")
     path = original if original and os.path.exists(original) else job["path"]
     st = os.stat(path)
@@ -760,6 +772,11 @@ def whole_act(name, job, rec, pending, post=True):
                      ", so only the zero scan judged it")
     if notes:
         rec["note"] = "; ".join(notes)
+    damage, asked = None, {"read": "ffmpeg", "kind": "video"}
+    if more and (ff.get("kinds") or {}).get("video"):   # video errors: read the video again, as a subtitle remux reads it
+        t0 = time.monotonic()
+        damage = proof.source_read(asked, path, None)
+        rec["whole"]["reread"] = dict(took=round(time.monotonic() - t0, 1), **({"damage": damage} if damage else {}))
     f = None
     if certain:
         f = {"kind": "video", "certain": certain, "mark": "whole"}
@@ -769,6 +786,26 @@ def whole_act(name, job, rec, pending, post=True):
             f["action"] = dict(regrab.regrab(app, grab, "zero-filled", regrab.whole_probe(path, count, rec["whole"]), "video", alone=True), kind="video")
         code = f["action"]["code"]
         rec = regrab.restore_log(dict(rec, outcome="corrupt_video", regrab=code, result=f"corrupt video: {certain}, re-grab {code}"), grab, pending, app)
+    elif damage and (said := damaged(job["path"])):   # the Damaged file alert of an earlier run said it, see process.write()
+        rec.update(outcome="damaged_source", result=f"damaged source: {damage['fault']}, marked damaged before: {said['fault']}")
+    elif damage:
+        f = {"kind": "damage", "fault": damage["fault"], "line": damage["line"], "doubts": more, "mark": "whole"}
+        # The second check of regrab() reads the whole video of the file the check read, as whole_probe() does. It runs
+        # here, before the lock, so no import waits for it, and deep_replaced() under the lock catches a file that
+        # changed since. The read has no time limit, and the wait for the lock keeps the job's. After a stop regrab()
+        # reads nothing, so neither does this.
+        with config.DEADLINE.paused():
+            again = None if stop_asked() else proof.damage_probe(asked, None)(path, None, True)
+        probe = lambda p, x, fresh=False: (again if x is None else None) or proof.damage_probe(asked, None)(path, x, fresh)   # the read above is of the job's file
+        with contextlib.nullcontext() if grab.get("check") else locked():   # a re-grab deletes the file
+            if drop := deep_replaced(job):
+                return dict(rec, **drop)
+            f["action"] = dict(regrab.regrab(app, grab, damage["fault"], probe, "damage", alone=True), kind="damage")
+        code = f["action"]["code"]
+        rec = regrab.restore_log(dict(rec, outcome="damaged_source", regrab=code, result=f"damaged source: {damage['fault']}, re-grab {code}"),
+                                 grab, pending, app)
+        if rec.get("apply") and code not in report.DELETED + ("unconfirmed",) and not f["action"].get("stopped"):
+            damage_mark(job["path"], damage)
     elif zero + more + heard:
         kind = "video" if zero + more else "audio"
         anywhere = any(c in decide.ANYWHERE for c, _ in fields["ffmpeg"].get("audio") or [])   # lines with no place, see decide.whole_verdict()
@@ -806,6 +843,44 @@ def burn_words(v):
 
 BURNED = "subtitles in another language are burned in"   # the fault of a burn-in re-grab, see regrab.regrab()
 BURN_ONCE = "burned_in_once"   # the store's ns of the items whose copy a burn-in in their own language re-grabbed once, see burn_plan()
+
+
+DAMAGED = "damaged"   # the store's ns of the files whose damage a read confirmed, see damaged()
+
+
+def damaged(path, st=None):
+    """The damage of the file at path that the whole-file check, see whole_act(), or the subtitle remux of an import,
+    see process.write(), confirmed, or None. The mark in
+    DAMAGED holds the inode and the size of that file, st or its stat now, as muted() keys its mark. A new file at the
+    path, as a re-grab or an upgrade puts there, clears it. A store that does not read gives None."""
+    try:
+        m = store.get(DAMAGED, path)
+        if not m:
+            return None
+        st = st or os.stat(path)
+        if [st.st_ino, st.st_size] == [m["ino"], m["size"]]:
+            return m["damage"]
+        store.drop(DAMAGED, path)
+    except (OSError, sqlite3.Error):
+        pass
+    return None
+
+
+def damage_mark(path, damage):
+    """Mark the file at path as damaged, see damaged(), with its stat now."""
+    with contextlib.suppress(OSError, sqlite3.Error):
+        st = os.stat(path)
+        store.put(DAMAGED, path, {"ino": st.st_ino, "size": st.st_size, "damage": damage})
+
+
+def damage_carry(path, before):
+    """Move the damage mark of the file at path to its stat now, see damaged(). before is the stat of the file before an
+    edit or a remux of AMG's own, which keeps the video. A flag edit can grow the file in place. Only a mark that
+    matched before moves. Another mark stays as it is, as one that a whole-file check put after the edit."""
+    with contextlib.suppress(OSError, sqlite3.Error):
+        m = store.get(DAMAGED, path)
+        if m and [before.st_ino, before.st_size] == [m["ino"], m["size"]]:
+            damage_mark(path, m["damage"])
 
 
 MUTED = "burned_in_muted"   # the store's ns of the files whose English subtitles a burn-in job turned off, see muted()
@@ -1081,7 +1156,8 @@ def deep_analysis(name, pending, claimed=False):
     the import set, after a remux of its own too, and only a subtitle verdict changes a flag, see process(). It has no
     time limit, and it never drops by age. It drops itself when its file is gone or replaced since its import, see
     deep_replaced(). It checks that at its start, each time it takes the file lock, after its remux, see
-    process.deep_drop(), and after an error.
+    process.deep_drop(), and after an error. It drops itself when its file is marked damaged, see damaged(), at its
+    start and at its remux, see process.write(), so the subtitles of that file get no retime, no rewrite and no alert.
 
     A recheck job, see queue_rechecks(), runs here too. Its "recheck" names the run of the saved result it repeats,
     import, sub_check, sub_time or deep, and it checks no deeper than that run, see process.Ctx. Its source is recheck.
@@ -1127,6 +1203,8 @@ def deep_analysis(name, pending, claimed=False):
             rec.update(outcome="subtitles_off", result="dropped, SUBTITLES is off")
         elif not got:
             rec.update(outcome="job_stale", result="dropped, the job holds no decision inputs of its import")
+        elif not job.get("backfill") and (hurt := damaged(path)):   # no subtitle work on a damaged file, see whole_act()
+            rec.update(outcome="file_damaged", result=f"dropped, {report.DAMAGED_SKIP}: {hurt['fault']}")
         elif job.get("backfill"):
             want, ids = got.get("want"), job["ids"]
             f = {"path": path, "id": ids.get("file_id"), "movieId": ids.get("app_id"), "sceneName": got.get("release")}

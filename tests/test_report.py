@@ -305,6 +305,17 @@ ACTIONS = [
     ({"code": "unsure"}, ", not confirmed", "A second check on other frames couldn't tell, so nothing was changed."),
     ({"code": "once"}, "", "An earlier copy was already re-grabbed for this, so this copy was kept."),
     ({"code": "check", "kind": "audio"}, ", would re-grab", "An import would re-grab the file. This check never re-grabs, so it was kept."),
+    # A re-grab names the indexer and the posted date of its grab record, see regrab.grab_facts(), each one it holds
+    ({"code": "regrabbed", "name": "Sonarr", "kind": "video", "n": 1, "indexer": "nzbs.example.org", "posted": "2025-01-09"}, ", re-grabbed",
+     "Deleted the broken file and marked the grab as failed, so Sonarr is searching for another copy. The download came from "
+     "nzbs.example.org, posted on 2025-01-09."),
+    ({"code": "regrabbed", "name": "Sonarr", "kind": "content", "n": 2, "indexer": "NZB"}, ", re-grabbed",
+     "Deleted 2 files with the wrong content from this download and marked the grab as failed, so Sonarr is searching for other copies. "
+     "The download came from NZB."),
+    ({"name": "Radarr", "came": ["Film A (1979) HDTV-720p.mp4"], "linked": True, "own_copy": False, "others": 0, "stayed": None,
+      "code": "regrabbed", "kind": "audio", "n": 1, "failed_before": True, "posted": "2014-10-22"}, ", old file restored",
+     "Deleted the broken upgrade. Its download was already marked as failed, so Radarr is already searching for another copy. The download "
+     "was posted on 2014-10-22. Put back the old file from the recycle bin: Film A (1979) HDTV-720p.mp4. Radarr picked it up again."),
 ]
 
 
@@ -1878,17 +1889,18 @@ def test_an_item_with_no_slug_alerts_as_before(monkeypatch, settings):
 
 
 def test_a_title_with_markdown_and_brackets_keeps_its_link_whole(settings):
-    """A ")" or "]" in a title never ends the link early, and a "*" never starts a bold span. The slug is percent-encoded.
-    A title whose brackets do not pair gets no link, because Discord would end the link at the lone bracket."""
+    """A ")" or "]" in a title never ends the link early. The slug is percent-encoded. A title with markdown, or whose
+    brackets do not pair, shows as plain text with a link to the app after it, see
+    test_a_title_keeps_its_link_only_where_discord_shows_it_as_written()."""
     settings(radarr={"link": MOVIES})
-    label = "Who Moved *Otto* [Otter] (1988) :)"
+    label = "Who Moved Otto [Otter] (1988) :)"
     e = h.render(decision(label=label, path="/m/Otto_Otter.mkv", ids={"slug": "otto (1988) [x]/y"}), "embed")[0]
-    assert e["fields"] == [IMPORT, {"name": "​", "value": f"[Who Moved \\*Otto\\* \\[Otter\\] (1988) :)]({MOVIES}/movie/"
+    assert e["fields"] == [IMPORT, {"name": "​", "value": f"[Who Moved Otto [Otter] (1988) :)]({MOVIES}/movie/"
                                                        "otto%20%281988%29%20%5Bx%5D%2Fy)\nOtto\\_Otter.mkv", "inline": False}]
     for label in ("Foo [ Bar (2001)", "Foo ] Bar [ (2001)", "Foo [[ Bar ] (2001)"):
         e = h.render(decision(label=label, path="/m/Foo.mkv", ids={"slug": "1"}), "embed")[0]
-        assert e["fields"] == [IMPORT, {"name": label, "value": "Foo.mkv", "inline": False}]
-    assert h.markdown(f'Two. Lines. {h.link("Dr. Robo S01E01", "http://h/series/dr-robo")}: OK') == \
+        assert e["fields"] == [IMPORT, {"name": "​", "value": f"{label} ([Radarr]({MOVIES}/movie/1))\nFoo.mkv", "inline": False}]
+    assert h.markdown(f'Two. Lines. {h.link("Dr. Robo S01E01", "http://h/series/dr-robo", "sonarr")}: OK') == \
         "Two.\nLines.\n[Dr. Robo S01E01](http://h/series/dr-robo): OK"   # a link span never breaks at a full stop
 
 

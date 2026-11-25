@@ -282,7 +282,8 @@ rescan, no monitor and no import of a new name. Plex gets an analyze only for a 
 - An `.mkv` file that holds another container converts under its own name. Its original goes to the kept originals.
   At `KEEP_ORIGINALS_DAYS=0` AMG keeps nothing, so the original is gone.
 - A remux keeps the original in `.<NAME>-originals` at the top of the file's mount. When AMG cannot write there, it
-  takes the highest folder on the path that it can write.
+  takes the highest folder on the path that it can write. Inside it, the file's folders come first, then a time
+  folder per keep, see [regrabs.md](regrabs.md#kept-originals).
 
 Such a file has no item, unless you name one. With no item, AMG knows no original language. So the flags and the
 language tags stay as they are, and only a subtitle verdict turns a flag off. Some checks need the item, so they do not
@@ -387,11 +388,13 @@ arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movie
 ```
 
 - The run then takes only the listed files.
-- A file converts when the check refuses it for the same reason as the last refusal in the log. AMG keeps the decision
+- A file converts when the check refuses it for the same reasons as the last refusal in the log. AMG keeps the decision
   lines of 14 days for this. Another reason, or no logged refusal, is not forced, and the run says why.
+- The check names every stream it refuses, in the log and in the alert. The force must cover each of them. A file
+  whose log line names one refused stream, and that now refuses two, stays as it is.
 - Every other step runs as normal.
 - The original stays in `.<NAME>-originals` for `KEEP_ORIGINALS_DAYS`, so one move puts it back.
-- The decision line names the refusal in `repack.forced`.
+- The decision line names the refusals in `repack.forced`.
 - The option needs `--convert --apply` and `KEEP_ORIGINALS_DAYS` above 0.
 - A path that is not in the run's list of files is reported and skipped.
 

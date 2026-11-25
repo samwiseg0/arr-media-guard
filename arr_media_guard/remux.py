@@ -2000,6 +2000,8 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
             info["garbled_text" if i in strip else "mismatch_text"][str(i)] = os.path.basename(e["sidecar"])
         os.replace(tmp, path)
     except BaseException as ex:
+        if damage := proof.read_damage(ex, path, j):   # the original cannot be read, see process.write()
+            info["damage"] = damage
         sw.unkeep(path)
         drop_broken(broken.values())
         if undone := sorted(os.path.basename(e["sidecar"]) for e in broken.values() if e.get("removed")):

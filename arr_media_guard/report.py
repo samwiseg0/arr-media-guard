@@ -9,13 +9,14 @@ alert kind. A finding the hook acted on holds the action, {"code": its code, **f
 finding code, ACTIONS one per action code, and SUB_LINES one per sentence of a subtitle alert."""
 import fractions, json, os, re, unicodedata
 
-from . import config, content, decide, judge, logs, regrab, subsync
+from . import apps, config, content, decide, judge, logs, regrab, subsync
 
 TENSES = ("planned", "done")
 B, E = "\x02", "\x03"   # the ends of a bold span in the text of a template, see bold()
 MARKDOWN = re.compile(r"([\\*_~`|])")   # the characters Discord reads as markdown, escaped in every embed
 L, M, R = "\x05", "\x06", "\x07"   # the start, the middle and the end of a link span, see link()
-LINK_TEXT = re.compile(r"([\\*_~`|\[\]])")   # the characters escaped in the text of a link: MARKDOWN and the brackets
+# what keeps a text out of a link, see link(): markdown, a URL, and a backslash that escapes a bracket or ends the text
+UNLINKED = re.compile(r"[*_~`|]|://|\\(?=[\[\]]|$)")
 SPAN = re.compile(f"{L}([^{M}]*){M}([^{R}]*){R}|{MARKDOWN.pattern}")   # a link span, or one markdown character, see escaped()
 # a bold span or a link span, which never breaks, or the space after a sentence
 SENTENCE_END = re.compile(f"{B}[^{E}]*{E}|{L}[^{R}]*{R}|(?<=[.!?])[ \n]+(?=[A-Z\"{B}{L}])")
@@ -52,11 +53,17 @@ def glued(v):
     return [glued(x) for x in v] if isinstance(v, list) else v
 
 
-def link(text, url):
-    """text as a link to url in a Discord embed, see escaped(). No url gives text alone. So does a text whose brackets
-    do not pair, because Discord then ends the link early, escaped or not. Only the text of an embed holds a link, so the
-    decision log, the CLI and Loki stay plain."""
-    return f"{L}{text}{M}{url}{R}" if url and paired(text) else text
+def link(text, url, app):
+    """text as a link to url in a Discord embed, see escaped(). No url gives text alone. Discord formats markdown in the
+    text of a link and prints an escape there with its backslash. So a text with a character of UNLINKED, or whose
+    brackets do not pair, shows as plain text with its escapes, and a link follows it: " (Sonarr)", the name of app as
+    its post names it. Discord ends a link early at a lone bracket and shows no link whose text holds a URL. Only the text
+    of an embed holds a link, so the decision log, the CLI and Loki stay plain."""
+    if not url:
+        return text
+    if paired(text) and not UNLINKED.search(text):
+        return f"{L}{text}{M}{url}{R}"
+    return f"{text} ({L}{apps.ARR[app].name}{M}{url}{R})"
 
 
 def paired(text):
@@ -71,8 +78,8 @@ def paired(text):
 
 def escaped(text):
     """text with every Discord markdown character escaped, so a name never breaks the format. A link span of link()
-    becomes [text](url). Its text has the brackets escaped too, and its URL stays as it is."""
-    return SPAN.sub(lambda m: "\\" + m[3] if m[3] else "[" + LINK_TEXT.sub(r"\\\1", m[1]) + f"]({m[2]})", text)
+    becomes [text](url), with its text and its URL as they are, as link() keeps markdown out of the text of a link."""
+    return SPAN.sub(lambda m: "\\" + m[3] if m[3] else f"[{m[1]}]({m[2]})", text)
 
 
 def markdown(text):
@@ -275,14 +282,15 @@ def failed_repack(f, t):
     if f.get("note"):   # a conversion that a stopped run left, see convert.pending_recover()
         return f'{cap(f["note"])}.'
     head, s = f'Couldn\'t convert the {f["container"]} file to MKV, so the original was kept.', f.get("skipped")
+    why = sentences(f["refusals"]) if f.get("refusals") else f'{cap(f["why"])}.'   # every refused stream, see convert.convert()
     if not s:
-        return f'{head} {cap(f["why"])}.'
+        return f'{head} {why}'
     # mkvmerge skipped invalid audio data away from the ends, see proof.skipped_audio()
     near = f'The {f["container"]} file is damaged near {content.hms(s["at"])}'
     if s.get("packets"):
         kind, new, old = s["packets"]
         return f'{head} {near}, and the copy lost {old - new} of {old} {kind} packets. Only a different release fixes it.'
-    return f'{head} {cap(f["why"])}. {near}. Only a different release fixes it.'
+    return f'{head} {why} {near}. Only a different release fixes it.'
 
 
 def unreadable_finding(tracks, kept=None, container=None, mark=None, remux=None):
@@ -329,6 +337,12 @@ def unreadable(f, t, of="original"):
 
 
 def damage(f, t):
+    """A damaged source: a conversion that showed it, the subtitle remux of an import (rewrite), see process.write(), or
+    the whole-file check (mark "whole"), whose second read of the video failed too, see runner.whole_act()."""
+    if f.get("rewrite"):
+        return f'Rewriting the file to fix its subtitles showed that it\'s damaged, because {bold(f["fault"])}. {f["line"].rstrip(".")}.'
+    if f.get("mark") == "whole":
+        return f'{sentences(f["doubts"])} A second read of the video showed that it\'s damaged, because {bold(f["fault"])}. {f["line"].rstrip(".")}.'
     refused = f' The new MKV did not match the original, because {f["refusal"]}.' if f.get("refusal") else ""
     return f'Converting the file to MKV showed that it\'s damaged, because {bold(f["fault"])}. {f["line"].rstrip(".")}.{refused}'
 
@@ -452,14 +466,28 @@ def removed(a, upgrade=True):
     return f'the {"" if a.get("kind") == "burned_in" else "broken "}{"upgrade" if upgrade and a.get("came") else "file"}'
 
 
+def source(a):
+    """The sentence that names the indexer and the posted date of the download a re-grab deleted, see
+    regrab.grab_facts(). Each re-grab of an item then reads apart from the one before. Empty when the grab record holds
+    neither."""
+    where, when = a.get("indexer"), a.get("posted")
+    if where and when:
+        return f" The download came from {bold(where)}, posted on {when}."
+    if where:
+        return f" The download came from {bold(where)}."
+    return f" The download was posted on {when}." if when else ""
+
+
 def regrabbed(a, t):
     what = removed(a)
     if a.get("failed_before"):
-        return f'Deleted {what}. Its download was already marked as failed, so {a["name"]} is already searching for another copy.'
-    if a["n"] == 1:
-        return f'Deleted {what} and marked the grab as failed, so {a["name"]} is searching for another copy.'
-    return (f'Deleted {a["n"]} {FAULTS[a["kind"]][2]} from this download and marked the grab as failed, so {a["name"]} is searching for '
-            "other copies.")
+        text = f'Deleted {what}. Its download was already marked as failed, so {a["name"]} is already searching for another copy.'
+    elif a["n"] == 1:
+        text = f'Deleted {what} and marked the grab as failed, so {a["name"]} is searching for another copy.'
+    else:
+        text = (f'Deleted {a["n"]} {FAULTS[a["kind"]][2]} from this download and marked the grab as failed, so {a["name"]} is searching '
+                "for other copies.")
+    return text + source(a)
 
 
 # The faults each REGRAB kind re-grabs, for the text of a kind REGRAB leaves out
@@ -666,6 +694,7 @@ KEPT_BACK = {"check": "SUBTITLES is set to check",
 REWRITE_FAILED = "rewriting the file failed"   # the words of a rewrite that failed, see remux_why()
 REWRITE_TITLE = "Rewrite failed"   # the title of a timing alert whose remux ran and failed, see title()
 REMUX_FAILED = "subtitle remux failed"   # the start of the result of a remux that ran and failed, see remux.resub()
+DAMAGED_SKIP = "the file is damaged"   # why a file marked damaged skips the subtitle remux, see process.write() and runner.damaged()
 
 
 def failed_write(x, t):
@@ -691,6 +720,8 @@ def remux_why(result):
         return "no copy of the original could be kept"
     if skip.startswith("subtitle remux failed, the original changed"):
         return "the app replaced or renamed the file at the same time"
+    if skip.startswith(DAMAGED_SKIP):
+        return "the file is damaged"
     return REWRITE_FAILED
 
 
@@ -956,7 +987,7 @@ def alert_embed(rec, f, t, stage=True):
 def item_embed(rec, head, text, color, note=None, more=()):
     """The embed of one post on the file of rec: the fields of more, then its field with the item and the file, see
     alert_embed(), and the footer with note and the host."""
-    shown, file = link(rec["label"], logs.page(rec)), os.path.basename(rec["path"])
+    shown, file = link(rec["label"], logs.page(rec), rec["app"]), os.path.basename(rec["path"])
     item = (rec["label"], file) if shown == rec["label"] else ("\u200b", f"{shown}\n{file}")   # U+200B, a zero-width space
     return logs.embed(rec["app"], head, text, color, [*more, item], " · ".join(x for x in (note, f"{config.CFG.name} on {config.CFG.instance}") if x))
 

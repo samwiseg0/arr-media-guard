@@ -404,7 +404,7 @@ def hunt(app, mid, a, cred, ctx):
     def save():
         store.put(f"subhunt-{app}", str(mid), item)
 
-    shown = report.link(label, apps.ARR[app].page(m.get("titleSlug")))   # the movie's name, a link to its page in Radarr
+    shown = report.link(label, apps.ARR[app].page(m.get("titleSlug")), app)   # the movie's name, a link to its page in Radarr
 
     def post(title, text, color, release):
         return logs.post(app, "subhunt", logs.embed(app, title, text, color, [("Title", shown), ("Release", release), ("App", logs.app_name(app))]))
