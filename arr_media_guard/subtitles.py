@@ -1364,9 +1364,9 @@ def sidecar_fix(sides, sync, apply, app, source, ends=None, timed=None, video=No
             with open(tmp, "wb") as f:
                 f.write(data)
             remux.own_like(tmp, st)
-            e["kept"] = vault.keep_original(s["path"], e)
+            e["kept"], proven = vault.keep_original(s["path"], e), runner.file_key(os.stat(tmp))
             os.replace(tmp, s["path"])
-            vault.kept_write(s["path"], e["kept"])
+            vault.kept_write(s["path"], e["kept"], proven)
             e["result"] = "repaired" if g else "retimed"
             logs.log(dict(app=app, source=source, path=s["path"], result=f"sidecar {e['result']}", kept=e["kept"], why=e["why"]))
         except OSError as ex:

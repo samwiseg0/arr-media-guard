@@ -310,13 +310,21 @@ def rescanned(ctx):
                                (rec.get("subremux"), (rec.get("subremux") or {}).get("done"))) if wrote]
 
 
+def swap_carry(path, before, info, was=None):
+    """Move the file marks and the cached words of the file at path from before, its stat before a remux of AMG's own,
+    to the file the remux put there. info is the remux's record, whose file_key names that file, see runner.carry_marks().
+    The remux keeps the audio and the video, so a burn-in job's mark, the damage mark and the words heard stay true.
+    was is the old path of a conversion, as in checks.lid_carry()."""
+    if now := runner.carry_marks(path, before, info.get("file_key")):
+        checks.lid_carry(path, before, was, now)
+
+
 def refresh(ctx, duration=True):
     """Probe the file at the start and again after a step replaced it: its stat, its size and mkvmerge -J. The record
-    takes the new size, mtime and duration. duration False keeps the record's duration, as after a subtitle remux."""
+    takes the new size, mtime and duration. duration False keeps the record's duration, as after a subtitle remux. The
+    step moves the file marks itself, see swap_carry()."""
     was, ctx.st = getattr(ctx, "st", None), os.stat(ctx.path)
-    if was:   # a remux of AMG's own keeps the marks of a burn-in job and of a damaged file, see runner.muted() and runner.damaged()
-        runner.mute_mark(ctx.path, was)
-        runner.damage_carry(ctx.path, was)
+    if was:
         ctx.waits = ctx.yields   # a job a backfill queued yields no more. A yield would lose the post and the decision line of the change,
         # and the job's import time limit bounds the rest. A deep analysis and a recheck have no time limit, so they still yield.
     ctx.size = ctx.st.st_size; ctx.j = checks.mkvmerge(ctx.path)
@@ -417,7 +425,7 @@ def conversion(ctx):
             if ctx.save:   # a run after a stop goes on from the new file, see cli.planned_file()
                 with contextlib.suppress(OSError, sqlite3.Error):
                     ctx.save(converted=list(runner.file_key(os.stat(path))))
-        checks.lid_carry(path, st, was)   # the proof shows the same audio, so the subtitle check's words move to the new file
+        swap_carry(path, st, rec["repack"], was)   # the proof shows the same audio, so the subtitle check's words move to the new file
         broken = rec["repack"].get("broken")
         unread = {n: {"unread": why} for n, why in (rec["repack"].get("sidecars_unread") or {}).items()}   # the sidecars it left out, see convert()
         if broken or unread:
@@ -520,7 +528,7 @@ def header(ctx):
     rec["header_repair"] = dict(info, issue=hp["issue"], result=result, code=code)
     if code in config.REPAIRED:
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
-        checks.lid_carry(path, ctx.st)   # the repair keeps the audio, so the hearing of a dry run moves to the new file, as in write()
+        swap_carry(path, ctx.st, info)   # the repair keeps the audio, so the hearing of a dry run moves to the new file, as in write()
         refresh(ctx)
         ctx.stage = None   # the stage was of the original
     elif code == "header_repair_failed" or info.get("stopped"):   # edit() tries no second remux of the file in this run
@@ -1073,7 +1081,7 @@ def write(ctx):
             ctx.damaged = {"kind": "damage", "fault": damage["fault"], "line": damage["line"], "rewrite": True, "action": action}
             ctx.first.append(ctx.damaged)
             if ctx.apply and action["code"] not in report.DELETED + ("unconfirmed",) and not action.get("stopped"):
-                runner.damage_mark(path, damage)
+                runner.damage_mark(path, damage, runner.file_key(ctx.st))   # the file the remux read, see remux.Swap.check()
             return
     else:
         code, result, info = ("header_repair_skipped", f"header repair skipped, {blocked}: {'; '.join(head['issue'])}", {}) if blocked else gate.allow(
@@ -1094,7 +1102,7 @@ def write(ctx):
                                       edits=edits))
     # The original is kept a while, so its record is on disk before anything else runs. It names the undo of the edits it carried.
     logs.log(dict(rec, outcome=code, result=result, **({"undo": ["mkvpropedit", path] + propedit_args(carried, 2)} if carried else {})))
-    checks.lid_carry(path, ctx.st)   # the proof shows the same audio, so the words the checks heard move to the new file
+    swap_carry(path, ctx.st, info)   # the proof shows the same audio, so the words the checks heard move to the new file
     refresh(ctx, duration=bool(head))   # a subtitle remux alone keeps the record's duration
     if sub:
         gone = {*ctx.remove, *ctx.strip}   # the tracks after a removed one move up one place, and a track that stays keeps its mismatch
@@ -1569,6 +1577,8 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
                         after=rec["before"], **({"header_repair": dict(rec["header_repair"], edit=True)} if "header_repair" in rec else {}))   # nothing changed
         logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
     else:
+        # An outside write since before is another file: no edit, and no mark moves to it. repack() checks this itself.
+        runner.same_file(path, before, "its stat before the edit")
         try:
             with runner.no_stop():   # neither the time limit nor SIGTERM cuts mkvpropedit, which rewrites the header in place
                 config.DEADLINE.stop()
@@ -1576,12 +1586,14 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
                 e = subprocess.run(["mkvpropedit", path] + propedit_args(edits, 1), capture_output=True, text=True, errors="replace")
         except runner.Stopped as ex:   # a stop came before the edit, so nothing changed
             return dict(rec, outcome="edit_failed", result=f"not edited: {ex}", after=rec["before"])
-    own = remuxed   # the carries below move the hook's state to the file now. mkvpropedit edits in place, so the inode stays.
-    with contextlib.suppress(OSError):
-        own = own or os.stat(path).st_ino == before.st_ino   # an import during the edit gives another inode, and it gets nothing
-    if own:   # before the exit code. A failed mkvpropedit can still turn the subtitles off, and the mark follows the flags.
-        runner.mute_mark(path, before)
-        runner.damage_carry(path, before)   # mkvpropedit can grow the file, and the damage in its video stays
+    # The carries below move the hook's state to the file now. mkvpropedit edits in place, so the inode stays, and the
+    # repack's file_key names its own file. An import during the edit is another file, and it gets nothing.
+    if not remuxed:   # the repack's swap gives its file the second itself, see remux.Swap.check()
+        runner.keep_second(path, before)
+    proven = rec["header_repair"].get("file_key") if remuxed else None
+    # Before the exit code. A failed mkvpropedit can still turn the subtitles off, and the mark follows the flags.
+    # mkvpropedit can grow the file, and the damage in its video stays.
+    own = runner.carry_marks(path, before, proven, (runner.DAMAGED, runner.MUTED))
     if not remuxed and e.returncode not in (0, 1):   # it may still have written. A run can fail on "Tracks" and still set the flags.
         rec.update(outcome="edit_failed", result="mkvpropedit failed: " + ((e.stdout + e.stderr).strip()[-300:] or f"exit code {e.returncode}"))
         try:
@@ -1590,8 +1602,8 @@ def edit(rec, j, edits, apply, replan=None, ts=None, hp=None):
             rec["after_error"] = config.mask(f"{type(ex).__name__}: {ex}")[:300]
         return rec
     if own:   # a failed edit carries neither, so the next check hears the file again and the next write keeps it anew
-        checks.lid_carry(path, before)
-        vault.kept_carry(path, before)   # relayout() below reuses the keep
+        runner.carry_marks(path, before, proven, (vault.WROTE,))   # relayout() below reuses the keep
+        checks.lid_carry(path, before, None, own)
         if not remuxed:   # the probe below takes the walk of the file before the edit
             matroska.carry(path, before)
     after = checks.mkvmerge(path)
@@ -1632,7 +1644,5 @@ def relayout(rec, path, j):
     if code not in config.REPAIRED:
         return j
     logs.log(dict(rec, outcome=code, result=result))   # the original is kept a while, so its record is on disk before anything else runs
-    checks.lid_carry(path, st)
-    runner.mute_mark(path, st)
-    runner.damage_carry(path, st)
+    swap_carry(path, st, info)
     return checks.mkvmerge(path)

@@ -945,7 +945,7 @@ def whole_later(app, f, info, a, job, rec, run):
     started = time.time()
     r = dict(id=uuid.uuid4().hex[:12], app=app, source="check", path=rec["path"], apply=a.apply, ids=rec.get("ids") or {}, label=rec.get("label"))
     try:
-        r = runner.whole_act(None, dict(plan, app=app, grab=job), r, [], post=run.post)
+        r = runner.whole_act(None, dict(plan, app=app, grab=job, key=runner.file_key(os.stat(rec["path"]))), r, [], post=run.post)   # as runner.queue_whole()
     except Exception as ex:
         r.update(outcome="error", result=config.mask(f"error: {type(ex).__name__}: {ex}")[:300])
     return time.time() - started, r

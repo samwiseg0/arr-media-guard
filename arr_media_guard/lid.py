@@ -174,15 +174,15 @@ def cache_put(cache, path, index, model, duration_s, samples, st):
                    (path, st.st_size, st.st_mtime_ns, index, model, round(duration_s), json.dumps(samples), time.time()))
 
 
-def carry(path, before, cache=CACHE, was=None):
-    """Move the cached results of path from its os.stat() before an in-place edit to its stat now.
+def carry(path, before, cache=CACHE, was=None, now=None):
+    """Move the cached results of path from its os.stat() before an in-place edit to now, its stat now by default.
     mkvpropedit changes the mtime but never the audio, so the hook calls this in-process after each edit. It never
     raises and never creates the cache, because a cache problem must not fail an edit that already happened.
     was is the old path of a conversion, whose proof shows the same audio. Only the subtitle check's words and the
     spans of speech move then."""
     if not os.path.exists(cache): return
     try:
-        st = os.stat(path)
+        st = now or os.stat(path)
         with closing(_db(cache)) as db, db:
             for table in ("words", "speech") if was else ("lid", "words", "kept", "speech"):   # never subcheck: a changed file needs a new verdict
                 db.execute(f"UPDATE OR REPLACE {table} SET path=?, size=?, mtime_ns=? WHERE path=? AND size=? AND mtime_ns=?",

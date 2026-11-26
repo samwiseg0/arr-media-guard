@@ -754,7 +754,10 @@ class Swap:
         tmp is not the file that sync() saw before the checks read it. A run under the exclusive lock can write over
         the temp file of a conversion that waits for its swap, see convert.busy_tmp(). Then, when keep is true, keep
         the original, see keep_original(). A failed keep stops the swap, and the original stays. A stop that cut the
-        proof raises here, before the rename."""
+        proof raises here, before the rename. Last, tmp takes the whole second of the original's mtime, see
+        runner.keep_second(). It comes right before the rename, because sweep_repack_tmp() ages a temp file by its
+        mtime. info["file_key"] then holds proven, the key of the file the rename puts at path, so the marks and the
+        keep row go only to that file, see runner.carry_marks() and vault.kept_write()."""
         runner.raise_term()
         now = None
         with contextlib.suppress(FileNotFoundError):
@@ -768,10 +771,13 @@ class Swap:
                 self.info["kept"] = vault.keep_original(self.path, self.info)
             except OSError as ex:
                 raise RuntimeError(f"the original could not be kept, so it stays: {ex}") from None
+        self.proven = runner.keep_second(self.tmp, self.st, self.proven) or self.proven
+        self.info["file_key"] = list(self.proven)
 
     def unkeep(self, *paths):
         """Drop info["kept"] after a failure when one of paths still holds the original. The rename then never ran. The
-        keep goes only when this write made it. A keep that an earlier write made stays, see vault.keep_original()."""
+        keep goes only when this write made it. A keep that an earlier write made stays, see vault.keep_original().
+        The marks of the original stay as they are, see runner.mark_key()."""
         with contextlib.suppress(OSError):
             if self.info.get("kept") and self.st.st_ino in {os.stat(p).st_ino for p in paths if os.path.lexists(p)}:
                 if self.info.get("kept_how") != vault.KEPT_BEFORE:
@@ -923,7 +929,7 @@ def repack(path, j, st, apply, hp, edits=()):
     finally:
         sw.close(folder)
     if info.get("kept"):
-        vault.kept_write(path, info["kept"])
+        vault.kept_write(path, info["kept"], info["file_key"])
         vault.prune_originals(vault.originals_root(path))
     info.update(new_size=size, new_tracks=checks.track_list(new))
     return *done, info
@@ -2012,7 +2018,7 @@ def resub(path, j, st, apply, fixes, drop=(), ends=None, timed=None, recode=None
     finally:
         sw.close(folder)
     if info.get("kept"):
-        vault.kept_write(path, info["kept"])
+        vault.kept_write(path, info["kept"], info["file_key"])
         vault.prune_originals(vault.originals_root(path))
     info["new_size"] = size
     return "subtitles_remuxed", "subtitles remuxed" if fixes or drop or ends or timed or recode or not covers else \

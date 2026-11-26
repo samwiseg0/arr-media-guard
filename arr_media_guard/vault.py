@@ -327,16 +327,19 @@ def drop_empty(folder, root):
         folder = os.path.dirname(folder)
 
 
+WROTE = "wrote"   # the store's ns of the files the hook wrote and the keep of each one's original, see kept_of()
+
+
 def kept_of(path):
     """(the keep of the original of path, its stamp folder), or None. The file at path must be the one the hook last
-    wrote there, see kept_write(). Its inode, size and mtime must all be those the hook wrote. A new grab, a hand edit
-    and a restore from the keep each change one of them, so the file is a new original. The keep must still exist, with
+    wrote there, see kept_write(). Its runner.mark_key() must be the one the row holds. A new grab, a hand edit and a
+    restore from the keep each change it, so the file is a new original. The keep must still exist, with
     more than regrab.KEEP_MARGIN of keep_days left. A prune can remove a keep in its last hour during the write. That
     prune decided before the renewal, or it ran on the other host, whose NFS cache can show an old RENEWED for about a
     minute. It reads only."""
     try:
-        r = store.get("wrote", path)
-        if not r or list(runner.file_key(os.stat(path))) != r["file"] or not os.path.isfile(r["keep"]):
+        r = store.get(WROTE, path)
+        if not r or r.get("key") != runner.mark_key(os.stat(path)) or not os.path.isfile(r["keep"]):
             return None
         folder = stamp_folder(r["keep"], originals_root(path))
         if not folder or time.time() - stamp_time(folder) > config.CFG.keep_days * 86400 - regrab.KEEP_MARGIN:
@@ -346,29 +349,22 @@ def kept_of(path):
         return None
 
 
-def kept_write(path, keep):
+def kept_write(path, keep, proven):
     """Record keep as the kept original of the file the hook just wrote at path, see kept_of(). Each write that keeps
-    calls it after its rename, so the next write of that file reuses the keep. Rows older than keep_days go. It raises
-    only OutOfTime. An error logs a line, and the next write of path keeps a new original."""
+    calls it after its rename, so the next write of that file reuses the keep. proven is the runner.file_key() of the
+    file the write put at path, see remux.Swap.check(). A file the app imported after the rename has another one and
+    gets no row, so its next write keeps it as a new original. Rows older than keep_days go. It raises only OutOfTime.
+    An error logs a line, and the next write of path keeps a new original."""
     try:
         st, now = os.stat(path), time.time()
+        if list(runner.file_key(st)) != list(proven):
+            return
         with store.tx():
-            store.put("wrote", path, dict(keep=keep, file=runner.file_key(st)), at=now)
-            store.drop("wrote", older=now - config.CFG.keep_days * 86400)
+            store.put(WROTE, path, dict(keep=keep, key=runner.mark_key(st)), at=now)
+            store.drop(WROTE, older=now - config.CFG.keep_days * 86400)
     except (sqlite3.Error, OSError) as ex:
         with contextlib.suppress(OSError):
             logs.log(dict(source="hook", path=path, result="warning", note=config.mask(f"the hook could not record its write: {type(ex).__name__}: {ex}")[:300]))
-
-
-def kept_carry(path, before):
-    """Move the row of kept_write() for path to the file now, when the row describes before, the stat of path before an
-    in-place edit of the hook's own. So a write after a flag edit still reuses the keep. A row of another file stays.
-    process.edit() calls it only after a successful mkvpropedit, and only when the file still has the inode of before.
-    An import that replaced the file during the edit has another inode, and its next write keeps a new original."""
-    with contextlib.suppress(OSError, sqlite3.Error):
-        r = store.get("wrote", path)
-        if r and r["file"] == list(runner.file_key(before)):
-            kept_write(path, r["keep"])
 
 
 def keep_original(path, note=None, stamp_of=None):

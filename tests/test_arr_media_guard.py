@@ -27011,26 +27011,27 @@ def test_the_nightly_audit_probes_a_muted_file_with_its_mark(env, burn, capsys):
 
 
 def test_the_mark_follows_a_remux_and_a_flag_edit_of_amg_itself(env):
-    """A remux of AMG's own gives the file a new inode, and mkvpropedit may change its size. The mark moves with them."""
-    hook.mute_mark(env["path"])
+    """A remux of AMG's own gives the file a new inode, and mkvpropedit may change its size. The mark moves with them
+    to the file the remux proved, see runner.carry_marks()."""
+    hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))
     before = os.stat(env["path"])
     os.replace(env["path"], env["path"] + ".tmp")
     shutil.copy(env["path"] + ".tmp", env["path"])
     with open(env["path"], "ab") as f:
         f.write(b"x")
-    hook.mute_mark(env["path"], before)   # as edit() and refresh() carry it
-    assert hook.muted(env["path"]) and hook.store.get("burned_in_muted", env["path"])["size"] == 1001
-    hook.mute_mark(env["path"], before)   # a stat that no longer matches carries nothing, and clears the mark
-    assert not hook.store.items("burned_in_muted")
-    hook.mute_mark(env["path"])
+    proven = list(hook.file_key(os.stat(env["path"])))
+    hook.carry_marks(env["path"], before, proven)   # as process.swap_carry() carries it
+    assert hook.muted(env["path"]) and hook.store.get("burned_in_muted", env["path"])["key"][1] == 1001
+    hook.carry_marks(env["path"], before, proven)   # a mark that no longer matches before stays as it is
+    assert hook.muted(env["path"])
     with open(env["path"], "ab") as f:   # the same inode with another size is another file
         f.write(b"x")
     assert not hook.muted(env["path"]) and not hook.store.items("burned_in_muted")
-    hook.mute_mark(env["path"])
-    ctx = types.SimpleNamespace(path=env["path"], st=os.stat(env["path"]), rec={}, yields=False)
-    os.replace(env["path"], env["path"] + ".tmp")   # a remux of AMG's own, see process.refresh()
+    hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))
+    before = os.stat(env["path"])
+    os.replace(env["path"], env["path"] + ".tmp")   # a remux of AMG's own, see process.swap_carry()
     shutil.copy(env["path"] + ".tmp", env["path"])
-    hook.refresh(ctx)
+    hook.swap_carry(env["path"], before, {"file_key": list(hook.file_key(os.stat(env["path"])))})
     assert hook.muted(env["path"])
 
 
@@ -27056,7 +27057,7 @@ def test_the_safety_rule_takes_a_muted_english_track_only_with_the_mark(env):
     off = [["track:=10", 0, 1]]
     with pytest.raises(hook.arr_subsync.Broken, match="rule only English subtitles off broken"):
         hook.mute_rule(env["path"], ts, off)
-    hook.mute_mark(env["path"])
+    hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))
     hook.mute_rule(env["path"], ts, off)
     with pytest.raises(hook.arr_subsync.Broken, match="rule muted broken"):
         hook.mute_rule(env["path"], hook.arr_decide.classify(sub_probe(("eng", False, {}))), [["track:=10", 1, 0]])
@@ -27916,7 +27917,7 @@ def test_check_runs_the_full_burned_in_check_its_quick_check_asks_for(env, burn,
     ops, kept = check_locks(monkeypatch), []
     monkeypatch.setattr(hook, "put_job", lambda *a, **k: kept.append(a))   # a queued job keeps its first pass for a yield
     if not apply:
-        hook.mute_mark(env["path"])
+        hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))
     hook.main(["--check", env["path"]] + (["--apply"] if apply else []))
     first, b = checked(env)
     assert (first["burned_in"]["result"], b["burned_in"]["plan"], b["edit_result"]) == (quick, "mute", "edited" if apply else "dry run"), b

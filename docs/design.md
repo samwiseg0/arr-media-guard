@@ -366,10 +366,10 @@ with `runner.held_after()`, which decides each held alert. The alert goes unpost
 `runner.gone_for_good()`. That is a file with another inode at its path, or a file the app says it no longer has for the
 item. The app says so with a 404, another movie or series, or other episodes, see `runner.moved()`. A file the app lists
 at its old missing path or at a path this container does not see is not gone, so its held alerts post. A person's
-`--sub-check --apply` or `--sub-time --apply` remux gives the file a new inode too, so it counts as replaced. That run
-checked the subtitles itself. The alert also goes unposted when the job settled each subtitle the alert names. A
-subtitle is settled when the job ran to its alerts and judged it, see `runner.judged()`. A verdict of `match`, `fit` or
-`mismatch` judges. The `unknown` of a failed hearing does not, and with no language model there is no verdict. A held
+`--sub-check --apply` or `--sub-time --apply` remux is a write of AMG's own, so the job takes the key of the file it
+left and runs on that file, see `runner.carry_marks()`. The alert also goes unposted when the job settled each
+subtitle the alert names. A subtitle is settled when the job ran to its alerts and judged it, see `runner.judged()`.
+A verdict of `match`, `fit` or `mismatch` judges. The `unknown` of a failed hearing does not, and with no language model there is no verdict. A held
 `subtiming` alert also needs the times of each subtitle judged again, see `runner.times_judged()`. The timing judge gave
 each one an outcome other than unknown, see "Timing outcome", or the subtitle does not match the audio. That outcome
 posts itself when lines are still off. A word check that matched the words but anchored too few cues to time them
@@ -764,9 +764,11 @@ One "Damaged file" alert takes the place of "Video may be broken", and it names 
 plain words. The file re-grabs as a damaged source under `REGRAB=damage`, alone, with the cap and the restore, and the
 re-grab's second check reads the video once more. That read runs before the global lock, as the second pass of a
 burn-in re-grab does, so no import waits for it. A job of a backfill or of `--check` only says what an import would
-do. An apply that keeps the file marks it in the store (`runner.damaged()`), by inode and size, so a new file at the
-path clears the mark. When AMG edits the flags or remuxes the file itself, the mark moves to the new inode and size
-(`runner.damage_carry()`), because a flag edit can grow the file in place. The deep analysis or recheck of a marked file drops itself at its start (outcome
+do. An apply that keeps the file marks it in the store (`runner.damaged()`), by the inode, size and mtime of the file
+the reads judged, so a new file at the path clears the mark, also one with the inode number and the size of the old
+file. A new file that lands between the reads and the mark gets no mark. When AMG edits the flags or
+remuxes the file itself, the mark moves to the file AMG left (`runner.carry_marks()`), because a flag edit can grow the
+file in place. See "File marks". The deep analysis or recheck of a marked file drops itself at its start (outcome
 `file_damaged`), and the alerts its import held drop with it, because the Damaged file alert said it. A deep analysis
 or recheck that started before the mark drops the same way at its subtitle remux, so it posts no subtitle alert. An
 import, a backfill job, `--sub-check` and `--sub-time` skip the subtitle remux of a marked file. They fix no sidecar
@@ -945,15 +947,19 @@ app's import of the new file skips that file, and the conversion's job then chec
 
 **Deep analysis.** With `SUBTITLES=deep`, an import job queues one deep analysis job for its file in the state store,
 named by the path, so a newer import of the path replaces it. The job holds the inode, size and mtime of the file the
-import left. The worker starts one only when no import job waits, `BACKGROUND_WORKERS` at a time per host, and never
+import left, its key. The worker starts one only when no import job waits, `BACKGROUND_WORKERS` at a time per host, and never
 drops one by age. It never runs two jobs of one file at once, see `runner.next_jobs()`, because a burn-in mute or a
 remux of the file would make a whole-file check of it drop with no verdict. A
 job drops itself with one decision line when its file is gone or has another inode, as after an upgrade, whose import
 queues a job of its own. When the file is gone at its start, the job first asks the app by the file id where it is now,
 see `runner.app_file()`. After a rename or a move, which queues no import, it goes on at the new path and logs a
-`file_moved` line. An edit in place keeps the inode, and the job goes on. It checks this when it starts, each time
-it takes the file lock, after its remux and after an error, because the app holds no lock. A change of its own never
-counts. A conversion of its own before a yield gives the job the new file's inode, size and mtime. The queue drains with
+`file_moved` line. An edit in place keeps the inode, and the job goes on. A remux of AMG's own gives the file a new
+inode, so it gives the queued and claimed jobs of the path that held the old inode the key of the file it left
+(`runner.carry_marks()`). It checks this when it starts, each time it takes the file lock, after its remux and after an
+error, because the app holds no lock. ext4 and XFS give a freed inode number to the
+next new file at once. So on those file systems, a queued job whose file the app replaces on the same inode number
+during the job's wait for the lock acts on the new file, as in every earlier release. A burn-in job drops before its
+mute instead, see "Burned-in subtitles". The queue drains with
 no new import, because the worker runs until both queues are empty. A deep analysis has no time limit. Its whole-file
 hearing hears two windows at a time, and between two of them it yields when an import's hearing waits at `lid.turn.gate` or an import
 job waits for its place, see `runner.import_waits()`. The worker that runs each job itself yields to every waiting
@@ -1069,6 +1075,59 @@ the scan's `<kind>-scan-<app>.txt`, or `<kind>-scan-<app>-ids.txt` for a scan wi
 
 In Docker, `STATE_DIR` is `/config/state`, a named volume of its own. SQLite in WAL mode needs a local disk, and
 `/config` may sit on a network share.
+
+### File marks
+
+Three kinds of row name a library file by its stat: the damage mark (`runner.damaged()`), the mark of a burn-in job
+(`runner.muted()`) and the keep row of a write (`vault.kept_of()`). Each holds `runner.mark_key()`: the inode, the size
+and the mtime. ext4 and XFS give a freed inode number to the next new file at once. A same-size repost at the path can
+then have the inode number of the old file. A new file gets a new mtime, so it gets none of the old file's marks. One
+case still matches: a same-size file on a reused inode number whose app set the same mtime to the ns, as the app's
+Change File Date can do with the air date.
+
+A chmod, a chown and a hard link keep the mtime, so the marks stay through a download client that removes its hard
+link, the app's permissions and a permissions job over the library. The key leaves out the ctime, which these change.
+A mark is stored by the path, so a rename or a move by the app drops it. A write in place changes the mtime and drops the marks. So each write of AMG's own moves the marks that
+matched the file before it to the file after it (`runner.carry_marks()`): a flag edit and a remux. After a flag edit
+the file must still have its inode, and the edit checks the whole key just before mkvpropedit, so an outside write
+between its stat and mkvpropedit moves no mark. After a remux the file must have the inode, size and mtime that the swap
+proved before its rename (`remux.Swap.check()`, `file_key` in the remux's record). The swap's chown, chmod and rename
+keep those three. An import that lands between the rename and the carry is another file and gets no mark, no keep row
+and no cached words. A remux that fails moves no mark, also when an outside write in place made it fail.
+
+A file that comes back by a rename keeps its inode, size and mtime: the restore of a re-grab from the recycle bin or
+the hook's copies, and the undo of a conversion. A mark of that same file matches it again, and a mark of the file it
+replaced drops. A kept original that a person moves back has the inode of the original or of its copy, which both
+existed beside the marked file, so every mark drops. A copy over the path that keeps the times gives the original's
+size and mtime, which differ from the mtime of AMG's write in ns, so every mark drops there too. The copy of a keep
+gets the original's times (`shutil.copystat()`), and no mark names a kept path.
+
+**The file date.** Sonarr and Radarr have a setting, Change File Date. With it on, the app sets the mtime of a file to
+its air date at the import and on each rescan. AMG asks the app for a rescan after a remux, and the app rescans each
+file on its own refresh too. A flag edit alone asks for no rescan. So each write of AMG's own gives its file the whole
+second of the original's mtime, with the sub-second part of the write's own mtime (`runner.keep_second()`). Sonarr
+changes a file whose whole second differs from the air date. Radarr changes a file whose day differs from the release
+date. Neither changes AMG's file, so its marks stay. The sub-second part is new, so each check of AMG's own by inode, size and mtime still sees the write: the `Replan` of a
+job, the file key of a dry run's plan and the saved subtitle result. A flag edit sets the time right after
+mkvpropedit. A swap sets it on the temp file right before the rename, because `remux.sweep_repack_tmp()` ages a temp
+file by its mtime. When the new mtime would be the original's, as on a file system that keeps whole seconds only, the
+write's own mtime stays, and the app's rescan drops the marks. A share that refuses the times of a file of another
+owner leaves the write's own mtime too.
+
+Sonarr v4 with Local Air Date compares the air date in local time with the mtime in UTC. On a host whose time zone is
+not UTC it sets the date on every rescan, so the marks of AMG's file drop there. Sonarr v5 compares both in local time.
+A backup tool that compares the size and the whole seconds of the mtime misses a flag edit that keeps the size, as
+rsync does by default. Such a tool needs a checksum or a compare in ns, as `rsync --modify-window=-1` makes.
+
+Each mark holds the key of the file its check read: the stat of the whole-file check, of the burn-in passes, or of
+the import's remux. A new file that lands between that read and the mark gets none. The jobs of the background
+queue hold the same key and compare its inode alone, see "How it runs". A change from outside AMG that writes the
+file drops the marks. The file is then checked as new. A damage mark that
+drops lets the next whole-file check post its alert and ask for a re-grab again. A burn-in mark that drops lets the
+next apply turn the English subtitles on again. A keep row that drops makes the next write keep a new original.
+
+A mark from 2.23.0 or older holds no `key` field and never matches, so each such file is checked as new once. That
+holds for the keep row of 2.22.0 too, whose `file` field has the same three values.
 
 ## Memory
 
@@ -2551,17 +2610,16 @@ remux and a later library-pass header repair. Before 2.18.6 each write kept the 
 held the hook's own output and a full extra copy for the setting's days.
 
 - After each write that keeps, `vault.kept_write()` records in the state store, by path, the kept path and the
-  inode, size and mtime of the file it wrote.
+  inode, size and mtime of the file it wrote, see "File marks".
 - `keep_original()` reuses that keep when the file at the path still has that inode, size and mtime, the kept file
   exists, and its time folder has more than an hour of the setting left. It keeps nothing new, returns the kept path,
   and sets `kept_how` to "kept at an earlier write". So every record and post of the write names the one original.
 - A new grab, a hand edit, a restore from the kept file, a rename by the app and an expired keep each fail that check.
-  The file then gets a new keep. A hash would read the whole file at each write. The ctime changes when a grab of
-  `KEEP_REPLACED` hard-links the file, so it is left out. So a same-size write in place that sets the old mtime back
-  reads as the hook's own output.
-- The hook's own flag edit with mkvpropedit changes the mtime. After a successful edit, `vault.kept_carry()` moves the
-  row to the edited file when its inode is unchanged, beside the carry of the language-ID cache. An import that
-  replaced the file during the edit has another inode, so its next write keeps a new original.
+  The file then gets a new keep. A hash would read the whole file at each write.
+- The hook's own flag edit with mkvpropedit changes the mtime. After a successful edit, `runner.carry_marks()` moves
+  the row to the edited file when its inode is unchanged, beside the carry of the language-ID cache. Just before
+  mkvpropedit, the edit checks that the file still has the inode, size and mtime of its stat. An import or an outside
+  write since then raises `Replan`, so that file gets no edit, and its next write keeps a new original.
 - A reuse sets the mtime of a `.renewed` file in the keep's time folder to now. The prune ages a time folder from the
   later of its name and that mtime, so the latest write can be undone for the full setting. A keep in its last hour
   (`regrab.KEEP_MARGIN`) is not reused, and the write keeps a new original. A prune that decided before the renewal
@@ -2768,8 +2826,10 @@ goes on. The limits of `HOOK_WORKERS` and `BACKGROUND_WORKERS` hold the whole ti
 The model name carries its revision, so a model bump misses the old rows. A hit applies the current
 thresholds, so a threshold change needs no new hearing. An edit changes the mtime and never the
 audio, so the hook carries the rows over after each successful mkvpropedit. The file must still have
-its inode. An import during the edit gives another inode, so the new file gets no rows. The mark of
-a burn-in job follows the same inode rule, also after a failed mkvpropedit, which can still write.
+its inode. An import during the edit gives another inode, so the new file gets no rows. After a remux,
+the rows move only to the file the swap proved, see "File marks". The mark of a burn-in job follows the
+same rules, also after a failed mkvpropedit, which can still write. A new file matches a cached answer only with the
+same size and the same mtime in nanoseconds. A miss costs a new hearing.
 
 **Install.** `arr_lid.requirements.txt` pins faster-whisper and its dependencies by hash. The model
 is `Systran/faster-whisper-small` at revision `536b0662742c02347bc0e980a01041f333bce120`, in
@@ -4018,13 +4078,13 @@ flags, as they keep every flag. When an edit fails and no flag changed, the aler
 changed. When it fails but still changed a flag, the alert says which tracks play now. mkvpropedit's own words stay in
 the decision log.
 
-**The mark.** Before the edit, the job marks the file in the store's `burned_in_muted` namespace with its path, inode
-and size, see `runner.muted()`. When the edit fails and changes nothing, the job drops the mark. While the mark matches
+**The mark.** Before the edit, the job marks the file in the store's `burned_in_muted` namespace with its path and the
+inode, size and mtime of the file its passes read, see `runner.muted()` and "File marks" in "State". When the edit fails and changes nothing, the job drops the mark. While the mark matches
 the file, a flag backfill, `--sub-check --apply` and `--sub-time` skip every edit that would turn an English subtitle
 on, see `process.muted_plan()`. Their decision line says so in `flags_kept`. The class of that line lists the edits that
 remain, and ends with "English subtitles kept off by the burned-in subtitle check". When AMG edits the flags or remuxes
-the file itself, the mark moves to the new inode and size. A new file at the path, such as an upgrade, has another
-inode or size and clears the mark. The nightly audit leaves the English subtitles of a marked file out of its further
+the file itself, the mark moves to the file AMG left. A new file at the path, such as an upgrade, has another mtime and
+clears the mark. The nightly audit leaves the English subtitles of a marked file out of its further
 edits. The mark is the one exception to the rule that the only English subtitles stay on, see "Safety self-checks" in
 [development.md](development.md).
 
@@ -4045,6 +4105,9 @@ more. Text in any other language follows the normal rule above.
 separate "edit" alert. With `NOTIFICATION_POSTS=all`, no change post repeats the flags the alert names.
 
 **Drops.** Each time the job takes the lock, it checks by the inode that the file is still the one its import checked.
+A job of `--check` holds no key, so it checks against the stat its passes started from. Before the mute, the file must
+still have the inode, size and mtime of the stat its passes started from. A new file that landed since, also one on
+the reused inode number, gets no edit and no mark, and the job drops with `file_replaced`.
 Like a deep analysis, it drops itself when the file is gone or replaced, and follows a move, see "How it runs". A queued
 job also drops itself when `BURNED_IN` is `off`, or when the check is not installed.
 

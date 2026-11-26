@@ -66,6 +66,7 @@ def header_issue(env, monkeypatch, result=("header_repaired", "header repaired")
                 f.write(open(path, "rb").read() + b"r")
             os.chmod(path + ".new", os.stat(path).st_mode)
             os.replace(path + ".new", path)
+            return (*result, {"old_size": st.st_size, "old_duration": hp["duration"], "end": hp["end"], "file_key": list(hook.file_key(os.stat(path)))})
         return (*result, {"old_size": st.st_size, "old_duration": hp["duration"], "end": hp["end"]})
     for name, fake in (("header_of", header_of), ("video_check", video_check), ("repack", repack)):
         monkeypatch.setattr(hook, name, fake)
@@ -439,8 +440,8 @@ def test_an_edit_that_breaks_the_layout_is_repaired_in_the_same_run(layouts, tmp
     no_damage(monkeypatch)
     real, blocked = hook.repack, []
     monkeypatch.setattr(hook, "repack", lambda *a, **k: blocked.append(signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, [])) or real(*a, **k))
-    hook.mute_mark(path)   # a burn-in job turned the subtitles off, and the repair keeps its mark
-    hook.damage_mark(path, {"fault": "parts of the file cannot be read"})   # the repair keeps the video, and so the damage mark
+    hook.mute_mark(path, hook.file_key(os.stat(path)))   # a burn-in job turned the subtitles off, and the repair keeps its mark
+    hook.damage_mark(path, {"fault": "parts of the file cannot be read"}, hook.file_key(os.stat(path)))   # the repair keeps the video, and so the damage mark
     seen = runs(monkeypatch)
     rec = hook.edit({"path": path}, j, edits, True)
     assert (rec["outcome"], rec["header_repair"]["code"], writes(seen), blocked) == ("edited", "header_repaired", (1, 1), [False]), rec
@@ -552,7 +553,7 @@ def test_the_content_checks_run_after_a_repair_inside_the_flag_edit(env, monkeyp
         calls, fake = header_issue(env, monkeypatch), hook.header_of
         monkeypatch.setattr(hook, "header_of", lambda path, j=None: fake(path, j) if env["mkvpropedit"] else dict(fake(path, j), issue=[]))
         monkeypatch.setattr(hook, "layout_of", lambda path: None if calls["done"] else TRACKS_LATE)
-    hook.mute_mark(env["path"])   # a burn-in job turned the subtitles off before, and the new file keeps its mark
+    hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))   # a burn-in job turned the subtitles off before, and the new file keeps its mark
     hook.main([])
     rec = decided(env)
     assert len(calls["repairs"]) == 1 and rec["outcome"] == "edited" and rec["header_repair"]["rescan"] == "sent", rec
@@ -618,7 +619,7 @@ def test_the_mute_rule_holds_the_edits_a_remux_carries(env, monkeypatch):
     env["probe"] = sub_probe(("eng", False, {}), audio=(("por", True),))
     calls = header_issue(env, monkeypatch)
     monkeypatch.setattr(hook, "muted_plan", lambda plan, muted=True: plan)
-    hook.mute_mark(env["path"])
+    hook.mute_mark(env["path"], hook.file_key(os.stat(env["path"])))
     with pytest.raises(hook.arr_subsync.Broken, match="rule muted broken"):
         hook.main([])
     assert calls["repairs"] == [] and env["mkvpropedit"] == []
@@ -1416,20 +1417,76 @@ def test_a_deep_analysis_that_a_stop_cut_keeps_its_held_alerts(env, monkeypatch,
     assert two_lines(env)[1][-1]["held_result"] == ["checked again"], two_lines(env)[1]
 
 
-def test_a_repair_inside_a_burn_in_edit_keeps_the_queued_jobs_of_the_file(env, monkeypatch, settings):
-    """The deep analysis and the whole-file check of the import hold the key of its file. A repair inside the burn-in
-    job's edit replaces the file, so they take the key of the new file and do not drop."""
+def test_a_remux_of_amg_s_own_re_keys_the_queued_and_claimed_jobs_of_the_file(env, monkeypatch, settings):
+    """The deep analysis, the whole-file check and the burn-in job of the import hold the key of its file. A remux of
+    AMG's own replaces the file, so carry_marks() gives the jobs that held the old key the key of the new file, and they
+    do not drop. A job that a newer import queued for another file keeps its key. A remux that proved another file, as
+    when an import replaced it after the remux, re-keys nothing."""
     settings(subtitles="deep")
-    name = queue_analysis(env, env["path"])
+    name, held, other = queue_analysis(env, env["path"]), hook.burn_name(env["path"]), hook.whole_name(env["path"])
     before = os.stat(env["path"])
+    hook.store.write("INSERT INTO jobs (name, claimed, at, job) VALUES (?, 1, ?, ?)", held, 0.0,
+                     json.dumps({"path": env["path"], "key": list(hook.file_key(before))}))   # the running burn-in job
+    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", other, 0.0, json.dumps({"path": env["path"], "key": [1, 2, 3]}))
     with open(env["path"] + ".new", "wb") as f:
         f.write(open(env["path"], "rb").read() + b"r")
     os.replace(env["path"] + ".new", env["path"])
-    other = hook.whole_name(env["path"])   # queued by a newer import of the path, for another file
-    hook.store.write("INSERT INTO jobs (name, at, job) VALUES (?, ?, ?)", other, 0.0, json.dumps({"path": env["path"], "key": [1, 2, 3]}))
-    hook.rekey(env["path"], before)
-    assert hook.job_of(name)["key"] == list(hook.file_key(os.stat(env["path"]))) and hook.deep_replaced(hook.job_of(name)) is None
+    now = list(hook.file_key(os.stat(env["path"])))
+    assert hook.carry_marks(env["path"], before, [1, 2, 3]) is None   # the remux proved another file
+    assert hook.job_of(name)["key"] == hook.job_of(held, True)["key"] == list(hook.file_key(before))
+    assert hook.carry_marks(env["path"], before, now)
+    assert hook.job_of(name)["key"] == hook.job_of(held, True)["key"] == now and hook.deep_replaced(hook.job_of(name)) is None
     assert hook.job_of(other)["key"] == [1, 2, 3]
+
+
+def test_a_remux_of_amg_s_own_re_keys_a_job_whose_file_a_tool_wrote_in_place(env, settings):
+    """A tool wrote the file in place after the import queued its deep analysis, so the job's key holds an older size
+    and mtime. The file keeps its inode, so the job still runs. A remux of AMG's own then gives the job the key of the
+    file it left, by the inode, so the job still runs after it."""
+    settings(subtitles="deep")
+    name = queue_analysis(env, env["path"])
+    with open(env["path"], "ab") as f:
+        f.write(b"t")
+    before = os.stat(env["path"])
+    assert hook.job_of(name)["key"] != list(hook.file_key(before)) and hook.deep_replaced(hook.job_of(name)) is None
+    with open(env["path"] + ".new", "wb") as f:
+        f.write(open(env["path"], "rb").read() + b"r")
+    os.replace(env["path"] + ".new", env["path"])
+    now = list(hook.file_key(os.stat(env["path"])))
+    assert hook.carry_marks(env["path"], before, now) and hook.job_of(name)["key"] == now and hook.deep_replaced(hook.job_of(name)) is None
+
+
+def test_a_burn_in_mute_re_keys_the_queued_deep_analysis_and_an_app_change_does_not(env, burn, monkeypatch, settings):
+    """mkvpropedit edits the file in place and gives it a new mtime. The queued deep analysis then takes the key of the
+    edited file, so it runs on the file AMG left. A file the app replaced during the edit is another file, so the job
+    keeps its key and drops."""
+    settings(subtitles="deep")
+    name = japanese_burn(env, ("eng", True, {}))
+    deep = queue_analysis(env, env["path"])
+    burn["full"] = [verdict("full", True, "eng")]
+    real, app = hook.subprocess.run, []
+
+    def run(argv, **kw):   # mkvpropedit writes the file in place, or the app replaces it during the edit
+        out, p = real(argv, **kw), argv[1] if argv[0] == "mkvpropedit" else None
+        if p and app:
+            with open(p + ".new", "wb") as f:
+                f.write(open(p, "rb").read() + b"app")
+            os.replace(p + ".new", p)
+        elif p:
+            os.utime(p, ns=(time.time_ns(), os.stat(p).st_mtime_ns + 1000))
+        return out
+    monkeypatch.setattr(hook.subprocess, "run", run)
+    key = hook.job_of(deep)["key"]
+    hook.background(name, [])
+    assert hook.job_of(deep)["key"] == list(hook.file_key(os.stat(env["path"]))) != key
+    assert hook.deep_replaced(hook.job_of(deep)) is None and hook.muted(env["path"])
+    key = hook.job_of(deep)["key"]
+    app.append(True)
+    env["files"].pop(env["path"])   # the English subtitles are on again
+    hook.background(japanese_burn(env, ("eng", True, {})), [])
+    assert len(env["mkvpropedit"]) == 2
+    assert hook.job_of(deep)["key"] == key != list(hook.file_key(os.stat(env["path"])))
+    assert hook.deep_replaced(hook.job_of(deep))["outcome"] == "file_replaced"
 
 
 @pytest.mark.parametrize("edits", [False, True, "repair"])
@@ -1512,31 +1569,6 @@ def test_a_file_the_app_replaces_after_the_write_gets_no_content_checks(env, mon
     assert not first or calls["repairs"] == [(True, [])]
 
 
-def test_a_repair_inside_a_burn_in_edit_re_keys_the_jobs_and_an_app_change_does_not(env, burn, monkeypatch, settings):
-    """The burn-in mute's edit replaces the file only through a repair of its own. Then the queued deep analysis takes
-    the new key. A file the app replaced during the edit is another file, so the job keeps its key and drops."""
-    settings(subtitles="deep")
-    name = japanese_burn(env, ("eng", True, {}))
-    deep = queue_analysis(env, env["path"])
-    burn["full"] = [verdict("full", True, "eng")]
-    real, repaired = hook.edit, {"code": "tail_removed"}
-
-    def edit(rec, *a, **k):   # the file under a new inode, through a repair of the edit's own or through the app
-        out, p = real(rec, *a, **k), rec["path"]
-        with open(p + ".new", "wb") as f:
-            f.write(open(p, "rb").read() + b"r")
-        os.replace(p + ".new", p)
-        return dict(out, header_repair=repaired) if repaired else out
-    monkeypatch.setattr(hook, "edit", edit)
-    hook.background(name, [])
-    assert hook.job_of(deep)["key"] == list(hook.file_key(os.stat(env["path"])))
-    key, repaired = hook.job_of(deep)["key"], None
-    env["files"].pop(env["path"])   # the English subtitles are on again
-    hook.background(japanese_burn(env, ("eng", True, {})), [])
-    assert len(env["mkvpropedit"]) == 2
-    assert hook.job_of(deep)["key"] == key != list(hook.file_key(os.stat(env["path"])))
-
-
 def test_a_failed_take_back_stays_an_edit_failure(env, monkeypatch):
     """mkvpropedit fails to take back the carried edits, so the record keeps the failure, never a no change."""
     env["movies"]["movie/7"]["originalLanguage"] = {"name": "Portuguese"}
@@ -1555,7 +1587,8 @@ def test_a_failed_take_back_stays_an_edit_failure(env, monkeypatch):
     assert decided(env)["outcome"] == "edit_failed"
 
 
-def test_re_keying_a_file_the_app_removed_changes_nothing(env):
-    before = os.stat(env["path"])
+def test_re_keying_a_file_the_app_removed_changes_nothing(env, settings):
+    settings(subtitles="deep")
+    name, before = queue_analysis(env, env["path"]), os.stat(env["path"])
     os.remove(env["path"])
-    hook.rekey(env["path"], before)
+    assert hook.carry_marks(env["path"], before) is None and hook.job_of(name)["key"] == list(hook.file_key(before))

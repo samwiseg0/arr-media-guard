@@ -111,14 +111,14 @@ def test_a_later_write_reuses_a_keep_in_either_layout(tmp_path, monkeypatch, set
                          (os.path.join(root, young, EP), os.path.join(root, young))):
         os.makedirs(os.path.dirname(keep), exist_ok=True)
         open(keep, "wb").write(b"original")
-        hook.kept_write(path, keep)
+        hook.kept_write(path, keep, hook.file_key(os.stat(path)))
         note = {}
         assert hook.keep_original(path, note) == keep and note["kept_how"] == hook.KEPT_BEFORE
         assert os.path.exists(os.path.join(folder or os.path.dirname(keep), hook.RENEWED))
     outside = str(tmp_path / "elsewhere" / young / "Show (1998) - S04E07.mp4")
     os.makedirs(os.path.dirname(outside))
     open(outside, "wb").write(b"original")
-    hook.kept_write(path, outside)
+    hook.kept_write(path, outside, hook.file_key(os.stat(path)))
     assert hook.kept_of(path) is None
 
 

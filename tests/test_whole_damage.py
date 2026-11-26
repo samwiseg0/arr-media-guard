@@ -101,9 +101,11 @@ def test_audio_errors_alone_read_nothing_again(clips, tmp_path, settings):
     assert rec["outcome"] == "audio_doubt" and "reread" not in rec["whole"] and "video" not in rec["whole"]["ffmpeg"]["kinds"], rec
 
 
-def test_a_damaged_file_is_marked_on_an_apply(clips, tmp_path, settings):
+@pytest.mark.parametrize("reused", [False, True])
+def test_a_damaged_file_is_marked_on_an_apply(clips, tmp_path, settings, monkeypatch, reused):
     """The job of a backfill applies, so it marks the file it kept. A dry check marks nothing. A new file at the path
-    clears the mark."""
+    clears the mark. clean.mkv has the size of nal0.mkv, and with reused the new file also gets the old inode number,
+    as ext4 and XFS give a freed one to the next new file at once. Its new mtime clears the mark."""
     settings(state_dir=str(tmp_path))
     path = tmp_path / "film.mkv"
     path.write_bytes((clips / "nal0.mkv").read_bytes())
@@ -111,8 +113,14 @@ def test_a_damaged_file_is_marked_on_an_apply(clips, tmp_path, settings):
     assert hook.damaged(str(path)) is None
     rec = check(path, apply=True)
     assert hook.damaged(str(path)) == rec["whole"]["reread"]["damage"]
+    ino = os.stat(path).st_ino
     path.unlink()
     path.write_bytes((clips / "clean.mkv").read_bytes())
+    if reused:
+        real = os.stat
+        monkeypatch.setattr(os, "stat", lambda p, *a, **k: types.SimpleNamespace(**dict(
+            {f: getattr(real(p), f) for f in dir(real(p)) if f.startswith("st_")}, st_ino=ino)) if p == path or p == str(path) else real(p, *a, **k))
+        assert os.stat(path).st_ino == ino and os.stat(path).st_size == os.path.getsize(clips / "nal0.mkv")
     assert hook.damaged(str(path)) is None and hook.store.get(hook.DAMAGED, str(path)) is None
     check(clips / "slices.mkv", apply=True)
     assert hook.damaged(str(clips / "slices.mkv")) is None
@@ -199,10 +207,9 @@ def test_an_import_keeps_a_damaged_file_when_regrab_leaves_damage_out(env, monke
     assert hook.damaged(env["path"]) == DAMAGE
 
 
-def test_every_read_of_the_video_reads_the_file_the_full_read_read(env, monkeypatch, settings, tmp_path):
-    """The import's header repair kept the original, so the full read reads it. The second read and the re-grab's own
-    check read that kept original too, as the zero runs are measured again in it."""
-    settings(regrab=frozenset({"audio", "video", "damage"}))
+def kept_original(monkeypatch, tmp_path):
+    """A kept original of an import's header repair, and a read of it that finds 108 video errors and then DAMAGE.
+    Returns its path and the list of the files each read read."""
     kept = tmp_path / "kept.mkv"
     kept.write_bytes(b"x" * 1000)
     fields = {"zeros": {"runs": [], "at": [], "read": 1000, "took": 0.1, "count": []}, "size": 1000, "pcm": False, "fault": None,
@@ -210,9 +217,51 @@ def test_every_read_of_the_video_reads_the_file_the_full_read_read(env, monkeypa
     monkeypatch.setattr(hook, "whole_check", lambda path, stop: (None, [], ["a full read of the file found 108 errors"], json.loads(json.dumps(fields))))
     reads = []
     monkeypatch.setattr(hook, "source_read", lambda damage, path, j: reads.append(path) or dict(DAMAGE))
-    job = {"app": "radarr", "path": env["path"], "original": str(kept), "remux": "header repair", "grab": {"check": True}}
+    return str(kept), reads
+
+
+@pytest.mark.parametrize("keyed", [True, False])
+def test_every_read_of_the_video_reads_the_file_the_full_read_read(env, monkeypatch, settings, tmp_path, keyed):
+    """The import's header repair kept the original, so the full read reads it. The second read and the re-grab's own
+    check read that kept original too, as the zero runs are measured again in it. The mark goes on the file the repair
+    made, by the job's key. A job with no key names no file, so it marks nothing."""
+    settings(regrab=frozenset({"audio", "video", "damage"}))
+    kept, reads = kept_original(monkeypatch, tmp_path)
+    job = {"app": "radarr", "path": env["path"], "original": kept, "remux": "header repair", "grab": {"check": True},
+           **({"key": list(hook.file_key(os.stat(env["path"])))} if keyed else {})}
     rec = hook.whole_act(None, job, {"id": "x", "apply": True}, [], post=False)
-    assert (rec["outcome"], rec["regrab"], reads) == ("damaged_source", "check", [str(kept)] * 2), (rec, reads)
+    assert (rec["outcome"], rec["regrab"], reads) == ("damaged_source", "check", [kept] * 2), (rec, reads)
+    assert hook.damaged(env["path"]) == (DAMAGE if keyed else None)
+
+
+def test_the_whole_file_check_of_check_marks_the_file_the_import_left(env, monkeypatch, settings, tmp_path):
+    """--check --apply runs the whole-file check at once, with the key of the file its import pass left, as an import
+    queues the job. So a read of the kept original marks that file."""
+    kept, _ = kept_original(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "whole_plan", lambda rec: {"path": rec["path"], "remux": "header repair", "original": kept})
+    _, rec = hook.whole_later("radarr", {}, (), types.SimpleNamespace(apply=True), {"check": True}, {"path": env["path"], "label": "Film"},
+                              types.SimpleNamespace(post=False))
+    assert rec["outcome"] == "damaged_source" and hook.damaged(env["path"]) == DAMAGE, rec
+
+
+def test_a_new_file_during_the_regrab_of_a_damaged_file_gets_no_mark(env, monkeypatch, settings):
+    """The re-grab runs under the lock, and its own second check reads the video for minutes. The app holds no lock and
+    can import a new file meanwhile. The mark holds the key of the file the reads judged, so the new file has none."""
+    rec, _ = damaged_import(env, monkeypatch)   # the default REGRAB keeps the file, so it gets the mark
+    assert hook.damaged(env["path"]) == DAMAGE
+    hook.store.drop(hook.DAMAGED, env["path"])
+    real = hook.regrab
+
+    def regrab(*a, **k):
+        out = real(*a, **k)
+        with open(env["path"] + ".new", "wb") as f:
+            f.write(b"n" * 1000)
+        os.replace(env["path"] + ".new", env["path"])
+        return out
+    monkeypatch.setattr(hook, "regrab", regrab)
+    job = {"app": "radarr", "path": env["path"], "grab": {}, "key": list(hook.file_key(os.stat(env["path"])))}
+    rec = hook.whole_act(None, job, {"id": "y", "apply": True}, [], post=False)   # a job with no grab fields finds no grab
+    assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "no_grab") and hook.damaged(env["path"]) is None, rec
 
 
 def test_a_damage_the_regrab_does_not_find_again_marks_nothing(env, monkeypatch, settings):
@@ -235,7 +284,7 @@ def test_a_stopped_regrab_of_a_damaged_file_marks_nothing(env, monkeypatch, sett
 def test_a_backfill_job_of_a_damaged_file_still_runs_its_checks(env, monkeypatch, settings):
     """The mark holds back only the subtitle work. The import checks of a backfill job still run on the file."""
     check_listed(env, monkeypatch, "")
-    hook.damage_mark(env["path"], DAMAGE)
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
     name = backfill_job(env, monkeypatch)
     hook.background(name, [])
     (rec,) = checked(env, "backfill_job")
@@ -248,7 +297,7 @@ def test_the_deep_analysis_of_a_damaged_file_drops_with_its_held_alert(env, monk
     Damaged file alert went out."""
     one_alert_film(env, monkeypatch, settings, "fixed")
     hook.run_job(enqueue(env, 0, env["path"]), [])
-    hook.damage_mark(env["path"], DAMAGE)
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
     (name,) = hook.deep_analysis_queued()
     hook.background(name, [])
     first, (deep,) = two_lines(env)
@@ -264,7 +313,7 @@ def test_a_deep_analysis_marked_damaged_during_the_run_drops_at_its_remux(env, m
     hook.run_job(enqueue(env, 0, env["path"]), [])
     real, asked = hook.damaged, []
     monkeypatch.setattr(hook, "damaged", lambda path, st=None: (asked.append(path), real(path, st) if len(asked) > 1 else None)[1])
-    hook.damage_mark(env["path"], DAMAGE)
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
     hook.main([])
     _, (deep,) = two_lines(env)
     assert len(asked) == 2 and deep["outcome"] == "file_damaged" and "subremux" not in deep, deep
@@ -402,6 +451,25 @@ def test_an_import_regrabs_a_file_its_subtitle_remux_found_damaged(env, monkeypa
     assert hook.store.get(hook.DAMAGED, env["path"]) is None
 
 
+def test_the_mark_of_an_import_s_remux_names_the_file_the_remux_read(env, monkeypatch, settings, tmp_path):
+    """The import's subtitle remux could not read the original. The app imports a new file during the re-grab. The mark
+    holds the key of the file the remux read, so the new file has none."""
+    remux_film(env, monkeypatch, settings, tmp_path, {"warnings": None, "damage": REMUX_DAMAGE})
+    grabbed(env, monkeypatch)
+    real = hook.regrab
+
+    def regrab(*a, **k):
+        out = real(*a, **k)
+        with open(env["path"] + ".new", "wb") as f:
+            f.write(b"n" * 1000)
+        os.replace(env["path"] + ".new", env["path"])
+        return out
+    monkeypatch.setattr(hook, "regrab", regrab)
+    hook.main([])
+    rec = decided(env)
+    assert (rec["outcome"], rec["regrab"]) == ("damaged_source", "would_regrab") and hook.damaged(env["path"]) is None, rec
+
+
 def test_a_backfill_job_marks_a_file_its_subtitle_remux_found_damaged(env, monkeypatch, settings, tmp_path):
     """A job a backfill queued never re-grabs. It says what an import would do, and it marks the file it kept."""
     remux_film(env, monkeypatch, settings, tmp_path, {"warnings": None, "damage": REMUX_DAMAGE})
@@ -423,7 +491,7 @@ def test_a_marked_file_keeps_its_sidecar_times_and_posts_no_subtitle_alert(env, 
     side, _ = remux_film(env, monkeypatch, settings, tmp_path, {"warnings": None})
     if "check" in run:
         settings(subtitles="check")
-    hook.damage_mark(env["path"], DAMAGE)
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
     check_listed(env, monkeypatch, "")
     if run.startswith("backfill job"):
         hook.background(backfill_job(env, monkeypatch), [])
@@ -444,7 +512,7 @@ def test_a_marked_file_that_its_flag_edit_grows_keeps_its_mark(env, monkeypatch,
     side, _ = remux_film(env, monkeypatch, settings, tmp_path, {"warnings": None})
     env["probe"] = main_tests.sub_probe(("fre", True, {}), audio=(("eng", True),))   # the French track plays by default, so the run edits its flag
     settings(subtitles="check")
-    hook.damage_mark(env["path"], DAMAGE)
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
     check_listed(env, monkeypatch, "")
     real, grown = hook.subprocess.run, []
 
@@ -474,20 +542,20 @@ def test_a_marked_file_that_its_flag_edit_grows_keeps_its_mark(env, monkeypatch,
 
 
 def test_the_damage_mark_follows_a_remux_of_amg_itself(env):
-    """A remux of AMG's own gives the file a new inode, and it keeps the video, so the mark moves to the new file, see
-    process.refresh(). A mark of another stat moves nothing and stays as it is."""
-    hook.damage_mark(env["path"], DAMAGE)
-    ctx = types.SimpleNamespace(path=env["path"], st=os.stat(env["path"]), rec={}, yields=False)
+    """A remux of AMG's own gives the file a new inode, and it keeps the video, so the mark moves to the new file that
+    the swap proved, see process.swap_carry(). A mark of another stat moves nothing and stays as it is."""
+    hook.damage_mark(env["path"], DAMAGE, hook.file_key(os.stat(env["path"])))
+    before = os.stat(env["path"])
     os.replace(env["path"], env["path"] + ".tmp")
     shutil.copy(env["path"] + ".tmp", env["path"])
-    hook.refresh(ctx)
-    assert hook.damaged(env["path"]) == DAMAGE and hook.store.get(hook.DAMAGED, env["path"])["ino"] == ctx.st.st_ino
+    hook.swap_carry(env["path"], before, {"file_key": list(hook.file_key(os.stat(env["path"])))})
+    assert hook.damaged(env["path"]) == DAMAGE and hook.store.get(hook.DAMAGED, env["path"])["key"] == hook.mark_key(os.stat(env["path"]))
     stale = hook.store.get(hook.DAMAGED, env["path"])
-    hook.damage_carry(env["path"], os.stat(env["path"] + ".tmp"))
+    hook.carry_marks(env["path"], os.stat(env["path"] + ".tmp"))
     assert hook.store.get(hook.DAMAGED, env["path"]) == stale
-    with open(env["path"], "ab") as f:   # the mark holds the old size now
+    with open(env["path"], "ab") as f:   # the mark holds the old size and mtime now
         f.write(b"x")
-    hook.damage_carry(env["path"], os.stat(env["path"] + ".tmp"))
+    hook.carry_marks(env["path"], os.stat(env["path"] + ".tmp"))
     assert hook.store.get(hook.DAMAGED, env["path"]) == stale and hook.damaged(env["path"]) is None
 
 

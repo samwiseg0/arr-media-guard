@@ -15,6 +15,7 @@ import time
 import types
 
 import amg
+import pytest
 from test_arr_media_guard import (hook, REAL_MKVMERGE, REAL_RUN, convertible, decided, env, kept_files, real_convert, refused_link,  # noqa: F401
                                   sidecar_film, stamp, state_dir_in_tmp, sync_mkv, talk)
 
@@ -277,23 +278,24 @@ def import_meanwhile(sync_mkv):
 
 
 def test_an_import_during_the_hook_s_flag_edit_gets_a_new_keep(sync_mkv, tmp_path, monkeypatch, settings):
-    """process.edit() stats the file, reads its header, then runs mkvpropedit. Here the app imports a new grab between,
-    so mkvpropedit edits the grab. kept_carry() sees another inode and leaves the row, so the next write keeps the grab."""
+    """process.edit() stats the file, reads its header, then runs mkvpropedit. Here the app imports a new grab between.
+    The edit sees another file and raises Replan before mkvpropedit, so the grab is not edited and keeps no row. The next
+    write keeps the grab."""
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=True)
     first = retime(path)[2]["kept"]
-    with monkeypatch.context() as m:
+    with monkeypatch.context() as m, pytest.raises(hook.Replan, match="the file changed since its stat before the edit"):
         m.setattr(hook, "header_of", import_meanwhile(sync_mkv))
-        rec = flag_edit(path)
+        flag_edit(path)
     grab = os.stat(path)
     clock(monkeypatch, 1 / 86400)   # 1 s later, so the new keep gets its own time folder
     _, result, info = retime(path)
-    assert rec["outcome"] == "edited" and result == "subtitles remuxed", (rec, result)
+    assert result == "subtitles remuxed" and open(path, "rb").read() != open(first, "rb").read(), result
     assert info["kept"] != first and "kept_how" not in info and os.stat(info["kept"]).st_ino == grab.st_ino, info
 
 
 def test_a_failed_flag_edit_carries_no_row(sync_mkv, tmp_path, monkeypatch, settings):
-    """mkvpropedit can exit 2 and still change the file. kept_carry() and lid_carry() run only after a successful edit,
+    """mkvpropedit can exit 2 and still change the file. The keep row's carry_marks() and lid_carry() run only after a successful edit,
     so the next write keeps the file as found, and the next check hears it again."""
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=False)
@@ -321,13 +323,38 @@ def test_an_import_during_the_hook_s_flag_edit_gets_no_words_and_no_mark(sync_mk
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=True)
     keys = heard(path)
-    hook.mute_mark(path)
-    with monkeypatch.context() as m:
+    hook.mute_mark(path, hook.file_key(os.stat(path)))
+    with monkeypatch.context() as m, pytest.raises(hook.Replan):
         m.setattr(hook, "header_of", import_meanwhile(sync_mkv))
-        rec = flag_edit(path, audio_off=True)
+        flag_edit(path, audio_off=True)
     grab = os.stat(path)
-    assert rec["outcome"] == "edited" and grab.st_ino != imported.st_ino, rec
+    assert grab.st_ino != imported.st_ino and hook.flags(REAL_MKVMERGE(path)) == hook.flags(REAL_MKVMERGE(str(sync_mkv / "f.mkv")))
     assert keys() == [(imported.st_size, imported.st_mtime_ns)] and not hook.muted(path)
+
+
+def test_an_outside_write_in_place_during_the_hook_s_flag_edit_moves_no_mark(sync_mkv, tmp_path, monkeypatch, settings):
+    """A tool writes the file in place after edit() took its stat and before mkvpropedit: same inode, same size, new
+    bytes and mtime. The edit raises Replan, so mkvpropedit never runs and no mark or cached word moves to that file."""
+    path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
+    settings(header_repair=True)
+    keys = heard(path)
+    hook.damage_mark(path, {"fault": "parts of the file cannot be read"}, hook.file_key(imported))
+    hook.mute_mark(path, hook.file_key(imported))
+
+    def header_of(p, j):
+        with open(p, "r+b") as f:
+            f.seek(imported.st_size // 2)
+            f.write(b"\0" * 64)
+        return {}
+    monkeypatch.setattr(hook, "header_of", header_of)
+    calls = []
+    real = hook.subprocess.run
+    monkeypatch.setattr(hook.subprocess, "run", lambda argv, **kw: calls.append(argv[0]) or real(argv, **kw))
+    with pytest.raises(hook.Replan):
+        flag_edit(path, audio_off=True)
+    now = os.stat(path)
+    assert "mkvpropedit" not in calls and now.st_ino == imported.st_ino and now.st_size == imported.st_size, calls
+    assert not (hook.damaged(path) or hook.muted(path)) and keys() == [(imported.st_size, imported.st_mtime_ns)]
 
 
 def test_the_hook_s_flag_edit_carries_the_words_and_the_mark(sync_mkv, tmp_path, monkeypatch, settings):
@@ -335,7 +362,7 @@ def test_the_hook_s_flag_edit_carries_the_words_and_the_mark(sync_mkv, tmp_path,
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=False)
     keys = heard(path)
-    hook.mute_mark(path)
+    hook.mute_mark(path, hook.file_key(os.stat(path)))
     rec = flag_edit(path, audio_off=True)
     edited = os.stat(path)
     assert rec["outcome"] == "edited" and edited.st_mtime_ns != imported.st_mtime_ns, rec
@@ -415,7 +442,7 @@ def test_a_failed_flag_edit_that_wrote_keeps_the_burn_in_mark(sync_mkv, tmp_path
     the mark moves to the file as it is, see runner.muted()."""
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=False)
-    hook.mute_mark(path)
+    hook.mute_mark(path, hook.file_key(os.stat(path)))
     real = hook.subprocess.run
 
     def grows_and_exits_2(argv, **kw):
@@ -435,13 +462,13 @@ def test_a_remux_inside_the_hook_s_flag_edit_carries_the_words_and_the_mark(sync
     path, imported = film(sync_mkv, tmp_path, monkeypatch, settings)
     settings(header_repair=True)
     keys = heard(path)
-    hook.mute_mark(path)
+    hook.mute_mark(path, hook.file_key(os.stat(path)))
 
     def repack(p, j, st, apply, hp=None, edits=()):   # as Swap's rename leaves it: a new inode with the edits
         shutil.copy(p, p + ".new")
         REAL_RUN(["mkvpropedit", p + ".new"] + hook.propedit_args(edits, 1), check=True, capture_output=True)
         os.replace(p + ".new", p)
-        return "header_repaired", "header repaired", {}
+        return "header_repaired", "header repaired", {"file_key": list(hook.file_key(os.stat(p)))}
     monkeypatch.setattr(hook, "header_of", lambda p, j: {"edit_tail": 10, "issue": ["10 bytes past the Segment end"], "repairable": True})
     monkeypatch.setattr(hook, "repack", repack)
     rec = flag_edit(path, audio_off=True)

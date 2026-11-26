@@ -1640,15 +1640,15 @@ def item_languages(original, expected):
     return decide.codes(original) | {e.get("original")} - {None}, set(e.get("spoken") or [])
 
 
-def lid_carry(path, before, was=None):
-    """Move lid.py's cached answers for path from its stat before an edit to its stat now. mkvpropedit changes the
-    mtime but never the audio. was is the original's path of a conversion, whose words move too. A failed import of
-    lid.py costs nothing, and carry() never raises."""
+def lid_carry(path, before, was=None, now=None):
+    """Move lid.py's cached answers for path from its stat before an edit to now, the stat runner.carry_marks() found AMG's
+    own file at, else its stat now. mkvpropedit changes the mtime but never the audio. was is the original's path of a
+    conversion, whose words move too. A failed import of lid.py costs nothing, and carry() never raises."""
     try:
         from . import lid
     except ImportError:
         return
-    lid.carry(path, before, os.path.join(config.CFG.state_dir, "lid.sqlite"), was)
+    lid.carry(path, before, os.path.join(config.CFG.state_dir, "lid.sqlite"), was, now)
 
 
 def tmdb_ask(app, ctx, fresh=False):

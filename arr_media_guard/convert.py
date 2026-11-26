@@ -1415,7 +1415,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             return "repack_failed", "repack failed: the run was stopped", info, path
         if undo == "completed":
             if info.get("kept"):
-                vault.kept_write(new, info["kept"])
+                vault.kept_write(new, info["kept"], info["file_key"])
             info.update(new_size=size, new_tracks=checks.track_list(new_j))
             return "repacked", "repacked", info, new
         stranded = ", the original and the new file both stay for a person" if undo == "stranded" else ""
@@ -1424,7 +1424,7 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
     finally:
         sw.close(folder)   # the temp file last, after the extras are back. A temp file hidden with them came back too.
     if info.get("kept"):
-        vault.kept_write(new, info["kept"])
+        vault.kept_write(new, info["kept"], info["file_key"])
         vault.prune_originals(vault.originals_root(path))
     info.update(new_size=size, new_tracks=checks.track_list(new_j))
     return "repacked", "repacked", info, new

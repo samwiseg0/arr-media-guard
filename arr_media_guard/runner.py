@@ -31,6 +31,77 @@ def file_key(st):
     return st.st_ino, st.st_size, st.st_mtime_ns
 
 
+def mark_key(st):
+    """file_key() of the stat st as a list, the key of a file mark of the store: damaged(), muted() and vault.kept_of().
+    A new file gets a new mtime, so a new file at the path has another key, also when the file system gives it the
+    inode number of the old file and it has the same size. A chmod, a chown and a hard link keep the key, so a mark
+    stays through a download client's unlink and a permissions job. A mark is stored by the path, so a rename or a move
+    by the app drops it. Each write of AMG's own moves the marks, see carry_marks(). A new file with the same size, the
+    reused inode number and the same mtime in ns keeps the marks, as when the app sets the file date of a same-size
+    copy to the air date of the old one."""
+    return list(file_key(st))
+
+
+def keep_second(path, st, key=None):
+    """Give the file at path, which a write of AMG's own made from the file of the stat st, a mtime in the whole second
+    of st's mtime, with the sub-second part of its own mtime. Returns file_key() of the file now, or None when path
+    holds another file. key is the file_key() of the file that a swap puts at path, see remux.Swap.check(). Without key
+    the write was in place, so the file must still have the inode of st. Another file, as an import meanwhile, keeps
+    its times.
+
+    Sonarr and Radarr with Change File Date on set the mtime of a file to its air date on each rescan. AMG asks for a
+    rescan after a remux, and the app rescans on its own refresh too. Sonarr changes a file whose whole second differs
+    from the air date, and Radarr one whose day differs. The written file has the second of the original, so the app
+    changes nothing, and the marks of the file stay. The sub-second part is new, so file_key() and every cache by path,
+    size and mtime see the write. When the new mtime would be st's, as on a file system that keeps whole seconds only,
+    the write's own mtime stays. A share that refuses the times of a file of another owner leaves it too."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        now = os.fstat(fd)
+        if (file_key(now) != tuple(key)) if key else now.st_ino != st.st_ino:
+            return None
+        want = st.st_mtime_ns // 10**9 * 10**9 + now.st_mtime_ns % 10**9
+        if want not in (now.st_mtime_ns, st.st_mtime_ns):
+            with contextlib.suppress(OSError):
+                os.utime(fd, ns=(now.st_atime_ns, want))
+                if os.fstat(fd).st_mtime_ns == st.st_mtime_ns:   # the file system cut the sub-second part
+                    os.utime(fd, ns=(now.st_atime_ns, now.st_mtime_ns))
+        return file_key(os.fstat(fd))
+    finally:
+        os.close(fd)
+
+
+def carry_marks(path, before, proven=None, marks=None):
+    """Move the file marks of path, see mark_key(), from before, its stat before a change of AMG's own, to its stat
+    now, and return that stat. marks names the store's ns of the marks, all three by default. Only a mark that matched
+    before moves. Another mark stays as it is, as one that a whole-file check put after the change. proven is the
+    file_key() of the file that a swap put at path, see remux.Swap.check(). Without proven the change was in place, so
+    the file must still have the inode of before. A file the app imported meanwhile gets no mark, and the call returns
+    None. A store that does not read moves nothing.
+
+    The queued and claimed jobs of path whose key names the inode of before take the key of now. A remux gives the file
+    a new inode, so a job that ran before the change still runs after it, see deep_replaced()."""
+    try:
+        now = os.stat(path)
+    except OSError:
+        return None
+    if (list(file_key(now)) != list(proven)) if proven else now.st_ino != before.st_ino:
+        return None
+    with contextlib.suppress(sqlite3.Error):
+        for ns in marks or (DAMAGED, MUTED, vault.WROTE):
+            if (m := store.get(ns, path)) and m.get("key") == mark_key(before):
+                store.put(ns, path, dict(m, key=mark_key(now)))
+        with store.tx():   # an import that queues a job of path meanwhile keeps its own key
+            for name in (deep_name(path), whole_name(path), burn_name(path)):
+                for raw, claimed in store.read("SELECT job, claimed FROM jobs WHERE name = ?", name):
+                    if ((job := json.loads(raw)).get("key") or [None])[0] == before.st_ino:
+                        put_job(name, dict(job, key=mark_key(now)), claimed)
+    return now
+
+
 def digest(x):
     """A short sha256 of x as JSON. A plan row holds what a write will write as one, see process.writes()."""
     return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -584,8 +655,10 @@ def queue_rechecks():
 def deep_replaced(job):
     """The outcome and result of a deep analysis job that drops itself, or None. It drops when the file at its path is
     gone, or has another inode than its key names, as after an upgrade, whose import queues a deep analysis of its own.
-    An edit in place keeps the inode, and the job goes on, because no new import queues another one. A job queued
-    before jobs held a key checks only that the file is there."""
+    An edit in place keeps the inode, and the job goes on, because no new import queues another one. A remux of AMG's
+    own gives the stored jobs of the path the key of its file, see carry_marks(). A new file on the reused inode number
+    of the old one passes, see docs/design.md, "How it runs". A job queued before jobs held a key checks only that the
+    file is there."""
     try:
         now = os.stat(job["path"])
     except FileNotFoundError:
@@ -804,8 +877,11 @@ def whole_act(name, job, rec, pending, post=True):
         code = f["action"]["code"]
         rec = regrab.restore_log(dict(rec, outcome="damaged_source", regrab=code, result=f"damaged source: {damage['fault']}, re-grab {code}"),
                                  grab, pending, app)
-        if rec.get("apply") and code not in report.DELETED + ("unconfirmed",) and not f["action"].get("stopped"):
-            damage_mark(job["path"], damage)
+        # The key of the file the reads judged, or of the file the import's remux made from that kept original. A job
+        # with no key names no file for the mark.
+        key = file_key(st) if path == job["path"] else job.get("key")
+        if key and rec.get("apply") and code not in report.DELETED + ("unconfirmed",) and not f["action"].get("stopped"):
+            damage_mark(job["path"], damage, key)
     elif zero + more + heard:
         kind = "video" if zero + more else "audio"
         anywhere = any(c in decide.ANYWHERE for c, _ in fields["ffmpeg"].get("audio") or [])   # lines with no place, see decide.whole_verdict()
@@ -851,14 +927,14 @@ DAMAGED = "damaged"   # the store's ns of the files whose damage a read confirme
 def damaged(path, st=None):
     """The damage of the file at path that the whole-file check, see whole_act(), or the subtitle remux of an import,
     see process.write(), confirmed, or None. The mark in
-    DAMAGED holds the inode and the size of that file, st or its stat now, as muted() keys its mark. A new file at the
-    path, as a re-grab or an upgrade puts there, clears it. A store that does not read gives None."""
+    DAMAGED holds the mark_key() of that file, st or its stat now, as muted() keys its mark. A new file at the path, as
+    a re-grab or an upgrade puts there, clears it. A store that does not read gives None."""
     try:
         m = store.get(DAMAGED, path)
         if not m:
             return None
         st = st or os.stat(path)
-        if [st.st_ino, st.st_size] == [m["ino"], m["size"]]:
+        if m.get("key") == mark_key(st):
             return m["damage"]
         store.drop(DAMAGED, path)
     except (OSError, sqlite3.Error):
@@ -866,21 +942,11 @@ def damaged(path, st=None):
     return None
 
 
-def damage_mark(path, damage):
-    """Mark the file at path as damaged, see damaged(), with its stat now."""
-    with contextlib.suppress(OSError, sqlite3.Error):
-        st = os.stat(path)
-        store.put(DAMAGED, path, {"ino": st.st_ino, "size": st.st_size, "damage": damage})
-
-
-def damage_carry(path, before):
-    """Move the damage mark of the file at path to its stat now, see damaged(). before is the stat of the file before an
-    edit or a remux of AMG's own, which keeps the video. A flag edit can grow the file in place. Only a mark that
-    matched before moves. Another mark stays as it is, as one that a whole-file check put after the edit."""
-    with contextlib.suppress(OSError, sqlite3.Error):
-        m = store.get(DAMAGED, path)
-        if m and [before.st_ino, before.st_size] == [m["ino"], m["size"]]:
-            damage_mark(path, m["damage"])
+def damage_mark(path, damage, key):
+    """Mark the file at path as damaged, see damaged(). key is the file_key() of the file the read judged. A new file
+    at the path since that read has another key, so the mark never matches it."""
+    with contextlib.suppress(sqlite3.Error):
+        store.put(DAMAGED, path, {"key": list(key), "damage": damage})
 
 
 MUTED = "burned_in_muted"   # the store's ns of the files whose English subtitles a burn-in job turned off, see muted()
@@ -888,14 +954,14 @@ MUTED = "burned_in_muted"   # the store's ns of the files whose English subtitle
 
 def muted(path, st=None):
     """Whether a burn-in job turned off the English subtitles of the file at path, see burn_act(). The mark in MUTED
-    holds the inode and the size of that file, st or its stat now. A new file at the path, as an import or an upgrade
-    puts there, has another inode or size, and clears the mark. A store that does not read gives False."""
+    holds the mark_key() of that file, st or its stat now. A new file at the path, as an import or an upgrade puts
+    there, has another key, and clears the mark. A store that does not read gives False."""
     try:
         m = store.get(MUTED, path)
         if not m:
             return False
         st = st or os.stat(path)
-        if [st.st_ino, st.st_size] == [m["ino"], m["size"]]:
+        if m.get("key") == mark_key(st):
             return True
         store.drop(MUTED, path)
     except (OSError, sqlite3.Error):
@@ -903,13 +969,11 @@ def muted(path, st=None):
     return False
 
 
-def mute_mark(path, before=None):
-    """Mark the file at path as muted, see muted(), with its stat now. With before, the stat of the file before an edit
-    or a remux of AMG's own, only a file whose mark matched before keeps it."""
-    with contextlib.suppress(OSError, sqlite3.Error):
-        if before is None or muted(path, before):
-            st = os.stat(path)
-            store.put(MUTED, path, {"ino": st.st_ino, "size": st.st_size})
+def mute_mark(path, key):
+    """Mark the file at path as muted, see muted(). key is the file_key() of the file the burned-in subtitle check read,
+    as for damage_mark(). carry_marks() moves the mark across a change of AMG's own."""
+    with contextlib.suppress(sqlite3.Error):
+        store.put(MUTED, path, {"key": list(key)})
 
 
 def burn_item(app, owner, episodes):
@@ -1016,6 +1080,9 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
     # A dry --check plans the check on the flags its import pass plans, see cli.burn_later(): the audio that plays then,
     # and the subtitles that are on then.
     probe = lambda: remux.planned_state(checks.mkvmerge(path), job["planned"])[0] if job.get("planned") else checks.mkvmerge(path)
+    st = os.stat(path)   # the file the passes read, which the mark names, see mute_mark()
+    if not job.get("key"):   # a job of --check holds none, and its mute or re-grab still acts only on the file the passes read
+        job = dict(job, key=list(file_key(st)))
     ts, _, duration = process.burn_probe(path, probe())
     audio, mkv, fix = process.burn_audio(ts), path.lower().endswith(".mkv"), config.CFG.burned_in == "fix"
     if not audio:
@@ -1044,19 +1111,20 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
                 f["not_mkv"] = True
             elif burn_step(plan, mkv, bool(on)) == "mute":
                 edits = [[t["sel"], 0, 1] for t in on if t["default"]] + [[t["sel"], 0, 1, decide.FORCED_FLAG] for t in on if t["forced_flag"]]
-                before = os.stat(path)
 
                 def mute():
+                    same_file(path, st, "the burned-in subtitle check")   # a new file since the passes, as on a reused inode number
                     if apply:   # first, so the safety rule of the edit sees it, see process.mute_rule(). edit() carries it.
-                        mute_mark(path)
+                        mute_mark(path, file_key(st))
+                        same_file(path, st, "the burned-in subtitle check")   # a new file during the store write. edit() takes its stat next.
                     return process.edit(rec, j, edits, apply, replan=lambda after: kept_off(after, got), ts=ts)
                 try:   # a job of a queued --check mutes only as its row plans, see queue_after()
                     done = gate.allow(types.SimpleNamespace(row=job.get("audited"), apply=apply, background=False), "burn-in mute", mute,
                                       edits=process.needed(j, edits))
                 except gate.PlanRefused as ex:
                     return dict(rec, outcome="plan_refused", plan_diff=ex.args[0], result=f"{words}, refused, the plan differs from the dry run's in edits")
-                if (done.get("header_repair") or {}).get("code") in config.REPAIRED:   # a repair inside the edit replaced the file
-                    rekey(path, before)
+                except Replan as ex:   # from mute() or process.edit(): the file is not the one the passes read
+                    return dict(rec, outcome="file_replaced", result=f"dropped, {ex}")
                 rec = dict(done, outcome=rec["outcome"], edit_result=done["result"], result=f'{words}, {done["result"]}')
                 f["edit"] = done["outcome"]
                 if burn_changed(done, {t["sel"] for t in on}):   # mkvpropedit can fail and still write, see process.edit()
@@ -1090,22 +1158,6 @@ def burn_act(name, job, rec, pending, claimed=False, post=True):
     if post:
         rec["alert_result"] = logs.alert_findings(rec, os.path.getsize(path) if os.path.exists(path) else 0)
     return rec
-
-
-def rekey(path, before):
-    """Give the queued deep analysis and whole-file check of path the key of the file now, when a repair inside a flag
-    edit of this job replaced the file that the stat before describes, see process.edit(). Else they would drop
-    themselves as for a file another import replaced, see deep_replaced(). A file the app removed meanwhile changes no
-    job."""
-    try:
-        now = os.stat(path)
-    except OSError:
-        return
-    for name in (deep_name(path), whole_name(path)) if now.st_ino != before.st_ino else ():
-        with contextlib.suppress(FileNotFoundError, ValueError, sqlite3.Error):
-            job = job_of(name)
-            if (job.get("key") or [None])[0] == before.st_ino:
-                put_job(name, dict(job, key=file_key(now)))
 
 
 def burn_changed(done, sels):
@@ -1171,8 +1223,8 @@ def deep_analysis(name, pending, claimed=False):
     each read and each fit of a track, and before a remux.
     The job goes back to the deep analysis queue, and its next run finds the words heard so far in the cache, and the
     whole-file read in the store. A track of that read that was cut short is a Cut again, see subtitles.Cut. A read
-    kept by a version that did not mark such tracks is read again. A conversion of its own before the stop changed the
-    file, so the job then takes the key of the new file.
+    kept by a version that did not mark such tracks is read again. A flag edit or a remux of its own before the stop
+    gave the stored job the key of the new file, see carry_marks().
 
     A job a backfill queued, see cli.backfill_queue(), runs here too, with "backfill" in its job. It runs the checks and
     the decision of an import on its file, as --check --apply runs them, see cli.backfill_file(): under an import's time
@@ -1259,9 +1311,7 @@ def deep_analysis(name, pending, claimed=False):
                     rec = run(lock, False)
             rec["job"] = name
     except subtitles.Yielded as ex:
-        logs.log(dict(rec, result="yielded", note=str(ex)))
-        if getattr(ctx, "st", None) and list(file_key(ctx.st)) != job.get("key"):   # a step of the run changed the file, see process.refresh()
-            put_job(name, dict(job, key=file_key(ctx.st)), claimed)
+        logs.log(dict(rec, result="yielded", note=str(ex)))   # a change of its own gave the stored job its key, see carry_marks()
         if claimed:   # back to the deep analysis queue, unless a newer import queued the path again meanwhile
             requeue(name)
         return
