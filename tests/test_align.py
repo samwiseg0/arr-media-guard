@@ -488,6 +488,26 @@ def test_the_judge_posts_10_lines_in_a_row_0_75_s_off(n, off):
     assert [(x["first"], x["last"]) for x in j["off"]] == ([(120 - n, 119)] if off else [])
 
 
+@pytest.mark.parametrize("n, late, off", [(10, -1.5, True), (10, 0.77, True), (10, 0.73, False), (9, -1.5, False)])
+def test_the_judge_posts_10_lines_in_a_row_off_in_the_middle_of_the_file(n, late, off):
+    """n lines from line 50 on sit late seconds off, and nothing moves. A change point costs 3.75. 10 lines 0.77 s late
+    cost 7.7 with the curve, more than two change points, so they split off. 10 lines 0.73 s late cost 7.3 and stay with
+    the curve. 9 lines 1.5 s off split off, but they are under "dense run" and under "tight move", so they post
+    nothing."""
+    cues, ws, _ = track(late=lambda i: late if 50 <= i < 50 + n else 0.0, gap=lambda i: 3.5)
+    j = align.judged(cues, align.anchors(cues, align.heard(ws), frozenset()), {})
+    assert [(x["first"], x["last"]) for x in j["off"]] == ([(50, 59)] if off else [])
+
+
+def test_the_judge_posts_10_lines_off_by_different_amounts_in_the_middle_of_the_file():
+    """Lines 50 to 59 sit 1.4 to 3 s early, each by its own amount, as captions that squeeze the pauses. Nothing moves.
+    The judge names the 10 lines at their median offset."""
+    lags = [-1.4, -2.8, -2.7, -2.6, -2.6, -2.5, -2.8, -2.7, -3.0, -2.7]
+    cues, ws, _ = track(late=lambda i: lags[i - 50] if 50 <= i < 60 else 0.0, gap=lambda i: 3.5)
+    (off,) = align.judged(cues, align.anchors(cues, align.heard(ws), frozenset()), {})["off"]
+    assert (off["first"], off["last"], off["lines"]) == (50, 59, 10) and off["late"] == pytest.approx(-2.7 - LEAD, abs=0.05)
+
+
 def test_two_stretches_side_by_side_of_opposite_sign_keep_every_line():
     """Lines from 50 to 72 s sit 1 s late, and from 74 to 96 s 1 s early. The judge names both, each with every one of
     its lines. The line at 73 s between them sits in time, and it may join one of them."""
@@ -528,3 +548,41 @@ def test_unheard_lines_far_enough_from_the_line_ahead_take_the_smaller_move():
     cues, ws, _ = unheard_track(6.0)
     got = align.run(cues, ws)
     assert [round(got["moves"][i]["start"] - cues[i][0], 2) for i in (98, 99)] == [round(LEAD - 4.0, 2)] * 2
+
+
+def test_lines_with_no_anchor_yield_to_a_moved_line_that_would_reach_them():
+    """Lines 40 to 81 sit 2 s early, and lines 70 to 80 start 1 s apart. Lines 80 and 81 are never heard, and line
+    80's speech starts 1.2 s after line 79's. Line 79 moves onto its speech, 0.8 s past line 80's old start. Line 80
+    moves on to "shown" after it. Else apply_order() sends line 79 back, and lines 70 to 78 after it. Line 81 sits
+    clear of line 80 and stays."""
+    cues, ws, speech = track(late=lambda i: -2.0 if 40 <= i <= 81 else 0.0, gap=lambda i: 1.2 if i == 79 else 1.0 if 70 <= i < 79 else 3.0)
+    ws = [dict(ws[0], words=[x for x in ws[0]["words"] if not any(speech[i] <= x[0] < speech[i] + 1.0 for i in (80, 81))])]
+    got = align.run(cues, ws)
+    new = starts(cues, got)
+    assert moved(got) == list(range(40, 81))
+    assert all(abs(new[i] - (speech[i] + LEAD)) < 0.01 for i in range(40, 80))
+    assert new[80] == pytest.approx(new[79] + T["shown"]) and got["moves"][80]["why"] == "yield"
+
+
+@pytest.mark.parametrize("wall, got", [(1.9, {1: 1.8}), (1.7, {})])
+def test_a_chain_of_yields_keeps_a_smaller_old_gap(wall, got):
+    """Lines start 0.3 s apart. Line 0 moves 1.8 s late, and line 2 moves wall seconds late. Line 1 has no move and no
+    anchor. It moves on to 0.3 s past line 0, the gap the two had, and only when it then starts 0.3 s or more before
+    line 2."""
+    cues = [(10.0, 10.2, ""), (10.3, 10.5, ""), (10.6, 10.8, "")]
+    assert align.yielded(cues, {0: 11.8, 2: 10.6 + wall}, {0: 1.8, 2: wall}) == pytest.approx(got)
+
+
+def test_a_line_that_two_chains_reach_stays():
+    """Line 0 moves 2 s late, and line 4 moves 2.5 s early. Each pushes the lines with no move and no anchor next to it,
+    up to a line it does not reach. Both reach line 2, so line 2 stays."""
+    cues = [(10.0, 10.1, ""), (10.1, 10.2, ""), (11.5, 11.6, ""), (14.0, 14.1, ""), (14.2, 14.3, "")]
+    assert align.yielded(cues, {0: 12.0, 4: 11.7}, {0: 2.0, 4: -2.5}) == pytest.approx({1: 2.0, 3: -2.5})
+
+
+@pytest.mark.parametrize("wall, got", [(14.0, {1: 1.3, 2: 0.8}), (12.6, {})])
+def test_a_chain_of_yields_moves_only_when_it_ends_clear_of_the_next_line(wall, got):
+    """Line 0 moves 1.8 s late. Lines 1 and 2 have no move and no anchor, and each moves on to 0.5 s past the line before
+    it. Line 3 has an anchor and stays. When line 2 would then start under 0.5 s before it, no line yields."""
+    cues = [(10.0, 11.0, ""), (11.0, 12.0, ""), (12.0, 13.0, ""), (wall, wall + 1.0, "")]
+    assert align.yielded(cues, {0: 11.8, 3: wall}, {0: 1.8}) == pytest.approx(got)

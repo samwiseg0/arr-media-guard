@@ -1879,7 +1879,10 @@ extra whose name maps to other episodes still refuses the file, and the refusal 
 
 **The swap.** The original must still have the inode, size and mtime it had before the remux. With
 a new name, a `converting` line and a pending entry in the state store come first. The entry names the process and
-its pid namespace. A later run reports an entry whose process is gone. The pid of another namespace, as of a
+its pid namespace. A later run reports an entry whose process is gone. It drops such an entry instead, with one log
+line, when the held name and every hidden extra are gone and one of the original and the new file is there. A later
+run or a person finished the conversion in that case. With both files there, or neither, as on a share that is not
+mounted, the entry stays. A converted entry waits for its settle. The pid of another namespace, as of a
 container beside the host, means nothing here, so such an entry counts as running for one day
 (`JOB_MAX_AGE`), and as stopped after that. A restart of a container or an LXC gives a new namespace, and the
 day keeps such an entry from hiding for ever. The extras move
@@ -3809,6 +3812,12 @@ that hearing of a library would take weeks.
      the two anchored lines then move the two moves weighed by their place between them at most, and keep their order.
      That holds only when no gap between them then needs an order cut. Else they take the smaller move as before. On
      a drift of 45 seconds, one long line that its author started 4.6 seconds late sent 192 lines back that way.
+     A line with no anchor that no segment moves can sit in the way of a moved line next to it. The moved line stops
+     at its own speech at most, so that line's speech comes later. It then moves on to 0.5 seconds past the moved
+     line, or to the gap the two had, and pushes the next such line the same way (`align.yielded()`). The chain moves
+     only when it ends clear of the next line with a move or an anchor. Else the order step decides, as below. On a
+     block 2 to 3.8 seconds early whose last two lines were never heard, the moved last line landed 0.7 seconds past
+     them, and the order step sent the 10 lines of the block back.
      No line crosses another. Two line starts stay 0.5 seconds apart after the moves, or
      as far apart as they were. The line that moved toward the other yields, and never past its old start. A line cut
      more than 1 second short of its move stays, so later lines never pile up behind it. A move that would start a
@@ -3898,7 +3907,14 @@ evidence give the stretches still off.
   timing". When its moves took effect, it reads the curve fitted again at the new starts, and else the lines where they
   sit. A stretch still off is a segment of 10 anchors or more that sits 0.75 seconds or more off. Shorter runs posted
   the scene lag of real tracks in time. So is a segment of 3 anchors or more that sits 2 seconds or more off, with its
-  anchors within 0.4 seconds of its line. A post edits nothing, so it takes looser evidence than a move. A stretch runs
+  anchors within 0.4 seconds of its line. A post edits nothing, so it takes looser evidence than a move. In the fit,
+  an anchor costs its distance from the curve, 1 second at most. The curve fitted again prices a change point at 3.75
+  seconds, half of what 10 anchors cost that sit 0.75 seconds off. A stretch in the middle of the file needs two
+  change points. So 10 anchors with little scatter split off there when they sit farther off than 0.75 seconds. At 1
+  second off or farther, a segment splits off from 4 anchors at a file end and from 8 in the middle. Up to 2.24.0 the
+  judge priced a change point as the first pass does, at 5 seconds. Two change points then cost as much as 10 anchors
+  1 second off or farther, and no stretch of 10 anchors split off in the middle of a file, at any offset. On captions
+  1.5 to 3.8 seconds early, 10 anchored lines in the middle of the file posted nothing. A stretch runs
   from its earliest line to its latest, and sits off by its segment's level. It counts every line between its first
   and last anchored line. A stretch that starts at the first anchored line starts at the subtitle's first line, because no
   line before it was heard in time. One that ends at the last anchored line runs to the subtitle's last line the same

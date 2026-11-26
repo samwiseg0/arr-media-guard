@@ -1151,9 +1151,10 @@ def test_a_stop_after_an_import_conversion_lets_the_next_run_settle_its_extras(e
     hook.requeue(name)
     entry = dict(entry, pid=entry["pid"] + 1)   # the job process exited
     hook.pending_edit(key, entry)
-    other = os.path.join(os.path.dirname(folder), "Film B (1981)", "Film B (1981).mkv")
+    other, held = os.path.join(os.path.dirname(folder), "Film B (1981)", "Film B (1981).mkv"), os.path.join(folder, ".held")
+    open(held, "w").close()   # the original of the held entry, so the worker start reports it
     others = {"radarr:8:other": dict(entry, owner=8, path=other[:-4] + ".mp4", new=other, old_id=21, extras=[]),
-              "radarr:7:held": dict(entry, state="held", extras=[])}   # a kill cut this one before the import
+              "radarr:7:held": dict(entry, state="held", held=held, extras=[])}   # a kill cut this one before the import
     for k, e in others.items():
         hook.pending_edit(k, e)
     monkeypatch.setattr(hook, "job_alive_pid", lambda pid, start=None: False)

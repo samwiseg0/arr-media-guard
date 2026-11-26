@@ -14,8 +14,9 @@ Whisper hears the whole file. run() then times every line of a subtitle against 
 3. plan(): one gate for every segment. The fewer anchors a segment has, the farther off it must sit to move on
    Whisper alone. The speech onsets can agree or disagree. A segment moves the lines it covers, see owners().
 4. The moves keep the screen sound. An anchored line moves toward its own speech and never past it. A line with no
-   anchor moves no farther than the anchored lines around it, see short_of_speech(). No line crosses another, see
-   apply_order(). Ends keep their length, see ends().
+   anchor moves no farther than the anchored lines around it, see short_of_speech(). A line with no move and no anchor
+   yields to a moved line that would reach it, see yielded(). No line crosses another, see apply_order(). Ends keep
+   their length, see ends().
 5. Live captions sit off by a different time each line. On such a track each line moves onto its own speech, see
    per_line().
 6. judged(): the curve fitted again where the moves put the lines, and the stretches still off.
@@ -304,6 +305,30 @@ def short_of_speech(cues, at, mv):
     return out
 
 
+def yielded(cues, at, mv):
+    """{line index: move} of the lines with no move and no anchor that a moved line next to them would reach. The moved
+    line stops at its own speech at most, so such a line's speech comes after it. It moves on to "shown" past that
+    line, or to the gap the two had when that is smaller, as apply_order() spaces them. The next such line moves on
+    the same way. A chain that would reach a line with a move or an anchor moves no line, and apply_order() decides
+    there. A line that two chains reach stays."""
+    s0, claim = [c[0] for c in cues], {}
+    for p, m in mv.items():
+        step = 1 if m > 0 else -1
+        i, prev, pos, chain = p + step, p, s0[p] + m, []
+        while 0 <= i < len(cues) and i not in mv and i not in at:
+            pos += step * min(T["shown"], abs(s0[i] - s0[prev]))
+            if (pos - s0[i]) * step <= 0:
+                break
+            chain.append((i, pos - s0[i]))
+            prev, i = i, i + step
+        else:
+            if chain and 0 <= i < len(cues) and (s0[i] + mv.get(i, 0.0) - pos) * step < min(T["shown"], abs(s0[i] - s0[prev])):
+                chain = []
+        for k, d in chain:
+            claim.setdefault(k, []).append(d)
+    return {k: d[0] for k, d in claim.items() if len(d) == 1}
+
+
 def apply_order(cues, news, pile=True):
     """{line index: new start} of news cut short where a line would cross another, or start under "shown" from it
     (or under the gap the two had). The line that moved toward the other yields, never past its old start. With pile,
@@ -392,13 +417,17 @@ def judged(cues, at, news):
     anchored line, and how late its lines sit against their speech, in seconds. "off" holds the stretches still off,
     each {"at", "to", "lines", "late", "first", "last"} in the same terms, at and to in seconds of the file. A stretch
     is a segment of TIMING "dense run" anchors or more that sits TIMING "alert" or more off. It is also a segment of
-    "tight anchors" or more that sits "tight move" off, with its anchors within "post spread" of its line."""
+    "tight anchors" or more that sits "tight move" off, with its anchors within "post spread" of its line.
+
+    Two change points of the curve cost what "dense run" anchors cost that sit "alert" off. So such a stretch in the
+    middle of the file splits off when it sits farther off or holds more anchors."""
     keys = sorted(at)
     if len(keys) < T["judge anchors"]:
         return {"judged": False, "anchors": len(keys), "curve": [], "off": []}
     ys = [news.get(i, cues[i][0]) for i in keys]
     segs, off = [], []
-    for a, b, r, v in curve([at[i] for i in keys], ys, T["fit change"], rates=(Fraction(1),)):
+    change = T["dense run"] * T["alert"] / (2 * T["fit cap"])
+    for a, b, r, v in curve([at[i] for i in keys], ys, change, rates=(Fraction(1),)):
         late, n = v - LEAD, b - a + 1
         segs.append({"first": keys[a], "last": keys[b], "anchors": n, "late": round(late, 2)})
         spread = statistics.median(abs(ys[k] - at[keys[k]] - v) for k in range(a, b + 1))
@@ -422,7 +451,8 @@ def run(cues, windows, onsets=(), lang="eng"):
     - "moves": {line index: {"start", "end", "segs", "why"}} of each line whose times change. "segs" are the indices
       in "curve" of the segments that moved it. "why" is "curve" (it moved with its segments), "speech" (it stops at
       its own speech), "order" (it stops short of a line next to it), "live" (onto its own speech), "between" (by
-      the smaller move of the anchored lines around it, or the two moves weighed by its place) or "end" (only its end changes, as the next line moved).
+      the smaller move of the anchored lines around it, or the two moves weighed by its place), "yield" (a moved line
+      next to it pushed it on, see yielded()) or "end" (only its end changes, as the next line moved).
     - "judge": the view of judged() at the new starts.
 
     The first pass fits the curve at every ratio of subsync.RATES, and at the ratio of free_rate() when the anchors
@@ -455,6 +485,9 @@ def run(cues, windows, onsets=(), lang="eng"):
         total = {i: mv.get(i, (0.0,))[0] + mv2.get(i, (0.0,))[0] for i in segs_of}
         want = short_of_speech(cues, at, total)
         why = {i: "curve" if abs(m - total[i]) <= 1e-9 else "speech" if i in at else "between" for i, m in want.items()}
+        pushed = yielded(cues, at, want)
+        why.update(dict.fromkeys(pushed, "yield"))
+        want.update(pushed)
         news = apply_order(cues, {i: cues[i][0] + m for i, m in want.items() if cues[i][0] + m >= 0})   # never before the file's start
     out.update(curve=recs, live=scatter >= T["live scatter"])
     for i, e in ends(cues, news).items():

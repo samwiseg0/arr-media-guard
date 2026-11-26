@@ -1041,7 +1041,10 @@ def pending_recover(app, settle_them):
     """The pending conversions of app that no running process owns, see pending_edit(). A converted one gets the
     settle() a kill cut short, when settle_them. Any other stopped between the swap and the import: its original may
     still hide under held_name(), and its extras in hide_dir. Those are printed and logged for a person, posted once per
-    pending entry, and nothing moves. Returns the entries it reported. Only a --convert run settles, so the post names
+    pending entry, and nothing moves. Such an entry goes, with one log line and no print or post, when the held name
+    and every hidden extra are gone and one of the original and the new file is there. A later run or a person
+    finished it in that case. With both files there, two files wait for a person. With neither, as on a share that is
+    not mounted, the state is unknown. The entry stays in both cases. Returns the entries it reported. Only a --convert run settles, so the post names
     it as the check, and the worker's names the worker's start, see report.CHECKS. The worker's leaves out a converted
     one whose new file is the path of a queued import job. A stop cut that job, and its next run settles it, see
     left_converted().
@@ -1069,7 +1072,21 @@ def pending_recover(app, settle_them):
     for owner, keys in sorted(done.items()):
         out = settle_extras(app, owner, keys)
         logs.log(dict(app=app, source="backfill", ids={"app_id": owner}, result="settle", settle=out, note="left by a stopped run"))
-    stranded = {k: e for k, e in rest.items() if k not in {x for v in done.values() for x in v}}
+    def left_alone(e):   # the one file of a stopped entry when nothing else of it is on disk, else None. An entry with a name missing stays.
+        if e.get("state") == "converted" or any(e.get(n) is None for n in ("held", "path", "new", "extras")) \
+                or os.path.lexists(e["held"]) or any(os.path.lexists(h) for h, _ in e["extras"]):
+            return None
+        there = [p for p in {e["path"], e["new"]} if os.path.lexists(p)]
+        return there[0] if len(there) == 1 else None
+    alone = {k: left_alone(e) for k, e in rest.items() if k not in {x for v in done.values() for x in v}}
+    for k, there in alone.items():
+        if there:
+            pending_edit(k)
+            logs.log(dict(app=app, source="backfill", result="pending dropped", path=rest[k]["path"],
+                          note=f"a conversion to MKV stopped partway{STOPPED.get(rest[k].get('state'), '')}, and nothing of it waits for a person "
+                               f"now. Only {there} is there, with no hidden original and no hidden extras. A later run or a person finished it, "
+                               "or the run stopped before its first move"))
+    stranded = {k: rest[k] for k, there in alone.items() if not there}
     for k, e in stranded.items():
         note = (f"a conversion to MKV finished, and its {len(e.get('extras') or [])} extras wait in {config.CFG.hide_dir} for the next "
                 "--convert run" if e.get("state") == "converted" else

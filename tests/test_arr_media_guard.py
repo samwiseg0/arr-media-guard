@@ -11434,6 +11434,63 @@ def test_a_stranded_conversion_is_reported_and_nothing_moves(env, monkeypatch, c
                      for check in ("Command line run", "Worker start")]
 
 
+def stopped_entry(env, monkeypatch, state, there, held=False, extra=False):
+    """The pending entry of a stopped conversion of x.avi to x.mkv with one extra, x.nfo. there names the files at
+    their names, held puts the original at its held name, and extra hides the extra."""
+    folder = os.path.dirname(env["path"])
+    path, hide = os.path.join(folder, "x.avi"), os.path.join(folder, hook.CFG.hide_dir)
+    entry = dict(app="radarr", owner=7, path=path, new=path[:-4] + ".mkv", held=hook.held_name(path), state=state, pid=999999,
+                 extras=[[os.path.join(hide, "x.nfo"), os.path.join(folder, "x.nfo")]])
+    for p in [os.path.join(folder, n) for n in there] + [entry["held"]] * held + [entry["extras"][0][0]] * extra:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").close()
+    hook.pending_edit("radarr:1:ab", entry)
+    monkeypatch.setattr(hook, "job_alive_pid", lambda pid, start=None: False)
+
+
+@pytest.mark.parametrize("state, there", [("stranded", ["x.mkv"]), ("held", ["x.mkv"]), ("swapping", ["x.avi"]), ("converted", ["x.mkv"])])
+def test_a_stopped_conversion_that_a_later_run_finished_goes(env, monkeypatch, capsys, state, there):
+    """Report 2026-11-26: a conversion stranded when the app did not answer the import, and a later run converted the
+    file again. Every worker start then printed the old entry. The disk shows one file and no hidden one, so the entry
+    goes with one log line, and nothing prints or posts. A converted entry waits for the settle of a --convert run,
+    which links its extras."""
+    stopped_entry(env, monkeypatch, state, there)
+    got, out = hook.pending_recover("radarr", False), capsys.readouterr().out
+    posts = [b for m, u, b in env["http"] if m == "POST"]
+    if state == "converted":
+        assert list(got) == ["radarr:1:ab"] and "STRANDED" in out and len(posts) == 1
+        return
+    assert (got, hook.pending_edit(), out, posts) == ({}, {}, "", [])
+    (line,) = [r for r in log_lines(env) if r.get("note")]
+    assert line["result"] == "pending dropped" and line["path"].endswith("/x.avi")
+    assert f"now. Only {os.path.join(os.path.dirname(env['path']), there[0])} is there, with no hidden original and no hidden extras. " in line["note"]
+
+
+@pytest.mark.parametrize("there, held, extra", [(["x.avi", "x.mkv"], False, False), (["x.mkv"], True, False), ([], False, False),
+                                                (["x.mkv"], False, True)], ids=["both files", "held name", "no mount", "hidden extra"])
+def test_a_stopped_conversion_stays_while_the_disk_holds_work_for_a_person(env, monkeypatch, capsys, there, held, extra):
+    """Both files at their names wait for a person, and so does the original at its held name or a hidden extra. With
+    neither file there, as on a share that is not mounted, the state is unknown. The entry stays and prints in each case."""
+    stopped_entry(env, monkeypatch, "stranded", there, held, extra)
+    assert list(hook.pending_recover("radarr", False)) == ["radarr:1:ab"] == list(hook.pending_edit())
+    assert "STRANDED" in capsys.readouterr().out and [r["result"] for r in log_lines(env) if r.get("note")] == ["warning"]
+
+
+@pytest.mark.parametrize("name", ["held", "path", "new", "extras"])
+def test_a_stopped_conversion_with_a_name_missing_stays(env, monkeypatch, capsys, name):
+    """An entry that lacks one of its names cannot show that nothing waits for a person. It stays and prints, and the
+    entries beside it still report."""
+    stopped_entry(env, monkeypatch, "stranded", ["x.mkv"])
+    entry = hook.pending_edit()["radarr:1:ab"]
+    hook.pending_edit("radarr:1:ab", {k: v for k, v in entry.items() if k != name})
+    other = os.path.join(os.path.dirname(entry["path"]), "y.avi")
+    hook.pending_edit("radarr:2:cd", dict(entry, state="held", path=other, new=other[:-4] + ".mkv", held=hook.held_name(other)))
+    os.makedirs(os.path.dirname(hook.held_name(other)), exist_ok=True)
+    open(hook.held_name(other), "w").close()
+    assert sorted(hook.pending_recover("radarr", False)) == ["radarr:1:ab", "radarr:2:cd"]
+    assert capsys.readouterr().out.count("STRANDED") == 2
+
+
 @pytest.mark.parametrize("app_says, result", [("new", "completed"), ("nothing", "stranded")])
 def test_an_undo_reads_the_app_before_it_deletes(env, monkeypatch, app_says, result):
     """The import went through, then a read of the app failed. The undo reads the app again: it
