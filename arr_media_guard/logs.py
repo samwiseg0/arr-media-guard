@@ -187,6 +187,7 @@ def post(app, name, emb):
 DEEP_KINDS = ("submatch", "subtiming")   # the alert kinds the deep analysis checks again, see alert_findings()
 HOLD_RESULT = "held for the deep analysis"   # what alert_findings() gives for an alert it holds
 STOPPED_RESULT = "not posted, the run was stopped"   # what alert_findings() gives for a finding the stop caused
+NO_MARKER = object()   # what alert() reads for a file, kind and size with no marker
 
 
 def alert_findings(rec, size, held=None):
@@ -196,10 +197,10 @@ def alert_findings(rec, size, held=None):
     sent for the same file, see alert().
 
     held is a list when the deep analysis of the file follows this import, see process.alerts(). A finding of
-    DEEP_KINDS that would post then goes into held as its kind, size and embed, the subtitles it names as "keys", see
-    report.named(), with the places its timing outcome left off as "spans", see report.named_spans(), and the places
-    after the run of the tracks whose flags it says were turned off as "flags", see report.tells(). It gives
-    HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
+    DEEP_KINDS that would post then goes into held as its kind, size and embed, its reason as "why", see report.reason(),
+    the subtitles it names as "keys", see report.named(), with the places its timing outcome left off as "spans", see
+    report.named_spans(), and the places after the run of the tracks whose flags it says were turned off as "flags", see
+    report.tells(). It gives HOLD_RESULT. The deep analysis posts what it still finds, or post_held() posts these when
     nothing judged those subtitles again, see runner.held_after(). An alert whose name NOTIFICATION_POSTS leaves out is
     never held, see report.post_name(). When NOTIFICATION_POSTS lists a name of config.CHANGES, a held finding keeps the
     change posts of what it says itself in "changes", see report.held_posts(): a removed track, a flag it says was
@@ -224,11 +225,11 @@ def alert_findings(rec, size, held=None):
             changes = report.held_posts(rec, f, report.tense_of(rec)) if config.wanted(config.CHANGES) else []
             spans = report.named_spans(rec, f) if f["kind"] == "subtiming" else {}   # the places the deep analysis must hear again
             flags = sorted(report.tells(f, report.track_langs(rec, after=True))["flags"])   # the deep analysis says them again, see process.subtitle_checks()
-            held.append({"kind": f["kind"], "size": size, "embed": e, "keys": report.named(rec, f), **({"changes": changes} if changes else {}),
-                         **({"spans": spans} if spans else {}), **({"flags": flags} if flags else {})})
+            held.append({"kind": f["kind"], "size": size, "embed": e, "why": report.reason(f, rec), "keys": report.named(rec, f),
+                         **({"changes": changes} if changes else {}), **({"spans": spans} if spans else {}), **({"flags": flags} if flags else {})})
             out.append(HOLD_RESULT)
         else:
-            out.append(alert(rec["app"], report.post_name(f), marker(f, rec), rec["path"], size, e))
+            out.append(alert(rec["app"], report.post_name(f), marker(f, rec), rec["path"], size, e, report.reason(f, rec)))
     if config.wanted(config.CHANGES):
         try:
             rec["change_result"] = [post(rec["app"], name, e) if isinstance(e, dict) else e for name, e in report.render(rec, "changes")]
@@ -278,15 +279,26 @@ def discord_test():
         return False, hide(f"The test message failed: {type(ex).__name__}: {ex}")
 
 
-def alert(app, name, kind, path, size, emb):
-    """Post the embed emb of the post name once per file, problem kind and size. A marker in the store remembers each
-    one sent. A post whose name NOTIFICATION_POSTS leaves out writes no marker, so the next one posts once the name is
-    listed, see post()."""
+def alert(app, name, kind, path, size, emb, why=None):
+    """Post the embed emb of the post name once per file, problem kind, size and reason. why is the reason, see
+    report.reason(). A marker in the store remembers each one sent, with a hash of why. A rerun with the same reason gives
+    "already sent". A new reason takes the place of the old one in the marker, and the embed posts. A marker of 2.23.1
+    or older holds no reason. It counts as the same reason and takes this one, so an upgrade posts no old problem again.
+    With no why, as for an alert that 2.23.1 held or a content alert of a run whose TMDB read failed, any marker
+    counts. A failed post drops the marker only while it holds this reason. So a reason that another process put in
+    stays, and the old reason may post once more. A post whose name NOTIFICATION_POSTS leaves out writes no marker, so
+    the next one posts once the name is listed, see post()."""
     if not config.wanted(name): return OFF_RESULT
-    mark = hashlib.sha1(f"{kind}|{path}|{size}".encode()).hexdigest()
+    mark, new = hashlib.sha1(f"{kind}|{path}|{size}".encode()).hexdigest(), None if why is None else hashlib.sha1(why.encode()).hexdigest()
     try:   # the marker is claimed before the post, so two job processes never send the same embed
-        if not store.add("alert", mark):
-            return "already sent"
+        if not store.add("alert", mark, new):
+            with store.tx():   # one lock over the read and the change of the reason
+                old = store.get("alert", mark, NO_MARKER)
+                if old is not NO_MARKER and (new is None or old in (None, new)):
+                    if old is None and new:
+                        store.put("alert", mark, new)
+                    return "already sent"
+                store.put("alert", mark, new)
     except (sqlite3.Error, OSError):   # a lost marker costs one repeated embed, never the decision line
         mark = None
     sent = None
@@ -295,16 +307,16 @@ def alert(app, name, kind, path, size, emb):
     finally:
         if sent != "sent" and mark:   # a later run tries again, also after a stop during the post
             with ff.held_off(), contextlib.suppress(sqlite3.Error, OSError):   # the store's checks would raise the stop again
-                store.drop("alert", mark)
+                store.drop("alert", mark, value=new)
     return sent
 
 
 def post_held(app, path, held):
-    """Post the alerts an import held for the deep analysis of path, see alert_findings(), each once per file, kind and
-    size, see alert(). A held alert is of DEEP_KINDS, so its kind is its post name. Each embed takes the time of the
-    post. Returns what each post gave."""
+    """Post the alerts an import held for the deep analysis of path, see alert_findings(), each once per file, kind, size
+    and reason, see alert(). A held alert is of DEEP_KINDS, so its kind is its post name. An alert that 2.23.1 held has
+    no reason. Each embed takes the time of the post. Returns what each post gave."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    return [alert(app, h["kind"], h["kind"], path, h["size"], dict(h["embed"], timestamp=now)) for h in held]
+    return [alert(app, h["kind"], h["kind"], path, h["size"], dict(h["embed"], timestamp=now), h.get("why")) for h in held]
 
 
 def held_changes(app, held, why, flags=frozenset()):

@@ -698,7 +698,7 @@ def subtitle_checks(ctx):
             kept_for[p] = "text"
     tagged = {f"s{n}": decide.track_tag(t.get("properties") or {}) for n, t in enumerate((t for t in j.get("tracks") or [] if t.get("type") == "subtitles"), 1)}
     texts = {p: remux.text_entry(tagged[p], codecs[p], True)
-             for p in unmatched - set(strip) - set(kept_for) if codecs.get(p) in remux.TEXT_EXT} if config.CFG.keep_days else {}
+             for p in sorted(unmatched - set(strip) - set(kept_for)) if codecs.get(p) in remux.TEXT_EXT} if config.CFG.keep_days else {}
     remux.broken_plan(path, texts)
     kept_for.update({p: "names" for p, e in texts.items() if e["reused"]})
     remove = sorted(unmatched - set(strip) - set(kept_for)) if config.CFG.keep_days else []   # a removal keeps the original, so KEEP_ORIGINALS_DAYS 0 keeps the track
@@ -736,11 +736,11 @@ def subtitle_checks(ctx):
             but = "its cues do not read now" if not cs else "a line with no text would pass a line that keeps its time"
             timed_by[k] = dict(timed_by[k], timing={"fix": None, "unfixed": timed_by[k]["timing"]["fix"]["offset"],
                                                     "why": f'{timed_by[k]["timing"]["why"]}, but {but}, so the times stay'})
-    moves = {p: x for p in {*blocks, *starts} if p not in sides and p not in others and p not in recode and p not in strip and codecs.get(p) in config.TEXT_CODECS
+    moves = {p: x for p in sorted({*blocks, *starts}) if p not in sides and p not in others and p not in recode and p not in strip and codecs.get(p) in config.TEXT_CODECS
              and (x := plan(p, cues_of(p), fixes.get(p), codecs[p] in ("S_TEXT/ASS", "S_TEXT/SSA")))}
     timing_of = lambda n: ({**sync, **timed_by}.get(n) or {}).get("timing") or {}
     side_cue = lambda n: subtitles.side_cues({**others, **sides}[n])
-    side_moves = {n: x for n in {*blocks, *starts} if (n in sides or n in others) and n not in bad_sides
+    side_moves = {n: x for n in sorted({*blocks, *starts}) if (n in sides or n in others) and n not in bad_sides
                   and (n not in starts or subtitles.same_cues(side_cue(n), items[n][2])) and (x := plan(n, side_cue(n), timing_of(n).get("fix"), False))}
     # A repair of a sidecar's text takes the place of its other changes in this run, as for a track. Its verdicts and
     # times wait for a run that reads its readable text.

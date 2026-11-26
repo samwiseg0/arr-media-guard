@@ -750,8 +750,12 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     only the start check sees a file start that is off. In an MP4 or TS such a track has stored times in both files,
     and its start check allows one tick of the new file, see mkv_slack().
     Every packet must also keep its time against its stream's first packet, see times_fault(). Those checks run for every stream, whatever passed its data.
+    Each video stream must also keep its display shape, see shape_fault(). That refusal counts on its own, so a force
+    of another refusal of the stream does not cover it.
     ffmpeg reads an MPEG program stream original with -fflags +genpts, see packet_hashes(). Without it a picture that
-    stores no PTS takes its DTS, one frame or more before mkvmerge and the decoders show it.
+    stores no PTS takes its DTS, one frame or more before mkvmerge and the decoders show it. The video of such a
+    Matroska copy keeps its stored times, see convert.kept_times(). A sorted check cannot see two pictures that swap
+    their times, so each picture of the original also pairs with its block of the copy in file order.
 
     Some differences pass. mkvmerge drops a cut last frame, the stream's last packet, when every
     other packet matches. The proof entry names it in dropped, with its time and size. An audio stream may also lose a
@@ -1124,12 +1128,21 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
             if why and fb.startswith("matroska") and not stored:   # ffmpeg's muxer may move a few times of its read, see packet_places()
                 got = [None if v != v else v for v in (pb.get(t["index"]) or [[]])[0]]
                 why, proof[-1]["times"]["reread"] = times_fault(name, s["codec_name"], xt, got[ycut])
+            if not why and fam == "mpeg" and s["codec_type"] == "video" and fb.startswith("matroska"):   # each picture keeps its own time, see kept_times()
+                got = [None if v != v else v for v in (pb.get(t["index"]) or [[]])[0]]
+                why, proof[-1]["times"]["paired"] = times_fault(name, s["codec_name"], xt, got[ycut], paired=True)
         proof[-1]["match"] = not why
         if why and bad is not None:
             proof[-1]["refused"] = why   # refused for its packets: audio_damage() counts it when another stream failed first
         whys += [why] if why else []
         if why and not fault:
             fault, stream = why, bad
+        if s["codec_type"] == "video":   # a player shows each picture at the display shape of its stream
+            proof[-1]["shape"] = [aspect(display_shape(s)), aspect(display_shape(t))]
+            if shaped := shape_fault(name, s["codec_name"], s, t):
+                proof[-1]["match"] = False
+                whys.append(shaped)
+                fault = fault or shaped
     for s, t in text:
         what, cb = f"the {s['codec_name']} stream {s['index']}", srt_cues(tb[t["index"]], -round(vb * 1000))
         if s["index"] in recoded:   # the new text, with the original's times
@@ -1177,6 +1190,43 @@ def prove(src, tmp, subs, folder, captions=None, dropped=(), retimed=None, absol
     if refusals is not None:
         refusals.extend(whys)
     return ((stream, fault) if fault else None), proof
+
+
+def display_shape(s):
+    """The display shape of the ffprobe video stream s, its width times its sample aspect over its height, as a
+    Fraction, or None for a stream with no width or height. ffprobe gives the sample aspect that the container states,
+    else the one of the bitstream, as ffmpeg-based players show it. A stream with none, or with 0:1, has square pixels."""
+    if not (s.get("width") and s.get("height")):
+        return None
+    n, _, d = (s.get("sample_aspect_ratio") or "").partition(":")
+    sar = fractions.Fraction(int(n), int(d)) if n.isdigit() and d.isdigit() and int(n) and int(d) else 1
+    return fractions.Fraction(s["width"] * sar, s["height"])
+
+
+def aspect(r):
+    """The display shape r of display_shape() as "W:H", or None."""
+    return None if r is None else f"{r.numerator}:{r.denominator}"
+
+
+def shown_size(s, r):
+    """The size "WxH" in square pixels at which mpv shows the picture of the ffprobe stream s with the display shape r:
+    it widens the picture when its pixels are wide, else it makes it taller, and it drops the fraction of a pixel."""
+    w, h = s["width"], s["height"]
+    return f"{int(h * r)}x{h}" if r * h > w else f"{w}x{int(w / r)}"
+
+
+def shape_fault(name, codec, a, b):
+    """Why the new file shows the video stream name at another display shape than the original, or None (docs/design.md,
+    "Display shape"). a and b are the ffprobe streams of the original and the new file, see display_shape(). mkvmerge
+    writes the display width of a bitstream's sample aspect in whole pixels. So the shapes match when the display
+    widths at the original's picture height differ by less than 1 pixel. A stream with no size is not checked."""
+    x, y = display_shape(a), display_shape(b)
+    if x is None or y is None or abs(x - y) * a["height"] < 1:
+        return None
+    more = (y / x - 1) * 100
+    return (f"the MKV would show the picture {abs(more):.1f}% {'wider' if more > 0 else 'narrower'} than the original, at {shown_size(b, y)} "
+            f"where the original shows {shown_size(a, x)}. Detail: stream {name} ({codec}) has the display shape {aspect(y)} in the new file, "
+            f"{aspect(x)} in the original")
 
 
 def proof_bsf(fam, codec):

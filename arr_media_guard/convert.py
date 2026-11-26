@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 samwiseg0
 """The conversion of a file that is not Matroska into .mkv, and its import into the app."""
-import collections, contextlib, datetime, fcntl, json, os, re, select, shutil, struct, subprocess, threading, time, urllib.parse, uuid
+import collections, contextlib, datetime, fcntl, fractions, json, os, re, select, shutil, struct, subprocess, threading, time, urllib.parse, uuid
 
 from . import apps, checks, config, content, decide, ff, logs, matroska, mp4, proof, regrab, remux, runner, store, subtitles, ts, vault
 
@@ -282,38 +282,49 @@ def plays_on(times):
 
 
 def kept_times(path, j, streams, skip, folder):
-    """The mkvmerge options that keep the stored time of each audio frame of the MP4, TS or MPEG-PS path (docs/design.md,
-    "Kept audio times"). The times come from mp4.samples() or ts.frames(), as the proof reads them. Each audio track
-    that plays_on() marks gets a v4 timestamps file in folder, one line per frame with data in file order, and
-    --timestamps gives it to mkvmerge. A line is the frame's time less the file start, the earliest time of the tracks
-    the remux keeps, which mkvmerge moves to 0. For an MP4 that is start_shift(), with each video track as mkvmerge
-    presents it, before ffmpeg's start rule. For a TS it is the earliest time of a kept PID. mkvmerge applies no --sync
-    to a track with --timestamps, so each line of an MP4 adds start_base() of mp4_sync(). skip holds the ffprobe
-    indexes of the tracks the remux leaves out. mkvmerge numbers each track of j by its track_ID or PID, as ffprobe's
-    id does, and the AC-3 core of a TrueHD PID by that PID, see proof.ts_places(). A PCM track, a track with an empty frame
+    """The mkvmerge options that keep the stored time of each audio frame of the MP4, TS or MPEG-PS path, and of each
+    picture of the MPEG-PS path (docs/design.md, "Kept audio times" and "Kept video times"). The times come from
+    mp4.samples() or ts.frames(), as the proof reads them. Each audio track that plays_on() marks gets a v4 timestamps
+    file in folder, one line per frame with data in file order, and --timestamps gives it to mkvmerge. A line is the
+    frame's time less the file start, the earliest time of the tracks the remux keeps, which mkvmerge moves to 0. For an MP4 that is
+    start_shift(), with each video track as mkvmerge presents it, before ffmpeg's start rule. For a TS it is the
+    earliest time of a kept PID. mkvmerge applies no --sync to a track with --timestamps, so each line of an MP4 adds
+    start_base() of mp4_sync(). skip holds the ffprobe indexes of the tracks the remux leaves out. mkvmerge numbers
+    each track of j by its track_ID or PID, as ffprobe's id does, and the AC-3 core of a TrueHD PID by that PID, see proof.ts_places(). A PCM track, a track with an empty frame
     or a time that is not known, a read that fails and a start that is not known get no file. mkvmerge times them,
     and prove() decides. An MPEG program stream has no reader. Its times come from the proof's read of the original,
     packet_hashes() with genpts, and its file start is the earliest time of a kept stream in that read. mkvmerge 102
-    writes the audio of a program stream with no gaps. So a track gets a file when a frame of that read starts more
-    than TIME_SLACK after the end of the frame before. ffmpeg's muxer moves a time that goes back to the time before
-    it, so a track that plays_on() marks in that read gets none. Each track pairs with its stream by track_stream().
-    Another container gets none."""
+    writes the audio of a program stream with no gaps. So an audio track gets a file when a frame of that read starts
+    more than TIME_SLACK after the end of the frame before. ffmpeg's muxer moves a time that goes back to the time before
+    it, so an audio track whose times go back in proof.packet_places(), which only demuxes, gets none. Two frames at one
+    time keep their times in both reads, as a PES whose PTS is one frame low gives them, so such a track gets a file.
+    mkvmerge 102 times the video of a program stream on an exact frame grid, and a stored clock can run a few ticks a
+    second off that grid. So each video track gets a file too, with the times of the same read in display order, as
+    mkvmerge gives the k-th line to the k-th picture it shows. Two pictures at one time in that read mark a time that
+    ffmpeg's muxer moved, so such a track gets none. Each track pairs with its stream by track_stream(). Another
+    container gets none."""
     if (j.get("container") or {}).get("type") == "MPEG program stream":
         keep = [s for s in proof.media_streams(streams) if s["index"] not in skip]
+        timeout = max(600, os.path.getsize(path) / proof.PROOF_RATE)
         try:
-            got = proof.packet_hashes(path, [s["index"] for s in keep], {}, [], folder, max(600, os.path.getsize(path) / proof.PROOF_RATE),
-                                      genpts=True)[0]
+            got = proof.packet_hashes(path, [s["index"] for s in keep], {}, [], folder, timeout, genpts=True)[0]
+            demuxed = proof.packet_places(path, folder, timeout)
         except (RuntimeError, OSError, subprocess.TimeoutExpired):   # the proof's read fails too, and decides
             return []
         lo = min((v for t in got.values() for v in t["times"] if v is not None), default=None)
         args = []
-        for x in [x for x in j.get("tracks") or [] if x.get("type") == "audio"] if lo is not None else ():
+        for x in j.get("tracks") or [] if lo is not None else ():
             t = got.get(s["index"]) if (s := track_stream(j, x, keep)) else None
-            ns = [round((v - lo) * 1e9) for v in t["times"] if v is not None] if t else []
-            if not t or (x.get("codec") or "").startswith("PCM") or t["empty"] or len(ns) < len(t["times"]) or plays_on(ns) \
-                    or not any(b - e > proof.TIME_SLACK for e, b in zip(t["ends"], t["times"][1:])):
+            if not t or t["empty"] or None in t["times"]:
                 continue
-            args += remux.v4_file(folder, f"kept-{x['id']}.txt", x["id"], ns)
+            ns = [round((v - lo) * 1e9) for v in t["times"]]
+            d = (demuxed.get(s["index"]) or ((),))[0]
+            if x.get("type") == "video" and len(set(ns)) == len(ns):
+                args += remux.v4_file(folder, f"kept-{x['id']}.txt", x["id"], sorted(ns))   # the k-th line goes to the k-th picture shown
+            # b >= a is False for a time that goes back, and for one that is not known (NaN)
+            elif x.get("type") == "audio" and not (x.get("codec") or "").startswith("PCM") and len(d) == len(ns) \
+                    and all(b >= a for a, b in zip(d, d[1:])) and any(b - e > proof.TIME_SLACK for e, b in zip(t["ends"], t["times"][1:])):
+                args += remux.v4_file(folder, f"kept-{x['id']}.txt", x["id"], ns)
         return args
     mov = (j.get("container") or {}).get("type") == "MP4/QuickTime"
     if not mov and (j.get("container") or {}).get("type") != "MPEG transport stream":
@@ -346,6 +357,52 @@ def kept_times(path, j, streams, skip, folder):
     return args
 
 
+def display_dims(path, j, streams):
+    """{mkvmerge track id: "WxH"} of the --display-dimensions that keep the display shape of each video track of path,
+    which j describes (docs/design.md, "Display shape"). Each track pairs with its stream by track_stream(). H is the
+    picture height, and W the display width at that height in whole pixels, rounded half up. mkvmerge writes the shape
+    of a bitstream at the picture height too, 853x480 for 720x480 at 16:9. So the copy holds proof.display_shape() of
+    the stream within half a pixel, and a size that mkvmerge 102 writes anyway gives the same MKV.
+
+    An MPEG-1 sequence header stores the shape as a pel aspect ratio, and mkvmerge 102 never reads it. It writes the
+    picture size as the display size, and a program stream or a TS stores no shape of its own. So an MPEG-1 track of a
+    program stream or a TS gets a size when its shape differs from the picture's by 1 pixel or more of display width,
+    as proof.shape_fault() tells them apart. ffprobe reads the shape of an MP4 or QuickTime track from its pasp box,
+    and mkvmerge 102 never reads pasp. It writes the width and height of the track's tkhd box, rounded half up to whole
+    pixels, or the picture size when tkhd holds 0. ffmpeg writes tkhd at the picture size in a MOV. So an MP4 or MOV
+    track gets a size when that tkhd shape differs from the stream's by 1 pixel or more. A non-square shape that an
+    H.264, MPEG-2 or MPEG-4 part 2 bitstream states wins over tkhd, and the --display-dimensions win over both. They
+    change no packet. A track whose tkhd shape matches pasp gets none, also when its bitstream states another shape.
+    mkvmerge then writes the bitstream shape, and prove() refuses the copy, as for an MP4 with a pasp of 1:1 beside a
+    VUI of 32:27. A file whose sample tables do not read gets none, and prove() decides. mkvmerge 102 keeps the shape
+    of every other source, and prove() refuses a copy that loses it."""
+    c = (j.get("container") or {}).get("type")
+    if c == "MP4/QuickTime":
+        try:
+            r = mp4.samples(path)
+        except Exception:   # a reader that fails, as on a cut box header, see proof.mp4_places()
+            return {}
+        # {track_ID: the tkhd size in whole pixels, its 16.16 value rounded half up as mkvmerge 102 does}. mkvmerge numbers
+        # an MP4 track by its track_ID.
+        made = {} if r["error"] else {t["id"]: [(v + 0x8000) >> 16 for v in t["display"]] for t in r["tracks"]}
+    elif c not in ("MPEG program stream", "MPEG transport stream"):
+        return {}
+    out = {}
+    for x in [x for x in j.get("tracks") or [] if x.get("type") == "video"]:
+        if not (r := proof.display_shape(s) if (s := track_stream(j, x, streams)) else None):
+            continue
+        picture = fractions.Fraction(s["width"], s["height"])
+        if c != "MP4/QuickTime":   # the shape that mkvmerge writes
+            mkv = picture if s.get("codec_name") == "mpeg1video" else r
+        elif (size := made.get((x.get("properties") or {}).get("number"))) is None:   # no tkhd read
+            continue
+        else:
+            mkv = fractions.Fraction(*size) if all(size) else picture
+        if abs(r - mkv) * s["height"] >= 1:
+            out[x["id"]] = f"{int(r * s['height'] + fractions.Fraction(1, 2))}x{s['height']}"
+    return out
+
+
 def track_stream(j, x, streams):
     """The stream of streams, ffprobe's list, that holds the track x of j, mkvmerge -J of the same MP4, TS or MPEG
     program stream, or None. mkvmerge numbers a track of an MP4 or TS by its track_ID or PID, as ffprobe's id does, and
@@ -360,7 +417,7 @@ def track_stream(j, x, streams):
     return next((s for s in streams if int(s.get("id") or "0", 16) == n and (s.get("codec_name") == "ac3") == (x.get("codec") == "AC-3")), None)
 
 
-def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), split=None, times=()):
+def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), split=None, times=(), dims=None):
     """The remux of src, its captions and its sidecars subs into tmp. mkvmerge keeps the track order and every track it
     reads but the subtitle track ids in drop, then adds each caption SubRip of convert_captions() as "English (CC)",
     then the sidecars. With drop, -s names the subtitle tracks that stay, or -S keeps none. A sidecar with new times
@@ -373,7 +430,8 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
     split_sync(). Each video track of src then comes from its own input of src, and the other tracks of src from one
     more, which alone gives the chapters, the tags and the attachments. times holds the --timestamps options of the
     audio tracks of src: remux.planned_args() for a Matroska src, kept_times() for any other src. With split, they go
-    to the input of the other tracks."""
+    to the input of the other tracks. dims maps a video track id to the --display-dimensions of display_dims(). With
+    split, they go to the input of that video track."""
     nice = ["ionice", "-c3", "nice", "-n", "19"]
     if streams is not None:   # no sidecar: they keep the base name, so the player still finds them beside the new file
         return nice + ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src] + [a for s in proof.media_streams(streams) for a in ("-map", f"0:{s['index']}")] \
@@ -390,14 +448,15 @@ def convert_cmd(src, tmp, j, subs, streams=None, captions=(), drop=(), sync=(), 
     kept = [str(t["id"]) for t in j.get("tracks") or [] if t.get("type") == "subtitles" and t.get("id") not in (None, *drop)]
     skip = (["-s", ",".join(kept)] if kept else ["-S"]) if drop else []   # mkvmerge 92 and 102 warn of each id of -s !N in an MP4
     argv = nice + ["mkvmerge", "-q", "--disable-lacing", "-o", tmp, *order]   # each frame its own block, with its own stored time
+    shape = lambda keep: [a for i, d in (dims or {}).items() if i in keep for a in ("--display-dimensions", f"{i}:{d}")]
     if own:
         pick = lambda keep: [a for p in zip(names[::2], names[1::2]) if int(p[1].partition(":")[0]) in keep for a in p]   # their --track-name
         for v, ms in own.items():
-            argv += [*pick({v}), "--sync", f"{v}:{ms}", "-d", str(v), "-A", "-S", "-B", "-M", "--no-chapters", "--no-global-tags", src]
+            argv += [*pick({v}), *shape({v}), "--sync", f"{v}:{ms}", "-d", str(v), "-A", "-S", "-B", "-M", "--no-chapters", "--no-global-tags", src]
         rest = [i for i in ids if i not in own]
         argv += [*pick(set(rest)), *[a for i in rest if rest_ms for a in ("--sync", f"{i}:{rest_ms}")], *skip, *times, "-D", src]
     else:
-        argv += [*names, *skip, *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], *times, src]
+        argv += [*names, *skip, *[a for x in sync for a in ("--sync", f"{x['track']}:{x['ms']}")], *times, *shape(ids), src]
     for c in captions:
         argv += ["--language", "0:en", "--track-name", f"0:{proof.CC_NAME}", "--sub-charset", "0:UTF-8", "--default-track-flag", "0:0",
                  "--forced-display-flag", "0:0", c["path"]]
@@ -1265,7 +1324,9 @@ def convert(app, path, j, st, apply, ids=None, lock=None, pool=None, force=None,
             times, plans = [] if unreadable else kept_times(path, j, streams, skip, folder), {}
             if times:   # the decision log names each track that keeps its stored times
                 info["kept_times"] = [int(a.partition(":")[0]) for a in times[1::2]]
-        r = ff.run("convert.convert", convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times),
+        if dims := {} if unreadable else display_dims(path, j, streams):   # the decision log names each display size
+            info["display_dims"] = [f"{i}:{d}" for i, d in dims.items()]
+        r = ff.run("convert.convert", convert_cmd(path, tmp, j, subs, streams if unreadable else None, list(cc.values()), gone, sync, split, times, dims),
                            capture_output=True, text=True, errors="replace")
         info["warnings"] = config.mask((r.stdout + r.stderr).strip())[-500:] or None
         # mkvmerge exits 1 on warnings alone. A warning can be harmless, such as zero bytes it skips at an audio end, so

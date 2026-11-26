@@ -20,10 +20,12 @@ A decision line holds:
 - `findings`, the problems AMG found, each with its kind, its facts and what AMG did. `alert_kinds` lists the kinds
   alone.
 - `alerts`, the text of each problem
-- `alert_result`, what the Discord post of each problem gave. That is `sent`, `already sent`, `log only` for a problem
-  AMG fixed, `left out by NOTIFICATION_POSTS` for a post whose name `NOTIFICATION_POSTS` does not list, or why the post
-  failed. A re-grab is a fix that posts, so it says `sent`. With `SUBTITLES=deep`, a subtitle problem of an import says
-  `held for the deep analysis`. The deep analysis checks it again and posts what it still finds.
+- `alert_result`, what the Discord post of each problem gave. That is `sent`, `already sent` for a problem that posted
+  before with the same reason, `log only` for a problem AMG fixed, `left out by NOTIFICATION_POSTS` for a post whose
+  name `NOTIFICATION_POSTS` does not list, or why the post failed. A problem whose reason changed since its last post
+  says `sent` again, as a conversion refused for another reason. A re-grab is a fix that posts, so it says `sent`. With
+  `SUBTITLES=deep`, a subtitle problem of an import says `held for the deep analysis`. The deep analysis checks it again
+  and posts what it still finds.
 - `held_result`, on a deep analysis line whose import held alerts, what became of each one. That is `checked again`,
   `fixed before the error`, `dropped with the file`, or what its post gave. A subtitle that the deep analysis retimed or
   took out counts as checked again. A held alert posts when nothing checked one of its subtitles again. That happens

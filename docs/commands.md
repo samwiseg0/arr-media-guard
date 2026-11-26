@@ -60,7 +60,8 @@ On a host, leave out `docker exec -it arr-media-guard`.
   recheck, or one missing on disk, stays for the next run.
 - Each apply that queues, here or with `--background`, writes one decision log line with result `queued`, its counts
   and its options. An apply that stops part way, as at Ctrl+C, writes the line with the counts so far.
-- A first backfill posts each problem that was not posted yet, once per file and kind. One file can post up to four
+- A first backfill posts each problem that was not posted yet, once per file and kind. A later run posts a problem
+  again only when its reason changed, as a conversion refused for another reason. One file can post up to four
   times: from its job, its burned-in subtitle check, its whole-file check and its deep analysis. With
   `NOTIFICATION_POSTS=all`, each file whose default tracks change also posts "Default tracks changed".
 - With no instance it takes every instance in turn, `radarr`, `sonarr`, then those of `APP_INSTANCES`. A line
@@ -71,11 +72,11 @@ On a host, leave out `docker exec -it arr-media-guard`.
 
 A plan option, `--plan-out` or `--plan-from`, runs the *flag backfill* instead. It fixes the default tracks and
 language tags of the Matroska files the app lists, at the lowest CPU and disk priority. Its `--apply` posts as a job
-above does. It posts each problem not posted yet, once per file and kind. With `NOTIFICATION_POSTS=all` it posts each
-change too. A dry run posts nothing. It shares a lock with the imports, so the two never change one file at the same
-time. It skips a file only when no check that can write has work for it, as a file with one audio track, its flags
-and language tag right, no subtitle and a header with no issue. Each such check has one trigger in `cli.TRIGGERS`.
-A new check that can write adds its trigger there.
+above does. It posts each problem not posted yet, once per file and kind, and again when its reason changed. With
+`NOTIFICATION_POSTS=all` it posts each change too. A dry run posts nothing. It shares a lock with the imports, so the
+two never change one file at the same time. It skips a file only when no check that can write has work for it, as a file
+with one audio track, its flags and language tag right, no subtitle and a header with no issue. Each such check has one
+trigger in `cli.TRIGGERS`. A new check that can write adds its trigger there.
 
 Run a large flag backfill in steps, and note the time before each apply. A *plan* is what a dry run would change in one
 file. A *plan group* is the [item class](policy.md#keys) and the rules of a plan, as `--audit --plan-from` groups them.
@@ -381,7 +382,9 @@ every run, with no setting. `CONVERT_MAX_FILES`, `CONVERT_WORKERS` and `REPACK_M
 ### Force a conversion
 
 Before AMG removes the source file, it checks the new file against it, stream by stream. It refuses a file it cannot
-prove has lost nothing, and the decision log holds the reason. When you checked the reason and accept it, name the file.
+prove has lost nothing, and the decision log holds the reason. A video stream must also keep the shape a player shows
+it at. A refusal of the shape reads, for example, "the MKV would show the picture 9.5% wider than the original, at
+352x240 where the original shows 352x262". When you checked the reason and accept it, name the file.
 
 ```
 arr-media-guard --backfill radarr --convert --apply --force-convert "/data/movies/Film A (2000)/Film A (2000).mp4"

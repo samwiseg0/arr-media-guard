@@ -22,6 +22,7 @@ Run: pytest tests/test_report.py
 import ast
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -29,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 import urllib.error
@@ -989,15 +991,14 @@ def test_the_unreadable_subtitles_notice_names_each_track_and_its_file(sent, set
 
 
 @pytest.fixture
-def wired(monkeypatch, settings):
-    """The titles that reach Discord through the real gate of logs.post(), and the alert markers in the store."""
-    out, marks = [], set()
-    settings(discord_webhook=HOOK)
+def wired(monkeypatch, settings, tmp_path):
+    """The titles that reach Discord through the real gate of logs.post(), and a call that reads the alert markers of a
+    store of the test's own."""
+    out = []
+    settings(discord_webhook=HOOK, state_dir=str(tmp_path))
     monkeypatch.setattr(h, "QUIET_UNTIL", 0.0)
     monkeypatch.setattr(h, "http", lambda url, method="GET", body=None, headers=None, timeout=15: out.extend(e["title"] for e in body["embeds"]))
-    monkeypatch.setattr(h.store, "add", lambda ns, key: key not in marks and not marks.add(key))
-    monkeypatch.setattr(h.store, "drop", lambda ns, key: marks.discard(key))
-    return out, marks
+    return out, lambda: h.store.items("alert")
 
 
 def test_a_list_of_names_posts_only_those_and_drops_the_left_out_sentences(wired, settings):
@@ -1033,7 +1034,7 @@ def test_a_left_out_re_grab_posts_nothing_and_its_result_says_why(wired, setting
     sent, marks = wired
     settings(notification_posts=h.post_names("all") - {"regrab"})
     got, rec = changed(outcome="wrong_content", result="wrong content: x", edit_result="edited", findings=[REGRAB, LANGUAGE, *CHANGED["findings"]])
-    assert got == ["left out by NOTIFICATION_POSTS", "log only", "log only"] and sent == [] and rec["change_result"] == [] and not marks
+    assert got == ["left out by NOTIFICATION_POSTS", "log only", "log only"] and sent == [] and rec["change_result"] == [] and not marks()
     settings(notification_posts=h.post_names("regrab"))
     assert changed(findings=[REGRAB])[0] == ["sent"] and sent == ["Wrong content, re-grabbed"]
     assert [h.post("radarr", n, {"title": n}) for n in ("audit", ("default", "forced"))] == ["left out by NOTIFICATION_POSTS"] * 2 and len(sent) == 1
@@ -1066,12 +1067,12 @@ def test_a_left_out_alert_writes_no_marker_so_the_next_one_posts_once_listed(wir
     sent, marks = wired
     settings(notification_posts=h.post_names("audio, scan"))
     with monkeypatch.context() as m:
-        m.setattr(h.store, "add", lambda ns, key: pytest.fail("a left-out alert claimed a marker"))
+        m.setattr(h.store, "add", lambda ns, key, value=None: pytest.fail("a left-out alert claimed a marker"))
         assert h.alert("radarr", "language", "language", "/m/Film A.mkv", 7, {"title": "Wrong audio language"}) == "left out by NOTIFICATION_POSTS"
-    assert not marks and sent == []
+    assert not marks() and sent == []
     settings(notification_posts=h.post_names("issues"))
     assert [h.alert("radarr", "language", "language", "/m/Film A.mkv", 7, {"title": "Wrong audio language"}) for _ in "ab"] == ["sent", "already sent"]
-    assert len(marks) == 1 and sent == ["Wrong audio language"]
+    assert len(marks()) == 1 and sent == ["Wrong audio language"]
 
 
 def test_a_left_out_deep_kind_is_never_held_and_its_flags_post_as_a_change(wired, settings):
@@ -1221,14 +1222,12 @@ def test_after_a_re_grab_only_the_re_grab_posts(sent, settings):
 
 
 
-def test_each_re_grab_posts_also_when_the_next_copy_has_the_same_path_and_size(monkeypatch):
+def test_each_re_grab_posts_also_when_the_next_copy_has_the_same_path_and_size(monkeypatch, settings, tmp_path):
     """A re-grab deleted its file, so the next copy is a new download, and its re-grab posts too. Two copies of one post
     land at the same path with the same size. The re-grab marker keys on the app's file id, else on the decision id. A
     repeat of one file id posts once, and every other alert still posts once per file, kind and size."""
-    marks = set()
+    settings(state_dir=str(tmp_path))
     monkeypatch.setattr(h, "post", lambda app, name, emb: "sent")
-    monkeypatch.setattr(h.store, "add", lambda ns, key: key not in marks and not marks.add(key))
-    monkeypatch.setattr(h.store, "drop", lambda ns, key: marks.discard(key))
     got = lambda **kw: h.alert_findings(decision(**kw), 7)
     assert got(ids={"file_id": 10}, findings=[REGRAB]) == ["sent"]
     assert got(ids={"file_id": 11}, findings=[REGRAB]) == ["sent"]
@@ -1236,6 +1235,282 @@ def test_each_re_grab_posts_also_when_the_next_copy_has_the_same_path_and_size(m
     assert got(findings=[REGRAB]) == ["sent"] and got(findings=[REGRAB]) == ["already sent"]   # no file id: the decision id
     assert got(id="b2", findings=[REGRAB]) == ["sent"]
     assert got(findings=[LANGUAGE]) == ["sent"] and got(id="b3", findings=[LANGUAGE]) == ["already sent"]
+
+
+# A refused conversion of a made-up file, and the reason a later release refused the same file for
+REFUSED = {"kind": "repack", "container": "MPEG program stream", "why": "the MKV would show the video 34 ms out of sync with the audio, in "
+           "1598 places between the start and 22:01. Detail: video 0 (mpeg1video) moved 34 ms, first at 0.601 s"}
+MOVED = dict(REFUSED, why="the MKV would play the audio 133 ms out of sync with the video, from 0:46 to the end. Detail: audio 1 (mp2) moved "
+             "133 ms, first at 46.524 s")
+OFF_S1 = {"kind": "subtiming", "lines": [{"code": "off", "track": "s1", "ref": None, "why": "the cues are off by 0.29 s late and 0.83 s late",
+                                          "offsets": [0.29, 0.83], "unfixed": None}]}
+
+
+@pytest.fixture
+def posted(monkeypatch, settings, tmp_path):
+    """The titles that a fake post() sent, with the result the test sets in result, and the alert markers in a store of
+    the test's own."""
+    settings(state_dir=str(tmp_path))
+    out = types.SimpleNamespace(titles=[], result="sent")
+    monkeypatch.setattr(h, "post", lambda app, name, emb: out.titles.append(emb["title"]) or out.result)
+    return out
+
+
+def rerun(f, held=None):
+    """What alert_findings() gives for finding f of one file, kind and size."""
+    return h.alert_findings(decision(findings=[f]), 7, held)
+
+
+def test_a_rerun_posts_again_only_when_the_reason_changed(posted):
+    """Owner 2026-11-26: a rerun that finds the same problem stays quiet. A rerun whose reason changed posts once more.
+    The tester's case: a later release refused the same file again because the audio moved."""
+    assert [rerun(REFUSED), rerun(REFUSED), rerun(MOVED), rerun(MOVED)] == [["sent"], ["already sent"], ["sent"], ["already sent"]]
+    assert posted.titles == ["Conversion to MKV failed"] * 2
+
+
+@pytest.mark.parametrize("again", [
+    # the deep analysis of the same subtitles again: each offset moved a few hundredths of a second
+    {"kind": "subtiming", "lines": [dict(OFF_S1["lines"][0], why="the cues are off by 0.24 s late and 0.78 s late", offsets=[0.24, 0.78])]},
+    # the first run turned off the flags of the subtitles, so the rerun finds no track to turn off
+    {"kind": "burned_in", "lang": "eng", "english": True, "audio": "kor"},
+    # TMDB did not answer the rerun, so the app names the original language
+    {"kind": "language", "want": "English", "has": ["por"], "aside": [], "listed": ["Radarr", "English"]},
+    # the rerun had less time left, so the frames of the still track v3 were not read and it is no cover
+    {"kind": "cover", "tracks": ["v2"], "name": "cover.jpg", "result": "subtitle remux failed: mkvmerge exited 2: x"}])
+def test_a_rerun_whose_times_or_outcome_moved_finds_the_same_reason(posted, again):
+    """The reason leaves out what AMG did, the times and scores of a subtitle sentence, the facts that depend on
+    whether TMDB answered, and the tracks of a cover alert, see report.REASONS. The same problem of another subtitle is
+    a new reason."""
+    first = {"subtiming": OFF_S1, "burned_in": {"kind": "burned_in", "lang": "eng", "english": True, "audio": "kor", "tracks": ["s1"], "edit": "edited"},
+             "language": {"kind": "language", "want": "English", "has": ["por"], "aside": [], "listed": ["TMDB", "English"]},
+             "cover": {"kind": "cover", "tracks": ["v2", "v3"], "name": "cover.jpg", "result": "subtitle remux failed: mkvmerge exited 2: x"}}[again["kind"]]
+    assert h.reason(first, decision()) == h.reason(again, decision()) and [rerun(first), rerun(again)] == [["sent"], ["already sent"]]
+    if again["kind"] == "subtiming":
+        assert rerun({"kind": "subtiming", "lines": [dict(OFF_S1["lines"][0], track="s2")]}) == ["sent"]
+
+
+def test_a_reason_keeps_no_order_of_a_set(posted):
+    """Each job process orders a set by its own hash seed, as the moves of a subtitle remux were. So a rerun whose
+    sentences, tracks of a sentence or tracks of a subtitle finding come in another order finds the same reason."""
+    lines = [{"code": "not_retimed", "tracks": ["s2", "s1"], "result": None}, dict(OFF_S1["lines"][0], track="s3")]
+    first, again = {"kind": "subtiming", "lines": lines}, {"kind": "subtiming", "lines": [lines[1], dict(lines[0], tracks=["s1", "s2"])]}
+    sub = lambda ps: {"kind": "subtitle", "issue": ["a subtitle event runs past the end"], "tracks": [{"track": p, "codec": "S_HDMV/PGS"} for p in ps]}
+    assert h.reason(sub(["s1", "s2"]), decision()) == h.reason(sub(["s2", "s1"]), decision())
+    assert h.reason(first, decision()) == h.reason(again, decision()) and [rerun(first), rerun(again)] == [["sent"], ["already sent"]]
+
+
+@pytest.mark.parametrize("tmdb", ["tmdb_unavailable", "tmdb_token_rejected", "tmdb_token_missing"])
+def test_a_content_rerun_whose_tmdb_read_failed_counts_any_marker(posted, tmdb):
+    """A run whose TMDB read failed scores the language signal as unknown, and the runtime signal can score where
+    TMDB's runtime put it in doubt. So its content finding has no reason, and the marker of a run with TMDB counts as
+    sent. The marker keeps that reason. A first run with no TMDB posts, and the next run with TMDB takes its reason. A
+    run with TMDB whose signals changed posts again."""
+    failed = dict(CONTENT, signals=["it runs 80 minutes, but the listed runtime is 120 minutes"], scored=["runtime"], points=1)
+    without = lambda: h.alert_findings(decision(findings=[failed], tmdb=tmdb), 7)
+    assert h.reason(failed, decision(tmdb=tmdb)) is None and h.reason(failed, decision(tmdb="no_record")) is not None
+    assert h.reason(LANGUAGE, decision(tmdb=tmdb)) == h.reason(LANGUAGE, decision())   # another kind keeps its reason
+    assert [rerun(CONTENT), without(), rerun(CONTENT), rerun(failed)] == [["sent"], ["already sent"], ["already sent"], ["sent"]]
+    h.store.drop("alert", hashlib.sha1(f"content|{decision()['path']}|7".encode()).hexdigest())
+    assert [without(), rerun(CONTENT), rerun(CONTENT), rerun(failed)] == [["sent"], ["already sent"], ["already sent"], ["sent"]]
+    assert posted.titles == ["Wrong content"] * 4
+
+
+def test_a_marker_of_an_older_release_counts_as_the_same_reason_and_takes_the_new_one(posted):
+    """A marker of 2.23.1 or older holds no reason, so a deploy posts no wave of old alerts. The marker takes the reason
+    of the rerun, so a later change of reason posts."""
+    h.store.add("alert", hashlib.sha1(b"repack|/m/Film A (1979)/Film A.mkv|7").hexdigest())   # as 2.23.1 claimed it
+    assert [rerun(MOVED), rerun(MOVED), rerun(REFUSED)] == [["already sent"], ["already sent"], ["sent"]]
+
+
+POST_FAILED = "failed: HTTPError: HTTP Error 500: Internal Server Error"
+REFUSED_PATH = decision()["path"]   # the file of REFUSED in rerun()
+MARK = hashlib.sha1(f"repack|{REFUSED_PATH}|7".encode()).hexdigest()   # the marker of REFUSED's file, kind and size
+
+
+def test_a_failed_post_of_a_new_reason_drops_the_marker(posted, monkeypatch):
+    """A failed post drops the marker, so the next run of the new reason tries again. A stop during the post does the
+    same. The old reason may post once more after that."""
+    assert rerun(REFUSED) == ["sent"]
+    posted.result = POST_FAILED
+    assert rerun(MOVED) == [POST_FAILED] and h.store.items("alert") == {}
+    posted.result = "sent"
+    assert [rerun(MOVED), rerun(MOVED)] == [["sent"], ["already sent"]]
+
+    def stop(app, name, emb):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(h, "post", stop)
+    with pytest.raises(KeyboardInterrupt):
+        rerun(REFUSED)
+    assert h.store.items("alert") == {}
+
+
+@pytest.fixture
+def racing(posted, monkeypatch):
+    """alert() of REFUSED's file, kind and size in threads, one per job process. start(name, why, result) starts the
+    thread name with the reason why and waits until its post began. Its post gives result once end(name) lets it end.
+    end() waits for the thread and gives what its alert() gave."""
+    began, go, threads, out = {}, {}, {}, {}
+
+    def post(app, name, emb):
+        me = threading.current_thread().name
+        if me not in go:   # a run of the test's own thread
+            return "sent"
+        began[me].set()
+        go[me][0].wait(10)
+        return go[me][1]
+    monkeypatch.setattr(h, "post", post)
+
+    def start(name, why, result):
+        began[name], go[name] = threading.Event(), (threading.Event(), result)
+        threads[name] = threading.Thread(target=lambda: out.update({name: h.alert("radarr", "repack", "repack", REFUSED_PATH, 7, {"title": "x"}, why)}),
+                                         name=name)
+        threads[name].start()
+        assert began[name].wait(10)
+
+    def end(name):
+        go[name][0].set()
+        threads[name].join(10)
+        return out[name]
+    return types.SimpleNamespace(start=start, end=end)
+
+
+def test_two_failed_posts_of_new_reasons_leave_no_unsent_reason_marked(racing):
+    """P1 claims a new marker with its reason, and P2 puts its own reason in while P1 posts. Both posts fail. A failed post
+    drops the marker only while it holds the reason of its own process, so P1 leaves P2's reason, and P2 drops it. The
+    next run of P1's reason posts."""
+    racing.start("P1", "R2", POST_FAILED)
+    racing.start("P2", "R3", POST_FAILED)
+    assert [racing.end("P1"), racing.end("P2")] == [POST_FAILED] * 2 and h.store.items("alert") == {}
+    assert h.alert("radarr", "repack", "repack", REFUSED_PATH, 7, {"title": "x"}, "R2") == "sent"
+
+
+def test_a_failed_post_never_takes_out_a_reason_another_process_sent(racing):
+    """The marker holds R1. P1 puts R2 in and posts. P2 puts R3 in, and its post is sent. P1's post fails, and R3 stays,
+    so the next run of R3 is quiet."""
+    h.store.add("alert", MARK, hashlib.sha1(b"R1").hexdigest())
+    racing.start("P1", "R2", POST_FAILED)
+    racing.start("P2", "R3", "sent")
+    assert [racing.end("P2"), racing.end("P1")] == ["sent", POST_FAILED]
+    assert h.store.items("alert") == {MARK: hashlib.sha1(b"R3").hexdigest()}
+    assert h.alert("radarr", "repack", "repack", REFUSED_PATH, 7, {"title": "x"}, "R3") == "already sent"
+
+
+def test_a_marker_that_a_failed_post_dropped_after_the_claim_is_new(posted, monkeypatch):
+    """The claim lost to another process, whose post then failed and dropped its marker. The run claims the marker as new,
+    and its own failed post drops it."""
+    monkeypatch.setattr(h.store, "add", lambda *a: False)
+    posted.result = "failed: Discord asked for no posts for 30 s"
+    assert rerun(REFUSED) == [posted.result] and h.store.items("alert") == {}
+    posted.result = "sent"
+    assert rerun(REFUSED) == ["sent"] and list(h.store.items("alert").values()) == [hashlib.sha1(h.reason(REFUSED, decision()).encode()).hexdigest()]
+
+
+def test_a_held_alert_posts_by_its_reason_and_one_of_an_older_release_by_its_marker(posted):
+    """An import holds a timing alert with its reason. post_held() posts it once, and a deep analysis that finds the same
+    reason stays quiet. An alert that 2.23.1 held has no reason, so any marker of its file, kind and size holds it."""
+    held = []
+    assert rerun(OFF_S1, held) == [h.HOLD_RESULT] and held[0]["why"] == h.reason(OFF_S1, decision())
+    path = decision()["path"]
+    assert h.post_held("radarr", path, held) == ["sent"] and h.post_held("radarr", path, held) == ["already sent"]
+    assert list(h.store.items("alert").values()) == [hashlib.sha1(held[0]["why"].encode()).hexdigest()]
+    assert rerun(OFF_S1) == ["already sent"]
+    assert rerun({"kind": "subtiming", "lines": [dict(OFF_S1["lines"][0], track="s2")]}) == ["sent"]
+    old = [{k: v for k, v in held[0].items() if k != "why"}]
+    assert h.post_held("radarr", path, old) == ["already sent"] and h.post_held("radarr", path + ".2", old) == ["sent"]
+
+
+REMUXED = {"removed": ["s1"], "done": True}   # the remux of a first run took subtitle 1 out, so subtitle 2 became subtitle 1
+
+
+def off(track, ref=None):
+    """A timing finding whose one sentence says the subtitle at place track is off, compared with ref."""
+    return {"kind": "subtiming", "lines": [{"code": "off", "track": track, "ref": ref, "why": "the cues are off by 0.3 s late"}]}
+
+
+PGS_LATE = {"codec": "S_HDMV/PGS", "end": 1500.0, "streams": 1440.0}   # a subtitle of another format that runs past the end
+
+
+@pytest.mark.parametrize("first, again", [
+    (off("s2", "s3"), off("s1", "s2")),
+    ({"kind": "subtitle", "issue": "x", "tracks": [dict(PGS_LATE, track="s3")]}, {"kind": "subtitle", "issue": "x", "tracks": [dict(PGS_LATE, track="s2")]})])
+def test_a_rerun_after_a_remux_names_each_subtitle_by_its_place_after_the_run(posted, first, again):
+    """A subtitle sentence names a track by its place before the remux of its run. The reason names it by its place after
+    the run, so the rerun over the file the remux left finds the same reason."""
+    assert [h.alert_findings(decision(source="backfill", subremux=REMUXED, findings=[first]), 7), rerun(again)] == [["sent"], ["already sent"]]
+
+
+def test_a_rerun_after_a_subtitle_fix_finds_the_same_reason(posted, monkeypatch):
+    """Run 1 removed subtitle 1, which does not match, and the garbled subtitle 2 stayed. The rerun over the file run 1
+    left finds the garbled subtitle 1 alone. The reason leaves out the fix and the cover picture that stayed a video
+    track, so the rerun is quiet."""
+    monkeypatch.setattr(h, "sub_fixes", lambda source: True)
+    one = decision(source="backfill", subremux=dict(REMUXED, kept=None), garbled={"s2": {"repair": False, "tag": "eng"}})
+    one["findings"] = h.sub_findings(one, {"s1": {"verdict": "mismatch", "why": "the text is Spanish"}}, [])
+    two = decision(source="backfill", garbled={"s1": {"repair": False, "tag": "eng"}})
+    two["findings"] = h.sub_findings(two, {}, [])
+    assert [[x["code"] for x in f["lines"]] for f in one["findings"] + two["findings"]] == [["removed", "garbled"], ["garbled"]]
+    one["findings"][0]["lines"].append({"code": "cover", "tracks": ["v1"], "also": True})
+    assert [h.alert_findings(one, 7), h.alert_findings(two, 7)] == [["sent"], ["already sent"]]
+
+
+def window(at, errors=0, stopped=None):
+    """A video window of decide.video_verdict() at second at, with its playback errors. stopped names the cap that
+    stopped it."""
+    return {"at": at, "ran": stopped is None, "stopped": stopped, "errors": errors, "noisy": False, "empty": False, "cut": False, "read": 1,
+            "late": False, "gap": 0}
+
+
+def test_a_doubt_of_the_audio_or_video_check_posts_once(posted):
+    """A doubt names what the load of the host did, as the cap that stopped a video window. An audio or video alert posts
+    once per file, kind and size, as in 2.23.1. A certain fault that changed stays quiet too."""
+    busy = h.decide.video_verdict([], [window(1800, 2, f"ran over {h.decide.VIDEO_TIMEOUT} s")])[1]
+    idle = h.decide.video_verdict([], [window(1800, 5, f"read over {h.decide.VIDEO_MAX_READ >> 20} MiB")])[1]
+    assert busy != idle and [rerun({"kind": "video", "doubts": busy}), rerun({"kind": "video", "doubts": idle})] == [["sent"], ["already sent"]]
+    audio = [{"doubts": [f"the audio check could not run at {n} of 6 places"]} for n in (2, 3)]
+    audio += [{"certain": c} for c in (SILENT, "the audio is silent at 2 of 3 places checked")]
+    assert [rerun(dict(f, kind="audio")) for f in audio] == [["sent"]] + [["already sent"]] * 3
+
+
+def test_a_video_fault_that_the_load_of_the_host_makes_certain_or_a_doubt_posts_once(posted):
+    """A REGRAB setting that leaves video out keeps the file, so each run checks it again. On an idle host two windows
+    decode in full with errors, so the fault is certain. On a busy host the time cap stops the window at 30:00, so one
+    bad window is a doubt. The alert posts once per file, kind and size."""
+    idle, busy = (h.decide.video_verdict([], [window(600, 3), w, window(3000)])
+                  for w in (window(1800, 7), window(1800, 7, f"ran over {h.decide.VIDEO_TIMEOUT} s")))
+    assert idle[0] and not busy[0] and busy[1]
+    certain, doubt = {"kind": "video", "certain": idle[0], "action": {"code": "would_regrab", "kind": "video"}}, {"kind": "video", "doubts": busy[1]}
+    assert [rerun(f) for f in (certain, doubt, certain)] == [["sent"], ["already sent"], ["already sent"]]
+
+
+def test_an_unreadable_notice_names_its_tracks_only(posted, monkeypatch):
+    """The entry of a track taken out holds its facts of the decision log, see logs.track_log(). Its frame count comes
+    from a walk of its frames, which runs only when the job has time left. The reason names the place or the sidecar
+    name of each entry, so the same original gives the same reason with and without the walk."""
+    props = {"language": "eng", "track_name": "English", "tag_number_of_frames": "1200", "tag__statistics_writing_app": "other 1.0",
+             "codec_id": "S_TEXT/UTF8", "default_track": False, "forced_track": False}
+    j = lambda walk: {"container": {"type": "Matroska", "properties": {"writing_application": "mkvmerge v102", "duration": 3600 * 10**9}},
+                      "tracks": [{"type": "video", "codec": "AVC", "properties": {}},
+                                 {"type": "subtitles", "codec": "SubRip/SRT", "properties": dict(props, **walk)}]}
+    monkeypatch.setattr(h.arr_decide, "POLICY", h.arr_decide.POLICY)
+    h.arr_decide.set_policy(json.load(open(os.path.join(ROOT, "examples", "policy.json"))))
+    on, off = (h.logs.track_log([t for t in h.arr_decide.classify(j(w)) if t["kind"] == "s"])[0] for w in ({"walk_frames": 40}, {}))
+    assert on["ev"] != off["ev"]
+    f = lambda e: h.unreadable_finding({"s1": dict(e, sidecar="Film A.s1.eng.garbled.srt"), "Film A.pl.srt": {"sidecar": "Film A.pl.garbled.srt.txt"}},
+                                       mark="unreadable_subtitles")
+    assert h.reason(f(on), decision()) == h.reason(f(off), decision()) == '{"tracks": ["Film A.pl.srt", "s1"]}'
+    assert [rerun(f(on)), rerun(f(off))] == [["sent"], ["already sent"]]
+
+
+@pytest.mark.parametrize("why", [
+    "Command '['ffmpeg', '-i', '/m/Film A (1979)/Film A.avi', '-f', 'framemd5', '{state}/.convert-{folder}/{name}']' timed out after 600 seconds",
+    "ffmpeg did not read Film A.mkv cleanly: [out#0/framemd5 @ 0x{at}] Error opening output {state}/.convert-{folder}/{name}.srt: No space left on device"])
+def test_the_work_folder_and_ffmpeg_addresses_of_a_failed_conversion_are_no_reason(posted, why):
+    """A conversion that fails on its work files names them, as a timeout names the ffmpeg command. The work folder and
+    the names in it are new in each run, and so is the address in an ffmpeg log line. The reason leaves them out."""
+    runs = [dict(state="/config", folder="k2j4_x9q", name="0f3e" * 8, at="55d5c3a1b2c0"), dict(state="/config", folder="abc12345", name="9b1a" * 8, at="7f00aa11bb22")]
+    assert [rerun(dict(REFUSED, why=why.format(**r))) for r in runs] == [["sent"], ["already sent"]]
+    assert rerun(dict(REFUSED, why=why.format(**runs[0]).replace("600", "900").replace("No space", "Out of space"))) == ["sent"]
+
 
 LIVE = {"code": "live", "track": "s3", "lag": 4.0, "moved": 900, "cues": 1200, "left": 300, "flags_off": True}
 

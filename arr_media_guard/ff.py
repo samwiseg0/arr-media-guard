@@ -46,7 +46,8 @@ READS = {
                             "content.trusted_duration() needs two of (plan A4), and the format duration, which places a window or gates a "
                             "doubt (plan A3)"),
     "proof.packet_places": Use(("packet.pts_time", "packet.dts_time", "packet.duration_time"), "ffprobe's byte of each MP4 packet pairs it "
-                               "with its sample. Its times count only for a source with no reader"),
+                               "with its sample. Its times count only for a source with no reader. ffprobe only demuxes, so its MPEG-PS "
+                               "audio times show a step back that ffmpeg's muxer hides, see convert.kept_times()"),
     "proof.extradata": Use((), "the codec header"),
     "proof.hevc_packets": Use(("packet.pts", "packet.dts"), "the RPU check holds the pts, the dts and the keyframe flag of each HEVC packet "
                               "equal in two reads, and measures no time"),

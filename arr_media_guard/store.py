@@ -224,10 +224,11 @@ def put(ns, key, value, at=None):
           ns, key, json.dumps(value), time.time() if at is None else at)
 
 
-def drop(ns, key=None, older=None):
-    """Remove key from ns. With no key, every key of ns goes, or with older each one stored before that time."""
-    where = "ns = ?" + (" AND key = ?" if key is not None else "") + (" AND at < ?" if older is not None else "")
-    write(f"DELETE FROM kv WHERE {where}", *(x for x in (ns, key, older) if x is not None))
+def drop(ns, key=None, older=None, value=None):
+    """Remove key from ns. With no key, every key of ns goes, or with older each one stored before that time. With value,
+    key goes only while it holds that value."""
+    where = "ns = ?" + (" AND key = ?" if key is not None else "") + (" AND at < ?" if older is not None else "") + (" AND value = ?" if value is not None else "")
+    write(f"DELETE FROM kv WHERE {where}", *(x for x in (ns, key, older, None if value is None else json.dumps(value)) if x is not None))
 
 
 def items(ns):
@@ -235,9 +236,9 @@ def items(ns):
     return {k: json.loads(v) for k, v in db().execute("SELECT key, value FROM kv WHERE ns = ? ORDER BY rowid", (ns,))}
 
 
-def add(ns, key):
-    """Store key in ns with no value. False when it is there already, so of two processes one alone adds it."""
-    return write("INSERT OR IGNORE INTO kv VALUES (?, ?, 'null', ?)", ns, key, time.time()).rowcount == 1
+def add(ns, key, value=None):
+    """Store key in ns with value. False when it is there already, so of two processes one alone adds it."""
+    return write("INSERT OR IGNORE INTO kv VALUES (?, ?, ?, ?)", ns, key, json.dumps(value), time.time()).rowcount == 1
 
 
 def decided(at, app, path, rec):

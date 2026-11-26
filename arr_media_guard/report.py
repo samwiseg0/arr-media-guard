@@ -633,6 +633,56 @@ def posts(f, rec=None):
     return True
 
 
+# Per alert kind, the facts that name the cause of its problem, see reason(). A rerun over an unchanged file finds the
+# same facts. The facts of what AMG did about the problem stay out. A burn-in's tracks are those it turns off, so its
+# rerun finds none. A language finding keeps the main audio and the wanted language. Its "listed" names TMDB only when
+# TMDB answered. A content finding of a run whose TMDB read failed has no facts, see reason(). An unreadable notice
+# keeps the places and sidecar names of its tracks only, see reason(). The other facts of a track, as its frame count,
+# come from reads that run only when the job has time left. A kind that is not listed has no facts, so its alert posts
+# once per file, kind and size. Audio and video are not listed, because the load of the host decides whether their
+# fault is certain or a doubt, as the cap that stops a video window. Cover is not listed, because a still track whose
+# frames no read counted in the time left drops out of its tracks, see remux.cover_tracks(). Some facts are prose, as
+# the "why" of a refused conversion or a failed header repair, and the "line" of a damaged file. A release that
+# rewords such a text posts each of those files again on its next rerun.
+REASONS = {"language": ("want", "has"), "runtime": ("runs", "listed"), "duration": ("why",), "episode": ("imported", "said", "title", "names"),
+           "content": ("signals",), "damage": ("fault", "line", "refusal", "doubts"),
+           "repack": ("why", "refusals", "skipped", "note"), "unreadable": ("tracks",), "header": ("why",), "cut": ("why",),
+           "subtitle": ("issue", "tracks"), "sublang": ("mismatch",), "edit": ("error",), "policy": ("error",),
+           "burned_in": ("lang", "english", "audio")}
+# The facts of a subtitle sentence that name its cause: its code and its subtitles. Its times and scores shift a little
+# from run to run, as the offsets that a deep analysis finds after the import's.
+LINE_REASON = ("code", "track", "tracks", "name", "ref")
+# A path in a work folder of runner.work_dir() and the address in an ffmpeg log line. Both are new in each run, and an
+# error text can hold them, as a timeout that names the ffmpeg command of a proof. reason() leaves them out.
+PER_RUN = re.compile(r"/\.[a-z]+-[a-z0-9_]{8}[^\s'\",:\\]*| @ 0x[0-9a-f]+")
+
+
+def reason(f, rec):
+    """The reason of the alert of finding f of rec, as JSON text, see logs.alert(): the facts of REASONS, or of
+    LINE_REASON for each sentence of a subtitle finding. A sentence of a fix, see logged(), and the cover sentence stay
+    out, as what AMG did. A subtitle goes by its place in the file after the run, as tells() names it, so the rerun over
+    the file a remux left finds the same reason. An unreadable notice names its tracks only, see REASONS. A content
+    finding of a run whose TMDB read failed gives None. The language signal is then unknown, and the runtime signal
+    can score where TMDB's runtime put it in doubt, so its signals differ from those of a run with TMDB. With None, any
+    marker of the file counts as sent, see logs.alert(). Each job process orders a set by its own hash seed. So the
+    sentences and each list of tracks go in the order of their JSON text, and every process gives one reason."""
+    if f["kind"] == "content" and (rec or {}).get("tmdb") in TMDB_FAILED:
+        return None
+    langs = track_langs(rec, after=True)
+    at = lambda p: f"s{number(p, langs)}" if isinstance(p, str) and re.fullmatch(r"s\d+", p) else p
+    order = lambda xs: sorted(xs, key=lambda x: json.dumps(x, sort_keys=True))
+    if "lines" in f:
+        facts = order({k: order(at(p) for p in x[k]) if k == "tracks" else at(x[k]) for k in LINE_REASON if k in x} for x in f["lines"]
+                      if not logged(x) and x["code"] != "cover")
+    else:
+        facts = {k: f[k] for k in REASONS.get(f["kind"], ()) if k in f}
+        if f["kind"] == "subtitle":
+            facts["tracks"] = order(dict(x, track=at(x["track"])) for x in facts.get("tracks") or ())
+        elif f["kind"] == "unreadable":
+            facts["tracks"] = order(facts.get("tracks") or ())
+    return PER_RUN.sub("", json.dumps(facts, sort_keys=True))
+
+
 def logged(x):
     """Whether the subtitle sentence x says the program fixed its subtitle, see LOGGED_LINES. A moved or renamed sidecar
     counts."""
@@ -968,6 +1018,7 @@ def alert_line(f, t, langs=None):
 # What a failed TMDB answer means for the language check, for the footer of the alerts it bears on
 TMDB_SKIPPED = {"no_record": "TMDB has no record of this item", "tmdb_unavailable": "TMDB didn't answer", "tmdb_token_missing": "No TMDB key is set",
                 "tmdb_token_rejected": "TMDB rejected the key"}
+TMDB_FAILED = set(TMDB_SKIPPED) - {"no_record"}   # the codes of a TMDB read that failed, see content.tmdb_state()
 
 
 def alert_embed(rec, f, t, stage=True):

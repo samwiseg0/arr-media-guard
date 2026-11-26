@@ -274,7 +274,26 @@ the app and `INSTANCE`. The embed says what is wrong and what the hook did, in a
 gives no advice. The footer names the host. On a language or content alert it also names a TMDB failure,
 because TMDB's language check then did not run. Red is broken audio, corrupt video, wrong content or a damaged source. Amber is every
 other alert. Mentions are off, and the secrets are masked. A marker in
-the state store stops a repeat, and an upgrade to a file of another size alerts again.
+the state store stops a repeat, and an upgrade to a file of another size alerts again. The marker keeps a hash of
+the alert's reason, see `report.reason()`. A rerun with the same reason posts nothing. A rerun whose reason changed
+posts once more, and the marker takes the new reason. `report.REASONS` names the facts of each kind that make its
+reason, as the refusal text of a conversion. A content alert keeps its scored signals as its reason. A run whose TMDB
+read failed scores the language signal as unknown, and its runtime signal can score where TMDB's runtime put it in
+doubt. So its content alert has no reason, and any marker of the file counts as sent. What AMG did about the problem stays out, as the flags a burn-in turned
+off, a subtitle sentence of a fix, see `report.logged()`, and the cover sentence of a remux that failed. A subtitle
+sentence gives its code and its subtitles only, because its times shift a little from run to run. It names each
+subtitle by its place in the file after the run, so the rerun over the file a remux left finds the same reason. An
+unreadable notice names the places and sidecar names of its tracks only. The other facts of a track, as its frame
+count, come from reads that run only when the job has time left. An audio, video or cover alert has no reason, so it
+posts once per file, kind and size, as in 2.23.1. The load of the host decides whether an audio or video fault is
+certain or a doubt, as the cap that stops a video window. A cover alert names the still tracks whose frames a read
+counted, and a track that the time left did not read drops out. A path in a work folder and the address in an ffmpeg log
+line are new in each run, so the reason leaves them out, see `report.PER_RUN`. Some reasons are prose, as the refusal text
+of a conversion, the text of a failed header repair and the line of a damaged file. A release that rewords such a text
+posts each of those files again on its next rerun. A marker of 2.23.1 or older holds no reason. It counts as the same
+reason and takes the reason of the rerun, so an upgrade posts no old problem again. A failed post drops the marker
+only while it holds the reason of that post. So a reason that another process sent stays, and the old reason may post
+once more.
 
 **What posts.** `report.posts()` is the one gate, and `logs.alert_findings()` asks it for every finding. A problem the
 hook left unresolved posts. That is a failed fix, a fix that a setting turns off, a fix that cannot run, or a doubt. A
@@ -383,7 +402,9 @@ post only as a change whose name `NOTIFICATION_POSTS` lists, see `report.posts()
 nothing. Every other held alert posts through `logs.post_held()`, because nothing settled one of its subtitles. That
 is an error before the remux, a failed hearing, no language model, `SUBTITLES=off`, a file the app moved during the
 run, or a third crash in `runner.requeue()`. Such a post keeps the import's text, which names the tracks by their
-numbers at the import, and each subtitle the alert named, also one the job settled.
+numbers at the import, and each subtitle the alert named, also one the job settled. It keeps the import's reason too,
+see `report.reason()`. So when the deep analysis posts a timing alert of its own, a held timing alert of the same file
+and size posts as well, because it names a subtitle that nothing judged again. 2.23.1 posted only the first.
 When the import cannot queue the job, its held alerts post at once. When
 `NOTIFICATION_POSTS` lists a name of `config.CHANGES`, a held finding keeps the change posts of what it says itself
 and whose names it lists as `changes`, see `report.held_posts()`. That is a fix of its logged lines, such as a removed track, a flag it says was turned off, and
@@ -1242,9 +1263,9 @@ jobs they queued stay.
 
 **The flag backfill.** A plan option runs the flag backfill, which fixes the default tracks and
 language tags. Its `--apply` posts the alerts as a job a backfill queued does, through
-`logs.alert_findings()`. A problem posts once per file, kind and size. Each change that `NOTIFICATION_POSTS` lists posts
-too. A dry run posts nothing. It runs at nice 19 and idle I/O, with the hook's file lock
-for each file. It runs language detection, the metadata checks and the header check like the hook,
+`logs.alert_findings()`. A problem posts once per file, kind and size, and again when its reason changes. Each change
+that `NOTIFICATION_POSTS` lists posts too. A dry run posts nothing. It runs at nice 19 and idle I/O, with the hook's
+file lock for each file. It runs language detection, the metadata checks and the header check like the hook,
 but it never re-grabs. It reads each `.mkv` file's own tracks, because the app's stored media info goes stale. It
 takes a file with two or more audio tracks, any subtitle, a tag to fix or another container inside.
 
@@ -1609,16 +1630,81 @@ next frame right after the frame before, and the rest of the track plays early. 
 time. A tester's episode stored 12 forward jumps of 181 to 294 ms, and its copy played the audio 2.94 s early at the
 end. So a program-stream track gets a file too when a frame starts more than `TIME_SLACK` after the end of the frame
 before. Its times come from the proof's ffmpeg read with `-fflags +genpts`, see "Time reads". The file start is the
-earliest time of a kept stream in that read. ffmpeg's muxer moves a time that goes back to the time before it, so a
-track that steps back in that read gets no file, and the proof decides. mkvmerge names each track by its stream id,
+earliest time of a kept stream in that read. ffmpeg's muxer moves a time that goes back to the time before it. So
+`kept_times()` also reads the stored times with ffprobe, which only demuxes (`proof.packet_places()`). A track whose
+stored times go back there gets no file, and the proof decides. Two frames at one time pass. A muxer can store a PES
+PTS one MP2 frame low, and ffmpeg's parser then gives the first frame of that PES the time of the frame before it. A
+tester's episodes held 5 and 2 such PES next to 16 and 10 forward jumps. In 2.23.1 the equal times gave the track no
+file, and the copy played the audio 133 ms and 172 ms early at the end. mkvmerge names each track by its stream id,
 and an audio track in private stream 1 by its substream id too. ffprobe's id is that substream id, else 0x100 plus
 the stream id, so the tracks pair by that id (`track_stream()`).
+
+**Kept video times.** mkvmerge 102 times the video of a program stream on an exact frame grid, 1001/30000 s for NTSC
+film. A stored clock can run off that grid. A tester's double episode stored 3003.00307 ticks a frame, one step of
+3004 in about 326 frames, so its copy showed the video 3.3 ms early at the end, and the proof refused it. So each
+video track gets a file too, of the times of the same read sorted, less the same file start, as for an audio track in
+"Kept audio times". mkvmerge gives the k-th line to the k-th picture in display order. Two pictures at one time in
+that read mark a time that ffmpeg's muxer moved, so such a track gets no file. A sorted time check cannot see a P and
+a B picture that swap their times. So the proof also pairs each picture of the original with its block of the copy in
+file order, within `TIME_SLACK`, and the proof entry holds that check in `times.paired`.
 
 Each frame of a track with a file keeps its time against the track's first frame, so only the start check sees a file
 start that is off. For an MP4 or TS the start check allows one tick of the new file (`proof.mkv_slack()`). The proof
 holds the start of every audio track of a program stream to `TIME_SLACK`, because ffmpeg reads the stored PTS of each
 frame. A program-stream file start one MP2 frame (26 ms) late passed the 50 ms of `SYNC`, and so did a copy with the
 video one frame (40 ms) late.
+
+**Display shape.** A player shows each picture at its display shape, the width times the sample aspect over the
+height. ffprobe gives the sample aspect that the container states, else the one of the bitstream, as ffmpeg-based
+players show it (`proof.display_shape()`). A stream with none has square pixels. mkvmerge 102 writes the shape as the
+track's display size. It keeps the shape of the sources measured below, with two exceptions. An MPEG-1 sequence header
+stores the shape as a pel aspect ratio, and mkvmerge 102 never reads it. It writes the picture size as the display
+size, and a program stream or a TS stores no shape of its own. So a tester's episodes, 352x240 at code 12 (SAR
+200:219), converted in 2.23.1 with square pixels and played 9.5% wide.
+
+The other exception is an MP4 or MOV track. ffprobe reads its shape from the pasp box. mkvmerge 102 never reads pasp.
+It writes the width and height of the tkhd box, rounded to whole pixels, or the picture size when tkhd holds 0. A
+non-square shape that an H.264 VUI, an MPEG-2 sequence header or an MPEG-4 part 2 VOL states wins over tkhd. mkvmerge reads no
+shape from any other bitstream, HEVC included. ffmpeg's MP4 muxer writes tkhd at the display size, its MOV muxer at
+the picture size. So in a MOV made by ffmpeg, each of the 32 codecs measured below lost its shape. 2.23.1 converted
+such a file with square pixels, 15.6% narrower for 16:9 DV.
+
+`display_dims()` gives a track `--display-dimensions` when the picture shape of an MPEG-1 track of a program stream or
+a TS, or the tkhd shape of an MP4 or MOV track, differs from the ffprobe shape by 1 pixel or more of display width, as
+the proof tells them apart. tkhd counts as mkvmerge 102 rounds it, its 16.16 value half up, so 160.5 is 161. The size
+is the picture height and the display width at that height, rounded half up to whole pixels. mkvmerge writes the
+shape of a bitstream at the picture height too, 853x480 for 720x480 at 16:9. So a size that mkvmerge writes anyway
+gives the same MKV as 2.23.1, as measured for H.264 and MPEG-4 part 2 MOVs made by ffmpeg. The tester's
+episodes get 321x240 for 321.46 pixels, and ffprobe then reads SAR 321:352 from the copy, 0.46 pixels off 200:219.
+The decision line names each size in `repack.display_dims`. The size wins over tkhd and over the bitstream, and
+mkvmerge 102 changes no packet for it. A track whose tkhd shape matches pasp gets no size, also when its bitstream
+states another non-square shape. mkvmerge then writes the bitstream shape, and the proof refuses the copy (owner
+choice). An MP4 or MOV whose sample tables do not read gets no size, and the proof decides.
+
+| Source | Where the shape lives | mkvmerge 102 |
+|---|---|---|
+| MPEG-1 in MPEG-PS or MPEG-TS | sequence header pel aspect ratio | writes square pixels, so the remux gives the shape |
+| MPEG-1 in AVI | AVI vprp | keeps it |
+| Any codec in MP4 or MOV | pasp for ffprobe, tkhd for mkvmerge | writes the tkhd size, so the remux gives the pasp shape where the two differ |
+| DV, MJPEG, ProRes, QuickTime RLE, PNG, Cinepak, SVQ1, H.263, HEVC, MPEG-1, raw, DNxHD, v210, JPEG 2000, TIFF, CineForm, HAP, FFV1, Theora and 13 more in a MOV by ffmpeg | pasp, tkhd at the picture size | writes square pixels, so the remux gives the shape. MPEG-1 and Theora in a MOV still refuse, because ffprobe names no codec in the copy |
+| MPEG-1 in RIFF CDXA (VCD) | sequence header | mkvmerge cannot read it, and the ffmpeg copy keeps it |
+| MPEG-2 in MPEG-PS, VOB, MPEG-TS, AVI or MP4 | sequence header display aspect, AVI vprp, MP4 pasp | keeps it |
+| MPEG-4 part 2 in AVI or MP4 | VOL, AVI vprp, MP4 pasp | keeps it. A vprp wins over the VOL, as in ffprobe |
+| H.264 in MPEG-TS, MPEG-PS, MP4, MOV, AVI or FLV | VUI, MP4 pasp and tkhd, AVI vprp | keeps it. A VUI of 1:1 gives the tkhd shape, so the remux gives the pasp shape. An MP4 pasp of 1:1 beside a VUI of 32:27 gives the VUI shape, and the proof refuses it |
+| HEVC in MPEG-TS | VUI | keeps it |
+| DV or MJPEG in AVI | AVI vprp | keeps it |
+| Theora in Ogg | Theora header | keeps it |
+| VP9 in WebM | DisplayWidth and DisplayHeight | keeps it |
+| ASF and WMV | ASF AspectRatioX and AspectRatioY | mkvmerge cannot read it, and the ffmpeg copy keeps it |
+| RealVideo | none | square pixels in both |
+
+mkvmerge writes the display width of a bitstream's sample aspect in whole pixels, 853x480 for 720x480 at 16:9. So the
+proof holds each video stream's shape within 1 pixel of display width at the original's picture height
+(`proof.shape_fault()`), and refuses a copy that differs more. The refusal names how much wider or narrower the copy
+shows the picture, the sizes mpv shows, and both shapes. It counts on its own, so a force of another refusal of the
+stream does not cover it. Each proof entry of a video stream holds both shapes in `shape`, [original, new file]. Of
+the kept test cases, only the program-stream episodes change shape. An MP4 with a pasp of 1:1 and an H.264 VUI of
+32:27 (made up) converted at 16:9 before and refuses now, because ffmpeg-based players show it at 3:2.
 
 **Blu-ray TrueHD.** A Blu-ray TrueHD PID carries an AC-3 core in PES of its own. ffmpeg names the core as a second
 stream of the PID, also when the PID holds no core PES. mkvmerge 102 writes the core as an AC-3 track after the TrueHD
@@ -1636,7 +1722,7 @@ filter brings both sides to the same bytes (`PROOF_BSF`). mkvmerge drops the fil
 which carry no picture, so the filter takes them out of both files. Each time comes from the reader of its
 container, see "Time reads", and each frame and each stream's start against the video's may move only the rounding
 of the two files (`proof.mkv_slack()`). A copy that moves one track by 2 ms refuses. The video and audio must end
-within 1 second. A source with no reader (AVI, ASF, MPEG-PS) reads its times through ffmpeg: each stream must start
+within 1 second. Each video stream must keep its display shape, see "Display shape". A source with no reader (AVI, ASF, MPEG-PS) reads its times through ffmpeg: each stream must start
 within 0.05 seconds of where it started (`SYNC`), and each packet time may move 2 ms at most (`TIME_SLACK`), because
 a stream whose times jump back can pass the digest and still play late. An MPEG-PS audio track must start within
 `TIME_SLACK`, see "Kept audio times". ffmpeg reads an MPEG-PS original with
@@ -2146,7 +2232,8 @@ show each such picture at its display time. With `-fflags +genpts` ffmpeg gives 
 PTS differs from its DTS, the MPEG display rule for an I or P picture. A B picture with no PTS keeps its DTS, which is
 its display time. Every packet that stores a PTS keeps it. In that episode the genpts read gave the decoder's time of
 each of the 39,258 frames. So the proof reads an MPEG-PS original with genpts, and `ff.py` allows `-fflags` with the
-value `+genpts` only.
+value `+genpts` only. `kept_times()` also reads the stored times with ffprobe, which only demuxes, so a step back
+that ffmpeg's muxer hides still shows, see "Kept audio times".
 
 **The slack.** A Matroska copy of an MP4 or TS file rounds each time to its tick, and mkvmerge moves the file by its
 earliest time, which is not on that tick. A time and the time it counts from each round, so a move reaches one tick

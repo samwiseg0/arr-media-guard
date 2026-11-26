@@ -96,11 +96,12 @@ def read(path, size, mtime_ns):
 
 
 def trak(b, start, end):
-    """The raw tables of the trak box b[start:end]: {id, kind, codec, timescale, stts, ctts, count, one, sizes, stsc,
-    chunks, edits}, each table as stored. count is the number of samples. one is the size of every sample when the
-    stsz box gives one size, and sizes is then None. Else sizes holds the size of each sample."""
-    t = {"id": None, "kind": None, "handler": "", "codec": "", "timescale": None, "stts": [], "ctts": [], "count": None, "one": 0, "sizes": None,
-         "stsc": [], "chunks": None, "edits": None}
+    """The raw tables of the trak box b[start:end]: {id, display, kind, codec, timescale, stts, ctts, count, one, sizes,
+    stsc, chunks, edits}, each table as stored. display is the (width, height) of the tkhd box in 16.16 fixed point.
+    count is the number of samples. one is the size of every sample when the stsz box gives one size, and sizes is
+    then None. Else sizes holds the size of each sample."""
+    t = {"id": None, "display": (0, 0), "kind": None, "handler": "", "codec": "", "timescale": None, "stts": [], "ctts": [], "count": None, "one": 0,
+         "sizes": None, "stsc": [], "chunks": None, "edits": None}
 
     def walk(s, e, parent=b""):
         for kind, d, x in boxes(b, s, e):
@@ -108,6 +109,7 @@ def trak(b, start, end):
                 walk(d, x, kind)
             elif kind == b"tkhd":
                 t["id"] = struct.unpack_from(">I", b, d + (20 if b[d] == 1 else 12))[0]
+                t["display"] = struct.unpack_from(">II", b, x - 8)   # the last two fields of either version
             elif kind == b"mdhd":
                 t["timescale"] = struct.unpack_from(">I", b, d + (20 if b[d] == 1 else 12))[0]
             elif kind == b"hdlr" and parent == b"mdia":   # a QuickTime minf holds a data handler too
@@ -253,7 +255,7 @@ def track(t, movie, advanced=True):
     time = array.array("q", (ns(c) for c in cts))
     st = [(c, d) for c, d in t["stts"] if c]   # one sample's ticks when every delta but the last sample's is one value
     deltas = {d for _, d in st[:-1]} | ({st[-1][1]} if st and st[-1][0] > 1 else set())
-    return {"id": t["id"], "kind": t["kind"], "handler": t["handler"], "codec": t["codec"], "timescale": ts, "edits": t["edits"],
+    return {"id": t["id"], "display": t["display"], "kind": t["kind"], "handler": t["handler"], "codec": t["codec"], "timescale": ts, "edits": t["edits"],
             "shift": (lead * 2000000000 + ts) // (2 * ts),
             "time": time, "tag": tag, "place": place, "dur": array.array("q", ((d * 2000000000 + ts) // (2 * ts) for d in dur)),
             "full": bytearray(s > 0 for s in size), "size": size,
